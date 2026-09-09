@@ -7,8 +7,14 @@
 //!   remuda send <name> <text>     deliver one instruction, body and Enter
 //!   remuda capture <name>         print the screen as text
 //!   remuda run <script.lua>       run a script with those bound as functions
+//!   remuda mcp                    serve those as MCP tools on stdin/stdout
 //!   remuda daemon                 run the daemon in the foreground
 //! ```
+//!
+//! `mcp` is the one line here a person does not type. It exists so the program
+//! running *inside* a session can reach the manager that holds it — point a
+//! client's server config at `remuda mcp` and the four operations show up as
+//! tools.
 //!
 //! The daemon starts itself on first use, so none of the above needs a setup
 //! step. That is deliberate: 정수님 asked for this to be seamless, and a tool
@@ -122,6 +128,14 @@ fn main() -> ExitCode {
             }
         }),
 
+        // Speaks MCP on stdin/stdout, so the thing running *inside* a session
+        // can reach the manager. Not meant to be typed by hand — a client
+        // spawns it and owns both pipes.
+        ["mcp"] => with_daemon(&path, |path| match remuda_native::mcp::serve(path) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(format!("mcp: {e}")),
+        }),
+
         _ => {
             eprint!("{}", USAGE);
             ExitCode::FAILURE
@@ -138,11 +152,15 @@ remuda — a pty manager you can attach to
   remuda send <name> <text>     deliver one instruction (body + Enter)
   remuda capture <name>         print the screen as text (no terminal needed)
   remuda run <script.lua>       run a script; the above are bound as functions
+  remuda mcp                    serve them as MCP tools on stdin/stdout
 
 In a script they live on one table, and a refusal is raised, not returned:
 
   remuda.new(\"build\", {\"make\", \"-j4\"})
   while not remuda.capture(\"build\"):find(\"$ \") do remuda.sleep(0.2) end
+
+`mcp` is for a program running inside a session to reach the manager holding
+it — a client spawns it and owns both pipes, so there is nothing to type here.
 ";
 
 /// Run `f`, starting the daemon first if nothing is listening yet.
