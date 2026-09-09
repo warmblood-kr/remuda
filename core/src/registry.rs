@@ -138,4 +138,21 @@ impl Registry {
     pub fn cursor(&self, name: &str) -> Option<Result<Cursor>> {
         self.get(name).map(|s| s.cursor())
     }
+
+    /// End a session, live or already dead, and stop tracking it.
+    ///
+    /// Terminate-then-remove, in that order: if the child is attached,
+    /// [`Session::terminate`] refuses and this returns that refusal *without*
+    /// removing the entry — an attached session survives a `close` exactly as
+    /// it survives a `send`, so the human is not silently disconnected. A
+    /// session already dead terminates as a no-op (see
+    /// [`crate::agent::AgentProcess::terminate`]) and is then removed, which
+    /// is how a self-exited session actually leaves the list — `reap` exists
+    /// for the bulk case, but nothing before this called it in production.
+    pub fn close(&self, name: &str) -> Option<Result<()>> {
+        let session = self.get(name)?;
+        Some(session.terminate().inspect(|()| {
+            self.remove(name);
+        }))
+    }
 }

@@ -126,6 +126,11 @@ pub trait AgentProcess: Send {
 
     fn is_alive(&mut self) -> bool;
 
+    /// End the child. Idempotent: calling it on an already-exited process is
+    /// not an error, because a caller that raced a self-exit (step 006) must
+    /// not be punished for the race it could not have won.
+    fn terminate(&mut self) -> Result<()>;
+
     /// The size fixed at spawn. There is deliberately no setter; see
     /// [`crate::session::Session`].
     fn size(&self) -> Size;
@@ -205,6 +210,15 @@ impl AgentProcess for ScriptedAgent {
 
     fn is_alive(&mut self) -> bool {
         self.alive
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        // Reuses the existing test helper: `kill()` is what a test calls to
+        // simulate a self-exit, and `terminate()` is what an orchestrated
+        // close calls. Both mean "this process is done" to a scripted double
+        // that has no real process to signal.
+        self.kill();
+        Ok(())
     }
 
     fn size(&self) -> Size {

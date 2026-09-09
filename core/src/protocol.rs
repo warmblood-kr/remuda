@@ -53,6 +53,14 @@ pub enum Request {
     /// Take the session over for a human at a terminal. On `Ok`, this
     /// connection becomes a byte pipe.
     Attach { name: String },
+    /// End a session — live or already self-exited — and stop tracking it.
+    ///
+    /// Death does not imply removal (step 006): a session whose process
+    /// exited stays listed, screen and all, until something explicitly closes
+    /// it. This is that something. Refused while a human is attached, exactly
+    /// as `Send`/`SendLine` are, so a close cannot tear a pty out from under
+    /// someone driving it — see [`crate::session::Session::terminate`].
+    Close { name: String },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]

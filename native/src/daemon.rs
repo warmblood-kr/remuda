@@ -39,13 +39,31 @@ pub fn socket_path(server: &str) -> PathBuf {
 
 /// Serve until the listener dies. Binds first, so a caller can be sure the
 /// socket exists when this returns control to its accept loop.
+///
+/// Step 006: this used to unlink `path` unconditionally, on the theory that
+/// only a crashed daemon leaves a stale socket. That theory holds for the
+/// *client's* auto-start path (connect, and start one only on failure) but
+/// not for this function called directly — `remuda daemon` typed by hand, or
+/// a second instance under the same name, unlinked a **live** peer's socket
+/// out from under it. The peer did not die; it kept running, unreachable,
+/// holding its pty children forever. Four were found alive on one machine
+/// this way (`steps/006-lifetime.md`). So: connect first, and unlink only
+/// when nothing answers. A live peer refuses this daemon outright, by name,
+/// rather than being silently displaced.
 pub fn serve(path: &Path) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    // A socket left by a crashed daemon would make bind fail forever. Removing
-    // it is safe only because a *live* daemon is detected by connecting, which
-    // is what the client does before it ever starts one.
+    if UnixStream::connect(path).is_ok() {
+        return Err(std::io::Error::other(format!(
+            "a daemon is already listening at {} — pick a different name (remuda -s <name>) \
+             or stop it first",
+            path.display()
+        )));
+    }
+    // Nothing answered, so any file here is a stale socket from a crashed
+    // daemon, not a live peer's. Removing it is what lets bind succeed instead
+    // of failing forever on an address already in use.
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
 
@@ -115,6 +133,15 @@ fn handle(stream: UnixStream, registry: &Registry) -> std::io::Result<()> {
         },
 
         Request::Attach { name } => attach(stream, reader, registry, &name),
+
+        Request::Close { name } => match registry.close(&name) {
+            None => reply(
+                &stream,
+                &Response::error(format!("no such session: {name}")),
+            ),
+            Some(Err(e)) => reply(&stream, &Response::error(e)),
+            Some(Ok(())) => reply(&stream, &Response::Ok),
+        },
     }
 }
 

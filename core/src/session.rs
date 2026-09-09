@@ -184,6 +184,25 @@ impl Session {
         }
     }
 
+    /// End the child. Refused while attached, for the same reason `send` is:
+    /// tearing the pty out from under a human at an attached terminal is
+    /// worse than making them detach first (step 006).
+    ///
+    /// Idempotent on an already-dead agent — see [`AgentProcess::terminate`].
+    /// This does not remove the session from a registry; a caller that only
+    /// wants "make sure the process is gone" can call this without also
+    /// discarding the last screen. [`crate::Registry::close`] does both.
+    pub fn terminate(&self) -> Result<()> {
+        if self.attached.load(Ordering::SeqCst) {
+            return Err(AgentError::Attached);
+        }
+        let mut agent = self
+            .agent
+            .lock()
+            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        agent.terminate()
+    }
+
     /// Take exclusive hold for a human at a terminal.
     ///
     /// `None` means someone is already attached. Two people driving one

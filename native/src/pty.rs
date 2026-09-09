@@ -163,6 +163,20 @@ impl AgentProcess for PtyAgent {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    /// Measured, not assumed (`steps/006-lifetime.md` Actual): the comment
+    /// this replaced claimed a signal to an already-exited pid "still returns
+    /// success" and was wrong. `is_alive` calls `try_wait`, which on unix
+    /// *reaps* the child the moment it returns `Some` — after that the pid is
+    /// gone, not merely a zombie, and `kill()` on it fails with ESRCH. So the
+    /// idempotence this trait promises is implemented here explicitly: if the
+    /// process is already gone, there is nothing to signal.
+    fn terminate(&mut self) -> Result<()> {
+        if !self.is_alive() {
+            return Ok(());
+        }
+        self.child.kill().map_err(io)
+    }
+
     fn size(&self) -> Size {
         self.size
     }

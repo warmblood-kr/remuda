@@ -46,8 +46,8 @@ use std::time::Duration;
 /// `tests/script.rs` asserts the live table's keys against this list in both
 /// directions, so a binding added without a decision, or a name listed here and
 /// never bound, fails the suite.
-pub const BINDINGS: [&str; 9] = [
-    "attach", "capture", "click", "insert", "key", "ls", "new", "send", "sleep",
+pub const BINDINGS: [&str; 10] = [
+    "attach", "capture", "click", "close", "insert", "key", "ls", "new", "send", "sleep",
 ];
 
 /// Execute a Lua script with the atomic functions bound.
@@ -153,6 +153,17 @@ fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
         "attach",
         lua.create_function(move |_, name: String| {
             client::attach(&path, &name).map_err(mlua::Error::external)
+        })?,
+    )?;
+
+    // End a session — live, or already self-exited (step 006). A dead session
+    // stays listed with its last screen intact until this is called; nothing
+    // reaps it on its own, on purpose (`steps/006-lifetime.md`).
+    let path = at();
+    table.set(
+        "close",
+        lua.create_function(move |lua, name: String| {
+            value(lua, ask(&path, Request::Close { name })?)
         })?,
     )?;
 

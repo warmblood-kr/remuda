@@ -37,6 +37,9 @@ impl AgentProcess for RecordingAgent {
     fn is_alive(&mut self) -> bool {
         true
     }
+    fn terminate(&mut self) -> Result<()> {
+        Ok(())
+    }
     fn size(&self) -> Size {
         Size::default()
     }
@@ -270,6 +273,10 @@ impl AgentProcess for FlagAgent {
     fn is_alive(&mut self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
+    fn terminate(&mut self) -> Result<()> {
+        self.alive.store(false, Ordering::SeqCst);
+        Ok(())
+    }
     fn size(&self) -> Size {
         Size::default()
     }
@@ -395,6 +402,96 @@ fn reap_drops_the_dead_and_keeps_the_living() {
     assert_eq!(registry.reap(), ["doomed"], "only the dead one");
     assert_eq!(registry.list().len(), 1);
     assert!(registry.get("healthy").is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Step 006 — ending a session.
+//
+// Death does not imply removal: a session whose process exited stays listed,
+// screen intact, until something explicitly closes it (`close = terminate,
+// then remove`). These pin that `close` does both halves, in the right order,
+// and does neither when attached.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn close_terminates_a_live_session_and_stops_tracking_it() {
+    let registry = Registry::new();
+    let alive = Arc::new(AtomicBool::new(true));
+    registry
+        .register(named(
+            "worker",
+            Box::new(FlagAgent {
+                alive: alive.clone(),
+            }),
+        ))
+        .expect("registration");
+
+    assert!(matches!(registry.close("worker"), Some(Ok(()))));
+    assert!(
+        !alive.load(Ordering::SeqCst),
+        "the process must actually end"
+    );
+    assert!(registry.get("worker").is_none(), "and stop being tracked");
+}
+
+#[test]
+fn close_on_an_already_dead_session_is_not_an_error() {
+    // The real backend's own measured surprise (steps/006-lifetime.md Actual):
+    // a naive `terminate` re-signals a pid `is_alive` has already reaped, and
+    // that fails. `close` on a session that died on its own — the case 정수님
+    // named directly — must still succeed, or nobody could ever clear one.
+    let registry = Registry::new();
+    registry
+        .register(named(
+            "worker",
+            Box::new(FlagAgent {
+                alive: Arc::new(AtomicBool::new(false)),
+            }),
+        ))
+        .expect("registration");
+
+    assert!(matches!(registry.close("worker"), Some(Ok(()))));
+    assert!(registry.get("worker").is_none());
+}
+
+#[test]
+fn close_on_an_unknown_name_is_none_not_an_error() {
+    let registry = Registry::new();
+    assert!(registry.close("ghost").is_none());
+}
+
+#[test]
+fn close_is_refused_while_attached_and_the_session_survives() {
+    let registry = Registry::new();
+    let alive = Arc::new(AtomicBool::new(true));
+    registry
+        .register(named(
+            "worker",
+            Box::new(FlagAgent {
+                alive: alive.clone(),
+            }),
+        ))
+        .expect("registration");
+
+    let session = registry.get("worker").expect("handle");
+    let held = session.attach().expect("attach");
+
+    assert!(
+        matches!(registry.close("worker"), Some(Err(AgentError::Attached))),
+        "tearing the pty out from under an attached human is worse than \
+         making them detach first"
+    );
+    assert!(
+        alive.load(Ordering::SeqCst),
+        "a refused close must not have touched the process"
+    );
+    assert!(registry.get("worker").is_some(), "and the entry survives");
+
+    drop(held);
+    assert!(
+        matches!(registry.close("worker"), Some(Ok(()))),
+        "detaching lets close through, exactly as it does for send"
+    );
 }
 
 // ---------------------------------------------------------------------------
