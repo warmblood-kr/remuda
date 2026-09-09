@@ -103,7 +103,13 @@ fn the_terminal_keeps_the_size_it_was_spawned_with() {
     let session = session("sized");
     assert_eq!(session.size(), Size::new(80, 24));
 
-    session.send_line("echo w=$(tput cols)").expect("send");
+    // `stty` is coreutils and present everywhere; `tput` needs ncurses, which
+    // the CI runner does not have — it failed there, correctly, once the
+    // `|| echo 80` fallback was removed. A fallback would have made this test
+    // measure the fallback instead of the pty.
+    session
+        .send_line("echo w=$(stty size | cut -d' ' -f2)")
+        .expect("send");
     let screen = wait_for(&session, "w=8");
     assert!(
         screen.contains("w=80"),
