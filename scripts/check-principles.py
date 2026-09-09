@@ -20,7 +20,7 @@ CLIPPY = ROOT / "core/clippy.toml"
 
 # The document must keep growing only with real principles; a parser that finds
 # nothing must fail rather than pass. See PRINCIPLES.md §2.
-MIN_PRINCIPLES = 8
+MIN_PRINCIPLES = 9
 
 problems: list[str] = []
 

@@ -5,6 +5,8 @@
 //! crate already proves. Cargo enforces the direction: `remuda-core` does not
 //! depend on this crate and cannot be made to.
 
+pub mod client;
+pub mod daemon;
 pub mod pty;
 
 pub use portable_pty::CommandBuilder;

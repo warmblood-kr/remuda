@@ -29,6 +29,7 @@ publish.workspace = true
 #   std paths by name. Two mechanisms, because one measurement showed one gap.
 
 [dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
 
 [lints]
 workspace = true

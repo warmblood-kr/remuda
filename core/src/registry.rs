@@ -22,6 +22,7 @@
 use crate::agent::{Cursor, Result, Size};
 use crate::session::Session;
 use core::time::Duration;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -29,7 +30,7 @@ use std::sync::{Arc, Mutex};
 ///
 /// Owned data, never a borrow into the registry — a caller may be a viewer on
 /// another machine, and this is what would go on the wire.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub name: String,
     pub alive: bool,

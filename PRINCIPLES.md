@@ -128,6 +128,32 @@ set wherever the code already is. These were set at three source files.
 **Enforced by:** `core/clippy.toml` (`too-many-arguments-threshold`,
 `too-many-lines-threshold`, `cognitive-complexity-threshold`) · CI job `lint`
 
+## 9. State the outcome before building, and capture it after
+
+Every unit of work gets a `steps/NNN-name.md`: **Before** (what is true now and
+what is wrong with it), **Desired outcome**, **Expected**, and **Actual** —
+where Actual is captured output, not a report of it.
+
+**Why.** 정수님 asked for this on 2026-09-10, and it paid on the same change.
+Building the daemon, "it seems to work" became two specific bugs the moment an
+expectation was written down first: auto-start swallowed the daemon's stderr and
+reported a timeout instead of `path must be shorter than SUN_LEN` — a wall claim
+naming the wrong wall — and detaching **deadlocked**, leaving a session locked to
+a viewer that had already gone, because the input and output pumps block on
+different things and a socket shutdown cannot wake a `recv()`. Both compiled
+cleanly and read correctly.
+
+Principle 4 has the same shape one level down: the live-pty tests were caught by
+noticing 0.05s was impossible for six shell spawns — an *actual* that failed an
+expectation nobody had written. Writing it down is what makes that catch routine
+instead of lucky.
+
+The fenced block in **Actual** is the load-bearing part. Prose can be written
+from intention; captured output cannot. For a terminal tool, pasted output is
+what a screenshot is for a UI.
+
+**Enforced by:** CI job `steps-are-documented` · CI job `gates-can-fail` · `scripts/check-steps.py`
+
 ---
 
 ## Adding a principle
