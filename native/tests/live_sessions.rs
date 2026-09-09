@@ -148,3 +148,74 @@ fn a_dead_process_reports_exited_rather_than_swallowing_input() {
     }
     assert!(session.send_line("anyone there").is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Attaching, as a human would: raw keystrokes in, a live byte stream out.
+//
+// The polling path above is what a machine uses. A person at a terminal cannot
+// poll — they need the bytes as the program emits them, and a repaint of what
+// is already on screen the moment they arrive.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn an_attached_viewer_gets_a_repaint_and_then_a_live_stream() {
+    let session = session("attachable");
+
+    // Something is already on screen before anyone attaches — the case a
+    // repaint exists for. A viewer that only streams would see none of this.
+    session.send_line("echo $((11*11))-before").expect("send");
+    wait_for(&session, "121-before");
+
+    let held = session.attach().expect("attach");
+
+    let painted = held.screen_bytes().expect("repaint");
+    let painted = String::from_utf8_lossy(&painted);
+    assert!(
+        painted.contains("121-before"),
+        "attaching must paint what is already there. got:\n{painted}"
+    );
+
+    let stream = held.subscribe().expect("a real pty can stream");
+
+    // Type it the way a human does: the keystrokes, then their own Enter.
+    held.write_raw(b"echo $((6*7))-live").expect("keystrokes");
+    held.write_raw(b"\r").expect("the human's own Enter");
+
+    // The answer cannot appear in the echo of the question, so matching it
+    // proves the shell ran rather than proving the pty echoed.
+    let deadline = Instant::now() + PATIENCE;
+    let mut seen = String::new();
+    while !seen.contains("42-live") {
+        assert!(
+            Instant::now() < deadline,
+            "streamed bytes never carried the result. saw:\n{seen}"
+        );
+        let chunk = stream
+            .recv_timeout(Duration::from_millis(500))
+            .expect("stream stays open while the process lives");
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+    }
+}
+
+#[test]
+fn detaching_leaves_the_agent_untouched_and_the_core_back_in_charge() {
+    let session = session("handover");
+    let held = session.attach().expect("attach");
+    held.write_raw(b"echo $((5*5))-typed\r")
+        .expect("keystrokes");
+    wait_for(&session, "25-typed");
+
+    // While held, the core is refused — and the refusal must not have leaked
+    // any bytes into the pty.
+    assert!(session.send_line("echo LEAKED").is_err());
+
+    drop(held);
+    session
+        .send_line("echo $((9*9))-after")
+        .expect("the core resumes on detach");
+    let screen = wait_for(&session, "81-after");
+    assert!(
+        !screen.contains("LEAKED"),
+        "a refused instruction must never reach the process. screen:\n{screen}"
+    );
+}

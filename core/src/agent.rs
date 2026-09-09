@@ -10,6 +10,7 @@
 //! and a second vendor later, are the same substitution.
 
 use core::fmt;
+use std::sync::mpsc::Receiver;
 
 /// Terminal dimensions. Immutable by construction — see [`Size::new`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -69,6 +70,9 @@ pub enum AgentError {
     /// The child is gone. Distinct from an I/O failure: a caller may
     /// legitimately want to reap and respawn rather than propagate.
     Exited,
+    /// Someone is attached and driving this session by hand. Orchestrated
+    /// input is refused rather than queued — see [`crate::session::Session`].
+    Attached,
     Io(String),
 }
 
@@ -76,6 +80,7 @@ impl fmt::Display for AgentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AgentError::Exited => write!(f, "agent process has exited"),
+            AgentError::Attached => write!(f, "a human is attached to this session"),
             AgentError::Io(m) => write!(f, "agent io error: {m}"),
         }
     }
@@ -98,6 +103,24 @@ pub trait AgentProcess: Send {
 
     /// The visible screen, rendered as text, newline-separated.
     fn screen_text(&mut self) -> Result<String>;
+
+    /// The visible screen as terminal bytes — escape sequences, colour and
+    /// all — for painting onto a real terminal that has just attached.
+    ///
+    /// `screen_text` is for a machine reading the screen; this is for a human
+    /// looking at it. Default: the text, which is correct but colourless.
+    fn screen_bytes(&mut self) -> Result<Vec<u8>> {
+        self.screen_text().map(String::into_bytes)
+    }
+
+    /// Subscribe to output as it arrives, for a viewer that must not poll.
+    ///
+    /// `None` means this backend cannot stream, which is the honest answer for
+    /// a scripted double and the reason this is not a required method. A
+    /// caller that gets `None` still has `screen_bytes`.
+    fn subscribe(&mut self) -> Option<Receiver<Vec<u8>>> {
+        None
+    }
 
     fn cursor(&mut self) -> Result<Cursor>;
 

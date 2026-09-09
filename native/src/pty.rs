@@ -27,7 +27,12 @@
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use remuda_core::agent::{AgentError, AgentProcess, Cursor, Result, Size};
 use std::io::{Read, Write};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+
+/// Live viewers of one pty's output. Shared with the reader thread, which is
+/// the only producer; every consumer holds the other end of a channel.
+type Watchers = Arc<Mutex<Vec<Sender<Vec<u8>>>>>;
 
 fn io<E: std::fmt::Display>(e: E) -> AgentError {
     AgentError::Io(e.to_string())
@@ -39,6 +44,7 @@ pub struct PtyAgent {
     screen: Arc<Mutex<vt100::Parser>>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
+    watchers: Watchers,
     _master: Box<dyn MasterPty + Send>,
 }
 
@@ -65,23 +71,34 @@ impl PtyAgent {
         let writer = pair.master.take_writer().map_err(io)?;
         let reader = pair.master.try_clone_reader().map_err(io)?;
         let screen = Arc::new(Mutex::new(vt100::Parser::new(size.rows(), size.cols(), 0)));
-        spawn_reader(reader, Arc::clone(&screen));
+        let watchers: Watchers = Arc::new(Mutex::new(Vec::new()));
+        spawn_reader(reader, Arc::clone(&screen), Arc::clone(&watchers));
 
         Ok(Self {
             size,
             screen,
             writer,
             child,
+            watchers,
             _master: pair.master,
         })
     }
 }
 
-/// Drain the pty into the grid until EOF, on its own thread.
+/// Drain the pty into the grid until EOF, on its own thread, tee-ing every
+/// chunk to whoever is watching live.
 ///
 /// Reading a pty blocks, and the whole point of the grid is that a caller can
-/// ask "what is on screen *now*" without having pumped it first.
-fn spawn_reader(mut reader: Box<dyn Read + Send>, screen: Arc<Mutex<vt100::Parser>>) {
+/// ask "what is on screen *now*" without having pumped it first. The tee is the
+/// other half: a machine polls the grid, a human needs the bytes as they come.
+///
+/// A subscriber that has hung up is dropped on its next failed send, so an
+/// attach/detach cycle leaks nothing.
+fn spawn_reader(
+    mut reader: Box<dyn Read + Send>,
+    screen: Arc<Mutex<vt100::Parser>>,
+    watchers: Watchers,
+) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         while let Ok(n) = reader.read(&mut buf) {
@@ -93,6 +110,14 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>, screen: Arc<Mutex<vt100::Parse
             } else {
                 break; // Poisoned: the grid can no longer be trusted.
             }
+            if let Ok(mut watchers) = watchers.lock() {
+                watchers.retain(|w| w.send(buf[..n].to_vec()).is_ok());
+            }
+        }
+        // EOF: drop every sender so each attached viewer's recv() ends instead
+        // of blocking forever on a process that is gone.
+        if let Ok(mut watchers) = watchers.lock() {
+            watchers.clear();
         }
     });
 }
@@ -109,6 +134,23 @@ impl AgentProcess for PtyAgent {
     fn screen_text(&mut self) -> Result<String> {
         let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
         Ok(parser.screen().contents())
+    }
+
+    /// The screen as terminal bytes, cursor position included.
+    ///
+    /// `contents_formatted` emits a full repaint — clear, then the grid with
+    /// its attributes — which is exactly what a terminal that just attached
+    /// needs. Without it a viewer stares at nothing until the program happens
+    /// to redraw on its own, which a paused agent never does.
+    fn screen_bytes(&mut self) -> Result<Vec<u8>> {
+        let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
+        Ok(parser.screen().contents_formatted())
+    }
+
+    fn subscribe(&mut self) -> Option<Receiver<Vec<u8>>> {
+        let (tx, rx) = channel();
+        self.watchers.lock().ok()?.push(tx);
+        Some(rx)
     }
 
     fn cursor(&mut self) -> Result<Cursor> {

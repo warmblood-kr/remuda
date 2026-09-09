@@ -372,3 +372,69 @@ fn reap_drops_the_dead_and_keeps_the_living() {
     assert_eq!(registry.list().len(), 1);
     assert!(registry.get("healthy").is_some());
 }
+
+// ---------------------------------------------------------------------------
+// Invariant 3 — raw keystrokes exist only while exactly one human holds it.
+//
+// 정수님, 2026-09-10: a tmux-like manager where "user can select a session to
+// attach". A human at a terminal types their own Enter, which needs the raw
+// write invariant 1 refuses to expose. These pin the reconciliation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn orchestrated_input_is_refused_while_a_human_is_attached() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
+
+    // Negative control: unattached, the core can drive normally. Without this
+    // the assertion below would also pass on a session that never accepts
+    // anything at all.
+    session.send_line("before").expect("core drives when free");
+    assert_eq!(writes.lock().unwrap().len(), 2, "body + Enter");
+
+    let held = session.attach().expect("first attach");
+    assert!(session.is_attached());
+    assert!(
+        matches!(session.send_line("during"), Err(AgentError::Attached)),
+        "the core must be told, not queued behind the human"
+    );
+    assert_eq!(
+        writes.lock().unwrap().len(),
+        2,
+        "the refused instruction must not have reached the pty at all"
+    );
+
+    drop(held);
+    assert!(!session.is_attached());
+    session
+        .send_line("after")
+        .expect("detach restores the core");
+    assert_eq!(writes.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn a_second_viewer_cannot_attach() {
+    let (session, _clock) = session_with(Box::new(ScriptedAgent::new(vec![])));
+    let first = session.attach().expect("first attach");
+    assert!(
+        session.attach().is_none(),
+        "two people on one keyboard is the same defect as core-plus-human"
+    );
+    drop(first);
+    assert!(session.attach().is_some(), "detaching frees the seat");
+}
+
+#[test]
+fn a_raw_keystroke_carries_no_invented_enter() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
+    let held = session.attach().expect("attach");
+
+    held.write_raw(b"ls").expect("raw write");
+
+    // Exactly the bytes typed. send_line appends CR because it delivers a whole
+    // instruction; a keystroke is not an instruction, and submitting a
+    // half-typed line on the human's behalf is the failure this guards.
+    let recorded = writes.lock().unwrap().clone();
+    assert_eq!(recorded, vec![b"ls".to_vec()], "one write, no Enter");
+}
