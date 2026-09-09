@@ -34,6 +34,7 @@
 
 pub mod agent;
 pub mod clock;
+pub mod keys;
 pub mod protocol;
 pub mod registry;
 pub mod session;

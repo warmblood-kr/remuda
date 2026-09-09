@@ -100,6 +100,44 @@ fn the_bound_surface_is_exactly_the_protocols() {
 }
 
 #[test]
+fn every_frozen_api_version_still_runs() {
+    // 정수님, 2026-09-10: *"그 언어 API 에 대고 사용자들이 자기 함수를 얹어서
+    // 설정하거나 플러그인, 워크플로 등을 만들면, 하위호환을 엄격하게 지켜야
+    // 합니다."*
+    //
+    // `tests/api/vN.lua` is a script written against version N of the Lua API,
+    // and it is frozen: widening the surface means adding `v2.lua`, never
+    // editing `v1.lua`. That is what makes this a control rather than a
+    // ceremony — a check you may edit to make it pass checks nothing. Renaming
+    // a binding, reordering its arguments, or making an optional argument
+    // required now fails the build instead of someone's plugin.
+    let dir = scratch("compat");
+    let path = dir.join("s.sock");
+    let _daemon = daemon_at(&path);
+
+    let api = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/api");
+    let mut versions: Vec<PathBuf> = std::fs::read_dir(&api)
+        .expect("tests/api must exist")
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "lua"))
+        .collect();
+    versions.sort();
+
+    // Absence here would look exactly like success: an empty directory runs
+    // zero scripts and passes. The count is asserted, so a lost or unreadable
+    // file is a failure rather than a silent skip.
+    assert!(
+        !versions.is_empty(),
+        "no frozen API scripts found in {api:?} — the compatibility gate is not running"
+    );
+
+    for version in versions {
+        script::run(&path, &version)
+            .unwrap_or_else(|e| panic!("{} no longer runs: {e}", version.display()));
+    }
+}
+
+#[test]
 fn a_script_reacts_to_what_a_session_shows() {
     // The whole point of the layer: send, wait, look, decide, send again. The
     // shell could express each step and not the loop between them.

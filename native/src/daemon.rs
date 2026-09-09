@@ -96,6 +96,15 @@ fn handle(stream: UnixStream, registry: &Registry) -> std::io::Result<()> {
             Some(Ok(())) => reply(&stream, &Response::Ok),
         },
 
+        Request::Send { name, bytes } => match registry.send(&name, &bytes) {
+            None => reply(
+                &stream,
+                &Response::error(format!("no such session: {name}")),
+            ),
+            Some(Err(e)) => reply(&stream, &Response::error(e)),
+            Some(Ok(())) => reply(&stream, &Response::Ok),
+        },
+
         Request::Capture { name } => match registry.screen_text(&name) {
             None => reply(
                 &stream,

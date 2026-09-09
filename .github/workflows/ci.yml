@@ -120,6 +120,22 @@ jobs:
           grep -q "cyclic package dependency" /tmp/out \
             || { echo "::error::cargo did not reject the reversed edge as a cycle"; exit 1; }
 
+      - name: a renamed Lua binding breaks the frozen API script
+        # The hole this closes, stated as a plant: rename a binding AND its
+        # entry in BINDINGS — the tidy thing a developer does — and the surface
+        # test still passes, because both sides moved together. Only a script
+        # written against the old API notices, which is why one is frozen in
+        # native/tests/api/ and never edited to make it pass.
+        run: |
+          cp native/src/script.rs /tmp/script.rs.bak
+          sed -i 's/"insert"/"insert_bytes"/g' native/src/script.rs
+          cargo test -p remuda-native --test script 2>&1 | tee /tmp/out || true
+          cp /tmp/script.rs.bak native/src/script.rs
+          grep -q "the_bound_surface_is_exactly_the_protocols ... ok" /tmp/out \
+            || { echo "::error::the surface test was supposed to STAY GREEN under a clean rename"; exit 1; }
+          grep -q "remuda.insert is gone" /tmp/out \
+            || { echo "::error::the frozen v1 script did not catch the rename"; exit 1; }
+
       - name: check-principles.py rejects a mechanism that does not exist
         # Built 2026-09-10 and it failed open TWICE while being built: once on
         # a phantom `push:` job name (indented like a job under `jobs:` but

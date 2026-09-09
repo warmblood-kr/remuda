@@ -127,6 +127,10 @@ impl Registry {
         self.get(name).map(|s| s.send_line(text))
     }
 
+    pub fn send(&self, name: &str, bytes: &[u8]) -> Option<Result<()>> {
+        self.get(name).map(|s| s.send(bytes))
+    }
+
     pub fn screen_text(&self, name: &str) -> Option<Result<String>> {
         self.get(name).map(|s| s.screen_text())
     }

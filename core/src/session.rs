@@ -14,13 +14,21 @@ use std::sync::{Arc, Mutex};
 
 /// A running agent, addressable by name.
 ///
-/// # Invariant 1 — a write and its Enter cannot be separated
+/// # Invariant 1 — one input act cannot be split by a second writer
 ///
-/// [`Self::send_line`] is the only way to put input into a session. There is
-/// no public `write`, so no caller can send a body, lose the lock, and have
-/// another writer's Enter submit it. The Emacs implementation had exactly
-/// this bug shape: a stray submit landed on whatever was highlighted, and the
-/// intended text was swallowed with both sides reporting success.
+/// [`Self::send`] and [`Self::send_line`] are the only ways to put input into a
+/// session, and each delivers its whole burst under a single lock acquisition.
+/// There is no *divisible* write — no method that takes the lock and hands it
+/// back part-way through an act — so no caller can send a body, lose the lock,
+/// and have another writer's Enter submit it. The Emacs implementation had
+/// exactly this bug shape: a stray submit landed on whatever was highlighted,
+/// and the intended text was swallowed with both sides reporting success.
+///
+/// This was first written as "there is no public raw write", which described
+/// the one atom that existed at the time rather than the property. Widening the
+/// atom to any byte burst (2026-09-10, for the Lua input vocabulary) left the
+/// property untouched and made the earlier wording read like a repeal, which is
+/// why it now names divisibility instead.
 ///
 /// # Invariant 2 — nobody can resize the pty
 ///
@@ -100,10 +108,37 @@ impl Session {
 
     /// Deliver one instruction: the text, then Enter, as one indivisible act.
     ///
-    /// Both writes happen under a single lock acquisition. Nothing awaits in
-    /// between because nothing here is async, so no scheduler can interleave
-    /// a second writer between the body and its submit.
+    /// Carriage return, not newline: a pty in canonical mode takes CR as submit,
+    /// and TUIs that read raw keys expect the same byte a real Enter key
+    /// produces. That decision lives here and nowhere else, which is the reason
+    /// this stays its own method rather than becoming a caller's `+ "\r"`.
     pub fn send_line(&self, text: &str) -> Result<()> {
+        let mut line = Vec::with_capacity(text.len() + 1);
+        line.extend_from_slice(text.as_bytes());
+        line.push(b'\r');
+        self.send(&line)
+    }
+
+    /// Deliver a burst of input as one indivisible act, appending nothing.
+    ///
+    /// This is the atom, and [`Self::send_line`] is one particular burst. It is
+    /// what every keystroke that is not a line of text has to go through — an
+    /// arrow key, a Ctrl chord, a mouse report.
+    ///
+    /// **Why this does not repeal invariant 1.** That invariant's own reason is
+    /// that no caller may "send a body, lose the lock, and have another writer's
+    /// Enter submit it". The property is the *atomicity of one input act*, not
+    /// the absence of raw bytes. A burst is written under a single lock
+    /// acquisition with nothing awaiting inside it, so a second sender still
+    /// cannot land in the middle of one. The operation that does not exist here
+    /// is a **divisible** write, and it still cannot be written: there is no
+    /// method that takes the lock and gives it back part-way through an act.
+    ///
+    /// What genuinely changes is that a half-typed line can now be left sitting
+    /// at a prompt. That is a script doing a deliberate thing, in the same class
+    /// as `sh script.sh`, and not the concurrency defect this type was built
+    /// against.
+    pub fn send(&self, bytes: &[u8]) -> Result<()> {
         if self.attached.load(Ordering::SeqCst) {
             return Err(AgentError::Attached);
         }
@@ -113,14 +148,10 @@ impl Session {
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
 
-        agent.write(text.as_bytes())?;
-        // Carriage return, not newline: a pty in canonical mode takes CR as
-        // submit, and TUIs that read raw keys expect the same byte a real
-        // Enter key produces.
-        agent.write(b"\r")?;
+        agent.write(bytes)?;
 
-        // Recorded only after both writes land, so a partial write does not
-        // look like delivered input.
+        // Recorded only after the write lands, so a failed write does not look
+        // like delivered input.
         if let Ok(mut at) = self.last_input_at.lock() {
             *at = self.clock.now();
         }

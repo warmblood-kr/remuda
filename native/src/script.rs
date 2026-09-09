@@ -24,22 +24,31 @@
 
 use crate::client;
 use mlua::{Lua, Table, Value};
+use remuda_core::keys;
 use remuda_core::protocol::{Request, Response};
 use std::path::Path;
 use std::time::Duration;
 
 /// Every name bound into the `remuda` table.
 ///
-/// The five protocol operations, plus `sleep`. `sleep` is not a remuda
-/// operation and is here because without it the runtime cannot express the one
-/// thing it exists for: send, wait, look, decide. The polling loop itself is
-/// written in Lua — building that helper in Rust would be doing in the host the
-/// exact job the guest language was embedded to do.
+/// The protocol operations, plus `sleep`. `sleep` is not a remuda operation and
+/// is here because without it the runtime cannot express the one thing it exists
+/// for: send, wait, look, decide. The polling loop itself is written in Lua —
+/// building that helper in Rust would be doing in the host the exact job the
+/// guest language was embedded to do.
+///
+/// `insert`, `key` and `click` are three names over *one* new operation
+/// ([`Request::Send`]). They are spellings, in the sense elisp has `insert`,
+/// `insert-char` and `insert-buffer-substring` over one primitive — the shape
+/// 정수님 pointed at on 2026-09-10. Adding them widened the protocol by a single
+/// variant, not by three.
 ///
 /// `tests/script.rs` asserts the live table's keys against this list in both
 /// directions, so a binding added without a decision, or a name listed here and
 /// never bound, fails the suite.
-pub const BINDINGS: [&str; 6] = ["attach", "capture", "ls", "new", "send", "sleep"];
+pub const BINDINGS: [&str; 9] = [
+    "attach", "capture", "click", "insert", "key", "ls", "new", "send", "sleep",
+];
 
 /// Execute a Lua script with the atomic functions bound.
 pub fn run(socket: &Path, script: &Path) -> mlua::Result<()> {
@@ -86,6 +95,49 @@ fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
         lua.create_function(move |lua, (name, text): (String, String)| {
             value(lua, ask(&path, Request::SendLine { name, text })?)
         })?,
+    )?;
+
+    // The `insert-char` analogue: exactly these bytes, nothing appended. An
+    // `mlua::String` rather than a Rust `String` so a script can hand over any
+    // byte sequence — an escape sequence is text, but a caller building one
+    // should not have to satisfy UTF-8 to reach the pty.
+    let path = at();
+    table.set(
+        "insert",
+        lua.create_function(move |lua, (name, text): (String, mlua::LuaString)| {
+            let bytes = text.as_bytes().to_vec();
+            value(lua, ask(&path, Request::Send { name, bytes })?)
+        })?,
+    )?;
+
+    // Named keys, in Emacs's `kbd` notation. An unknown name is raised, not
+    // quietly encoded as an empty burst — a script that presses nothing and
+    // reports success is the failure mode `value` exists to prevent, and this
+    // is the same failure one layer earlier.
+    let path = at();
+    table.set(
+        "key",
+        lua.create_function(move |lua, (name, spec): (String, String)| {
+            let bytes = keys::key(&spec)
+                .ok_or_else(|| mlua::Error::runtime(format!("no such key: {spec}")))?;
+            value(lua, ask(&path, Request::Send { name, bytes })?)
+        })?,
+    )?;
+
+    // Column and row are 1-based, matching the terminal's own coordinates and
+    // Lua's own indexing, so nothing has to be converted at the call site.
+    let path = at();
+    table.set(
+        "click",
+        lua.create_function(
+            move |lua, (name, col, row, button): (String, u16, u16, Option<String>)| {
+                let button = button.unwrap_or_else(|| "left".into());
+                let bytes = keys::mouse(&button, col, row).ok_or_else(|| {
+                    mlua::Error::runtime(format!("no such click: {button} at {col},{row}"))
+                })?;
+                value(lua, ask(&path, Request::Send { name, bytes })?)
+            },
+        )?,
     )?;
 
     let path = at();

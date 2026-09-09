@@ -48,32 +48,48 @@ fn session_with(agent: Box<dyn AgentProcess>) -> (Session, Arc<ManualClock>) {
     (session, clock)
 }
 
-/// True when every body write is immediately followed by its Enter — i.e. no
-/// second writer got between them.
-fn every_body_is_followed_by_enter(writes: &[Vec<u8>]) -> bool {
-    let mut i = 0;
-    while i < writes.len() {
-        if writes[i] == b"\r" {
-            // An Enter with no body before it means a pair was broken apart.
-            return false;
-        }
-        match writes.get(i + 1) {
-            Some(next) if next == b"\r" => i += 2,
-            _ => return false,
-        }
-    }
-    true
+/// True when every write is a whole instruction — a body with its Enter on the
+/// end, never a body alone and never a bare Enter.
+///
+/// This used to check that a body write was *followed by* an Enter write,
+/// because `send_line` wrote the two separately under one lock. Since
+/// 2026-09-10 `send_line` is one burst through `Session::send`, so the pair
+/// cannot be observed apart at all and the predicate states the stronger claim
+/// directly. The negative control below still fails it, which is the only
+/// reason this is a strengthening rather than a loosening.
+fn every_write_is_a_whole_instruction(writes: &[Vec<u8>]) -> bool {
+    writes.iter().all(|w| {
+        matches!(w.split_last(), Some((&b'\r', body)) if !body.is_empty() && !body.contains(&b'\r'))
+    })
 }
 
 #[test]
-fn send_line_writes_the_body_then_enter() {
+fn send_line_writes_the_body_and_its_enter_as_one_burst() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
 
     session.send_line("hello").unwrap();
 
     let got = writes.lock().unwrap().clone();
-    assert_eq!(got, vec![b"hello".to_vec(), b"\r".to_vec()]);
+    assert_eq!(got, vec![b"hello\r".to_vec()]);
+}
+
+#[test]
+fn send_appends_nothing_so_a_line_can_be_left_un_submitted() {
+    // The capability 004 adds, and the footgun it admits to: a script may type
+    // into a prompt and stop. Nothing invents the CR that would run it.
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
+
+    session.send(b"half a thought").unwrap();
+    session.send(&[0x1b, b'[', b'A']).unwrap();
+
+    let got = writes.lock().unwrap().clone();
+    assert_eq!(
+        got,
+        vec![b"half a thought".to_vec(), vec![0x1b, b'[', b'A']],
+        "send must deliver exactly the bytes given, one write per call"
+    );
 }
 
 #[test]
@@ -94,9 +110,13 @@ fn concurrent_send_lines_never_interleave() {
     }
 
     let got = writes.lock().unwrap().clone();
-    assert_eq!(got.len(), 32, "16 sends should produce 16 body+enter pairs");
+    assert_eq!(
+        got.len(),
+        16,
+        "16 sends should produce 16 indivisible bursts"
+    );
     assert!(
-        every_body_is_followed_by_enter(&got),
+        every_write_is_a_whole_instruction(&got),
         "a body write was separated from its Enter: {got:?}"
     );
 }
@@ -145,7 +165,7 @@ fn control_unlocked_writers_do_interleave() {
     let got = writes.lock().unwrap().clone();
     assert_eq!(got.len(), WRITERS * 2);
     assert!(
-        !every_body_is_followed_by_enter(&got),
+        !every_write_is_a_whole_instruction(&got),
         "control failed to interleave, so the positive test proves nothing"
     );
 }
@@ -288,7 +308,11 @@ fn a_name_collision_is_refused_and_the_first_session_survives() {
         .send_line("worker", "still me")
         .expect("session present")
         .expect("write ok");
-    assert_eq!(first_writes.lock().unwrap().len(), 2, "body + Enter");
+    assert_eq!(
+        first_writes.lock().unwrap().len(),
+        1,
+        "one indivisible burst"
+    );
     assert!(
         second_writes.lock().unwrap().is_empty(),
         "the rejected session must never have been wired up"
@@ -314,7 +338,7 @@ fn many_handles_drive_one_session() {
 
     viewer.send_line("from the viewer").expect("viewer write");
     core.send_line("from the core").expect("core write");
-    assert_eq!(writes.lock().unwrap().len(), 4, "two bodies, two Enters");
+    assert_eq!(writes.lock().unwrap().len(), 2, "one burst per send");
 }
 
 #[test]
@@ -390,7 +414,7 @@ fn orchestrated_input_is_refused_while_a_human_is_attached() {
     // the assertion below would also pass on a session that never accepts
     // anything at all.
     session.send_line("before").expect("core drives when free");
-    assert_eq!(writes.lock().unwrap().len(), 2, "body + Enter");
+    assert_eq!(writes.lock().unwrap().len(), 1, "one indivisible burst");
 
     let held = session.attach().expect("first attach");
     assert!(session.is_attached());
@@ -398,10 +422,18 @@ fn orchestrated_input_is_refused_while_a_human_is_attached() {
         matches!(session.send_line("during"), Err(AgentError::Attached)),
         "the core must be told, not queued behind the human"
     );
+    // The raw vocabulary added in 004 goes through the same refusal. Checked
+    // separately from `send_line` because a keystroke reaching a session a
+    // person is driving is the original incident, and `send` is the newest and
+    // easiest way to arrive there.
+    assert!(
+        matches!(session.send(b"\x1b[A"), Err(AgentError::Attached)),
+        "raw input must be refused while a human holds the session"
+    );
     assert_eq!(
         writes.lock().unwrap().len(),
-        2,
-        "the refused instruction must not have reached the pty at all"
+        1,
+        "neither refused act may have reached the pty at all"
     );
 
     drop(held);
@@ -409,7 +441,7 @@ fn orchestrated_input_is_refused_while_a_human_is_attached() {
     session
         .send_line("after")
         .expect("detach restores the core");
-    assert_eq!(writes.lock().unwrap().len(), 4);
+    assert_eq!(writes.lock().unwrap().len(), 2);
 }
 
 #[test]

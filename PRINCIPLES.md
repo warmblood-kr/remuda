@@ -154,6 +154,33 @@ what a screenshot is for a UI.
 
 **Enforced by:** CI job `steps-are-documented` · CI job `gates-can-fail` · `scripts/check-steps.py`
 
+## 10. The embedded language's API is frozen by a script, not by intent
+
+Every version of the Lua surface has a script written against it in
+`native/tests/api/`, and CI runs all of them on every commit. Widening the API
+means adding `v2.lua`; it never means editing `v1.lua`.
+
+**Why.** 정수님, 2026-09-10: *"그 언어 API 에 대고 사용자들이 자기 함수를 얹어서
+설정하거나 플러그인, 워크플로 등을 만들면, 하위호환을 엄격하게 지켜야 합니다."*
+The incident is this repo's own step 004, the change that introduced the rule:
+`BINDINGS` grew from six names to nine, `send_line`'s write pattern changed
+underneath it, and **nothing in the build could have told the difference between
+that and a rename.** The existing surface test compares the live table against
+`BINDINGS` — so a developer renaming a binding *and* its constant passes it,
+which is precisely the change that breaks every script already written.
+
+That is the hole this closes, and the negative control in `gates-can-fail`
+plants exactly that rename to prove it: the surface test stays green and the
+frozen script goes red.
+
+The freezing is what makes it a control rather than a ceremony. A compatibility
+check you may edit to make it pass checks nothing — so if a change genuinely
+cannot keep `v1.lua` running, the honest act is to delete the file in the open,
+not to adjust it.
+
+**Enforced by:** CI job `test` (runs `every_frozen_api_version_still_runs`) ·
+CI job `gates-can-fail` · `native/tests/api/v1.lua`
+
 ---
 
 ## Adding a principle

@@ -33,6 +33,17 @@ pub enum Request {
     /// Deliver one instruction as an indivisible act. Refused while a human is
     /// attached — see [`crate::session::Session`], invariant 3.
     SendLine { name: String, text: String },
+    /// Deliver a burst of input bytes as an indivisible act, appending nothing.
+    ///
+    /// This is the primitive [`Request::SendLine`] is made of, and the one every
+    /// keystroke that is not a line of text has to go through: an arrow key, a
+    /// Ctrl chord, a mouse report, or a line deliberately left un-submitted.
+    ///
+    /// Indivisible is the load-bearing word. It is *not* a raw write in the
+    /// sense invariant 1 forbids — nothing here hands out the session lock
+    /// mid-act, so two senders still cannot interleave inside one burst. Refused
+    /// while a human is attached, exactly as `SendLine` is.
+    Send { name: String, bytes: Vec<u8> },
     /// Read the screen as text, without taking the session over.
     ///
     /// This is how a machine looks: it needs no terminal, no raw mode and no
