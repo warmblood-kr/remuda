@@ -8,12 +8,39 @@
 pub mod client;
 pub mod daemon;
 pub mod pty;
+pub mod script;
 
 pub use portable_pty::CommandBuilder;
 pub use pty::PtyAgent;
 
-use remuda_core::Clock;
+use remuda_core::{Clock, Size};
 use std::time::{Duration, Instant};
+
+/// This terminal's size, or the floor if it cannot be determined.
+///
+/// `Size::new` clamps anyway, so a wrong answer here cannot produce a terminal
+/// that silently drops keystrokes — the worst case is a session smaller than the
+/// window it was started from. A script run with no terminal at all (a cron job,
+/// a pipe) gets the floor, which is the same honest answer.
+pub fn terminal_size() -> Size {
+    // TIOCGWINSZ has no safe wrapper in `nix`, and the alternative — shelling
+    // out to `stty` — would put a subprocess on the startup path of every
+    // command. Four lines of well-trodden ioctl instead.
+    use std::os::fd::AsRawFd;
+    let mut ws: nix::libc::winsize = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        nix::libc::ioctl(
+            std::io::stdout().as_raw_fd(),
+            nix::libc::TIOCGWINSZ,
+            &mut ws,
+        )
+    };
+    if rc == 0 && ws.ws_col > 0 {
+        Size::new(ws.ws_col, ws.ws_row)
+    } else {
+        Size::default()
+    }
+}
 
 /// The real clock.
 ///

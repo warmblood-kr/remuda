@@ -1,4 +1,4 @@
-//! `remuda` — a pty manager you can attach to, and later script.
+//! `remuda` — a pty manager you can attach to, and script.
 //!
 //! ```text
 //!   remuda ls                     list this node's sessions
@@ -6,6 +6,7 @@
 //!   remuda attach <name>          hand this terminal over; Ctrl-\ detaches
 //!   remuda send <name> <text>     deliver one instruction, body and Enter
 //!   remuda capture <name>         print the screen as text
+//!   remuda run <script.lua>       run a script with those bound as functions
 //!   remuda daemon                 run the daemon in the foreground
 //! ```
 //!
@@ -14,8 +15,7 @@
 //! that makes you start a server before it works is not.
 
 use remuda_core::protocol::{Request, Response};
-use remuda_core::Size;
-use remuda_native::daemon;
+use remuda_native::{daemon, terminal_size};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -113,6 +113,15 @@ fn main() -> ExitCode {
             }
         }),
 
+        ["run", script] => with_daemon(&path, |path| {
+            match remuda_native::script::run(path, Path::new(script)) {
+                Ok(()) => ExitCode::SUCCESS,
+                // Lua's own message, which already carries the file, the line
+                // and a traceback. Reformatting it would only lose the line.
+                Err(e) => fail(e),
+            }
+        }),
+
         _ => {
             eprint!("{}", USAGE);
             ExitCode::FAILURE
@@ -128,6 +137,12 @@ remuda — a pty manager you can attach to
   remuda attach <name>          hand this terminal over; Ctrl-\\ detaches
   remuda send <name> <text>     deliver one instruction (body + Enter)
   remuda capture <name>         print the screen as text (no terminal needed)
+  remuda run <script.lua>       run a script; the above are bound as functions
+
+In a script they live on one table, and a refusal is raised, not returned:
+
+  remuda.new(\"build\", {\"make\", \"-j4\"})
+  while not remuda.capture(\"build\"):find(\"$ \") do remuda.sleep(0.2) end
 ";
 
 /// Run `f`, starting the daemon first if nothing is listening yet.
@@ -184,31 +199,6 @@ fn start_daemon(path: &Path) -> Result<(), String> {
         "daemon did not come up at {} — {said}",
         path.display()
     ))
-}
-
-/// This terminal's size, or the floor if it cannot be determined.
-///
-/// `Size::new` clamps anyway, so a wrong answer here cannot produce a terminal
-/// that silently drops keystrokes — the worst case is a session that is smaller
-/// than the window it was started from.
-fn terminal_size() -> Size {
-    // TIOCGWINSZ has no safe wrapper in `nix`, and the alternative — shelling
-    // out to `stty` — would put a subprocess on the startup path of every
-    // command. Four lines of well-trodden ioctl instead.
-    use std::os::fd::AsRawFd;
-    let mut ws: nix::libc::winsize = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        nix::libc::ioctl(
-            std::io::stdout().as_raw_fd(),
-            nix::libc::TIOCGWINSZ,
-            &mut ws,
-        )
-    };
-    if rc == 0 && ws.ws_col > 0 {
-        Size::new(ws.ws_col, ws.ws_row)
-    } else {
-        Size::default()
-    }
 }
 
 fn describe(response: std::io::Result<Response>) -> String {
