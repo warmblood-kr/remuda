@@ -3,8 +3,8 @@
 //! this suite is the MVP's first completion criterion, "the whole suite runs
 //! on a machine that has never installed `claude`."
 
-use remuda::agent::{AgentError, AgentProcess, Cursor, Result, Size};
-use remuda::{Clock, ManualClock, ScriptedAgent, Session};
+use remuda_core::agent::{AgentError, AgentProcess, Cursor, Result, Size};
+use remuda_core::{Clock, ManualClock, ScriptedAgent, Session};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 

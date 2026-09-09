@@ -1,0 +1,34 @@
+[package]
+name = "remuda-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# THE DEPENDENCY LIST IS THE ARCHITECTURE RULE.
+#
+# It is empty, and that is the enforcement. This crate cannot touch a pty, spawn
+# a process, or emulate a terminal, because it cannot name a crate that does.
+# Adding one is a visible edit to this file, not a forgotten feature flag.
+#
+# MEASURED SCOPE OF THE WASM GATE — narrower than it looks, so do not lean on it
+# for more than it does. Four deliberate leaks, planted in the pure layer and
+# checked (2026-09-09):
+#
+#       std::os::unix::io::AsRawFd    3 errors   CAUGHT
+#       std::process::Command         0 errors   compiles
+#       std::fs::read_to_string       0 errors   compiles
+#       std::time::Instant            0 errors   compiles
+#
+#   wasm32-unknown-unknown ships std stubs that compile and fail only at
+#   RUNTIME. So the target catches host CRATES — the axis portable-pty sits on —
+#   and does NOT catch a bare std syscall written here by hand.
+#
+#   The crate split closes the first axis properly (this file). The second axis
+#   is closed by `clippy.toml` next to this manifest, which denies those exact
+#   std paths by name. Two mechanisms, because one measurement showed one gap.
+
+[dependencies]
+
+[lints]
+workspace = true

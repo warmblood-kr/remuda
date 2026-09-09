@@ -1,0 +1,34 @@
+# The second axis of the layering rule — the one the crate split does NOT close.
+#
+# Measured 2026-09-09: `cargo check --target wasm32-unknown-unknown` catches a
+# host CRATE, but a bare `Command`, `fs`, or `Instant` written directly in this
+# crate compiled with ZERO errors, because wasm32 ships std stubs that only fail
+# at runtime. The crate boundary closes the dependency axis; this file closes
+# the hand-written-syscall axis. Two mechanisms because one measurement showed
+# one gap — not because two felt safer.
+#
+# CI runs `cargo clippy -- -D warnings`, so a match here FAILS THE BUILD.
+
+disallowed-types = [
+    { path = "std::time::Instant", reason = "policy takes a Clock; see remuda_core::Clock" },
+    { path = "std::time::SystemTime", reason = "policy takes a Clock, and never wall-clock" },
+    { path = "std::process::Command", reason = "spawning is the host layer's job — remuda-native" },
+    { path = "std::net::TcpStream", reason = "no sockets in the policy layer" },
+    { path = "std::net::TcpListener", reason = "no sockets in the policy layer" },
+]
+
+disallowed-methods = [
+    { path = "std::fs::read", reason = "no filesystem in the policy layer" },
+    { path = "std::fs::read_to_string", reason = "no filesystem in the policy layer" },
+    { path = "std::fs::write", reason = "no filesystem in the policy layer" },
+    { path = "std::fs::File::open", reason = "no filesystem in the policy layer" },
+    { path = "std::fs::File::create", reason = "no filesystem in the policy layer" },
+    { path = "std::thread::sleep", reason = "advance a ManualClock instead; a sleeping test proves timing, not logic" },
+]
+
+# R15's own subject — "한 클래스에 너무 많은 메소드나 속성이 들어가지 않도록".
+# The thresholds are deliberately low: this crate is three files old, and a
+# limit set after the code outgrows it is not a limit.
+too-many-arguments-threshold = 5
+too-many-lines-threshold = 60
+cognitive-complexity-threshold = 12

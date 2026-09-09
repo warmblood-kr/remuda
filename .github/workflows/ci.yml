@@ -1,0 +1,103 @@
+name: ci
+
+# 정수님, 2026-09-09: "정적 코드분석 도구를 사용합니다. 그리고 아키텍처 린터 …
+# 그걸 린터처럼 빌드마다 체크합니다."
+#
+# Every job here FAILS THE BUILD on violation. None of them prints advice. A
+# check that only warns is a hope with a log line, and this repository's own
+# design notes say so: 「모듈을 작게 유지하자」는 희망이고, 빌드를 깨는 임계값은 장치다.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo test --workspace --all-targets
+
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo fmt --all --check
+
+  lint:
+    # Static analysis AND the architecture linter. `clippy.toml` next to
+    # `core/Cargo.toml` denies the std paths the wasm gate was measured NOT to
+    # catch, plus the size thresholds R15 actually asks for. `-D warnings` is
+    # what turns all of it from a report into a gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  wasm-boundary:
+    # The policy layer must build for a target that has no fork, no pty, no tty.
+    # This catches a host CRATE leaking into core — the axis portable-pty sits
+    # on. It does NOT catch a hand-written syscall; that is the `lint` job's
+    # half. Both, because the gap between them was measured, not assumed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add wasm32-unknown-unknown
+      - run: cargo check -p remuda-core --target wasm32-unknown-unknown
+
+  gates-can-fail:
+    # A gate nobody has watched go red is a claim, not a control.
+    #
+    # Each step plants the violation its gate exists to catch and asserts the
+    # gate rejects it — then reverts. If someone silences a lint, this job goes
+    # red instead of the guard going quiet.
+    #
+    # ⚠ EVERY STEP MATCHES THE REJECTION *REASON*, NEVER JUST "IT FAILED".
+    # The first draft of this job asserted only non-zero exit, and it passed for
+    # the wrong reason on its very first local run: a `>>` appended a dependency
+    # line into the trailing `[lints]` table, so cargo died on `unknown variant
+    # '../native'` — a TOML syntax error — and the check happily reported the
+    # architecture rule was alive. A negative control that accepts any failure
+    # also accepts your own typo. Grep for the message the gate itself emits.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add wasm32-unknown-unknown
+
+      - name: clippy rejects a syscall written into the policy layer
+        run: |
+          cp core/src/lib.rs /tmp/lib.rs.bak
+          echo 'pub fn _leak() { let _ = std::process::Command::new("ls"); }' >> core/src/lib.rs
+          cargo clippy -p remuda-core --all-targets -- -D warnings 2>&1 | tee /tmp/out || true
+          cp /tmp/lib.rs.bak core/src/lib.rs
+          grep -q "disallowed type .std::process::Command" /tmp/out \
+            || { echo "::error::clippy did not reject Command for the stated reason"; exit 1; }
+
+      - name: the wasm target rejects a platform API in the policy layer
+        run: |
+          cp core/src/lib.rs /tmp/lib.rs.bak
+          echo 'pub fn _leak(f: &std::fs::File) -> i32 { use std::os::unix::io::AsRawFd; f.as_raw_fd() }' >> core/src/lib.rs
+          cargo check -p remuda-core --target wasm32-unknown-unknown 2>&1 | tee /tmp/out || true
+          cp /tmp/lib.rs.bak core/src/lib.rs
+          grep -q "os::unix" /tmp/out \
+            || { echo "::error::wasm target did not reject std::os::unix"; exit 1; }
+
+      - name: cargo rejects an edge from the policy layer back to the host layer
+        # Note the exact claim: this proves the arrow cannot be REVERSED (cargo
+        # calls it a cycle). It does NOT prove core is free of host crates in
+        # general — a brand-new host dependency is caught by `wasm-boundary`
+        # above, which is why both jobs exist.
+        run: |
+          cp core/Cargo.toml /tmp/Cargo.toml.bak
+          sed -i 's|^\[dependencies\]$|[dependencies]\nremuda-native = { path = "../native" }|' core/Cargo.toml
+          cargo check -p remuda-core 2>&1 | tee /tmp/out || true
+          cp /tmp/Cargo.toml.bak core/Cargo.toml
+          grep -q "cyclic package dependency" /tmp/out \
+            || { echo "::error::cargo did not reject the reversed edge as a cycle"; exit 1; }
+
+      - name: the suite still passes once every leak is reverted
+        run: cargo test --workspace --all-targets

@@ -1,0 +1,17 @@
+[package]
+name = "remuda-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Everything that touches the operating system lives here: the real clock now,
+# the pty backend and terminal emulation next. This crate may depend on
+# `remuda-core`; the reverse is rejected by cargo, and that one-way arrow is the
+# whole architecture rule.
+
+[dependencies]
+remuda-core = { path = "../core" }
+
+[lints]
+workspace = true

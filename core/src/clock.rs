@@ -20,36 +20,10 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> Duration;
 }
 
-/// The real clock. Native only — `std::time::Instant` is not available on
-/// every wasm target, and a policy layer has no business reading a clock
-/// directly anyway; it receives one.
-#[cfg(feature = "native")]
-pub struct SystemClock {
-    origin: std::time::Instant,
-}
-
-#[cfg(feature = "native")]
-impl SystemClock {
-    pub fn new() -> Self {
-        Self {
-            origin: std::time::Instant::now(),
-        }
-    }
-}
-
-#[cfg(feature = "native")]
-impl Default for SystemClock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(feature = "native")]
-impl Clock for SystemClock {
-    fn now(&self) -> Duration {
-        self.origin.elapsed()
-    }
-}
+// The real clock lives in `remuda-native`, not here. It sat behind a `native`
+// feature in the first cut — but a feature you can forget to disable is a
+// weaker wall than a crate that cannot name `std::time::Instant` at all.
+// `clippy.toml` beside this crate's manifest denies that path by name.
 
 /// A clock that only moves when a test moves it.
 ///
