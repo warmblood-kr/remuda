@@ -22,6 +22,18 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo test --workspace --all-targets
 
+  principles-are-documented:
+    # PRINCIPLES.md §2: a gate nobody has watched go red is a claim, not a
+    # control. This applies to the principles document about itself — every
+    # `Enforced by:` line names a real CI job, clippy key, denied path, test
+    # function, or file. See scripts/check-principles.py's own docstring for
+    # how this checker itself failed open twice while being built, and what
+    # fixed each one.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/check-principles.py
+
   format:
     runs-on: ubuntu-latest
     steps:
@@ -98,6 +110,25 @@ jobs:
           cp /tmp/Cargo.toml.bak core/Cargo.toml
           grep -q "cyclic package dependency" /tmp/out \
             || { echo "::error::cargo did not reject the reversed edge as a cycle"; exit 1; }
+
+      - name: check-principles.py rejects a mechanism that does not exist
+        # Built 2026-09-10 and it failed open TWICE while being built: once on
+        # a phantom `push:` job name (indented like a job under `jobs:` but
+        # isn't), once on a second backticked name sharing a line with the
+        # first (the checker read only the field's opening line). Both are in
+        # the script's own docstring. This step is the permanent proof the
+        # fixed version still rejects a broken reference.
+        run: |
+          cp PRINCIPLES.md /tmp/PRINCIPLES.md.bak
+          sed -i 's/CI job `wasm-boundary`/CI job `no-such-job`/' PRINCIPLES.md
+          if python3 scripts/check-principles.py 2>/tmp/out; then
+            echo "::error::check-principles.py ACCEPTED a CI job name that ci.yml does not define"
+            cp /tmp/PRINCIPLES.md.bak PRINCIPLES.md
+            exit 1
+          fi
+          cp /tmp/PRINCIPLES.md.bak PRINCIPLES.md
+          grep -q "no-such-job" /tmp/out \
+            || { echo "::error::check-principles.py rejected for the wrong reason"; exit 1; }
 
       - name: the suite still passes once every leak is reverted
         run: cargo test --workspace --all-targets
