@@ -219,3 +219,156 @@ fn manual_clock_only_moves_when_moved() {
     clock.advance(Duration::from_millis(250));
     assert_eq!(clock.now(), Duration::from_millis(500));
 }
+
+// ---------------------------------------------------------------------------
+// Registry — every session on this node, addressable by name.
+//
+// The cluster direction 정수님 set on 2026-09-10 (any node attaches a session
+// hosted on any other node) makes this the local half of a distributed
+// directory. These tests pin the properties that half has to have; see
+// `remuda_core::registry` for why no consensus protocol is involved.
+// ---------------------------------------------------------------------------
+
+use remuda_core::Registry;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// An agent whose liveness the test still controls after the session owns it.
+struct FlagAgent {
+    alive: Arc<AtomicBool>,
+}
+
+impl AgentProcess for FlagAgent {
+    fn write(&mut self, _bytes: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn screen_text(&mut self) -> Result<String> {
+        Ok(String::new())
+    }
+    fn cursor(&mut self) -> Result<Cursor> {
+        Ok(Cursor { row: 0, col: 0 })
+    }
+    fn is_alive(&mut self) -> bool {
+        self.alive.load(Ordering::SeqCst)
+    }
+    fn size(&self) -> Size {
+        Size::default()
+    }
+}
+
+fn named(name: &str, agent: Box<dyn AgentProcess>) -> Session {
+    Session::new(name, agent, Arc::new(ManualClock::new()))
+}
+
+#[test]
+fn a_name_collision_is_refused_and_the_first_session_survives() {
+    let registry = Registry::new();
+    let first_writes = Arc::new(Mutex::new(Vec::new()));
+
+    registry
+        .register(named(
+            "worker",
+            Box::new(RecordingAgent::new(first_writes.clone())),
+        ))
+        .expect("first registration");
+
+    let second_writes = Arc::new(Mutex::new(Vec::new()));
+    let rejected = registry.register(named(
+        "worker",
+        Box::new(RecordingAgent::new(second_writes.clone())),
+    ));
+
+    // Returned unregistered, not swallowed: the caller still holds it and can
+    // rename or drop it deliberately.
+    assert!(rejected.is_err(), "a taken name must be refused");
+
+    // And "worker" is still the FIRST session, not a replacement. Silently
+    // replacing would leave a live pty with no handle to reach it while the
+    // caller saw success — the whole reason register returns a Result.
+    registry
+        .send_line("worker", "still me")
+        .expect("session present")
+        .expect("write ok");
+    assert_eq!(first_writes.lock().unwrap().len(), 2, "body + Enter");
+    assert!(
+        second_writes.lock().unwrap().is_empty(),
+        "the rejected session must never have been wired up"
+    );
+}
+
+#[test]
+fn many_handles_drive_one_session() {
+    // Attaching is meant to be routine, so a viewer's handle and the core's
+    // handle must be the same session — not two views that can diverge.
+    let registry = Registry::new();
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    registry
+        .register(named(
+            "worker",
+            Box::new(RecordingAgent::new(writes.clone())),
+        ))
+        .expect("registration");
+
+    let viewer = registry.get("worker").expect("handle for the viewer");
+    let core = registry.get("worker").expect("handle for the core");
+    assert!(Arc::ptr_eq(&viewer, &core), "one session, not two");
+
+    viewer.send_line("from the viewer").expect("viewer write");
+    core.send_line("from the core").expect("core write");
+    assert_eq!(writes.lock().unwrap().len(), 4, "two bodies, two Enters");
+}
+
+#[test]
+fn listing_is_a_sorted_owned_snapshot() {
+    let registry = Registry::new();
+    for name in ["charlie", "alpha", "bravo"] {
+        registry
+            .register(named(name, Box::new(ScriptedAgent::new(vec![]))))
+            .expect("registration");
+    }
+
+    let names: Vec<String> = registry.list().into_iter().map(|s| s.name).collect();
+    assert_eq!(names, ["alpha", "bravo", "charlie"], "sorted by name");
+
+    // The snapshot outlives the lock and borrows nothing, which is what lets it
+    // cross a process — or a machine — boundary later.
+    let snapshot = registry.list();
+    registry.remove("alpha");
+    assert_eq!(
+        snapshot.len(),
+        3,
+        "a taken snapshot does not change under us"
+    );
+    assert_eq!(registry.list().len(), 2, "but the registry did");
+}
+
+#[test]
+fn reap_drops_the_dead_and_keeps_the_living() {
+    let registry = Registry::new();
+    let doomed = Arc::new(AtomicBool::new(true));
+    registry
+        .register(named(
+            "doomed",
+            Box::new(FlagAgent {
+                alive: doomed.clone(),
+            }),
+        ))
+        .expect("registration");
+    registry
+        .register(named(
+            "healthy",
+            Box::new(FlagAgent {
+                alive: Arc::new(AtomicBool::new(true)),
+            }),
+        ))
+        .expect("registration");
+
+    // Negative control: nothing has died, so reaping must take nothing. Without
+    // this, a reap that removes everything passes the assertion below.
+    assert!(registry.reap().is_empty(), "nothing dead yet");
+    assert_eq!(registry.list().len(), 2);
+
+    doomed.store(false, Ordering::SeqCst);
+    assert_eq!(registry.reap(), ["doomed"], "only the dead one");
+    assert_eq!(registry.list().len(), 1);
+    assert!(registry.get("healthy").is_some());
+}

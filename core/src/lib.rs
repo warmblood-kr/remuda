@@ -34,8 +34,10 @@
 
 pub mod agent;
 pub mod clock;
+pub mod registry;
 pub mod session;
 
 pub use agent::{AgentError, AgentProcess, Cursor, ScriptedAgent, Size};
 pub use clock::{Clock, ManualClock};
+pub use registry::{Registry, SessionSummary};
 pub use session::Session;

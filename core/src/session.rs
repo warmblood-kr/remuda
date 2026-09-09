@@ -35,6 +35,18 @@ pub struct Session {
     last_input_at: Mutex<Duration>,
 }
 
+/// Identity and size only. Deliberately takes no lock: a `Debug` that locks
+/// deadlocks exactly where you reach for it — in a panic message printed while
+/// the session's own lock is held.
+impl core::fmt::Debug for Session {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Session")
+            .field("name", &self.name)
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Session {
     pub fn new(
         name: impl Into<String>,
