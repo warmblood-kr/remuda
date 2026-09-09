@@ -1,0 +1,54 @@
+[package]
+name = "pty_core"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# No dependencies yet, on purpose.
+#
+# Everything in this first slice — the agent seam, the injected clock, and the
+# indivisible write — is decidable without a pty. Keeping it dependency-free
+# means the whole suite runs on a machine that has never had `claude`, a
+# terminal, or a network. That is completion criterion (1) for the MVP.
+#
+# The real pty backend (portable-pty + termwiz) arrives as a second slice and
+# lands behind `AgentProcess`, so it cannot change any logic proved here.
+
+[features]
+# `native` carries everything that touches the operating system: process
+# spawning, pty allocation, terminal emulation. Nothing else may.
+#
+# WHY THIS FEATURE EXISTS AT ALL (정수님, 2026-09-09: "rust also can be
+# compiled into webasm"):
+#
+#   wasm32 has no fork, no pty, no tty. So the host layer can never be a WASM
+#   target, and the policy layer must never depend on it:
+#
+#       cargo check --target wasm32-unknown-unknown --no-default-features
+#
+# MEASURED SCOPE OF THAT GATE — it is narrower than it looks, so do not lean
+# on it for more than it does. Four deliberate leaks, planted in the pure
+# layer, then checked (2026-09-09):
+#
+#       std::os::unix::io::AsRawFd    3 errors   CAUGHT
+#       std::process::Command         0 errors   compiles
+#       std::fs::read_to_string       0 errors   compiles
+#       std::time::Instant            0 errors   compiles
+#
+#   wasm32-unknown-unknown ships std stubs that compile and only fail at
+#   RUNTIME. So this gate catches platform-specific APIs and host crates that
+#   cannot build for wasm — which is the axis `portable-pty` sits on, and the
+#   one that matters for layering — but it does NOT catch a bare Command or
+#   fs call written directly in the core.
+#
+#   Closing that second axis needs a lint, not a target (clippy
+#   `disallowed_types`/`disallowed_methods`), and a lint config is crate-wide,
+#   so it wants the pure layer in its own crate. That split is the next
+#   structural move; it is deferred here on purpose rather than half-built,
+#   and it is now justified by the measurement above instead of by taste.
+default = ["native"]
+native = []
+
+[dependencies]
+
+[dev-dependencies]
