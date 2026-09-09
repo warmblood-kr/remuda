@@ -174,8 +174,163 @@ Written before building, so the result can contradict it:
 
 ## Actual
 
-Measurements taken 2026-09-10 before any of the above was designed. Commands as
-run, output as returned.
+### After building it
+
+Three doors, one interpreter — and each `-e` is a different *process*, which is
+the whole claim:
+
+```
+$ remuda -e "fleet = {}"          # silent: a statement returns nothing
+$ remuda -e "fleet.count = 3"
+$ remuda -e "fleet.count"
+3
+$ remuda -e "1+1"
+2
+$ remuda -e "'hello' .. ' image'"
+hello image
+```
+
+The REPL is the same image, and what it changes is there for the next `-e`:
+
+```
+$ printf 'fleet.count\nfleet.count = fleet.count + 10\nfleet.count\n' | remuda repl
+> 3
+> > 13
+> $ remuda -e "fleet.count"
+13
+```
+
+The `remuda` vocabulary is bound inside the image, so sessions are reachable
+from it exactly as from a script file:
+
+```
+$ remuda -e "remuda.new('imgtest', {'bash'})"
+$ remuda -e "#remuda.ls()"
+1
+$ remuda -e "remuda.ls()[1].name"
+imgtest
+```
+
+Errors stay errors, with Lua's own traceback:
+
+```
+$ remuda -e "nosuchfn()"
+remuda: runtime error: (eval):1: attempt to call a nil value (global 'nosuchfn')
+stack traceback:
+	[C]: in global 'nosuchfn'
+	(eval):1: in main chunk
+exit=1
+```
+
+### Two things the design got wrong, both caught by measuring
+
+**`remuda run` was not a door onto the image.** Desired says "a script file, a
+`-e`, and a REPL line are three doors into one interpreter" — but `script::run`
+still built its own `Lua::new()` in the *client* process, and I did not notice
+until a script asked for a table two `-e` calls had just built:
+
+```
+$ remuda -e "fleet = {count = 7}"
+$ cat img.lua
+print("script sees fleet:", tostring(fleet))
+$ remuda run img.lua
+script sees fleet:	nil          ← its own interpreter, not the image
+```
+
+Fixed by making `run` read the file and send it as `Request::Eval`, carrying
+the path so a traceback still names it. `Request::Eval` grew a `name` field for
+exactly that — the alternative was letting every script error report `(eval)`,
+trading this repo's own stated care about chunk names for one fewer field.
+Re-measured:
+
+```
+$ remuda -e "fleet = {count = 7}"
+$ remuda run img.lua
+script sees fleet.count:	7
+$ remuda -e "fleet.count"        # the script doubled it
+14
+$ remuda run boom.lua
+remuda: runtime error: …/scratchpad/boom.lua:2: deliberate    ← file still named
+```
+
+**`print` went to `/dev/null`.** The daemon is spawned with `Stdio::null()`, so
+`print` inside the image wrote to a stdout nobody holds. Nothing errored;
+output simply vanished. `print` is the first thing anyone types into a scratch
+buffer, so this made the feature look broken while being technically correct.
+Fixed by rebinding `print` to a per-job buffer that travels back with the
+result:
+
+```
+$ remuda -e 'print("hello from image")'
+hello from image
+$ remuda -e 'do print("side effect") end return 99'
+side effect
+99
+$ remuda -e "y = 1"              # still silent — printed nothing, returned nothing
+```
+
+`nil` also rendered as `<nil>` through a type-name fallback, which is not Lua
+and reads like a placeholder that failed to fill in. Now:
+
+```
+$ remuda -e "nil"      nil
+$ remuda -e "true"     true
+$ remuda -e "({})"     <table>    ← type without the address, so output is reproducible
+```
+
+### Confirmations, and the suite
+
+Expected #1 held — `mlua::Lua` is `!Send` without the `send` feature, so the
+"process / thread / event loop" fork 정수님 offered was never three options:
+the state is pinned to one thread and reached by channel, which *is* an event
+loop. No new dependency, no feature flag.
+
+Expected #5 held — `v1.lua` passes unchanged; `Eval` is an addition.
+
+```
+$ cargo test --release -q
+test result: ok. 21 passed   (invariants)
+test result: ok. 10 passed
+test result: ok. 1 passed
+test result: ok. 4 passed
+test result: ok. 8 passed
+test result: ok. 4 passed
+..v1 ok
+test result: ok. 4 passed    ← the frozen compatibility spec
+$ cargo clippy --release --all-targets -q                       (clean)
+$ cargo fmt --check                                             (clean)
+$ cargo check -p remuda-core --target wasm32-unknown-unknown    (clean)
+$ python3 scripts/check-principles.py
+ok — 10 principles, every named mechanism exists (7 CI jobs, 11 denied paths, 101 test fns seen)
+```
+
+### What this step did NOT do
+
+Expected #2/#3 — session handles as `UserData`, a global session table, the
+dead-handle question — are **not built**. The image exists and everything
+persists in it, but `remuda.ls()` still returns values and operations still
+name a session by string. That was the larger half of Desired and it is
+deferred deliberately: 정수님's follow-up — *"어디서든 내부 런타임에 코드를
+전달하여 실행"* — is about reaching the runtime, and that is what shipped.
+Handles carry a real design question (a proxy that outlives its session is a
+handle that lies) and folding them in here would have made this step
+unreviewable.
+
+Also unbuilt, and named in Desired: re-expressing the CLI subcommands as image
+calls. `remuda send` still speaks the protocol directly, so the two paths could
+in principle drift — the frozen `v1.lua` is what would catch it.
+
+⚠ A cost this step accepted knowingly: the image's `remuda` table talks to the
+daemon over its **own socket** rather than reaching the `Registry` directly as
+the design predicted. One definition of the vocabulary instead of two that
+could diverge, at the price of a loopback hop per call. It cannot deadlock —
+the daemon answers each connection on its own thread — but it is not what the
+design said, and the direct path is the obvious thing to take when handles
+arrive.
+
+### Measurements taken before any of the above was designed
+
+Commands as run, output as returned.
 
 The binary works standalone, with no manual daemon start:
 

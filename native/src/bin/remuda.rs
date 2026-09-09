@@ -8,6 +8,8 @@
 //!   remuda capture <name>         print the screen as text
 //!   remuda close <name>           end a session (live or already self-exited)
 //!   remuda run <script.lua>       run a script with those bound as functions
+//!   remuda -e <code>              evaluate Lua in the daemon's living image
+//!   remuda repl                   the same image, a line at a time
 //!   remuda mcp                    serve those as MCP tools on stdin/stdout
 //!   remuda daemon                 run the daemon in the foreground
 //!   remuda -s <server> …          talk to a *named* daemon instead of "default"
@@ -122,6 +124,12 @@ fn main() -> ExitCode {
             }
         }),
 
+        // `emacsclient -e` for this runtime: the code runs in the daemon's
+        // long-lived image, so what it defines is still there next time.
+        ["-e", code] => with_daemon(server, &path, |path| eval_once(path, code)),
+
+        ["repl"] => with_daemon(server, &path, repl),
+
         // Speaks MCP on stdin/stdout, so the thing running *inside* a session
         // can reach the manager. Not meant to be typed by hand — a client
         // spawns it and owns both pipes.
@@ -149,7 +157,16 @@ remuda — a pty manager you can attach to
   remuda capture <name>         print the screen as text (no terminal needed)
   remuda close <name>           end a session (live, or already self-exited)
   remuda run <script.lua>       run a script; the above are bound as functions
+  remuda -e <code>              evaluate Lua in the daemon's living image
+  remuda repl                   the same image, a line at a time
   remuda mcp                    serve them as MCP tools on stdin/stdout
+
+The daemon holds one Lua interpreter for its whole life, and `-e`, `repl` and
+a script are three doors into it. State persists between them:
+
+  $ remuda -e \"fleet = {}\"
+  $ remuda -e \"#fleet\"
+  0
 
   remuda -s <server> <command…>  talk to a named daemon instead of \"default\" —
                                   several can coexist on one node, each with its
@@ -269,6 +286,73 @@ fn list_sessions(path: &Path) -> ExitCode {
             ExitCode::SUCCESS
         }
         other => fail(describe(other)),
+    }
+}
+
+/// Evaluate one chunk in the daemon's image and print what it came to.
+///
+/// Nothing is printed for an expression that returned nothing, so
+/// `remuda -e "x = 1"` is silent while `remuda -e "x"` prints `1` — the
+/// distinction `Response::Value` exists to carry.
+fn eval_once(path: &Path, code: &str) -> ExitCode {
+    match remuda_native::client::request(
+        path,
+        &Request::Eval {
+            code: code.to_string(),
+            name: None,
+        },
+    ) {
+        Ok(Response::Value(value)) => {
+            if !value.is_empty() {
+                println!("{value}");
+            }
+            ExitCode::SUCCESS
+        }
+        other => fail(describe(other)),
+    }
+}
+
+/// A line-at-a-time REPL against the image.
+///
+/// Deliberately not a readline: no history, no completion, no raw mode. It is
+/// the *scratch buffer* 정수님 named — somewhere to hand code to the running
+/// runtime — and the thing that makes it worth having is that the image
+/// remembers, not that the line editor is good. Piping a heredoc into it works
+/// for the same reason.
+///
+/// An error prints and the loop continues: a typo must not end a session whose
+/// whole value is the state it accumulated.
+fn repl(path: &Path) -> ExitCode {
+    use std::io::Write;
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    loop {
+        print!("> ");
+        let _ = std::io::stdout().flush();
+        line.clear();
+        match stdin.read_line(&mut line) {
+            Ok(0) => return ExitCode::SUCCESS,
+            Ok(_) => {}
+            Err(e) => return fail(e),
+        }
+        let code = line.trim();
+        if code.is_empty() {
+            continue;
+        }
+        match remuda_native::client::request(
+            path,
+            &Request::Eval {
+                code: code.to_string(),
+                name: None,
+            },
+        ) {
+            Ok(Response::Value(value)) => {
+                if !value.is_empty() {
+                    println!("{value}");
+                }
+            }
+            other => eprintln!("remuda: {}", describe(other)),
+        }
     }
 }
 

@@ -50,23 +50,40 @@ pub const BINDINGS: [&str; 10] = [
     "attach", "capture", "click", "close", "insert", "key", "ls", "new", "send", "sleep",
 ];
 
-/// Execute a Lua script with the atomic functions bound.
-pub fn run(socket: &Path, script: &Path) -> mlua::Result<()> {
-    let source = std::fs::read_to_string(script)?;
-    let lua = Lua::new();
-    let table = bindings(&lua, socket)?;
-    lua.globals().set("remuda", table)?;
-    // The `@` prefix is Lua's own marker for "this chunk name is a filename".
-    // Without it a traceback reads `[string "/path/to/x.lua"]:2:`; with it,
-    // `/path/to/x.lua:2:` — the form an editor and a human both jump from. One
-    // character, and it is the difference between an error that names the file
-    // and one that quotes it.
-    lua.load(source)
-        .set_name(format!("@{}", script.display()))
-        .exec()
+/// Run a script file **in the daemon's image** (step 007).
+///
+/// This used to build its own `Lua::new()` in the client process, which made
+/// `remuda run` the one door that could not see what `-e` and the REPL share.
+/// Measured and caught while proving 007: a script printed `fleet: nil` for a
+/// table two `-e` calls had just built. The image is only an image if every
+/// door opens onto it.
+///
+/// The chunk name travels with the source so a traceback still names the file
+/// — the `@` marker that decides that lives in `image::eval`, and this passes
+/// the path it needs.
+pub fn run(socket: &Path, script: &Path) -> Result<(), String> {
+    let source = std::fs::read_to_string(script).map_err(|e| e.to_string())?;
+    let request = Request::Eval {
+        code: source,
+        name: Some(script.display().to_string()),
+    };
+    match client::request(socket, &request).map_err(|e| e.to_string())? {
+        // Whatever the script printed comes back in the same string (the
+        // daemon's own stdout is /dev/null, so `print` is captured rather than
+        // written) and is relayed here. Empty means it printed nothing and
+        // returned nothing, which should stay silent.
+        Response::Value(output) => {
+            if !output.is_empty() {
+                println!("{output}");
+            }
+            Ok(())
+        }
+        Response::Error(reason) => Err(reason),
+        other => Err(format!("unexpected response: {other:?}")),
+    }
 }
 
-fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
+pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
 
@@ -198,6 +215,11 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
     match response {
         Response::Ok => Ok(Value::Nil),
         Response::Screen(text) => Ok(Value::String(lua.create_string(&text)?)),
+        // No binding here asks for an `Eval`, so this arm is unreachable in
+        // practice — spelled out rather than folded into a wildcard so that
+        // adding one later is a compile error to think about, not a silent
+        // fall-through that returns the wrong shape.
+        Response::Value(text) => Ok(Value::String(lua.create_string(&text)?)),
         Response::Sessions(list) => {
             let rows = lua.create_table()?;
             for (index, session) in list.into_iter().enumerate() {

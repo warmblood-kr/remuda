@@ -61,12 +61,37 @@ pub enum Request {
     /// as `Send`/`SendLine` are, so a close cannot tear a pty out from under
     /// someone driving it — see [`crate::session::Session::terminate`].
     Close { name: String },
+    /// Evaluate Lua in the daemon's long-lived image (step 007).
+    ///
+    /// The state this touches outlives the request, which is what separates it
+    /// from every other variant here: two `Eval`s share globals, and a script
+    /// file, a `-e`, and a REPL line are three doors into one interpreter. That
+    /// is 정수님's *"어디서든 내부 런타임에 코드를 전달하여 실행"* — the
+    /// orchestrator has an image, and this is how anything reaches it.
+    Eval {
+        code: String,
+        /// What a traceback should call this chunk — a file path for
+        /// `remuda run`, `None` for a `-e` or a REPL line.
+        ///
+        /// Carried on the wire rather than derived in the daemon because only
+        /// the caller knows where the source came from, and an error that
+        /// names the file is the difference between a traceback you can jump
+        /// from and one you have to read.
+        name: Option<String>,
+    },
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Response {
     Sessions(Vec<SessionSummary>),
     Screen(String),
+    /// What an [`Request::Eval`] returned, already rendered to text.
+    ///
+    /// Distinct from `Screen` although both carry a `String`: one is what a
+    /// terminal looks like, the other is what an expression came to. Merging
+    /// them would make a client unable to tell "the session printed nothing"
+    /// from "the expression returned nothing".
+    Value(String),
     Ok,
     /// The reason, in words meant for a person. A client prints this; it does
     /// not parse it.

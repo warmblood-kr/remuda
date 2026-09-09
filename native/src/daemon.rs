@@ -12,6 +12,7 @@
 //! connection stops speaking the protocol and becomes a raw byte pipe, in both
 //! directions, until either end hangs up.
 
+use crate::image::Image;
 use crate::pty::PtyAgent;
 use remuda_core::protocol::{Request, Response};
 use remuda_core::{Registry, Session, Size};
@@ -68,17 +69,23 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     let listener = UnixListener::bind(path)?;
 
     let registry = Arc::new(Registry::new());
+    // The image starts with the daemon and lives exactly as long (step 007).
+    // It is started *after* the bind, so the `remuda` table it binds points at
+    // a socket that is already accepting — the interpreter's first call cannot
+    // race the listener it will talk to.
+    let image = Image::spawn(path);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let registry = Arc::clone(&registry);
+        let image = image.clone();
         std::thread::spawn(move || {
-            let _ = handle(stream, &registry);
+            let _ = handle(stream, &registry, &image);
         });
     }
     Ok(())
 }
 
-fn handle(stream: UnixStream, registry: &Registry) -> std::io::Result<()> {
+fn handle(stream: UnixStream, registry: &Registry, image: &Image) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
@@ -141,6 +148,13 @@ fn handle(stream: UnixStream, registry: &Registry) -> std::io::Result<()> {
             ),
             Some(Err(e)) => reply(&stream, &Response::error(e)),
             Some(Ok(())) => reply(&stream, &Response::Ok),
+        },
+
+        Request::Eval { code, name } => match image.eval(&code, name.as_deref()) {
+            Ok(value) => reply(&stream, &Response::Value(value)),
+            // Lua's own message, which already carries the line and a
+            // traceback — the same treatment `remuda run` gives a script file.
+            Err(e) => reply(&stream, &Response::error(e)),
         },
     }
 }

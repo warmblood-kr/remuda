@@ -157,6 +157,12 @@ fn call(socket: &Path, id: Value, params: &Value) -> String {
         Err(e) => ok_reply(id, tool_error(&format!("{e}"))),
         Ok(Response::Error(reason)) => ok_reply(id, tool_error(&reason)),
         Ok(Response::Screen(screen)) => ok_reply(id, tool_text(&screen)),
+        // `TOOLS` exposes no `eval`, deliberately: MCP is the door for the
+        // agent running *inside* a session, and handing that agent the image
+        // would let it rewrite the manager holding it. So this is unreachable
+        // — spelled out rather than folded into a wildcard, so that adding an
+        // eval tool becomes a decision made here instead of one inherited.
+        Ok(Response::Value(value)) => ok_reply(id, tool_text(&value)),
         Ok(Response::Ok) => ok_reply(id, tool_text("ok")),
         Ok(Response::Sessions(sessions)) => {
             let rows: Vec<String> = sessions
