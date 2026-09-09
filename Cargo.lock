@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "pty_core"
+name = "remuda"
 version = "0.0.0"
