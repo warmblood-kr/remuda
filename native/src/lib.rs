@@ -5,6 +5,11 @@
 //! crate already proves. Cargo enforces the direction: `remuda-core` does not
 //! depend on this crate and cannot be made to.
 
+pub mod pty;
+
+pub use portable_pty::CommandBuilder;
+pub use pty::PtyAgent;
+
 use remuda_core::Clock;
 use std::time::{Duration, Instant};
 

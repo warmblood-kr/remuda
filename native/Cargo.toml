@@ -11,7 +11,9 @@ publish.workspace = true
 # whole architecture rule.
 
 [dependencies]
+portable-pty = "0.9.0"
 remuda-core = { path = "../core" }
+vt100 = "0.16.2"
 
 [lints]
 workspace = true
