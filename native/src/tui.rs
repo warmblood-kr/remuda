@@ -299,26 +299,111 @@ pub fn layout(term_cols: u16, widest: u16) -> (u16, u16) {
     (list, usable - list)
 }
 
+/// One visible unit of session content, and how many display columns it
+/// claims. `char`'s answer is 1 for everything, which is deliberately not
+/// the correct answer for a wide (e.g. CJK) character — it is today's
+/// answer, kept so [`Viewport`] reproduces `crop`'s old, char-counting
+/// behaviour exactly. Teaching a cell its real width, or giving it colour,
+/// is a later, isolated change against this same trait — not this one.
+pub trait Cell {
+    fn width(&self) -> u16;
+}
+
+impl Cell for char {
+    fn width(&self) -> u16 {
+        1
+    }
+}
+
+/// A window from a larger coordinate space onto a smaller one — today, the
+/// panel's rectangle onto a session's own screen. Named so a caller states
+/// *which* conversion it means instead of three loose numbers (a row
+/// offset, a pan, a clip) at the call site — 정수님, 2026-09-10: *"두 개의
+/// 좌표계. panel 안의 session 좌표계, panel 전체 좌표계 ... 그것을 클래스로
+/// 만들어야 한다."*
+///
+/// Shaped to cascade rather than to cover every case today: a further layer
+/// (a panel's rectangle onto the whole terminal) is applying a second
+/// `Viewport` to this one's output, not a reason to add parameters here —
+/// nothing needs that layer yet, so it is not built.
+pub struct Viewport {
+    row_offset: usize,
+    col_offset: u16,
+    width: u16,
+    height: u16,
+}
+
+impl Viewport {
+    /// Anchor at the bottom: the source's last `height` rows are visible,
+    /// the rest scrolled off above — what the preview pane has always done,
+    /// since an agent's own input line sits at the bottom.
+    pub fn bottom_anchored(source_rows: usize, col_offset: u16, width: u16, height: u16) -> Self {
+        Self {
+            row_offset: source_rows.saturating_sub(height as usize),
+            col_offset,
+            width,
+            height,
+        }
+    }
+
+    /// Crop `source` (session coordinates) into panel coordinates: the
+    /// visible rows, each panned and clipped by display column, using
+    /// every cell's own [`Cell::width`] rather than assuming one column
+    /// each. Each row comes back with whether IT was cut, so a caller that
+    /// marks a cut in its own cell type (today, a `→` appended to a
+    /// `String`) can do so without this type knowing what a marker is.
+    pub fn crop<C: Cell + Clone>(&self, source: &[Vec<C>]) -> (Vec<(Vec<C>, bool)>, bool) {
+        let start = self.row_offset.min(source.len());
+        let mut any_cut = false;
+        let rows = source[start..]
+            .iter()
+            .take(self.height as usize)
+            .map(|row| {
+                let (visible, cut) = self.crop_row(row);
+                any_cut |= cut;
+                (visible, cut)
+            })
+            .collect();
+        (rows, any_cut)
+    }
+
+    fn crop_row<C: Cell + Clone>(&self, row: &[C]) -> (Vec<C>, bool) {
+        let total: u32 = row.iter().map(|c| u32::from(c.width().max(1))).sum();
+        let (offset, width) = (u32::from(self.col_offset), u32::from(self.width));
+        let mut out = Vec::new();
+        let (mut col, mut taken) = (0u32, 0u32);
+        for cell in row {
+            let w = u32::from(cell.width().max(1));
+            if col < offset {
+                col += w;
+                continue;
+            }
+            if taken + w > width {
+                break;
+            }
+            taken += w;
+            col += w;
+            out.push(cell.clone());
+        }
+        let cut = total > offset + width;
+        (out, cut)
+    }
+}
+
 /// The visible rectangle of a screen: the last `rows` lines, each panned by
 /// `pan` and cut to `cols`. Bottom-left, because agents left-align and put
 /// their input line at the bottom. The flag says whether anything was cut.
 pub fn crop(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool) {
-    let lines: Vec<&str> = screen.lines().collect();
-    let start = lines.len().saturating_sub(rows as usize);
-    let mut cut = false;
-    let out = lines[start..]
-        .iter()
-        .map(|line| {
-            let chars: Vec<char> = line.chars().collect();
-            let mut visible: String = chars
-                .iter()
-                .skip(pan as usize)
-                .take(cols as usize)
-                .collect();
+    let source: Vec<Vec<char>> = screen.lines().map(|line| line.chars().collect()).collect();
+    let viewport = Viewport::bottom_anchored(source.len(), pan, cols, rows);
+    let (cropped, cut) = viewport.crop(&source);
+    let out = cropped
+        .into_iter()
+        .map(|(cells, row_cut)| {
+            let mut visible: String = cells.into_iter().collect();
             // The marker has to go on here rather than in `fit`: by the time
             // the row is padded there is nothing left to tell it was cut.
-            if chars.len() > (pan as usize) + (cols as usize) {
-                cut = true;
+            if row_cut {
                 visible.pop();
                 visible.push('→');
             }
@@ -842,6 +927,71 @@ mod tests {
     fn a_terminal_too_small_to_split_still_produces_a_frame() {
         let (list, preview) = layout(10, 80);
         assert_eq!(list + preview, 9, "the divider, and no underflow");
+    }
+
+    /// `crop`'s exact behaviour before the `Viewport` migration, kept here
+    /// only as a reference to migrate against — never called outside this
+    /// test. 정수님 asked for the plain-text path to move onto the new
+    /// coordinate-system class FIRST and be verified byte-identical before
+    /// colour rides on it; this is that verification, mechanical rather
+    /// than eyeballed, across a spread of geometries.
+    fn crop_reference(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool) {
+        let lines: Vec<&str> = screen.lines().collect();
+        let start = lines.len().saturating_sub(rows as usize);
+        let mut cut = false;
+        let out = lines[start..]
+            .iter()
+            .map(|line| {
+                let chars: Vec<char> = line.chars().collect();
+                let mut visible: String =
+                    chars.iter().skip(pan as usize).take(cols as usize).collect();
+                if chars.len() > (pan as usize) + (cols as usize) {
+                    cut = true;
+                    visible.pop();
+                    visible.push('→');
+                }
+                visible
+            })
+            .collect();
+        (out, cut)
+    }
+
+    #[test]
+    fn the_viewport_migration_reproduces_crop_byte_for_byte() {
+        let screens = [
+            "",
+            "one line, no newline",
+            "short\nlines",
+            "a line that is definitely longer than the pane\nsecond, shorter",
+            "exact\nfit!!",
+            "one\ntwo\nthree\nfour\nfive\nsix",
+            "унікод and 漢字 mixed with ascii",
+        ];
+        for screen in screens {
+            // Exhaustive through and just past the two boundaries `crop`
+            // actually branches on — a line exactly full (cols/pan) and the
+            // screen exactly full (rows) — rather than a handful of picked
+            // geometries, which a first pass here missed: a deliberately
+            // injected off-by-one in the cut threshold (`total > offset +
+            // width + 1`) passed a hand-picked geometry list undetected and
+            // was only caught once the sweep below was made exhaustive near
+            // the boundary. Kept exhaustive so that class of gap cannot
+            // recur silently.
+            let max_len = screen.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+            let max_rows = screen.lines().count() as u16;
+            for cols in 0..=max_len + 2 {
+                for pan in 0..=max_len + 2 {
+                    for rows in 0..=max_rows + 2 {
+                        let got = crop(screen, cols, rows, pan);
+                        let want = crop_reference(screen, cols, rows, pan);
+                        assert_eq!(
+                            got, want,
+                            "screen={screen:?} cols={cols} rows={rows} pan={pan}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
