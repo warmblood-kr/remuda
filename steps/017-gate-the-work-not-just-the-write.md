@@ -94,7 +94,7 @@ test result: ok. 7 passed;   ok. 4 passed;
 $ cargo fmt --all --check                                   (exit 0)
 $ cargo clippy --workspace --all-targets -- -D warnings      Finished
 $ python3 scripts/check-comments.py     ok — 204 doc comment(s) within cap
-$ python3 scripts/check-steps.py        ok — 16 step(s)
+$ python3 scripts/check-steps.py        ok — 17 step(s)
 $ python3 scripts/check-principles.py   ok — 14 principles
 $ python3 scripts/check-workflows.py    ok — 3 workflow file(s) parse
 $ python3 scripts/check-install.py      ok — 3 target(s) built and offered
