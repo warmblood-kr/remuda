@@ -188,6 +188,41 @@ way any client does.
   it the natural home for the `on_output` callback step 007's header already
   warned about (a pump may never call *into* Lua; it must post a job).
 
+### Correction (2026-09-10) — the missing verb is not an ergonomics gap
+
+The bullet above filed readiness under *convenience*: no verb for it, so the
+caller writes a poll loop. That is the wrong weight, and this step contains the
+counter-example it needed.
+
+`wait_for` calls `remuda.sleep(0.5)` **on the image thread**. For the 20 seconds
+of a 40-poll wait, no other Lua can run — not for this session, not for any
+other client. That is precisely the failure this project exists to escape:
+Emacs freezes not because it has one thread, but because blocking work runs on
+the same thread as everything else (`cc-butler.el:232` comments out
+`shell-command-to-string` as "blocks in C with no timeout"; `matrix-bridge.el:29`
+forbids synchronous `url-retrieve` for the same reason). Step 007 moved every
+blocking operation — PTY pumps, grid parsing, accept loops — off the image
+thread. Then this step put one back, in Lua, and called it a success.
+
+So the design's defense is real but it is **structural only as far as the verb
+set allows it to be**. "Don't block in Lua" as a discipline lasted three days.
+The fix is therefore not a rule but a subtraction plus an addition:
+
+- **remove `remuda.sleep`** — while it exists the loop above is the obvious way
+  to wait, and every caller will rediscover it;
+- **add `remuda.wait(name, pattern, timeout)`** that posts a job and leaves the
+  image thread free until the manager answers.
+
+Ranking, revised: readiness is not the fourth-most-interesting gap this step
+found. It is the seam that keeps the single-threaded image from reproducing the
+symptom the whole rewrite is a response to.
+
+**Unmeasured**: that a host-side wait actually leaves the image responsive. It
+should by construction, but construction is what this step just falsified three
+times. Step 009 measures it directly — issue a long wait, then drive a *second*
+session while it runs. If that command lands, this holds; if it stalls, the
+claim above is wrong.
+
 ### What this step did NOT do
 
 No code changed. Nothing was added to make the test pass, on purpose: the value
