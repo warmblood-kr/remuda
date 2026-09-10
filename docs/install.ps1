@@ -38,7 +38,12 @@ $channelFile = Join-Path $dataDir 'channel'
 
 $channel = $env:REMUDA_CHANNEL
 if (-not $channel -and (Test-Path $channelFile)) {
-    $channel = (Get-Content -Raw $channelFile).Trim()
+    # Test-Path only proves the file exists, not that it has content — an
+    # empty channel file makes Get-Content -Raw return $null, and $null.Trim()
+    # is the same "cannot call a method on a null-valued expression" crash as
+    # the arch bug below.
+    $raw = Get-Content -Raw $channelFile
+    if ($raw) { $channel = $raw.Trim() }
 }
 if (-not $channel) { $channel = 'stable' }
 if ($channel -ne 'stable' -and $channel -ne 'nightly') {
@@ -49,9 +54,15 @@ if ($channel -ne 'stable' -and $channel -ne 'nightly') {
 # platform this script offers has no asset to download. `scripts/check-install.py`
 # fails the build when they drift.
 $targets = @{
-    'X64' = 'x86_64-pc-windows-msvc'
+    'AMD64' = 'x86_64-pc-windows-msvc'
 }
-$arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+# Not [RuntimeInformation]::OSArchitecture: in an interactive session,
+# PowerShell can bind that type name to PSReadLine's own same-named shadow
+# class instead of the real .NET type — a silent $null member read, then this
+# exact "cannot call a method on a null-valued expression" from .ToString().
+# PROCESSOR_ARCHITEW6432 carries the true OS architecture when the process is
+# 32-bit under WOW64; PROCESSOR_ARCHITECTURE otherwise.
+$arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
 $target = $targets[$arch]
 if (-not $target) {
     Die "no prebuilt binary for Windows/$arch - build from source: cargo install --git https://github.com/$Repo"
@@ -63,7 +74,14 @@ try {
     $indexFile = Join-Path $tmp 'latest.json'
     Fetch $Index $indexFile
     $version = (Get-Content -Raw $indexFile | ConvertFrom-Json).$channel
-    if (-not $version) { Die "no '$channel' version published at $Index" }
+    # "0.0.0" is a placeholder, not a version: the field being present ('0.0.0'
+    # is truthy) is not the same question as whether it names a real release.
+    if (-not $version -or $version -eq '0.0.0') {
+        if ($channel -eq 'stable') {
+            Die "no stable version published at $Index - install nightly instead: `$env:REMUDA_CHANNEL='nightly'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex"
+        }
+        Die "no '$channel' version published at $Index"
+    }
 
     $tag = if ($channel -eq 'stable') { "v$version" } else { 'nightly' }
     $base = "https://github.com/$Repo/releases/download/$tag"
