@@ -333,41 +333,70 @@ fn eval_once(path: &Path, code: &str) -> ExitCode {
     }
 }
 
-/// A line-at-a-time REPL against the image. Deliberately not a readline — no
-/// history, completion or raw mode — so a piped heredoc works too. An error
-/// prints and the loop continues; a typo must not discard accumulated state.
+/// A line-at-a-time REPL against the image. `rustyline` because arrow keys
+/// printing `^[[A` is what a person hits first; it also reads a pipe as lines,
+/// so `printf … | remuda repl` keeps working. Ctrl-C cancels, Ctrl-D exits.
 fn repl(path: &Path) -> ExitCode {
-    use std::io::Write;
-    let stdin = std::io::stdin();
-    let mut line = String::new();
+    let mut editor = match rustyline::DefaultEditor::new() {
+        Ok(editor) => editor,
+        Err(e) => return fail(format!("repl: {e}")),
+    };
+    let history = history_path();
+    // A missing or unwritable state dir loses history, not the REPL.
+    if let Some(file) = &history {
+        let _ = editor.load_history(file);
+    }
     loop {
-        print!("> ");
-        let _ = std::io::stdout().flush();
-        line.clear();
-        match stdin.read_line(&mut line) {
-            Ok(0) => return ExitCode::SUCCESS,
-            Ok(_) => {}
-            Err(e) => return fail(e),
-        }
-        let code = line.trim();
-        if code.is_empty() {
-            continue;
-        }
-        match remuda_native::client::request(
-            path,
-            &Request::Eval {
-                code: code.to_string(),
-                name: None,
-            },
-        ) {
-            Ok(Response::Value(value)) => {
-                if !value.is_empty() {
-                    println!("{value}");
+        match editor.readline("> ") {
+            Ok(line) => {
+                let code = line.trim();
+                if code.is_empty() {
+                    continue;
                 }
+                let _ = editor.add_history_entry(code);
+                eval_line(path, code);
             }
-            other => eprintln!("remuda: {}", describe(other)),
+            // Ctrl-C abandons the half-typed line; the image keeps its state,
+            // which is the whole reason not to exit here.
+            Err(rustyline::error::ReadlineError::Interrupted) => continue,
+            Err(rustyline::error::ReadlineError::Eof) => break,
+            Err(e) => return fail(format!("repl: {e}")),
         }
     }
+    if let Some(file) = &history {
+        let _ = std::fs::create_dir_all(file.parent().unwrap_or(file));
+        let _ = editor.save_history(file);
+    }
+    ExitCode::SUCCESS
+}
+
+/// One REPL line. An error prints and the loop continues — a typo must not
+/// discard accumulated state.
+fn eval_line(path: &Path, code: &str) {
+    match remuda_native::client::request(
+        path,
+        &Request::Eval {
+            code: code.to_string(),
+            name: None,
+        },
+    ) {
+        Ok(Response::Value(value)) => {
+            if !value.is_empty() {
+                println!("{value}");
+            }
+        }
+        other => eprintln!("remuda: {}", describe(other)),
+    }
+}
+
+/// Where REPL history lives, by the XDG state convention. `None` when `$HOME`
+/// is unset too — nowhere to put it is not a reason to refuse to start.
+fn history_path() -> Option<std::path::PathBuf> {
+    let state = match std::env::var_os("XDG_STATE_HOME") {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".local/state"),
+    };
+    Some(state.join("remuda").join("repl-history"))
 }
 
 /// The shape every request that answers with a bare `Ok` shares: `new`,
