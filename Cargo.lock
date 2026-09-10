@@ -493,6 +493,7 @@ dependencies = [
  "remuda-core",
  "rustyline",
  "serde_json",
+ "unicode-width 0.2.2",
  "vt100",
  "windows-sys 0.61.2",
 ]

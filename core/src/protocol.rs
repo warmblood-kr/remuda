@@ -100,7 +100,7 @@ impl Response {
 }
 
 /// One run of adjacent cells sharing an identical style — the wire shape
-/// [`Response::StyledScreen`] actually sends. See steps/022.
+/// [`Response::StyledScreen`] actually sends. See steps/022, 023.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct StyledRun {
     pub text: String,
@@ -111,10 +111,15 @@ pub struct StyledRun {
     pub italic: bool,
     pub underline: bool,
     pub inverse: bool,
+    /// True when every character in `text` is a wide (CJK) glyph — see
+    /// [`StyledCell::wide`]. Part of the grouping key: a run never mixes
+    /// wide and narrow cells, so this one flag applies to the whole run.
+    pub wide: bool,
 }
 
-/// Collapse adjacent cells sharing one style into runs. Every `StyledCell`
-/// is one `char` wide by construction, so nothing is lost. See steps/022.
+/// Collapse adjacent cells sharing one style (wideness included) into runs.
+/// A wide cell's now-empty continuation collapses to nothing either way,
+/// which is correct: it claims 0 columns. See steps/022, 023.
 pub fn collapse_runs(row: &[StyledCell]) -> Vec<StyledRun> {
     let mut runs: Vec<StyledRun> = Vec::new();
     for cell in row {
@@ -126,6 +131,7 @@ pub fn collapse_runs(row: &[StyledCell]) -> Vec<StyledRun> {
                 && r.italic == cell.italic
                 && r.underline == cell.underline
                 && r.inverse == cell.inverse
+                && r.wide == cell.wide
         });
         if extends_last {
             runs.last_mut().unwrap().text.push_str(&cell.text);
@@ -139,14 +145,16 @@ pub fn collapse_runs(row: &[StyledCell]) -> Vec<StyledRun> {
                 italic: cell.italic,
                 underline: cell.underline,
                 inverse: cell.inverse,
+                wide: cell.wide,
             });
         }
     }
     runs
 }
 
-/// The exact inverse of [`collapse_runs`]: one `StyledCell` per character of
-/// each run, carrying the run's style.
+/// The exact inverse of [`collapse_runs`]: one `StyledCell` per character,
+/// carrying the run's style and wideness. An empty-`text` run (only
+/// continuations) expands back to nothing, same as it started.
 pub fn expand_runs(runs: &[StyledRun]) -> Vec<StyledCell> {
     runs.iter()
         .flat_map(|run| {
@@ -159,6 +167,7 @@ pub fn expand_runs(runs: &[StyledRun]) -> Vec<StyledCell> {
                 italic: run.italic,
                 underline: run.underline,
                 inverse: run.inverse,
+                wide: run.wide,
             })
         })
         .collect()
@@ -219,5 +228,31 @@ mod tests {
         let runs = collapse_runs(&row);
         assert_eq!(runs.len(), 4, "four style groups, not seven runs: {runs:?}");
         assert_eq!(expand_runs(&runs), row);
+    }
+
+    /// [MEASURED] A wide cell's flag survives the round trip; its
+    /// now-empty continuation never merges into it and never reappears.
+    /// See steps/023.
+    #[test]
+    fn a_wide_cells_flag_survives_the_round_trip_and_its_continuation_vanishes() {
+        let mut wide = cell("안", Color::Idx(2));
+        wide.wide = true;
+        let continuation = cell("", Color::Idx(2)); // wide: false, by construction
+        let row = vec![wide.clone(), continuation, cell("!", Color::Default)];
+
+        let runs = collapse_runs(&row);
+        assert_eq!(
+            runs.len(),
+            3,
+            "the continuation's differing `wide` must start its own run, \
+             not merge into the wide cell despite sharing a colour: {runs:?}"
+        );
+
+        let back = expand_runs(&runs);
+        assert_eq!(
+            back,
+            vec![wide, cell("!", Color::Default)],
+            "the continuation must not reappear: {back:?}"
+        );
     }
 }
