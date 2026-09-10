@@ -420,19 +420,29 @@ pub fn crop(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool)
     (out, cut)
 }
 
-/// Exactly `width` columns: padded with spaces, or cut with a `→` in the last
-/// cell. A crop that looks like absence is the failure mode this repo keeps
-/// re-discovering, so a cut always shows.
+/// Exactly `width` columns: padded with spaces, or cut with a `→` in the
+/// last cell. Counts real display width via `visible_width`, not `char`s —
+/// a wide (CJK) name used to overflow this budget. See steps/025.
 fn fit(text: &str, width: u16) -> String {
+    use unicode_width::UnicodeWidthChar;
     let width = width as usize;
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() > width {
-        let mut out: String = chars.into_iter().take(width.saturating_sub(1)).collect();
+    if visible_width(text) > width {
+        let mut out = String::new();
+        let mut used = 0usize;
+        for c in text.chars() {
+            let w = c.width().unwrap_or(1);
+            if used + w > width.saturating_sub(1) {
+                break;
+            }
+            out.push(c);
+            used += w;
+        }
         out.push('→');
+        out.push_str(&" ".repeat(width.saturating_sub(used + 1)));
         out
     } else {
-        let mut out: String = chars.into_iter().collect();
-        out.push_str(&" ".repeat(width - text.chars().count()));
+        let mut out = text.to_string();
+        out.push_str(&" ".repeat(width - visible_width(text)));
         out
     }
 }
@@ -695,7 +705,7 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
         22.. => format!("{state} {flag}"),
         _ => flag.to_string(),
     };
-    let room = (width as usize).saturating_sub(tail.chars().count() + 3);
+    let room = (width as usize).saturating_sub(visible_width(&tail) + 3);
     format!("{cursor} {} {tail}", fit(&session.name, room as u16))
 }
 
@@ -1406,6 +1416,21 @@ mod tests {
             lines[0].ends_with('→'),
             "a cut row must show it was cut: {:?}",
             lines[0]
+        );
+    }
+
+    /// [MEASURED] A wide (CJK) session name used to overflow `list_row`'s own
+    /// column budget — `fit` counted `char`s, not display width. Exercises
+    /// `list_row`, what `render_styled` actually calls. See steps/025.
+    #[test]
+    fn list_row_with_a_wide_session_name_still_fits_its_column_budget() {
+        let ui = ui(vec![row("안녕하세요", true, false)]);
+        let width = 20;
+        let line = list_row(&ui, 0, width);
+        assert_eq!(
+            visible_width(&line),
+            width as usize,
+            "a wide-named session must still occupy exactly {width} columns: {line:?}"
         );
     }
 
