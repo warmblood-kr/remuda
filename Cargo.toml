@@ -24,7 +24,7 @@ members = ["core", "native"]
 # See the design doc: "컴파일러가 강제할 수 있는 경계는 린터에게 맡기지 않는다."
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2021"
 license = "MIT"
 publish = false

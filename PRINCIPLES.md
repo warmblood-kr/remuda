@@ -225,6 +225,53 @@ not to adjust it.
 **Enforced by:** CI job `test` (runs `every_frozen_api_version_still_runs`) ·
 CI job `gates-can-fail` · `native/tests/api/v1.lua`
 
+## 11. The two ends of a download must be checked against each other
+
+The release workflow writes an asset and the install script asks for one. Those
+are a YAML matrix and a shell script, so nothing in a normal build compares them
+— and when they disagree, the only place it appears is a stranger's terminal,
+as a 404, from a one-liner the README promised.
+
+**Why.** Measured 2026-09-10, building this. Two mistakes of exactly that shape,
+both invisible to every gate the repo already had and both found only by
+installing for real against a locally served release:
+
+```
+sha256sum ./*.tar.gz    wrote "<hash>  ./remuda-…"   the installer grepped for "<hash>  remuda-…"
+curl … | sh             a pipeline reports SH's status, so a 404 fed an empty
+                        script to a shell that exited 0 — a failed upgrade
+                        reported as a finished one
+```
+
+The first is now a name comparison rather than a pattern match, and the second
+lands the script on disk before running it. Neither bug was reachable by reading
+the code; both were obvious the instant a real binary was fetched and unpacked.
+
+⇒ The mechanism covers the axis a mechanism *can* cover — that both files name
+the same set of platforms and the same asset shape. The rest is the discipline
+below, and it is stated separately rather than folded in, because a gate that
+covers one axis of a two-axis failure reads as if it covered both.
+
+**Enforced by:** CI job `install-path-is-consistent` · CI job `gates-can-fail` ·
+`scripts/check-install.py`
+
+## 12. An installer is only proven by installing
+
+Before shipping a change to the release path, serve a real release locally and
+run the real install script against it — both channels, and a deliberately
+corrupted tarball.
+
+**Why.** Both defects in principle 11 were found this way and could not have
+been found otherwise: the checksum-name mismatch needs a `SHA256SUMS` file that
+a machine actually wrote, and the pipeline-status bug needs a URL that actually
+404s. Reading either line makes it look correct.
+
+**Enforced by:** nothing — discipline only. *(The proof needs a built release
+for three platforms and a server; CI has those only on a release run, which is
+after the merge that would ship the break. `install-path-is-consistent` catches
+the drift axis on every commit, which is the part that can be automated. The
+manual rehearsal, and its captured output, is in `steps/009-versioning-and-install.md`.)*
+
 ---
 
 ## Adding a principle

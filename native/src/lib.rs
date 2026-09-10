@@ -7,6 +7,7 @@
 
 pub mod client;
 pub mod daemon;
+pub mod dist;
 pub mod image;
 pub mod mcp;
 pub mod pty;

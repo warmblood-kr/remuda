@@ -13,6 +13,56 @@ An orchestration core for coding-agent sessions. You keep a herd running, you
 attach to one and ride it, you swap to another. The herd outlives any single
 ride.
 
+## Install
+
+**Linux and macOS** (x86_64, and Apple Silicon):
+
+```sh
+curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | sh
+```
+
+It downloads a signed-by-checksum tarball, verifies it against the release's
+`SHA256SUMS`, and lands `remuda` in `~/.local/bin`. Set `REMUDA_INSTALL_DIR` to
+put it elsewhere.
+
+**Windows: not yet.** The binary does not compile for it — the daemon speaks
+over a unix socket and the terminal handling is termios and `TIOCGWINSZ`. That
+is real porting work, not a build flag, and the compiler's own verdict is
+recorded in [`steps/009-versioning-and-install.md`](steps/009-versioning-and-install.md).
+There is deliberately no `install.ps1`: an installer for a binary that cannot
+exist is worse than none.
+
+### Channels
+
+Two, in the shape rustup uses:
+
+| channel | built from | version string |
+|---|---|---|
+| `stable` (default) | a `vX.Y.Z` tag | `0.1.0` |
+| `nightly` | every commit on `main` | `0.1.0-nightly.20260910.abc1234` |
+
+```sh
+curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh
+```
+
+The chosen channel is remembered in `$XDG_DATA_HOME/remuda/channel`, so
+upgrading stays on the track you picked:
+
+```sh
+remuda upgrade                      # follow the channel you installed
+remuda upgrade --channel stable     # switch tracks
+```
+
+`remuda upgrade` re-runs that same install script — one download-and-verify path
+rather than two — and lands the new binary by rename, so upgrading while a
+daemon is running is safe.
+
+Every command checks [`latest.json`](https://warmblood-kr.github.io/remuda/latest.json)
+at most once a day and prints one line to stderr when you are behind. The fetch
+happens in a detached child that no command waits for, so a slow or absent
+network costs nothing; the cost is that a notice can arrive one run late.
+`REMUDA_NO_UPDATE_CHECK=1` turns it off.
+
 ## Programmable
 
 The daemon holds **one Lua interpreter for its whole lifetime**, so a script is
@@ -67,7 +117,7 @@ and fail only at runtime. Closing that second axis needs a lint, not a target.
 ## Build
 
 ```sh
-cargo test --workspace --all-targets                          # 52 tests
+cargo test --workspace --all-targets                          # 55 tests
 cargo check -p remuda-core --target wasm32-unknown-unknown    # the boundary gate
 ```
 
