@@ -21,15 +21,17 @@ use remuda_core::registry::SessionSummary;
 use remuda_core::Size;
 use std::io::Write;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-/// How often the preview is re-captured while the list has focus.
+/// How often an idle herd is relisted, recaptured and redrawn — see
+/// [`should_refresh`]. A key always forces an immediate refresh regardless.
 const TICK: Duration = Duration::from_millis(250);
 
-/// The same, while the session has focus. Shorter because this is the interval
-/// between a keystroke and seeing it echoed, not between glances at a list.
+/// How often the keyboard is polled while a session has focus — shorter
+/// than `TICK` so a keypress is never left waiting to be noticed. Used to
+/// also be the redraw cadence; see steps/017 for why that was the bug.
 const TICK_TYPING: Duration = Duration::from_millis(40);
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -519,6 +521,55 @@ fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
     }
 }
 
+/// Whether the herd should be relisted, the focused screen recaptured and
+/// the frame rebuilt: forced right after a key, or because `TICK` has
+/// elapsed — never on every wake of the input poll. See steps/017.
+fn should_refresh(forced: bool, since_last: Duration) -> bool {
+    forced || since_last >= TICK
+}
+
+/// The one expensive act of a frame: relist the herd, take or release the
+/// focus hold, capture the focused screen and repaint if that changed
+/// anything on screen. Called on `should_refresh`, not on every poll wake.
+fn refresh(
+    path: &Path,
+    server: &str,
+    ui: &mut Ui,
+    held: &mut Option<(String, Hold)>,
+    painted: &mut String,
+) -> std::io::Result<(u16, u16)> {
+    ui.sessions = list(path);
+    ui.clamp();
+    ui.follow_focus(held.as_ref().map(|(name, _)| name.as_str()));
+    // Dropping the hold is the detach, and this is the only place it
+    // happens: focus went back to the list, or the session ended under it.
+    if ui.focus == Focus::List {
+        *held = None;
+    } else if held.is_none() {
+        *held = take(path, ui);
+    }
+
+    let screen = ui
+        .selected()
+        .map(|s| capture(path, &s.name))
+        .unwrap_or_default();
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let frame = render(ui, &screen, server, cols, rows);
+    // The write is gated on change, as it always was — but before
+    // `should_refresh` existed, everything ABOVE this line (a relist, an IPC
+    // round-trip for a full screen snapshot, a rebuilt frame) ran on every
+    // wake of the input poll too, key or not. That is what a session with
+    // focus cost ~25 times a second while sitting idle, and every keystroke
+    // on top of that.
+    if frame != *painted {
+        let mut stdout = std::io::stdout();
+        stdout.write_all(frame.as_bytes())?;
+        stdout.flush()?;
+        *painted = frame;
+    }
+    Ok((cols, rows))
+}
+
 /// Draw the herd until the user quits. One screen for the whole run: focus
 /// moves between the panes, and the terminal is never handed over, so the
 /// alternate screen is entered exactly once. `notice` is what stderr cannot reach.
@@ -530,33 +581,15 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     // The exclusive hold on the focused session, and the name it was taken on.
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
     let mut held: Option<(String, Hold)> = None;
+    let mut last_refresh = Instant::now();
+    let mut force_refresh = true;
+    let (mut cols, mut rows) = (80u16, 24u16);
 
     loop {
-        ui.sessions = list(path);
-        ui.clamp();
-        ui.follow_focus(held.as_ref().map(|(name, _)| name.as_str()));
-        // Dropping the hold is the detach, and this is the only place it
-        // happens: focus went back to the list, or the session ended under it.
-        if ui.focus == Focus::List {
-            held = None;
-        } else if held.is_none() {
-            held = take(path, &mut ui);
-        }
-
-        let screen = ui
-            .selected()
-            .map(|s| capture(path, &s.name))
-            .unwrap_or_default();
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let frame = render(&ui, &screen, server, cols, rows);
-        // Repaint only on change. A hand-rolled draw loop that writes the whole
-        // frame four times a second flickers; this is the cheap half of what a
-        // diffing renderer would buy, and the reason ratatui is not here yet.
-        if frame != painted {
-            let mut stdout = std::io::stdout();
-            stdout.write_all(frame.as_bytes())?;
-            stdout.flush()?;
-            painted = frame;
+        if should_refresh(force_refresh, last_refresh.elapsed()) {
+            force_refresh = false;
+            last_refresh = Instant::now();
+            (cols, rows) = refresh(path, server, &mut ui, &mut held, &mut painted)?;
         }
 
         let tick = if ui.focus == Focus::Session {
@@ -592,6 +625,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             Action::Kill(name) => ui.notice = kill(path, &name).err(),
         }
         painted.clear();
+        force_refresh = true;
     }
 }
 
@@ -663,6 +697,46 @@ fn kill(path: &Path, name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use remuda_core::Size;
+
+    /// The regression this change guards: an idle focused session must not
+    /// redo the full IPC cycle on every `TICK_TYPING` wake. See steps/017.
+    #[test]
+    fn an_idle_focused_session_refreshes_on_the_slow_tick_not_every_poll_wake() {
+        let mut refreshes = 0;
+        let mut since_last = Duration::ZERO;
+        for _ in 0..25 {
+            since_last += TICK_TYPING;
+            if should_refresh(false, since_last) {
+                refreshes += 1;
+                since_last = Duration::ZERO;
+            }
+        }
+        assert!(
+            refreshes <= 5,
+            "an idle session must not redo the full IPC cycle on every \
+             {TICK_TYPING:?} poll wake — got {refreshes} refreshes in one \
+             simulated second; the pre-fix behavior gives 25"
+        );
+    }
+
+    /// The other half of the report: typing does not wait for `TICK` either.
+    /// Echoing a keystroke has always meant an immediate refresh, and that is
+    /// still true — it is proportional to typing speed, not the bug.
+    #[test]
+    fn a_key_forces_an_immediate_refresh_regardless_of_the_slow_tick() {
+        assert!(
+            should_refresh(true, Duration::ZERO),
+            "a keystroke must not wait for TICK to be echoed"
+        );
+    }
+
+    /// Sanity on the boundary itself, so the two tests above cannot both pass
+    /// by accident of a threshold that admits everything or nothing.
+    #[test]
+    fn refresh_waits_for_the_slow_tick_when_nothing_forced_it() {
+        assert!(!should_refresh(false, TICK - Duration::from_millis(1)));
+        assert!(should_refresh(false, TICK));
+    }
 
     fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
         SessionSummary {
