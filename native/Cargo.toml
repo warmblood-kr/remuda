@@ -32,6 +32,10 @@ remuda-core = { path = "../core" }
 vt100 = "0.16.2"
 mlua = { version = "0.12.1", features = ["lua54", "vendored"] }
 rustyline = "14.0.0"
+# Already in the dependency graph via `vt100` itself, which uses it to decide
+# `Cell::is_wide` — pinned to the same major version so a rendered row's own
+# width judgment can never disagree with vt100's. See steps/023.
+unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28.0", features = ["socket"] }

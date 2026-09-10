@@ -176,8 +176,9 @@ impl AgentProcess for PtyAgent {
         Ok(parser.screen().contents_formatted())
     }
 
-    /// Styled cells, cell by cell off `vt100`'s own grid rather than the
-    /// default's reparsed text — this is the path that actually keeps colour.
+    /// Styled cells off `vt100`'s own grid, including its wide/continuation
+    /// judgment (`is_wide`/`is_wide_continuation`) rather than re-deriving
+    /// it — this is the path that actually keeps colour. See steps/020, 023.
     fn screen_cells(&mut self) -> Result<Vec<Vec<StyledCell>>> {
         let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
         let screen = parser.screen();
@@ -186,11 +187,20 @@ impl AgentProcess for PtyAgent {
                 (0..self.size.cols())
                     .map(|col| {
                         let cell = screen.cell(row, col);
-                        let text = cell.map_or("", |c| c.contents());
+                        // A wide cell's continuation carries no text of its
+                        // own — the wide cell before it already claims both
+                        // columns. Only a genuinely blank ordinary cell gets
+                        // the space substitute, so it still claims 1 column.
+                        let continuation = cell.is_some_and(|c| c.is_wide_continuation());
+                        let text = if continuation {
+                            String::new()
+                        } else {
+                            let t = cell.map_or("", |c| c.contents());
+                            (if t.is_empty() { " " } else { t }).to_string()
+                        };
                         StyledCell {
-                            // A blank or wide-char continuation cell reports
-                            // "" — a space keeps column alignment intact.
-                            text: if text.is_empty() { " " } else { text }.to_string(),
+                            text,
+                            wide: cell.is_some_and(|c| c.is_wide()),
                             fg: color(cell.map_or(vt100::Color::Default, |c| c.fgcolor())),
                             bg: color(cell.map_or(vt100::Color::Default, |c| c.bgcolor())),
                             bold: cell.is_some_and(|c| c.bold()),
@@ -275,6 +285,39 @@ mod tests {
         assert!(
             bytes.windows(2).any(|w| w == b"\x1b["),
             "screen_bytes (attach's initial repaint) must carry SGR: {bytes:?}"
+        );
+    }
+
+    /// [MEASURED, Linux] `screen_cells` reads `vt100`'s own wide/continuation
+    /// judgment for real Hangul, what `PtyAgent` actually hands the pane.
+    /// See steps/023.
+    #[test]
+    fn screen_cells_marks_a_wide_hangul_cell_and_its_empty_continuation() {
+        let mut cmd = CommandBuilder::new("printf");
+        cmd.arg("안녕!");
+        let mut agent = PtyAgent::spawn(cmd, Size::new(80, 24)).unwrap();
+        wait_for(&mut agent, "안녕!");
+
+        let cells = agent.screen_cells().unwrap();
+        let row0 = &cells[0];
+        assert_eq!(row0[0].text, "안");
+        assert!(row0[0].wide, "안 is East-Asian Wide: {:?}", row0[0]);
+        assert_eq!(
+            row0[1].text, "",
+            "a wide cell's continuation carries no text of its own: {:?}",
+            row0[1]
+        );
+        assert!(!row0[1].wide);
+        assert_eq!(row0[2].text, "녕");
+        assert!(row0[2].wide);
+        assert_eq!(row0[3].text, "");
+        assert!(!row0[3].wide);
+        assert_eq!(row0[4].text, "!");
+        assert!(!row0[4].wide);
+        assert_eq!(
+            row0[5].text, " ",
+            "a genuinely blank ordinary cell still claims 1 column: {:?}",
+            row0[5]
         );
     }
 

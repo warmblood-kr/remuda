@@ -83,6 +83,10 @@ pub struct StyledCell {
     pub italic: bool,
     pub underline: bool,
     pub inverse: bool,
+    /// True for the first (and only rendered) half of a wide CJK character —
+    /// it claims 2 display columns. A wide glyph's continuation carries
+    /// empty `text` and `wide: false`, so it claims 0. See steps/023.
+    pub wide: bool,
 }
 
 #[derive(Debug)]

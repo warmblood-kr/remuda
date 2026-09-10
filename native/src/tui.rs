@@ -315,11 +315,18 @@ impl Cell for char {
     }
 }
 
-/// Same "1 for everything" stance as `impl Cell for char`, and for the same
-/// reason: CJK width is a separate, not-yet-fixed bug. See steps/020.
+/// A wide (CJK) cell claims 2 columns; its now-empty continuation claims 0.
+/// `impl Cell for char` (the plain, pane-dead path) stays wrong on purpose —
+/// see steps/023.
 impl Cell for StyledCell {
     fn width(&self) -> u16 {
-        1
+        if self.wide {
+            2
+        } else if self.text.is_empty() {
+            0
+        } else {
+            1
+        }
     }
 }
 
@@ -365,12 +372,15 @@ impl Viewport {
     }
 
     fn crop_row<C: Cell + Clone>(&self, row: &[C]) -> (Vec<C>, bool) {
-        let total: u32 = row.iter().map(|c| u32::from(c.width().max(1))).sum();
+        // No `.max(1)` here on purpose: a wide cell's continuation is a real
+        // zero-width entry now (steps/023), and clamping it back up to 1
+        // would double-count the column its own wide cell already claimed.
+        let total: u32 = row.iter().map(|c| u32::from(c.width())).sum();
         let (offset, width) = (u32::from(self.col_offset), u32::from(self.width));
         let mut out = Vec::new();
         let (mut col, mut taken) = (0u32, 0u32);
         for cell in row {
-            let w = u32::from(cell.width().max(1));
+            let w = u32::from(cell.width());
             if col < offset {
                 col += w;
                 continue;
@@ -557,7 +567,16 @@ fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Ve
         .into_iter()
         .map(|(mut visible, row_cut)| {
             if row_cut {
-                visible.pop();
+                // Free at least 1 display column for `→`. A wide cell's
+                // trailing continuation frees 0 on its own, so keep popping
+                // until real width comes back — see steps/023.
+                let mut freed = 0u16;
+                while freed < 1 {
+                    match visible.pop() {
+                        Some(cell) => freed += cell.width(),
+                        None => break,
+                    }
+                }
             }
             let mut s = render_styled_row(&visible);
             if row_cut {
@@ -570,8 +589,10 @@ fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Ve
 }
 
 /// A styled row's display width, ignoring the SGR bytes riding along with
-/// it — what `fit`'s char count would give if escapes couldn't fool it.
+/// it, and counting a wide (CJK) character as the 2 columns it actually
+/// draws — `fit`'s plain char count would under-count it by 1. See steps/023.
 fn visible_width(s: &str) -> usize {
+    use unicode_width::UnicodeWidthChar;
     let mut width = 0;
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -582,7 +603,7 @@ fn visible_width(s: &str) -> usize {
                 }
             }
         } else {
-            width += 1;
+            width += c.width().unwrap_or(1);
         }
     }
     width
@@ -1323,6 +1344,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// [MEASURED] `StyledCell::width` — the trait `crop_styled`/`render_styled`
+    /// actually call through `Viewport::crop` — answers 2 for a wide cell, 0
+    /// for its empty continuation, 1 otherwise. See steps/023.
+    #[test]
+    fn styled_cell_width_reflects_wide_and_continuation() {
+        let normal = StyledCell {
+            text: "a".into(),
+            ..Default::default()
+        };
+        let wide = StyledCell {
+            text: "안".into(),
+            wide: true,
+            ..Default::default()
+        };
+        let continuation = StyledCell {
+            text: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(normal.width(), 1);
+        assert_eq!(wide.width(), 2);
+        assert_eq!(continuation.width(), 0);
+    }
+
+    /// [MEASURED] A cut right after a wide cell used to pop only its
+    /// zero-width continuation, pushing `→` one column past the pane's
+    /// width. Exercises `crop_styled`, what the live pane calls. See steps/023.
+    #[test]
+    fn a_cut_after_a_wide_cell_never_overflows_the_pane_width() {
+        fn plain(text: &str) -> StyledCell {
+            StyledCell {
+                text: text.into(),
+                ..Default::default()
+            }
+        }
+        let wide = StyledCell {
+            text: "안".into(),
+            wide: true,
+            ..Default::default()
+        };
+        let continuation = plain("");
+        // "ab안" is exactly 4 columns (1+1+2); "x" after it forces the cut
+        // right where the wide cell's continuation is the naive last entry.
+        let row = vec![plain("a"), plain("b"), wide, continuation, plain("x")];
+        let cols = 4;
+
+        let (lines, cut) = crop_styled(&[row], cols, 1, 0);
+        assert!(
+            cut,
+            "there is more content than fits — this must be marked cut"
+        );
+        assert!(
+            visible_width(&lines[0]) <= cols as usize,
+            "row {:?} claims {} columns, more than the pane's {cols}",
+            lines[0],
+            visible_width(&lines[0])
+        );
+        assert!(
+            lines[0].ends_with('→'),
+            "a cut row must show it was cut: {:?}",
+            lines[0]
+        );
     }
 
     /// Two style groups must emit exactly two style-change points, not one
