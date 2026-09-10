@@ -46,9 +46,9 @@ pub enum Request {
     /// Take the session over for a human at a terminal. On `Ok`, this
     /// connection becomes a byte pipe.
     Attach { name: String },
-    /// End a session — live or already self-exited — and stop tracking it. Death
-    /// alone does not remove: an exited session stays listed until this. Refused
-    /// while a human is attached, as `Send`/`SendLine` are.
+    /// End a session — live or already self-exited — and stop tracking it.
+    /// Refused while a human is attached, as `Send`/`SendLine` are. A session
+    /// that ended on its own is dropped by `List`; this is for one still alive.
     Close { name: String },
     /// What build the daemon was started from, as [`Response::Value`]. A daemon
     /// outlives the binary that spawned it, so this is a client's only way to

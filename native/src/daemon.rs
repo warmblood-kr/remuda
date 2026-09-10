@@ -101,6 +101,13 @@ fn shell_or_default(configured: Option<String>) -> String {
     })
 }
 
+/// Whether a session that ended keeps its entry. Off by default: 정수님,
+/// 2026-09-10, asked that a session go away by itself when its program exits.
+/// Read in the DAEMON's environment, so changing it takes a `remuda restart`.
+fn keep_exited() -> bool {
+    std::env::var("REMUDA_KEEP_EXITED").is_ok_and(|v| v == "1")
+}
+
 /// Serve until the listener dies. Caution: connect before unlinking — an
 /// unconditional unlink displaces a *live* peer, which then keeps running
 /// unreachable and holds its pty children forever.
@@ -144,7 +151,15 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
     };
 
     match request {
-        Request::List => reply(&stream, &Response::Sessions(registry.list())),
+        // Where a session that ended stops being listed. Here rather than on a
+        // timer because listing is the only moment the answer is looked at, and
+        // a reaper thread would need a clock this layer is not given.
+        Request::List => {
+            if !keep_exited() {
+                registry.reap();
+            }
+            reply(&stream, &Response::Sessions(registry.list()))
+        }
 
         Request::Version => reply(&stream, &Response::Value(crate::dist::VERSION.into())),
 
