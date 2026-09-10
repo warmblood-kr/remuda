@@ -177,6 +177,23 @@ mod tests {
             "0.2.0-nightly.20260911.def5678",
             "0.2.0-nightly.20260910.abc1234"
         ));
+        // Two nightlies of ONE day. This used to rank by sha — which has no
+        // order — and the binary really did announce `…ce56928` as newer than
+        // the `…396eb78` already installed. Hence a stamp to the second.
+        assert!(is_newer(
+            "0.1.0-nightly.20260910143022.396eb78",
+            "0.1.0-nightly.20260910052043.ce56928"
+        ));
+        assert!(!is_newer(
+            "0.1.0-nightly.20260910052043.ce56928",
+            "0.1.0-nightly.20260910143022.396eb78"
+        ));
+        // The stamp got longer mid-flight: whoever installed under the old
+        // day-only scheme must still be offered the new one, never the reverse.
+        assert!(is_newer(
+            "0.1.0-nightly.20260910143022.396eb78",
+            "0.1.0-nightly.20260910.396eb78"
+        ));
         // Not newer: equal, older, and a nightly of the version you already run.
         assert!(!is_newer("0.1.0", "0.1.0"));
         assert!(!is_newer("0.1.0", "0.2.0"));

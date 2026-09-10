@@ -31,9 +31,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - id: v
-        # The nightly version is derived, never hand-maintained: the manifest's
-        # own number, the UTC date, and the commit. Sorting by that string is
-        # what `dist::is_newer` relies on, so the date has to come first.
+        # Derived, never hand-maintained. `dist::is_newer` sorts the prerelease
+        # LEXICALLY, and a sha has no order — so the stamp is to the SECOND, not
+        # the day, or two nightlies of one day rank by sha, i.e. by coin flip.
         run: |
           set -eu
           if [ "$GITHUB_REF_TYPE" = tag ]; then
@@ -42,7 +42,7 @@ jobs:
             echo "channel=stable"        >> "$GITHUB_OUTPUT"
           else
             base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-            version="$base-nightly.$(date -u +%Y%m%d).$(git rev-parse --short=7 HEAD)"
+            version="$base-nightly.$(date -u +%Y%m%d%H%M%S).$(git rev-parse --short=7 HEAD)"
             echo "tag=nightly"    >> "$GITHUB_OUTPUT"
             echo "channel=nightly" >> "$GITHUB_OUTPUT"
           fi

@@ -56,6 +56,15 @@ if shape not in installer:
 if "remuda-${{ needs.plan.outputs.version }}-${{ matrix.target }}" not in workflow:
     problems.append("release.yml no longer names assets remuda-<version>-<target>")
 
+# `dist::is_newer` sorts the prerelease lexically and a sha has no order, so
+# the stamp must reach the second: with `%Y%m%d` two nightlies of one day rank
+# by sha, and the binary really did offer an older build as an upgrade.
+if not re.search(r"nightly\.\$\(date -u \+%Y%m%d%H%M%S\)", workflow):
+    problems.append(
+        "release.yml's nightly stamp is not to the second — two nightlies of one "
+        "day would rank by git sha, which has no order (see dist.rs's tests)"
+    )
+
 if problems:
     print("the installer and the release workflow disagree:\n", file=sys.stderr)
     for p in problems:
