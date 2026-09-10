@@ -204,14 +204,11 @@ jobs:
           python3 scripts/check-comments.py \
             || { echo "::error::tree was already over cap — this control proves nothing"; exit 1; }
           cp core/src/clock.rs /tmp/clock.bak
-          cat >> core/src/clock.rs <<'RS'
-
-/// one
-/// two
-/// three
-/// four
-pub fn ci_probe_over_cap() {}
-RS
+          # printf, not a heredoc: a heredoc body has to start at column 0, which
+          # ENDS the YAML block scalar this step lives in. That is not a style
+          # point — it is what silently disabled this entire file (see step 009).
+          printf '\n/// one\n/// two\n/// three\n/// four\npub fn ci_probe_over_cap() {}\n' \
+            >> core/src/clock.rs
           if python3 scripts/check-comments.py 2>/tmp/out; then
             echo "::error::check-comments.py ACCEPTED a doc comment over the cap"
             cp /tmp/clock.bak core/src/clock.rs
@@ -257,6 +254,26 @@ RS
           cp /tmp/install.bak docs/install.sh
           grep -qi "syntax error" /tmp/out \
             || { echo "::error::sh -n rejected for the wrong reason"; exit 1; }
+
+      - name: check-workflows.py rejects a workflow that would start no jobs
+        # This plants the REAL 2026-09-10 incident, not an approximation of it:
+        # a heredoc body at column 0 inside an indented block. That is what
+        # stopped ci.yml parsing, and a file that does not parse starts zero
+        # jobs — including this one, which is why the guard lives elsewhere.
+        # Planted with printf on purpose; a heredoc here would re-lay the trap.
+        run: |
+          python3 scripts/check-workflows.py \
+            || { echo "::error::a workflow was already broken — this control proves nothing"; exit 1; }
+          cp .github/workflows/ci.yml /tmp/ci.bak
+          printf "      - run: cat <<'X'\nnot indented\nX\n" >> .github/workflows/ci.yml
+          if python3 scripts/check-workflows.py 2>/tmp/out; then
+            echo "::error::check-workflows.py ACCEPTED a file that does not parse"
+            cp /tmp/ci.bak .github/workflows/ci.yml
+            exit 1
+          fi
+          cp /tmp/ci.bak .github/workflows/ci.yml
+          grep -q "ci.yml: does not parse as YAML" /tmp/out \
+            || { echo "::error::check-workflows.py rejected for the wrong reason"; exit 1; }
 
       - name: the suite still passes once every leak is reverted
         run: cargo test --workspace --all-targets

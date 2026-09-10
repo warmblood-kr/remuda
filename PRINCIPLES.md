@@ -272,6 +272,41 @@ after the merge that would ship the break. `install-path-is-consistent` catches
 the drift axis on every commit, which is the part that can be automated. The
 manual rehearsal, and its captured output, is in `steps/009-versioning-and-install.md`.)*
 
+## 13. A gate can fail by being absent, and that looks like nothing at all
+
+§2 guards against a gate that never goes red. This is the worse case: a gate
+that never **runs**, while the build still reports.
+
+**Why.** Measured 2026-09-10, found while opening the PR that added §11. A
+heredoc body written at column 0 inside an indented `run: |` block **ends the
+YAML block scalar it lives in**, so `ci.yml` stopped parsing. GitHub then
+started *zero* jobs — and rendered the run as an ordinary red X:
+
+```
+completed  failure  comments: cap doc comments…      ci.yml  main  0s   ← zero jobs
+completed  failure  readme: lead with what it is…    ci.yml  main  0s
+completed  failure  readme: a hero image…            ci.yml  main  0s
+completed  success  feat: the input vocabulary…      ci.yml  main  1m15s ← the last real run
+```
+
+Every gate in this repository was dead for twelve hours, `gates-can-fail`
+included — the job whose whole purpose is to notice a guard going quiet. It
+could not, because it was one of the jobs that did not exist. And the change
+that broke it was itself a change to `gates-can-fail`.
+
+The tell is the **0s duration and an empty job list**, not the colour. Red meant
+"a test failed" to every reader, and the file had simply stopped being a file
+GitHub could read.
+
+⇒ The check cannot live in `ci.yml`: a workflow cannot verify that it itself
+still parses, because if it does not, the verifying job is not created either.
+So `workflow-guard.yml` is a separate, deliberately tiny file. **Its own honest
+limit: if that file breaks, nothing catches it** — the recursion stops
+somewhere, and the useful move is to stop it at a file nobody edits.
+
+**Enforced by:** CI job `workflows-parse` · CI job `gates-can-fail` ·
+`scripts/check-workflows.py`
+
 ---
 
 ## Adding a principle

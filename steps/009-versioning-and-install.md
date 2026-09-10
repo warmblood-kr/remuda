@@ -377,6 +377,129 @@ ok — 3 target(s) built and offered: aarch64-apple-darwin, x86_64-apple-darwin,
 55 tests, three of them new (version ordering, shell quoting, a non-empty
 version string). The `wasm-boundary` gate is untouched and still passes.
 
+### 6 — and then CI went red, for a reason that predates this branch
+
+Pushing the branch produced a failure in **0 seconds**. The same run on `main`,
+from before this work, does the same:
+
+```
+completed  failure  release: two channels, a one-line install…  ci.yml  release-system  0s
+completed  success  pages build and deployment                  pages   main            37s
+completed  failure  readme: a hero image, generated and sized down  ci.yml  main         0s
+completed  failure  readme: lead with what it is, show the progra…  ci.yml  main         0s
+completed  success  feat: the input vocabulary at the Lua level…    ci.yml  main         1m15s
+```
+
+Zero jobs in every failing run:
+
+```
+$ gh api repos/warmblood-kr/remuda/actions/runs/34437269294/jobs --jq '.jobs[] | .name'
+(nothing)
+$ gh api repos/warmblood-kr/remuda/actions/runs/34427943080/jobs --jq '.jobs[] | .name'
+(nothing)
+```
+
+`ci.yml` had stopped parsing — on `main`, not on this branch:
+
+```
+$ git show origin/main:.github/workflows/ci.yml > /tmp/main-ci.yml
+$ python3 -c "import yaml; yaml.safe_load(open('/tmp/main-ci.yml'))"
+PARSE ERROR: while scanning a simple key
+  in "/tmp/main-ci.yml", line 198, column 1
+could not find expected ':'
+```
+
+The cause is `93545f6`, the commit that added the doc-comment cap. Its negative
+control appends a probe with a heredoc:
+
+```yaml
+          cat >> core/src/clock.rs <<'RS'
+
+/// one
+...
+RS
+```
+
+A heredoc body must begin at column 0, and column 0 **ends the YAML block
+scalar** the step lives in. So the file stopped being loadable, GitHub created
+no jobs, and the run showed a red X — indistinguishable at a glance from a test
+failure. **Every gate in this repository was dead for twelve hours**, including
+`gates-can-fail`, whose entire purpose is to notice a gate going quiet. It could
+not: it was one of the jobs that no longer existed. And the change that broke it
+was a change *to `gates-can-fail`*.
+
+Fixed by planting with `printf` instead, which has no column-0 requirement. Then
+the guard, because relying on someone noticing a 0s duration is a hope:
+
+```
+$ python3 scripts/check-workflows.py
+ok — 3 workflow file(s) parse, 13 job(s) defined
+
+=== NEGATIVE CONTROL: reproduce the actual incident ===
+planted a column-0 heredoc body, as in the real incident
+a workflow file would not run as written:
+
+  - .github/workflows/ci.yml: does not parse as YAML — while scanning a simple key
+
+A workflow that does not parse starts ZERO jobs and still shows a red X. Every other gate goes quiet with it, and quiet reads exactly like clean.
+exit=1
+--- reverted ---
+ok — 3 workflow file(s) parse, 13 job(s) defined
+```
+
+It lives in `workflow-guard.yml`, a separate file, because `ci.yml` cannot check
+whether `ci.yml` parses — if it does not, the checking job is not created
+either. That is PRINCIPLES §13, and its honest limit is stated there: if
+`workflow-guard.yml` itself breaks, nothing catches it.
+
+`check-principles.py` also had to widen: it read job names out of `ci.yml` alone,
+which was already stale the moment `release.yml` existed, and `workflows-parse`
+cannot live in `ci.yml` by construction.
+
+Because `gates-can-fail` has not actually run since 21:49 the previous evening,
+all ten of its controls were extracted verbatim out of `ci.yml` and run here —
+so the job is not being taken on trust after twelve hours of not existing:
+
+```
+=== clippy rejects a syscall written into the policy layer ===        -> control passed
+=== the wasm target rejects a platform API ===                        -> control passed
+=== cargo rejects an edge from the policy layer ===                   -> control passed
+=== a renamed Lua binding breaks the frozen API script ===            -> control passed
+=== check-principles.py rejects a mechanism that does not exist ===   -> control passed
+=== check-steps.py rejects a step with no captured evidence ===       -> control passed
+=== check-comments.py rejects a doc comment over the cap ===          -> control passed
+=== check-install.py rejects a platform ===                           -> control passed
+=== sh -n rejects a broken installer ===                              -> control passed
+=== check-workflows.py rejects a workflow that would start no jobs === -> control passed
+```
+
+Each plants its violation, asserts the rejection *reason*, and reverts;
+`git status` after the run shows only the files this branch means to change.
+
+### 7 — GitHub Pages was already on, contradicting what this document first said
+
+An earlier draft of the section below listed "turn Pages on" as a required
+manual step. That was written from the absence of a Pages workflow in the repo,
+which is not the same as Pages being off. Asked the API instead:
+
+```
+$ gh api repos/warmblood-kr/remuda/pages
+{"status":"built","html_url":"https://warmblood-kr.github.io/remuda/",
+ "build_type":"legacy","source":{"branch":"main","path":"/docs"},"public":true}
+
+$ curl -o /dev/null -w '%{http_code}\n' https://warmblood-kr.github.io/remuda/
+200
+$ curl -o /dev/null -w '%{http_code}\n' https://warmblood-kr.github.io/remuda/latest.json
+404
+$ curl -o /dev/null -w '%{http_code}\n' https://warmblood-kr.github.io/remuda/install.sh
+404
+```
+
+Pages is live and already serving `main` `/docs` — exactly the source this work
+assumed. The two 404s are simply the two files not existing on `main` yet; they
+are on this branch. **No repo setting is needed at all**, and the URLs start
+working on merge.
+
 ## What this step did NOT do
 
 Stated plainly, because the section above is otherwise easy to read as "the
@@ -392,10 +515,13 @@ release system works":
 - **macOS is unbuilt.** Both Darwin targets are in the matrix on the strength of
   the code being unix; no Apple machine was involved. The Linux target is the
   one actually compiled and installed.
-- **GitHub Pages is not on.** `latest.json` and `install.sh` are committed under
-  `docs/`, and serving them needs Pages pointed at `main` `/docs` — a repo
-  setting, deliberately not touched. Until that is flipped, every published URL
-  here 404s, which is exactly what the update check was measured against above.
+- **The published URLs do not resolve yet**, though not for the reason first
+  written here — Pages is already on and serving `main` `/docs` (§7 above).
+  `latest.json` and `install.sh` exist only on this branch, so they 404 until
+  merge. That is what the update check was measured against above, and no repo
+  setting is required.
+- **`workflow-guard.yml` guards everything except itself.** Stated in §13
+  rather than hidden: the recursion has to stop somewhere.
 - **`shellcheck` did not run.** It is not installed here and the release
   download 500s through this network, so `sh -n` is the only shell lint that has
   actually been watched work — and it is the only one wired into CI, rather than
