@@ -84,7 +84,7 @@ fn fingerprint(text: &std::ffi::OsStr) -> u64 {
 /// The shell a bare `new` starts. `$SHELL` is the unix answer and `%COMSPEC%`
 /// the Windows one; both are what the OS itself uses to mean "this person's
 /// interactive shell".
-fn default_shell() -> String {
+pub fn default_shell() -> String {
     std::env::var("SHELL")
         .or_else(|_| std::env::var("COMSPEC"))
         .unwrap_or_else(|_| if cfg!(windows) { "cmd.exe" } else { "sh" }.into())
@@ -139,13 +139,24 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
             name,
             command,
             size,
-        } => match spawn(&name, &command, size) {
-            Err(e) => reply(&stream, &Response::error(e)),
-            Ok(session) => match registry.register(session) {
-                Ok(_) => reply(&stream, &Response::Ok),
-                Err(_) => reply(&stream, &Response::error(format!("name taken: {name}"))),
-            },
-        },
+        } => {
+            let name = match name {
+                Some(given) => given,
+                None => registry.unique_name(&remuda_core::registry::slug(
+                    command
+                        .first()
+                        .map_or_else(default_shell, String::clone)
+                        .as_str(),
+                )),
+            };
+            match spawn(&name, &command, size) {
+                Err(e) => reply(&stream, &Response::error(e)),
+                Ok(session) => match registry.register(session) {
+                    Ok(_) => reply(&stream, &Response::Value(name)),
+                    Err(_) => reply(&stream, &Response::error(format!("name taken: {name}"))),
+                },
+            }
+        }
 
         Request::SendLine { name, text } => match registry.send_line(&name, &text) {
             None => reply(
@@ -205,6 +216,12 @@ fn spawn(name: &str, command: &[String], size: Size) -> Result<Session, String> 
     }
     if let Ok(cwd) = std::env::current_dir() {
         builder.cwd(cwd);
+    }
+    // The daemon inherits its whole environment, and it is often auto-started
+    // from something with no terminal — so `TERM` reaches the agent unset or
+    // `dumb` and its TUI degrades for a reason nobody can see from inside.
+    if std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true) {
+        builder.env("TERM", "xterm-256color");
     }
 
     let agent = PtyAgent::spawn(builder, size).map_err(|e| e.to_string())?;

@@ -29,10 +29,19 @@ fn read_response(stream: &Stream) -> std::io::Result<Response> {
     serde_json::from_str(&line).map_err(std::io::Error::other)
 }
 
-/// Give this terminal to a session until the user presses [`DETACH`], then
-/// return. Leaving does not disturb the session: the process keeps running and
-/// the pty keeps its size, since nothing here can resize it.
-pub fn attach(path: &Path, name: &str) -> std::io::Result<()> {
+/// Which way a ride ended. Both used to return `Ok(())`, and the terminal
+/// looked identical either way — that is the incident this exists for: a second
+/// `exit` went to the user's real login shell.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Left {
+    Detached,
+    Exited,
+}
+
+/// Give this terminal to a session until the user presses [`DETACH`] or the
+/// session ends. Leaving does not disturb the session: the process keeps
+/// running and the pty keeps its size, since nothing here can resize it.
+pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
     let stream = ipc::connect(path)?;
     send(
         &stream,
@@ -57,9 +66,14 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<()> {
 
     let _raw = RawMode::enable()?;
 
+    // Only the key thread can tell the two exits apart: the reader below just
+    // sees the stream end, which is true of a detach and of a death alike.
+    let detached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     // Keystrokes out, on their own thread; the screen pump runs here.
     let keys = std::thread::spawn({
         let mut stream = stream.try_clone()?;
+        let detached = std::sync::Arc::clone(&detached);
         move || {
             let mut stdin = std::io::stdin().lock();
             let mut buf = [0u8; 1024];
@@ -74,6 +88,7 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<()> {
                     Some(at) => {
                         let _ = stream.write_all(&buf[..at]);
                         let _ = stream.flush();
+                        detached.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
                     None => {
@@ -102,24 +117,47 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<()> {
     }
 
     ipc::wake(&stream);
+    let left = if detached.load(std::sync::atomic::Ordering::SeqCst) {
+        Left::Detached
+    } else {
+        // The session ended while the key thread sits in a tty read, and a tty
+        // read cannot be interrupted portably — so `join` below returns only on
+        // the next keystroke, which it then swallows. Say so instead of
+        // freezing: a stated wait is not the same failure as a dead screen.
+        let _ = write!(stdout, "\r\n[remuda] {name} ended — press any key\r\n");
+        let _ = stdout.flush();
+        Left::Exited
+    };
     let _ = keys.join();
-    Ok(())
+    Ok(left)
 }
 
-/// Puts the terminal in raw mode and puts it back on the way out. Restoring
-/// must stay in `Drop`: the exits that matter — an error, a panic, a `?` —
-/// are exactly the ones that skip the end of `attach`.
-struct RawMode;
+/// Raw mode plus the alternate screen, restored on the way out. Restoring must
+/// stay in `Drop`: the exits that matter — an error, a panic, a `?` — are
+/// exactly the ones that skip the end of `attach`.
+pub struct RawMode;
 
 impl RawMode {
-    fn enable() -> std::io::Result<Self> {
+    /// The alternate screen is what makes leaving *visible*: your scrollback
+    /// and prompt come back, so a second `exit` cannot be aimed at the wrong
+    /// shell by a screen that never changed.
+    pub fn enable() -> std::io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
+        if let Err(e) =
+            crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)
+        {
+            let _ = crossterm::terminal::disable_raw_mode();
+            return Err(e);
+        }
         Ok(Self)
     }
 }
 
 impl Drop for RawMode {
+    /// Leave the alternate screen *before* termios goes back, so the last thing
+    /// the terminal does in raw mode is the buffer switch.
     fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }

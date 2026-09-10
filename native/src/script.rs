@@ -11,7 +11,7 @@
 //! operations were *removed from the API* rather than forbidden by rule, a
 //! whole scripting language could be pointed at it without re-auditing anything.
 //!
-//! ⚠ **This is not a sandbox.** `remuda run script.lua` is as trusted as
+//! ⚠ **This is not a sandbox.** `remuda lua script.lua` is as trusted as
 //! `sh script.sh`, and the full standard library is what makes a setup script
 //! worth writing. That changes the day a script arrives from another node; the
 //! restricted stdlib belongs in *that* change, where the boundary appears.
@@ -68,14 +68,16 @@ pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
     let path = at();
     table.set(
         "new",
-        lua.create_function(move |lua, (name, argv): (String, Option<Vec<String>>)| {
-            let request = Request::New {
-                name,
-                command: argv.unwrap_or_default(),
-                size: crate::terminal_size(),
-            };
-            value(lua, ask(&path, request)?)
-        })?,
+        lua.create_function(
+            move |lua, (name, argv): (Option<String>, Option<Vec<String>>)| {
+                let request = Request::New {
+                    name,
+                    command: argv.unwrap_or_default(),
+                    size: crate::terminal_size(),
+                };
+                value(lua, ask(&path, request)?)
+            },
+        )?,
     )?;
 
     let path = at();
@@ -140,8 +142,13 @@ pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
     let path = at();
     table.set(
         "attach",
+        // v1 froze this as a function that exists, not one that works: the
+        // image runs inside the daemon, whose stdin is /dev/null, so raw mode
+        // cannot be entered. Returns nil, as it always did.
         lua.create_function(move |_, name: String| {
-            client::attach(&path, &name).map_err(mlua::Error::external)
+            client::attach(&path, &name)
+                .map(|_| ())
+                .map_err(mlua::Error::external)
         })?,
     )?;
 

@@ -158,7 +158,7 @@ fn a_tool_call_moves_a_real_session() {
 
 #[test]
 fn a_refusal_is_an_error_not_an_empty_success() {
-    // The shell failure this rules out: `$(remuda capture nosuch)` is "" and the
+    // The shell failure this rules out: `$(remuda -e ...capture...)` is "" and the
     // caller proceeds over a session that was never created. A model does worse
     // than proceed — it explains the empty screen.
     let dir = scratch("refusal");
