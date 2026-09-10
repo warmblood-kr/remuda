@@ -171,6 +171,20 @@ $ python3 scripts/check-workflows.py   ok — 3 workflow file(s) parse
 $ python3 scripts/check-steps.py       ok — 13 step(s)
 ```
 
+And on `windows-latest`, where the socket is a named pipe: the whole suite green
+in **1m28s**, against a 1m18s baseline on `main`.
+
+That number is the second thing this step measured, and it was not free. The
+first push ran the Windows job for **fifty minutes** and never finished. The three
+`restart` tests spawned the daemon with *inherited* stdio, so a leaked one held
+cargo's stdout pipe open, and they ended in an unbounded `Child::wait`. Either
+alone turns a Windows failure into a hang: the assertion fires, the daemon is
+never reaped, and cargo waits on a pipe nothing will close. **A guard that hangs
+instead of failing hides exactly the platform difference it exists to find.**
+The daemon's streams are `null` now, a `Drop` guard kills it on any panic, and
+the wait is bounded — so "it did not stop" is a red test with a name. The code
+under test needed no change; only the harness did.
+
 ## Ceilings
 
 **`restart` needs two mechanisms, and one is a back door.** `Request::Shutdown`
