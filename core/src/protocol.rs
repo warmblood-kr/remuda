@@ -16,7 +16,7 @@
 //! and becomes a raw byte pipe in both directions, which is why attaching has
 //! no response type beyond the acknowledgement.
 
-use crate::agent::{Size, StyledCell};
+use crate::agent::{Color, Size, StyledCell};
 use crate::registry::SessionSummary;
 use serde::{Deserialize, Serialize};
 
@@ -77,8 +77,10 @@ pub enum Request {
 pub enum Response {
     Sessions(Vec<SessionSummary>),
     Screen(String),
-    /// A styled screen, answering [`Request::CaptureStyled`].
-    StyledScreen(Vec<Vec<StyledCell>>),
+    /// A styled screen, answering [`Request::CaptureStyled`] — as runs, not
+    /// cells; see [`StyledRun`] for why the wire never sends one JSON object
+    /// per cell.
+    StyledScreen(Vec<Vec<StyledRun>>),
     /// What an [`Request::Eval`] returned, already rendered to text. Kept
     /// distinct from `Screen` so a client can tell "the session printed
     /// nothing" from "the expression returned nothing".
@@ -95,6 +97,71 @@ impl Response {
     pub fn error(reason: impl core::fmt::Display) -> Self {
         Response::Error(reason.to_string())
     }
+}
+
+/// One run of adjacent cells sharing an identical style — the wire shape
+/// [`Response::StyledScreen`] actually sends. See steps/022.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct StyledRun {
+    pub text: String,
+    pub fg: Color,
+    pub bg: Color,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
+/// Collapse adjacent cells sharing one style into runs. Every `StyledCell`
+/// is one `char` wide by construction, so nothing is lost. See steps/022.
+pub fn collapse_runs(row: &[StyledCell]) -> Vec<StyledRun> {
+    let mut runs: Vec<StyledRun> = Vec::new();
+    for cell in row {
+        let extends_last = runs.last().is_some_and(|r: &StyledRun| {
+            r.fg == cell.fg
+                && r.bg == cell.bg
+                && r.bold == cell.bold
+                && r.dim == cell.dim
+                && r.italic == cell.italic
+                && r.underline == cell.underline
+                && r.inverse == cell.inverse
+        });
+        if extends_last {
+            runs.last_mut().unwrap().text.push_str(&cell.text);
+        } else {
+            runs.push(StyledRun {
+                text: cell.text.clone(),
+                fg: cell.fg,
+                bg: cell.bg,
+                bold: cell.bold,
+                dim: cell.dim,
+                italic: cell.italic,
+                underline: cell.underline,
+                inverse: cell.inverse,
+            });
+        }
+    }
+    runs
+}
+
+/// The exact inverse of [`collapse_runs`]: one `StyledCell` per character of
+/// each run, carrying the run's style.
+pub fn expand_runs(runs: &[StyledRun]) -> Vec<StyledCell> {
+    runs.iter()
+        .flat_map(|run| {
+            run.text.chars().map(move |c| StyledCell {
+                text: c.to_string(),
+                fg: run.fg,
+                bg: run.bg,
+                bold: run.bold,
+                dim: run.dim,
+                italic: run.italic,
+                underline: run.underline,
+                inverse: run.inverse,
+            })
+        })
+        .collect()
 }
 
 // `Size` clamps to a floor below which real TUIs silently drop keystrokes, and
@@ -121,5 +188,36 @@ impl<'de> Deserialize<'de> for Size {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let wire = SizeWire::deserialize(d)?;
         Ok(Size::new(wire.cols, wire.rows))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(text: &str, fg: Color) -> StyledCell {
+        StyledCell {
+            text: text.to_string(),
+            fg,
+            ..Default::default()
+        }
+    }
+
+    /// [MEASURED] `expand_runs` is the exact inverse of `collapse_runs` — a
+    /// styled row survives the round trip byte for byte. See steps/022.
+    #[test]
+    fn collapsing_into_runs_and_expanding_back_changes_nothing_visible() {
+        let row: Vec<StyledCell> = vec![
+            cell("u", Color::Idx(2)),
+            cell("s", Color::Idx(2)),
+            cell("r", Color::Idx(2)),
+            cell(":", Color::Default),
+            cell("~", Color::Idx(4)),
+            cell("$", Color::Idx(4)),
+            cell(" ", Color::Default),
+        ];
+        let runs = collapse_runs(&row);
+        assert_eq!(runs.len(), 4, "four style groups, not seven runs: {runs:?}");
+        assert_eq!(expand_runs(&runs), row);
     }
 }

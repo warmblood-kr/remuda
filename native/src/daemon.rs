@@ -16,7 +16,7 @@ use crate::image::Image;
 use crate::ipc::{self, Listener, Stream, TryClone};
 use crate::pty::PtyAgent;
 use interprocess::local_socket::traits::ListenerExt;
-use remuda_core::protocol::{Request, Response};
+use remuda_core::protocol::{collapse_runs, Request, Response};
 use remuda_core::{Registry, Session, Size};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -226,7 +226,12 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
                 &Response::error(format!("no such session: {name}")),
             ),
             Some(Err(e)) => reply(&stream, &Response::error(e)),
-            Some(Ok(cells)) => reply(&stream, &Response::StyledScreen(cells)),
+            Some(Ok(cells)) => {
+                // Runs on the wire, not cells — see steps/022 for the 44x+
+                // measured on a real screen.
+                let runs = cells.iter().map(|row| collapse_runs(row)).collect();
+                reply(&stream, &Response::StyledScreen(runs))
+            }
         },
 
         Request::Attach { name } => attach(stream, reader, registry, &name),
@@ -369,6 +374,50 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::shell_or_default;
+    use remuda_core::agent::{Color, StyledCell};
+    use remuda_core::protocol::collapse_runs;
+
+    fn cell(text: &str, fg: Color) -> StyledCell {
+        StyledCell {
+            text: text.to_string(),
+            fg,
+            ..Default::default()
+        }
+    }
+
+    /// [MEASURED] A real screen collapses to a fraction of the per-cell wire
+    /// size — the fix for the 113x multiplier steps/020 introduced. See
+    /// steps/022.
+    #[test]
+    fn collapsing_to_runs_shrinks_the_wire_size_a_real_screen_produces() {
+        // 80x24: one coloured prompt-shaped run of text on row 0, everything
+        // else default — the realistic case this fix targets, a handful of
+        // style runs per row, not one independent style per cell.
+        let mut row0: Vec<StyledCell> = Vec::new();
+        for c in "user@host".chars() {
+            row0.push(cell(&c.to_string(), Color::Idx(2)));
+        }
+        row0.push(cell(":", Color::Default));
+        for c in "~/project".chars() {
+            row0.push(cell(&c.to_string(), Color::Idx(4)));
+        }
+        while row0.len() < 80 {
+            row0.push(cell(" ", Color::Default));
+        }
+        let mut screen: Vec<Vec<StyledCell>> = vec![row0];
+        for _ in 1..24 {
+            screen.push(vec![cell(" ", Color::Default); 80]);
+        }
+
+        let per_cell_bytes = serde_json::to_string(&screen).unwrap().len();
+        let runs: Vec<_> = screen.iter().map(|r| collapse_runs(r)).collect();
+        let run_bytes = serde_json::to_string(&runs).unwrap().len();
+
+        assert!(
+            run_bytes * 10 < per_cell_bytes,
+            "expected at least a 10x reduction, got {per_cell_bytes} -> {run_bytes}"
+        );
+    }
 
     #[test]
     fn a_shell_the_person_already_chose_is_never_second_guessed() {
