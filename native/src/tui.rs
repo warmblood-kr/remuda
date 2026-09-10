@@ -720,7 +720,12 @@ fn refresh(
     held: &mut Option<(String, Hold)>,
     painted: &mut String,
 ) -> std::io::Result<(u16, u16)> {
-    ui.sessions = list(path);
+    match list(path) {
+        Ok(sessions) => ui.sessions = sessions,
+        // Keep the last known herd rather than blanking it: a transport
+        // failure is not a report that every session vanished. See steps/021.
+        Err(e) => ui.notice = Some(e),
+    }
     ui.clamp();
     ui.follow_focus(held.as_ref().map(|(name, _)| name.as_str()));
     // Dropping the hold is the detach, and this is the only place it
@@ -731,10 +736,16 @@ fn refresh(
         *held = take(path, ui);
     }
 
-    let cells = ui
-        .selected()
-        .map(|s| capture_styled(path, &s.name))
-        .unwrap_or_default();
+    let cells = match ui.selected().map(|s| s.name.clone()) {
+        Some(name) => match capture_styled(path, &name) {
+            Ok(cells) => cells,
+            Err(e) => {
+                ui.notice = Some(format!("{name}: {e}"));
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let frame = render_styled(ui, &cells, server, cols, rows);
     // The write is gated on change, as it always was — but before
@@ -758,7 +769,14 @@ fn refresh(
 pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result<()> {
     let _terminal = RawMode::enable()?;
     let shell = crate::daemon::default_shell();
-    let mut ui = Ui::new(list(path), &shell, notice);
+    let (sessions, list_err) = match list(path) {
+        Ok(sessions) => (sessions, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    // The caller's own notice (e.g. a version-skew warning) is the more
+    // specific diagnosis when both exist; only fall back to the raw list
+    // failure if nothing else already explains why nothing works.
+    let mut ui = Ui::new(sessions, &shell, notice.or(list_err));
     let mut painted = String::new();
     // The exclusive hold on the focused session, and the name it was taken on.
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
@@ -802,7 +820,11 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             }
             Action::Start(command) => {
                 ui.notice = start(path, &command, pane_size(&ui, cols, rows)).err();
-                ui.sessions = list(path);
+                match list(path) {
+                    Ok(sessions) => ui.sessions = sessions,
+                    Err(e) if ui.notice.is_none() => ui.notice = Some(e),
+                    Err(_) => {}
+                }
             }
             Action::Kill(name) => ui.notice = kill(path, &name).err(),
         }
@@ -829,24 +851,30 @@ fn take(path: &Path, ui: &mut Ui) -> Option<(String, Hold)> {
     }
 }
 
-fn list(path: &Path) -> Vec<SessionSummary> {
+/// A transport failure and a daemon `Response::Error` are both real answers —
+/// `start`/`kill` already say so this way; see steps/021 for why the herd list
+/// and the styled capture used to say it a different, worse way instead.
+fn list(path: &Path) -> Result<Vec<SessionSummary>, String> {
     match client::request(path, &Request::List) {
-        Ok(Response::Sessions(sessions)) => sessions,
-        _ => Vec::new(),
+        Ok(Response::Sessions(sessions)) => Ok(sessions),
+        Ok(Response::Error(reason)) => Err(reason),
+        other => Err(format!("{other:?}")),
     }
 }
 
 /// Styled counterpart of the (now unused) plain `capture` — see steps/020.
-/// Empty grid on any error, matching `capture`'s empty-string convention.
-fn capture_styled(path: &Path, name: &str) -> Vec<Vec<StyledCell>> {
+/// Surfaces the daemon's own words on failure instead of discarding them —
+/// see steps/021.
+fn capture_styled(path: &Path, name: &str) -> Result<Vec<Vec<StyledCell>>, String> {
     match client::request(
         path,
         &Request::CaptureStyled {
             name: name.to_string(),
         },
     ) {
-        Ok(Response::StyledScreen(cells)) => cells,
-        _ => Vec::new(),
+        Ok(Response::StyledScreen(cells)) => Ok(cells),
+        Ok(Response::Error(reason)) => Err(reason),
+        other => Err(format!("{other:?}")),
     }
 }
 
@@ -1506,5 +1534,61 @@ mod tests {
         assert!(!list.contains('┃'));
         assert!(session.contains("every key goes to the session"));
         assert!(session.contains("ctrl-\\ back to the list"));
+    }
+
+    fn scratch_socket(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("remuda-tuitest-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        crate::daemon::socket_path_in(&dir, "s")
+    }
+
+    /// Starts a real daemon and returns once it actually answers — the same
+    /// shape as `native/tests/daemon.rs`'s helper, kept local since a unit
+    /// test needs `list`/`capture_styled` themselves, which are private.
+    fn daemon_at(path: &std::path::Path) {
+        let serving = path.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = crate::daemon::serve(&serving);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while crate::ipc::connect(path).is_err() {
+            assert!(Instant::now() < deadline, "daemon never bound {path:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// [MEASURED] `list` (the pane's own function, not a stand-in) must say a
+    /// transport failure happened, not report an empty herd. See steps/021.
+    #[test]
+    fn list_reports_a_transport_failure_instead_of_an_empty_herd() {
+        let path = scratch_socket("list-no-daemon");
+        // Nothing is listening at this address on purpose.
+        let result = list(&path);
+        assert!(
+            result.is_err(),
+            "no daemon answered — an empty Ok(vec![]) would read as \
+             'no sessions exist', which is not what happened: {result:?}"
+        );
+    }
+
+    /// [MEASURED] `capture_styled` (the pane's own function) against a real
+    /// daemon's real "no such session" error — must surface it, not swallow
+    /// it into an empty grid. See steps/021.
+    #[test]
+    fn capture_styled_reports_the_daemons_own_words_instead_of_an_empty_grid() {
+        let path = scratch_socket("capture-no-session");
+        daemon_at(&path);
+
+        let result = capture_styled(&path, "no-such-session");
+        let err = result.expect_err(
+            "the daemon has no session by this name — Ok(vec![]) here is the \
+             exact defect: a blank pane where a real error was available",
+        );
+        assert!(
+            err.contains("no such session"),
+            "the fix must surface what the daemon actually said, not a made-up \
+             message: {err:?}"
+        );
     }
 }
