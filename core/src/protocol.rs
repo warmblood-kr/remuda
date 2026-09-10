@@ -50,6 +50,14 @@ pub enum Request {
     /// alone does not remove: an exited session stays listed until this. Refused
     /// while a human is attached, as `Send`/`SendLine` are.
     Close { name: String },
+    /// What build the daemon was started from, as [`Response::Value`]. A daemon
+    /// outlives the binary that spawned it, so this is a client's only way to
+    /// learn it is talking to yesterday's code before a field mismatch does.
+    Version,
+    /// Stop the daemon, so the next command starts a fresh one. Every session
+    /// and the whole Lua image die with it; naming that loss and getting it
+    /// confirmed is the client's job, not this one's.
+    Shutdown,
     /// Evaluate Lua in the daemon's long-lived image. Caution: the state this
     /// touches outlives the request — two `Eval`s share globals, and a script,
     /// a `-e` and a REPL line are three doors into one interpreter.

@@ -318,3 +318,128 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
         "a refused instruction reached the process anyway:\n{screen}"
     );
 }
+
+#[test]
+fn the_daemon_names_the_build_it_was_started_from() {
+    let path = scratch("version");
+    let _daemon = daemon_at(&path);
+
+    match client::request(&path, &Request::Version).expect("version") {
+        Response::Value(said) => assert_eq!(said, remuda_native::dist::VERSION),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+/// `restart` drives the SHIPPED BINARY, not `daemon::serve` on a thread: the
+/// stop is a `process::exit`, so an in-process daemon would take the test
+/// runner with it — which is also why this is the only honest way to test it.
+#[test]
+fn restart_stops_a_daemon_and_leaves_the_next_command_free_to_start_one() {
+    let dir = scratch_dir("restart");
+    let path = daemon::socket_path_in(&dir, "s");
+    let remuda = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(args)
+            .env("REMUDA_RUNTIME_DIR", &dir)
+            .env("REMUDA_NO_UPDATE_CHECK", "1")
+            .output()
+            .expect("run remuda")
+    };
+
+    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "daemon"])
+        .env("REMUDA_RUNTIME_DIR", &dir)
+        .spawn()
+        .expect("spawn daemon");
+    let deadline = Instant::now() + PATIENCE;
+    while remuda_native::ipc::connect(&path).is_err() {
+        assert!(Instant::now() < deadline, "daemon never bound {path:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Positive control: it is answering before we ask it to stop, so "the
+    // socket is silent" below cannot pass on a daemon that never came up.
+    assert!(
+        String::from_utf8_lossy(&remuda(&["-s", "s", "ls"]).stdout).contains("no sessions"),
+        "the daemon was not answering to begin with"
+    );
+
+    let out = remuda(&["-s", "s", "restart"]);
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(out.status.success(), "restart failed: {said}");
+    assert!(said.contains("stopped the daemon"), "{said}");
+    assert!(
+        remuda_native::ipc::connect(&path).is_err(),
+        "the daemon is still answering after restart"
+    );
+    assert!(daemon.wait().expect("wait").success(), "it did not exit 0");
+
+    // And the herd comes back: the next command starts a fresh one.
+    assert!(String::from_utf8_lossy(&remuda(&["-s", "s", "ls"]).stdout).contains("no sessions"));
+    let _ = remuda(&["-s", "s", "restart"]);
+}
+
+#[test]
+fn restart_with_no_daemon_running_is_not_an_error() {
+    let dir = scratch_dir("restart-empty");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "restart"])
+        .env("REMUDA_RUNTIME_DIR", &dir)
+        .env("REMUDA_NO_UPDATE_CHECK", "1")
+        .output()
+        .expect("run remuda");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no daemon running"));
+}
+
+/// A live herd must not be thrown away by a command that was typed by habit.
+/// With no terminal to ask on, the refusal names the flag rather than prompting
+/// into a pipe that will never answer.
+#[test]
+fn restart_refuses_to_kill_a_live_session_without_being_told_twice() {
+    let dir = scratch_dir("restart-live");
+    let path = daemon::socket_path_in(&dir, "s");
+    let remuda = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(args)
+            .env("REMUDA_RUNTIME_DIR", &dir)
+            .env("REMUDA_NO_UPDATE_CHECK", "1")
+            .output()
+            .expect("run remuda")
+    };
+    let mut daemon = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "daemon"])
+        .env("REMUDA_RUNTIME_DIR", &dir)
+        .spawn()
+        .expect("spawn daemon");
+    let deadline = Instant::now() + PATIENCE;
+    while remuda_native::ipc::connect(&path).is_err() {
+        assert!(Instant::now() < deadline, "daemon never bound {path:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    new_session(&path, "keeper");
+
+    let out = remuda(&["-s", "s", "restart"]);
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(
+        !out.status.success(),
+        "it killed a live herd unasked: {said}"
+    );
+    assert!(
+        said.contains("keeper"),
+        "it did not name what it would lose: {said}"
+    );
+    assert!(
+        remuda_native::ipc::connect(&path).is_ok(),
+        "the daemon died despite refusing"
+    );
+
+    // -f is the way past it, and the same daemon now goes.
+    let forced = remuda(&["-s", "s", "restart", "-f"]);
+    assert!(
+        forced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    assert!(daemon.wait().expect("wait").success());
+}

@@ -30,6 +30,12 @@ fn main() -> ExitCode {
     let path = daemon::socket_path(server);
 
     announce_update(&argv);
+    // Asked once, before anything dispatches. A daemon that is already up was
+    // started by some other binary, and this is the cheapest moment to ask which.
+    let skew = version_skew(&argv, &path);
+    if let Some(notice) = &skew {
+        eprintln!("remuda: {notice}");
+    }
 
     match argv.as_slice() {
         // The whole ask: typing the program's name opens the herd. Only when
@@ -37,7 +43,9 @@ fn main() -> ExitCode {
         // the usage text is the useful answer and a TUI is a hang.
         [] if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
             with_daemon(server, &path, |path| {
-                match remuda_native::tui::run(path, server) {
+                // The line above went to stderr, which the alternate screen is
+                // about to hide. The footer is where a TUI user can read it.
+                match remuda_native::tui::run(path, server, skew.clone()) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(e) => fail(format!("tui: {e}")),
                 }
@@ -62,6 +70,11 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(format!("daemon: {e}")),
         },
+
+        // Deliberately NOT behind `with_daemon`: the daemon this stops is often
+        // exactly the one that cannot be talked to, and starting one to stop it
+        // is not a thing to do.
+        ["restart", rest @ ..] => restart(server, &path, rest),
 
         ["ls"] => with_daemon(server, &path, list_sessions),
 
@@ -126,6 +139,9 @@ remuda — a pty manager you can attach to
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
   remuda upgrade [--channel C]  re-run the installer on stable or nightly
+  remuda restart [-f]           stop the daemon; the next command starts a fresh
+                                  one. Its sessions and Lua image die with it,
+                                  so a live herd is named and confirmed first.
   remuda --version              the version this binary was built with
 
 Four verbs, not ten. A verb is here only if it needs a terminal, must survive
@@ -219,6 +235,129 @@ fn ride(path: &Path, name: &str) -> ExitCode {
         }
         Err(e) => fail(format!("attach: {e}")),
     }
+}
+
+/// `restart [-f]`: stop this server's daemon so the next command starts a fresh
+/// one. `remuda upgrade` replaces the binary and cannot touch a daemon already
+/// running — this is the verb that closes that gap.
+fn restart(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let force = match args {
+        [] => false,
+        ["-f"] | ["--force"] => true,
+        _ => return fail("usage: remuda restart [-f]"),
+    };
+    if remuda_native::ipc::connect(path).is_err() {
+        eprintln!("remuda: no daemon running for {server:?} — the next command starts one");
+        return ExitCode::SUCCESS;
+    }
+    if !force {
+        if let Err(refusal) = confirm_losses(path) {
+            return fail(refusal);
+        }
+    }
+    match stop_daemon(path) {
+        Ok(()) => {
+            eprintln!(
+                "remuda: stopped the daemon for {server:?} — the next command starts a fresh one"
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => fail(e),
+    }
+}
+
+/// Name what dies before it dies. Killing the daemon takes every session's
+/// process and scrollback and the whole Lua image with it, so an empty herd is
+/// the only case that goes without asking.
+fn confirm_losses(path: &Path) -> Result<(), String> {
+    let live = match remuda_native::client::request(path, &Request::List) {
+        Ok(Response::Sessions(sessions)) => sessions,
+        // It cannot even list. That is itself the reason someone typed this.
+        _ => return Ok(()),
+    };
+    if live.is_empty() {
+        return Ok(());
+    }
+    // A dead session counts too: its last screen is the evidence for why it
+    // died, which is the whole reason `close` does not happen automatically.
+    let names: Vec<String> = live
+        .iter()
+        .map(|s| format!("{} ({})", s.name, if s.alive { "live" } else { "dead" }))
+        .collect();
+    eprintln!(
+        "remuda: {} session(s) go with it: {}",
+        names.len(),
+        names.join(", ")
+    );
+    eprintln!("remuda: their processes, their last screens and the Lua image are all lost.");
+    if !std::io::stdin().is_terminal() {
+        return Err("nothing to ask on — `remuda restart -f` if that is what you want".into());
+    }
+    eprint!("remuda: type y to go ahead: ");
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    match answer.trim() {
+        "y" | "Y" => Ok(()),
+        _ => Err("left it running".into()),
+    }
+}
+
+/// `Shutdown` is the door. A daemon built before that variant existed refuses
+/// it, and its Lua image is the only lever those already-deployed ones leave —
+/// `os.exit` there ends the same process. Drop the fallback after one release.
+fn stop_daemon(path: &Path) -> Result<(), String> {
+    let asked = remuda_native::client::request(path, &Request::Shutdown);
+    if !matches!(asked, Ok(Response::Ok)) {
+        let _ = remuda_native::client::request(
+            path,
+            &Request::Eval {
+                code: "os.exit(0)".into(),
+                name: None,
+            },
+        );
+    }
+    // The socket file outlives the process on unix, so "gone" is a connect that
+    // is refused, never a path that disappeared. `ipc::listen` clears the file.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if remuda_native::ipc::connect(path).is_err() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Err(format!(
+        "the daemon at {} is still answering — {}",
+        path.display(),
+        describe(asked)
+    ))
+}
+
+/// One line when the running daemon is not this build. A warning, not a refusal:
+/// most skews are harmless, and stranding someone mid-work behind a version
+/// string is its own incident. `None` when nothing is listening — it will be us.
+fn version_skew(argv: &[&str], path: &Path) -> Option<String> {
+    if matches!(argv, ["daemon"] | ["mcp"] | ["restart", ..]) {
+        return None;
+    }
+    remuda_native::ipc::connect(path).ok()?;
+    let theirs = match remuda_native::client::request(path, &Request::Version) {
+        Ok(Response::Value(theirs)) if theirs == dist::VERSION => return None,
+        Ok(Response::Value(theirs)) => theirs,
+        // It went away between the connect and the ask; the real request will
+        // start one and say so properly.
+        Err(_) => return None,
+        // Older than the handshake itself. Not knowing is itself the answer.
+        Ok(_) => "from a build that predates this handshake".into(),
+    };
+    // Cure first, and no "remuda:" prefix — the caller adds one, and this also
+    // goes to a TUI footer that crops the tail at the terminal's width.
+    Some(format!(
+        "the daemon is not this build — `remuda restart` replaces it, and its \
+         sessions and Lua image go with it. It is {theirs}; this command is {}",
+        dist::VERSION
+    ))
 }
 
 /// One stderr line when a newer version is out. Silent on `daemon` — its stderr

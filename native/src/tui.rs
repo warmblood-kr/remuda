@@ -350,10 +350,9 @@ fn footer(ui: &Ui) -> String {
 }
 
 /// Browse until the user quits or picks a session, then ride it and come back.
-/// The terminal guard is dropped inside [`browse`] before handing over, so the
-/// alternate screen is entered once at a time and by exactly one owner.
-pub fn run(path: &Path, server: &str) -> std::io::Result<()> {
-    let mut notice = None;
+/// The guard is dropped inside [`browse`] before handing over, so one owner
+/// enters the alternate screen at a time. `notice` is what stderr cannot reach.
+pub fn run(path: &Path, server: &str, mut notice: Option<String>) -> std::io::Result<()> {
     let mut last = None;
     loop {
         match browse(path, server, notice.take(), last.as_deref())? {
