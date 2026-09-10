@@ -25,12 +25,24 @@ It downloads a signed-by-checksum tarball, verifies it against the release's
 `SHA256SUMS`, and lands `remuda` in `~/.local/bin`. Set `REMUDA_INSTALL_DIR` to
 put it elsewhere.
 
-**Windows: not yet.** The binary does not compile for it — the daemon speaks
-over a unix socket and the terminal handling is termios and `TIOCGWINSZ`. That
-is real porting work, not a build flag, and the compiler's own verdict is
-recorded in [`steps/009-versioning-and-install.md`](steps/009-versioning-and-install.md).
-There is deliberately no `install.ps1`: an installer for a binary that cannot
-exist is worse than none.
+**Windows** (x86_64), in PowerShell:
+
+```powershell
+irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
+```
+
+Same shape: verified against `SHA256SUMS`, landed in `~\.local\bin`, and
+`$env:REMUDA_INSTALL_DIR` moves it. The daemon speaks over a named pipe instead
+of a unix socket, and the terminal handling is the console API instead of
+termios; both live behind one seam, so there is one code path rather than two.
+
+⚠ **What is proven on Windows, and what is not.** CI builds and runs the whole
+suite on `windows-latest` — including tests that open real ConPTYs and drive the
+shipped binary through raw mode and the Ctrl-\ detach. Nobody has yet run
+`remuda attach` by hand in Windows Terminal or conhost, so the interactive
+feel — resize behaviour, key handling under a real console host — is
+**untested**, not merely undocumented. The port and its evidence are in
+[`steps/010-windows.md`](steps/010-windows.md).
 
 ### Channels
 

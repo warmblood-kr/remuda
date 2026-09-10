@@ -7,9 +7,10 @@
 #   REMUDA_CHANNEL=stable|nightly   default: the channel already installed, else stable
 #   REMUDA_INSTALL_DIR=<dir>        default: ~/.local/bin
 #
-# Windows is deliberately absent: remuda does not compile for it yet (unix
-# sockets, termios, TIOCGWINSZ). See steps/009. An installer that places a
-# binary which cannot exist is worse than no installer.
+# Windows has its own installer, docs/install.ps1, because a `uname` case arm
+# cannot run there. The two hold disjoint halves of one platform list and
+# `scripts/check-install.py` fails the build if either half drifts from the
+# release matrix. See steps/010.
 
 set -eu
 

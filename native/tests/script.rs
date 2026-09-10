@@ -16,7 +16,7 @@ const PATIENCE: Duration = Duration::from_secs(10);
 
 /// A directory of our own, short enough for `sun_path` (~108 bytes).
 fn scratch(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(format!("/tmp/remuda-s{}-{tag}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("remuda-s{}-{tag}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -28,7 +28,7 @@ fn daemon_at(path: &Path) -> impl Drop {
         let _ = daemon::serve(&serving);
     });
     let deadline = Instant::now() + PATIENCE;
-    while std::os::unix::net::UnixStream::connect(path).is_err() {
+    while remuda_native::ipc::connect(path).is_err() {
         assert!(Instant::now() < deadline, "daemon never bound {path:?}");
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -67,7 +67,7 @@ fn the_bound_surface_is_exactly_the_protocols() {
     // directions — a binding added without a decision fails, and a name listed
     // in BINDINGS but never bound fails too.
     let dir = scratch("surface");
-    let path = dir.join("s.sock");
+    let path = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&path);
 
     let expected = script::BINDINGS.join(",");
@@ -112,7 +112,7 @@ fn every_frozen_api_version_still_runs() {
     // a binding, reordering its arguments, or making an optional argument
     // required now fails the build instead of someone's plugin.
     let dir = scratch("compat");
-    let path = dir.join("s.sock");
+    let path = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&path);
 
     let api = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/api");
@@ -146,7 +146,7 @@ fn a_script_reacts_to_what_a_session_shows() {
     // input, so waiting for a string that appears in the command proves only
     // that the echo happened.
     let dir = scratch("react");
-    let path = dir.join("s.sock");
+    let path = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&path);
 
     let source = r#"
@@ -197,7 +197,7 @@ fn a_refusal_stops_the_script_instead_of_being_returned() {
     // must not run — and the proof is on the far side, in a session that never
     // receives the marker.
     let dir = scratch("refusal");
-    let path = dir.join("s.sock");
+    let path = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&path);
 
     let source = r#"

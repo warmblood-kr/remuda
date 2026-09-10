@@ -13,11 +13,12 @@
 //! directions, until either end hangs up.
 
 use crate::image::Image;
+use crate::ipc::{self, Listener, Stream, TryClone};
 use crate::pty::PtyAgent;
+use interprocess::local_socket::traits::ListenerExt;
 use remuda_core::protocol::{Request, Response};
 use remuda_core::{Registry, Session, Size};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -31,32 +32,76 @@ pub fn socket_path(server: &str) -> PathBuf {
     let base = std::env::var_os("REMUDA_RUNTIME_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
-        .unwrap_or_else(|| {
-            let who = std::env::var("USER").unwrap_or_else(|_| "nobody".into());
-            PathBuf::from(format!("/tmp/remuda-{who}"))
-        });
-    base.join("remuda").join(format!("{server}.sock"))
+        .unwrap_or_else(default_runtime_dir);
+    socket_path_in(&base, server)
+}
+
+/// The same derivation with the runtime directory supplied — what the daemon
+/// tests use, so they exercise the shipped naming instead of a hand-built path
+/// that only resembles it.
+pub fn socket_path_in(base: &Path, server: &str) -> PathBuf {
+    #[cfg(unix)]
+    {
+        base.join("remuda").join(format!("{server}.sock"))
+    }
+    // A named pipe has no directory to live in, so the runtime directory folds
+    // into the pipe's NAME. That is what keeps `REMUDA_RUNTIME_DIR` isolating
+    // one daemon from another on Windows the way a directory does on unix.
+    #[cfg(windows)]
+    {
+        PathBuf::from(format!(
+            r"\\.\pipe\remuda-{:016x}-{server}",
+            fingerprint(base.as_os_str())
+        ))
+    }
+}
+
+fn default_runtime_dir() -> PathBuf {
+    #[cfg(unix)]
+    {
+        let who = std::env::var("USER").unwrap_or_else(|_| "nobody".into());
+        PathBuf::from(format!("/tmp/remuda-{who}"))
+    }
+    #[cfg(windows)]
+    {
+        let who = std::env::var("USERNAME").unwrap_or_else(|_| "nobody".into());
+        PathBuf::from(format!(r"\\remuda\{who}"))
+    }
+}
+
+/// FNV-1a over the runtime directory, so an arbitrarily long path still yields
+/// a pipe name inside the 256-character limit. Only used on Windows.
+#[cfg(windows)]
+fn fingerprint(text: &std::ffi::OsStr) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The shell a bare `new` starts. `$SHELL` is the unix answer and `%COMSPEC%`
+/// the Windows one; both are what the OS itself uses to mean "this person's
+/// interactive shell".
+fn default_shell() -> String {
+    std::env::var("SHELL")
+        .or_else(|_| std::env::var("COMSPEC"))
+        .unwrap_or_else(|_| if cfg!(windows) { "cmd.exe" } else { "sh" }.into())
 }
 
 /// Serve until the listener dies. Caution: connect before unlinking — an
 /// unconditional unlink displaces a *live* peer, which then keeps running
 /// unreachable and holds its pty children forever.
 pub fn serve(path: &Path) -> std::io::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    if UnixStream::connect(path).is_ok() {
+    if ipc::connect(path).is_ok() {
         return Err(std::io::Error::other(format!(
             "a daemon is already listening at {} — pick a different name (remuda -s <name>) \
              or stop it first",
             path.display()
         )));
     }
-    // Nothing answered, so any file here is a stale socket from a crashed
-    // daemon, not a live peer's. Removing it is what lets bind succeed instead
-    // of failing forever on an address already in use.
-    let _ = std::fs::remove_file(path);
-    let listener = UnixListener::bind(path)?;
+    let listener: Listener = ipc::listen(path)?;
 
     let registry = Arc::new(Registry::new());
     // The image starts with the daemon and lives exactly as long (step 007).
@@ -75,7 +120,7 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn handle(stream: UnixStream, registry: &Registry, image: &Image) -> std::io::Result<()> {
+fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
@@ -152,7 +197,7 @@ fn handle(stream: UnixStream, registry: &Registry, image: &Image) -> std::io::Re
 fn spawn(name: &str, command: &[String], size: Size) -> Result<Session, String> {
     let mut argv = command.to_vec();
     if argv.is_empty() {
-        argv.push(std::env::var("SHELL").unwrap_or_else(|_| "sh".into()));
+        argv.push(default_shell());
     }
     let mut builder = CommandBuilder::new(&argv[0]);
     for arg in &argv[1..] {
@@ -174,8 +219,8 @@ fn spawn(name: &str, command: &[String], size: Size) -> Result<Session, String> 
 /// `Session::attach` returning `None`, not here, so a second viewer is refused
 /// even when it arrives over some later transport.
 fn attach(
-    stream: UnixStream,
-    mut reader: BufReader<UnixStream>,
+    stream: Stream,
+    mut reader: BufReader<Stream>,
     registry: &Registry,
     name: &str,
 ) -> std::io::Result<()> {
@@ -248,12 +293,12 @@ fn attach(
         }
         done.store(true, std::sync::atomic::Ordering::SeqCst);
         // Unblocks the key thread's read so the scope can close.
-        let _ = stream.shutdown(std::net::Shutdown::Both);
+        ipc::wake(&stream);
     });
     Ok(())
 }
 
-fn reply(mut stream: &UnixStream, response: &Response) -> std::io::Result<()> {
+fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
     let mut line = serde_json::to_string(response)?;
     line.push('\n');
     stream.write_all(line.as_bytes())?;
