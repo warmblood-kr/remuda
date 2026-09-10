@@ -108,9 +108,11 @@ curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nig
 $env:REMUDA_CHANNEL='nightly'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
 ```
 
-⚠ No stable release has been published yet, so the default channel above
-currently fails with a message pointing at the `nightly` one-liner — use it
-directly until a `stable` build exists.
+⚠ No stable release has been published yet. On this branch, the default
+channel above falls back to `nightly` and prints which channel it actually
+installed — see [PR #9](https://github.com/warmblood-kr/remuda/pull/9) for
+the alternative under review, where the default instead fails with a message
+pointing at the `nightly` one-liner.
 
 The chosen channel is remembered in `$XDG_DATA_HOME/remuda/channel`, so
 upgrading stays on the track you picked:

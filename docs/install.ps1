@@ -76,12 +76,19 @@ try {
     $version = (Get-Content -Raw $indexFile | ConvertFrom-Json).$channel
     # "0.0.0" is a placeholder, not a version: the field being present ('0.0.0'
     # is truthy) is not the same question as whether it names a real release.
-    if (-not $version -or $version -eq '0.0.0') {
-        if ($channel -eq 'stable') {
-            Die "no stable version published at $Index - install nightly instead: `$env:REMUDA_CHANNEL='nightly'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex"
-        }
-        Die "no '$channel' version published at $Index"
+    #
+    # What gets persisted below (see $requestedChannel) is the channel this
+    # install FOLLOWS, not whatever the fallback substituted in for the run
+    # that couldn't honor it. A fallback is not a choice - persisting it would
+    # silently pin future runs to nightly forever and stop them from ever
+    # re-checking whether stable is real yet.
+    $requestedChannel = $channel
+    if ((-not $version -or $version -eq '0.0.0') -and $channel -eq 'stable') {
+        Write-Host "install.ps1: no stable release published yet - installing nightly instead"
+        $channel = 'nightly'
+        $version = (Get-Content -Raw $indexFile | ConvertFrom-Json).$channel
     }
+    if (-not $version -or $version -eq '0.0.0') { Die "no '$channel' version published at $Index" }
 
     $tag = if ($channel -eq 'stable') { "v$version" } else { 'nightly' }
     $base = "https://github.com/$Repo/releases/download/$tag"
@@ -159,7 +166,7 @@ try {
     Get-ChildItem -Path $installDir -Filter '.remuda.exe.old-*' -Force -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
 
-    Set-Content -Path $channelFile -Value $channel -NoNewline
+    Set-Content -Path $channelFile -Value $requestedChannel -NoNewline
 
     Write-Host "install.ps1: remuda $version -> $installed ($channel channel)"
     $onPath = ($env:PATH -split ';') -contains $installDir

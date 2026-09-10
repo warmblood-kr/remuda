@@ -94,9 +94,9 @@ jobs:
 
   cold-install:
     # No stable release has ever been published — latest.json carries
-    # "stable":"0.0.0", a placeholder. See scripts/check-cold-install.sh's
-    # own header for what this proves: a cold stable install fails with an
-    # actionable message, not a raw 404, and does not silently fall back.
+    # "stable":"0.0.0", a placeholder. This branch proposes an alternative to
+    # what's on main: fall back to nightly with disclosure instead of hard-
+    # failing. See scripts/check-cold-install.sh's own header.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

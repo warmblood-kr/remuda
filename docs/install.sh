@@ -64,15 +64,23 @@ Darwin/arm64) target=aarch64-apple-darwin ;;
 *) die "no prebuilt binary for $os/$arch — build from source: cargo install --git https://github.com/$REPO" ;;
 esac
 
-version=$(fetch "$INDEX" | tr -d ' \n\r\t' | sed -n "s/.*\"$channel\":\"\([^\"]*\)\".*/\1/p")
+json=$(fetch "$INDEX" | tr -d ' \n\r\t')
+version=$(printf '%s' "$json" | sed -n "s/.*\"$channel\":\"\([^\"]*\)\".*/\1/p")
 # "0.0.0" is a placeholder, not a version: the field being present ("0.0.0"
 # passes -n) is not the same question as whether it names a real release.
-if [ -z "$version" ] || [ "$version" = 0.0.0 ]; then
-	if [ "$channel" = stable ]; then
-		die "no stable version published at $INDEX — install nightly instead: curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh"
-	fi
-	die "no '$channel' version published at $INDEX"
+#
+# What gets persisted below (see $requested_channel) is the channel this
+# install FOLLOWS, not whatever the fallback substituted in for the run that
+# couldn't honor it. A fallback is not a choice — persisting it would
+# silently pin future runs to nightly forever and stop them from ever
+# re-checking whether stable is real yet.
+requested_channel="$channel"
+if { [ -z "$version" ] || [ "$version" = 0.0.0 ]; } && [ "$channel" = stable ]; then
+	echo "install.sh: no stable release published yet — installing nightly instead" >&2
+	channel=nightly
+	version=$(printf '%s' "$json" | sed -n "s/.*\"$channel\":\"\([^\"]*\)\".*/\1/p")
 fi
+[ -n "$version" ] && [ "$version" != 0.0.0 ] || die "no '$channel' version published at $INDEX"
 
 case "$channel" in
 stable) tag="v$version" ;;
@@ -126,7 +134,7 @@ cp remuda "$install_dir/.remuda.incoming"
 chmod 755 "$install_dir/.remuda.incoming"
 mv -f "$install_dir/.remuda.incoming" "$install_dir/remuda"
 
-echo "$channel" >"$channel_file"
+echo "$requested_channel" >"$channel_file"
 
 echo "install.sh: remuda $version -> $install_dir/remuda ($channel channel)" >&2
 case ":$PATH:" in
