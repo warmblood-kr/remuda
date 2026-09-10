@@ -10,6 +10,7 @@
 //! and a second vendor later, are the same substitution.
 
 use core::fmt;
+use serde::{Deserialize, Serialize};
 use std::sync::mpsc::Receiver;
 
 /// Terminal dimensions. Immutable by construction — see [`Size::new`].
@@ -59,6 +60,31 @@ pub struct Cursor {
     pub col: u16,
 }
 
+/// A terminal colour, shaped like `vt100::Color` so a backend maps it 1:1.
+/// See [`StyledCell`] for why `core` names this at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum Color {
+    #[default]
+    Default,
+    Idx(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// One screen cell, styled. `text` rather than `char`: a combining character
+/// or a wide glyph's continuation cell can need more or fewer than one
+/// `char`; see [`AgentProcess::screen_cells`] for the plain-text fallback.
+#[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct StyledCell {
+    pub text: String,
+    pub fg: Color,
+    pub bg: Color,
+    pub bold: bool,
+    pub dim: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub inverse: bool,
+}
+
 #[derive(Debug)]
 pub enum AgentError {
     /// The child is gone. Distinct from an I/O failure: a caller may
@@ -98,6 +124,24 @@ pub trait AgentProcess: Send {
     /// which is correct but colourless.
     fn screen_bytes(&mut self) -> Result<Vec<u8>> {
         self.screen_text().map(String::into_bytes)
+    }
+
+    /// The visible screen as styled cells, for a croppable colour pane.
+    /// Default: every cell plain, from the same text `screen_text` gives —
+    /// a backend that hasn't implemented styling degrades to colourless.
+    fn screen_cells(&mut self) -> Result<Vec<Vec<StyledCell>>> {
+        Ok(self
+            .screen_text()?
+            .lines()
+            .map(|l| {
+                l.chars()
+                    .map(|c| StyledCell {
+                        text: c.to_string(),
+                        ..Default::default()
+                    })
+                    .collect()
+            })
+            .collect())
     }
 
     /// Subscribe to output as it arrives, for a viewer that must not poll.

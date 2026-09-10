@@ -220,6 +220,15 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
             Some(Ok(text)) => reply(&stream, &Response::Screen(text)),
         },
 
+        Request::CaptureStyled { name } => match registry.screen_cells(&name) {
+            None => reply(
+                &stream,
+                &Response::error(format!("no such session: {name}")),
+            ),
+            Some(Err(e)) => reply(&stream, &Response::error(e)),
+            Some(Ok(cells)) => reply(&stream, &Response::StyledScreen(cells)),
+        },
+
         Request::Attach { name } => attach(stream, reader, registry, &name),
 
         Request::Close { name } => match registry.close(&name) {

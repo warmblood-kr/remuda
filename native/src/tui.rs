@@ -16,6 +16,7 @@
 //! testable on a machine with no tty; everything needing one lives in [`run`].
 
 use crate::client::{self, Hold, RawMode};
+use remuda_core::agent::{Color, StyledCell};
 use remuda_core::protocol::{Request, Response};
 use remuda_core::registry::SessionSummary;
 use remuda_core::Size;
@@ -314,6 +315,14 @@ impl Cell for char {
     }
 }
 
+/// Same "1 for everything" stance as `impl Cell for char`, and for the same
+/// reason: CJK width is a separate, not-yet-fixed bug. See steps/019.
+impl Cell for StyledCell {
+    fn width(&self) -> u16 {
+        1
+    }
+}
+
 /// A window from a larger coordinate space onto a smaller one — today, the
 /// panel's rectangle onto a session's own screen. Named per 정수님's
 /// instruction; see steps/018 for the quote and the cascading design.
@@ -453,6 +462,179 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
     out
 }
 
+/// True when a cell carries no colour or attribute at all — the case that
+/// must emit no SGR, so an all-default grid renders byte-identical to `crop`.
+fn is_plain(c: &StyledCell) -> bool {
+    c.fg == Color::Default
+        && c.bg == Color::Default
+        && !c.bold
+        && !c.dim
+        && !c.italic
+        && !c.underline
+        && !c.inverse
+}
+
+/// Every non-default attribute of `cell`, regenerated from scratch. Simpler
+/// and correct: a style change resets first, so no per-attribute "turn this
+/// back off" code is ever needed.
+fn sgr_codes(cell: &StyledCell) -> String {
+    let mut out = String::new();
+    if cell.bold {
+        out.push_str("\x1b[1m");
+    }
+    if cell.dim {
+        out.push_str("\x1b[2m");
+    }
+    if cell.italic {
+        out.push_str("\x1b[3m");
+    }
+    if cell.underline {
+        out.push_str("\x1b[4m");
+    }
+    if cell.inverse {
+        out.push_str("\x1b[7m");
+    }
+    push_color(&mut out, cell.fg, true);
+    push_color(&mut out, cell.bg, false);
+    out
+}
+
+/// One half (fg or bg) of a cell's colour, in the convention this codebase
+/// already writes raw escapes in — see steps/019 for why not `crossterm::style`.
+fn push_color(out: &mut String, color: Color, fg: bool) {
+    match color {
+        Color::Default => {}
+        Color::Idx(n) if n < 8 => out.push_str(&format!("\x1b[{}{n}m", if fg { 3 } else { 4 })),
+        Color::Idx(n) => out.push_str(&format!("\x1b[{}{}m", if fg { 9 } else { 10 }, n - 8)),
+        Color::Rgb(r, g, b) => {
+            out.push_str(&format!("\x1b[{};2;{r};{g};{b}m", if fg { 38 } else { 48 }))
+        }
+    }
+}
+
+/// One row of styled cells as text plus minimal SGR — see steps/019 for the
+/// shape this has to satisfy (byte-identity when plain; minimal when not).
+fn render_styled_row(cells: &[StyledCell]) -> String {
+    let mut out = String::new();
+    let mut current: Option<&StyledCell> = None;
+    let mut styled_at_all = false;
+    for cell in cells {
+        let changed = match current {
+            None => !is_plain(cell),
+            Some(prev) => !same_style(prev, cell),
+        };
+        if changed {
+            out.push_str("\x1b[0m");
+            out.push_str(&sgr_codes(cell));
+            styled_at_all |= !is_plain(cell);
+        }
+        out.push_str(&cell.text);
+        current = Some(cell);
+    }
+    if styled_at_all {
+        out.push_str("\x1b[0m");
+    }
+    out
+}
+
+/// Whether two cells would emit the same SGR — everything but `text`.
+fn same_style(a: &StyledCell, b: &StyledCell) -> bool {
+    a.fg == b.fg
+        && a.bg == b.bg
+        && a.bold == b.bold
+        && a.dim == b.dim
+        && a.italic == b.italic
+        && a.underline == b.underline
+        && a.inverse == b.inverse
+}
+
+/// The styled counterpart of the free `crop`, byte-identical to it when
+/// every cell is plain — see steps/019's oracle.
+fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool) {
+    let viewport = Viewport::bottom_anchored(cells.len(), pan, cols, rows);
+    let (cropped, cut) = viewport.crop(cells);
+    let out = cropped
+        .into_iter()
+        .map(|(mut visible, row_cut)| {
+            if row_cut {
+                visible.pop();
+            }
+            let mut s = render_styled_row(&visible);
+            if row_cut {
+                s.push('→');
+            }
+            s
+        })
+        .collect();
+    (out, cut)
+}
+
+/// A styled row's display width, ignoring the SGR bytes riding along with
+/// it — what `fit`'s char count would give if escapes couldn't fool it.
+fn visible_width(s: &str) -> usize {
+    let mut width = 0;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for skip in chars.by_ref() {
+                if skip == 'm' {
+                    break;
+                }
+            }
+        } else {
+            width += 1;
+        }
+    }
+    width
+}
+
+/// `fit`'s padding step for a styled row: pad to `width` visible columns
+/// without counting escape bytes as columns. `crop_styled` never hands back
+/// a row wider than asked, so there is nothing here to cut.
+fn fit_styled(line: &str, width: u16) -> String {
+    let pad = (width as usize).saturating_sub(visible_width(line));
+    let mut out = line.to_string();
+    out.push_str(&" ".repeat(pad));
+    out
+}
+
+/// Same frame as [`render`], but the preview column carries real colour from
+/// a styled capture. Kept separate so the plain path and its byte-identity
+/// oracle are never perturbed — see steps/019.
+pub fn render_styled(
+    ui: &Ui,
+    cells: &[Vec<StyledCell>],
+    server: &str,
+    cols: u16,
+    rows: u16,
+) -> String {
+    let (list_w, preview_w) = layout(cols, widest(ui));
+    let body = rows.saturating_sub(1);
+    let divider = match ui.focus {
+        Focus::List => "│",
+        Focus::Session => "\x1b[7m┃\x1b[0m",
+    };
+
+    let (lines, cut) = crop_styled(cells, preview_w, body, ui.pan);
+    let mut out = String::from("\x1b[H\x1b[2J");
+    for row in 0..body {
+        out.push_str(&format!("\x1b[{};1H", row + 1));
+        let left = if row == 0 {
+            format!("remuda · {server}")
+        } else {
+            list_row(ui, row as usize - 1, list_w)
+        };
+        out.push_str(&fit(&left, list_w));
+        out.push_str(divider);
+        let line = lines.get(row as usize).map_or("", String::as_str);
+        out.push_str(&fit_styled(line, preview_w));
+    }
+
+    out.push_str(&format!("\x1b[{};1H", rows));
+    out.push_str(&fit(&footer(ui, cut, preview_w), cols));
+    out
+}
+
 /// The widest session in the herd, which is what the preview column claims —
 /// from the herd rather than the cursor, so the divider does not jump. Zero
 /// when there is no herd: nothing to preview, so nothing to reserve.
@@ -549,12 +731,12 @@ fn refresh(
         *held = take(path, ui);
     }
 
-    let screen = ui
+    let cells = ui
         .selected()
-        .map(|s| capture(path, &s.name))
+        .map(|s| capture_styled(path, &s.name))
         .unwrap_or_default();
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let frame = render(ui, &screen, server, cols, rows);
+    let frame = render_styled(ui, &cells, server, cols, rows);
     // The write is gated on change, as it always was — but before
     // `should_refresh` existed, everything ABOVE this line (a relist, an IPC
     // round-trip for a full screen snapshot, a rebuilt frame) ran on every
@@ -654,15 +836,17 @@ fn list(path: &Path) -> Vec<SessionSummary> {
     }
 }
 
-fn capture(path: &Path, name: &str) -> String {
+/// Styled counterpart of the (now unused) plain `capture` — see steps/019.
+/// Empty grid on any error, matching `capture`'s empty-string convention.
+fn capture_styled(path: &Path, name: &str) -> Vec<Vec<StyledCell>> {
     match client::request(
         path,
-        &Request::Capture {
+        &Request::CaptureStyled {
             name: name.to_string(),
         },
     ) {
-        Ok(Response::Screen(text)) => text,
-        _ => String::new(),
+        Ok(Response::StyledScreen(cells)) => cells,
+        _ => Vec::new(),
     }
 }
 
@@ -1052,6 +1236,123 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every cell plain, so the styled path must degrade to exactly what the
+    /// plain `crop` produces — same screens, same exhaustive sweep as the
+    /// migration oracle above. See steps/019.
+    #[test]
+    fn the_styled_crop_matches_plain_crop_when_every_cell_is_default() {
+        let screens = [
+            "",
+            "one line, no newline",
+            "short\nlines",
+            "a line that is definitely longer than the pane\nsecond, shorter",
+            "exact\nfit!!",
+            "one\ntwo\nthree\nfour\nfive\nsix",
+            "унікод and 漢字 mixed with ascii",
+        ];
+        for screen in screens {
+            let cells: Vec<Vec<StyledCell>> = screen
+                .lines()
+                .map(|l| {
+                    l.chars()
+                        .map(|c| StyledCell {
+                            text: c.to_string(),
+                            ..Default::default()
+                        })
+                        .collect()
+                })
+                .collect();
+            let max_len = screen.lines().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+            let max_rows = screen.lines().count() as u16;
+            for cols in 0..=max_len + 2 {
+                for pan in 0..=max_len + 2 {
+                    for rows in 0..=max_rows + 2 {
+                        let want = crop(screen, cols, rows, pan);
+                        let (got_lines, got_cut) = crop_styled(&cells, cols, rows, pan);
+                        // Defensive: a default-only row should never actually
+                        // carry a trailing reset, but strip one if present
+                        // rather than assume it.
+                        let got_lines: Vec<String> = got_lines
+                            .into_iter()
+                            .map(|l| l.strip_suffix("\x1b[0m").unwrap_or(&l).to_string())
+                            .collect();
+                        assert_eq!(
+                            (got_lines, got_cut),
+                            want,
+                            "screen={screen:?} cols={cols} rows={rows} pan={pan}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Two style groups must emit exactly two style-change points, not one
+    /// per cell — and a trailing reset only because the row used colour.
+    #[test]
+    fn render_styled_row_only_emits_sgr_on_a_style_change() {
+        let red = StyledCell {
+            text: "r".into(),
+            fg: Color::Idx(1),
+            ..Default::default()
+        };
+        let blue = StyledCell {
+            text: "b".into(),
+            fg: Color::Idx(4),
+            ..Default::default()
+        };
+        let row = [
+            StyledCell {
+                text: "a".into(),
+                ..red.clone()
+            },
+            StyledCell {
+                text: "b".into(),
+                ..red.clone()
+            },
+            StyledCell {
+                text: "c".into(),
+                ..red.clone()
+            },
+            StyledCell {
+                text: "d".into(),
+                ..blue.clone()
+            },
+            StyledCell {
+                text: "e".into(),
+                ..blue.clone()
+            },
+            StyledCell {
+                text: "f".into(),
+                ..blue.clone()
+            },
+        ];
+        let out = render_styled_row(&row);
+        assert_eq!(
+            out.matches("\x1b[0m").count(),
+            3,
+            "one reset before each of the 2 style changes, plus the trailing \
+             reset — not one per cell: {out:?}"
+        );
+        assert!(
+            out.ends_with("\x1b[0m"),
+            "row used colour, so it must reset at the end: {out:?}"
+        );
+
+        let plain_row = [
+            StyledCell {
+                text: "x".into(),
+                ..Default::default()
+            },
+            StyledCell {
+                text: "y".into(),
+                ..Default::default()
+            },
+        ];
+        let out = render_styled_row(&plain_row);
+        assert_eq!(out, "xy", "no style used, no SGR at all");
     }
 
     #[test]
