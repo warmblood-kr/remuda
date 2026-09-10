@@ -221,5 +221,10 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
             Ok(Value::Table(rows))
         }
         Response::Error(reason) => Err(mlua::Error::runtime(reason)),
+        // No binding here asks for `CaptureStyled` either — same reasoning as
+        // `Response::Value` above.
+        Response::StyledScreen(_) => Err(mlua::Error::runtime(
+            "styled capture is not exposed to scripts",
+        )),
     }
 }

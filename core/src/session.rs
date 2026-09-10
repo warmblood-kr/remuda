@@ -5,7 +5,7 @@
 //! third is the interesting one: it does not forbid the dangerous operation, it
 //! scopes it to the only situation in which it is safe.
 
-use crate::agent::{AgentError, AgentProcess, Cursor, Result, Size};
+use crate::agent::{AgentError, AgentProcess, Cursor, Result, Size, StyledCell};
 use crate::clock::Clock;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -116,6 +116,14 @@ impl Session {
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
         agent.cursor()
+    }
+
+    pub fn screen_cells(&self) -> Result<Vec<Vec<StyledCell>>> {
+        let mut agent = self
+            .agent
+            .lock()
+            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        agent.screen_cells()
     }
 
     pub fn is_alive(&self) -> bool {

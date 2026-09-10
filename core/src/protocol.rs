@@ -16,7 +16,7 @@
 //! and becomes a raw byte pipe in both directions, which is why attaching has
 //! no response type beyond the acknowledgement.
 
-use crate::agent::Size;
+use crate::agent::{Size, StyledCell};
 use crate::registry::SessionSummary;
 use serde::{Deserialize, Serialize};
 
@@ -43,6 +43,9 @@ pub enum Request {
     /// Read the screen as text without taking the session over. Needs no
     /// terminal, raw mode or exclusivity, so it works while a human is attached.
     Capture { name: String },
+    /// Like `Capture`, but styled cells instead of plain text — what a
+    /// croppable colour pane reads. See [`Response::StyledScreen`].
+    CaptureStyled { name: String },
     /// Take the session over for a human at a terminal. On `Ok`, this
     /// connection becomes a byte pipe.
     Attach { name: String },
@@ -74,6 +77,8 @@ pub enum Request {
 pub enum Response {
     Sessions(Vec<SessionSummary>),
     Screen(String),
+    /// A styled screen, answering [`Request::CaptureStyled`].
+    StyledScreen(Vec<Vec<StyledCell>>),
     /// What an [`Request::Eval`] returned, already rendered to text. Kept
     /// distinct from `Screen` so a client can tell "the session printed
     /// nothing" from "the expression returned nothing".

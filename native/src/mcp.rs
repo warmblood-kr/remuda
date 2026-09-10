@@ -155,6 +155,12 @@ fn call(socket: &Path, id: Value, params: &Value) -> String {
         Err(e) => ok_reply(id, tool_error(&format!("{e}"))),
         Ok(Response::Error(reason)) => ok_reply(id, tool_error(&reason)),
         Ok(Response::Screen(screen)) => ok_reply(id, tool_text(&screen)),
+        // No MCP tool asks for `CaptureStyled`, so this never arrives — spelled
+        // out rather than a wildcard for the same reason as `Response::Value`
+        // below: a real caller appearing later is a compile error to notice.
+        Ok(Response::StyledScreen(_)) => {
+            ok_reply(id, tool_error("styled capture is not exposed over MCP"))
+        }
         // This arm used to say `TOOLS` exposes no eval, deliberately — because
         // MCP was the door for the agent running *inside* a session, and giving
         // it the image would let it rewrite the manager holding it. **The

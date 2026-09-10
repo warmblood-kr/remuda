@@ -19,7 +19,7 @@
 //! a line of policy.
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use remuda_core::agent::{AgentError, AgentProcess, Cursor, Result, Size};
+use remuda_core::agent::{AgentError, AgentProcess, Color, Cursor, Result, Size, StyledCell};
 use std::io::{Read, Write};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -39,6 +39,16 @@ const DSR_CURSOR: &[u8] = b"\x1b[6n";
 
 fn io<E: std::fmt::Display>(e: E) -> AgentError {
     AgentError::Io(e.to_string())
+}
+
+/// `vt100::Color` and [`Color`] are shaped identically on purpose; this is
+/// the one place that fact is spent.
+fn color(c: vt100::Color) -> Color {
+    match c {
+        vt100::Color::Default => Color::Default,
+        vt100::Color::Idx(n) => Color::Idx(n),
+        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
 }
 
 /// A child process attached to a pty, with its screen parsed into a grid.
@@ -166,6 +176,35 @@ impl AgentProcess for PtyAgent {
         Ok(parser.screen().contents_formatted())
     }
 
+    /// Styled cells, cell by cell off `vt100`'s own grid rather than the
+    /// default's reparsed text — this is the path that actually keeps colour.
+    fn screen_cells(&mut self) -> Result<Vec<Vec<StyledCell>>> {
+        let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
+        let screen = parser.screen();
+        Ok((0..self.size.rows())
+            .map(|row| {
+                (0..self.size.cols())
+                    .map(|col| {
+                        let cell = screen.cell(row, col);
+                        let text = cell.map_or("", |c| c.contents());
+                        StyledCell {
+                            // A blank or wide-char continuation cell reports
+                            // "" — a space keeps column alignment intact.
+                            text: if text.is_empty() { " " } else { text }.to_string(),
+                            fg: color(cell.map_or(vt100::Color::Default, |c| c.fgcolor())),
+                            bg: color(cell.map_or(vt100::Color::Default, |c| c.bgcolor())),
+                            bold: cell.is_some_and(|c| c.bold()),
+                            dim: cell.is_some_and(|c| c.dim()),
+                            italic: cell.is_some_and(|c| c.italic()),
+                            underline: cell.is_some_and(|c| c.underline()),
+                            inverse: cell.is_some_and(|c| c.inverse()),
+                        }
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+
     fn subscribe(&mut self) -> Option<Receiver<Vec<u8>>> {
         let (tx, rx) = channel();
         self.watchers.lock().ok()?.push(tx);
@@ -236,6 +275,32 @@ mod tests {
         assert!(
             bytes.windows(2).any(|w| w == b"\x1b["),
             "screen_bytes (attach's initial repaint) must carry SGR: {bytes:?}"
+        );
+    }
+
+    /// [MEASURED, Linux] `screen_cells` is the styled readout `screen_text`
+    /// cannot be: the cells under "red" carry the colour, and a cell the
+    /// child never touched stays `Color::Default`. See steps/020.
+    #[test]
+    fn screen_cells_carries_colour_that_screen_text_discards() {
+        let mut cmd = CommandBuilder::new("printf");
+        cmd.arg("\x1b[31mred\x1b[0m");
+        let mut agent = PtyAgent::spawn(cmd, Size::new(80, 24)).unwrap();
+        wait_for(&mut agent, "red");
+
+        let cells = agent.screen_cells().unwrap();
+        let row0 = &cells[0];
+        assert_eq!(row0[0].text, "r");
+        assert_eq!(row0[1].text, "e");
+        assert_eq!(row0[2].text, "d");
+        for c in &row0[0..3] {
+            assert_eq!(c.fg, Color::Idx(1), "SGR 31 (red) is vt100 Idx(1): {c:?}");
+        }
+        assert_eq!(
+            row0[3].fg,
+            Color::Default,
+            "a cell after the \\x1b[0m reset, never itself painted, stays default: {:?}",
+            row0[3]
         );
     }
 }
