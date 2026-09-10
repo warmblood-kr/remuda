@@ -23,11 +23,24 @@ use remuda_core::protocol::{Request, Response};
 use std::path::Path;
 use std::time::Duration;
 
-/// Every name bound into the `remuda` table: the protocol operations, plus
-/// `sleep`. `insert`, `key` and `click` are three spellings of one operation
-/// ([`Request::Send`]). Asserted against the live table, both directions.
-pub const BINDINGS: [&str; 10] = [
-    "attach", "capture", "click", "close", "insert", "key", "ls", "new", "send", "sleep",
+/// Every name in the live `remuda` table: the protocol operations and `sleep`
+/// bound here, then `tool`/`tools`/`_call`/`_descriptors` added by `tools.lua`.
+/// Asserted against the live table, both directions.
+pub const BINDINGS: [&str; 14] = [
+    "_call",
+    "_descriptors",
+    "attach",
+    "capture",
+    "click",
+    "close",
+    "insert",
+    "key",
+    "ls",
+    "new",
+    "send",
+    "sleep",
+    "tool",
+    "tools",
 ];
 
 /// Run a script file **in the daemon's image**, never in a fresh `Lua::new()`

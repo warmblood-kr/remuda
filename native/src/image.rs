@@ -60,6 +60,14 @@ impl Image {
             // rather than the thread dying quietly and every caller hanging.
             let ready = script::bindings(&lua, &socket)
                 .and_then(|table| lua.globals().set("remuda", table))
+                // The tool frame is Lua over those bindings, not a second set of
+                // them. It must load *after* the table exists and *before* any
+                // caller, so a `tools/list` on a fresh daemon is already true.
+                .and_then(|()| {
+                    lua.load(include_str!("tools.lua"))
+                        .set_name("@remuda/tools.lua")
+                        .exec()
+                })
                 .and_then(|()| capture_print(&lua, Rc::clone(&printed)))
                 .map_err(|e| e.to_string());
 
