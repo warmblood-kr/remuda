@@ -81,6 +81,17 @@ jobs:
       - run: sh -n docs/install.sh
       - run: pwsh -NoProfile -File scripts/check-powershell.ps1
 
+  nightly-stale-index:
+    # latest.json is cached for up to ten minutes, but the nightly tag is
+    # fixed and every release replaces its assets — so a real install can hit
+    # a version string that no longer names anything downloadable. See
+    # scripts/check-nightly-stale-index.sh's own header for how this is
+    # provoked without waiting for the real race.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh scripts/check-nightly-stale-index.sh
+
   format:
     runs-on: ubuntu-latest
     steps:

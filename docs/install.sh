@@ -72,15 +72,30 @@ stable) tag="v$version" ;;
 nightly) tag=nightly ;;
 esac
 
-asset="remuda-$version-$target.tar.gz"
 base="https://github.com/$REPO/releases/download/$tag"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
+fetch "$base/SHA256SUMS" >"$tmp/SHA256SUMS" || die "cannot download $base/SHA256SUMS"
+
+if [ "$channel" = nightly ]; then
+	# nightly's tag is fixed and every release replaces its assets, so a
+	# version read from latest.json's cached copy (cache-control: max-age=600)
+	# can already name a build whose assets no longer exist under that name —
+	# for up to ten minutes after every push to main. SHA256SUMS lives on the
+	# tag itself and lists exactly what is published right now, so derive the
+	# asset name (and the version to report) from that instead of constructing
+	# it from the index.
+	asset=$(awk -v t="$target" '{ n = $2; sub(/^\.\//, "", n); if (n ~ ("^remuda-.*-" t "\\.tar\\.gz$")) print n }' "$tmp/SHA256SUMS" | head -n1)
+	[ -n "$asset" ] || die "no nightly build published for $target"
+	version=$(printf '%s' "$asset" | sed -n "s/^remuda-\(.*\)-$target\.tar\.gz\$/\1/p")
+else
+	asset="remuda-$version-$target.tar.gz"
+fi
+
 echo "install.sh: fetching remuda $version ($channel, $target)" >&2
 fetch "$base/$asset" >"$tmp/$asset" || die "cannot download $base/$asset"
-fetch "$base/SHA256SUMS" >"$tmp/SHA256SUMS" || die "cannot download $base/SHA256SUMS"
 
 cd "$tmp" || die "cannot enter $tmp"
 # Exact string equality on the filename, not a regex match: the asset name is

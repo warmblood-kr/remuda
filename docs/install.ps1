@@ -66,12 +66,33 @@ try {
     if (-not $version) { Die "no '$channel' version published at $Index" }
 
     $tag = if ($channel -eq 'stable') { "v$version" } else { 'nightly' }
-    $asset = "remuda-$version-$target.tar.gz"
     $base = "https://github.com/$Repo/releases/download/$tag"
+
+    Fetch "$base/SHA256SUMS" (Join-Path $tmp 'SHA256SUMS')
+
+    if ($channel -eq 'nightly') {
+        # nightly's tag is fixed and every release replaces its assets, so a
+        # version read from latest.json's cached copy (cache-control:
+        # max-age=600) can already name a build whose assets no longer exist
+        # under that name - for up to ten minutes after every push to main.
+        # SHA256SUMS lives on the tag itself and lists exactly what is
+        # published right now, so derive the asset name (and the version to
+        # report) from that instead of constructing it from the index.
+        $asset = $null
+        foreach ($line in Get-Content (Join-Path $tmp 'SHA256SUMS')) {
+            $fields = $line -split '\s+', 2
+            if ($fields.Count -lt 2) { continue }
+            $name = $fields[1].Trim() -replace '^\./', ''
+            if ($name -match "^remuda-.*-$target\.tar\.gz$") { $asset = $name; break }
+        }
+        if (-not $asset) { Die "no nightly build published for $target" }
+        $version = $asset -replace "^remuda-(.*)-$target\.tar\.gz$", '$1'
+    } else {
+        $asset = "remuda-$version-$target.tar.gz"
+    }
 
     Write-Host "install.ps1: fetching remuda $version ($channel, $target)"
     Fetch "$base/$asset" (Join-Path $tmp $asset)
-    Fetch "$base/SHA256SUMS" (Join-Path $tmp 'SHA256SUMS')
 
     # Exact string equality on the filename, not a regex match: the asset name
     # is full of dots, and `sha256sum ./*` writes a `./` prefix that a naive
