@@ -196,3 +196,47 @@ impl AgentProcess for PtyAgent {
         self.size
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn wait_for(agent: &mut PtyAgent, needle: &str) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if agent.screen_text().unwrap().contains(needle) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for {needle:?}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// [MEASURED, Linux, no terminal, no Windows host] This is the whole
+    /// diagnosis for "no colour in the TUI pane": `screen_text` — what
+    /// `Request::Capture` serves, and what the browsing TUI's pane reads —
+    /// discards SGR colour that the child actually emitted. `screen_bytes` —
+    /// used only by `attach`'s initial repaint — keeps it. The colour is not
+    /// lost anywhere upstream; it is discarded at this one call, on every
+    /// platform, independent of `TERM`/`COLORTERM`/console VT mode.
+    #[test]
+    fn screen_text_strips_colour_that_screen_bytes_keeps() {
+        let mut cmd = CommandBuilder::new("printf");
+        cmd.arg("\x1b[31mred\x1b[0m");
+        let mut agent = PtyAgent::spawn(cmd, Size::new(80, 24)).unwrap();
+        wait_for(&mut agent, "red");
+
+        let text = agent.screen_text().unwrap();
+        let bytes = agent.screen_bytes().unwrap();
+
+        assert!(
+            !text.contains('\x1b'),
+            "screen_text (Capture, what the TUI pane reads) must be plain: {text:?}"
+        );
+        assert!(
+            bytes.windows(2).any(|w| w == b"\x1b["),
+            "screen_bytes (attach's initial repaint) must carry SGR: {bytes:?}"
+        );
+    }
+}
