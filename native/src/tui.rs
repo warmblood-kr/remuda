@@ -1,31 +1,36 @@
-//! The picker: `remuda` with no arguments.
+//! The herd: `remuda` with no arguments.
 //!
-//! Two modes, because the owner's sentence — "the right pane shows one session
-//! whole, full-screen" — is only consistent as two. **browse** is a list beside
-//! a read-only preview and the keys drive remuda; **ride** is the session
-//! owning the whole terminal and every key going to the pty. The frame's
-//! presence is what tells you which one you are in.
+//! One screen, not two. The list is always on the left and the selected session
+//! is always on the right; what moves is **focus**. With focus on the list, keys
+//! drive remuda; with focus on the session, every key — `x` and `q` included —
+//! is typed into the pty, and `Ctrl-\` brings focus back.
 //!
-//! Ride mode is `client::attach` unchanged — this module drops its own terminal
-//! guard, hands over, and takes it back. There is no second raw-mode mechanism
-//! and no privileged path: the TUI is a client speaking the same `Request` a
-//! script speaks.
+//! One key rather than a prefix, because a prefix exists to open a *namespace*
+//! and there is exactly one command from inside a session. One keypress is also
+//! one byte, so it carries no inter-key timing to be mangled by nested ttys.
+//! `Ctrl-\` is [`client::DETACH`], the key `remuda attach` already leaves by.
 //!
-//! [`render`] and [`Ui::on_key`] are pure and take no terminal, which is what
-//! keeps the state machine testable on a machine with no tty. Everything that
-//! needs one lives in [`run`].
+//! Focus is exclusive, not a peek: it takes the same `Attach` guard a ride does
+//! (PRINCIPLES §6, invariant 3), so orchestrated input is refused while a person
+//! is typing. [`render`] and [`Ui::on_key`] stay pure, so the state machine is
+//! testable on a machine with no tty; everything needing one lives in [`run`].
 
-use crate::client::{self, Left, RawMode};
+use crate::client::{self, Hold, RawMode};
 use remuda_core::protocol::{Request, Response};
 use remuda_core::registry::SessionSummary;
+use remuda_core::Size;
 use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-/// How often the preview is re-captured, and the event loop's tick.
+/// How often the preview is re-captured while the list has focus.
 const TICK: Duration = Duration::from_millis(250);
+
+/// The same, while the session has focus. Shorter because this is the interval
+/// between a keystroke and seeing it echoed, not between glances at a list.
+const TICK_TYPING: Duration = Duration::from_millis(40);
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -36,11 +41,20 @@ pub enum Mode {
     Confirm(String),
 }
 
+/// Which pane the keyboard is talking to. Always drawn, never remembered — the
+/// improvement over a prefix key, whose state is invisible by construction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Focus {
+    List,
+    Session,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Action {
     Nothing,
     Quit,
-    Ride(String),
+    /// Bytes for the focused session's pty, already encoded.
+    Type(Vec<u8>),
     Start(String),
     Kill(String),
 }
@@ -50,6 +64,10 @@ pub struct Ui {
     pub selected: usize,
     pub pan: u16,
     pub mode: Mode,
+    pub focus: Focus,
+    /// What `n` prefills the prompt with. Held rather than read at the prompt,
+    /// so the pure state machine still needs no environment.
+    shell: String,
     /// One line of feedback under the list — a refusal, or how the last ride
     /// ended. Cleared by the next keypress that does anything.
     pub notice: Option<String>,
@@ -57,34 +75,22 @@ pub struct Ui {
 
 impl Ui {
     pub fn new(sessions: Vec<SessionSummary>, shell: &str, notice: Option<String>) -> Self {
-        // An empty herd opens the prompt prefilled rather than showing a blank
-        // screen or silently spawning a shell — the latter is the first half of
-        // the incident this whole change exists for.
-        let mode = if sessions.is_empty() {
-            Mode::Prompt(shell.to_string())
-        } else {
-            Mode::Browse
-        };
         Self {
             sessions,
             selected: 0,
             pan: 0,
-            mode,
+            // An empty herd asks rather than acting: it says what to press and
+            // waits. It must never spawn a shell on its own — that silent spawn
+            // is half of the incident `steps/012` is named after.
+            mode: Mode::Browse,
+            focus: Focus::List,
+            shell: shell.to_string(),
             notice,
         }
     }
 
     pub fn selected(&self) -> Option<&SessionSummary> {
         self.sessions.get(self.selected)
-    }
-
-    /// Put the cursor on a named session, if it is still here. A session that
-    /// died and was cleared while you rode it leaves the cursor alone.
-    pub fn select_named(&mut self, name: Option<&str>) {
-        let Some(name) = name else { return };
-        if let Some(at) = self.sessions.iter().position(|s| s.name == name) {
-            self.selected = at;
-        }
     }
 
     /// Keep the cursor on a real row after the herd changes underneath it.
@@ -95,10 +101,38 @@ impl Ui {
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
+        if self.focus == Focus::Session {
+            return self.session_key(key);
+        }
         match self.mode.clone() {
             Mode::Prompt(buffer) => self.prompt_key(key, buffer),
             Mode::Confirm(name) => self.confirm_key(key, name),
             Mode::Browse => self.browse_key(key),
+        }
+    }
+
+    /// Everything reaches the pty except the one key that comes back. Checked
+    /// first and unconditionally, so no remuda command can be typed by accident
+    /// into a shell — the whole reason focus exists rather than modeless keys.
+    fn session_key(&mut self, key: KeyEvent) -> Action {
+        if is_detach(key) {
+            self.focus = Focus::List;
+            self.notice = None;
+            return Action::Nothing;
+        }
+        to_bytes(key).map_or(Action::Nothing, Action::Type)
+    }
+
+    /// Follow the session the keyboard is talking to by NAME, and hand the
+    /// keyboard back when it is gone. Rows move under the cursor when the herd
+    /// changes, and focus landing on a neighbour would type into the wrong pty.
+    pub fn follow_focus(&mut self, name: Option<&str>) {
+        let Some(name) = name else { return };
+        match self.sessions.iter().position(|s| s.name == name && s.alive) {
+            Some(at) => self.selected = at,
+            // With sessions closing themselves on exit, this is how a ride
+            // ordinarily ends: you type `exit`, and you are on the list.
+            None => self.focus = Focus::List,
         }
     }
 
@@ -128,20 +162,20 @@ impl Ui {
                 Action::Nothing
             }
             KeyCode::Char('n') => {
-                self.mode = Mode::Prompt(String::new());
+                self.mode = Mode::Prompt(self.shell.clone());
                 self.notice = None;
                 Action::Nothing
             }
             KeyCode::Char('x') => self.kill_selected(),
-            KeyCode::Enter => self.ride_selected(),
+            KeyCode::Enter => self.focus_session(),
             _ => Action::Nothing,
         }
     }
 
-    /// Refuse before the screen is handed over, not after: an occupied or dead
-    /// session cannot be ridden, and finding that out mid-handover is the shape
-    /// of confusion this design keeps deleting.
-    fn ride_selected(&mut self) -> Action {
+    /// Refuse before focus moves, not after: an occupied or dead session cannot
+    /// be typed into, and finding that out with the keyboard already elsewhere
+    /// is the shape of confusion this design keeps deleting.
+    fn focus_session(&mut self) -> Action {
         let Some(session) = self.selected() else {
             return Action::Nothing;
         };
@@ -156,7 +190,9 @@ impl Ui {
             ));
             return Action::Nothing;
         }
-        Action::Ride(session.name.clone())
+        self.notice = None;
+        self.focus = Focus::Session;
+        Action::Nothing
     }
 
     fn kill_selected(&mut self) -> Action {
@@ -207,6 +243,51 @@ impl Ui {
             _ => Action::Nothing,
         }
     }
+}
+
+/// Ctrl-\, the key `remuda attach` already detaches by. ⚠ Also true of Ctrl-4:
+/// a terminal sends 0x1C for both, and crossterm spells that byte `C-4`. The
+/// conflation is the terminal's, and `client::attach` has always shared it.
+fn is_detach(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('\\') | KeyCode::Char('4'))
+}
+
+/// A keypress as the bytes a terminal would have sent, or `None` for a key we
+/// cannot spell — refused rather than sent as an empty burst, the rule
+/// `remuda_core::keys` already states. The spelling is that module's, reused.
+fn to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    let base = match key.code {
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "RET".into(),
+        KeyCode::Tab => "TAB".into(),
+        KeyCode::BackTab => "<backtab>".into(),
+        KeyCode::Backspace => "DEL".into(),
+        KeyCode::Esc => "ESC".into(),
+        KeyCode::Up => "<up>".into(),
+        KeyCode::Down => "<down>".into(),
+        KeyCode::Right => "<right>".into(),
+        KeyCode::Left => "<left>".into(),
+        KeyCode::Home => "<home>".into(),
+        KeyCode::End => "<end>".into(),
+        KeyCode::Insert => "<insert>".into(),
+        KeyCode::Delete => "<delete>".into(),
+        KeyCode::PageUp => "<prior>".into(),
+        KeyCode::PageDown => "<next>".into(),
+        KeyCode::F(n) => format!("<f{n}>"),
+        _ => return None,
+    };
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // Shift is deliberately absent: crossterm has already applied it to the
+    // character, and naming it again would ask for `C-S-a`, which xterm spells
+    // with a CSI parameter that a plain letter has no room for.
+    let spec = format!(
+        "{}{}{base}",
+        if ctrl { "C-" } else { "" },
+        if alt { "M-" } else { "" }
+    );
+    remuda_core::keys::key(&spec)
 }
 
 /// List width and preview width, divider excluded. The preview claims what the
@@ -267,11 +348,14 @@ fn fit(text: &str, width: u16) -> String {
 /// The whole frame as one string of text and ANSI cursor moves. Pure on
 /// purpose: this is the part a test can read without owning a terminal.
 pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> String {
-    // No herd means nothing to preview, so the list is not squeezed for a pane
-    // that would be blank — and the empty-herd sentence fits.
-    let widest = ui.sessions.iter().map(|s| s.size.cols()).max().unwrap_or(0);
-    let (list_w, preview_w) = layout(cols, widest);
+    let (list_w, preview_w) = layout(cols, widest(ui));
     let body = rows.saturating_sub(1);
+    // The border, and the only thing on screen that is always saying where the
+    // keyboard is pointing. A prefix key's state is invisible; this is not.
+    let divider = match ui.focus {
+        Focus::List => "│",
+        Focus::Session => "\x1b[7m┃\x1b[0m",
+    };
 
     let (lines, cut) = crop(screen, preview_w, body, ui.pan);
     let mut out = String::from("\x1b[H\x1b[2J");
@@ -286,7 +370,7 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
             list_row(ui, row as usize - 1, list_w)
         };
         out.push_str(&fit(&left, list_w));
-        out.push('│');
+        out.push_str(divider);
         let line = lines.get(row as usize).map_or("", String::as_str);
         out.push_str(&fit(line, preview_w));
     }
@@ -296,15 +380,32 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
     out
 }
 
+/// The widest session in the herd, which is what the preview column claims —
+/// from the herd rather than the cursor, so the divider does not jump. Zero
+/// when there is no herd: nothing to preview, so nothing to reserve.
+fn widest(ui: &Ui) -> u16 {
+    ui.sessions.iter().map(|s| s.size.cols()).max().unwrap_or(0)
+}
+
+/// The size a session started from here is given: the pane it will live in.
+/// Nothing can resize a pty afterwards (PRINCIPLES §6), so this is the only
+/// chance to make it fit — and `Size::new` still floors it at 80×24.
+pub fn pane_size(ui: &Ui, cols: u16, rows: u16) -> Size {
+    let (_, preview_w) = layout(cols, widest(ui));
+    Size::new(preview_w, rows.saturating_sub(1))
+}
+
 /// A row that degrades instead of being cut. When the preview claims most of
 /// the terminal the list can floor at 16 columns, and a truncated row loses
 /// `live`/`dead` — the one field the whole list exists to show.
 fn list_row(ui: &Ui, row: usize, width: u16) -> String {
     if ui.sessions.is_empty() {
-        return if row == 1 {
-            "  the herd is empty.".into()
-        } else {
-            String::new()
+        // The empty herd says what it is and what to do about it. It does not
+        // open a prompt on its own, and it never starts anything by itself.
+        return match row {
+            1 => "  the herd is empty.".into(),
+            3 => "  press n to start a session.".into(),
+            _ => String::new(),
         };
     }
     let Some(session) = ui.sessions.get(row) else {
@@ -329,54 +430,48 @@ fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
     match &ui.mode {
         Mode::Prompt(buffer) => format!("start: {buffer}▏   ⏎ run · esc cancel"),
         Mode::Confirm(name) => format!("kill {name}? it is running — y / n"),
+        // Focus is named in words as well as drawn, because the one thing a
+        // person must never wonder is where their next keystroke lands.
+        Mode::Browse if ui.focus == Focus::Session => format!(
+            "▶ {} — every key goes to the session{}   ctrl-\\ back to the list",
+            ui.selected().map_or("", |s| s.name.as_str()),
+            if cut { format!("   showing {preview_w} cols") } else { String::new() },
+        ),
         Mode::Browse => match &ui.notice {
             Some(notice) => format!("remuda: {notice}"),
+            None if ui.sessions.is_empty() => "n new   q quit".into(),
             None if cut => format!(
-                "↑↓ select   ⏎ ride   n new   x kill   showing {preview_w} cols — h/l pans   q quit"
+                "↑↓ select   ⏎ enter   n new   x kill   showing {preview_w} cols — h/l pans   q quit"
             ),
-            None => "↑↓ select   ⏎ ride   n new   x kill   q quit".into(),
+            None => "↑↓ select   ⏎ enter   n new   x kill   q quit".into(),
         },
     }
 }
 
-/// Browse until the user quits or picks a session, then ride it and come back.
-/// The guard is dropped inside [`browse`] before handing over, so one owner
-/// enters the alternate screen at a time. `notice` is what stderr cannot reach.
-pub fn run(path: &Path, server: &str, mut notice: Option<String>) -> std::io::Result<()> {
-    let mut last = None;
-    loop {
-        match browse(path, server, notice.take(), last.as_deref())? {
-            None => return Ok(()),
-            Some(name) => {
-                match client::attach(path, &name) {
-                    Ok(Left::Detached) => {}
-                    Ok(Left::Exited) => {
-                        notice = Some(format!("{name} exited — its screen is kept; x clears it"));
-                    }
-                    Err(e) => notice = Some(format!("attach {name}: {e}")),
-                }
-                last = Some(name);
-            }
-        }
-    }
-}
-
-fn browse(
-    path: &Path,
-    server: &str,
-    notice: Option<String>,
-    select: Option<&str>,
-) -> std::io::Result<Option<String>> {
+/// Draw the herd until the user quits. One screen for the whole run: focus
+/// moves between the panes, and the terminal is never handed over, so the
+/// alternate screen is entered exactly once. `notice` is what stderr cannot reach.
+pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result<()> {
     let _terminal = RawMode::enable()?;
     let shell = crate::daemon::default_shell();
     let mut ui = Ui::new(list(path), &shell, notice);
-    // Coming back from a ride lands where you left, not at the top.
-    ui.select_named(select);
     let mut painted = String::new();
+    // The exclusive hold on the focused session, and the name it was taken on.
+    // Its `Drop` is the detach, so letting it fall out of scope is the release.
+    let mut held: Option<(String, Hold)> = None;
 
     loop {
         ui.sessions = list(path);
         ui.clamp();
+        ui.follow_focus(held.as_ref().map(|(name, _)| name.as_str()));
+        // Dropping the hold is the detach, and this is the only place it
+        // happens: focus went back to the list, or the session ended under it.
+        if ui.focus == Focus::List {
+            held = None;
+        } else if held.is_none() {
+            held = take(path, &mut ui);
+        }
+
         let screen = ui
             .selected()
             .map(|s| capture(path, &s.name))
@@ -393,7 +488,12 @@ fn browse(
             painted = frame;
         }
 
-        if !crossterm::event::poll(TICK)? {
+        let tick = if ui.focus == Focus::Session {
+            TICK_TYPING
+        } else {
+            TICK
+        };
+        if !crossterm::event::poll(tick)? {
             continue;
         }
         let Event::Key(key) = crossterm::event::read()? else {
@@ -405,15 +505,40 @@ fn browse(
         }
         match ui.on_key(key) {
             Action::Nothing => {}
-            Action::Quit => return Ok(None),
-            Action::Ride(name) => return Ok(Some(name)),
+            Action::Quit => return Ok(()),
+            Action::Type(bytes) => {
+                if let Some((name, hold)) = &held {
+                    if let Err(e) = hold.keys(&bytes) {
+                        ui.notice = Some(format!("{name}: {e}"));
+                        ui.focus = Focus::List;
+                    }
+                }
+            }
             Action::Start(command) => {
-                ui.notice = start(path, &command).err();
+                ui.notice = start(path, &command, pane_size(&ui, cols, rows)).err();
                 ui.sessions = list(path);
             }
             Action::Kill(name) => ui.notice = kill(path, &name).err(),
         }
         painted.clear();
+    }
+}
+
+/// Take the exclusive hold focus needs, or say why not and stay on the list.
+/// The refusal is the daemon's — a session someone else attached is refused
+/// there, not here, so a second viewer over any transport is refused too.
+fn take(path: &Path, ui: &mut Ui) -> Option<(String, Hold)> {
+    let Some(name) = ui.selected().map(|s| s.name.clone()) else {
+        ui.focus = Focus::List;
+        return None;
+    };
+    match client::hold(path, &name) {
+        Ok(hold) => Some((name, hold)),
+        Err(e) => {
+            ui.notice = Some(format!("{name}: {e}"));
+            ui.focus = Focus::List;
+            None
+        }
     }
 }
 
@@ -436,14 +561,14 @@ fn capture(path: &Path, name: &str) -> String {
     }
 }
 
-/// A session's size is the size of the terminal that will ride it, never the
-/// size of the pane previewing it — a preview is a transient layout decision
-/// and the pty's size is permanent.
-fn start(path: &Path, command: &str) -> Result<(), String> {
+/// A session started here is sized to the pane it will live in, and keeps that
+/// size for life — nothing can resize a pty (PRINCIPLES §6). Sizing it to the
+/// whole terminal instead would guarantee a crop the list can never give back.
+fn start(path: &Path, command: &str, size: Size) -> Result<(), String> {
     let request = Request::New {
         name: None,
         command: command.split_whitespace().map(str::to_string).collect(),
-        size: crate::terminal_size(),
+        size,
     };
     match client::request(path, &request) {
         Ok(Response::Value(_)) => Ok(()),
@@ -497,10 +622,119 @@ mod tests {
     }
 
     #[test]
-    fn enter_rides_the_selected_session() {
+    fn enter_points_the_keyboard_at_the_selected_session() {
         let mut ui = ui(vec![row("a", true, false), row("b", true, false)]);
         ui.on_key(press(KeyCode::Char('j')));
-        assert_eq!(ui.on_key(press(KeyCode::Enter)), Action::Ride("b".into()));
+        assert_eq!(ui.on_key(press(KeyCode::Enter)), Action::Nothing);
+        assert_eq!(ui.focus, Focus::Session);
+        assert_eq!(ui.selected().unwrap().name, "b");
+        // The list stays on screen: nothing about entering removes a session.
+        assert_eq!(ui.sessions.len(), 2);
+    }
+
+    /// The bug this whole mode exists to make impossible: in the list `x` kills
+    /// and `q` quits, and inside a session both must be plain text.
+    #[test]
+    fn with_focus_on_the_session_the_command_keys_are_just_text() {
+        let mut ui = ui(vec![row("sh", true, false)]);
+        ui.on_key(press(KeyCode::Enter));
+        for (code, byte) in [('x', b'x'), ('q', b'q'), ('n', b'n'), ('y', b'y')] {
+            assert_eq!(
+                ui.on_key(press(KeyCode::Char(code))),
+                Action::Type(vec![byte]),
+                "{code} must reach the pty, not remuda"
+            );
+        }
+        assert_eq!(ui.mode, Mode::Browse, "no prompt, no kill confirmation");
+        assert_eq!(ui.focus, Focus::Session, "and the keyboard has not moved");
+    }
+
+    #[test]
+    fn ctrl_backslash_is_the_only_key_that_comes_back() {
+        let mut ui = ui(vec![row("sh", true, false)]);
+        ui.on_key(press(KeyCode::Enter));
+        assert_eq!(ui.focus, Focus::Session);
+        let detach = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+        assert_eq!(ui.on_key(detach), Action::Nothing);
+        assert_eq!(ui.focus, Focus::List);
+        // And now the same keys are commands again.
+        assert_eq!(ui.on_key(press(KeyCode::Char('q'))), Action::Quit);
+    }
+
+    /// crossterm reports 0x1C as `C-4`, because a terminal sends that byte for
+    /// Ctrl-\ and Ctrl-4 alike. Accepting only `C-\` would leave the key dead
+    /// on unix — measured against crossterm 0.29's own parser.
+    #[test]
+    fn the_detach_byte_is_recognised_however_crossterm_spells_it() {
+        for code in [KeyCode::Char('\\'), KeyCode::Char('4')] {
+            let mut ui = ui(vec![row("sh", true, false)]);
+            ui.on_key(press(KeyCode::Enter));
+            ui.on_key(KeyEvent::new(code, KeyModifiers::CONTROL));
+            assert_eq!(ui.focus, Focus::List, "{code:?} did not come back");
+        }
+    }
+
+    #[test]
+    fn a_key_reaches_the_pty_as_the_bytes_a_terminal_would_have_sent() {
+        let mut ui = ui(vec![row("sh", true, false)]);
+        ui.on_key(press(KeyCode::Enter));
+        // Enter is CR, not LF: canonical mode takes CR as submit.
+        assert_eq!(
+            ui.on_key(press(KeyCode::Enter)),
+            Action::Type(b"\r".to_vec())
+        );
+        assert_eq!(
+            ui.on_key(press(KeyCode::Up)),
+            Action::Type(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            ui.on_key(press(KeyCode::Backspace)),
+            Action::Type(vec![0x7f]),
+            "backspace sends DEL, not BS"
+        );
+        assert_eq!(
+            ui.on_key(press(KeyCode::BackTab)),
+            Action::Type(b"\x1b[Z".to_vec()),
+            "shift-tab is its own sequence, and agents cycle modes on it"
+        );
+        assert_eq!(
+            ui.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Type(vec![0x03]),
+            "Ctrl-C interrupts the program, it does not quit remuda"
+        );
+    }
+
+    #[test]
+    fn a_session_that_ends_hands_the_keyboard_back() {
+        let mut ui = ui(vec![row("sh", true, false)]);
+        ui.on_key(press(KeyCode::Enter));
+        assert_eq!(ui.focus, Focus::Session);
+        // What the next `List` returns once the shell has exited and closed.
+        ui.sessions.clear();
+        ui.clamp();
+        ui.follow_focus(Some("sh"));
+        assert_eq!(ui.focus, Focus::List);
+    }
+
+    /// The keyboard is pointed at a name, not at a row. A session vanishing
+    /// above the focused one shifts every row below it, and focus following the
+    /// row would start typing into a neighbour.
+    #[test]
+    fn focus_follows_the_session_when_the_herd_shifts_under_it() {
+        let mut ui = ui(vec![
+            row("a", true, false),
+            row("b", true, false),
+            row("c", true, false),
+        ]);
+        ui.on_key(press(KeyCode::Char('j')));
+        ui.on_key(press(KeyCode::Enter));
+        assert_eq!(ui.selected().unwrap().name, "b");
+
+        ui.sessions.remove(0);
+        ui.clamp();
+        ui.follow_focus(Some("b"));
+        assert_eq!(ui.focus, Focus::Session);
+        assert_eq!(ui.selected().unwrap().name, "b", "not c");
     }
 
     #[test]
@@ -543,14 +777,16 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_herd_opens_the_prompt_prefilled_rather_than_spawning_silently() {
+    fn an_empty_herd_invites_and_does_not_open_a_prompt_by_itself() {
         let ui = ui(vec![]);
-        assert_eq!(ui.mode, Mode::Prompt("/bin/sh".into()));
+        assert_eq!(ui.mode, Mode::Browse, "nothing was opened for the user");
+        assert_eq!(ui.focus, Focus::List);
     }
 
     #[test]
     fn the_prompt_edits_and_starts_what_it_shows() {
         let mut ui = ui(vec![]);
+        ui.on_key(press(KeyCode::Char('n')));
         ui.on_key(press(KeyCode::Backspace));
         for c in "!".chars() {
             ui.on_key(press(KeyCode::Char(c)));
@@ -567,7 +803,11 @@ mod tests {
     fn esc_leaves_the_prompt_without_starting_anything() {
         let mut ui = ui(vec![row("a", true, false)]);
         ui.on_key(press(KeyCode::Char('n')));
-        assert_eq!(ui.mode, Mode::Prompt(String::new()));
+        assert_eq!(
+            ui.mode,
+            Mode::Prompt("/bin/sh".into()),
+            "n prefills the shell — the prompt is the same wherever it came from"
+        );
         assert_eq!(ui.on_key(press(KeyCode::Esc)), Action::Nothing);
         assert_eq!(ui.mode, Mode::Browse);
     }
@@ -584,7 +824,7 @@ mod tests {
         // of a program with a `q` in it quits.
         ui.on_key(press(KeyCode::Char('n')));
         assert_eq!(ui.on_key(press(KeyCode::Char('q'))), Action::Nothing);
-        assert_eq!(ui.mode, Mode::Prompt("q".into()));
+        assert_eq!(ui.mode, Mode::Prompt("/bin/shq".into()));
     }
 
     #[test]
@@ -637,7 +877,8 @@ mod tests {
         assert!(frame.contains("remuda · default"));
         assert!(frame.contains("▸ claude"), "the cursor is on the first row");
         assert!(frame.contains('⚑'), "and the busy one is flagged");
-        assert!(frame.contains("⏎ ride"), "the footer teaches the keys");
+        assert!(frame.contains("⏎ enter"), "the footer teaches the keys");
+        assert!(frame.contains('│'), "and the border is the quiet one");
     }
 
     /// The preview column of each row — where a ride puts the same content.
@@ -667,16 +908,26 @@ mod tests {
         );
     }
 
+    /// The pane is where a session will live for its whole life, and nothing
+    /// can resize a pty afterwards — so sizing it to the whole terminal would
+    /// crop it permanently against a list that is now never going away.
     #[test]
-    fn coming_back_from_a_ride_lands_where_you_left() {
-        let mut ui = ui(vec![row("a", true, false), row("b", true, false)]);
-        ui.select_named(Some("b"));
-        assert_eq!(ui.selected, 1);
-        ui.select_named(Some("gone-while-you-were-away"));
-        assert_eq!(
-            ui.selected, 1,
-            "a vanished session does not move the cursor"
-        );
+    fn a_session_started_here_is_sized_to_the_pane_not_the_terminal() {
+        let empty = ui(vec![]);
+        let first = pane_size(&empty, 160, 40);
+        assert_eq!((first.cols(), first.rows()), (119, 39));
+
+        // And once it exists, the layout it caused fits it exactly.
+        let mut herd = ui(vec![row("sh", true, false)]);
+        herd.sessions[0].size = first;
+        let (_, preview_w) = layout(160, widest(&herd));
+        assert_eq!(preview_w, first.cols(), "the second frame must not crop it");
+    }
+
+    #[test]
+    fn a_pane_below_the_floor_is_raised_rather_than_dropping_keystrokes() {
+        let size = pane_size(&ui(vec![]), 80, 24);
+        assert_eq!((size.cols(), size.rows()), (80, 24), "Size::new's floor");
     }
 
     #[test]
@@ -713,13 +964,36 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_herd_renders_its_own_sentence() {
+    fn an_empty_herd_says_so_and_says_what_to_do_about_it() {
         let ui = ui(vec![]);
         let frame = render(&ui, "", "default", 80, 10);
         assert!(frame.contains("the herd is empty."));
         assert!(
-            frame.contains("start: /bin/sh"),
-            "prefilled, and it says what it will run"
+            frame.contains("press n to start a session."),
+            "an empty screen that only states a fact leaves a new user stuck"
         );
+        assert!(
+            !frame.contains("start: "),
+            "and no prompt was opened on the user's behalf"
+        );
+        assert!(
+            frame.contains("n new   q quit"),
+            "the footer drops what a herdless screen cannot do"
+        );
+    }
+
+    /// The focused pane is drawn, not remembered — the improvement over a
+    /// prefix key, whose state exists only in the user's head.
+    #[test]
+    fn which_pane_has_the_keyboard_is_on_screen_either_way() {
+        let mut ui = ui(vec![row("sh", true, false)]);
+        let list = render(&ui, "hello", "default", 120, 10);
+        ui.on_key(press(KeyCode::Enter));
+        let session = render(&ui, "hello", "default", 120, 10);
+        assert_ne!(list, session, "the two states must not look alike");
+        assert!(session.contains('┃'), "the focused border is heavier");
+        assert!(!list.contains('┃'));
+        assert!(session.contains("every key goes to the session"));
+        assert!(session.contains("ctrl-\\ back to the list"));
     }
 }

@@ -168,10 +168,11 @@ a script are three doors into it. State persists between them:
                                   own sessions, the way several claude configs
                                   coexist under different home directories.
 
-A session that dies on its own is not removed automatically — its last screen
-is exactly the evidence for why it died, so `ls` keeps showing it as `dead`
-until something calls `close` on it. `close` also refuses on an attached
-session, the same way `send` does, rather than disconnecting a human.
+A session whose program exits closes itself and leaves the list. Its last
+screen is the evidence for why it died, so set REMUDA_KEEP_EXITED=1 in the
+daemon's environment to keep it listed as `dead` until something calls `close`.
+`close` refuses on an attached session, the same way `send` does, rather than
+disconnecting a human.
 
 In a script they live on one table, and a refusal is raised, not returned:
 
@@ -229,11 +230,23 @@ fn ride(path: &Path, name: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Left::Exited) => {
-            eprintln!("remuda: {name} exited — kept as dead, its last screen is in `remuda ls`");
+            eprintln!("remuda: {name} exited — {}", fate(path, name));
             eprintln!("remuda: you are back in your own shell");
             ExitCode::SUCCESS
         }
         Err(e) => fail(format!("attach: {e}")),
+    }
+}
+
+/// Whether the session survived its own exit — asked, not assumed. Only the
+/// daemon knows whether it was started with REMUDA_KEEP_EXITED, and `List` is
+/// where an exited session is dropped, so this reads the answer it just made.
+fn fate(path: &Path, name: &str) -> String {
+    match remuda_native::client::request(path, &Request::List) {
+        Ok(Response::Sessions(sessions)) if sessions.iter().any(|s| s.name == name) => {
+            "kept as dead, its last screen is in `remuda ls`".into()
+        }
+        _ => "the session is gone; REMUDA_KEEP_EXITED=1 in the daemon keeps it".into(),
     }
 }
 

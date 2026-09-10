@@ -173,6 +173,70 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
     Ok(left)
 }
 
+/// A session held for a human typing into a pane rather than into the whole
+/// terminal. The same exclusive `Attach` a ride takes, so orchestrated input is
+/// refused while a person drives — PRINCIPLES §6, invariant 3.
+pub struct Hold {
+    stream: Stream,
+    drain: Option<std::thread::JoinHandle<()>>,
+}
+
+/// Take a session for the TUI's focused pane. The output is *not* handed back:
+/// a pane repaints from `Capture`, which crops to its own width and cannot be
+/// fed raw pty bytes aimed at a whole terminal.
+pub fn hold(path: &Path, name: &str) -> std::io::Result<Hold> {
+    let stream = ipc::connect(path)?;
+    send(
+        &stream,
+        &Request::Attach {
+            name: name.to_string(),
+        },
+    )?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    match interpret(&line) {
+        Response::Ok => {}
+        Response::Error(reason) => return Err(std::io::Error::other(reason)),
+        _ => return Err(std::io::Error::other("daemon did not acknowledge attach")),
+    }
+    // Drained rather than ignored: the daemon repaints and then streams, and an
+    // unread socket fills and parks its output pump.
+    let drain = std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+        }
+    });
+    Ok(Hold {
+        stream,
+        drain: Some(drain),
+    })
+}
+
+impl Hold {
+    /// Type exactly these bytes: one `write_all`, nothing appended — the terms
+    /// `Attached::write_raw` sets one layer down.
+    pub fn keys(&self, bytes: &[u8]) -> std::io::Result<()> {
+        let mut stream = &self.stream;
+        stream.write_all(bytes)?;
+        stream.flush()
+    }
+}
+
+impl Drop for Hold {
+    /// Hanging up is what releases the guard, so it has to survive a panic or an
+    /// early return — a guard outliving its viewer is the deadlock step 012 met.
+    fn drop(&mut self) {
+        ipc::wake(&self.stream);
+        if let Some(drain) = self.drain.take() {
+            let _ = drain.join();
+        }
+    }
+}
+
 /// Raw mode plus the alternate screen, restored on the way out. Restoring must
 /// stay in `Drop`: the exits that matter — an error, a panic, a `?` — are
 /// exactly the ones that skip the end of `attach`.

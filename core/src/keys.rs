@@ -84,6 +84,9 @@ fn named(spec: &str) -> Option<&'static [u8]> {
         "RET" | "return" | "enter" => b"\r",
         "LFD" | "linefeed" => b"\n",
         "TAB" | "tab" => b"\t",
+        // Shift-Tab is not Tab with a modifier: the terminal sends its own
+        // sequence, and an agent TUI cycling modes on it needs exactly this one.
+        "backtab" => b"\x1b[Z",
         "SPC" | "space" => b" ",
         "ESC" | "escape" => b"\x1b",
         // What the Backspace key actually sends on a modern terminal. Emacs

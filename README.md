@@ -32,18 +32,31 @@ for a human** in a way the Lua image cannot. Everything else — `new`, `close`,
 remuda -e 'remuda.close("build")'
 ```
 
-Two modes, no prefix key and no config file. **browse** is the list beside a
-read-only preview and the keys drive remuda; **ride** is the session owning the
-whole terminal and every key going to the pty. `Ctrl-\` is the boundary, and it
-is the same key `remuda attach` already used.
+One screen and no prefix key. The list is always on the left and the selected
+session is always on the right; what moves is **focus**. With focus on the list
+the keys drive remuda; with focus on the session every key — `x` and `q`
+included — is typed into the pty, and `Ctrl-\` brings focus back. The border
+says which, always, which is the part tmux leaves in your head.
 
 ```
-↑↓ select   ⏎ ride   n new   x kill   h/l pan a cropped preview   q quit
+↑↓ select   ⏎ enter   n new   x kill   h/l pan a cropped preview   q quit
 ```
 
-remuda enters the alternate screen while you ride, so **leaving looks like
-leaving**: your own scrollback and prompt come back, and a line says which way
-you left and how to get back.
+One key rather than a prefix, because a prefix exists to open a *namespace* and
+there is exactly one command from inside a session. One keypress is also one
+byte, so it carries no inter-key timing for a stack of nested ttys to mangle.
+`Ctrl-\` is the key `remuda attach` already leaves by, not a second one.
+
+⚠ A program that takes the whole screen and every key — vim, a nested tmux, an
+agent's own TUI — can swallow `Ctrl-\` before remuda sees it. `remuda attach`
+has always had that ceiling and this shares it.
+
+A session whose program exits closes itself and leaves the list. Set
+`REMUDA_KEEP_EXITED=1` in the daemon's environment to keep it listed as `dead`
+instead — its last screen is the evidence for why it died.
+
+remuda enters the alternate screen, so **leaving looks like leaving**: your own
+scrollback and prompt come back, and a line says how to get back.
 
 ## Install
 
