@@ -71,26 +71,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # ONE macOS host builds BOTH macOS targets. `macos-13` held the Intel
-          # slice and is being retired by GitHub: run 34438277779 sat 27 minutes
-          # with `labels=["macos-13"]` and `started_at == created_at`, never
-          # assigned a runner, and since `publish` needs every build, one dead
-          # label withheld ALL assets on every platform. A permanently-queued
-          # job is worse than an absent one — it looks merely slow. Intel mac
-          # was dropped in ce56928 and comes back here as a cross-compile.
+          # Every entry here has been built by a real runner, and that bar is the
+          # rule: `publish` is strict, so a target no runner picks up withholds
+          # ALL assets, and a permanently-queued job looks merely slow.
+          # `macos-13` proved it — run 34438277779, 27 minutes with
+          # `started_at == created_at` and no runner, and nothing shipped.
           #
-          # `[self-hosted, macOS, ARM64]` is warmblood-macbook-runner-1, a
-          # PHYSICAL office machine. It is persistent, not an image: assume
-          # nothing about its state, install nothing system-wide, and never let
-          # a `pull_request` reach it (see the trigger note above).
+          # `[self-hosted, macOS, ARM64]` (warmblood-macbook-runner-1, a PHYSICAL
+          # office machine) failed the SAME way for this repo: run 34443114624,
+          # both macOS jobs 11 minutes with an empty `runner_name`, while linux
+          # and windows built beside them. A runner group must admit a PUBLIC
+          # repo and that is an org admin's call, so macOS stays on GitHub's
+          # runner — free here, measured: `billable.MACOS.total_ms = 0`.
+          # Intel mac waits for a host that can answer whether mlua's vendored
+          # C cross-compiles from arm64; nobody has built it yet.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04 # older glibc → runs on more distros
             bin: remuda
           - target: aarch64-apple-darwin
-            os: [self-hosted, macOS, ARM64]
-            bin: remuda
-          - target: x86_64-apple-darwin
-            os: [self-hosted, macOS, ARM64] # cross-compiled; Xcode ships both SDKs
+            os: macos-14
             bin: remuda
           - target: x86_64-pc-windows-msvc
             os: windows-latest

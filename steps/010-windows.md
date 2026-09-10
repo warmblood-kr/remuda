@@ -288,3 +288,27 @@ Say it plainly rather than implying support:
   function it tests does not exist there — paths travel to PowerShell as
   environment variables, never quoted into script text. That is the only test
   gated by platform, and it is gated because there is nothing to call.
+
+## Resolution before merge — macOS went back to GitHub's runner
+
+The self-hosted macOS entries above were reverted to `macos-14` and
+`x86_64-apple-darwin` was dropped from the matrix, so what merges is exactly
+the previously-shipping set plus Windows. Three reasons, in order of weight:
+
+1. **Merging as written would have stopped macOS assets from publishing**, and
+   the person who asked for Windows installs on Apple Silicon. `publish` is
+   strict by the deliberate argument in `release.yml`, so a macOS job that no
+   runner accepts withholds Linux and Windows too.
+2. **The self-hosted blocker is not ours to clear.** A runner group must admit a
+   public repository; `repos/warmblood-kr/remuda/actions/runners` is
+   `total_count: 0` and the org endpoint answers 403 without `admin:org`.
+   Guessing which it is, or quietly falling back, would make "allowed" and
+   "blocked" look identical — the failure this whole step is about.
+3. **The reason for self-hosted was cost, and the cost is zero here.** GitHub's
+   billing API for run 34438277779: `billable.MACOS.total_ms = 0`, because
+   standard runners are free on public repositories. The office Mac still earns
+   its keep on the private repos, where the multiplier is real.
+
+`x86_64-apple-darwin` stays out until some host answers the mlua cross-compile
+question. It has never been built; shipping a matrix entry on the strength of
+"Xcode has both SDKs" would be the same unmeasured optimism as the line above.
