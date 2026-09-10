@@ -17,7 +17,7 @@
 
 use crate::client::{self, Hold, RawMode};
 use remuda_core::agent::{Color, StyledCell};
-use remuda_core::protocol::{Request, Response};
+use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
 use remuda_core::Size;
 use std::io::Write;
@@ -712,19 +712,22 @@ fn should_refresh(forced: bool, since_last: Duration) -> bool {
 
 /// The one expensive act of a frame: relist the herd, take or release the
 /// focus hold, capture the focused screen and repaint if that changed
-/// anything on screen. Called on `should_refresh`, not on every poll wake.
+/// anything. `skip_list` skips the relist for a `Type`-forced wake. See steps/022.
 fn refresh(
     path: &Path,
     server: &str,
     ui: &mut Ui,
     held: &mut Option<(String, Hold)>,
     painted: &mut String,
+    skip_list: bool,
 ) -> std::io::Result<(u16, u16)> {
-    match list(path) {
-        Ok(sessions) => ui.sessions = sessions,
-        // Keep the last known herd rather than blanking it: a transport
-        // failure is not a report that every session vanished. See steps/021.
-        Err(e) => ui.notice = Some(e),
+    if !skip_list {
+        match list(path) {
+            Ok(sessions) => ui.sessions = sessions,
+            // Keep the last known herd rather than blanking it: a transport
+            // failure is not a report that every session vanished. See steps/021.
+            Err(e) => ui.notice = Some(e),
+        }
     }
     ui.clamp();
     ui.follow_focus(held.as_ref().map(|(name, _)| name.as_str()));
@@ -783,13 +786,17 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     let mut held: Option<(String, Hold)> = None;
     let mut last_refresh = Instant::now();
     let mut force_refresh = true;
+    // Set only by an `Action::Type` below, consumed by the very next refresh,
+    // then always cleared — never carried into a tick-driven refresh.
+    let mut skip_list = false;
     let (mut cols, mut rows) = (80u16, 24u16);
 
     loop {
         if should_refresh(force_refresh, last_refresh.elapsed()) {
             force_refresh = false;
             last_refresh = Instant::now();
-            (cols, rows) = refresh(path, server, &mut ui, &mut held, &mut painted)?;
+            (cols, rows) = refresh(path, server, &mut ui, &mut held, &mut painted, skip_list)?;
+            skip_list = false;
         }
 
         let tick = if ui.focus == Focus::Session {
@@ -807,7 +814,9 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        match ui.on_key(key) {
+        let action = ui.on_key(key);
+        skip_list = matches!(action, Action::Type(_));
+        match action {
             Action::Nothing => {}
             Action::Quit => return Ok(()),
             Action::Type(bytes) => {
@@ -862,9 +871,8 @@ fn list(path: &Path) -> Result<Vec<SessionSummary>, String> {
     }
 }
 
-/// Styled counterpart of the (now unused) plain `capture` — see steps/020.
-/// Surfaces the daemon's own words on failure instead of discarding them —
-/// see steps/021.
+/// Styled counterpart of the (now unused) plain `capture` — see steps/020,
+/// 021. The wire carries runs, expanded back to cells here — see steps/022.
 fn capture_styled(path: &Path, name: &str) -> Result<Vec<Vec<StyledCell>>, String> {
     match client::request(
         path,
@@ -872,7 +880,7 @@ fn capture_styled(path: &Path, name: &str) -> Result<Vec<Vec<StyledCell>>, Strin
             name: name.to_string(),
         },
     ) {
-        Ok(Response::StyledScreen(cells)) => Ok(cells),
+        Ok(Response::StyledScreen(runs)) => Ok(runs.iter().map(|row| expand_runs(row)).collect()),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
     }
@@ -1589,6 +1597,41 @@ mod tests {
             err.contains("no such session"),
             "the fix must surface what the daemon actually said, not a made-up \
              message: {err:?}"
+        );
+    }
+
+    /// [MEASURED] `skip_list=true` really skips the relist, and
+    /// `skip_list=false` — all a `Start`/`Kill` wake ever uses — still sees
+    /// a herd change. See steps/022.
+    #[test]
+    fn refresh_skips_the_herd_relist_only_when_asked() {
+        let path = scratch_socket("refresh-skip-list");
+        daemon_at(&path);
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        refresh(&path, "default", &mut ui, &mut held, &mut painted, false).unwrap();
+        assert_eq!(ui.sessions.len(), 1, "the first session must be seen");
+
+        // A herd change from elsewhere — exactly what a `Kill` from the list
+        // (which sets no `skip_list`) or a second client would produce.
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        refresh(&path, "default", &mut ui, &mut held, &mut painted, true).unwrap();
+        assert_eq!(
+            ui.sessions.len(),
+            1,
+            "skip_list=true must not relist — this is the optimisation"
+        );
+
+        refresh(&path, "default", &mut ui, &mut held, &mut painted, false).unwrap();
+        assert_eq!(
+            ui.sessions.len(),
+            2,
+            "skip_list=false must still see the herd change — a Start/Kill \
+             wake never sets skip_list, so it can never lose one"
         );
     }
 }
