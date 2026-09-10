@@ -1,5 +1,7 @@
 # remuda
 
+**tmux for coding agents** — a terminal orchestrator with a programmable layer.
+
 **re·mu·da** \ ri-ˈmü-də, -ˈmyü- \ — *the herd of horses from which those to be
 used for the day are chosen.* From American Spanish, "relay of horses"; from
 `remudar`, to exchange.
@@ -7,6 +9,22 @@ used for the day are chosen.* From American Spanish, "relay of horses"; from
 An orchestration core for coding-agent sessions. You keep a herd running, you
 attach to one and ride it, you swap to another. The herd outlives any single
 ride.
+
+## Programmable
+
+The daemon holds **one Lua interpreter for its whole lifetime**, so a script is
+not a one-shot subprocess. It keeps state between calls and drives the same herd
+the CLI drives.
+
+```lua
+remuda.new("reviewer", {"claude"})
+remuda.send("reviewer", "review the diff on this branch\n")
+print(remuda.capture("reviewer"))
+```
+
+The same herd is reachable over MCP — `new`, `ls`, `send`, `capture` — so an
+agent can drive other agents. `attach` is deliberately absent there: handing a
+real terminal to something that has none can only fail.
 
 ## Status
 
@@ -34,7 +52,7 @@ First slice. Three joints are here because they cannot be retrofitted later:
 The boundary is checked by the compiler:
 
 ```sh
-cargo check --target wasm32-unknown-unknown --no-default-features
+cargo check -p remuda-core --target wasm32-unknown-unknown
 ```
 
 That gate is real but **partial**, and the measurement is recorded in
@@ -46,8 +64,8 @@ and fail only at runtime. Closing that second axis needs a lint, not a target.
 ## Build
 
 ```sh
-cargo test                                                    # 9 invariants
-cargo check --target wasm32-unknown-unknown --no-default-features
+cargo test --workspace --all-targets                          # 52 tests
+cargo check -p remuda-core --target wasm32-unknown-unknown    # the boundary gate
 ```
 
 ## License

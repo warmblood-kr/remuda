@@ -1,0 +1,6 @@
+# GitHub Pages serves this directory when the repo is set to
+# "Deploy from a branch → main → /docs". Nothing else is needed — no workflow,
+# no build step. Turning it on is one setting.
+title: remuda
+description: tmux for coding agents — a terminal orchestrator with a programmable layer.
+theme: jekyll-theme-minimal
