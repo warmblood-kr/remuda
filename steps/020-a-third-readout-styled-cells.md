@@ -1,4 +1,4 @@
-# 019 — a third readout: styled cells, croppable
+# 020 — a third readout: styled cells, croppable
 
 `steps/018` migrated the plain-text preview onto `Viewport`/`Cell`, proved it
 a no-op, and deliberately punted two things: the pane still shows no colour,
@@ -97,24 +97,31 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
-test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+test result: ok. 61 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
-test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s
 test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
 
 $ cargo fmt --all --check                                    (exit 0)
 $ cargo clippy --workspace --all-targets -- -D warnings       Finished, no warnings
 $ python3 scripts/check-comments.py     ok — 231 doc comment(s) within cap (item 3, module 20)
-$ python3 scripts/check-steps.py        ok — 18 step(s), each with before, desired, expected and captured actual   (pre-019; this file added after)
-$ python3 scripts/check-principles.py   ok — 14 principles, every named mechanism exists (14 CI jobs, 11 denied paths, 242 test fns seen)
-$ python3 scripts/check-workflows.py    ok — 3 workflow file(s) parse, 14 job(s) defined
+$ python3 scripts/check-steps.py        ok — 20 step(s), each with before, desired, expected and captured actual
+$ python3 scripts/check-principles.py   ok — 14 principles, every named mechanism exists (16 CI jobs, 11 denied paths, 242 test fns seen)
+$ python3 scripts/check-workflows.py    ok — 3 workflow file(s) parse, 16 job(s) defined
 $ python3 scripts/check-install.py      ok — 3 target(s) built and offered (2 via install.sh, 1 via install.ps1): aarch64-apple-darwin, x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu
 ```
 
-No CI gate was added, and no new denied path — `gates-can-fail`/`PRINCIPLES.md`
-gain no new plant.
+Re-run in full after a rebase: this branch was first measured as `steps/019`, but
+a concurrent PR (#12, the cargo-audit gate) landed its own `steps/019` on `main`
+first — `check-steps.py` correctly rejects two files claiming the same number, so
+this file is `020` and every in-source pointer to it was updated to match. The 16
+CI jobs above (up from 14 in the first measurement) are PR #12's cargo-audit gate,
+not anything added here.
+
+No CI gate was added by this step, and no new denied path — `gates-can-fail`/
+`PRINCIPLES.md` gain no new plant.
 
 ## Not verified
 
@@ -124,7 +131,16 @@ gain no new plant.
 - **The colour mapping itself.** `Idx` → standard/bright ANSI 16-colour
   (`\x1b[3{n}m`/`\x1b[9{n-8}m` and the `4`/`10` background equivalents) and
   `Rgb` → truecolor (`\x1b[38;2;r;g;bm`) are built from the ANSI/vt100 spec,
-  not verified against a real terminal's rendering.
+  not verified against a real terminal's rendering. Narrower than it sounds,
+  though: the shipped TUI already writes raw SGR every frame (`\x1b[H\x1b[2J`
+  clears the screen, `\x1b[7m┃\x1b[0m` draws the focus divider), and 정수님
+  reported it drawing cleanly and structurally correctly on Windows Terminal —
+  if escapes did not reach his terminal, that draw would show as garbage
+  rather than a clean, correctly-cleared frame. That is inferred from the
+  existing frame's own escapes plus his report, not from anyone having watched
+  *this* step's styled output render. It narrows the open risk from "escapes
+  might not work at all" to "a specific colour index might map to the wrong
+  colour" — cosmetic, not a rendering regression.
 - **Windows.** No Windows host is available. Nothing in this step — the new
   wire messages, `PtyAgent::screen_cells`, or the renderer — has run or been
   seen on Windows.

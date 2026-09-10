@@ -280,7 +280,7 @@ mod tests {
 
     /// [MEASURED, Linux] `screen_cells` is the styled readout `screen_text`
     /// cannot be: the cells under "red" carry the colour, and a cell the
-    /// child never touched stays `Color::Default`. See steps/019.
+    /// child never touched stays `Color::Default`. See steps/020.
     #[test]
     fn screen_cells_carries_colour_that_screen_text_discards() {
         let mut cmd = CommandBuilder::new("printf");

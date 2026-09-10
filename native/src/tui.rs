@@ -316,7 +316,7 @@ impl Cell for char {
 }
 
 /// Same "1 for everything" stance as `impl Cell for char`, and for the same
-/// reason: CJK width is a separate, not-yet-fixed bug. See steps/019.
+/// reason: CJK width is a separate, not-yet-fixed bug. See steps/020.
 impl Cell for StyledCell {
     fn width(&self) -> u16 {
         1
@@ -500,7 +500,7 @@ fn sgr_codes(cell: &StyledCell) -> String {
 }
 
 /// One half (fg or bg) of a cell's colour, in the convention this codebase
-/// already writes raw escapes in — see steps/019 for why not `crossterm::style`.
+/// already writes raw escapes in — see steps/020 for why not `crossterm::style`.
 fn push_color(out: &mut String, color: Color, fg: bool) {
     match color {
         Color::Default => {}
@@ -512,7 +512,7 @@ fn push_color(out: &mut String, color: Color, fg: bool) {
     }
 }
 
-/// One row of styled cells as text plus minimal SGR — see steps/019 for the
+/// One row of styled cells as text plus minimal SGR — see steps/020 for the
 /// shape this has to satisfy (byte-identity when plain; minimal when not).
 fn render_styled_row(cells: &[StyledCell]) -> String {
     let mut out = String::new();
@@ -549,7 +549,7 @@ fn same_style(a: &StyledCell, b: &StyledCell) -> bool {
 }
 
 /// The styled counterpart of the free `crop`, byte-identical to it when
-/// every cell is plain — see steps/019's oracle.
+/// every cell is plain — see steps/020's oracle.
 fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool) {
     let viewport = Viewport::bottom_anchored(cells.len(), pan, cols, rows);
     let (cropped, cut) = viewport.crop(cells);
@@ -600,7 +600,7 @@ fn fit_styled(line: &str, width: u16) -> String {
 
 /// Same frame as [`render`], but the preview column carries real colour from
 /// a styled capture. Kept separate so the plain path and its byte-identity
-/// oracle are never perturbed — see steps/019.
+/// oracle are never perturbed — see steps/020.
 pub fn render_styled(
     ui: &Ui,
     cells: &[Vec<StyledCell>],
@@ -836,7 +836,7 @@ fn list(path: &Path) -> Vec<SessionSummary> {
     }
 }
 
-/// Styled counterpart of the (now unused) plain `capture` — see steps/019.
+/// Styled counterpart of the (now unused) plain `capture` — see steps/020.
 /// Empty grid on any error, matching `capture`'s empty-string convention.
 fn capture_styled(path: &Path, name: &str) -> Vec<Vec<StyledCell>> {
     match client::request(
@@ -1240,7 +1240,7 @@ mod tests {
 
     /// Every cell plain, so the styled path must degrade to exactly what the
     /// plain `crop` produces — same screens, same exhaustive sweep as the
-    /// migration oracle above. See steps/019.
+    /// migration oracle above. See steps/020.
     #[test]
     fn the_styled_crop_matches_plain_crop_when_every_cell_is_default() {
         let screens = [
