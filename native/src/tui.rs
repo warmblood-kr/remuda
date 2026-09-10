@@ -25,20 +25,13 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-/// How often an idle herd is relisted, its focused screen recaptured and the
-/// frame rebuilt. A key always forces an immediate refresh regardless of this
-/// (see [`should_refresh`]), so this cadence only bounds how quickly the
-/// child's own, unprompted output becomes visible.
+/// How often an idle herd is relisted, recaptured and redrawn — see
+/// [`should_refresh`]. A key always forces an immediate refresh regardless.
 const TICK: Duration = Duration::from_millis(250);
 
-/// How often the keyboard is polled while a session has focus — shorter than
-/// `TICK` so a keypress is never left waiting to be noticed. This used to
-/// also be the redraw cadence: every wake of this poll, key or not, re-ran
-/// the full (list, capture, render) cycle — an IPC round-trip for a whole
-/// screen snapshot among them — so an idle attached session cost ~25 of
-/// those a second, forever, and actually typing drove it higher still, one
-/// full cycle per keystroke on top of the timer. [`should_refresh`] is the
-/// fix: only a key or the slower `TICK` may trigger that cycle now.
+/// How often the keyboard is polled while a session has focus — shorter
+/// than `TICK` so a keypress is never left waiting to be noticed. Used to
+/// also be the redraw cadence; see steps/017 for why that was the bug.
 const TICK_TYPING: Duration = Duration::from_millis(40);
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -457,11 +450,9 @@ fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
     }
 }
 
-/// Whether the herd should be relisted, the focused screen recaptured and the
-/// frame rebuilt: forced right after a key changed state, or because `TICK`
-/// has elapsed since the last time — never on every wake of the input poll.
-/// Pure so the rate this bounds can be measured without a terminal or a
-/// daemon: see the `tests` module below.
+/// Whether the herd should be relisted, the focused screen recaptured and
+/// the frame rebuilt: forced right after a key, or because `TICK` has
+/// elapsed — never on every wake of the input poll. See steps/017.
 fn should_refresh(forced: bool, since_last: Duration) -> bool {
     forced || since_last >= TICK
 }
@@ -636,13 +627,8 @@ mod tests {
     use super::*;
     use remuda_core::Size;
 
-    /// The regression this whole change exists for: before `should_refresh`,
-    /// `run` redid the full (list, capture, render) cycle — an IPC round-trip
-    /// for a whole screen snapshot among them — on every wake of the input
-    /// poll, key or not. With a session focused that poll wakes every
-    /// `TICK_TYPING` (40ms), so one idle second was 25 of those cycles.
-    /// Simulate that second here, with no key ever pressed, and assert the
-    /// count stays down at `TICK`'s cadence (4/s) instead.
+    /// The regression this change guards: an idle focused session must not
+    /// redo the full IPC cycle on every `TICK_TYPING` wake. See steps/017.
     #[test]
     fn an_idle_focused_session_refreshes_on_the_slow_tick_not_every_poll_wake() {
         let mut refreshes = 0;
