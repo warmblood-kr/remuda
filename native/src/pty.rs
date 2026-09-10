@@ -4,25 +4,19 @@
 //!
 //! A coding agent redraws its screen. Accumulating raw pty bytes gives you the
 //! *history of the drawing*, not the picture — and `Cursor` is unobtainable
-//! from raw bytes at all. The existing Emacs implementation distinguishes real
-//! typed input from ghost/autocomplete text **by cursor column**, so cursor
-//! queryability is a hard requirement on whatever parses the stream, not a
-//! nice-to-have.
+//! from raw bytes at all. Ghost/autocomplete text is told from real typed input
+//! **by cursor column**, so ⚠ cursor queryability is a hard requirement on
+//! whatever parses the stream, not a nice-to-have.
 //!
 //! # Why `vt100` and not `termwiz`
 //!
-//! The design doc picked `termwiz` because it ships from the same monorepo as
-//! `portable-pty`. That reasoning is weak at this particular seam: a pty hands
-//! over bytes, and bytes are bytes — there is no compatibility surface between
-//! the two crates to keep aligned. Meanwhile the doc's own note records that
-//! termwiz's `screen_chars_to_string` is documented as existing *"primarily for
-//! testing"*, and it would have been our main read path. `vt100` offers exactly
-//! the three things [`AgentProcess`] asks for — feed bytes, read the grid, read
-//! the cursor — in one crate.
-//!
-//! This is a reversible choice on purpose: it sits behind [`AgentProcess`], the
-//! seam built on day one precisely so the vendor underneath can change without
-//! touching a line of policy.
+//! `vt100` offers exactly the three things [`AgentProcess`] asks for — feed
+//! bytes, read the grid, read the cursor — in one crate, whereas termwiz's
+//! equivalent read path is documented as existing *"primarily for testing"*. A
+//! pty hands over bytes, so there is no compatibility surface between the two
+//! crates to keep aligned. Reversible on purpose: the choice sits behind
+//! [`AgentProcess`], the seam built so the vendor can change without touching
+//! a line of policy.
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use remuda_core::agent::{AgentError, AgentProcess, Cursor, Result, Size};
@@ -49,12 +43,9 @@ pub struct PtyAgent {
 }
 
 impl PtyAgent {
-    /// Spawn `command` on a new pty of `size`.
-    ///
-    /// The pty is opened at `size` and never resized — [`remuda_core::Session`]
-    /// exposes no resize method, so a viewer attaching later cannot shrink the
-    /// terminal out from under a running agent. That was a real defect in the
-    /// implementation this replaces.
+    /// Spawn `command` on a new pty of `size`. The pty is opened at `size` and
+    /// never resized, so a viewer attaching later cannot shrink the terminal
+    /// out from under a running agent.
     pub fn spawn(command: CommandBuilder, size: Size) -> Result<Self> {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -85,15 +76,9 @@ impl PtyAgent {
     }
 }
 
-/// Drain the pty into the grid until EOF, on its own thread, tee-ing every
-/// chunk to whoever is watching live.
-///
-/// Reading a pty blocks, and the whole point of the grid is that a caller can
-/// ask "what is on screen *now*" without having pumped it first. The tee is the
-/// other half: a machine polls the grid, a human needs the bytes as they come.
-///
-/// A subscriber that has hung up is dropped on its next failed send, so an
-/// attach/detach cycle leaks nothing.
+/// Drain the pty into the grid until EOF, on its own thread, tee-ing every chunk
+/// to live watchers — a machine polls the grid, a human needs bytes as they
+/// come. A hung-up subscriber is dropped on its next failed send.
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     screen: Arc<Mutex<vt100::Parser>>,
@@ -136,12 +121,9 @@ impl AgentProcess for PtyAgent {
         Ok(parser.screen().contents())
     }
 
-    /// The screen as terminal bytes, cursor position included.
-    ///
-    /// `contents_formatted` emits a full repaint — clear, then the grid with
-    /// its attributes — which is exactly what a terminal that just attached
-    /// needs. Without it a viewer stares at nothing until the program happens
-    /// to redraw on its own, which a paused agent never does.
+    /// The screen as terminal bytes, cursor included. `contents_formatted`
+    /// emits a full repaint, which is what a just-attached terminal needs — a
+    /// paused agent never redraws on its own.
     fn screen_bytes(&mut self) -> Result<Vec<u8>> {
         let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
         Ok(parser.screen().contents_formatted())
@@ -163,13 +145,9 @@ impl AgentProcess for PtyAgent {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// Measured, not assumed (`steps/006-lifetime.md` Actual): the comment
-    /// this replaced claimed a signal to an already-exited pid "still returns
-    /// success" and was wrong. `is_alive` calls `try_wait`, which on unix
-    /// *reaps* the child the moment it returns `Some` — after that the pid is
-    /// gone, not merely a zombie, and `kill()` on it fails with ESRCH. So the
-    /// idempotence this trait promises is implemented here explicitly: if the
-    /// process is already gone, there is nothing to signal.
+    /// Caution: `is_alive` calls `try_wait`, which *reaps* the child on unix, so
+    /// `kill()` afterwards fails with ESRCH. The trait's idempotence is
+    /// therefore explicit here — an already-gone process is nothing to signal.
     fn terminate(&mut self) -> Result<()> {
         if !self.is_alive() {
             return Ok(());

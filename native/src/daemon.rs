@@ -38,19 +38,9 @@ pub fn socket_path(server: &str) -> PathBuf {
     base.join("remuda").join(format!("{server}.sock"))
 }
 
-/// Serve until the listener dies. Binds first, so a caller can be sure the
-/// socket exists when this returns control to its accept loop.
-///
-/// Step 006: this used to unlink `path` unconditionally, on the theory that
-/// only a crashed daemon leaves a stale socket. That theory holds for the
-/// *client's* auto-start path (connect, and start one only on failure) but
-/// not for this function called directly — `remuda daemon` typed by hand, or
-/// a second instance under the same name, unlinked a **live** peer's socket
-/// out from under it. The peer did not die; it kept running, unreachable,
-/// holding its pty children forever. Four were found alive on one machine
-/// this way (`steps/006-lifetime.md`). So: connect first, and unlink only
-/// when nothing answers. A live peer refuses this daemon outright, by name,
-/// rather than being silently displaced.
+/// Serve until the listener dies. Caution: connect before unlinking — an
+/// unconditional unlink displaces a *live* peer, which then keeps running
+/// unreachable and holds its pty children forever.
 pub fn serve(path: &Path) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
@@ -180,11 +170,9 @@ fn spawn(name: &str, command: &[String], size: Size) -> Result<Session, String> 
     ))
 }
 
-/// Hand this connection over to a human.
-///
-/// The exclusivity that makes raw input safe is enforced by `Session::attach`
-/// returning `None`, not by anything here — so a second viewer is refused even
-/// if it arrives over a different transport later.
+/// Hand this connection over to a human. Exclusivity is enforced by
+/// `Session::attach` returning `None`, not here, so a second viewer is refused
+/// even when it arrives over some later transport.
 fn attach(
     stream: UnixStream,
     mut reader: BufReader<UnixStream>,

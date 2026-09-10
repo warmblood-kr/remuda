@@ -7,16 +7,11 @@
 
 use core::time::Duration;
 
-/// A source of monotonic elapsed time.
-///
-/// Deliberately NOT wall-clock: every question this crate asks of time is
-/// "how long since X", never "what date is it". Monotonic time cannot jump
-/// backwards when the host adjusts its clock, and it is trivially fakeable.
+/// A source of monotonic elapsed time. Deliberately NOT wall-clock: every
+/// question here is "how long since X", never "what date is it".
 pub trait Clock: Send + Sync {
-    /// Time elapsed since this clock's own arbitrary origin.
-    ///
-    /// Only differences between two readings are meaningful. The origin
-    /// itself carries no information and must not be compared across clocks.
+    /// Time elapsed since this clock's own arbitrary origin. Only differences
+    /// between two readings are meaningful, and never across two clocks.
     fn now(&self) -> Duration;
 }
 
@@ -25,11 +20,8 @@ pub trait Clock: Send + Sync {
 // weaker wall than a crate that cannot name `std::time::Instant` at all.
 // `clippy.toml` beside this crate's manifest denies that path by name.
 
-/// A clock that only moves when a test moves it.
-///
-/// Available in every build, not just tests: the whole point of the seam is
-/// that a caller can drive time, and a WASM host has no `Instant` to fall
-/// back on.
+/// A clock that only moves when a caller moves it. Available in every build,
+/// not just tests — a WASM host has no `Instant` to fall back on.
 pub struct ManualClock {
     elapsed: core::sync::atomic::AtomicU64,
 }

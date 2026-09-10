@@ -33,50 +33,28 @@ pub enum Request {
     /// Deliver one instruction as an indivisible act. Refused while a human is
     /// attached — see [`crate::session::Session`], invariant 3.
     SendLine { name: String, text: String },
-    /// Deliver a burst of input bytes as an indivisible act, appending nothing.
-    ///
-    /// This is the primitive [`Request::SendLine`] is made of, and the one every
-    /// keystroke that is not a line of text has to go through: an arrow key, a
-    /// Ctrl chord, a mouse report, or a line deliberately left un-submitted.
-    ///
-    /// Indivisible is the load-bearing word. It is *not* a raw write in the
-    /// sense invariant 1 forbids — nothing here hands out the session lock
-    /// mid-act, so two senders still cannot interleave inside one burst. Refused
-    /// while a human is attached, exactly as `SendLine` is.
+    /// Deliver a burst of input bytes as an indivisible act, appending nothing —
+    /// the primitive [`Request::SendLine`] is made of. Indivisible is the
+    /// load-bearing word; refused while a human is attached, as `SendLine` is.
     Send { name: String, bytes: Vec<u8> },
-    /// Read the screen as text, without taking the session over.
-    ///
-    /// This is how a machine looks: it needs no terminal, no raw mode and no
-    /// exclusivity, so it works while a human is attached. Attaching for a
-    /// glance would lock the core out of a session it only wanted to read.
+    /// Read the screen as text without taking the session over. Needs no
+    /// terminal, raw mode or exclusivity, so it works while a human is attached.
     Capture { name: String },
     /// Take the session over for a human at a terminal. On `Ok`, this
     /// connection becomes a byte pipe.
     Attach { name: String },
-    /// End a session — live or already self-exited — and stop tracking it.
-    ///
-    /// Death does not imply removal (step 006): a session whose process
-    /// exited stays listed, screen and all, until something explicitly closes
-    /// it. This is that something. Refused while a human is attached, exactly
-    /// as `Send`/`SendLine` are, so a close cannot tear a pty out from under
-    /// someone driving it — see [`crate::session::Session::terminate`].
+    /// End a session — live or already self-exited — and stop tracking it. Death
+    /// alone does not remove: an exited session stays listed until this. Refused
+    /// while a human is attached, as `Send`/`SendLine` are.
     Close { name: String },
-    /// Evaluate Lua in the daemon's long-lived image (step 007).
-    ///
-    /// The state this touches outlives the request, which is what separates it
-    /// from every other variant here: two `Eval`s share globals, and a script
-    /// file, a `-e`, and a REPL line are three doors into one interpreter. That
-    /// is 정수님's *"어디서든 내부 런타임에 코드를 전달하여 실행"* — the
-    /// orchestrator has an image, and this is how anything reaches it.
+    /// Evaluate Lua in the daemon's long-lived image. Caution: the state this
+    /// touches outlives the request — two `Eval`s share globals, and a script,
+    /// a `-e` and a REPL line are three doors into one interpreter.
     Eval {
         code: String,
         /// What a traceback should call this chunk — a file path for
-        /// `remuda run`, `None` for a `-e` or a REPL line.
-        ///
-        /// Carried on the wire rather than derived in the daemon because only
-        /// the caller knows where the source came from, and an error that
-        /// names the file is the difference between a traceback you can jump
-        /// from and one you have to read.
+        /// `remuda run`, `None` for a `-e` or a REPL line. Carried on the wire
+        /// because only the caller knows where the source came from.
         name: Option<String>,
     },
 }
@@ -85,12 +63,9 @@ pub enum Request {
 pub enum Response {
     Sessions(Vec<SessionSummary>),
     Screen(String),
-    /// What an [`Request::Eval`] returned, already rendered to text.
-    ///
-    /// Distinct from `Screen` although both carry a `String`: one is what a
-    /// terminal looks like, the other is what an expression came to. Merging
-    /// them would make a client unable to tell "the session printed nothing"
-    /// from "the expression returned nothing".
+    /// What an [`Request::Eval`] returned, already rendered to text. Kept
+    /// distinct from `Screen` so a client can tell "the session printed
+    /// nothing" from "the expression returned nothing".
     Value(String),
     Ok,
     /// The reason, in words meant for a person. A client prints this; it does

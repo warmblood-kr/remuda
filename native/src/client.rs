@@ -5,11 +5,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-/// Detach key: Ctrl-\ (0x1C).
-///
-/// In raw mode this is just a byte, and almost nothing binds it — unlike
-/// Ctrl-C, Ctrl-D or Ctrl-Z, which the program you are attached to needs. It is
-/// consumed by the client and never forwarded.
+/// Detach key: Ctrl-\ (0x1C). Chosen because almost nothing binds it, unlike
+/// Ctrl-C/D/Z, which the attached program needs. Consumed, never forwarded.
 pub const DETACH: u8 = 0x1C;
 
 /// Send one request and read one response.
@@ -32,11 +29,9 @@ fn read_response(stream: &UnixStream) -> std::io::Result<Response> {
     serde_json::from_str(&line).map_err(std::io::Error::other)
 }
 
-/// Give this terminal to a session until the user presses [`DETACH`].
-///
-/// Returns once detached. The session is untouched by our leaving: the process
-/// keeps running and the pty keeps its size, because nothing here can resize it
-/// (`Session` exposes no such method).
+/// Give this terminal to a session until the user presses [`DETACH`], then
+/// return. Leaving does not disturb the session: the process keeps running and
+/// the pty keeps its size, since nothing here can resize it.
 pub fn attach(path: &Path, name: &str) -> std::io::Result<()> {
     let stream = UnixStream::connect(path)?;
     send(
@@ -108,12 +103,9 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Puts the terminal in raw mode and puts it back on the way out.
-///
-/// Restoring lives in `Drop` rather than at the end of `attach` because the
-/// interesting exits are the ones that skip the end: an error, a panic, a `?`.
-/// A tool that leaves a terminal raw is one the user has to blindly type
-/// `reset` into.
+/// Puts the terminal in raw mode and puts it back on the way out. Restoring
+/// must stay in `Drop`: the exits that matter — an error, a panic, a `?` —
+/// are exactly the ones that skip the end of `attach`.
 struct RawMode {
     original: nix::sys::termios::Termios,
 }

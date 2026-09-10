@@ -26,10 +26,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-/// One session's state, copied out.
-///
-/// Owned data, never a borrow into the registry — a caller may be a viewer on
-/// another machine, and this is what would go on the wire.
+/// One session's state, copied out. Owned data, never a borrow into the
+/// registry — the caller may be a viewer on another machine.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub name: String,
@@ -48,12 +46,9 @@ impl Registry {
         Self::default()
     }
 
-    /// Take ownership of a session and hand back a shared handle.
-    ///
-    /// A name already in use is refused and the session is returned in `Err`
-    /// **unregistered**. Replacing silently would drop the last handle to a
-    /// live pty — a running agent with nobody able to reach it — and the
-    /// caller would see success.
+    /// Take ownership of a session and hand back a shared handle. Caution: a
+    /// name already in use is refused, and the session comes back in `Err`
+    /// **unregistered** — replacing would strand a live pty.
     pub fn register(&self, session: Session) -> core::result::Result<Arc<Session>, Session> {
         let mut sessions = self.lock();
         if sessions.contains_key(session.name()) {
@@ -118,10 +113,8 @@ impl Registry {
     }
 }
 
-/// Deliver one instruction to a named session.
-///
-/// Sugar over `get` + `send_line`, and the shape a remote call would take:
-/// name in, result out, no handle crossing the boundary.
+/// Name-addressed sugar over `get` plus a session method — the shape a remote
+/// call takes: name in, result out, no handle crossing the boundary.
 impl Registry {
     pub fn send_line(&self, name: &str, text: &str) -> Option<Result<()>> {
         self.get(name).map(|s| s.send_line(text))
@@ -139,16 +132,9 @@ impl Registry {
         self.get(name).map(|s| s.cursor())
     }
 
-    /// End a session, live or already dead, and stop tracking it.
-    ///
-    /// Terminate-then-remove, in that order: if the child is attached,
-    /// [`Session::terminate`] refuses and this returns that refusal *without*
-    /// removing the entry — an attached session survives a `close` exactly as
-    /// it survives a `send`, so the human is not silently disconnected. A
-    /// session already dead terminates as a no-op (see
-    /// [`crate::agent::AgentProcess::terminate`]) and is then removed, which
-    /// is how a self-exited session actually leaves the list — `reap` exists
-    /// for the bulk case, but nothing before this called it in production.
+    /// End a session, live or already dead, and stop tracking it. Caution:
+    /// terminate-then-remove in that order — an attached session refuses and
+    /// keeps its entry, so a close cannot disconnect a human mid-drive.
     pub fn close(&self, name: &str) -> Option<Result<()>> {
         let session = self.get(name)?;
         Some(session.terminate().inspect(|()| {

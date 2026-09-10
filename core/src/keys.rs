@@ -1,53 +1,24 @@
 //! Keystrokes and mouse reports, as the bytes a terminal actually sends.
 //!
-//! 정수님, 2026-09-10: *"pty에 글자 입력, 문자열 입력, 안시코드 입력, 마우스 입력
-//! … 여러 기본함수들을 제공할 필요가 있겠습니다."*
-//!
-//! Those four are not four operations. They are one operation —
-//! [`crate::protocol::Request::Send`], a burst of bytes — and four ways of
+//! Character, string, ANSI and mouse input are not four operations. They are
+//! one — [`crate::protocol::Request::Send`], a burst of bytes — and four ways of
 //! *spelling* the bytes. This module is the spelling; nothing here talks to a
 //! session, which is why it lives in the policy layer and needs no pty to test.
 //!
-//! **The notation is Emacs's `kbd`, deliberately.** `C-c`, `M-x`, `C-M-x`,
-//! `<up>`, `RET`, `TAB`, `SPC`, `ESC`, `DEL`, `<f1>`. Inventing a second key
-//! notation would mean the person writing a remuda script has to learn one, and
-//! the one they already know has been read by more people than any we could
-//! design.
-//!
-//! Read from the manual on this machine rather than from memory
-//! (`emacs-30.1/info/elisp.info`, node *Changing Key Bindings*):
-//!
-//! > Each key stroke is either a single character, or the name of an event,
-//! > surrounded by angle brackets. … The only keys that have a special shorthand
-//! > syntax are `NUL`, `RET`, `TAB`, `LFD`, `ESC`, `SPC` and `DEL`. … The
-//! > modifiers have to be specified in alphabetical order: `A-C-H-M-S-s`.
-//!
-//! Two deliberate divergences, both toward permissiveness, and both matching
-//! what `kbd` itself does — the manual calls it *"very permissive, and will try
-//! to return something sensible even if the syntax used isn't completely
-//! conforming"*, with `key-valid-p` as the separate strict check:
+//! **The notation is Emacs's `kbd`, deliberately**: `C-c`, `M-x`, `C-M-x`,
+//! `<up>`, `RET`, `TAB`, `SPC`, `ESC`, `DEL`, `<f1>`. Two deliberate
+//! divergences, both toward permissiveness and both matching what `kbd` does:
 //!
 //! - **Angle brackets are optional.** `up` and `<up>` are the same key here.
-//!   remuda has no competing meaning for a bare word, and a script author
-//!   should not have to remember which names are shorthands.
-//! - **Modifier order is free.** `C-M-x` is the canonical spelling and
-//!   `M-C-x` is accepted. Emacs's own *Function Keys* node says the order
-//!   "does not matter in arguments to the key-binding lookup and modification
-//!   functions", so the two nodes already disagree.
+//! - **Modifier order is free.** `C-M-x` is canonical, `M-C-x` is accepted.
 //!
 //! The *byte* values are not Emacs's — they are xterm's, which is what a pty on
-//! the other end is expecting. One place the two agree, and it is the one most
-//! often got wrong: **Backspace sends 127, not 8.** The manual, node *Function
-//! Keys*: *"In ASCII, <BS> is really `C-h`. But `backspace` converts into the
-//! character code 127 (<DEL>), not into code 8 (<BS>). This is what most users
-//! prefer."*
+//! the other end expects. ⚠ The one most often got wrong, where the two agree
+//! anyway: **Backspace sends 127 (DEL), not 8 (BS).**
 
 /// The bytes a terminal sends for a key, or `None` if we do not know the name.
-///
-/// `None` rather than an empty vector on purpose: a caller that treats "unknown
-/// key" as "send nothing" produces a script that silently does not press
-/// anything, which is the empty-success failure this repo keeps finding. Every
-/// surface turns this into a refusal the caller can see.
+/// `None` rather than an empty vector on purpose — every surface must turn an
+/// unknown key into a visible refusal, never into a silent no-op.
 pub fn key(spec: &str) -> Option<Vec<u8>> {
     let (ctrl, alt, base) = modifiers(spec);
     if base.is_empty() {
@@ -144,12 +115,9 @@ fn named(spec: &str) -> Option<&'static [u8]> {
     })
 }
 
-/// Fold Ctrl/Meta into a named key's sequence, xterm-style.
-///
-/// xterm carries modifiers as a CSI parameter — `ESC [ A` becomes
-/// `ESC [ 1 ; 5 A` for Ctrl. The code is `1 + 1·shift + 2·alt + 4·ctrl`.
-/// F1–F4 arrive in SS3 form (`ESC O P`) which has nowhere to put a parameter,
-/// so a modified one is rewritten into the CSI form the same terminals accept.
+/// Fold Ctrl/Meta into a named key's sequence, xterm-style: modifiers ride as a
+/// CSI parameter, code `1 + 1·shift + 2·alt + 4·ctrl`. F1–F4 arrive in SS3 form
+/// (`ESC O P`), which has no parameter slot, so a modified one is rewritten CSI.
 fn modified(base: &'static [u8], ctrl: bool, alt: bool) -> Option<Vec<u8>> {
     if !ctrl && !alt {
         return Some(base.to_vec());
@@ -198,15 +166,9 @@ fn control_byte(c: char) -> Option<u8> {
     }
 }
 
-/// An SGR mouse report for a click at a 1-based screen cell.
-///
-/// A click is press *and* release, returned as one burst, because that is what
-/// a click is — a program that sees only the press waits forever for the
-/// button to come up. Wheel events have no release and get one event.
-///
-/// We encode and send; we do not enable mouse reporting on the program's
-/// behalf. Whether it is listening is its own configuration, and turning it on
-/// for it would be remuda deciding what the agent's terminal looks like.
+/// An SGR mouse report for a click at a 1-based screen cell. A click is press
+/// *and* release in one burst; a wheel event has no release. Caution: we only
+/// encode — enabling mouse reporting stays the program's own configuration.
 pub fn mouse(button: &str, col: u16, row: u16) -> Option<Vec<u8>> {
     // Zero would be off the screen in a 1-based protocol; treating it as cell 1
     // would silently click somewhere the caller did not ask for.

@@ -437,3 +437,23 @@ $ grep -n -A20 'pub enum Request' core/src/protocol.rs | grep -E '^\s*[0-9]+-\s+
     (…Insert, Key, Click, Capture, Attach, Run…)
     # no Kill, no Close — searched, absent
 ```
+
+## Design note — why the image calls back over its own socket
+
+Relocated here from `image::spawn`'s doc comment, where it had outgrown the
+3-line cap. It is a deliberate first cut, so it is the kind of thing someone
+will revisit with this step in hand.
+
+`Image::spawn` takes the daemon's *own* socket and binds the `remuda` table
+exactly as `remuda run` binds it. So a session name means the same thing typed
+at the CLI, written in a script file, or evaluated inside the image.
+
+The calls therefore go back out over the loopback socket rather than reaching
+the `Registry` directly. That is on purpose: it keeps **one** definition of the
+vocabulary instead of two that could drift. It cannot deadlock, because the
+daemon answers each connection on its own thread — the property that makes the
+shortcut unnecessary is the same one that would make it safe.
+
+If a future change does reach `Registry` directly for latency, the thing to
+preserve is that single definition: a second binding path is where `remuda.ls()`
+starts meaning something different inside the image than outside it.

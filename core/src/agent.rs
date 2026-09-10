@@ -50,15 +50,9 @@ impl Default for Size {
     }
 }
 
-/// Cursor position, zero-based.
-///
-/// The column is load-bearing and not decoration. The Emacs implementation
-/// distinguishes text a human actually typed from a greyed-out completion
-/// suggestion by cursor column, and its source records that colour-based
-/// detection failed three times before that. A backend that renders a grid
-/// but cannot report the cursor makes ghost-text detection structurally
-/// impossible — which is invisible in an MVP and fires the first time the
-/// core sends an instruction to a real worker.
+/// Cursor position, zero-based. Caution: the column is load-bearing — ghost
+/// text is told from typed input by cursor column, not by colour, so a backend
+/// that cannot report the cursor cannot detect it at all.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Cursor {
     pub row: u16,
@@ -88,14 +82,9 @@ impl fmt::Display for AgentError {
 
 pub type Result<T> = core::result::Result<T, AgentError>;
 
-/// A live agent process presented as a screen we can read and a keyboard we
-/// can type on.
-///
-/// Every method is synchronous, and that is a correctness requirement rather
-/// than a simplification. The one dangerous interleaving in this whole design
-/// is a body write and its Enter landing as two separately-awaited futures,
-/// with a second writer scheduled in between. Keeping the trait sync means
-/// that shape cannot be written, in any of the embedded languages evaluated.
+/// A live agent process: a screen we can read, a keyboard we can type on.
+/// Caution: every method is sync for correctness, not simplicity — awaiting a
+/// body write and its Enter separately lets a second writer land between them.
 pub trait AgentProcess: Send {
     /// Type raw bytes. Not public API on [`Session`] — see
     /// [`crate::session::Session::send_line`] for why callers never get this.
@@ -104,20 +93,16 @@ pub trait AgentProcess: Send {
     /// The visible screen, rendered as text, newline-separated.
     fn screen_text(&mut self) -> Result<String>;
 
-    /// The visible screen as terminal bytes — escape sequences, colour and
-    /// all — for painting onto a real terminal that has just attached.
-    ///
-    /// `screen_text` is for a machine reading the screen; this is for a human
-    /// looking at it. Default: the text, which is correct but colourless.
+    /// The visible screen as terminal bytes — escapes, colour and all — for
+    /// painting onto a terminal that has just attached. Default: the text,
+    /// which is correct but colourless.
     fn screen_bytes(&mut self) -> Result<Vec<u8>> {
         self.screen_text().map(String::into_bytes)
     }
 
     /// Subscribe to output as it arrives, for a viewer that must not poll.
-    ///
-    /// `None` means this backend cannot stream, which is the honest answer for
-    /// a scripted double and the reason this is not a required method. A
-    /// caller that gets `None` still has `screen_bytes`.
+    /// `None` means this backend cannot stream; that caller falls back to
+    /// `screen_bytes`.
     fn subscribe(&mut self) -> Option<Receiver<Vec<u8>>> {
         None
     }
@@ -136,11 +121,9 @@ pub trait AgentProcess: Send {
     fn size(&self) -> Size;
 }
 
-/// An agent that answers from a script instead of running anything.
-///
-/// This is the reason the suite needs no `claude` binary, no pty, and no
-/// network. It also records every byte written, which is what makes the
-/// atomicity of `send_line` observable rather than merely asserted.
+/// An agent that answers from a script instead of running anything — the suite
+/// needs no `claude` binary, pty or network. Records every byte written, which
+/// is what makes `send_line`'s atomicity observable rather than asserted.
 pub struct ScriptedAgent {
     /// Screens handed out in order; the last one repeats once exhausted.
     screens: Vec<String>,

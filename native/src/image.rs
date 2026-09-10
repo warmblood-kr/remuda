@@ -1,30 +1,16 @@
 //! The image: one Lua interpreter that lives as long as the daemon.
 //!
-//! 정수님, 2026-09-10: *"네, 이미지 기반이 그 의미라면, 이미지 기반이어야
-//! 하겠습니다. 데몬이나 스탠드얼론이 떠있는 동안 수명을 함께 하는 lua 메인
-//! 프로세스 혹은 쓰레드, 혹은 이벤트루프."* And, on what reaches it:
-//! *"emacs는 scratch buffer, eval-buffer function 등을 제공합니다. 그
-//! 오케스트레이터 런타임 안에서 어디서든 내부 런타임에 코드를 전달하여
-//! 실행시킬 수 있습니다."*
-//!
 //! # Why a thread and a channel, and not a mutex around `Lua`
 //!
 //! `mlua::Lua` is `!Send` without the `send` feature — a Lua state is
 //! single-threaded, and no lock changes that. So the state is *pinned* to one
 //! thread that owns it outright, and every other thread reaches it by posting a
-//! job and waiting for the answer. A thread serving a queue is an event loop,
-//! which is the third of the three shapes 정수님 offered; they were never three
-//! options, they were one answer seen from three sides. Emacs's command loop is
-//! the same design for the same reason.
+//! job and waiting for the answer. A thread serving a queue is an event loop.
 //!
-//! # Where this deliberately differs from Emacs
-//!
-//! In Emacs, a long-running Lisp function freezes the editor: the one thread
-//! that runs Lisp is also the one servicing everything else. We do not inherit
-//! that, because sessions here are not Lua objects — they are Rust structs
-//! behind their own locks, pumped by threads that never touch Lua. A script
-//! that loops forever makes the *next Lua caller* wait, and nothing else: pty
-//! output keeps being read, screens keep updating, `remuda ls` keeps answering.
+//! Unlike Emacs, a long-running script freezes nothing else: sessions here are
+//! not Lua objects but Rust structs behind their own locks, pumped by threads
+//! that never touch Lua. A script that loops forever makes only the *next Lua
+//! caller* wait — pty output keeps being read, `remuda ls` keeps answering.
 //!
 //! ⚠ The corollary, named now so it is not discovered as a deadlock later: an
 //! output pump may never *call into* Lua. If `on_output(session, fn)` is ever
@@ -54,15 +40,9 @@ pub struct Image {
 }
 
 impl Image {
-    /// Start the interpreter and return a handle to it.
-    ///
-    /// `socket` is the daemon's own socket: the `remuda` table is bound exactly
-    /// as `remuda run` binds it, so a name means the same thing typed at the
-    /// CLI, written in a script file, or evaluated in here. That the calls go
-    /// back out over the loopback socket rather than reaching the `Registry`
-    /// directly is a deliberate first cut — it keeps one definition of the
-    /// vocabulary instead of two that could drift, and it cannot deadlock
-    /// because the daemon answers each connection on its own thread.
+    /// Start the interpreter and return a handle to it. `socket` is the daemon's
+    /// own: the `remuda` table calls back over it rather than reaching the
+    /// `Registry`, keeping one definition of the vocabulary instead of two.
     pub fn spawn(socket: &Path) -> Self {
         let (jobs, inbox) = channel::<Job>();
         let socket: PathBuf = socket.to_path_buf();
@@ -99,11 +79,9 @@ impl Image {
         Self { jobs }
     }
 
-    /// Evaluate `code` in the image and wait for the result.
-    ///
-    /// State persists between calls — that is the whole point. A variable set
-    /// by one `-e` is there for the next one, and for a script, and for the
-    /// REPL, because all of them are doors into this one interpreter.
+    /// Evaluate `code` in the image and wait for the result. State persists
+    /// between calls — a `-e`, a script and a REPL line are all doors into one
+    /// interpreter, and a variable set by any of them outlives the call.
     pub fn eval(&self, code: &str, name: Option<&str>) -> Result<String, String> {
         let (reply, answer) = channel();
         self.jobs
@@ -119,16 +97,9 @@ impl Image {
     }
 }
 
-/// Evaluate one chunk, expression-first.
-///
-/// `return <code>` is tried before plain `<code>`, which is the technique the
-/// reference `lua` interpreter's own REPL uses (`lua.c`, `addreturn`): it makes
-/// `remuda -e "1+1"` print `2` while `remuda -e "x = 1"` still works, without
-/// asking the user to know which of the two they typed. A statement simply
-/// fails to compile as an expression and falls through.
-///
-/// Results are `tostring`ed and tab-joined, matching what `print` does with
-/// multiple values — so `remuda -e "1, 2"` reads the way a Lua user expects.
+/// Evaluate one chunk, expression-first: `return <code>` is tried before plain
+/// `<code>` (the reference REPL's `addreturn` trick), so `-e "1+1"` prints `2`
+/// and `-e "x = 1"` still works. Results are `tostring`ed and tab-joined.
 fn eval(lua: &Lua, code: &str, name: Option<&str>) -> Result<String, String> {
     // Lua's own convention: `@` means "this is a filename", `=` means "use
     // this verbatim". A script keeps the path it came from so a traceback
@@ -158,15 +129,9 @@ fn eval(lua: &Lua, code: &str, name: Option<&str>) -> Result<String, String> {
     Ok(rendered.join("\t"))
 }
 
-/// Point `print` at a buffer instead of the daemon's stdout.
-///
-/// Measured, not foreseen (`steps/007-the-image.md` Actual): the daemon is
-/// spawned with `Stdio::null()`, so a script's `print` went to `/dev/null` and
-/// the caller saw nothing at all. `print` is the first thing anyone types into
-/// a scratch buffer, and silently swallowing it is worse than not having one.
-///
-/// Lua's own `print` semantics are kept: values `tostring`ed, tab-separated,
-/// newline at the end.
+/// Point `print` at a buffer instead of the daemon's stdout, which is
+/// `Stdio::null()` — without this a script's `print` vanishes and the caller
+/// sees nothing. Lua semantics kept: `tostring`ed, tab-separated, newline.
 fn capture_print(lua: &Lua, into: Rc<RefCell<String>>) -> mlua::Result<()> {
     let print = lua.create_function(move |_, values: mlua::MultiValue| {
         let line: Vec<String> = values.iter().map(render).collect();
@@ -179,10 +144,7 @@ fn capture_print(lua: &Lua, into: Rc<RefCell<String>>) -> mlua::Result<()> {
 }
 
 /// What the caller sees: anything printed, then whatever the chunk came to.
-///
-/// Both can be empty, and the common cases are exactly the ones that should
-/// look clean — a statement that printed nothing returns an empty string, and
-/// a `print`-only script returns just its output with no trailing blank.
+/// Either half may be empty, and neither leaves a stray blank line behind.
 fn join_output(printed: &str, value: &str) -> String {
     match (printed.trim_end_matches('\n'), value) {
         ("", value) => value.to_string(),
@@ -191,13 +153,9 @@ fn join_output(printed: &str, value: &str) -> String {
     }
 }
 
-/// One value as a Lua user expects to see it.
-///
-/// `tostring` semantics, minus the address on tables and functions: an address
-/// is noise in a transcript and differs on every run, which makes an expected
-/// output impossible to write down. `nil` and booleans print as themselves —
-/// an earlier cut rendered them `<nil>` through a type-name fallback, which is
-/// not Lua and reads like a placeholder that failed to fill in.
+/// One value as a Lua user expects to see it: `tostring` semantics, minus the
+/// address on tables and functions — an address differs every run, so an
+/// expected output could not be written down.
 fn render(value: &mlua::Value) -> String {
     match value {
         mlua::Value::Nil => "nil".to_string(),

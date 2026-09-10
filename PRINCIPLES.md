@@ -101,6 +101,50 @@ session down to the smallest client. `Session` exposes no raw write either, so
 body-and-Enter cannot be separated by a second writer. Both are properties of the
 API's *shape*, not of caller discipline.
 
+### The three invariants this buys
+
+**1 — one input act cannot be split by a second writer.** `send` and `send_line`
+are the only ways to put input into a session, and each delivers its whole burst
+under a single lock acquisition. There is no *divisible* write — no method that
+takes the lock and hands it back part-way through an act — so no caller can send
+a body, lose the lock, and have another writer's Enter submit it. The Emacs
+implementation had exactly this bug shape: a stray submit landed on whatever was
+highlighted, and the intended text was swallowed **with both sides reporting
+success**.
+
+**2 — nobody can resize the pty.** There is no `resize`, and `Size` is immutable
+once constructed. Attaching is meant to be routine — it is how a human logs the
+agent in — and in zellij, whose behaviour was measured for this design, attaching
+resizes the shared session down to the smallest client. Here an attacher gets a
+view and may scroll or crop; the program underneath never sees SIGWINCH.
+
+**3 — raw keystrokes exist only while exactly one human holds the session.** A
+human at an attached terminal types Enter themselves, so attaching needs the very
+raw write invariant 1 refuses to expose. The two are reconciled by *exclusivity*
+rather than by a rule: `attach` hands out an `Attached` guard, at most one at a
+time, and `write_raw` lives **only on that guard**. While it is held, `send_line`
+returns `AgentError::Attached` instead of queueing. Refusing is the point —
+orchestrated input landing in a session a person is driving is the exact fleet
+incident this design exists to prevent. "The core is busy" is information the
+caller can act on; a silently interleaved keystroke is not.
+
+### Widening an atom does not repeal invariant 1
+
+Invariant 1 was first written as "there is no public raw write", which described
+the one atom that existed at the time rather than the property. Widening the atom
+to any byte burst (2026-09-10, for the Lua input vocabulary) left the property
+untouched, but made the earlier wording read like a repeal.
+
+The property is the *atomicity of one input act*, not the absence of raw bytes. A
+burst is written under a single lock acquisition with nothing awaiting inside it,
+so a second sender still cannot land in the middle of one. The operation that
+does not exist is a **divisible** write, and it still cannot be written. What
+genuinely changed is that a half-typed line can now be left sitting at a prompt —
+a script doing a deliberate thing, in the same class as `sh script.sh`, and not
+the concurrency defect the type was built against.
+
+⇒ When restating this invariant, name **divisibility**, never "raw".
+
 **Enforced by:** the type system (the method does not exist) · test
 `concurrent_send_lines_never_interleave` and its negative control
 `control_unlocked_writers_do_interleave`

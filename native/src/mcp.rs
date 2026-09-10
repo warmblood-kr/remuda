@@ -1,30 +1,20 @@
 //! The manager, reachable from inside a session.
 //!
-//! 정수님, 2026-09-10: *"claude-code-ide.el 같은, 그 pty manager에서 claude code를
-//! 구동하고, pty manager와 mcp 등으로 연결하는 장치를 두고."*
-//!
-//! Step 002 handed the five operations to a script running *outside*. This
-//! hands the same vocabulary to whatever is running *inside* a session, which
-//! is the last job Emacs is still doing for cc-butler: hosting an MCP server
-//! that the Claude in a session calls back into.
-//!
-//! It is the third surface over one `Request`, and it cost no new access
-//! control again — there is no raw write and no resize to expose because the
-//! type has no such variant (`PRINCIPLES.md` §6). Invariant 3 is still the
-//! daemon's, enforced when the call arrives, which is what makes it hold for a
-//! caller that is a language model rather than a person with a shell.
+//! The same vocabulary the CLI and scripts get, handed to whatever runs
+//! *inside* a session — an MCP server the agent calls back into. It is the
+//! third surface over one `Request` and cost no new access control: there is no
+//! raw write and no resize to expose, because the type has no such variant
+//! (`PRINCIPLES.md` §6). Invariant 3 stays the daemon's, enforced when the call
+//! arrives, so it holds for a caller that is a model rather than a person.
 //!
 //! **`attach` is not exposed here, and that is not a rule against it.** Attach
 //! exists to hand a terminal to a human; an MCP client has no terminal, and the
 //! stdio this speaks JSON-RPC over is the very channel attach would turn into a
-//! raw byte pipe. The operation's precondition cannot be met, so offering it
-//! would be offering something that can only fail. `TOOLS` states the four
-//! deliberately, and `tests/mcp.rs` asserts the live list against it in both
-//! directions, so a fifth appearing without a decision fails the suite.
+//! raw byte pipe. The precondition cannot be met, so offering it would be
+//! offering something that can only fail. `TOOLS` states the four deliberately,
+//! and `tests/mcp.rs` asserts the live list against it in both directions.
 //!
-//! **Transport is stdio only.** The tunnel and the node registry are their own
-//! step with their own trust boundary. What this step does keep is the property
-//! that makes that step cheap: a session name is an *address*, opaque to the
+//! **Transport is stdio only.** A session name is an *address*, opaque to the
 //! protocol, so qualifying it by node later changes the resolver and not the
 //! shape of any message.
 
@@ -37,12 +27,9 @@ use std::path::Path;
 /// The MCP protocol revision this speaks.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// Every tool name exposed over MCP.
-///
-/// Four, not five: see the module docs for why `attach` is absent. Kept as a
-/// constant so the test can assert the live `tools/list` against it in both
-/// directions — a tool added without deciding to, or a name listed and never
-/// served, both fail.
+/// Every tool name exposed over MCP — four, not five; the module docs say why
+/// `attach` is absent. A constant so a test can assert `tools/list` against it
+/// both ways: an undecided addition and an unserved name each fail.
 pub const TOOLS: [&str; 4] = ["capture", "ls", "new", "send"];
 
 /// Serve MCP over stdin/stdout until the client closes the stream.
@@ -64,12 +51,8 @@ pub fn serve(socket: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// One request in, at most one reply out.
-///
-/// Public so the tests can drive the real dispatch against a real daemon
-/// without a subprocess between them. `serve` above is then the only untested
-/// part, and it is a stdlib line loop; one test still runs the actual binary
-/// end to end so that loop is not taken on faith either.
+/// One request in, at most one reply out. Public so tests can drive the real
+/// dispatch against a real daemon with no subprocess in between.
 pub fn handle(socket: &Path, line: &str) -> Option<String> {
     let request: Value = match serde_json::from_str(line) {
         Ok(value) => value,
@@ -109,13 +92,9 @@ pub fn handle(socket: &Path, line: &str) -> Option<String> {
     Some(reply)
 }
 
-/// Run one tool call.
-///
-/// A refusal from the daemon comes back as `isError: true` with the daemon's
-/// own words, never as a successful result with empty content. That distinction
-/// is the whole reason this is not a shell pipeline: `$(remuda capture nosuch)`
-/// yields `""`, and a caller — especially a model — reads an empty screen as an
-/// idle session and narrates a plausible story about it.
+/// Run one tool call. Caution: a refusal must come back as `isError: true` with
+/// the daemon's own words, never as success with empty content — a model reads
+/// an empty screen as an idle session and narrates a story about it.
 fn call(socket: &Path, id: Value, params: &Value) -> String {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));

@@ -15,22 +15,9 @@
 //!   remuda -s <server> …          talk to a *named* daemon instead of "default"
 //! ```
 //!
-//! `mcp` is the one line here a person does not type. It exists so the program
-//! running *inside* a session can reach the manager that holds it — point a
-//! client's server config at `remuda mcp` and the four operations show up as
-//! tools.
-//!
-//! The daemon starts itself on first use, so none of the above needs a setup
-//! step. That is deliberate: 정수님 asked for this to be seamless, and a tool
-//! that makes you start a server before it works is not.
-//!
-//! `-s` is the second axis of the same idea (step 006): several daemons can
-//! coexist on one node the way several `claude` configs coexist under
-//! different home directories — this picks *which* one by name, under the
-//! same runtime directory. `REMUDA_RUNTIME_DIR` is the other axis (a whole
-//! different runtime), and the two compose: `daemon::socket_path` already
-//! took a server name from day one, only the CLI had it hardcoded to
-//! `"default"`.
+//! `mcp` is the one line a person does not type: it lets the program running
+//! *inside* a session reach the manager holding it. The daemon starts itself on
+//! first use. `-s` names one of several daemons; `REMUDA_RUNTIME_DIR` the tree.
 
 use remuda_core::protocol::{Request, Response};
 use remuda_native::{daemon, terminal_size};
@@ -188,12 +175,9 @@ In a script they live on one table, and a refusal is raised, not returned:
 it — a client spawns it and owns both pipes, so there is nothing to type here.
 ";
 
-/// Pull a leading `-s <server>` off argv, wherever `main` needs the daemon's
-/// name before it can compute a socket path. Returns `"default"` when absent.
-///
-/// Only the *leading* position is recognised — `remuda new -s x` treats `-s`
-/// as the session's own argv, not ours, because after `new <name>` everything
-/// is already the spawned command's business (see the `--` convention there).
+/// Pull a leading `-s <server>` off argv; `"default"` when absent. Only the
+/// *leading* position counts — in `remuda new -s x` the `-s` belongs to the
+/// spawned command's argv, not to us.
 fn split_server_flag(args: &[String]) -> (&str, &[String]) {
     match args {
         [flag, server, rest @ ..] if flag == "-s" => (server.as_str(), rest),
@@ -211,17 +195,9 @@ fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> Exit
     f(path)
 }
 
-/// Spawn ourselves as the daemon and wait for the socket to answer.
-///
-/// Waiting for a *successful connect* rather than for the file to exist: the
-/// path can be there while the listener is not yet bound, and a client that
-/// raced past it would fail on its first real request instead of here.
-///
-/// `-s <server>` is passed through explicitly. Without it the spawned child
-/// re-derives its own path from bare `remuda daemon`, which always means
-/// `"default"` — so `remuda -s alt ls` would wait forever on `alt.sock` while
-/// a daemon came up on `default.sock` instead. Measured, not foreseen
-/// (`steps/006-lifetime.md` Actual).
+/// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
+/// successful *connect*, not on the file existing, and pass `-s <server>`
+/// through — a bare `remuda daemon` re-derives `"default"` and never matches.
 fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
     // stderr is captured rather than discarded. The first version discarded it,
@@ -289,11 +265,8 @@ fn list_sessions(path: &Path) -> ExitCode {
     }
 }
 
-/// Evaluate one chunk in the daemon's image and print what it came to.
-///
-/// Nothing is printed for an expression that returned nothing, so
-/// `remuda -e "x = 1"` is silent while `remuda -e "x"` prints `1` — the
-/// distinction `Response::Value` exists to carry.
+/// Evaluate one chunk in the daemon's image and print what it came to. Nothing
+/// is printed when it returned nothing, so `-e "x = 1"` is silent.
 fn eval_once(path: &Path, code: &str) -> ExitCode {
     match remuda_native::client::request(
         path,
@@ -312,16 +285,9 @@ fn eval_once(path: &Path, code: &str) -> ExitCode {
     }
 }
 
-/// A line-at-a-time REPL against the image.
-///
-/// Deliberately not a readline: no history, no completion, no raw mode. It is
-/// the *scratch buffer* 정수님 named — somewhere to hand code to the running
-/// runtime — and the thing that makes it worth having is that the image
-/// remembers, not that the line editor is good. Piping a heredoc into it works
-/// for the same reason.
-///
-/// An error prints and the loop continues: a typo must not end a session whose
-/// whole value is the state it accumulated.
+/// A line-at-a-time REPL against the image. Deliberately not a readline — no
+/// history, completion or raw mode — so a piped heredoc works too. An error
+/// prints and the loop continues; a typo must not discard accumulated state.
 fn repl(path: &Path) -> ExitCode {
     use std::io::Write;
     let stdin = std::io::stdin();

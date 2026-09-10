@@ -18,12 +18,9 @@ pub use pty::PtyAgent;
 use remuda_core::{Clock, Size};
 use std::time::{Duration, Instant};
 
-/// This terminal's size, or the floor if it cannot be determined.
-///
-/// `Size::new` clamps anyway, so a wrong answer here cannot produce a terminal
-/// that silently drops keystrokes — the worst case is a session smaller than the
-/// window it was started from. A script run with no terminal at all (a cron job,
-/// a pipe) gets the floor, which is the same honest answer.
+/// This terminal's size, or the floor if it cannot be determined (no tty, a
+/// pipe, a cron job). `Size::new` clamps anyway, so the worst case is a session
+/// smaller than its window, never one that drops keystrokes.
 pub fn terminal_size() -> Size {
     // TIOCGWINSZ has no safe wrapper in `nix`, and the alternative — shelling
     // out to `stty` — would put a subprocess on the startup path of every
@@ -44,11 +41,8 @@ pub fn terminal_size() -> Size {
     }
 }
 
-/// The real clock.
-///
-/// It lives here and not in `remuda-core` because `Instant` is a host facility.
-/// A policy layer has no business reading a clock directly anyway — it receives
-/// one, which is what makes idle-timeout behaviour testable without sleeping.
+/// The real clock. It lives here, not in `remuda-core`, because `Instant` is a
+/// host facility and the policy layer receives a clock rather than reading one.
 pub struct SystemClock {
     origin: Instant,
 }

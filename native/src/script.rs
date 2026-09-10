@@ -1,26 +1,20 @@
 //! A programming runtime, with the atomic functions wired to it.
 //!
-//! 정수님, 2026-09-10: *"이 pty manager layer에 programming runtime을 심어서
-//! 코드를 실행할 수 있게 만들고 atomic function들을 물려서 연결합니다."*
-//!
-//! The reason this is safe to do at all is that the vocabulary handed to Lua is
-//! exactly [`Request`] — the surface that already has no raw write and no
-//! resize. A script gets Turing-completeness over *which* operations run in
-//! *what order*; it gets no operation the CLI does not already have, because
-//! there is no such variant to bind. Invariant 3 is enforced by the daemon when
-//! the call arrives, not by the caller behaving, so a script that sends into a
-//! human-held session is refused exactly as the CLI is.
+//! This is safe to do because the vocabulary handed to Lua is exactly
+//! [`Request`] — the surface that already has no raw write and no resize. A
+//! script gets Turing-completeness over *which* operations run in *what order*;
+//! it gets no operation the CLI lacks, because there is no such variant to
+//! bind. Invariant 3 is enforced by the daemon when the call arrives, not by
+//! the caller behaving.
 //!
 //! That is `PRINCIPLES.md` §6 collecting its rent: because the dangerous
 //! operations were *removed from the API* rather than forbidden by rule, a
 //! whole scripting language could be pointed at it without re-auditing anything.
 //!
-//! **This is not a sandbox.** `remuda run script.lua` is as trusted as
-//! `sh script.sh` — the user runs their own file on their own machine, and the
-//! full standard library is what makes a setup script worth writing. That
-//! changes the day a script arrives from another node over the transport layer.
-//! The restricted stdlib belongs in *that* change, where the boundary actually
-//! appears, and putting it here now would be a wall around the wrong thing.
+//! ⚠ **This is not a sandbox.** `remuda run script.lua` is as trusted as
+//! `sh script.sh`, and the full standard library is what makes a setup script
+//! worth writing. That changes the day a script arrives from another node; the
+//! restricted stdlib belongs in *that* change, where the boundary appears.
 
 use crate::client;
 use mlua::{Lua, Table, Value};
@@ -29,38 +23,16 @@ use remuda_core::protocol::{Request, Response};
 use std::path::Path;
 use std::time::Duration;
 
-/// Every name bound into the `remuda` table.
-///
-/// The protocol operations, plus `sleep`. `sleep` is not a remuda operation and
-/// is here because without it the runtime cannot express the one thing it exists
-/// for: send, wait, look, decide. The polling loop itself is written in Lua —
-/// building that helper in Rust would be doing in the host the exact job the
-/// guest language was embedded to do.
-///
-/// `insert`, `key` and `click` are three names over *one* new operation
-/// ([`Request::Send`]). They are spellings, in the sense elisp has `insert`,
-/// `insert-char` and `insert-buffer-substring` over one primitive — the shape
-/// 정수님 pointed at on 2026-09-10. Adding them widened the protocol by a single
-/// variant, not by three.
-///
-/// `tests/script.rs` asserts the live table's keys against this list in both
-/// directions, so a binding added without a decision, or a name listed here and
-/// never bound, fails the suite.
+/// Every name bound into the `remuda` table: the protocol operations, plus
+/// `sleep`. `insert`, `key` and `click` are three spellings of one operation
+/// ([`Request::Send`]). Asserted against the live table, both directions.
 pub const BINDINGS: [&str; 10] = [
     "attach", "capture", "click", "close", "insert", "key", "ls", "new", "send", "sleep",
 ];
 
-/// Run a script file **in the daemon's image** (step 007).
-///
-/// This used to build its own `Lua::new()` in the client process, which made
-/// `remuda run` the one door that could not see what `-e` and the REPL share.
-/// Measured and caught while proving 007: a script printed `fleet: nil` for a
-/// table two `-e` calls had just built. The image is only an image if every
-/// door opens onto it.
-///
-/// The chunk name travels with the source so a traceback still names the file
-/// — the `@` marker that decides that lives in `image::eval`, and this passes
-/// the path it needs.
+/// Run a script file **in the daemon's image**, never in a fresh `Lua::new()`
+/// here — a script must see the state `-e` and the REPL share. The chunk name
+/// travels with the source so a traceback still names the file.
 pub fn run(socket: &Path, script: &Path) -> Result<(), String> {
     let source = std::fs::read_to_string(script).map_err(|e| e.to_string())?;
     let request = Request::Eval {
@@ -203,14 +175,9 @@ fn ask(socket: &Path, request: Request) -> mlua::Result<Response> {
     client::request(socket, &request).map_err(mlua::Error::external)
 }
 
-/// Turn a response into what the script sees — and a refusal into a raised
-/// error.
-///
-/// [`Response::Error`] deliberately does **not** become a return value. A
-/// script that forgets to check one would otherwise carry on over a session
-/// that was never created, which is the failure mode the shell version already
-/// had: `$(remuda capture x)` yields an empty string for a missing session and
-/// the pipeline proceeds on nothing.
+/// Turn a response into what the script sees. Caution: [`Response::Error`]
+/// raises rather than returning a value — a script that forgot to check one
+/// would otherwise carry on over a session that was never created.
 fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
     match response {
         Response::Ok => Ok(Value::Nil),
