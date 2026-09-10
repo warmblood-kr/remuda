@@ -9,15 +9,35 @@ publish.workspace = true
 # the pty backend and terminal emulation next. This crate may depend on
 # `remuda-core`; the reverse is rejected by cargo, and that one-way arrow is the
 # whole architecture rule.
+#
+# WHY THESE THREE AND NOT A CFG FORK PER PLATFORM.
+#
+#   interprocess  a unix socket on unix, a named pipe on Windows, behind ONE
+#                 type — so `client` and `daemon` are one code path. The single
+#                 thing it does not abstract (a pipe has no `shutdown`) is
+#                 isolated in `ipc::wake` rather than smeared through both.
+#   crossterm     raw mode and terminal size. It replaced `nix::termios` and a
+#                 hand-written TIOCGWINSZ ioctl, which were the other two
+#                 unix-only surfaces and the only `unsafe` in this crate.
+#
+# `nix` survives for exactly one call, `shutdown(2)`, and is now gated to unix
+# so it cannot creep back onto the shared path.
 
 [dependencies]
-nix = { version = "0.28.0", features = ["term"] }
+crossterm = "0.29.0"
+interprocess = "2.4.4"
 portable-pty = "0.9.0"
 serde_json = "1.0.140"
 remuda-core = { path = "../core" }
 vt100 = "0.16.2"
 mlua = { version = "0.12.1", features = ["lua54", "vendored"] }
 rustyline = "14.0.0"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.28.0", features = ["socket"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_IO"] }
 
 [lints]
 workspace = true

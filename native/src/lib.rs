@@ -9,6 +9,7 @@ pub mod client;
 pub mod daemon;
 pub mod dist;
 pub mod image;
+pub mod ipc;
 pub mod mcp;
 pub mod pty;
 pub mod script;
@@ -23,22 +24,12 @@ use std::time::{Duration, Instant};
 /// pipe, a cron job). `Size::new` clamps anyway, so the worst case is a session
 /// smaller than its window, never one that drops keystrokes.
 pub fn terminal_size() -> Size {
-    // TIOCGWINSZ has no safe wrapper in `nix`, and the alternative — shelling
-    // out to `stty` — would put a subprocess on the startup path of every
-    // command. Four lines of well-trodden ioctl instead.
-    use std::os::fd::AsRawFd;
-    let mut ws: nix::libc::winsize = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        nix::libc::ioctl(
-            std::io::stdout().as_raw_fd(),
-            nix::libc::TIOCGWINSZ,
-            &mut ws,
-        )
-    };
-    if rc == 0 && ws.ws_col > 0 {
-        Size::new(ws.ws_col, ws.ws_row)
-    } else {
-        Size::default()
+    // This was a hand-written TIOCGWINSZ ioctl, and the only `unsafe` in the
+    // crate. crossterm asks the console host on Windows and the same ioctl on
+    // unix, so the one call covers both and the block goes away.
+    match crossterm::terminal::size() {
+        Ok((cols, rows)) if cols > 0 => Size::new(cols, rows),
+        _ => Size::default(),
     }
 }
 

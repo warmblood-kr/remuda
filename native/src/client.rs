@@ -1,8 +1,8 @@
 //! Talking to a daemon, including handing your terminal over to one.
 
+use crate::ipc::{self, Stream, TryClone};
 use remuda_core::protocol::{Request, Response};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 /// Detach key: Ctrl-\ (0x1C). Chosen because almost nothing binds it, unlike
@@ -11,19 +11,19 @@ pub const DETACH: u8 = 0x1C;
 
 /// Send one request and read one response.
 pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
-    let stream = UnixStream::connect(path)?;
+    let stream = ipc::connect(path)?;
     send(&stream, request)?;
     read_response(&stream)
 }
 
-fn send(mut stream: &UnixStream, request: &Request) -> std::io::Result<()> {
+fn send(mut stream: &Stream, request: &Request) -> std::io::Result<()> {
     let mut line = serde_json::to_string(request)?;
     line.push('\n');
     stream.write_all(line.as_bytes())?;
     stream.flush()
 }
 
-fn read_response(stream: &UnixStream) -> std::io::Result<Response> {
+fn read_response(stream: &Stream) -> std::io::Result<Response> {
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     serde_json::from_str(&line).map_err(std::io::Error::other)
@@ -33,7 +33,7 @@ fn read_response(stream: &UnixStream) -> std::io::Result<Response> {
 /// return. Leaving does not disturb the session: the process keeps running and
 /// the pty keeps its size, since nothing here can resize it.
 pub fn attach(path: &Path, name: &str) -> std::io::Result<()> {
-    let stream = UnixStream::connect(path)?;
+    let stream = ipc::connect(path)?;
     send(
         &stream,
         &Request::Attach {
@@ -83,7 +83,10 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<()> {
                     }
                 }
             }
-            let _ = stream.shutdown(std::net::Shutdown::Both);
+            // Ends the screen pump below, which then returns from `attach` and
+            // drops every handle on this connection — that hang-up is what the
+            // daemon reads as "the human left".
+            ipc::wake(&stream);
         }
     });
 
@@ -98,7 +101,7 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<()> {
         }
     }
 
-    let _ = stream.shutdown(std::net::Shutdown::Both);
+    ipc::wake(&stream);
     let _ = keys.join();
     Ok(())
 }
@@ -106,25 +109,17 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<()> {
 /// Puts the terminal in raw mode and puts it back on the way out. Restoring
 /// must stay in `Drop`: the exits that matter — an error, a panic, a `?` —
 /// are exactly the ones that skip the end of `attach`.
-struct RawMode {
-    original: nix::sys::termios::Termios,
-}
+struct RawMode;
 
 impl RawMode {
     fn enable() -> std::io::Result<Self> {
-        use nix::sys::termios::{cfmakeraw, tcgetattr, tcsetattr, SetArg};
-        let stdin = std::io::stdin();
-        let original = tcgetattr(&stdin).map_err(std::io::Error::other)?;
-        let mut raw = original.clone();
-        cfmakeraw(&mut raw);
-        tcsetattr(&stdin, SetArg::TCSANOW, &raw).map_err(std::io::Error::other)?;
-        Ok(Self { original })
+        crossterm::terminal::enable_raw_mode()?;
+        Ok(Self)
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        use nix::sys::termios::{tcsetattr, SetArg};
-        let _ = tcsetattr(std::io::stdin(), SetArg::TCSANOW, &self.original);
+        let _ = crossterm::terminal::disable_raw_mode();
     }
 }

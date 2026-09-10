@@ -20,13 +20,19 @@ use std::time::{Duration, Instant};
 
 const PATIENCE: Duration = Duration::from_secs(10);
 
-/// A socket path short enough for `sun_path`, which is ~108 bytes. A long path
-/// fails at bind with a message no caller would guess from a timeout — see the
-/// startup-error handling in the binary.
-fn scratch(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(format!("/tmp/remuda-t{}-{tag}", std::process::id()));
+/// A runtime directory of our own. Short enough for `sun_path` (~108 bytes) —
+/// a long path fails at bind with a message no caller would guess from a
+/// timeout, which is what the binary's startup-error handling exists for.
+fn scratch_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("remuda-t{}-{tag}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
-    dir.join("s.sock")
+    dir
+}
+
+/// The address, derived the way the shipped binary derives it. Hand-building
+/// one that merely resembles it is what made the attach test fail first time.
+fn scratch(tag: &str) -> PathBuf {
+    daemon::socket_path_in(&scratch_dir(tag), "s")
 }
 
 /// Start a daemon and return once it actually answers, not once it was spawned.
@@ -37,7 +43,7 @@ fn daemon_at(path: &Path) -> impl Drop {
     });
 
     let deadline = Instant::now() + PATIENCE;
-    while std::os::unix::net::UnixStream::connect(path).is_err() {
+    while remuda_native::ipc::connect(path).is_err() {
         assert!(Instant::now() < deadline, "daemon never bound {path:?}");
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -184,9 +190,8 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     // so the daemon must listen exactly there. Pointing the test somewhere else
     // is what made the first run fail — and it failed as "no repaint", which
     // names the wrong wall just like the swallowed startup error did.
-    let dir = PathBuf::from(format!("/tmp/remuda-t{}-attach", std::process::id()));
-    let path = dir.join("remuda").join("default.sock");
-    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    let dir = scratch_dir("attach");
+    let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
     new_session(&path, "target");
 

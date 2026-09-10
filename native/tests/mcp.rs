@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 const PATIENCE: Duration = Duration::from_secs(10);
 
 fn scratch(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(format!("/tmp/remuda-m{}-{tag}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("remuda-m{}-{tag}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -30,7 +30,7 @@ fn daemon_at(path: &Path) -> impl Drop {
         let _ = daemon::serve(&serving);
     });
     let deadline = Instant::now() + PATIENCE;
-    while std::os::unix::net::UnixStream::connect(path).is_err() {
+    while remuda_native::ipc::connect(path).is_err() {
         assert!(Instant::now() < deadline, "daemon never bound {path:?}");
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -74,7 +74,7 @@ fn the_tool_surface_is_exactly_the_decided_set() {
     // Four, not five. `attach` hands a terminal to a human and an MCP client has
     // no terminal; the absence is a decision, recorded here so it stays one.
     let dir = scratch("surface");
-    let path = dir.join("s.sock");
+    let path = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&path);
 
     let reply = ask(
@@ -120,7 +120,7 @@ fn a_tool_call_moves_a_real_session() {
     // input, so finding a string that appears in the command proves only that
     // the echo happened.
     let dir = scratch("call");
-    let path = dir.join("s.sock");
+    let path = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&path);
 
     let made = call(&path, "new", json!({"name": "driven", "command": ["sh"]}));
@@ -162,7 +162,7 @@ fn a_refusal_is_an_error_not_an_empty_success() {
     // caller proceeds over a session that was never created. A model does worse
     // than proceed — it explains the empty screen.
     let dir = scratch("refusal");
-    let path = dir.join("s.sock");
+    let path = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&path);
 
     let reply = call(&path, "capture", json!({"session": "typo-in-the-name"}));
@@ -197,7 +197,7 @@ fn the_real_binary_completes_a_handshake_over_stdio() {
     // while testing nothing — the socket has to be *ours* for the last assertion
     // in this test to mean anything.
     let dir = scratch("stdio");
-    let path = dir.join("remuda").join("default.sock");
+    let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_remuda"))

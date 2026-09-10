@@ -235,7 +235,7 @@ fn split_server_flag(args: &[String]) -> (&str, &[String]) {
 
 /// Run `f`, starting the named daemon first if nothing is listening yet.
 fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> ExitCode {
-    if std::os::unix::net::UnixStream::connect(path).is_err() {
+    if remuda_native::ipc::connect(path).is_err() {
         if let Err(e) = start_daemon(server, path) {
             return fail(e);
         }
@@ -263,7 +263,7 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
-        if std::os::unix::net::UnixStream::connect(path).is_ok() {
+        if remuda_native::ipc::connect(path).is_ok() {
             return Ok(());
         }
         // If it has already exited, waiting out the deadline only delays the

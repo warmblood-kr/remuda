@@ -18,7 +18,14 @@ pub const VERSION: &str = match option_env!("REMUDA_VERSION") {
 };
 
 pub const INDEX_URL: &str = "https://warmblood-kr.github.io/remuda/latest.json";
-pub const INSTALL_URL: &str = "https://warmblood-kr.github.io/remuda/install.sh";
+
+/// The installer this binary re-runs to upgrade itself. Two scripts, one
+/// behaviour — see `docs/install.ps1`, which mirrors `docs/install.sh`.
+pub const INSTALL_URL: &str = if cfg!(windows) {
+    "https://warmblood-kr.github.io/remuda/install.ps1"
+} else {
+    "https://warmblood-kr.github.io/remuda/install.sh"
+};
 
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -43,16 +50,7 @@ pub fn upgrade(channel: Option<&str>) -> Result<(), String> {
         return Err(format!("unknown channel {channel:?} — stable or nightly"));
     }
     eprintln!("remuda: upgrading on the {channel} channel…");
-    // Deliberately NOT `curl … | sh`. A pipeline reports the *last* command's
-    // status, so a 404 from curl feeds an empty script into a shell that exits
-    // 0 — measured here, and it made a failed upgrade look like a done one.
-    // Landing the script first also means a truncated download never runs.
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(format!(
-            "set -e; t=$(mktemp); trap 'rm -f \"$t\"' EXIT; \
-             curl -fsSL --max-time 120 -o \"$t\" {INSTALL_URL}; sh \"$t\""
-        ))
+    let status = installer_command()
         .env("REMUDA_CHANNEL", &channel)
         .status()
         .map_err(|e| format!("cannot run the installer: {e}"))?;
@@ -61,6 +59,36 @@ pub fn upgrade(channel: Option<&str>) -> Result<(), String> {
     } else {
         Err(format!("the installer exited with {status}"))
     }
+}
+
+/// Fetch the installer to a file and run it from there. Deliberately NOT
+/// `curl … | sh`: a pipeline reports the *last* status, so a 404 fed an empty
+/// script to a shell that exited 0 — a failed upgrade that looked finished.
+#[cfg(unix)]
+fn installer_command() -> Command {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(format!(
+        "set -e; t=$(mktemp); trap 'rm -f \"$t\"' EXIT; \
+         curl -fsSL --max-time 120 -o \"$t\" {INSTALL_URL}; sh \"$t\""
+    ));
+    command
+}
+
+/// The same two rules in PowerShell: land the script, then run it. `-Stop` is
+/// what makes `Invoke-WebRequest` raise on a 404 instead of returning an error
+/// page for the next line to execute.
+#[cfg(windows)]
+fn installer_command() -> Command {
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]);
+    command.arg(format!(
+        "$ErrorActionPreference='Stop'; \
+         $t = Join-Path ([IO.Path]::GetTempPath()) ('remuda-install-' + [guid]::NewGuid() + '.ps1'); \
+         try {{ Invoke-WebRequest -UseBasicParsing -Uri '{INSTALL_URL}' -OutFile $t; \
+         & powershell -NoProfile -ExecutionPolicy Bypass -File $t; exit $LASTEXITCODE }} \
+         finally {{ Remove-Item -Force -ErrorAction SilentlyContinue $t }}"
+    ));
+    command
 }
 
 /// One line for stderr when a newer version is published, or `None`. Reads only
@@ -93,29 +121,58 @@ fn is_stale(cache: &Path) -> bool {
         .unwrap_or(true)
 }
 
-/// Fetch the index in the background and never wait for it. The trailing
-/// `touch` is what stops an offline machine from spawning a curl per command:
-/// a failed fetch still stamps the cache, so the next attempt is a day away.
+/// Fetch the index in the background and never wait for it. The trailing stamp
+/// is what stops an offline machine from spawning a fetch per command: a failed
+/// fetch still touches the cache, so the next attempt is a day away.
 fn refresh(cache: &Path) {
     let Some(dir) = cache.parent() else { return };
     if std::fs::create_dir_all(dir).is_err() {
         return;
     }
     let tmp = cache.with_extension("tmp");
-    let script = format!(
-        "curl -fsSL --max-time 10 -o {tmp} {INDEX_URL} && mv -f {tmp} {cache}; touch {cache}",
-        tmp = shell_quote(&tmp),
-        cache = shell_quote(cache),
-    );
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(script)
+    let mut command = fetch_index_command(&tmp, cache);
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
+    let _ = command.spawn();
 }
 
+#[cfg(unix)]
+fn fetch_index_command(tmp: &Path, cache: &Path) -> Command {
+    let mut command = Command::new("sh");
+    command.arg("-c").arg(format!(
+        "curl -fsSL --max-time 10 -o {tmp} {INDEX_URL} && mv -f {tmp} {cache}; touch {cache}",
+        tmp = shell_quote(tmp),
+        cache = shell_quote(cache),
+    ));
+    command
+}
+
+/// Paths travel as environment variables rather than inside the script text, so
+/// there is no PowerShell quoting to get wrong. `CREATE_NO_WINDOW` keeps this
+/// from flashing a console on every single command.
+#[cfg(windows)]
+fn fetch_index_command(tmp: &Path, cache: &Path) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = Command::new("powershell");
+    command
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"])
+        .arg(format!(
+            "try {{ Invoke-WebRequest -UseBasicParsing -Uri '{INDEX_URL}' \
+             -OutFile $env:REMUDA_TMP -ErrorAction Stop; \
+             Move-Item -Force $env:REMUDA_TMP $env:REMUDA_CACHE }} catch {{}}; \
+             if (Test-Path $env:REMUDA_CACHE) \
+             {{ (Get-Item $env:REMUDA_CACHE).LastWriteTime = Get-Date }} \
+             else {{ New-Item -ItemType File -Force $env:REMUDA_CACHE | Out-Null }}"
+        ))
+        .env("REMUDA_TMP", tmp)
+        .env("REMUDA_CACHE", cache)
+        .creation_flags(0x0800_0000);
+    command
+}
+
+#[cfg(unix)]
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.display().to_string().replace('\'', r"'\''"))
 }
@@ -157,8 +214,12 @@ fn base_dir(variable: &str, fallback: &str) -> PathBuf {
     }
 }
 
+/// `$HOME`, or `%USERPROFILE%` where that is what the OS calls it. The XDG
+/// layout underneath is kept on both, so the installer and this binary derive
+/// the channel file from one rule rather than two.
 fn home() -> PathBuf {
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_default()
 }
@@ -200,6 +261,10 @@ mod tests {
         assert!(!is_newer("0.1.0-nightly.20260910.abc1234", "0.1.0"));
     }
 
+    // Unix-only because the FUNCTION is: Windows passes paths as environment
+    // variables and never quotes them into a script. Not a test skipped to make
+    // a suite green — there is nothing on the other platform to call.
+    #[cfg(unix)]
     #[test]
     fn shell_quoting_survives_a_quote_in_the_path() {
         assert_eq!(shell_quote(Path::new("/tmp/a b")), "'/tmp/a b'");
