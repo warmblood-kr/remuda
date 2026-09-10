@@ -37,6 +37,13 @@ reaches the live list column through `render_styled` → `list_row` → `fit`.
    — with a wide-charactered session name, proving the row still occupies
    exactly its column budget rather than overflowing it.
 
+`fit`'s rewritten cut path keeps the invariant its old doc comment named:
+a cut always leaves a `→` visible, never zero-width. A crop that looks like
+absence is the same failure shape this repo keeps re-discovering elsewhere
+(a silently-empty pane, a silently-`None` version check) — here it would
+mean a wide name truncated so tightly that the marker itself gets crowded
+out, and the row reads as if nothing was cut at all.
+
 ## Expected
 
 - `tui::tests::list_row_with_a_wide_session_name_still_fits_its_column_budget`:
