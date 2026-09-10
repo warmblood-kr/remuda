@@ -215,6 +215,21 @@ jobs:
           grep -q "no fenced block" /tmp/out \
             || { echo "::error::check-steps.py rejected for the wrong reason"; exit 1; }
 
+      - name: check-steps.py rejects two steps claiming one number
+        # Two branches in flight both take the next number and git merges them
+        # without a conflict, so nothing but this notices.
+        run: |
+          taken=$(ls steps/ | head -1 | cut -d- -f1)
+          cp "steps/$(ls steps/ | head -1)" "steps/$taken-a-second-claim.md"
+          if python3 scripts/check-steps.py 2>/tmp/out; then
+            echo "::error::check-steps.py ACCEPTED two steps on number $taken"
+            rm -f "steps/$taken-a-second-claim.md"
+            exit 1
+          fi
+          rm -f "steps/$taken-a-second-claim.md"
+          grep -q "is claimed by 2" /tmp/out \
+            || { echo "::error::check-steps.py rejected for the wrong reason"; exit 1; }
+
       - name: check-comments.py rejects a doc comment over the cap
         # The control that matters is not "it fails" — a broken glob also fails.
         # It is that the checker still SEES the comments it is meant to measure.

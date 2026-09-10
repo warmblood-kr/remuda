@@ -177,7 +177,7 @@ remuda.tool{
 A word is callable and carries its own description, so the next tool is written
 out of the last: `remuda.tools.idle_workers{seconds = "60"}` is a normal call
 from any script. `wait_for` ships this way rather than in Rust, so the path is
-exercised rather than merely present. [`steps/013`](steps/013-a-tool-registry.md)
+exercised rather than merely present. [`steps/014`](steps/014-a-tool-registry.md)
 has the ruling and the ceilings.
 
 ## Status

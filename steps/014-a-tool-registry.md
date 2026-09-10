@@ -1,4 +1,4 @@
-# 013 — a tool registry: the MCP server becomes a frame
+# 014 — a tool registry: the MCP server becomes a frame
 
 An MCP tool is a Lua function marked exported. `run_script` is the door for
 everything that does not have a name yet. And the comment that refused an eval

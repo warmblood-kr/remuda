@@ -43,6 +43,17 @@ docs = sorted(STEPS.glob("*.md"))
 if not docs:
     problems.append("steps/ has no step documents — the parser or the tree is broken")
 
+# The number IS the reading order, and two branches in flight both take the next
+# one. Git merges them without a conflict — the filenames differ — and the README
+# is then left linking `steps/013` at two documents.
+numbers: dict[str, list[str]] = {}
+for doc in docs:
+    if match := re.match(r"(\d+)-", doc.name):
+        numbers.setdefault(match.group(1), []).append(doc.name)
+for number, sharers in sorted(numbers.items()):
+    if len(sharers) > 1:
+        problems.append(f"step {number} is claimed by {len(sharers)}: {', '.join(sharers)}")
+
 for doc in docs:
     text = doc.read_text(encoding="utf-8")
     name = doc.relative_to(ROOT)
