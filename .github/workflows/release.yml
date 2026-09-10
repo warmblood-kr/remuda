@@ -10,6 +10,12 @@ name: release
 # The publish job writes the new version into docs/latest.json on main, which
 # GitHub Pages serves. `paths-ignore` is what stops that commit from starting
 # another nightly.
+#
+# ⚠ THERE IS NO `pull_request:` TRIGGER HERE, AND THERE MUST NEVER BE ONE.
+# The macOS build runs on a physical machine in the office (see that job). A
+# fork's pull request running on it would execute a stranger's code on hardware
+# we own. `workflow_dispatch` is safe by contrast — only someone with write
+# access to this repository can start one.
 
 on:
   push:
@@ -17,6 +23,7 @@ on:
     tags: ["v*"]
     paths-ignore:
       - docs/latest.json
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -28,6 +35,7 @@ jobs:
       version: ${{ steps.v.outputs.version }}
       tag: ${{ steps.v.outputs.tag }}
       channel: ${{ steps.v.outputs.channel }}
+      targets: ${{ steps.v.outputs.targets }}
     steps:
       - uses: actions/checkout@v4
       - id: v
@@ -49,25 +57,65 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "building $version" >&2
 
+          # The matrix below is the single source of truth for which platforms
+          # exist; `publish` reads this rather than a second hand-kept list,
+          # because a second list is precisely what principle 11 is about.
+          targets=$(sed -n 's/^ *- target: \(.*\)$/\1/p' .github/workflows/release.yml | tr '\n' ' ')
+          [ -n "$targets" ] || { echo "::error::no build targets parsed"; exit 1; }
+          echo "targets=$targets" >> "$GITHUB_OUTPUT"
+          echo "targets: $targets" >&2
+
   build:
     needs: plan
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Each target builds on a host of its own architecture — no
-          # cross-compiling, because mlua vendors and compiles Lua from C.
-          # Windows is absent on purpose; see steps/009.
-          # Intel mac is absent because `macos-13` is retired: run 34438277779
-          # sat 27 min unassigned, and publish needs every build — so one dead
-          # label withheld ALL assets, on every platform.
+          # ONE macOS host builds BOTH macOS targets. `macos-13` held the Intel
+          # slice and is being retired by GitHub: run 34438277779 sat 27 minutes
+          # with `labels=["macos-13"]` and `started_at == created_at`, never
+          # assigned a runner, and since `publish` needs every build, one dead
+          # label withheld ALL assets on every platform. A permanently-queued
+          # job is worse than an absent one — it looks merely slow. Intel mac
+          # was dropped in ce56928 and comes back here as a cross-compile.
+          #
+          # `[self-hosted, macOS, ARM64]` is warmblood-macbook-runner-1, a
+          # PHYSICAL office machine. It is persistent, not an image: assume
+          # nothing about its state, install nothing system-wide, and never let
+          # a `pull_request` reach it (see the trigger note above).
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04 # older glibc → runs on more distros
+            bin: remuda
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: [self-hosted, macOS, ARM64]
+            bin: remuda
+          - target: x86_64-apple-darwin
+            os: [self-hosted, macOS, ARM64] # cross-compiled; Xcode ships both SDKs
+            bin: remuda
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bin: remuda.exe
     runs-on: ${{ matrix.os }}
+    # A self-hosted runner can be busy, offline, or simply not permitted to
+    # serve this repository, and GitHub leaves such a job QUEUED rather than
+    # failing it. A bound turns "never starts" into a red job someone can read.
+    timeout-minutes: 45
+    defaults:
+      run:
+        # One script for four targets. Git for Windows puts bash on the hosted
+        # image, so `tar`, `set -eu` and `$(…)` mean the same thing everywhere
+        # and nothing below needs a per-OS spelling.
+        shell: bash
     steps:
       - uses: actions/checkout@v4
+
+      - name: put the toolchain on PATH
+        # The self-hosted runner is a launchd service and does not source a
+        # shell profile, so an interactively-installed rustup is invisible to
+        # it. Harmless on the hosted images, where this is already the PATH.
+        if: runner.os == 'macOS'
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - run: rustup target add ${{ matrix.target }}
       - name: build
         env:
@@ -78,9 +126,14 @@ jobs:
         # A build-time env var that silently fails to reach the binary produces
         # a release whose assets are named one thing and whose --version says
         # another. Cheap to assert here, invisible otherwise.
+        #
+        # Skipped for the cross-compiled Intel slice: this host cannot run it.
+        # That is the honest cost of building x86_64 on Apple Silicon, and it is
+        # stated rather than hidden — no other target is exempt.
+        if: matrix.target != 'x86_64-apple-darwin'
         run: |
           set -eu
-          got=$(./target/${{ matrix.target }}/release/remuda --version)
+          got=$(./target/${{ matrix.target }}/release/${{ matrix.bin }} --version)
           [ "$got" = "remuda ${{ needs.plan.outputs.version }}" ] \
             || { echo "::error::--version said '$got'"; exit 1; }
 
@@ -89,15 +142,34 @@ jobs:
           set -eu
           name="remuda-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
           mkdir -p dist
-          tar -czf "dist/$name.tar.gz" -C "target/${{ matrix.target }}/release" remuda
+          tar -czf "dist/$name.tar.gz" -C "target/${{ matrix.target }}/release" ${{ matrix.bin }}
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: dist/*
 
+      - name: leave the shared machine as we found it
+        # The office runner is persistent and shared with other repositories.
+        # `actions/checkout` cleans the tree on the way IN, which is too late to
+        # stop a release-sized `target/` sitting there until the next run.
+        if: always() && runner.os == 'macOS'
+        run: rm -rf target dist
+
   publish:
     needs: [plan, build]
+    # `always()` so this job RUNS when a build did not. Skipped-because-a-
+    # dependency-failed is the silence that cost an hour on 2026-09-10: nobody
+    # was told which target was missing, only that the release did not appear.
+    #
+    # `workflow_dispatch` exists so a branch can PROVE the build matrix on real
+    # runners before it is merged. Publishing from a branch would be a different
+    # thing entirely — it would delete and replace the rolling `nightly` release
+    # with a build of unmerged code, and push to main. So the matrix runs
+    # anywhere and only main or a tag publishes.
+    if: |
+      always() && needs.plan.result == 'success'
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -107,6 +179,60 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: staged
+
+      - name: every offered platform has an asset, or nothing ships
+        # WHY THIS REFUSES INSTEAD OF PUBLISHING WHAT BUILT.
+        #
+        # "3 of 4 beats 0 of 4" is the obvious reading, and it is wrong here.
+        # Work the two cases through from a USER's side, for the case that will
+        # actually recur — the self-hosted macOS runner busy or offline:
+        #
+        #   partial   nightly is a ROLLING tag, so publishing means deleting the
+        #             release and recreating it. The three assets go up, the mac
+        #             one is GONE, and latest.json advances. A mac user's next
+        #             `remuda upgrade` resolves the new version and 404s. We
+        #             took away a build they could have installed a minute ago.
+        #   strict    nothing is deleted, latest.json does not move. Every
+        #             platform keeps installing the last complete build. Linux
+        #             and Windows are one build STALE until the next push.
+        #
+        # Staleness on a rolling channel is invisible; a 404 from the one-liner
+        # the README promises is not. `check-install.py`'s standing promise is
+        # that every offered platform has an asset, and a partial publish breaks
+        # it for real people rather than in theory.
+        #
+        # So the strict path is the one that degrades gracefully, and what was
+        # wrong on 2026-09-10 was never strictness — it was SILENCE. `publish`
+        # was skipped, so nobody was told which target was missing. Hence
+        # always() above and the job summary below.
+        #
+        # ⚠ This reasoning depends on nightly being a rolling tag that is
+        # deleted and recreated. Change that, and revisit this decision.
+        env:
+          EXPECTED: ${{ needs.plan.outputs.targets }}
+        run: |
+          set -eu
+          missing=""
+          for target in $EXPECTED; do
+            # Artifacts land as staged/<target>/remuda-<version>-<target>.tar.gz.
+            ls staged/"$target"/*.tar.gz >/dev/null 2>&1 || missing="$missing $target"
+          done
+          if [ -n "$missing" ]; then
+            {
+              echo "## Release withheld — incomplete build matrix"
+              echo
+              echo "No asset was produced for:"
+              for target in $missing; do echo "- \`$target\`"; done
+              echo
+              echo "Nothing was published and nothing was deleted, so the previous"
+              echo "complete release keeps serving every platform. Fix the failing"
+              echo "or unassigned build and re-run; do not publish a partial set."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::no asset for$missing — refusing to publish a partial release"
+            exit 1
+          fi
+          echo "all $(echo $EXPECTED | wc -w) targets produced an asset" >> "$GITHUB_STEP_SUMMARY"
+
       - name: collect and checksum
         run: |
           set -eu
