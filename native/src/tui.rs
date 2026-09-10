@@ -271,45 +271,29 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
     // that would be blank — and the empty-herd sentence fits.
     let widest = ui.sessions.iter().map(|s| s.size.cols()).max().unwrap_or(0);
     let (list_w, preview_w) = layout(cols, widest);
-    let body = rows.saturating_sub(2);
+    let body = rows.saturating_sub(1);
 
     let (lines, cut) = crop(screen, preview_w, body, ui.pan);
     let mut out = String::from("\x1b[H\x1b[2J");
-    out.push_str(&fit(&format!("remuda · {server}"), list_w));
-    out.push('│');
-    out.push_str(&fit(&preview_title(ui, preview_w, cut), preview_w));
-
     for row in 0..body {
-        out.push_str(&format!("\x1b[{};1H", row + 2));
-        out.push_str(&fit(&list_row(ui, row as usize, list_w), list_w));
+        out.push_str(&format!("\x1b[{};1H", row + 1));
+        // The left column has a header; the preview deliberately has none, so
+        // its first row is the session's own first row — the same thing a ride
+        // shows, at the same place on the screen.
+        let left = if row == 0 {
+            format!("remuda · {server}")
+        } else {
+            list_row(ui, row as usize - 1, list_w)
+        };
+        out.push_str(&fit(&left, list_w));
         out.push('│');
         let line = lines.get(row as usize).map_or("", String::as_str);
         out.push_str(&fit(line, preview_w));
     }
 
     out.push_str(&format!("\x1b[{};1H", rows));
-    out.push_str(&fit(&footer(ui), cols));
+    out.push_str(&fit(&footer(ui, cut, preview_w), cols));
     out
-}
-
-fn preview_title(ui: &Ui, preview_w: u16, cut: bool) -> String {
-    let Some(session) = ui.selected() else {
-        return String::new();
-    };
-    let state = if session.alive { "live" } else { "exited" };
-    let mut title = format!(
-        "{} · {}×{} · {state}",
-        session.name,
-        session.size.cols(),
-        session.size.rows()
-    );
-    if cut {
-        title.push_str(&format!(" · showing {preview_w} cols — h/l pans"));
-    }
-    if !session.alive {
-        title.push_str(" · screen kept, x clears it");
-    }
-    title
 }
 
 /// A row that degrades instead of being cut. When the preview claims most of
@@ -338,12 +322,18 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
     format!("{cursor} {} {tail}", fit(&session.name, room as u16))
 }
 
-fn footer(ui: &Ui) -> String {
+/// The crop notice moved here when the preview lost its title band: a crop that
+/// reads as absence is the failure this repo keeps re-discovering, and the
+/// footer is the only band left that is not the session's own screen.
+fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
     match &ui.mode {
         Mode::Prompt(buffer) => format!("start: {buffer}▏   ⏎ run · esc cancel"),
         Mode::Confirm(name) => format!("kill {name}? it is running — y / n"),
         Mode::Browse => match &ui.notice {
             Some(notice) => format!("remuda: {notice}"),
+            None if cut => format!(
+                "↑↓ select   ⏎ ride   n new   x kill   showing {preview_w} cols — h/l pans   q quit"
+            ),
             None => "↑↓ select   ⏎ ride   n new   x kill   q quit".into(),
         },
     }
@@ -645,13 +635,36 @@ mod tests {
         ui.notice = None;
         let frame = render(&ui, "hello", "default", 120, 10);
         assert!(frame.contains("remuda · default"));
-        assert!(
-            frame.contains("claude · 80×24 · live"),
-            "the title band names it"
-        );
         assert!(frame.contains("▸ claude"), "the cursor is on the first row");
         assert!(frame.contains('⚑'), "and the busy one is flagged");
         assert!(frame.contains("⏎ ride"), "the footer teaches the keys");
+    }
+
+    /// The preview column of each row — where a ride puts the same content.
+    fn preview_rows(frame: &str, list_w: usize) -> Vec<String> {
+        frame
+            .split("\x1b[")
+            .filter_map(|chunk| chunk.split_once(";1H"))
+            .map(|(_, row)| row.chars().skip(list_w + 1).collect())
+            .collect()
+    }
+
+    #[test]
+    fn the_preview_starts_at_the_sessions_own_first_row() {
+        let ui = ui(vec![row("claude", true, false)]);
+        let (list_w, _) = layout(120, 80);
+        let frame = render(&ui, "first line\nsecond line", "default", 120, 10);
+        let rows = preview_rows(&frame, list_w as usize);
+        assert_eq!(
+            rows[0].trim_end(),
+            "first line",
+            "nothing sits above the screen, so entering does not shift it"
+        );
+        assert_eq!(rows[1].trim_end(), "second line");
+        assert!(
+            !frame.contains("80×24"),
+            "and no size: it is the size at creation, false the moment you resize"
+        );
     }
 
     #[test]
@@ -688,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cropped_preview_says_so_in_the_title() {
+    fn a_cropped_preview_says_so_in_the_footer() {
         let mut ui = ui(vec![row("wide", true, false)]);
         ui.sessions[0].size = Size::new(200, 50);
         let frame = render(&ui, &"x".repeat(300), "default", 100, 10);

@@ -81,13 +81,24 @@ fn fingerprint(text: &std::ffi::OsStr) -> u64 {
     hash
 }
 
-/// The shell a bare `new` starts. `$SHELL` is the unix answer and `%COMSPEC%`
-/// the Windows one; both are what the OS itself uses to mean "this person's
-/// interactive shell".
+/// The shell a bare `new` starts. `$SHELL` first on every host: a person's
+/// shell is their own choice, and nothing here improves on it.
 pub fn default_shell() -> String {
-    std::env::var("SHELL")
-        .or_else(|_| std::env::var("COMSPEC"))
-        .unwrap_or_else(|_| if cfg!(windows) { "cmd.exe" } else { "sh" }.into())
+    shell_or_default(std::env::var("SHELL").ok())
+}
+
+/// `powershell.exe` and not `pwsh.exe`: 5.1 is in-box on every supported
+/// Windows and 7 is a separate install, so `pwsh` risks prefilling the prompt
+/// with a binary that is not on the machine — worse than the `cmd.exe` it replaces.
+fn shell_or_default(configured: Option<String>) -> String {
+    configured.unwrap_or_else(|| {
+        if cfg!(windows) {
+            "powershell.exe"
+        } else {
+            "sh"
+        }
+        .to_string()
+    })
 }
 
 /// Serve until the listener dies. Caution: connect before unlinking — an
@@ -329,4 +340,38 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
     line.push('\n');
     stream.write_all(line.as_bytes())?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_or_default;
+
+    #[test]
+    fn a_shell_the_person_already_chose_is_never_second_guessed() {
+        assert_eq!(
+            shell_or_default(Some("/usr/bin/fish".into())),
+            "/usr/bin/fish"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_with_no_shell_set_falls_back_to_sh() {
+        assert_eq!(shell_or_default(None), "sh");
+    }
+
+    /// Runs the prefill rather than asserting its spelling: the failure this
+    /// guards is a prompt naming a binary the machine does not have.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_prefill_is_powershell_and_it_is_really_there() {
+        let shell = shell_or_default(None);
+        assert_eq!(shell, "powershell.exe");
+        // `42` cannot appear in an echo of the question (PRINCIPLES §4).
+        let out = std::process::Command::new(&shell)
+            .args(["-NoProfile", "-Command", "Write-Output (6*7)"])
+            .output()
+            .expect("the prefilled shell must be runnable, not merely plausible");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "42");
+    }
 }
