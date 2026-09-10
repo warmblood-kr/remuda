@@ -108,6 +108,39 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  cargo-audit:
+    # Plain `cargo audit` exits 0 on `unmaintained`/`unsound`/`yanked`
+    # advisories — only `--deny warnings` turns those into a failed build.
+    # A gate that passes on the thing it exists to catch is theatre.
+    #
+    # A red here can appear with no commit of ours, because RustSec
+    # publishes advisories on its own schedule. That is correct behavior,
+    # not a flake: read the advisory and bump the crate, don't just re-run
+    # the job. If no patched version exists yet (`unmaintained` advisories
+    # often have none), the only moves are replacing the crate, or
+    # `cargo audit --ignore RUSTSEC-XXXX-NNNN` with a comment naming a
+    # dated expiry to revisit — never ignore with no expiry.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Report crate and finding counts
+        run: |
+          cargo audit --json > audit.json
+          crates=$(jq -r '.lockfile."dependency-count"' audit.json)
+          vulns=$(jq -r '.vulnerabilities.count' audit.json)
+          warns=$(jq -r '[.warnings[]? | length] | add // 0' audit.json)
+          {
+            echo "### cargo audit"
+            echo "- crates scanned: $crates"
+            echo "- vulnerabilities: $vulns"
+            echo "- warnings (unmaintained/unsound/yanked/notice): $warns"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Gate on findings
+        run: cargo audit --no-fetch --deny warnings
+
   wasm-boundary:
     # The policy layer must build for a target that has no fork, no pty, no tty.
     # This catches a host CRATE leaking into core — the axis portable-pty sits
