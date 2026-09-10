@@ -26,7 +26,48 @@ fn send(mut stream: &Stream, request: &Request) -> std::io::Result<()> {
 fn read_response(stream: &Stream) -> std::io::Result<Response> {
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
-    serde_json::from_str(&line).map_err(std::io::Error::other)
+    Ok(interpret(&line))
+}
+
+/// What a daemon says when it cannot READ what we sent. Only the deserializer
+/// produces it — every refusal about content ("no such session") is worded by a
+/// handler — so this prefix means one thing and nothing else.
+const CANNOT_READ: &str = "bad request: ";
+
+/// One reply, with the two shapes of version skew turned into words a person
+/// can act on. Everything else is passed through exactly as the daemon wrote it:
+/// a malformed request that is NOT skew must still say what it was.
+fn interpret(line: &str) -> Response {
+    if line.trim().is_empty() {
+        return Response::error("the daemon hung up without answering");
+    }
+    match serde_json::from_str::<Response>(line) {
+        // We serialized that request from this binary's own `Request`, so a
+        // daemon on this build CANNOT fail to read it. One that did is not.
+        Ok(Response::Error(reason)) => match reason.strip_prefix(CANNOT_READ) {
+            Some(detail) => {
+                Response::error(skew(&format!("it could not read the request: {detail}")))
+            }
+            None => Response::Error(reason),
+        },
+        Ok(other) => other,
+        // The mirror: a reply we cannot read, from a daemon newer than we are.
+        Err(e) => Response::error(skew(&format!("its reply did not parse: {e}"))),
+    }
+}
+
+/// Every daemon deployed before any handshake existed can never announce its own
+/// version, so the client's reaction to the failure is the only diagnosis that
+/// reaches those users. See [`tests::the_cure_survives_an_eighty_column_crop`].
+fn skew(detail: &str) -> String {
+    // One line, cure first. The TUI footer is one row of `cols` and crops the
+    // tail: measured at 80 columns, a message that led with the diagnosis lost
+    // `remuda restart` off the right edge — the only actionable half of it.
+    format!(
+        "the daemon is not this build — run `remuda restart`, then this again. \
+         This command is {}; the daemon: {detail}",
+        crate::dist::VERSION,
+    )
 }
 
 /// Which way a ride ended. Both used to return `Ok(())`, and the terminal
@@ -56,9 +97,9 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    match serde_json::from_str::<Response>(&line) {
-        Ok(Response::Ok) => {}
-        Ok(Response::Error(reason)) => {
+    match interpret(&line) {
+        Response::Ok => {}
+        Response::Error(reason) => {
             return Err(std::io::Error::other(reason));
         }
         _ => return Err(std::io::Error::other("daemon did not acknowledge attach")),
@@ -159,5 +200,76 @@ impl Drop for RawMode {
     fn drop(&mut self) {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
         let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::interpret;
+    use remuda_core::protocol::Response;
+
+    /// The line the daemon at 618cda4^ actually sent, byte for byte.
+    const STALE: &str =
+        r#"{"Error":"bad request: invalid type: null, expected a string at line 1 column 19"}"#;
+
+    #[test]
+    fn a_daemon_that_cannot_read_us_is_named_as_a_stale_build() {
+        let Response::Error(said) = interpret(STALE) else {
+            panic!("not an error")
+        };
+        assert!(said.starts_with("the daemon is not this build"), "{said}");
+        // The serde detail is the real diagnostic; it must survive, just not lead.
+        assert!(said.contains("invalid type: null"), "{said}");
+    }
+
+    #[test]
+    fn an_unknown_variant_is_the_same_diagnosis() {
+        // What an old daemon says to `Version` — the shape step 015 must not
+        // turn into something more confusing than what it replaced.
+        let line = r#"{"Error":"bad request: unknown variant `Version`, expected one of `List`, `New` at line 1 column 11"}"#;
+        let Response::Error(said) = interpret(line) else {
+            panic!("not an error")
+        };
+        assert!(said.starts_with("the daemon is not this build"), "{said}");
+    }
+
+    /// The TUI footer is one row wide and crops the tail, so a message that
+    /// leads with the diagnosis loses the cure off the right edge. Measured at
+    /// 80 columns with the 8-character "remuda: " prefix a caller adds.
+    #[test]
+    fn the_cure_survives_an_eighty_column_crop() {
+        let Response::Error(said) = interpret(STALE) else {
+            panic!("not an error")
+        };
+        let footer: String = format!("remuda: {said}").chars().take(80).collect();
+        assert!(
+            footer.contains("remuda restart"),
+            "cropped away the cure:\n{footer}"
+        );
+    }
+
+    /// The negative control: a refusal about CONTENT is not skew and must reach
+    /// the user in the daemon's own words. Without this the fix above would
+    /// swallow every error into one sentence and be indistinguishable from it.
+    #[test]
+    fn an_ordinary_refusal_is_passed_through_untouched() {
+        let line = r#"{"Error":"no such session: build"}"#;
+        assert_eq!(
+            interpret(line),
+            Response::Error("no such session: build".into())
+        );
+    }
+
+    #[test]
+    fn a_hangup_is_not_reported_as_a_parse_failure() {
+        let Response::Error(said) = interpret("") else {
+            panic!("not an error")
+        };
+        assert!(said.contains("hung up"), "{said}");
+    }
+
+    #[test]
+    fn a_normal_reply_still_arrives_as_itself() {
+        assert_eq!(interpret(r#""Ok""#), Response::Ok);
     }
 }

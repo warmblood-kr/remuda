@@ -100,8 +100,24 @@ remuda upgrade --channel stable     # switch tracks
 ```
 
 `remuda upgrade` re-runs that same install script — one download-and-verify path
-rather than two — and lands the new binary by rename, so upgrading while a
-daemon is running is safe.
+rather than two — and lands the new binary by rename, so upgrading while a daemon
+is running does not disturb it.
+
+⚠ **It does not disturb the daemon because it does not replace it.** A daemon
+outlives every client on purpose, so after an upgrade the new binary is talking to
+a daemon still running the old code, and the first request whose *shape* changed
+fails. Every command asks the daemon which build it is and prints one line when
+the answer is not its own — but a daemon started before that handshake existed
+cannot answer, so the client names the skew from its own side instead, on the
+request the old code could not read. Either way the cure is one verb, and it takes
+the herd with it:
+
+```sh
+remuda restart        # names any live session and asks first; -f skips the ask
+```
+
+[`steps/013`](steps/013-a-daemon-that-says-which-build-it-is.md) has the incident,
+and what each half does and does not cover.
 
 Every command checks [`latest.json`](https://warmblood-kr.github.io/remuda/latest.json)
 at most once a day and prints one line to stderr when you are behind. The fetch

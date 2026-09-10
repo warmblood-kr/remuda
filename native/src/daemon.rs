@@ -135,6 +135,15 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
     match request {
         Request::List => reply(&stream, &Response::Sessions(registry.list())),
 
+        Request::Version => reply(&stream, &Response::Value(crate::dist::VERSION.into())),
+
+        // Answer before going. A client left guessing from a hung-up socket
+        // cannot tell "it stopped" from "it never heard me".
+        Request::Shutdown => {
+            reply(&stream, &Response::Ok)?;
+            std::process::exit(0);
+        }
+
         Request::New {
             name,
             command,
