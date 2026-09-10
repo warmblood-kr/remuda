@@ -280,14 +280,14 @@ dependencies = [
 
 [[package]]
 name = "remuda-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "remuda-native"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "mlua",
  "nix",

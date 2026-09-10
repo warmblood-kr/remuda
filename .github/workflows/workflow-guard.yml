@@ -1,0 +1,24 @@
+name: workflow-guard
+
+# ci.yml cannot check whether ci.yml parses. If it does not, none of its jobs
+# exist to do the checking — that is not a gap in coverage, it is arithmetic.
+#
+# Measured 2026-09-10: a heredoc body at column 0 ended the YAML block scalar it
+# was written inside, ci.yml stopped parsing, GitHub started ZERO jobs, and the
+# run still showed a red X that looked like an ordinary test failure. Every gate
+# in this repository was dead for twelve hours, `gates-can-fail` among them.
+#
+# So this lives in its own file, is deliberately tiny, and is edited almost
+# never. The honest limit: if THIS file breaks, nothing catches it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  workflows-parse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/check-workflows.py

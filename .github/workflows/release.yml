@@ -1,0 +1,159 @@
+name: release
+
+# Two channels, ONE workflow, because the thing that breaks an installer is two
+# build matrices drifting apart. `scripts/check-install.py` also asserts this
+# matrix matches the triples docs/install.sh offers.
+#
+#   push a tag v1.2.3  →  release "v1.2.3", marked latest      (stable)
+#   push to main       →  rolling release "nightly", prerelease (nightly)
+#
+# The publish job writes the new version into docs/latest.json on main, which
+# GitHub Pages serves. `paths-ignore` is what stops that commit from starting
+# another nightly.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - docs/latest.json
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+      channel: ${{ steps.v.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        # The nightly version is derived, never hand-maintained: the manifest's
+        # own number, the UTC date, and the commit. Sorting by that string is
+        # what `dist::is_newer` relies on, so the date has to come first.
+        run: |
+          set -eu
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+            echo "tag=$GITHUB_REF_NAME"  >> "$GITHUB_OUTPUT"
+            echo "channel=stable"        >> "$GITHUB_OUTPUT"
+          else
+            base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+            version="$base-nightly.$(date -u +%Y%m%d).$(git rev-parse --short=7 HEAD)"
+            echo "tag=nightly"    >> "$GITHUB_OUTPUT"
+            echo "channel=nightly" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "building $version" >&2
+
+  build:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Each target builds on a host of its own architecture — no
+          # cross-compiling, because mlua vendors and compiles Lua from C.
+          # Windows is absent on purpose; see steps/009.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04 # older glibc → runs on more distros
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - name: build
+        env:
+          REMUDA_VERSION: ${{ needs.plan.outputs.version }}
+        run: cargo build --release --bin remuda --target ${{ matrix.target }}
+
+      - name: the binary reports the version it was built with
+        # A build-time env var that silently fails to reach the binary produces
+        # a release whose assets are named one thing and whose --version says
+        # another. Cheap to assert here, invisible otherwise.
+        run: |
+          set -eu
+          got=$(./target/${{ matrix.target }}/release/remuda --version)
+          [ "$got" = "remuda ${{ needs.plan.outputs.version }}" ] \
+            || { echo "::error::--version said '$got'"; exit 1; }
+
+      - name: package
+        run: |
+          set -eu
+          name="remuda-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
+          mkdir -p dist
+          tar -czf "dist/$name.tar.gz" -C "target/${{ matrix.target }}/release" remuda
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+
+  publish:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          path: staged
+      - name: collect and checksum
+        run: |
+          set -eu
+          mkdir -p dist
+          find staged -type f -name '*.tar.gz' -exec mv {} dist/ \;
+          # Plain names, no `./` prefix, so `sha256sum -c SHA256SUMS` works for
+          # a human in the download directory too.
+          cd dist && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS
+
+      - name: publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -eu
+          if [ "${{ needs.plan.outputs.channel }}" = nightly ]; then
+            # Rolling: delete the old one so "nightly" always names today's.
+            gh release delete "$TAG" --yes --cleanup-tag || true
+            gh release create "$TAG" --prerelease --target "$GITHUB_SHA" \
+              --title "nightly $VERSION" \
+              --notes "Rolling build of main. Version \`$VERSION\`." dist/*
+          else
+            gh release create "$TAG" --latest --title "$TAG" \
+              --generate-notes dist/*
+          fi
+
+      - name: publish the version index
+        env:
+          CHANNEL: ${{ needs.plan.outputs.channel }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, os, datetime, pathlib
+          p = pathlib.Path("docs/latest.json")
+          index = json.loads(p.read_text())
+          index[os.environ["CHANNEL"]] = os.environ["VERSION"]
+          index["updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat(
+              timespec="seconds"
+          ).replace("+00:00", "Z")
+          p.write_text(json.dumps(index, indent=2) + "\n")
+          print(p.read_text())
+          PY
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/latest.json
+          git diff --cached --quiet && exit 0
+          git commit -m "release: $CHANNEL is now $VERSION"
+          git pull --rebase origin main
+          git push origin HEAD:main

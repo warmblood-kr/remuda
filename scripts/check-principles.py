@@ -16,6 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PRINCIPLES = ROOT / "PRINCIPLES.md"
 CI = ROOT / ".github/workflows/ci.yml"
+WORKFLOWS = ROOT / ".github/workflows"
 CLIPPY = ROOT / "core/clippy.toml"
 
 # The document must keep growing only with real principles; a parser that finds
@@ -66,10 +67,21 @@ if len(headings) != len(enforced):
 # under `on:`, which indents identically — measured 2026-09-10, and it would
 # have let `CI job \`push\`` pass as a real mechanism. Fail closed if the
 # section is missing rather than silently finding no jobs.
-if ci and "\njobs:\n" not in ci:
-    problems.append("ci.yml has no `jobs:` section — cannot verify any CI job name")
-jobs_section = ci.split("\njobs:\n", 1)[1] if "\njobs:\n" in ci else ""
-ci_jobs = set(re.findall(r"^  ([a-z][a-z0-9-]*):$", jobs_section, re.M))
+#
+# Every workflow file, not just ci.yml: jobs live in release.yml and
+# workflow-guard.yml too, and `workflows-parse` in particular CANNOT live in
+# ci.yml — a file cannot check whether it itself still parses.
+ci_jobs: set[str] = set()
+workflow_files = sorted(WORKFLOWS.glob("*.yml"))
+if not workflow_files:
+    problems.append(f"no workflow files under {WORKFLOWS.relative_to(ROOT)}")
+for path in workflow_files:
+    text = path.read_text(encoding="utf-8")
+    if "\njobs:\n" not in text:
+        problems.append(f"{path.name} has no `jobs:` section — cannot verify its job names")
+        continue
+    section = text.split("\njobs:\n", 1)[1]
+    ci_jobs |= set(re.findall(r"^  ([a-z][a-z0-9-]*):$", section, re.M))
 clippy_keys = set(re.findall(r"^([a-z][a-z0-9-]*)\s*=", clippy, re.M))
 clippy_paths = set(re.findall(r'path\s*=\s*"([^"]+)"', clippy))
 

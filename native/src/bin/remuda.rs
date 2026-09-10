@@ -8,19 +8,19 @@
 //!   remuda capture <name>         print the screen as text
 //!   remuda close <name>           end a session (live or already self-exited)
 //!   remuda run <script.lua>       run a script with those bound as functions
-//!   remuda -e <code>              evaluate Lua in the daemon's living image
-//!   remuda repl                   the same image, a line at a time
+//!   remuda -e <code> / repl       evaluate Lua in the daemon's living image
 //!   remuda mcp                    serve those as MCP tools on stdin/stdout
 //!   remuda daemon                 run the daemon in the foreground
+//!   remuda upgrade / --version    follow a release channel; say which build this is
 //!   remuda -s <server> …          talk to a *named* daemon instead of "default"
 //! ```
 //!
 //! `mcp` is the one line a person does not type: it lets the program running
 //! *inside* a session reach the manager holding it. The daemon starts itself on
-//! first use. `-s` names one of several daemons; `REMUDA_RUNTIME_DIR` the tree.
+//! first use. `-s` names a daemon; `REMUDA_RUNTIME_DIR` the tree. See `USAGE`.
 
 use remuda_core::protocol::{Request, Response};
-use remuda_native::{daemon, terminal_size};
+use remuda_native::{daemon, dist, terminal_size};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -30,11 +30,21 @@ fn main() -> ExitCode {
     let argv: Vec<&str> = rest.iter().map(String::as_str).collect();
     let path = daemon::socket_path(server);
 
+    announce_update(&argv);
+
     match argv.as_slice() {
         [] | ["help"] | ["-h"] | ["--help"] => {
             eprint!("{}", USAGE);
             ExitCode::SUCCESS
         }
+
+        ["--version"] | ["-V"] | ["version"] => {
+            println!("remuda {}", dist::VERSION);
+            ExitCode::SUCCESS
+        }
+
+        // No daemon involved: this replaces the binary, it does not talk to one.
+        ["upgrade", rest @ ..] => run_upgrade(rest),
 
         // Not part of the user-facing set: this is what the auto-start spawns.
         ["daemon"] => match daemon::serve(&path) {
@@ -147,6 +157,13 @@ remuda — a pty manager you can attach to
   remuda -e <code>              evaluate Lua in the daemon's living image
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve them as MCP tools on stdin/stdout
+  remuda upgrade [--channel C]  re-run the installer on stable or nightly
+  remuda --version              the version this binary was built with
+
+Installs follow a channel — `stable` (release tags) or `nightly` (every commit
+on main) — recorded at $XDG_DATA_HOME/remuda/channel by the install script.
+Every command checks for a newer one at most once a day, in a detached child
+that no command waits for. REMUDA_NO_UPDATE_CHECK=1 turns it off.
 
 The daemon holds one Lua interpreter for its whole life, and `-e`, `repl` and
 a script are three doors into it. State persists between them:
@@ -174,6 +191,37 @@ In a script they live on one table, and a refusal is raised, not returned:
 `mcp` is for a program running inside a session to reach the manager holding
 it — a client spawns it and owns both pipes, so there is nothing to type here.
 ";
+
+/// One stderr line when a newer version is out. Silent on `daemon` — its stderr
+/// is the client's only diagnostic when start-up fails — and on `mcp`, whose
+/// streams belong to whatever spawned it.
+fn announce_update(argv: &[&str]) {
+    if !matches!(argv, ["daemon"] | ["mcp"]) {
+        if let Some(notice) = dist::update_notice() {
+            eprintln!("{notice}");
+        }
+    }
+}
+
+/// Split out of `main` for the same reason `list_sessions` was: clippy's line
+/// budget. This one talks to no daemon — it replaces this very binary.
+fn run_upgrade(args: &[&str]) -> ExitCode {
+    match upgrade_channel(args).and_then(dist::upgrade) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => fail(e),
+    }
+}
+
+/// `--channel <name>` or nothing, in which case the installed channel file
+/// decides. An unknown flag is refused rather than ignored.
+fn upgrade_channel<'a>(args: &[&'a str]) -> Result<Option<&'a str>, String> {
+    match args {
+        [] => Ok(None),
+        ["--channel", name] if dist::is_channel(name) => Ok(Some(name)),
+        ["--channel", name] => Err(format!("unknown channel {name:?} — stable or nightly")),
+        _ => Err("usage: remuda upgrade [--channel stable|nightly]".into()),
+    }
+}
 
 /// Pull a leading `-s <server>` off argv; `"default"` when absent. Only the
 /// *leading* position counts — in `remuda new -s x` the `-s` belongs to the
