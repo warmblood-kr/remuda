@@ -151,9 +151,34 @@ for _, s in ipairs(remuda.ls()) do
 end
 ```
 
-The same herd is reachable over MCP — `new`, `ls`, `send`, `capture` — so an
-agent can drive other agents. `attach` is deliberately absent there: handing a
-real terminal to something that has none can only fail.
+The same herd is reachable over MCP — `new`, `ls`, `send`, `capture`,
+`run_script` — so an agent can drive other agents. `attach` is deliberately
+absent there: handing a real terminal to something that has none can only fail.
+
+**The MCP server is a frame, not a fixed set.** `run_script` evaluates Lua in
+that same image, and a Lua function marked exported becomes a real MCP tool —
+listed with its arguments, callable — with no rebuild:
+
+```lua
+remuda.tool{
+  name  = "idle_workers",
+  about = "Every live session that has said nothing for a while, one per line.",
+  args  = { seconds = "How idle counts as idle. Default 300." },
+  run   = function(a)
+    local out = {}
+    for _, s in ipairs(remuda.ls()) do
+      if s.alive and s.idle > (tonumber(a.seconds) or 300) then out[#out+1] = s.name end
+    end
+    return table.concat(out, "\n")
+  end,
+}
+```
+
+A word is callable and carries its own description, so the next tool is written
+out of the last: `remuda.tools.idle_workers{seconds = "60"}` is a normal call
+from any script. `wait_for` ships this way rather than in Rust, so the path is
+exercised rather than merely present. [`steps/014`](steps/014-a-tool-registry.md)
+has the ruling and the ceilings.
 
 ## Status
 
@@ -193,7 +218,7 @@ and fail only at runtime. Closing that second axis needs a lint, not a target.
 ## Build
 
 ```sh
-cargo test --workspace --all-targets                          # 90 tests
+cargo test --workspace --all-targets                          # 96 tests
 cargo check -p remuda-core --target wasm32-unknown-unknown    # the boundary gate
 ```
 

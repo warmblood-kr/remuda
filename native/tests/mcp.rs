@@ -1,11 +1,11 @@
-//! MCP: what a program inside a session can reach, and what a refusal looks like.
+//! MCP: what an agent driving remuda can reach, and what a refusal looks like.
 //!
-//! 정수님, 2026-09-10: *"그 pty manager에서 claude code를 구동하고, pty manager와
-//! mcp 등으로 연결하는 장치를 두고."* The claims worth exercising are that the tool
-//! surface is exactly the decided set (a third binding must not widen the API),
-//! that a call actually moves a session, and that a refusal arrives as an error
-//! rather than as a successful empty result — the failure a model turns into a
-//! confident story about an idle terminal.
+//! 정수님, 2026-09-10: *"MCP server는 제공을 하고, 필요에 따라서 tool을
+//! 추가해나갈 수 있도록."* The claims worth exercising are that the served list
+//! is the frame plus the image's registry (a tool defined in Lua is listed and
+//! dispatched with no rebuild), that a call actually moves a session, and that a
+//! refusal arrives as an error rather than as a successful empty result — the
+//! failure a model turns into a confident story about an idle terminal.
 
 use remuda_core::protocol::{Request, Response};
 use remuda_native::{client, daemon, mcp};
@@ -65,14 +65,29 @@ fn text_of(reply: &Value) -> String {
         .to_string()
 }
 
+fn listed(path: &Path) -> Vec<String> {
+    let reply = ask(
+        path,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let mut names: Vec<String> = reply["result"]["tools"]
+        .as_array()
+        .expect("tools is a list")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    names.sort();
+    names
+}
+
 #[test]
-fn the_tool_surface_is_exactly_the_decided_set() {
-    // The property that makes a third surface safe: the vocabulary is `Request`
-    // and nothing else. Checked in both directions — a tool served but not
-    // declared fails, and a name declared but never served fails too.
+fn the_tool_surface_is_the_frame_plus_the_image() {
+    // Checked in both directions — a tool served but not declared fails, and a
+    // name declared but never served fails too. On a fresh daemon the whole
+    // list is `TOOLS` plus what `src/tools.lua` registers, which is `wait_for`.
     //
-    // Four, not five. `attach` hands a terminal to a human and an MCP client has
-    // no terminal; the absence is a decision, recorded here so it stays one.
+    // `attach` is absent: it hands a terminal to a human and an MCP client has
+    // no terminal. The absence is a decision, recorded here so it stays one.
     let dir = scratch("surface");
     let path = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&path);
@@ -81,18 +96,14 @@ fn the_tool_surface_is_exactly_the_decided_set() {
         &path,
         json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
     );
-    let mut served: Vec<String> = reply["result"]["tools"]
-        .as_array()
-        .expect("tools is a list")
-        .iter()
-        .map(|t| t["name"].as_str().unwrap_or_default().to_string())
-        .collect();
-    served.sort();
+    let served = listed(&path);
 
+    let mut expected = mcp::TOOLS.map(str::to_string).to_vec();
+    expected.push("wait_for".to_string());
+    expected.sort();
     assert_eq!(
-        served,
-        mcp::TOOLS.to_vec(),
-        "the served tools and mcp::TOOLS disagree"
+        served, expected,
+        "the served tools and mcp::TOOLS + the image's registry disagree"
     );
     assert!(
         !served.contains(&"attach".to_string()),
@@ -181,8 +192,181 @@ fn a_refusal_is_an_error_not_an_empty_success() {
     );
 
     // An unknown tool is the same shape, so a client cannot read a typo as ok.
+    // It is the registry that answers this now, so the words are Lua's.
     let bogus = call(&path, "capture-all", json!({}));
     assert_eq!(bogus["result"]["isError"], true, "unknown tool: {bogus}");
+    assert!(
+        text_of(&bogus).contains("no such tool"),
+        "the registry must say what it did not find: {bogus}"
+    );
+}
+
+#[test]
+fn a_tool_defined_in_lua_is_listed_and_dispatched() {
+    // Ruling ③, 정수님 2026-09-10: the MCP server is a frame and tools get added
+    // as needed. The claim under test is that a Lua function marked exported
+    // becomes a real MCP tool — listed with its arguments and callable — with no
+    // rebuild between defining it and calling it.
+    let dir = scratch("registry");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    assert!(
+        !listed(&path).contains(&"add".to_string()),
+        "the tool exists before it was defined — this test proves nothing"
+    );
+
+    let defined = call(
+        &path,
+        "run_script",
+        json!({"code": r#"
+            remuda.tool{
+              name = "add",
+              about = "Add two numbers, to prove the registry carries arguments.",
+              args = {a = "left addend", b = "right addend"},
+              needs = {"a"},
+              run = function(x) return tonumber(x.a) + tonumber(x.b or 0) end,
+            }
+            return "defined"
+        "#}),
+    );
+    assert_eq!(defined["result"]["isError"], false, "define: {defined}");
+
+    // Listed, with the schema the definition described.
+    let reply = ask(
+        &path,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let added = reply["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "add")
+        .unwrap_or_else(|| panic!("`add` never reached tools/list: {reply}"));
+    assert_eq!(added["inputSchema"]["required"], json!(["a"]), "{added}");
+    assert_eq!(
+        added["inputSchema"]["properties"]["b"]["description"], "right addend",
+        "{added}"
+    );
+
+    // Dispatched. Arithmetic, per PRINCIPLES.md §4 — the answer cannot appear
+    // in the echo of the question.
+    let sum = call(&path, "add", json!({"a": "6", "b": "7"}));
+    assert_eq!(sum["result"]["isError"], false, "add: {sum}");
+    assert_eq!(text_of(&sum), "13", "{sum}");
+
+    // An optional argument may be omitted; a needed one may not.
+    assert_eq!(text_of(&call(&path, "add", json!({"a": "5"}))), "5");
+    let missing = call(&path, "add", json!({"b": "5"}));
+    assert_eq!(missing["result"]["isError"], true, "{missing}");
+    assert!(text_of(&missing).contains("needs `a`"), "{missing}");
+
+    // A string argument is escaped, not interpolated: this one is Lua source
+    // that would run if the dispatch built its call by concatenation.
+    let quoted = call(
+        &path,
+        "run_script",
+        json!({"code": r#"
+            remuda.tool{
+              name = "echo",
+              about = "Answer with the argument, so quoting can be checked.",
+              args = {text = "anything at all"},
+              needs = {"text"},
+              run = function(x) return x.text end,
+            }
+            return "ok"
+        "#}),
+    );
+    assert_eq!(quoted["result"]["isError"], false, "{quoted}");
+    let hostile = r#"" .. os.exit() .. ""#;
+    let echoed = call(&path, "echo", json!({"text": hostile}));
+    assert_eq!(echoed["result"]["isError"], false, "{echoed}");
+    assert_eq!(text_of(&echoed), hostile, "the argument was not escaped");
+}
+
+#[test]
+fn run_script_reaches_the_one_shared_image() {
+    // Ruling ②, 정수님 2026-09-10: one daemon, `RunScript` from outside and
+    // inside alike. What makes it the *shared* image rather than a fresh
+    // interpreter per call is that state set by one call is seen by the next —
+    // and that the herd it drives is the herd `ls` shows.
+    let dir = scratch("runscript");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let set = call(&path, "run_script", json!({"code": "fleet = 6 * 7"}));
+    assert_eq!(set["result"]["isError"], false, "{set}");
+
+    let read = call(&path, "run_script", json!({"code": "fleet"}));
+    assert_eq!(
+        text_of(&read),
+        "42",
+        "state did not survive the call: {read}"
+    );
+
+    // The image drives the same sessions the other tools do.
+    let made = call(
+        &path,
+        "run_script",
+        json!({"code": r#"return remuda.new("by-script", {"sh"})"#}),
+    );
+    assert_eq!(text_of(&made), "by-script", "{made}");
+    assert!(
+        text_of(&call(&path, "ls", json!({}))).contains("by-script"),
+        "the script's session is not in the herd `ls` shows"
+    );
+
+    // A Lua error is a refusal, not a successful empty answer.
+    let bad = call(&path, "run_script", json!({"code": "error('by hand')"}));
+    assert_eq!(bad["result"]["isError"], true, "{bad}");
+    assert!(text_of(&bad).contains("by hand"), "{bad}");
+
+    // Empty source would `load` fine and return nothing, which is the empty
+    // success this whole surface refuses.
+    let empty = call(&path, "run_script", json!({"code": "   "}));
+    assert_eq!(empty["result"]["isError"], true, "{empty}");
+}
+
+#[test]
+fn wait_for_answers_a_screen_and_refuses_a_deadline() {
+    // The tool the frame ships through its own registry, so the path is
+    // exercised rather than merely present. Both directions matter: it must
+    // answer with a matching screen, and it must FAIL on a deadline rather than
+    // answer with a screen that does not match.
+    let dir = scratch("waitfor");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    assert_eq!(
+        call(&path, "new", json!({"name": "waited", "command": ["sh"]}))["result"]["isError"],
+        false
+    );
+    assert_eq!(
+        call(
+            &path,
+            "send",
+            json!({"session": "waited", "text": "echo $((6*7))-awaited"})
+        )["result"]["isError"],
+        false
+    );
+
+    let seen = call(
+        &path,
+        "wait_for",
+        json!({"session": "waited", "pattern": "42%-awaited", "seconds": "10"}),
+    );
+    assert_eq!(seen["result"]["isError"], false, "wait_for: {seen}");
+    assert!(text_of(&seen).contains("42-awaited"), "{seen}");
+
+    // Negative control: the same call for something that will never appear must
+    // go red, or the pass above could have come from any screen at all.
+    let never = call(
+        &path,
+        "wait_for",
+        json!({"session": "waited", "pattern": "99%-never", "seconds": "0.3"}),
+    );
+    assert_eq!(never["result"]["isError"], true, "{never}");
+    assert!(text_of(&never).contains("never matched"), "{never}");
 }
 
 #[test]
@@ -250,10 +434,12 @@ fn the_real_binary_completes_a_handshake_over_stdio() {
     );
     let second: Value = serde_json::from_str(lines[1]).expect("reply 2 is JSON");
     assert_eq!(second["id"], 2);
+    // The frame's own five plus whatever the image registered — the shipped
+    // binary must reflect the registry, not just the constant compiled into it.
     assert_eq!(
         second["result"]["tools"].as_array().map(Vec::len),
-        Some(mcp::TOOLS.len()),
-        "the binary serves a different tool count than mcp::TOOLS"
+        Some(mcp::TOOLS.len() + 1),
+        "the binary serves a different tool count than mcp::TOOLS + wait_for"
     );
 
     // The daemon really was the one answering, not a stub inside the child.
