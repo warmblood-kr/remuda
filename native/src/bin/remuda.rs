@@ -355,12 +355,26 @@ fn version_skew(argv: &[&str], path: &Path) -> Option<String> {
         return None;
     }
     remuda_native::ipc::connect(path).ok()?;
-    let theirs = match remuda_native::client::request(path, &Request::Version) {
+    skew_notice(remuda_native::client::request(path, &Request::Version))
+}
+
+/// What to say about a `Request::Version` outcome — split out of
+/// `version_skew` so this decision is testable without a socket. See
+/// steps/024.
+fn skew_notice(response: std::io::Result<Response>) -> Option<String> {
+    let theirs = match response {
         Ok(Response::Value(theirs)) if theirs == dist::VERSION => return None,
         Ok(Response::Value(theirs)) => theirs,
-        // It went away between the connect and the ask; the real request will
-        // start one and say so properly.
-        Err(_) => return None,
+        // Cure first, same reason as the message below: this can reach a TUI
+        // footer that crops the tail at the terminal's width.
+        Err(_) => {
+            return Some(format!(
+                "the daemon could not confirm its version — `remuda restart` \
+                 replaces it if something still seems off. The check itself \
+                 failed partway through; this command is {}",
+                dist::VERSION
+            ))
+        }
         // Older than the handshake itself. Not knowing is itself the answer.
         Ok(_) => "from a build that predates this handshake".into(),
     };
@@ -605,4 +619,22 @@ fn describe(response: std::io::Result<Response>) -> String {
 fn fail(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("remuda: {message}");
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod version_skew_tests {
+    use super::*;
+
+    /// [MEASURED] A request failure must not read as a confirmed match —
+    /// that silently uses a possibly-mismatched daemon. See steps/024.
+    #[test]
+    fn a_failed_version_request_is_not_silently_no_skew() {
+        let notice = skew_notice(Err(std::io::Error::other("boom")));
+        assert!(
+            notice.is_some(),
+            "a transport failure on the version check must say something, \
+             not silently read as a confirmed match"
+        );
+        assert!(notice.unwrap().contains("remuda restart"));
+    }
 }
