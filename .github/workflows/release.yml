@@ -58,10 +58,11 @@ jobs:
           # Each target builds on a host of its own architecture — no
           # cross-compiling, because mlua vendors and compiles Lua from C.
           # Windows is absent on purpose; see steps/009.
+          # Intel mac is absent because `macos-13` is retired: run 34438277779
+          # sat 27 min unassigned, and publish needs every build — so one dead
+          # label withheld ALL assets, on every platform.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04 # older glibc → runs on more distros
-          - target: x86_64-apple-darwin
-            os: macos-13
           - target: aarch64-apple-darwin
             os: macos-14
     runs-on: ${{ matrix.os }}
