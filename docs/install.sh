@@ -65,7 +65,14 @@ Darwin/arm64) target=aarch64-apple-darwin ;;
 esac
 
 version=$(fetch "$INDEX" | tr -d ' \n\r\t' | sed -n "s/.*\"$channel\":\"\([^\"]*\)\".*/\1/p")
-[ -n "$version" ] || die "no '$channel' version published at $INDEX"
+# "0.0.0" is a placeholder, not a version: the field being present ("0.0.0"
+# passes -n) is not the same question as whether it names a real release.
+if [ -z "$version" ] || [ "$version" = 0.0.0 ]; then
+	if [ "$channel" = stable ]; then
+		die "no stable version published at $INDEX — install nightly instead: curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh"
+	fi
+	die "no '$channel' version published at $INDEX"
+fi
 
 case "$channel" in
 stable) tag="v$version" ;;

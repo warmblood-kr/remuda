@@ -104,6 +104,14 @@ Two, in the shape rustup uses:
 curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh
 ```
 
+```powershell
+$env:REMUDA_CHANNEL='nightly'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
+```
+
+⚠ No stable release has been published yet, so the default channel above
+currently fails with a message pointing at the `nightly` one-liner — use it
+directly until a `stable` build exists.
+
 The chosen channel is remembered in `$XDG_DATA_HOME/remuda/channel`, so
 upgrading stays on the track you picked:
 
