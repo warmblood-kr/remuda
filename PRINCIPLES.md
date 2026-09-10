@@ -307,6 +307,41 @@ somewhere, and the useful move is to stop it at a file nobody edits.
 **Enforced by:** CI job `workflows-parse` · CI job `gates-can-fail` ·
 `scripts/check-workflows.py`
 
+## 14. A terminal that only reads is half a terminal
+
+`remuda-native` is the terminal emulator for every session it holds. An emulator
+that parses output and never answers the terminal protocol's queries is not a
+smaller emulator — on some hosts it is a hung one.
+
+**Why.** Measured 2026-09-10, porting to Windows. Everything compiled, the daemon
+bound its pipe, `remuda ls` reported the session `live` — and the screen was
+blank forever, for `sh`, `cmd` and `powershell` alike. The entire output of the
+pty was four bytes:
+
+```
+PROBE stream: "\u{1b}[6n"     ← Device Status Report: where is the cursor?
+```
+
+ConPTY asks that **before emitting anything** and waits for the reply, because
+`portable-pty` opens the pseudoconsole with `PSUEDOCONSOLE_INHERIT_CURSOR`. Unix
+ptys never ask, so three years of unix use could not have found it. The reader
+thread now answers `ESC[<row>;<col>R` from the grid it already maintains.
+
+The general form: **a pty is a conversation, not a feed.** When a program's
+output stops without its process dying, look for a query that went unanswered
+before looking for a bug in the pump.
+
+⚠ The first measurement was of the wrong thing and looked identical. Dumping
+`screen_bytes()` renders the *grid*, so an empty grid and an empty stream print
+the same. The stream had to be teed raw before the four bytes appeared — the
+same shape as principle 4, one layer down.
+
+**Enforced by:** nothing — discipline only. *(The unanswered-query state is a
+hang, not a wrong value, and it only occurs on hosts that ask. CI job
+`test-windows` is what would go red today, because every session-level test
+there depends on the reply arriving — but that is coverage of one host, not a
+mechanism that would catch the next query we fail to answer.)*
+
 ---
 
 ## Adding a principle
