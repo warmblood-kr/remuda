@@ -191,7 +191,7 @@ fn a_script_reacts_to_what_a_session_shows() {
 
 #[test]
 fn a_refusal_stops_the_script_instead_of_being_returned() {
-    // The failure this rules out is the shell one: `$(remuda capture nosuch)`
+    // The failure this rules out is the shell one: `$(remuda -e 'remuda.capture("nosuch")')`
     // is an empty string, and the pipeline carries on over a session that was
     // never created. Here the daemon's refusal is raised, so the line after it
     // must not run — and the proof is on the far side, in a session that never

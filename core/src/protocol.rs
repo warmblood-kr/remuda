@@ -24,9 +24,12 @@ use serde::{Deserialize, Serialize};
 pub enum Request {
     /// Every session this node holds.
     List,
-    /// Start a session. `command` is argv; empty means the user's shell.
+    /// Start a session, answering [`Response::Value`] with the name it got.
+    /// `command` is argv; empty means the user's shell. `None` for `name`
+    /// derives one from argv[0] and de-duplicates it; a given name is exact.
     New {
-        name: String,
+        #[serde(default)]
+        name: Option<String>,
         command: Vec<String>,
         size: Size,
     },

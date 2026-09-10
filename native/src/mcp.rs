@@ -108,7 +108,9 @@ fn call(socket: &Path, id: Value, params: &Value) -> String {
     let request = match name {
         "ls" => Request::List,
         "new" => Request::New {
-            name: text("name"),
+            // Optional: an agent spawning five workers should not have to
+            // invent five unique strings. Omitted, argv[0] names it.
+            name: args.get("name").and_then(Value::as_str).map(str::to_string),
             command: args
                 .get("command")
                 .and_then(Value::as_array)
@@ -185,14 +187,15 @@ fn descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "new",
-            "description": "Start a session. `command` is argv; omit it for the user's shell.",
+            "description": "Start a session, answering with the name it got. `command` is argv; \
+                            omit it for the user's shell. Omit `name` and argv[0] names it, \
+                            de-duplicated: claude, claude-2, claude-3.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Name for the new session."},
                     "command": {"type": "array", "items": {"type": "string"}},
                 },
-                "required": ["name"],
             },
         }),
         json!({

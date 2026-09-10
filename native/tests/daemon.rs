@@ -61,13 +61,17 @@ fn new_session(path: &Path, name: &str) {
     let response = client::request(
         path,
         &Request::New {
-            name: name.to_string(),
+            name: Some(name.to_string()),
             command: vec!["sh".into()],
             size: Size::new(80, 24),
         },
     )
     .expect("new");
-    assert_eq!(response, Response::Ok, "spawning {name}");
+    assert_eq!(
+        response,
+        Response::Value(name.to_string()),
+        "New answers with the name it gave the session"
+    );
 }
 
 fn capture(path: &Path, name: &str) -> String {
@@ -139,6 +143,38 @@ fn sessions_are_listed_and_kept_apart() {
 }
 
 #[test]
+fn an_unnamed_session_names_itself_after_the_program_and_dedupes() {
+    // Bug A by construction: the person types the program, never a name, so no
+    // leading positional can eat the word they meant to run.
+    let path = scratch("generated");
+    let _daemon = daemon_at(&path);
+
+    let make = || {
+        client::request(
+            &path,
+            &Request::New {
+                name: None,
+                command: vec!["sh".into()],
+                size: Size::new(80, 24),
+            },
+        )
+        .expect("new")
+    };
+
+    assert_eq!(make(), Response::Value("sh".into()));
+    assert_eq!(make(), Response::Value("sh-2".into()));
+    assert_eq!(make(), Response::Value("sh-3".into()));
+
+    // And the caller can address what it just made, which is the whole reason
+    // `New` had to start answering with a value.
+    let seen: Vec<String> = match client::request(&path, &Request::List).expect("ls") {
+        Response::Sessions(sessions) => sessions.into_iter().map(|s| s.name).collect(),
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(seen, vec!["sh", "sh-2", "sh-3"]);
+}
+
+#[test]
 fn a_taken_name_is_refused_in_words() {
     let path = scratch("dup");
     let _daemon = daemon_at(&path);
@@ -147,7 +183,7 @@ fn a_taken_name_is_refused_in_words() {
     let again = client::request(
         &path,
         &Request::New {
-            name: "only".into(),
+            name: Some("only".into()),
             command: vec!["sh".into()],
             size: Size::new(80, 24),
         },

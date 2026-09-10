@@ -34,6 +34,32 @@ pub struct SessionSummary {
     pub alive: bool,
     pub idle: Duration,
     pub size: Size,
+    /// Whether a human holds it right now. A fact about the terminal, not about
+    /// the session's job — see the scope line in `steps/012`.
+    pub attached: bool,
+}
+
+/// A session name from a program's argv[0]: basename, lowercased, anything
+/// outside `[a-z0-9_-]` folded to `-`. `"/usr/bin/zsh"` becomes `"zsh"`.
+pub fn slug(command: &str) -> String {
+    let base = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    let folded: String = base
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = folded.trim_matches('-');
+    if trimmed.is_empty() {
+        "session".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 #[derive(Default)]
@@ -59,6 +85,20 @@ impl Registry {
         Ok(handle)
     }
 
+    /// `base`, or `base-2`, `base-3`… when it is taken. Caution: advisory — the
+    /// lock is released before you build the session, so `register` is still
+    /// the thing that decides, and it still refuses a collision.
+    pub fn unique_name(&self, base: &str) -> String {
+        let sessions = self.lock();
+        let mut candidate = base.to_string();
+        let mut n = 1u32;
+        while sessions.contains_key(&candidate) {
+            n += 1;
+            candidate = format!("{base}-{n}");
+        }
+        candidate
+    }
+
     /// A handle to a live session. Many callers may hold one at once: that is
     /// what lets a viewer attach while the core keeps driving.
     pub fn get(&self, name: &str) -> Option<Arc<Session>> {
@@ -76,6 +116,7 @@ impl Registry {
                 alive: s.is_alive(),
                 idle: s.idle_for(),
                 size: s.size(),
+                attached: s.is_attached(),
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));

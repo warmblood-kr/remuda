@@ -13,6 +13,38 @@ An orchestration core for coding-agent sessions. You keep a herd running, you
 attach to one and ride it, you swap to another. The herd outlives any single
 ride.
 
+## Use it
+
+```sh
+remuda                 # open the herd: a list on the left, the selected session on the right
+remuda run claude      # start claude and ride it, in one act — the session names itself
+remuda attach claude   # go back to one; Ctrl-\ detaches
+remuda ls              # what is running
+remuda send claude "don't merge #12 until the migration lands"
+```
+
+Five lines, and four of them are optional. A verb is on the command line only if
+it **needs a terminal**, must **survive the shell's own quoting**, or **renders
+for a human** in a way the Lua image cannot. Everything else — `new`, `close`,
+`capture`, `insert`, `key`, `click` — is in Lua, where it costs no front page:
+
+```sh
+remuda -e 'remuda.close("build")'
+```
+
+Two modes, no prefix key and no config file. **browse** is the list beside a
+read-only preview and the keys drive remuda; **ride** is the session owning the
+whole terminal and every key going to the pty. `Ctrl-\` is the boundary, and it
+is the same key `remuda attach` already used.
+
+```
+↑↓ select   ⏎ ride   n new   x kill   h/l pan a cropped preview   q quit
+```
+
+remuda enters the alternate screen while you ride, so **leaving looks like
+leaving**: your own scrollback and prompt come back, and a line says which way
+you left and how to get back.
+
 ## Install
 
 **Linux and macOS** (x86_64, and Apple Silicon):
@@ -41,8 +73,10 @@ suite on `windows-latest` — including tests that open real ConPTYs and drive t
 shipped binary through raw mode and the Ctrl-\ detach. Nobody has yet run
 `remuda attach` by hand in Windows Terminal or conhost, so the interactive
 feel — resize behaviour, key handling under a real console host — is
-**untested**, not merely undocumented. The port and its evidence are in
-[`steps/010-windows.md`](steps/010-windows.md).
+**untested**, not merely undocumented. The TUI added in
+[`steps/012`](steps/012-a-front-door.md) is in the same position and one step
+further out: it has never been drawn on a Windows console at all. The port and
+its evidence are in [`steps/010-windows.md`](steps/010-windows.md).
 
 ### Channels
 
@@ -82,9 +116,23 @@ not a one-shot subprocess. It keeps state between calls and drives the same herd
 the CLI drives.
 
 ```lua
-remuda.new("reviewer", {"claude"})
-remuda.send("reviewer", "review the diff on this branch\n")
-print(remuda.capture("reviewer"))
+-- new() answers with the name it gave the session. Pass nil for the name and
+-- argv[0] supplies one, de-duplicated: claude, claude-2, claude-3.
+local who = remuda.new(nil, {"claude"})
+remuda.send(who, "review the diff on this branch")
+print(remuda.capture(who))
+```
+
+`ls()` returns an **array** of rows, not a map — `{v, v}` is a list in Lua and
+`{k = v}` is a map, and this is the first table a script author meets:
+
+```lua
+-- { [1] = row, [2] = row }.  Each row is a table with string keys.
+for _, s in ipairs(remuda.ls()) do
+  if s.alive and s.idle > 300 then
+    remuda.send(s.name, "status?")
+  end
+end
 ```
 
 The same herd is reachable over MCP — `new`, `ls`, `send`, `capture` — so an
@@ -129,7 +177,7 @@ and fail only at runtime. Closing that second axis needs a lint, not a target.
 ## Build
 
 ```sh
-cargo test --workspace --all-targets                          # 55 tests
+cargo test --workspace --all-targets                          # 90 tests
 cargo check -p remuda-core --target wasm32-unknown-unknown    # the boundary gate
 ```
 
