@@ -208,18 +208,17 @@ mod tests {
             if agent.screen_text().unwrap().contains(needle) {
                 return;
             }
-            assert!(Instant::now() < deadline, "timed out waiting for {needle:?}");
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for {needle:?}"
+            );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
 
-    /// [MEASURED, Linux, no terminal, no Windows host] This is the whole
-    /// diagnosis for "no colour in the TUI pane": `screen_text` — what
-    /// `Request::Capture` serves, and what the browsing TUI's pane reads —
-    /// discards SGR colour that the child actually emitted. `screen_bytes` —
-    /// used only by `attach`'s initial repaint — keeps it. The colour is not
-    /// lost anywhere upstream; it is discarded at this one call, on every
-    /// platform, independent of `TERM`/`COLORTERM`/console VT mode.
+    /// [MEASURED, Linux] Reproduces "no colour in the TUI pane": `screen_text`
+    /// (what `Capture` serves) discards SGR that `screen_bytes` (what `attach`
+    /// uses) keeps. See steps/018.
     #[test]
     fn screen_text_strips_colour_that_screen_bytes_keeps() {
         let mut cmd = CommandBuilder::new("printf");

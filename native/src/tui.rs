@@ -299,12 +299,9 @@ pub fn layout(term_cols: u16, widest: u16) -> (u16, u16) {
     (list, usable - list)
 }
 
-/// One visible unit of session content, and how many display columns it
-/// claims. `char`'s answer is 1 for everything, which is deliberately not
-/// the correct answer for a wide (e.g. CJK) character — it is today's
-/// answer, kept so [`Viewport`] reproduces `crop`'s old, char-counting
-/// behaviour exactly. Teaching a cell its real width, or giving it colour,
-/// is a later, isolated change against this same trait — not this one.
+/// Display columns a unit of session content claims. `char`'s answer of 1
+/// for everything is deliberately not correct for a wide (CJK) character —
+/// see steps/018 for why that's kept for now.
 pub trait Cell {
     fn width(&self) -> u16;
 }
@@ -316,16 +313,8 @@ impl Cell for char {
 }
 
 /// A window from a larger coordinate space onto a smaller one — today, the
-/// panel's rectangle onto a session's own screen. Named so a caller states
-/// *which* conversion it means instead of three loose numbers (a row
-/// offset, a pan, a clip) at the call site — 정수님, 2026-09-10: *"두 개의
-/// 좌표계. panel 안의 session 좌표계, panel 전체 좌표계 ... 그것을 클래스로
-/// 만들어야 한다."*
-///
-/// Shaped to cascade rather than to cover every case today: a further layer
-/// (a panel's rectangle onto the whole terminal) is applying a second
-/// `Viewport` to this one's output, not a reason to add parameters here —
-/// nothing needs that layer yet, so it is not built.
+/// panel's rectangle onto a session's own screen. Named per 정수님's
+/// instruction; see steps/018 for the quote and the cascading design.
 pub struct Viewport {
     row_offset: usize,
     col_offset: u16,
@@ -346,12 +335,9 @@ impl Viewport {
         }
     }
 
-    /// Crop `source` (session coordinates) into panel coordinates: the
-    /// visible rows, each panned and clipped by display column, using
-    /// every cell's own [`Cell::width`] rather than assuming one column
-    /// each. Each row comes back with whether IT was cut, so a caller that
-    /// marks a cut in its own cell type (today, a `→` appended to a
-    /// `String`) can do so without this type knowing what a marker is.
+    /// Crop `source` (session coordinates) into panel coordinates: visible
+    /// rows, panned and clipped by display column via [`Cell::width`]. Each
+    /// row says whether IT was cut; the caller decides how to mark that.
     pub fn crop<C: Cell + Clone>(&self, source: &[Vec<C>]) -> (Vec<(Vec<C>, bool)>, bool) {
         let start = self.row_offset.min(source.len());
         let mut any_cut = false;
@@ -929,12 +915,9 @@ mod tests {
         assert_eq!(list + preview, 9, "the divider, and no underflow");
     }
 
-    /// `crop`'s exact behaviour before the `Viewport` migration, kept here
-    /// only as a reference to migrate against — never called outside this
-    /// test. 정수님 asked for the plain-text path to move onto the new
-    /// coordinate-system class FIRST and be verified byte-identical before
-    /// colour rides on it; this is that verification, mechanical rather
-    /// than eyeballed, across a spread of geometries.
+    /// `crop`'s behaviour before the `Viewport` migration, kept only as the
+    /// reference the byte-identity oracle below migrates against. See
+    /// steps/018.
     fn crop_reference(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool) {
         let lines: Vec<&str> = screen.lines().collect();
         let start = lines.len().saturating_sub(rows as usize);
@@ -943,8 +926,11 @@ mod tests {
             .iter()
             .map(|line| {
                 let chars: Vec<char> = line.chars().collect();
-                let mut visible: String =
-                    chars.iter().skip(pan as usize).take(cols as usize).collect();
+                let mut visible: String = chars
+                    .iter()
+                    .skip(pan as usize)
+                    .take(cols as usize)
+                    .collect();
                 if chars.len() > (pan as usize) + (cols as usize) {
                     cut = true;
                     visible.pop();
