@@ -28,6 +28,15 @@ use std::sync::{Arc, Mutex};
 /// the only producer; every consumer holds the other end of a channel.
 type Watchers = Arc<Mutex<Vec<Sender<Vec<u8>>>>>;
 
+/// The pty's input end. Shared, because the reader thread must answer the
+/// terminal's own questions — see [`DSR_CURSOR`].
+type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
+/// "Where is the cursor?" — a query the terminal must answer. ⚠ ConPTY asks it
+/// BEFORE emitting anything and waits: unanswered, the child is alive and the
+/// screen is blank forever. Measured on a windows-latest runner; see steps/010.
+const DSR_CURSOR: &[u8] = b"\x1b[6n";
+
 fn io<E: std::fmt::Display>(e: E) -> AgentError {
     AgentError::Io(e.to_string())
 }
@@ -36,7 +45,7 @@ fn io<E: std::fmt::Display>(e: E) -> AgentError {
 pub struct PtyAgent {
     size: Size,
     screen: Arc<Mutex<vt100::Parser>>,
-    writer: Box<dyn Write + Send>,
+    writer: SharedWriter,
     child: Box<dyn Child + Send + Sync>,
     watchers: Watchers,
     _master: Box<dyn MasterPty + Send>,
@@ -59,11 +68,16 @@ impl PtyAgent {
         let child = pair.slave.spawn_command(command).map_err(io)?;
         drop(pair.slave); // Or the master never sees EOF when the child exits.
 
-        let writer = pair.master.take_writer().map_err(io)?;
+        let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer().map_err(io)?));
         let reader = pair.master.try_clone_reader().map_err(io)?;
         let screen = Arc::new(Mutex::new(vt100::Parser::new(size.rows(), size.cols(), 0)));
         let watchers: Watchers = Arc::new(Mutex::new(Vec::new()));
-        spawn_reader(reader, Arc::clone(&screen), Arc::clone(&watchers));
+        spawn_reader(
+            reader,
+            Arc::clone(&screen),
+            Arc::clone(&watchers),
+            Arc::clone(&writer),
+        );
 
         Ok(Self {
             size,
@@ -83,6 +97,7 @@ fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     screen: Arc<Mutex<vt100::Parser>>,
     watchers: Watchers,
+    writer: SharedWriter,
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -90,10 +105,18 @@ fn spawn_reader(
             if n == 0 {
                 break;
             }
-            if let Ok(mut parser) = screen.lock() {
-                parser.process(&buf[..n]);
-            } else {
-                break; // Poisoned: the grid can no longer be trusted.
+            let asked = buf[..n].windows(DSR_CURSOR.len()).any(|w| w == DSR_CURSOR);
+            let at = match screen.lock() {
+                Ok(mut parser) => {
+                    parser.process(&buf[..n]);
+                    let (row, col) = parser.screen().cursor_position();
+                    (row + 1, col + 1)
+                }
+                // Poisoned: the grid can no longer be trusted.
+                Err(_) => break,
+            };
+            if asked {
+                answer_cursor_query(&writer, at);
             }
             if let Ok(mut watchers) = watchers.lock() {
                 watchers.retain(|w| w.send(buf[..n].to_vec()).is_ok());
@@ -107,13 +130,27 @@ fn spawn_reader(
     });
 }
 
+/// Reply to a cursor-position query. One `write_all` under the same lock every
+/// other write takes, so no divisible write appears and PRINCIPLES §6
+/// invariant 1 holds: no caller can land inside another's burst.
+// ponytail: matched within one read. ConPTY writes the query as a single
+// four-byte message; a split one would be missed until the next ask.
+fn answer_cursor_query(writer: &SharedWriter, (row, col): (u16, u16)) {
+    let reply = format!("\x1b[{row};{col}R");
+    if let Ok(mut writer) = writer.lock() {
+        let _ = writer.write_all(reply.as_bytes());
+        let _ = writer.flush();
+    }
+}
+
 impl AgentProcess for PtyAgent {
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         if !self.is_alive() {
             return Err(AgentError::Exited);
         }
-        self.writer.write_all(bytes).map_err(io)?;
-        self.writer.flush().map_err(io)
+        let mut writer = self.writer.lock().map_err(|_| io("writer lock poisoned"))?;
+        writer.write_all(bytes).map_err(io)?;
+        writer.flush().map_err(io)
     }
 
     fn screen_text(&mut self) -> Result<String> {
