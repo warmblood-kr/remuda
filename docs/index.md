@@ -1,3 +1,6 @@
+![A small herd of horses waiting in a rope corral at first light, with one
+already saddled and stepped forward](remuda.jpg)
+
 ## tmux for coding agents
 
 A terminal orchestrator with a programmable layer. You keep a herd of agent

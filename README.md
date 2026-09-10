@@ -1,5 +1,8 @@
 # remuda
 
+![A small herd of horses waiting in a rope corral at first light, with one
+already saddled and stepped forward](docs/remuda.jpg)
+
 **tmux for coding agents** — a terminal orchestrator with a programmable layer.
 
 **re·mu·da** \ ri-ˈmü-də, -ˈmyü- \ — *the herd of horses from which those to be
