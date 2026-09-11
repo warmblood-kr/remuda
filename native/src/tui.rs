@@ -24,7 +24,9 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 /// How often an idle herd is relisted, recaptured and redrawn — see
 /// [`should_refresh`]. A key always forces an immediate refresh regardless.
@@ -112,6 +114,35 @@ impl Ui {
             Mode::Confirm(name) => self.confirm_key(key, name),
             Mode::Browse => self.browse_key(key),
         }
+    }
+
+    /// A press inside the list column selects and enters that row — the exact
+    /// `Action` a `↓`-to-there plus `⏎` already produces, not a second
+    /// mechanism. Only the list is clickable; see `run` for why. steps/028.
+    pub fn on_mouse(&mut self, event: MouseEvent, cols: u16, rows: u16) -> Action {
+        if self.focus != Focus::List || self.mode != Mode::Browse {
+            return Action::Nothing;
+        }
+        if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Action::Nothing;
+        }
+        let (list_w, _) = layout(cols, widest(self));
+        let body = rows.saturating_sub(1);
+        // crossterm's column/row are 0-based; the frame's own rows are
+        // 1-based (row 1 is the header, row `body+1` is the footer — see
+        // `render`/`render_styled`), so both get +1 before comparing.
+        let col = event.column + 1;
+        let row = event.row + 1;
+        if col > list_w || row < 2 || row > body {
+            return Action::Nothing;
+        }
+        let index = (row - 2) as usize;
+        if index >= self.sessions.len() {
+            return Action::Nothing;
+        }
+        self.selected = index;
+        self.pan = 0;
+        self.focus_session()
     }
 
     /// Everything reaches the pty except the one key that comes back. Checked
@@ -871,11 +902,52 @@ fn refresh(
     Ok((cols, rows))
 }
 
+/// Enables SGR mouse reporting on construction, disables it on drop
+/// unconditionally — regardless of which pane last had focus — so `run` can
+/// never exit leaving mouse mode armed for whatever reads this terminal next.
+struct MouseCapture;
+
+impl MouseCapture {
+    fn enable() -> std::io::Result<Self> {
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
+    }
+}
+
+/// Arms or disarms mouse reporting to match `want_on`, and only touches the
+/// terminal when that's actually a change — repeating the same escape every
+/// idle-list tick would be one more thing sitting in the way of #026's fix.
+fn sync_mouse_capture(is_on: &mut bool, want_on: bool) {
+    if *is_on == want_on {
+        return;
+    }
+    let mut stdout = std::io::stdout();
+    let _ = if want_on {
+        crossterm::execute!(stdout, crossterm::event::EnableMouseCapture)
+    } else {
+        crossterm::execute!(stdout, crossterm::event::DisableMouseCapture)
+    };
+    *is_on = want_on;
+}
+
 /// Draw the herd until the user quits. One screen for the whole run: focus
 /// moves between the panes, and the terminal is never handed over, so the
 /// alternate screen is entered exactly once. `notice` is what stderr cannot reach.
 pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result<()> {
     let _terminal = RawMode::enable()?;
+    // Scoped to the herd screen, not `RawMode` itself: `attach` uses `RawMode`
+    // too, forwards every raw byte it reads, and has no list to click — mouse
+    // reports would just leak into whatever it's attached to. Starts enabled
+    // to match `Ui::new`'s starting focus, `List`; toggles off the moment
+    // focus leaves it, below, so an attached session's native mouse handling
+    // (drag-to-copy, its own scrollback) is never touched. See steps/028.
+    let _mouse = MouseCapture::enable()?;
     let shell = crate::daemon::default_shell();
     let (sessions, list_err) = match list(path) {
         Ok(sessions) => (sessions, None),
@@ -895,6 +967,11 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     // then always cleared — never carried into a tick-driven refresh.
     let mut skip_list = false;
     let (mut cols, mut rows) = (80u16, 24u16);
+    // Mirrors what's actually armed in the terminal right now (`MouseCapture`
+    // starts it enabled), so it can be synced to `ui.focus` regardless of
+    // which of several places moved focus — a key, a click, or `refresh`'s
+    // own `take` giving up on a hold that failed.
+    let mut mouse_on = true;
 
     loop {
         let tick = if ui.focus == Focus::Session {
@@ -908,18 +985,17 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             (cols, rows) = refresh(path, server, &mut ui, &mut held, &mut painted, skip_list)?;
             skip_list = false;
         }
+        sync_mouse_capture(&mut mouse_on, ui.focus == Focus::List);
 
         if !crossterm::event::poll(tick)? {
             continue;
         }
-        let Event::Key(key) = crossterm::event::read()? else {
-            continue;
+        let action = match crossterm::event::read()? {
+            // Windows delivers Release as well, and acting on both double-fires.
+            Event::Key(key) if key.kind == KeyEventKind::Press => ui.on_key(key),
+            Event::Mouse(m) => ui.on_mouse(m, cols, rows),
+            _ => continue,
         };
-        // Windows delivers Release as well, and acting on both double-fires.
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        let action = ui.on_key(key);
         skip_list = matches!(action, Action::Type(_));
         match action {
             Action::Nothing => {}
@@ -1126,6 +1202,82 @@ mod tests {
         assert_eq!(ui.selected().unwrap().name, "b");
         // The list stays on screen: nothing about entering removes a session.
         assert_eq!(ui.sessions.len(), 2);
+    }
+
+    fn click(col: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// steps/028: a click is the same `Action` `↓ ↓ ⏎` already produces. "b"
+    /// is screen row 3 (1-based: header, "a", "b") — crossterm's 0-based
+    /// `row` 2; column 5 sits inside `layout(80, 80)`'s 16-wide list.
+    #[test]
+    fn a_click_on_a_list_row_selects_and_enters_it_like_arrow_plus_enter() {
+        let mut ui = ui(vec![row("a", true, false), row("b", true, false)]);
+        assert_eq!(ui.on_mouse(click(5, 2), 80, 24), Action::Nothing);
+        assert_eq!(ui.selected, 1, "clicked the second row");
+        assert_eq!(ui.focus, Focus::Session, "a click enters, same as Enter");
+    }
+
+    /// The header (row 0) and anything below the herd's actual rows are both
+    /// outside the list — a click there must not panic or move selection.
+    #[test]
+    fn a_click_outside_any_list_row_is_a_no_op() {
+        let mut ui = ui(vec![row("a", true, false), row("b", true, false)]);
+        assert_eq!(
+            ui.on_mouse(click(5, 0), 80, 24),
+            Action::Nothing,
+            "the header row"
+        );
+        assert_eq!(ui.selected, 0, "unmoved by the header click");
+        assert_eq!(ui.focus, Focus::List, "unmoved by the header click");
+        // Screen row 4 (0-based 3) is past "b" — the herd has only 2 rows.
+        assert_eq!(
+            ui.on_mouse(click(5, 3), 80, 24),
+            Action::Nothing,
+            "past the last row"
+        );
+        assert_eq!(ui.selected, 0, "unmoved by the out-of-range click");
+    }
+
+    /// Only a press selects. A release or a drag reaching here (e.g. the drag
+    /// tail of a click that started off the list) must be inert.
+    #[test]
+    fn a_release_or_drag_alone_never_selects() {
+        let mut ui = ui(vec![row("a", true, false), row("b", true, false)]);
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 5,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 5,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(ui.on_mouse(up, 80, 24), Action::Nothing);
+        assert_eq!(ui.selected, 0, "a release did not select");
+        assert_eq!(ui.on_mouse(drag, 80, 24), Action::Nothing);
+        assert_eq!(ui.selected, 0, "a drag did not select");
+    }
+
+    /// A session in focus reads mouse events from nowhere in `run` (capture
+    /// is off there), but `on_mouse` refuses on its own too — belt and
+    /// braces, so a stray event can never fight the keyboard for focus.
+    #[test]
+    fn a_click_is_ignored_once_a_session_has_focus() {
+        let mut ui = ui(vec![row("a", true, false), row("b", true, false)]);
+        ui.on_key(press(KeyCode::Enter));
+        assert_eq!(ui.on_mouse(click(5, 2), 80, 24), Action::Nothing);
+        assert_eq!(ui.focus, Focus::Session, "still on the session Enter chose");
+        assert_eq!(ui.selected, 0, "the click's row must not override it");
     }
 
     /// The bug this whole mode exists to make impossible: in the list `x` kills
