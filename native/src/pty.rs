@@ -223,8 +223,13 @@ impl AgentProcess for PtyAgent {
 
     fn cursor(&mut self) -> Result<Cursor> {
         let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
-        let (row, col) = parser.screen().cursor_position();
-        Ok(Cursor { row, col })
+        let screen = parser.screen();
+        let (row, col) = screen.cursor_position();
+        Ok(Cursor {
+            row,
+            col,
+            visible: !screen.hide_cursor(),
+        })
     }
 
     fn is_alive(&mut self) -> bool {
@@ -344,6 +349,23 @@ mod tests {
             Color::Default,
             "a cell after the \\x1b[0m reset, never itself painted, stays default: {:?}",
             row0[3]
+        );
+    }
+
+    /// [MEASURED, Linux] `vt100::Screen::hide_cursor` is `mode(MODE_HIDE_CURSOR)`
+    /// under the hood — it tracks the child's own DECTCEM request rather than
+    /// this process inferring it from raw bytes. See steps/027.
+    #[test]
+    fn cursor_reports_the_childs_own_hide_request() {
+        let mut cmd = CommandBuilder::new("printf");
+        cmd.arg("before\x1b[?25lhidden");
+        let mut agent = PtyAgent::spawn(cmd, Size::new(80, 24)).unwrap();
+        wait_for(&mut agent, "hidden");
+
+        let cursor = agent.cursor().unwrap();
+        assert!(
+            !cursor.visible,
+            "the child asked for \\x1b[?25l — the pane must not paint a caret: {cursor:?}"
         );
     }
 }

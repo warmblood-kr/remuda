@@ -16,7 +16,7 @@
 //! and becomes a raw byte pipe in both directions, which is why attaching has
 //! no response type beyond the acknowledgement.
 
-use crate::agent::{Color, Size, StyledCell};
+use crate::agent::{Color, Cursor, Size, StyledCell};
 use crate::registry::SessionSummary;
 use serde::{Deserialize, Serialize};
 
@@ -78,9 +78,12 @@ pub enum Response {
     Sessions(Vec<SessionSummary>),
     Screen(String),
     /// A styled screen, answering [`Request::CaptureStyled`] — as runs, not
-    /// cells; see [`StyledRun`] for why the wire never sends one JSON object
-    /// per cell.
-    StyledScreen(Vec<Vec<StyledRun>>),
+    /// cells; see [`StyledRun`]. `cursor` rides the same round trip, so the
+    /// pane's caret and its content are always the same frame. See steps/027.
+    StyledScreen {
+        rows: Vec<Vec<StyledRun>>,
+        cursor: Cursor,
+    },
     /// What an [`Request::Eval`] returned, already rendered to text. Kept
     /// distinct from `Screen` so a client can tell "the session printed
     /// nothing" from "the expression returned nothing".

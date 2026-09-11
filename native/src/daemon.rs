@@ -16,6 +16,7 @@ use crate::image::Image;
 use crate::ipc::{self, Listener, Stream, TryClone};
 use crate::pty::PtyAgent;
 use interprocess::local_socket::traits::ListenerExt;
+use remuda_core::agent::Cursor;
 use remuda_core::protocol::{collapse_runs, Request, Response};
 use remuda_core::{Registry, Session, Size};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -229,8 +230,19 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
             Some(Ok(cells)) => {
                 // Runs on the wire, not cells — see steps/022 for the 44x+
                 // measured on a real screen.
-                let runs = cells.iter().map(|row| collapse_runs(row)).collect();
-                reply(&stream, &Response::StyledScreen(runs))
+                let rows = cells.iter().map(|row| collapse_runs(row)).collect();
+                // The session existed a line above (`screen_cells` answered),
+                // so this only fails on a poisoned lock — hide rather than
+                // guess a position. See steps/027.
+                let cursor = registry
+                    .cursor(&name)
+                    .and_then(Result::ok)
+                    .unwrap_or(Cursor {
+                        row: 0,
+                        col: 0,
+                        visible: false,
+                    });
+                reply(&stream, &Response::StyledScreen { rows, cursor })
             }
         },
 

@@ -32,7 +32,11 @@ impl AgentProcess for RecordingAgent {
         Ok(String::new())
     }
     fn cursor(&mut self) -> Result<Cursor> {
-        Ok(Cursor { row: 0, col: 0 })
+        Ok(Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        })
     }
     fn is_alive(&mut self) -> bool {
         true
@@ -268,7 +272,11 @@ impl AgentProcess for FlagAgent {
         Ok(String::new())
     }
     fn cursor(&mut self) -> Result<Cursor> {
-        Ok(Cursor { row: 0, col: 0 })
+        Ok(Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        })
     }
     fn is_alive(&mut self) -> bool {
         self.alive.load(Ordering::SeqCst)

@@ -16,7 +16,7 @@
 //! testable on a machine with no tty; everything needing one lives in [`run`].
 
 use crate::client::{self, Hold, RawMode};
-use remuda_core::agent::{Color, StyledCell};
+use remuda_core::agent::{Color, Cursor, StyledCell};
 use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
 use remuda_core::Size;
@@ -395,6 +395,35 @@ impl Viewport {
         let cut = total > offset + width;
         (out, cut)
     }
+
+    /// A session-space `(row, col)` cell in panel coordinates, or `None` when
+    /// scrolled above the visible rows or panned past the visible columns.
+    /// Column math mirrors `crop_row`'s own width-folding. See steps/027.
+    pub fn map_cursor<C: Cell>(
+        &self,
+        source: &[Vec<C>],
+        row: usize,
+        col: usize,
+    ) -> Option<(u16, u16)> {
+        if row < self.row_offset {
+            return None;
+        }
+        let panel_row = row - self.row_offset;
+        if panel_row >= self.height as usize {
+            return None;
+        }
+        let source_row = source.get(row)?;
+        let target: u32 = source_row[..col.min(source_row.len())]
+            .iter()
+            .map(|c| u32::from(c.width()))
+            .sum();
+        let offset = u32::from(self.col_offset);
+        let panel_col = target.checked_sub(offset)?;
+        if panel_col >= u32::from(self.width) {
+            return None;
+        }
+        Some((panel_row as u16, panel_col as u16))
+    }
 }
 
 /// The visible rectangle of a screen: the last `rows` lines, each panned by
@@ -629,12 +658,35 @@ fn fit_styled(line: &str, width: u16) -> String {
     out
 }
 
-/// Same frame as [`render`], but the preview column carries real colour from
-/// a styled capture, and is written with row-local clears plus synchronized
-/// output instead of a full erase — see steps/020 and steps/026.
+/// The session's own cursor on the real screen, 1-based `(row, col)` for
+/// `\x1b[{row};{col}H`. `None` hides the caret: the child asked for that, or
+/// it's scrolled/panned out of the pane's current crop. See steps/027.
+fn locate_cursor(
+    cells: &[Vec<StyledCell>],
+    cursor: Cursor,
+    pan: u16,
+    preview_w: u16,
+    body: u16,
+    list_w: u16,
+) -> Option<(u16, u16)> {
+    if !cursor.visible {
+        return None;
+    }
+    let viewport = Viewport::bottom_anchored(cells.len(), pan, preview_w, body);
+    let (panel_row, panel_col) =
+        viewport.map_cursor(cells, cursor.row as usize, cursor.col as usize)?;
+    // +1 for the header row above row 0 of the pane; list_w + divider + 1 for
+    // the preview pane's own left edge; both again for 1-based addressing.
+    Some((panel_row + 1, list_w + panel_col + 2))
+}
+
+/// Same frame as [`render`], but the preview column carries real colour, is
+/// written with row-local clears plus synchronized output instead of a full
+/// erase, and the terminal's own caret follows the session's cursor.
 pub fn render_styled(
     ui: &Ui,
     cells: &[Vec<StyledCell>],
+    cursor: Cursor,
     server: &str,
     cols: u16,
     rows: u16,
@@ -647,6 +699,7 @@ pub fn render_styled(
     };
 
     let (lines, cut) = crop_styled(cells, preview_w, body, ui.pan);
+    let caret = locate_cursor(cells, cursor, ui.pan, preview_w, body, list_w);
     let mut out = String::from("\x1b[?2026h\x1b[H");
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
@@ -664,8 +717,15 @@ pub fn render_styled(
     out.push_str(&format!("\x1b[{};1H\x1b[K", rows));
     out.push_str(&fit(&footer(ui, cut, preview_w), cols));
     // Erase anything a previous, taller frame left below this one — a resize
-    // to fewer rows is the only way stale content can survive past here.
-    out.push_str("\x1b[J\x1b[?2026l");
+    // to fewer rows is the only way stale content can survive past here. Must
+    // happen BEFORE the caret move below, or `\x1b[J` erases from the caret's
+    // new position instead of the footer's.
+    out.push_str("\x1b[J");
+    match caret {
+        Some((row, col)) => out.push_str(&format!("\x1b[{row};{col}H\x1b[?25h")),
+        None => out.push_str("\x1b[?25l"),
+    }
+    out.push_str("\x1b[?2026l");
     out
 }
 
@@ -776,18 +836,26 @@ fn refresh(
         *held = take(path, ui);
     }
 
-    let cells = match ui.selected().map(|s| s.name.clone()) {
+    // Hidden-at-origin is the safe default: nothing selected, or a failed
+    // capture, means there is no cursor to trust — showing one anyway would
+    // paint a caret the daemon never reported. See steps/027.
+    let hidden = Cursor {
+        row: 0,
+        col: 0,
+        visible: false,
+    };
+    let (cells, cursor) = match ui.selected().map(|s| s.name.clone()) {
         Some(name) => match capture_styled(path, &name) {
-            Ok(cells) => cells,
+            Ok(result) => result,
             Err(e) => {
                 ui.notice = Some(format!("{name}: {e}"));
-                Vec::new()
+                (Vec::new(), hidden)
             }
         },
-        None => Vec::new(),
+        None => (Vec::new(), hidden),
     };
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let frame = render_styled(ui, &cells, server, cols, rows);
+    let frame = render_styled(ui, &cells, cursor, server, cols, rows);
     // The write is gated on change, as it always was — but before
     // `should_refresh` existed, everything ABOVE this line (a relist, an IPC
     // round-trip for a full screen snapshot, a rebuilt frame) ran on every
@@ -912,14 +980,17 @@ fn list(path: &Path) -> Result<Vec<SessionSummary>, String> {
 
 /// Styled counterpart of the (now unused) plain `capture` — see steps/020,
 /// 021. The wire carries runs, expanded back to cells here — see steps/022.
-fn capture_styled(path: &Path, name: &str) -> Result<Vec<Vec<StyledCell>>, String> {
+/// The cursor rides the same round trip — see steps/027.
+fn capture_styled(path: &Path, name: &str) -> Result<(Vec<Vec<StyledCell>>, Cursor), String> {
     match client::request(
         path,
         &Request::CaptureStyled {
             name: name.to_string(),
         },
     ) {
-        Ok(Response::StyledScreen(runs)) => Ok(runs.iter().map(|row| expand_runs(row)).collect()),
+        Ok(Response::StyledScreen { rows, cursor }) => {
+            Ok((rows.iter().map(|row| expand_runs(row)).collect(), cursor))
+        }
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
     }
@@ -1536,7 +1607,7 @@ mod tests {
     fn render_styled_never_erases_the_whole_screen() {
         let ui = ui(vec![row("claude", true, false)]);
         let cells = vec![vec![StyledCell::default(); 10]; 5];
-        let out = render_styled(&ui, &cells, "default", 80, 10);
+        let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 10);
         assert!(
             !out.contains("\x1b[2J"),
             "a full erase is exactly the flicker being fixed: {out:?}"
@@ -1550,9 +1621,112 @@ mod tests {
     fn render_styled_wraps_the_frame_in_synchronized_output() {
         let ui = ui(vec![row("claude", true, false)]);
         let cells = vec![vec![StyledCell::default(); 10]; 5];
-        let out = render_styled(&ui, &cells, "default", 80, 10);
+        let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 10);
         assert!(out.starts_with("\x1b[?2026h"), "begin sync: {out:?}");
         assert!(out.ends_with("\x1b[?2026l"), "end sync: {out:?}");
+    }
+
+    fn hidden_cursor() -> Cursor {
+        Cursor {
+            row: 0,
+            col: 0,
+            visible: false,
+        }
+    }
+
+    /// A row of real cells (not `StyledCell::default`, whose empty text
+    /// claims 0 columns), so cumulative width advances one column per cell.
+    fn text_row(width: usize) -> Vec<StyledCell> {
+        (0..width)
+            .map(|_| StyledCell {
+                text: "x".into(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// With a real 16-wide list column and header row in front of it, a
+    /// cursor at session (2, 3) must land at absolute (3, 21) — not at
+    /// (2, 3) itself. See steps/027 and the PR's negative control.
+    #[test]
+    fn a_focused_cursor_lands_at_its_absolute_screen_position_not_at_origin() {
+        let ui = ui(vec![row("claude", true, false)]);
+        let cells = vec![text_row(10); 5];
+        let cursor = Cursor {
+            row: 2,
+            col: 3,
+            visible: true,
+        };
+        let out = render_styled(&ui, &cells, cursor, "default", 80, 10);
+        assert!(
+            out.ends_with("\x1b[3;21H\x1b[?25h\x1b[?2026l"),
+            "row 2 col 3 in session space, with a 16-col list + divider in \
+             front and a header row above, must land at screen (3, 21), \
+             positioned before the end-sync marker: {out:?}"
+        );
+    }
+
+    /// The child's own DECTCEM hide must win: steps/027's axis 4. A visible
+    /// caret painted over an app that deliberately hid its own (a spinner, a
+    /// full-screen TUI) is worse than none.
+    #[test]
+    fn a_hidden_cursor_never_gets_a_show_sequence() {
+        let ui = ui(vec![row("claude", true, false)]);
+        let cells = vec![text_row(10); 5];
+        let cursor = Cursor {
+            row: 2,
+            col: 3,
+            visible: false,
+        };
+        let out = render_styled(&ui, &cells, cursor, "default", 80, 10);
+        assert!(
+            !out.contains("\x1b[?25h"),
+            "the child asked to hide: {out:?}"
+        );
+        assert!(
+            out.ends_with("\x1b[?25l\x1b[?2026l"),
+            "an explicit hide, not a silently-omitted one: {out:?}"
+        );
+    }
+
+    /// A cursor scrolled above the bottom-anchored viewport (more session
+    /// rows than the pane has height for) must not paint a caret at some
+    /// clamped, wrong row — steps/027's axis 3.
+    #[test]
+    fn a_cursor_scrolled_out_of_the_viewport_is_hidden_not_clamped() {
+        let ui = ui(vec![row("claude", true, false)]);
+        // 20 session rows into a 9-row body (rows=10): row_offset = 11, so
+        // session row 0 is 11 rows above the visible window.
+        let cells = vec![text_row(10); 20];
+        let cursor = Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        };
+        let out = render_styled(&ui, &cells, cursor, "default", 80, 10);
+        assert!(
+            out.ends_with("\x1b[?25l\x1b[?2026l"),
+            "row 0 is scrolled off above the visible window: {out:?}"
+        );
+    }
+
+    /// A cursor panned past the visible columns must not paint a caret
+    /// inside the list column or the divider — steps/027's axis 3 and 5.
+    #[test]
+    fn a_cursor_panned_out_of_view_is_hidden() {
+        let mut ui = ui(vec![row("claude", true, false)]);
+        ui.pan = 5;
+        let cells = vec![text_row(3); 5];
+        let cursor = Cursor {
+            row: 2,
+            col: 1,
+            visible: true,
+        };
+        let out = render_styled(&ui, &cells, cursor, "default", 80, 10);
+        assert!(
+            out.ends_with("\x1b[?25l\x1b[?2026l"),
+            "column 1 is behind the pan of 5, so nothing of it is visible: {out:?}"
+        );
     }
 
     #[test]
