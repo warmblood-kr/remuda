@@ -19,20 +19,21 @@
 use crate::client;
 use mlua::{Lua, Table, Value};
 use remuda_core::keys;
-use remuda_core::protocol::{Request, Response};
+use remuda_core::protocol::{Request, Response, Step};
 use std::path::Path;
 use std::time::Duration;
 
 /// Every name in the live `remuda` table: the protocol operations and `sleep`
-/// bound here, then `tool`/`tools`/`_call`/`_descriptors` added by `tools.lua`.
-/// Asserted against the live table, both directions.
-pub const BINDINGS: [&str; 14] = [
+/// bound here, then `tool`/`tools`/`_call`/`_descriptors`/`type_text` added by
+/// `tools.lua`. Asserted against the live table, both directions.
+pub const BINDINGS: [&str; 16] = [
     "_call",
     "_descriptors",
     "attach",
     "capture",
     "click",
     "close",
+    "feed",
     "insert",
     "key",
     "ls",
@@ -41,6 +42,7 @@ pub const BINDINGS: [&str; 14] = [
     "sleep",
     "tool",
     "tools",
+    "type_text",
 ];
 
 /// Run a script file **in the daemon's image**, never in a fresh `Lua::new()`
@@ -144,6 +146,23 @@ pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
         )?,
     )?;
 
+    // A sequence of bursts and pauses delivered as one indivisible act — the
+    // primitive `send`/`insert` are the one-`Burst` case of. `steps` is a Lua
+    // array of `{burst = "..."}` / `{pause = seconds}` entries, in order.
+    // Like `sleep`, this blocks the calling Image — for as long as `steps`'s
+    // pauses sum to: `client::request` waits synchronously for the daemon's
+    // reply, and the daemon does not answer until the whole act is done. The
+    // daemon refuses a total pause over a few seconds rather than trust a
+    // units mistake (or a runaway caller) not to hold an Image hostage.
+    let path = at();
+    table.set(
+        "feed",
+        lua.create_function(move |lua, (name, steps): (String, Table)| {
+            let steps = lua_steps_to_wire(steps)?;
+            value(lua, ask(&path, Request::Feed { name, steps })?)
+        })?,
+    )?;
+
     let path = at();
     table.set(
         "capture",
@@ -176,6 +195,11 @@ pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
         })?,
     )?;
 
+    // Blocks the WHOLE Image, not just this call: the interpreter is pinned to
+    // one thread (image.rs), so a sleeping script stalls every other job —
+    // the REPL, `-e`, any other script — for the full duration. Not a wait or
+    // a timer primitive; remuda has no periodic-execution mechanism yet, and
+    // faking one with a sleep-and-poll loop holds the Image hostage the same way.
     table.set(
         "sleep",
         lua.create_function(|_, seconds: f64| {
@@ -193,6 +217,26 @@ pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
 
 fn ask(socket: &Path, request: Request) -> mlua::Result<Response> {
     client::request(socket, &request).map_err(mlua::Error::external)
+}
+
+/// A Lua array of `{burst = "..."}` / `{pause = seconds}` entries into the
+/// wire `Step`s `feed` delivers — `pause` is seconds, matching `sleep`, and
+/// travels the wire as whole milliseconds.
+fn lua_steps_to_wire(steps: Table) -> mlua::Result<Vec<Step>> {
+    let mut wire = Vec::with_capacity(steps.raw_len());
+    for step in steps.sequence_values::<Table>() {
+        let step = step?;
+        if let Ok(burst) = step.get::<mlua::LuaString>("burst") {
+            wire.push(Step::Burst(burst.as_bytes().to_vec()));
+        } else if let Ok(seconds) = step.get::<f64>("pause") {
+            wire.push(Step::Pause((seconds.max(0.0) * 1000.0) as u64));
+        } else {
+            return Err(mlua::Error::runtime(
+                "each feed step needs a `burst` string or a `pause` number",
+            ));
+        }
+    }
+    Ok(wire)
 }
 
 /// Turn a response into what the script sees. Caution: [`Response::Error`]

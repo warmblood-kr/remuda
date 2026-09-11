@@ -4,6 +4,7 @@
 //! on a machine that has never installed `claude`."
 
 use remuda_core::agent::{AgentError, AgentProcess, Cursor, Result, Size};
+use remuda_core::protocol::Step;
 use remuda_core::{Clock, ManualClock, ScriptedAgent, Session};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -574,4 +575,284 @@ fn a_raw_keystroke_carries_no_invented_enter() {
     // half-typed line on the human's behalf is the failure this guards.
     let recorded = writes.lock().unwrap().clone();
     assert_eq!(recorded, vec![b"ls".to_vec()], "one write, no Enter");
+}
+
+// ---------------------------------------------------------------------------
+// `feed` — an input act as a sequence of bursts and pauses (PRINCIPLES.md §6,
+// "Widened again, 2026-09-11"). A caller that must type, wait, then submit
+// needs that whole sequence to still be one indivisible act; these pin that
+// `input_lock` — not the `agent` lock a `Burst` briefly holds — is what makes
+// that true even across the pause.
+// ---------------------------------------------------------------------------
+
+/// Advances `clock` by `pause` over and over, until `feeder` actually
+/// finishes — never a fixed number of times.
+///
+/// A single `clock.advance(pause)` right after seeing the first burst can
+/// race a feeder thread between that write returning and its call into
+/// `Clock::sleep`: if the advance lands first, `sleep` computes its target
+/// from a clock already moved, needing another full `pause` that a *fixed*
+/// count of advances is never provably enough to supply — whatever count is
+/// picked, a feeder scheduled late enough always reads `now()` after the last
+/// one (measured: a real 60s+ hang under `cargo test --workspace`, twice,
+/// after two different fixed counts). Advancing again on every iteration the
+/// feeder is not yet `is_finished()` has no such bound to guess.
+fn advance_until_finished<T>(
+    clock: &ManualClock,
+    pause: Duration,
+    feeder: &std::thread::JoinHandle<T>,
+) {
+    for _ in 0..100_000 {
+        if feeder.is_finished() {
+            return;
+        }
+        clock.advance(pause);
+        std::thread::yield_now();
+    }
+    panic!(
+        "feed did not finish after {:?} rounds of advancing past its pause",
+        100_000
+    );
+}
+
+#[test]
+fn feed_bursts_and_pauses_are_one_indivisible_act() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (session, clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
+    let session = Arc::new(session);
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+
+    let feeder = {
+        let session = session.clone();
+        std::thread::spawn(move || {
+            session
+                .feed(&[
+                    Step::Burst(b"first".to_vec()),
+                    Step::Pause(1000),
+                    Step::Burst(b"second".to_vec()),
+                ])
+                .unwrap();
+        })
+    };
+
+    // Spin rather than sleep (denied) until the first burst has landed, so the
+    // interloper below races a feed act that is provably inside its pause.
+    while writes.lock().unwrap().is_empty() {
+        std::thread::yield_now();
+    }
+
+    let interloper = {
+        let session = session.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            session.send(b"interloper").unwrap();
+        })
+    };
+    barrier.wait();
+    // The interloper is now contending for `input_lock`, which the pause does
+    // not release — advancing the clock is what finally lets either proceed.
+    advance_until_finished(&clock, Duration::from_secs(1), &feeder);
+
+    feeder.join().unwrap();
+    interloper.join().unwrap();
+
+    let got = writes.lock().unwrap().clone();
+    assert_eq!(
+        got,
+        vec![
+            b"first".to_vec(),
+            b"second".to_vec(),
+            b"interloper".to_vec()
+        ],
+        "the interloper must land only after the whole feed act finished: {got:?}"
+    );
+}
+
+/// NEGATIVE CONTROL for the test above.
+///
+/// The exact real-world idiom `feed` replaces: type, then submit, as two
+/// SEPARATE `Session::send` calls with a gap — `tests/api/v1.lua`'s own
+/// `insert` then `key RET`. Each call is individually atomic; the pair is not.
+#[test]
+fn control_separate_calls_with_a_gap_do_interleave() {
+    use std::sync::Barrier;
+
+    const WRITERS: usize = 8;
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
+    let session = Arc::new(session);
+    let barrier = Arc::new(Barrier::new(WRITERS));
+
+    let mut handles = Vec::new();
+    for i in 0..WRITERS {
+        let session = session.clone();
+        let barrier = barrier.clone();
+        handles.push(std::thread::spawn(move || {
+            session.send(format!("line-{i}").as_bytes()).unwrap();
+            barrier.wait();
+            session.send(b"\r").unwrap();
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let got = writes.lock().unwrap().clone();
+    assert_eq!(got.len(), WRITERS * 2);
+    assert!(
+        !every_write_is_a_whole_instruction(&got),
+        "control failed to interleave, so the positive test proves nothing: {got:?}"
+    );
+}
+
+#[test]
+fn capture_does_not_wait_out_a_feed_pause() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (session, clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
+    let session = Arc::new(session);
+
+    let feeder = {
+        let session = session.clone();
+        std::thread::spawn(move || {
+            // Under `Session::MAX_TOTAL_PAUSE` — a pause over the cap is
+            // refused before it writes anything, which is a different test.
+            session
+                .feed(&[
+                    Step::Burst(b"first".to_vec()),
+                    Step::Pause(2000),
+                    Step::Burst(b"second".to_vec()),
+                ])
+                .unwrap();
+        })
+    };
+
+    while writes.lock().unwrap().is_empty() {
+        std::thread::yield_now();
+    }
+
+    // If a screen read waited on `input_lock`, this would hang forever: the
+    // pause above is not released until the advancing below wakes it.
+    session.screen_text().unwrap();
+
+    advance_until_finished(&clock, Duration::from_secs(2), &feeder);
+    feeder.join().unwrap();
+}
+
+#[test]
+fn attaching_during_a_feed_pause_refuses_the_remaining_bursts() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (session, clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
+    let session = Arc::new(session);
+
+    let feeder = {
+        let session = session.clone();
+        std::thread::spawn(move || {
+            session.feed(&[
+                Step::Burst(b"first".to_vec()),
+                Step::Pause(1000),
+                Step::Burst(b"second".to_vec()),
+            ])
+        })
+    };
+
+    while writes.lock().unwrap().is_empty() {
+        std::thread::yield_now();
+    }
+
+    // `attach` takes neither lock a feed act holds, so it must succeed right
+    // away — proving there is no deadlock behind an act sitting in a pause.
+    let held = session
+        .attach()
+        .expect("attach must not wait on a paused feed");
+
+    advance_until_finished(&clock, Duration::from_secs(1), &feeder);
+    let result = feeder.join().unwrap();
+
+    assert!(
+        matches!(result, Err(AgentError::Attached)),
+        "the act must refuse once a human has attached mid-pause: {result:?}"
+    );
+    assert_eq!(
+        writes.lock().unwrap().clone(),
+        vec![b"first".to_vec()],
+        "the second burst must never reach the pty once attached"
+    );
+    drop(held);
+}
+
+#[test]
+fn feed_refuses_a_total_pause_over_the_cap() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
+
+    // Two pauses that individually look modest but sum past the cap — the
+    // sum is what is checked, not any one `Pause`.
+    let over_cap = Session::MAX_TOTAL_PAUSE + Duration::from_millis(1);
+    let result = session.feed(&[
+        Step::Burst(b"first".to_vec()),
+        Step::Pause(over_cap.as_millis() as u64 / 2),
+        Step::Burst(b"second".to_vec()),
+        Step::Pause(over_cap.as_millis() as u64 / 2 + 1),
+        Step::Burst(b"third".to_vec()),
+    ]);
+
+    assert!(
+        matches!(result, Err(AgentError::PauseTooLong { .. })),
+        "a total pause over the cap must be refused: {result:?}"
+    );
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "nothing may be written once any part of the act is refused"
+    );
+}
+
+/// A human can attach *and fully detach again* entirely inside one `Pause` —
+/// `attached` is back to `false` by the time the next burst runs, so a check
+/// of the live flag alone would let that burst through. This is the R4
+/// failure `feed` exists to prevent: the orchestrator's own submitting burst
+/// landing right after a human's typing, because nothing remembered the
+/// human was ever there.
+#[test]
+fn attaching_and_detaching_inside_a_pause_still_refuses_the_next_burst() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (session, clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
+    let session = Arc::new(session);
+
+    let feeder = {
+        let session = session.clone();
+        std::thread::spawn(move || {
+            session.feed(&[
+                Step::Burst(b"first".to_vec()),
+                Step::Pause(1000),
+                Step::Burst(b"second".to_vec()),
+            ])
+        })
+    };
+
+    while writes.lock().unwrap().is_empty() {
+        std::thread::yield_now();
+    }
+
+    // Attach AND detach again, fully, before the second burst ever runs.
+    let held = session.attach().expect("attach during the pause");
+    drop(held);
+    assert!(
+        !session.is_attached(),
+        "must be detached again before the next burst runs — that is the point"
+    );
+
+    advance_until_finished(&clock, Duration::from_secs(1), &feeder);
+    let result = feeder.join().unwrap();
+
+    assert!(
+        matches!(result, Err(AgentError::Attached)),
+        "a burst must refuse if attach touched this act anywhere, even if \
+         already detached again by the time the burst runs: {result:?}"
+    );
+    assert_eq!(
+        writes.lock().unwrap().clone(),
+        vec![b"first".to_vec()],
+        "the submitting burst must never reach the pty once attach touched this act"
+    );
 }

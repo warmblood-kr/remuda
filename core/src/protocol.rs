@@ -40,6 +40,10 @@ pub enum Request {
     /// the primitive [`Request::SendLine`] is made of. Indivisible is the
     /// load-bearing word; refused while a human is attached, as `SendLine` is.
     Send { name: String, bytes: Vec<u8> },
+    /// Deliver a sequence of [`Step`]s as one indivisible act — `Send`/
+    /// `SendLine` are its one-`Burst` case. Refused while a human is
+    /// attached, as they are; see [`crate::session::Session`].
+    Feed { name: String, steps: Vec<Step> },
     /// Read the screen as text without taking the session over. Needs no
     /// terminal, raw mode or exclusivity, so it works while a human is attached.
     Capture { name: String },
@@ -71,6 +75,15 @@ pub enum Request {
         /// because only the caller knows where the source came from.
         name: Option<String>,
     },
+}
+
+/// One element of a [`Request::Feed`] act: bytes, or a pause before the next
+/// `Burst`. Milliseconds, not `Duration` — kept a plain integer so this enum,
+/// unlike `Duration`, can still derive `Eq`.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum Step {
+    Burst(Vec<u8>),
+    Pause(u64),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]

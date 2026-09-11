@@ -7,8 +7,9 @@
 
 use crate::agent::{AgentError, AgentProcess, Cursor, Result, Size, StyledCell};
 use crate::clock::Clock;
+use crate::protocol::Step;
 use core::time::Duration;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
@@ -27,6 +28,14 @@ pub struct Session {
     /// two orchestrated `send_line`s still serialize against each other without
     /// the second reporting a spurious "busy".
     attached: AtomicBool,
+    /// Bumped every time `attach` succeeds. A `feed` act records this at
+    /// start; a burst refuses if it has since changed, even if `attached` is
+    /// false again by then — an attach-then-detach fully inside one `Pause`.
+    attach_generation: AtomicU64,
+    /// Held for the whole of one input act — every `Burst` **and** every
+    /// `Pause` between them — so a second sender cannot land a write during a
+    /// pause, when the `agent` lock is briefly free. See [`Self::feed`].
+    input_lock: Mutex<()>,
 }
 
 /// Identity and size only. Deliberately takes no lock: a `Debug` that locks
@@ -56,6 +65,8 @@ impl Session {
             clock,
             last_input_at: Mutex::new(started),
             attached: AtomicBool::new(false),
+            attach_generation: AtomicU64::new(0),
+            input_lock: Mutex::new(()),
         }
     }
 
@@ -80,10 +91,69 @@ impl Session {
     }
 
     /// Deliver a burst of input as one indivisible act, appending nothing — the
-    /// atom [`Self::send_line`] is one case of. Written under a single lock
-    /// acquisition, so a second sender cannot land in the middle of a burst.
+    /// one-`Burst` case of [`Self::feed`]. Holds `input_lock`, so it cannot
+    /// land inside a `feed` act's pause, nor a `feed` act land inside it.
     pub fn send(&self, bytes: &[u8]) -> Result<()> {
-        if self.attached.load(Ordering::SeqCst) {
+        let _held = self
+            .input_lock
+            .lock()
+            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        self.write_one_burst(bytes, None)
+    }
+
+    /// Above this, a `feed` act is refused rather than executed — a caller's
+    /// seconds/millis mixup must not hold an Image hostage indefinitely. See
+    /// PRINCIPLES.md §6; settle pauses run ~0.1s, so this leaves ample room.
+    pub const MAX_TOTAL_PAUSE: Duration = Duration::from_secs(5);
+
+    /// Deliver a sequence of bursts and pauses as one indivisible input act —
+    /// `input_lock` spans the whole thing, but a pause holds no lock
+    /// `screen_text`/`capture` need. See PRINCIPLES.md §6 for why.
+    pub fn feed(&self, steps: &[Step]) -> Result<()> {
+        let total_pause: Duration = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Pause(millis) => Some(Duration::from_millis(*millis)),
+                Step::Burst(_) => None,
+            })
+            .sum();
+        if total_pause > Self::MAX_TOTAL_PAUSE {
+            return Err(AgentError::PauseTooLong {
+                total: total_pause,
+                cap: Self::MAX_TOTAL_PAUSE,
+            });
+        }
+
+        let _held = self
+            .input_lock
+            .lock()
+            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        // Recorded once, after the lock is held so nothing can attach and
+        // bump it before this act's own baseline is fixed — see
+        // `write_one_burst`, which refuses a burst the moment this changes,
+        // even across a `Pause` where a human attached and already detached.
+        let started_at_generation = self.attach_generation.load(Ordering::SeqCst);
+        for step in steps {
+            match step {
+                Step::Burst(bytes) => self.write_one_burst(bytes, Some(started_at_generation))?,
+                Step::Pause(millis) => self.clock.sleep(Duration::from_millis(*millis)),
+            }
+        }
+        Ok(())
+    }
+
+    /// The one place that actually touches the pty. Callers hold `input_lock`
+    /// before calling this — it does not take that lock itself, since `feed`
+    /// needs to call it once per burst without releasing it in between.
+    fn write_one_burst(&self, bytes: &[u8], started_at_generation: Option<u64>) -> Result<()> {
+        // `None` (a bare `send`) checks only the live flag — one burst has no
+        // pause for an attach-then-detach to hide inside. `Some` (a `feed`
+        // burst) also refuses if attachment happened at any point since the
+        // act started, even if it is not held any more by the time this runs.
+        let attached_now = self.attached.load(Ordering::SeqCst);
+        let attached_during_act = started_at_generation
+            .is_some_and(|gen| self.attach_generation.load(Ordering::SeqCst) != gen);
+        if attached_now || attached_during_act {
             return Err(AgentError::Attached);
         }
 
@@ -156,7 +226,13 @@ impl Session {
         self.attached
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .ok()
-            .map(|_| Attached { session: self })
+            .map(|_| {
+                // Bumped on every successful attach, never on a refused one —
+                // `feed` compares against this to catch an attach-then-detach
+                // that happened entirely inside one of its `Pause`s.
+                self.attach_generation.fetch_add(1, Ordering::SeqCst);
+                Attached { session: self }
+            })
     }
 
     /// Whether a human currently holds this session.

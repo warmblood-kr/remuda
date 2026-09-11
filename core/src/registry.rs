@@ -20,6 +20,7 @@
 //! `core/clippy.toml` denies outright.
 
 use crate::agent::{Cursor, Result, Size, StyledCell};
+use crate::protocol::Step;
 use crate::session::Session;
 use core::time::Duration;
 use serde::{Deserialize, Serialize};
@@ -163,6 +164,10 @@ impl Registry {
 
     pub fn send(&self, name: &str, bytes: &[u8]) -> Option<Result<()>> {
         self.get(name).map(|s| s.send(bytes))
+    }
+
+    pub fn feed(&self, name: &str, steps: &[Step]) -> Option<Result<()>> {
+        self.get(name).map(|s| s.feed(steps))
     }
 
     pub fn screen_text(&self, name: &str) -> Option<Result<String>> {

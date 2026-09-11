@@ -16,7 +16,7 @@ use crate::image::Image;
 use crate::ipc::{self, Listener, Stream, TryClone};
 use crate::pty::PtyAgent;
 use interprocess::local_socket::traits::ListenerExt;
-use remuda_core::agent::Cursor;
+use remuda_core::agent::{Cursor, Result as AgentResult};
 use remuda_core::protocol::{collapse_runs, Request, Response};
 use remuda_core::{Registry, Session, Size};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -194,32 +194,30 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
             }
         }
 
-        Request::SendLine { name, text } => match registry.send_line(&name, &text) {
-            None => reply(
-                &stream,
-                &Response::error(format!("no such session: {name}")),
-            ),
-            Some(Err(e)) => reply(&stream, &Response::error(e)),
-            Some(Ok(())) => reply(&stream, &Response::Ok),
-        },
+        Request::SendLine { name, text } => {
+            respond(&stream, &name, registry.send_line(&name, &text), |()| {
+                Response::Ok
+            })
+        }
 
-        Request::Send { name, bytes } => match registry.send(&name, &bytes) {
-            None => reply(
-                &stream,
-                &Response::error(format!("no such session: {name}")),
-            ),
-            Some(Err(e)) => reply(&stream, &Response::error(e)),
-            Some(Ok(())) => reply(&stream, &Response::Ok),
-        },
+        Request::Send { name, bytes } => {
+            respond(&stream, &name, registry.send(&name, &bytes), |()| {
+                Response::Ok
+            })
+        }
 
-        Request::Capture { name } => match registry.screen_text(&name) {
-            None => reply(
-                &stream,
-                &Response::error(format!("no such session: {name}")),
-            ),
-            Some(Err(e)) => reply(&stream, &Response::error(e)),
-            Some(Ok(text)) => reply(&stream, &Response::Screen(text)),
-        },
+        Request::Feed { name, steps } => {
+            respond(&stream, &name, registry.feed(&name, &steps), |()| {
+                Response::Ok
+            })
+        }
+
+        Request::Capture { name } => respond(
+            &stream,
+            &name,
+            registry.screen_text(&name),
+            Response::Screen,
+        ),
 
         Request::CaptureStyled { name } => match registry.screen_cells(&name) {
             None => reply(
@@ -248,14 +246,9 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
 
         Request::Attach { name } => attach(stream, reader, registry, &name),
 
-        Request::Close { name } => match registry.close(&name) {
-            None => reply(
-                &stream,
-                &Response::error(format!("no such session: {name}")),
-            ),
-            Some(Err(e)) => reply(&stream, &Response::error(e)),
-            Some(Ok(())) => reply(&stream, &Response::Ok),
-        },
+        Request::Close { name } => {
+            respond(&stream, &name, registry.close(&name), |()| Response::Ok)
+        }
 
         Request::Eval { code, name } => match image.eval(&code, name.as_deref()) {
             Ok(value) => reply(&stream, &Response::Value(value)),
@@ -263,6 +256,22 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
             // traceback — the same treatment `remuda run` gives a script file.
             Err(e) => reply(&stream, &Response::error(e)),
         },
+    }
+}
+
+/// The `None`/`Some(Err)`/`Some(Ok)` shape several `Request` arms share: no
+/// such session, a refused or failed op, or an answer built from what it
+/// returned.
+fn respond<T>(
+    stream: &Stream,
+    name: &str,
+    result: Option<AgentResult<T>>,
+    ok: impl FnOnce(T) -> Response,
+) -> std::io::Result<()> {
+    match result {
+        None => reply(stream, &Response::error(format!("no such session: {name}"))),
+        Some(Err(e)) => reply(stream, &Response::error(e)),
+        Some(Ok(v)) => reply(stream, &ok(v)),
     }
 }
 

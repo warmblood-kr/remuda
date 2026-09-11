@@ -145,9 +145,47 @@ the concurrency defect the type was built against.
 
 ⇒ When restating this invariant, name **divisibility**, never "raw".
 
+### Widened again, 2026-09-11: an act can be several bursts and a pause
+
+`feed` lets one input act be a sequence of bursts with a pause between them —
+for a caller that has to type, wait, then submit, and needs that whole
+sequence to still be one act. "Nothing awaiting inside it" still names the
+*agent* lock a `Burst` briefly holds to write; `screen_text`/`capture` never
+wait longer than one burst takes, pause or no pause. What now spans the whole
+act, pause included, is a second lock, `input_lock` — the thing a second
+sender cannot land inside at any point in the sequence. That is `feed`
+widening the same **divisibility** property a second time, not repealing it.
+
+Attachment is re-checked on *every* burst, not once at the act's start — and
+not just the live flag. A human can `attach` **and detach again**, both
+fully inside one `Pause`, so `attached` reads false again by the time the
+next burst runs; a generation counter bumped on every successful `attach`
+is what a burst actually compares against, refusing if it has changed since
+the act started even though nothing is held *now*. `attach` itself takes
+neither lock, so an act sitting in a pause cannot make it wait — it simply
+wins the race, and the act's remaining bursts lose theirs. The failure this
+buys is a safe one: a refused act leaves its body typed but not submitted,
+never silently corrupted or misdelivered to whoever attached.
+
+A `feed` act's own pauses are what a caller sits inside of too — `Session::
+feed` runs on the daemon's connection thread, and a script's call blocks
+synchronously for the reply, so every pause in `steps` holds the calling
+Image hostage for that long, same as `sleep` does. `Session::MAX_TOTAL_PAUSE`
+(5s) bounds that: a total over it is refused before anything is written, not
+clamped, so a seconds/millis mixup or a runaway caller errors loudly instead
+of quietly stalling an Image for however long it guessed wrong by.
+
 **Enforced by:** the type system (the method does not exist) · test
 `concurrent_send_lines_never_interleave` and its negative control
-`control_unlocked_writers_do_interleave`
+`control_unlocked_writers_do_interleave` · the wider act's own divisibility by
+test `feed_bursts_and_pauses_are_one_indivisible_act` and its negative control
+`control_separate_calls_with_a_gap_do_interleave` · a screen read never
+waiting on a pause, by test `capture_does_not_wait_out_a_feed_pause` · the
+attach race, by test
+`attaching_during_a_feed_pause_refuses_the_remaining_bursts` and the
+attach-then-detach-inside-one-pause case, by test
+`attaching_and_detaching_inside_a_pause_still_refuses_the_next_burst` · the
+pause cap, by test `feed_refuses_a_total_pause_over_the_cap`
 
 ## 7. Time is injected, never read
 
