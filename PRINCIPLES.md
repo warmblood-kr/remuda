@@ -145,9 +145,32 @@ the concurrency defect the type was built against.
 
 ⇒ When restating this invariant, name **divisibility**, never "raw".
 
+### Widened again, 2026-09-11: an act can be several bursts and a pause
+
+`feed` lets one input act be a sequence of bursts with a pause between them —
+for a caller that has to type, wait, then submit, and needs that whole
+sequence to still be one act. "Nothing awaiting inside it" still names the
+*agent* lock a `Burst` briefly holds to write; `screen_text`/`capture` never
+wait longer than one burst takes, pause or no pause. What now spans the whole
+act, pause included, is a second lock, `input_lock` — the thing a second
+sender cannot land inside at any point in the sequence. That is `feed`
+widening the same **divisibility** property a second time, not repealing it.
+
+Attachment is re-checked on *every* burst, not once at the act's start: a
+human can `attach` mid-pause, and the next burst must see that and refuse
+rather than finish delivering to a session it no longer has any business
+touching. `attach` itself takes neither lock, so an act sitting in a pause
+cannot make it wait — it simply wins the race, and the act's remaining bursts
+lose theirs.
+
 **Enforced by:** the type system (the method does not exist) · test
 `concurrent_send_lines_never_interleave` and its negative control
-`control_unlocked_writers_do_interleave`
+`control_unlocked_writers_do_interleave` · the wider act's own divisibility by
+test `feed_bursts_and_pauses_are_one_indivisible_act` and its negative control
+`control_separate_calls_with_a_gap_do_interleave` · a screen read never
+waiting on a pause, by test `capture_does_not_wait_out_a_feed_pause` · the
+attach race, by test
+`attaching_during_a_feed_pause_refuses_the_remaining_bursts`
 
 ## 7. Time is injected, never read
 

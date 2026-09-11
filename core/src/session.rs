@@ -7,6 +7,7 @@
 
 use crate::agent::{AgentError, AgentProcess, Cursor, Result, Size, StyledCell};
 use crate::clock::Clock;
+use crate::protocol::Step;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -27,6 +28,10 @@ pub struct Session {
     /// two orchestrated `send_line`s still serialize against each other without
     /// the second reporting a spurious "busy".
     attached: AtomicBool,
+    /// Held for the whole of one input act — every `Burst` **and** every
+    /// `Pause` between them — so a second sender cannot land a write during a
+    /// pause, when the `agent` lock is briefly free. See [`Self::feed`].
+    input_lock: Mutex<()>,
 }
 
 /// Identity and size only. Deliberately takes no lock: a `Debug` that locks
@@ -56,6 +61,7 @@ impl Session {
             clock,
             last_input_at: Mutex::new(started),
             attached: AtomicBool::new(false),
+            input_lock: Mutex::new(()),
         }
     }
 
@@ -80,9 +86,37 @@ impl Session {
     }
 
     /// Deliver a burst of input as one indivisible act, appending nothing — the
-    /// atom [`Self::send_line`] is one case of. Written under a single lock
-    /// acquisition, so a second sender cannot land in the middle of a burst.
+    /// one-`Burst` case of [`Self::feed`]. Holds `input_lock`, so it cannot
+    /// land inside a `feed` act's pause, nor a `feed` act land inside it.
     pub fn send(&self, bytes: &[u8]) -> Result<()> {
+        let _held = self
+            .input_lock
+            .lock()
+            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        self.write_one_burst(bytes)
+    }
+
+    /// Deliver a sequence of bursts and pauses as one indivisible input act —
+    /// `input_lock` spans the whole thing, but a pause holds no lock
+    /// `screen_text`/`capture` need. See PRINCIPLES.md §6 for why.
+    pub fn feed(&self, steps: &[Step]) -> Result<()> {
+        let _held = self
+            .input_lock
+            .lock()
+            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        for step in steps {
+            match step {
+                Step::Burst(bytes) => self.write_one_burst(bytes)?,
+                Step::Pause(millis) => self.clock.sleep(Duration::from_millis(*millis)),
+            }
+        }
+        Ok(())
+    }
+
+    /// The one place that actually touches the pty. Callers hold `input_lock`
+    /// before calling this — it does not take that lock itself, since `feed`
+    /// needs to call it once per burst without releasing it in between.
+    fn write_one_burst(&self, bytes: &[u8]) -> Result<()> {
         if self.attached.load(Ordering::SeqCst) {
             return Err(AgentError::Attached);
         }

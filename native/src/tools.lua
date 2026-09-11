@@ -136,6 +136,22 @@ function remuda._call(name, arguments)
   return tostring(answer)
 end
 
+-- Type TEXT into SESSION and submit it with Return, as one act `remuda.feed`
+-- will not let a second sender split. Not an MCP tool — a plain stdlib
+-- function beside `send`/`insert`, since remuda itself frames none of this
+-- (no default pause, no paste sequence) and this is the caller that does.
+-- SETTLE (seconds before the submitting Return) defaults to 0.1.
+function remuda.type_text(session, text, settle)
+  local body = tostring(text):gsub("\r\n?", "\n"):gsub("\27", "")
+  settle = settle or 0.1
+  local typed = body:find("\n", 1, true) and ("\27[200~" .. body .. "\27[201~") or body
+  remuda.feed(session, {
+    { burst = typed },
+    { pause = settle },
+    { burst = "\r" },
+  })
+end
+
 -- The first word, and the one `steps/008` found missing: readiness. Driving an
 -- agent means waiting for it, and every caller so far has written this loop
 -- again — `tests/api/v1.lua` has its own copy.

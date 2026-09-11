@@ -58,6 +58,10 @@ impl Clock for SystemClock {
     fn now(&self) -> Duration {
         self.origin.elapsed()
     }
+
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
 #[cfg(test)]
