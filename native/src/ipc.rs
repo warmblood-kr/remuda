@@ -74,3 +74,21 @@ pub fn wake(stream: &Stream) {
         };
     }
 }
+
+/// Stop a reader thread and wait for it to exit: `stop` (checked before
+/// every read) covers "not reading yet"; retrying `wake` until `is_finished`
+/// covers "reading, but the cancel arrived too early". See steps/029.
+pub fn stop_reader(
+    stream: &Stream,
+    stop: &std::sync::atomic::AtomicBool,
+    is_finished: impl Fn() -> bool,
+) {
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    loop {
+        wake(stream);
+        if is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}

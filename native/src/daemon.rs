@@ -347,16 +347,27 @@ fn attach(
     // already gone. The core got "a human is attached" forever.
     let done = std::sync::atomic::AtomicBool::new(false);
     let done = &done;
+    // Checked before every read of the key pump below, not just its first —
+    // a cancel that arrives before a read is pending is a documented no-op
+    // on Windows, so the flag (not the cancel alone) is what actually stops
+    // the loop. See steps/029.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let stop = &stop;
 
     std::thread::scope(|scope| {
         // Keystrokes in, on their own thread: reading a socket blocks, and the
         // output pump must not wait on the human to type.
         let held = &held;
-        scope.spawn(move || {
+        let key_thread = scope.spawn(move || {
             let mut buf = [0u8; 4096];
-            while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 || held.write_raw(&buf[..n]).is_err() {
-                    break;
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if held.write_raw(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
             done.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -380,7 +391,7 @@ fn attach(
         }
         done.store(true, std::sync::atomic::Ordering::SeqCst);
         // Unblocks the key thread's read so the scope can close.
-        ipc::wake(&stream);
+        ipc::stop_reader(&stream, stop, || key_thread.is_finished());
     });
     Ok(())
 }
