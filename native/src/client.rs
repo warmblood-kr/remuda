@@ -185,6 +185,21 @@ pub struct Hold {
 /// a pane repaints from `Capture`, which crops to its own width and cannot be
 /// fed raw pty bytes aimed at a whole terminal.
 pub fn hold(path: &Path, name: &str) -> std::io::Result<Hold> {
+    hold_inner(path, name, std::time::Duration::ZERO)
+}
+
+/// [TEST-ONLY] Like `hold`, but the drain thread sleeps `drain_delay` before
+/// its first read, forcing the Windows same-thread-drop race regardless of
+/// caller timing. See steps/029.
+pub fn hold_with_drain_delay(
+    path: &Path,
+    name: &str,
+    drain_delay: std::time::Duration,
+) -> std::io::Result<Hold> {
+    hold_inner(path, name, drain_delay)
+}
+
+fn hold_inner(path: &Path, name: &str, drain_delay: std::time::Duration) -> std::io::Result<Hold> {
     let stream = ipc::connect(path)?;
     send(
         &stream,
@@ -203,6 +218,9 @@ pub fn hold(path: &Path, name: &str) -> std::io::Result<Hold> {
     // Drained rather than ignored: the daemon repaints and then streams, and an
     // unread socket fills and parks its output pump.
     let drain = std::thread::spawn(move || {
+        if !drain_delay.is_zero() {
+            std::thread::sleep(drain_delay);
+        }
         let mut buf = [0u8; 8192];
         while let Ok(n) = reader.read(&mut buf) {
             if n == 0 {
