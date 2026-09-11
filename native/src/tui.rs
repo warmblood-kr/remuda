@@ -2301,7 +2301,7 @@ mod tests {
 
     /// [DIAGNOSTIC, not a fix] Reproduces #25's `reconcile_hold` sequence:
     /// drop A's `Hold`, immediately hold B — each stage watchdog-timed since
-    /// `Drop` can't be timed out in place. See steps/029.
+    /// `Drop` can't be timed out in place. See steps/030.
     #[test]
     fn dropping_one_sessions_hold_then_holding_another_does_not_hang() {
         let path = scratch_socket("hold-drop-then-hold");
@@ -2325,7 +2325,7 @@ mod tests {
         assert!(
             rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "STAGE 1: Hold::drop for session A did not return within 5s — \
-             see steps/029"
+             see steps/030"
         );
 
         // Stage 2: immediately hold B — the exact sequence a click to a
@@ -2338,7 +2338,7 @@ mod tests {
         assert!(
             rx.recv_timeout(Duration::from_secs(5)).expect(
                 "STAGE 2: client::hold for session B did not return \
-                     within 5s — see steps/029"
+                     within 5s — see steps/030"
             ),
             "STAGE 2: hold B must succeed once A's is released"
         );
@@ -2346,7 +2346,7 @@ mod tests {
 
     /// [DIAGNOSTIC, not a fix] Isolates one extra IPC round trip — a
     /// `capture_styled` call, what #25's `refresh()` makes and the sibling
-    /// test above does not — before the same hold/drop/hold. See steps/029.
+    /// test above does not — before the same hold/drop/hold. See steps/030.
     #[test]
     fn a_capture_styled_round_trip_before_hold_does_not_change_the_outcome() {
         let path = scratch_socket("capture-then-hold-drop-then-hold");
@@ -2375,7 +2375,7 @@ mod tests {
         assert!(
             rx.recv_timeout(Duration::from_secs(5)).is_ok(),
             "STAGE 1: Hold::drop for session A did not return within 5s — \
-             see steps/029"
+             see steps/030"
         );
 
         // Stage 2: immediately hold B — the exact sequence a click to a
@@ -2388,9 +2388,147 @@ mod tests {
         assert!(
             rx.recv_timeout(Duration::from_secs(5)).expect(
                 "STAGE 2: client::hold for session B did not return \
-                     within 5s — see steps/029"
+                     within 5s — see steps/030"
             ),
             "STAGE 2: hold B must succeed once A's is released"
         );
+    }
+
+    /// [DIAGNOSTIC] #25's `reconcile_hold_switches_the_real_attach_not_just_ui_state`
+    /// verbatim, but with NO thread spawned — every hold/drop, including the
+    /// implicit final one, happens on the test thread as #25 has it. See steps/030.
+    #[test]
+    fn reconcile_hold_switches_the_real_attach_not_just_ui_state_same_thread() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Finished(Arc<AtomicBool>);
+        impl Drop for Finished {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let stage = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let _sentinel = Finished(finished.clone());
+        {
+            let stage = stage.clone();
+            let finished = finished.clone();
+            std::thread::spawn(move || {
+                for _ in 0..300 {
+                    std::thread::sleep(Duration::from_millis(200));
+                    if finished.load(Ordering::SeqCst) {
+                        return;
+                    }
+                }
+                let msg = format!("V1 STUCK AFTER STAGE {}\n", stage.load(Ordering::SeqCst));
+                let _ = std::io::stderr().write_all(msg.as_bytes());
+                std::process::exit(101);
+            });
+        }
+
+        let path = scratch_socket("reconcile-hold-switch-same-thread");
+        daemon_at(&path);
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        refresh(&path, "default", &mut ui, &mut held, &mut painted, false).unwrap();
+        assert_eq!(ui.sessions.len(), 2, "both sessions must be seen");
+        let first = ui.sessions[0].name.clone();
+        let second = ui.sessions[1].name.clone();
+        stage.store(1, Ordering::SeqCst);
+
+        ui.selected = 0;
+        reconcile_hold(&path, &mut ui, &mut held, &first);
+        assert_eq!(
+            held.as_ref().map(|(name, _)| name.as_str()),
+            Some(first.as_str()),
+            "attached to the first session"
+        );
+        stage.store(2, Ordering::SeqCst);
+
+        // The regression: selecting a DIFFERENT session while one is already
+        // held must drop the stale hold and take the new one.
+        ui.selected = 1;
+        reconcile_hold(&path, &mut ui, &mut held, &second);
+        assert_eq!(
+            held.as_ref().map(|(name, _)| name.as_str()),
+            Some(second.as_str()),
+            "must have switched — a stale hold on the first is the exact bug"
+        );
+        stage.store(3, Ordering::SeqCst);
+
+        // Idempotence: calling it again with the SAME name must not
+        // needlessly drop and re-take a hold that already matches.
+        let before = held.as_ref().map(|(name, _)| name.clone());
+        reconcile_hold(&path, &mut ui, &mut held, &second);
+        assert_eq!(
+            held.as_ref().map(|(name, _)| name.clone()),
+            before,
+            "already held — must be a no-op, not a needless re-attach"
+        );
+        stage.store(4, Ordering::SeqCst);
+        stage.store(5, Ordering::SeqCst);
+    }
+
+    /// [DIAGNOSTIC] The bare hold/drop/hold/drop sequence, all on the test
+    /// thread — the same-thread counterpart of the cross-thread sibling test
+    /// above. See steps/030.
+    #[test]
+    fn hold_a_drop_a_hold_b_drop_b_same_thread() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct Finished(Arc<AtomicBool>);
+        impl Drop for Finished {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let stage = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let _sentinel = Finished(finished.clone());
+        {
+            let stage = stage.clone();
+            let finished = finished.clone();
+            std::thread::spawn(move || {
+                for _ in 0..300 {
+                    std::thread::sleep(Duration::from_millis(200));
+                    if finished.load(Ordering::SeqCst) {
+                        return;
+                    }
+                }
+                let msg = format!("V2 STUCK AFTER STAGE {}\n", stage.load(Ordering::SeqCst));
+                let _ = std::io::stderr().write_all(msg.as_bytes());
+                std::process::exit(101);
+            });
+        }
+
+        let path = scratch_socket("hold-drop-hold-drop-same-thread");
+        daemon_at(&path);
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        let sessions = list(&path).unwrap();
+        assert_eq!(sessions.len(), 2, "both sessions must be seen");
+        let a = sessions[0].name.clone();
+        let b = sessions[1].name.clone();
+
+        let hold_a = client::hold(&path, &a).unwrap();
+        stage.store(1, Ordering::SeqCst);
+
+        drop(hold_a);
+        stage.store(2, Ordering::SeqCst);
+
+        let hold_b = client::hold(&path, &b).unwrap();
+        stage.store(3, Ordering::SeqCst);
+
+        drop(hold_b);
+        stage.store(4, Ordering::SeqCst);
     }
 }
