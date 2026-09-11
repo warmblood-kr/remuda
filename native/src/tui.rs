@@ -2183,6 +2183,73 @@ mod tests {
         }
     }
 
+    /// (test name, stage), so one watchdog's exit can report every OTHER
+    /// stalled test too — run 5's own exit hid a sibling's stage. See steps/030.
+    struct StageRegistry(
+        std::sync::Mutex<Vec<(&'static str, std::sync::Arc<std::sync::atomic::AtomicUsize>)>>,
+    );
+    static STAGE_REGISTRY: std::sync::OnceLock<StageRegistry> = std::sync::OnceLock::new();
+
+    fn stage_registry() -> &'static StageRegistry {
+        STAGE_REGISTRY.get_or_init(|| StageRegistry(std::sync::Mutex::new(Vec::new())))
+    }
+
+    fn register_stage(name: &'static str) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        let stage = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        stage_registry()
+            .0
+            .lock()
+            .unwrap()
+            .push((name, stage.clone()));
+        stage
+    }
+
+    fn deregister_stage(name: &'static str) {
+        stage_registry()
+            .0
+            .lock()
+            .unwrap()
+            .retain(|(n, _)| *n != name);
+    }
+
+    fn dump_all_stages() -> String {
+        let entries = stage_registry().0.lock().unwrap();
+        let mut out = String::new();
+        for (name, stage) in entries.iter() {
+            out.push_str(&format!(
+                "STUCK: {name} AFTER STAGE {}\n",
+                stage.load(std::sync::atomic::Ordering::SeqCst)
+            ));
+        }
+        out
+    }
+
+    /// Deregisters on drop. Declared FIRST in a test's body so it drops LAST,
+    /// after every other local (locals drop in reverse declaration order).
+    struct Finished(std::sync::Arc<std::sync::atomic::AtomicBool>, &'static str);
+    impl Drop for Finished {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            deregister_stage(self.1);
+        }
+    }
+
+    /// On a 60s timeout, dumps every registered test's stage via
+    /// `stderr().write_all` (bypasses libtest's `eprintln!` capture) and exits.
+    fn spawn_watchdog(finished: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        std::thread::spawn(move || {
+            for _ in 0..300 {
+                std::thread::sleep(Duration::from_millis(200));
+                if finished.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+            }
+            let dump = dump_all_stages();
+            let _ = std::io::stderr().write_all(dump.as_bytes());
+            std::process::exit(101);
+        });
+    }
+
     /// [MEASURED] `list` (the pane's own function, not a stand-in) must say a
     /// transport failure happened, not report an empty herd. See steps/021.
     #[test]
@@ -2399,34 +2466,13 @@ mod tests {
     /// implicit final one, happens on the test thread as #25 has it. See steps/030.
     #[test]
     fn reconcile_hold_switches_the_real_attach_not_just_ui_state_same_thread() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        struct Finished(Arc<AtomicBool>);
-        impl Drop for Finished {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let stage = Arc::new(AtomicUsize::new(0));
+        let stage = register_stage("V1");
         let finished = Arc::new(AtomicBool::new(false));
-        let _sentinel = Finished(finished.clone());
-        {
-            let stage = stage.clone();
-            let finished = finished.clone();
-            std::thread::spawn(move || {
-                for _ in 0..300 {
-                    std::thread::sleep(Duration::from_millis(200));
-                    if finished.load(Ordering::SeqCst) {
-                        return;
-                    }
-                }
-                let msg = format!("V1 STUCK AFTER STAGE {}\n", stage.load(Ordering::SeqCst));
-                let _ = std::io::stderr().write_all(msg.as_bytes());
-                std::process::exit(101);
-            });
-        }
+        let _sentinel = Finished(finished.clone(), "V1");
+        spawn_watchdog(finished);
 
         let path = scratch_socket("reconcile-hold-switch-same-thread");
         daemon_at(&path);
@@ -2480,34 +2526,13 @@ mod tests {
     /// above. See steps/030.
     #[test]
     fn hold_a_drop_a_hold_b_drop_b_same_thread() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        struct Finished(Arc<AtomicBool>);
-        impl Drop for Finished {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let stage = Arc::new(AtomicUsize::new(0));
+        let stage = register_stage("V2");
         let finished = Arc::new(AtomicBool::new(false));
-        let _sentinel = Finished(finished.clone());
-        {
-            let stage = stage.clone();
-            let finished = finished.clone();
-            std::thread::spawn(move || {
-                for _ in 0..300 {
-                    std::thread::sleep(Duration::from_millis(200));
-                    if finished.load(Ordering::SeqCst) {
-                        return;
-                    }
-                }
-                let msg = format!("V2 STUCK AFTER STAGE {}\n", stage.load(Ordering::SeqCst));
-                let _ = std::io::stderr().write_all(msg.as_bytes());
-                std::process::exit(101);
-            });
-        }
+        let _sentinel = Finished(finished.clone(), "V2");
+        spawn_watchdog(finished);
 
         let path = scratch_socket("hold-drop-hold-drop-same-thread");
         daemon_at(&path);
