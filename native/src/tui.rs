@@ -630,8 +630,8 @@ fn fit_styled(line: &str, width: u16) -> String {
 }
 
 /// Same frame as [`render`], but the preview column carries real colour from
-/// a styled capture. Kept separate so the plain path and its byte-identity
-/// oracle are never perturbed — see steps/020.
+/// a styled capture, and is written with row-local clears plus synchronized
+/// output instead of a full erase — see steps/020 and steps/026.
 pub fn render_styled(
     ui: &Ui,
     cells: &[Vec<StyledCell>],
@@ -647,9 +647,9 @@ pub fn render_styled(
     };
 
     let (lines, cut) = crop_styled(cells, preview_w, body, ui.pan);
-    let mut out = String::from("\x1b[H\x1b[2J");
+    let mut out = String::from("\x1b[?2026h\x1b[H");
     for row in 0..body {
-        out.push_str(&format!("\x1b[{};1H", row + 1));
+        out.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
         let left = if row == 0 {
             format!("remuda · {server}")
         } else {
@@ -661,8 +661,11 @@ pub fn render_styled(
         out.push_str(&fit_styled(line, preview_w));
     }
 
-    out.push_str(&format!("\x1b[{};1H", rows));
+    out.push_str(&format!("\x1b[{};1H\x1b[K", rows));
     out.push_str(&fit(&footer(ui, cut, preview_w), cols));
+    // Erase anything a previous, taller frame left below this one — a resize
+    // to fewer rows is the only way stale content can survive past here.
+    out.push_str("\x1b[J\x1b[?2026l");
     out
 }
 
@@ -700,10 +703,13 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
     let cursor = if row == ui.selected { "▸" } else { " " };
     let flag = if session.attached { "⚑" } else { " " };
     let state = if session.alive { "live" } else { "dead" };
-    let tail = match width {
-        34.. => format!("{state} {flag} {}s", session.idle.as_secs()),
-        22.. => format!("{state} {flag}"),
-        _ => flag.to_string(),
+    // No time-driven field: `idle` never resets on typing (only on `send`,
+    // see session.rs), so it read as an uptime clock, not "liveness" — and it
+    // was the only per-second repaint source in the whole TUI. See steps/026.
+    let tail = if width >= 22 {
+        format!("{state} {flag}")
+    } else {
+        flag.to_string()
     };
     let room = (width as usize).saturating_sub(visible_width(&tail) + 3);
     format!("{cursor} {} {tail}", fit(&session.name, room as u16))
@@ -734,11 +740,11 @@ fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
     }
 }
 
-/// Whether the herd should be relisted, the focused screen recaptured and
-/// the frame rebuilt: forced right after a key, or because `TICK` has
-/// elapsed — never on every wake of the input poll. See steps/017.
-fn should_refresh(forced: bool, since_last: Duration) -> bool {
-    forced || since_last >= TICK
+/// Whether to relist, recapture and rebuild the frame: forced right after a
+/// key, or because `tick` elapsed. See steps/017 and steps/026 for why the
+/// caller picks `tick` rather than this always using `TICK`.
+fn should_refresh(forced: bool, since_last: Duration, tick: Duration) -> bool {
+    forced || since_last >= tick
 }
 
 /// The one expensive act of a frame: relist the herd, take or release the
@@ -823,18 +829,18 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     let (mut cols, mut rows) = (80u16, 24u16);
 
     loop {
-        if should_refresh(force_refresh, last_refresh.elapsed()) {
+        let tick = if ui.focus == Focus::Session {
+            TICK_TYPING
+        } else {
+            TICK
+        };
+        if should_refresh(force_refresh, last_refresh.elapsed(), tick) {
             force_refresh = false;
             last_refresh = Instant::now();
             (cols, rows) = refresh(path, server, &mut ui, &mut held, &mut painted, skip_list)?;
             skip_list = false;
         }
 
-        let tick = if ui.focus == Focus::Session {
-            TICK_TYPING
-        } else {
-            TICK
-        };
         if !crossterm::event::poll(tick)? {
             continue;
         }
@@ -868,7 +874,9 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             }
             Action::Kill(name) => ui.notice = kill(path, &name).err(),
         }
-        painted.clear();
+        // Not `painted.clear()`: the frame-vs-`painted` compare in `refresh`
+        // already skips the write when a key changed nothing visible — see
+        // steps/026. Only the immediate re-check is forced here.
         force_refresh = true;
     }
 }
@@ -949,44 +957,65 @@ mod tests {
     use super::*;
     use remuda_core::Size;
 
-    /// The regression this change guards: an idle focused session must not
-    /// redo the full IPC cycle on every `TICK_TYPING` wake. See steps/017.
+    /// The regression steps/017 guards: an idle *list*-focused herd must not
+    /// redo the full IPC cycle on every poll wake — `run` only uses the
+    /// faster `TICK_TYPING` gate for a focused session, see the next test.
     #[test]
-    fn an_idle_focused_session_refreshes_on_the_slow_tick_not_every_poll_wake() {
+    fn an_idle_list_refreshes_on_the_slow_tick_not_every_poll_wake() {
         let mut refreshes = 0;
         let mut since_last = Duration::ZERO;
         for _ in 0..25 {
             since_last += TICK_TYPING;
-            if should_refresh(false, since_last) {
+            if should_refresh(false, since_last, TICK) {
                 refreshes += 1;
                 since_last = Duration::ZERO;
             }
         }
         assert!(
             refreshes <= 5,
-            "an idle session must not redo the full IPC cycle on every \
+            "an idle list must not redo the full IPC cycle on every \
              {TICK_TYPING:?} poll wake — got {refreshes} refreshes in one \
-             simulated second; the pre-fix behavior gives 25"
+             simulated second; gating on TICK_TYPING gives 25"
         );
     }
 
-    /// The other half of the report: typing does not wait for `TICK` either.
+    /// The lag steps/026 fixes: a keystroke's echo can land just after the
+    /// capture that missed it, and `run` gates the retry on `TICK_TYPING`
+    /// while focused, so the corrected screen is ~40ms behind, not 250ms.
+    #[test]
+    fn a_focused_sessions_late_echo_is_retried_within_the_typing_tick() {
+        assert!(
+            !should_refresh(false, TICK_TYPING - Duration::from_millis(1), TICK_TYPING),
+            "sanity: not yet at the boundary"
+        );
+        assert!(
+            should_refresh(false, TICK_TYPING, TICK_TYPING),
+            "a focused session's unforced refresh must fire within TICK_TYPING, \
+             not wait out the rest of TICK"
+        );
+    }
+
+    /// The other half of the report: typing does not wait for a tick at all.
     /// Echoing a keystroke has always meant an immediate refresh, and that is
     /// still true — it is proportional to typing speed, not the bug.
     #[test]
-    fn a_key_forces_an_immediate_refresh_regardless_of_the_slow_tick() {
+    fn a_key_forces_an_immediate_refresh_regardless_of_the_tick() {
         assert!(
-            should_refresh(true, Duration::ZERO),
-            "a keystroke must not wait for TICK to be echoed"
+            should_refresh(true, Duration::ZERO, TICK),
+            "a keystroke must not wait for a tick to be echoed"
         );
     }
 
-    /// Sanity on the boundary itself, so the two tests above cannot both pass
-    /// by accident of a threshold that admits everything or nothing.
+    /// Sanity on the list-tick boundary itself, so the tests above cannot
+    /// both pass by accident of a threshold that admits everything or nothing.
     #[test]
     fn refresh_waits_for_the_slow_tick_when_nothing_forced_it() {
-        assert!(!should_refresh(false, TICK - Duration::from_millis(1)));
-        assert!(should_refresh(false, TICK));
+        assert!(!should_refresh(
+            false,
+            TICK - Duration::from_millis(1),
+            TICK
+        ));
+        assert!(should_refresh(false, TICK, TICK));
     }
 
     fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
@@ -1500,6 +1529,32 @@ mod tests {
         assert_eq!(out, "xy", "no style used, no SGR at all");
     }
 
+    /// The flicker steps/026 fixes: a full erase repaints every cell on every
+    /// frame, which is what a real terminal shows as flashing. Row-local
+    /// clears (`\x1b[K`) replace it; nothing here erases the whole screen.
+    #[test]
+    fn render_styled_never_erases_the_whole_screen() {
+        let ui = ui(vec![row("claude", true, false)]);
+        let cells = vec![vec![StyledCell::default(); 10]; 5];
+        let out = render_styled(&ui, &cells, "default", 80, 10);
+        assert!(
+            !out.contains("\x1b[2J"),
+            "a full erase is exactly the flicker being fixed: {out:?}"
+        );
+        assert!(out.contains("\x1b[K"), "rows are cleared locally instead");
+    }
+
+    /// A terminal that supports synchronized output never paints a
+    /// half-written frame — see steps/026.
+    #[test]
+    fn render_styled_wraps_the_frame_in_synchronized_output() {
+        let ui = ui(vec![row("claude", true, false)]);
+        let cells = vec![vec![StyledCell::default(); 10]; 5];
+        let out = render_styled(&ui, &cells, "default", 80, 10);
+        assert!(out.starts_with("\x1b[?2026h"), "begin sync: {out:?}");
+        assert!(out.ends_with("\x1b[?2026l"), "end sync: {out:?}");
+    }
+
     #[test]
     fn the_crop_anchors_bottom_left_and_admits_what_it_cut() {
         let screen = "one\ntwo\nthree\nfourfourfour";
@@ -1601,9 +1656,17 @@ mod tests {
             list_row(&ui, 0, 40).contains("live"),
             "and keeps it when there is room"
         );
+    }
+
+    /// `idle` never resets on typing, so it read as uptime, not liveness —
+    /// and was the list's only per-second repaint source. See steps/026.
+    #[test]
+    fn the_list_row_carries_no_seconds_counter() {
+        let ui = ui(vec![row("claude", true, false)]);
+        let line = list_row(&ui, 0, 40);
         assert!(
-            list_row(&ui, 0, 40).contains("4s"),
-            "idle survives at full width"
+            !line.contains('s'),
+            "no seconds suffix even at full width: {line:?}"
         );
     }
 
