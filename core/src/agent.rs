@@ -54,10 +54,13 @@ impl Default for Size {
 /// Cursor position, zero-based. Caution: the column is load-bearing — ghost
 /// text is told from typed input by cursor column, not by colour, so a backend
 /// that cannot report the cursor cannot detect it at all.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Cursor {
     pub row: u16,
     pub col: u16,
+    /// The child's own DECTCEM request (`\x1b[?25l`/`\x1b[?25h`) — a hidden
+    /// caret must stay hidden in the preview too. See steps/027.
+    pub visible: bool,
 }
 
 /// A terminal colour, shaped like `vt100::Color` so a backend maps it 1:1.
@@ -190,7 +193,11 @@ impl ScriptedAgent {
         Self {
             screens,
             next_screen: 0,
-            cursor: Cursor { row: 0, col: 0 },
+            cursor: Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
             alive: true,
             size: Size::default(),
             writes: Vec::new(),
