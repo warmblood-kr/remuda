@@ -1,8 +1,10 @@
-//! [TESTS ONLY, no fix] Measures the Windows same-thread `Hold::drop` race
-//! from steps/029: a pause sweep to bound the threshold, and a reader-side
-//! injection hook that forces the race regardless of caller timing — the
-//! test a real structural fix must pass and a timing-narrowing band-aid
-//! cannot. See steps/029 for the full mechanism reasoning.
+//! Measures, and (as of the sticky-flag stop in `ipc::stop_reader`) exercises
+//! the fix for, the Windows same-thread `Hold::drop` race from steps/029: a
+//! pause sweep to bound the threshold, a reader-side injection hook that
+//! forces the race regardless of caller timing, a null control confirming
+//! the fix's own code does not self-hang when never exercised, and a
+//! streaming-drop loop covering the same gap between reads rather than only
+//! before the first one. See steps/029 for the full mechanism reasoning.
 //!
 //! Every test that could hang runs its `hold`/`drop` sequence on a spawned
 //! WORKER thread and waits on a channel with a bounded `recv_timeout`
@@ -93,6 +95,30 @@ fn new_session(path: &Path, name: &str) {
         &Request::New {
             name: Some(name.to_string()),
             command: vec!["sh".into()],
+            size: Size::new(80, 24),
+        },
+    )
+    .expect("new");
+    assert_eq!(
+        response,
+        Response::Value(name.to_string()),
+        "New answers with the name it gave the session"
+    );
+}
+
+/// Like `new_session`, but the shell never goes idle: continuous output means
+/// a drop can land while the drain thread is mid-read or between two live
+/// reads, rather than only ever racing a first read against an idle pipe.
+fn new_streaming_session(path: &Path, name: &str) {
+    let response = client::request(
+        path,
+        &Request::New {
+            name: Some(name.to_string()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "while :; do printf x; done".into(),
+            ],
             size: Size::new(80, 24),
         },
     )
@@ -234,6 +260,59 @@ fn hold_drop_loop(
     }
 }
 
+/// Continuous-output `hold` → sleep(50ms) → `drop`, `cycles` times,
+/// alternating sessions per `hold_drop_loop`'s note on daemon bookkeeping.
+/// 50ms is past the 0ms first-read race the pause sweep already measures —
+/// the drain thread is already mid-loop, reading real data, when `drop`
+/// fires. Without a stop flag checked before *every* read (not just the
+/// first), a cancel that arrives between two completed reads of live data is
+/// a no-op on Windows and the drain issues another read that never returns.
+/// See steps/029's gap analysis. Pre-fix expectation: RED on Windows only —
+/// the old drain loop has no per-iteration stop check, only the sweep's
+/// single first-read race. Post-fix: GREEN.
+fn streaming_hold_drop_loop(
+    path: PathBuf,
+    a: &'static str,
+    b: &'static str,
+    cycles: usize,
+) -> Result<(), String> {
+    arm_backstop();
+    let progress = Arc::new(AtomicUsize::new(0));
+    let progress_reader = progress.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for i in 0..cycles {
+            let name = if i % 2 == 0 { a } else { b };
+            let retry_deadline = Instant::now() + Duration::from_secs(5);
+            let hold = loop {
+                match client::hold(&path, name) {
+                    Ok(h) => break h,
+                    Err(e) if Instant::now() < retry_deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        let _ = e;
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("hold failed at cycle {i} ({name}): {e}")));
+                        return;
+                    }
+                }
+            };
+            std::thread::sleep(Duration::from_millis(50));
+            drop(hold);
+            progress.store(i + 1, Ordering::SeqCst);
+        }
+        let _ = tx.send(Ok(()));
+    });
+    match rx.recv_timeout(Duration::from_secs(30)) {
+        Ok(r) => r,
+        Err(_) => Err(format!(
+            "stuck at cycle {} of {cycles} (streaming drop)",
+            progress_reader.load(Ordering::SeqCst)
+        )),
+    }
+}
+
 macro_rules! pause_test_in_process {
     ($fn_name:ident, $ms:literal) => {
         #[test]
@@ -319,10 +398,16 @@ fn cross_thread_hold_drop_plain() {
     assert!(result.is_ok(), "{}", result.unwrap_err());
 }
 
-/// [EXPECTED RED before the fix] Control on the injection hook itself: a 2s
-/// reader delay should defeat even cross-thread's own incidental scheduling
-/// latency. If this ever passes without a fix, the hook has no teeth and a
-/// green run under the real fix would prove nothing. See steps/029.
+/// Control on the injection hook itself: a 2s reader delay should defeat
+/// even cross-thread's own incidental scheduling latency. Pre-fix, this ran
+/// GREEN on run 8 — read as a mechanism result, not a hook-validity failure:
+/// cross-thread's pass record was always the same first-read race as
+/// same-thread, just with enough incidental thread-spawn latency to win it,
+/// and a 2s injected delay does not defeat a race whose stop flag now covers
+/// every read, not only the first. The hook's own validity is that all 19
+/// tests here ran green under injection on Linux — the injection itself
+/// introduces no false positive; only Windows' cancel-before-pending timing
+/// ever turned it into a hang. See steps/029.
 #[test]
 fn cross_thread_hold_drop_with_injection() {
     let path = scratch("cross-thread-injected");
@@ -332,15 +417,58 @@ fn cross_thread_hold_drop_with_injection() {
     assert!(result.is_ok(), "{}", result.unwrap_err());
 }
 
-/// [EXPECTED RED before the fix] The real discriminator: the reader is
-/// deliberately delayed regardless of the caller's own timing, so only a
-/// structural fix — not a caller-side pause of any length — can pass this.
-/// See steps/029.
+/// The real discriminator: the reader is deliberately delayed regardless of
+/// the caller's own timing, so only a structural fix — not a caller-side
+/// pause of any length — can pass this. Pre-fix: RED on Windows (run 8).
+/// Post-fix: GREEN, because the stop flag is set and checked before the
+/// drain thread's first read regardless of when that read is scheduled. See
+/// steps/029.
 #[test]
 fn same_thread_hold_drop_with_injection() {
     let path = scratch("same-thread-injected");
     let _daemon = daemon_at(&path);
     new_session(&path, "a");
     let result = hold_pause_drop(path, "a", Duration::ZERO, Duration::from_secs(2));
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+}
+
+/// NULL CONTROL: the fix's new code (the `AtomicBool` stop flag, the
+/// retry-until-finished loop in `ipc::stop_reader`) is present in a running
+/// daemon but never exercised — no client ever holds or attaches. Green
+/// here is a separate claim from "the hook has teeth" above: it says the fix
+/// does not self-hang merely by existing, independent of whether it
+/// correctly resolves the race it targets. See steps/029.
+#[test]
+fn null_control_no_attach_out_of_process() {
+    let dir = scratch_dir("null-control");
+    let path = daemon::socket_path_in(&dir, "s");
+    let daemon = Daemon::spawn(&dir);
+    new_session(&path, "a");
+    // No hold, no attach, no drop: neither `Hold::drop` nor daemon.rs's
+    // `attach()` hangup path is ever reached.
+    drop(daemon);
+}
+
+/// STREAMING DROP: see `streaming_hold_drop_loop` for the scenario and the
+/// pre/post-fix expectation.
+#[test]
+fn streaming_drop_loop_in_process() {
+    let path = scratch("streaming-loop-in-process");
+    let _daemon = daemon_at(&path);
+    new_streaming_session(&path, "a");
+    new_streaming_session(&path, "b");
+    let result = streaming_hold_drop_loop(path, "a", "b", 50);
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+}
+
+/// STREAMING DROP, out-of-process. See `streaming_hold_drop_loop`.
+#[test]
+fn streaming_drop_loop_out_of_process() {
+    let dir = scratch_dir("streaming-loop-oop");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = Daemon::spawn(&dir);
+    new_streaming_session(&path, "a");
+    new_streaming_session(&path, "b");
+    let result = streaming_hold_drop_loop(path, "a", "b", 50);
     assert!(result.is_ok(), "{}", result.unwrap_err());
 }

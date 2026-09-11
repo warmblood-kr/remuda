@@ -179,6 +179,7 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
 pub struct Hold {
     stream: Stream,
     drain: Option<std::thread::JoinHandle<()>>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Take a session for the TUI's focused pane. The output is *not* handed back:
@@ -217,20 +218,24 @@ fn hold_inner(path: &Path, name: &str, drain_delay: std::time::Duration) -> std:
     }
     // Drained rather than ignored: the daemon repaints and then streams, and an
     // unread socket fills and parks its output pump.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drain_stop = stop.clone();
     let drain = std::thread::spawn(move || {
         if !drain_delay.is_zero() {
             std::thread::sleep(drain_delay);
         }
         let mut buf = [0u8; 8192];
-        while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 {
-                break;
+        while !drain_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
             }
         }
     });
     Ok(Hold {
         stream,
         drain: Some(drain),
+        stop,
     })
 }
 
@@ -248,8 +253,8 @@ impl Drop for Hold {
     /// Hanging up is what releases the guard, so it has to survive a panic or an
     /// early return — a guard outliving its viewer is the deadlock step 012 met.
     fn drop(&mut self) {
-        ipc::wake(&self.stream);
         if let Some(drain) = self.drain.take() {
+            ipc::stop_reader(&self.stream, &self.stop, || drain.is_finished());
             let _ = drain.join();
         }
     }
