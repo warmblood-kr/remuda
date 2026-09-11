@@ -62,6 +62,9 @@ pub enum Action {
     Type(Vec<u8>),
     Start(String),
     Kill(String),
+    /// `focus_session` succeeded: keyboard and mouse now point at this name.
+    /// `run`'s `reconcile_hold` re-attaches if it differs from what's held.
+    Focus(String),
 }
 
 pub struct Ui {
@@ -116,24 +119,37 @@ impl Ui {
         }
     }
 
-    /// A press inside the list column selects and enters that row — the exact
-    /// `Action` a `↓`-to-there plus `⏎` already produces, not a second
-    /// mechanism. Only the list is clickable; see `run` for why. steps/028.
+    /// A press in the list column switches to that row's session, even if
+    /// another one already has focus. A press in the session pane forwards
+    /// as a real click to the child instead. See steps/029.
     pub fn on_mouse(&mut self, event: MouseEvent, cols: u16, rows: u16) -> Action {
-        if self.focus != Focus::List || self.mode != Mode::Browse {
+        if self.mode != Mode::Browse {
             return Action::Nothing;
         }
-        if !matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return Action::Nothing;
-        }
-        let (list_w, _) = layout(cols, widest(self));
+        let (list_w, preview_w) = layout(cols, widest(self));
         let body = rows.saturating_sub(1);
         // crossterm's column/row are 0-based; the frame's own rows are
         // 1-based (row 1 is the header, row `body+1` is the footer — see
         // `render`/`render_styled`), so both get +1 before comparing.
         let col = event.column + 1;
         let row = event.row + 1;
-        if col > list_w || row < 2 || row > body {
+
+        if col <= list_w {
+            return self.click_list_row(event.kind, row, body);
+        }
+        // `col == list_w + 1` is the divider itself — between the two panes,
+        // part of neither. Anything past it is the session pane.
+        if col <= list_w + 1 {
+            return Action::Nothing;
+        }
+        self.click_session_pane(event.kind, row, col - list_w - 1, body, preview_w)
+    }
+
+    fn click_list_row(&mut self, kind: MouseEventKind, row: u16, body: u16) -> Action {
+        if !matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Action::Nothing;
+        }
+        if row < 2 || row > body {
             return Action::Nothing;
         }
         let index = (row - 2) as usize;
@@ -143,6 +159,47 @@ impl Ui {
         self.selected = index;
         self.pan = 0;
         self.focus_session()
+    }
+
+    /// A left click on the session pane, forwarded as a real SGR mouse
+    /// report in the child's own pty-cell coordinates — same encoder the
+    /// Lua `click` verb uses. `pane_row`/`pane_col` are 1-based, pane-local.
+    fn click_session_pane(
+        &mut self,
+        kind: MouseEventKind,
+        pane_row: u16,
+        pane_col: u16,
+        body: u16,
+        preview_w: u16,
+    ) -> Action {
+        if self.focus != Focus::Session {
+            return Action::Nothing;
+        }
+        if !matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Action::Nothing;
+        }
+        if pane_row < 1 || pane_row > body || pane_col < 1 || pane_col > preview_w {
+            return Action::Nothing;
+        }
+        let Some(session) = self.selected() else {
+            return Action::Nothing;
+        };
+        // The pane is bottom-anchored (`Viewport::bottom_anchored`) and never
+        // resizes the pty (PRINCIPLES §6), so the session's own fixed size —
+        // already known from the herd list — is enough; no live capture
+        // needed just to place a click.
+        let row_offset = (session.size.rows() as usize).saturating_sub(body as usize);
+        let child_row = row_offset + pane_row as usize;
+        let child_col = self.pan as usize + pane_col as usize;
+        // Only reachable if the outer terminal grew taller/the pan scrolled
+        // further than this session's own (fixed, PRINCIPLES §6) pty extends.
+        if child_row > session.size.rows() as usize || child_col > session.size.cols() as usize {
+            return Action::Nothing;
+        }
+        match remuda_core::keys::mouse("left", child_col as u16, child_row as u16) {
+            Some(bytes) => Action::Type(bytes),
+            None => Action::Nothing,
+        }
     }
 
     /// Everything reaches the pty except the one key that comes back. Checked
@@ -224,9 +281,10 @@ impl Ui {
             ));
             return Action::Nothing;
         }
+        let name = session.name.clone();
         self.notice = None;
         self.focus = Focus::Session;
-        Action::Nothing
+        Action::Focus(name)
     }
 
     fn kill_selected(&mut self) -> Action {
@@ -902,9 +960,9 @@ fn refresh(
     Ok((cols, rows))
 }
 
-/// Enables SGR mouse reporting on construction, disables it on drop
-/// unconditionally — regardless of which pane last had focus — so `run` can
-/// never exit leaving mouse mode armed for whatever reads this terminal next.
+/// Enables SGR mouse reporting on construction, disables it on drop — for
+/// the whole `run` now, not just while the list has focus (steps/028 toggled
+/// this off on attach; steps/029 explains why that changed).
 struct MouseCapture;
 
 impl MouseCapture {
@@ -920,33 +978,15 @@ impl Drop for MouseCapture {
     }
 }
 
-/// Arms or disarms mouse reporting to match `want_on`, and only touches the
-/// terminal when that's actually a change — repeating the same escape every
-/// idle-list tick would be one more thing sitting in the way of #026's fix.
-fn sync_mouse_capture(is_on: &mut bool, want_on: bool) {
-    if *is_on == want_on {
-        return;
-    }
-    let mut stdout = std::io::stdout();
-    let _ = if want_on {
-        crossterm::execute!(stdout, crossterm::event::EnableMouseCapture)
-    } else {
-        crossterm::execute!(stdout, crossterm::event::DisableMouseCapture)
-    };
-    *is_on = want_on;
-}
-
 /// Draw the herd until the user quits. One screen for the whole run: focus
 /// moves between the panes, and the terminal is never handed over, so the
 /// alternate screen is entered exactly once. `notice` is what stderr cannot reach.
 pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result<()> {
     let _terminal = RawMode::enable()?;
     // Scoped to the herd screen, not `RawMode` itself: `attach` uses `RawMode`
-    // too, forwards every raw byte it reads, and has no list to click — mouse
-    // reports would just leak into whatever it's attached to. Starts enabled
-    // to match `Ui::new`'s starting focus, `List`; toggles off the moment
-    // focus leaves it, below, so an attached session's native mouse handling
-    // (drag-to-copy, its own scrollback) is never touched. See steps/028.
+    // too, forwards every raw byte it reads, and has no list to click — a
+    // session reached directly by `remuda attach` has no list to switch to,
+    // so there is nothing for a click there to do. See steps/028 and steps/029.
     let _mouse = MouseCapture::enable()?;
     let shell = crate::daemon::default_shell();
     let (sessions, list_err) = match list(path) {
@@ -967,11 +1007,6 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     // then always cleared — never carried into a tick-driven refresh.
     let mut skip_list = false;
     let (mut cols, mut rows) = (80u16, 24u16);
-    // Mirrors what's actually armed in the terminal right now (`MouseCapture`
-    // starts it enabled), so it can be synced to `ui.focus` regardless of
-    // which of several places moved focus — a key, a click, or `refresh`'s
-    // own `take` giving up on a hold that failed.
-    let mut mouse_on = true;
 
     loop {
         let tick = if ui.focus == Focus::Session {
@@ -985,7 +1020,6 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             (cols, rows) = refresh(path, server, &mut ui, &mut held, &mut painted, skip_list)?;
             skip_list = false;
         }
-        sync_mouse_capture(&mut mouse_on, ui.focus == Focus::List);
 
         if !crossterm::event::poll(tick)? {
             continue;
@@ -1017,12 +1051,24 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 }
             }
             Action::Kill(name) => ui.notice = kill(path, &name).err(),
+            Action::Focus(name) => reconcile_hold(path, &mut ui, &mut held, &name),
         }
         // Not `painted.clear()`: the frame-vs-`painted` compare in `refresh`
         // already skips the write when a key changed nothing visible — see
         // steps/026. Only the immediate re-check is forced here.
         force_refresh = true;
     }
+}
+
+/// [`Action::Focus`]`(name)` just fired. Already held: no-op. A different
+/// name: drop the stale hold (its `Drop` is the detach) and take the new one
+/// immediately — `refresh` must never be the one to notice. See steps/029.
+fn reconcile_hold(path: &Path, ui: &mut Ui, held: &mut Option<(String, Hold)>, name: &str) {
+    if held.as_ref().is_some_and(|(held, _)| held == name) {
+        return;
+    }
+    *held = None;
+    *held = take(path, ui);
 }
 
 /// Take the exclusive hold focus needs, or say why not and stay on the list.
@@ -1197,7 +1243,7 @@ mod tests {
     fn enter_points_the_keyboard_at_the_selected_session() {
         let mut ui = ui(vec![row("a", true, false), row("b", true, false)]);
         ui.on_key(press(KeyCode::Char('j')));
-        assert_eq!(ui.on_key(press(KeyCode::Enter)), Action::Nothing);
+        assert_eq!(ui.on_key(press(KeyCode::Enter)), Action::Focus("b".into()));
         assert_eq!(ui.focus, Focus::Session);
         assert_eq!(ui.selected().unwrap().name, "b");
         // The list stays on screen: nothing about entering removes a session.
@@ -1219,7 +1265,7 @@ mod tests {
     #[test]
     fn a_click_on_a_list_row_selects_and_enters_it_like_arrow_plus_enter() {
         let mut ui = ui(vec![row("a", true, false), row("b", true, false)]);
-        assert_eq!(ui.on_mouse(click(5, 2), 80, 24), Action::Nothing);
+        assert_eq!(ui.on_mouse(click(5, 2), 80, 24), Action::Focus("b".into()));
         assert_eq!(ui.selected, 1, "clicked the second row");
         assert_eq!(ui.focus, Focus::Session, "a click enters, same as Enter");
     }
@@ -1268,16 +1314,89 @@ mod tests {
         assert_eq!(ui.selected, 0, "a drag did not select");
     }
 
-    /// A session in focus reads mouse events from nowhere in `run` (capture
-    /// is off there), but `on_mouse` refuses on its own too — belt and
-    /// braces, so a stray event can never fight the keyboard for focus.
+    /// steps/029: a click on a *different* list row switches straight to it
+    /// even while another session is already attached — the one-way door
+    /// #028 left. See steps/029 for the full before/after.
     #[test]
-    fn a_click_is_ignored_once_a_session_has_focus() {
+    fn a_click_on_a_different_list_row_switches_focus_even_while_attached() {
         let mut ui = ui(vec![row("a", true, false), row("b", true, false)]);
+        assert_eq!(ui.on_key(press(KeyCode::Enter)), Action::Focus("a".into()));
+        assert_eq!(ui.focus, Focus::Session);
+        assert_eq!(
+            ui.on_mouse(click(5, 2), 80, 24),
+            Action::Focus("b".into()),
+            "row 2 (0-based) is \"b\" — clicking it must switch, not be ignored"
+        );
+        assert_eq!(ui.focus, Focus::Session, "still attached, now to \"b\"");
+        assert_eq!(ui.selected, 1, "the click's row did override it");
+    }
+
+    /// The ⒝ half of steps/029: a click inside the session pane forwards as
+    /// a real SGR mouse report at the child's OWN coordinates — screen (20,
+    /// 5) lands at child (3, 6), not (20, 5). See steps/029 for the math.
+    #[test]
+    fn a_click_inside_the_session_pane_is_forwarded_to_the_child_as_a_click() {
+        let mut ui = ui(vec![row("a", true, false)]);
+        assert_eq!(ui.on_key(press(KeyCode::Enter)), Action::Focus("a".into()));
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 19, // screen col 20, 1-based
+            row: 4,     // screen row 5, 1-based
+            modifiers: KeyModifiers::NONE,
+        };
+        let expected = remuda_core::keys::mouse("left", 3, 6).unwrap();
+        assert_eq!(
+            ui.on_mouse(event, 80, 24),
+            Action::Type(expected),
+            "the click must reach the child at its OWN (3, 6), not remuda's screen (20, 5)"
+        );
+    }
+
+    /// The divider column is part of neither pane — a click there selects
+    /// nothing and forwards nothing.
+    #[test]
+    fn a_click_on_the_divider_is_a_no_op() {
+        let mut ui = ui(vec![row("a", true, false)]);
         ui.on_key(press(KeyCode::Enter));
-        assert_eq!(ui.on_mouse(click(5, 2), 80, 24), Action::Nothing);
-        assert_eq!(ui.focus, Focus::Session, "still on the session Enter chose");
-        assert_eq!(ui.selected, 0, "the click's row must not override it");
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 16, // screen col 17 = list_w(16) + 1: the divider
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(ui.on_mouse(event, 80, 24), Action::Nothing);
+    }
+
+    /// Nothing is attached, so a click landing where the pane *would* be has
+    /// nothing to forward to — this is what keeps a stray click from ever
+    /// reaching a child that was never asked to receive it.
+    #[test]
+    fn a_click_in_the_pane_region_with_nothing_attached_is_a_no_op() {
+        let mut ui = ui(vec![row("a", true, false)]);
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 19,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(ui.on_mouse(event, 80, 24), Action::Nothing);
+        assert_eq!(ui.focus, Focus::List, "unmoved — nothing was attached");
+    }
+
+    /// The "wheel-leak" question steps/028 raised: keeping capture on for the
+    /// whole run does not forward a wheel scroll to the child — `on_mouse`
+    /// only ever builds bytes for a left-button `Down`. See steps/029.
+    #[test]
+    fn a_scroll_wheel_while_attached_is_not_forwarded() {
+        let mut ui = ui(vec![row("a", true, false)]);
+        ui.on_key(press(KeyCode::Enter));
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 19,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(ui.on_mouse(wheel, 80, 24), Action::Nothing);
     }
 
     /// The bug this whole mode exists to make impossible: in the list `x` kills
@@ -2130,6 +2249,53 @@ mod tests {
             2,
             "skip_list=false must still see the herd change — a Start/Kill \
              wake never sets skip_list, so it can never lose one"
+        );
+    }
+
+    /// [MEASURED] The real bug behind steps/029: which session's pty a real
+    /// `Hold` is attached to, not just `Ui` state — proven against a real
+    /// daemon and two real held sessions, not a mock. See steps/029.
+    #[test]
+    fn reconcile_hold_switches_the_real_attach_not_just_ui_state() {
+        let path = scratch_socket("reconcile-hold-switch");
+        daemon_at(&path);
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        refresh(&path, "default", &mut ui, &mut held, &mut painted, false).unwrap();
+        assert_eq!(ui.sessions.len(), 2, "both sessions must be seen");
+        let first = ui.sessions[0].name.clone();
+        let second = ui.sessions[1].name.clone();
+
+        ui.selected = 0;
+        reconcile_hold(&path, &mut ui, &mut held, &first);
+        assert_eq!(
+            held.as_ref().map(|(name, _)| name.as_str()),
+            Some(first.as_str()),
+            "attached to the first session"
+        );
+
+        // The regression: selecting a DIFFERENT session while one is already
+        // held must drop the stale hold and take the new one.
+        ui.selected = 1;
+        reconcile_hold(&path, &mut ui, &mut held, &second);
+        assert_eq!(
+            held.as_ref().map(|(name, _)| name.as_str()),
+            Some(second.as_str()),
+            "must have switched — a stale hold on the first is the exact bug"
+        );
+
+        // Idempotence: calling it again with the SAME name must not
+        // needlessly drop and re-take a hold that already matches.
+        let before = held.as_ref().map(|(name, _)| name.clone());
+        reconcile_hold(&path, &mut ui, &mut held, &second);
+        assert_eq!(
+            held.as_ref().map(|(name, _)| name.clone()),
+            before,
+            "already held — must be a no-op, not a needless re-attach"
         );
     }
 }
