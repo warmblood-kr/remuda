@@ -2343,4 +2343,54 @@ mod tests {
             "STAGE 2: hold B must succeed once A's is released"
         );
     }
+
+    /// [DIAGNOSTIC, not a fix] Isolates one extra IPC round trip — a
+    /// `capture_styled` call, what #25's `refresh()` makes and the sibling
+    /// test above does not — before the same hold/drop/hold. See steps/029.
+    #[test]
+    fn a_capture_styled_round_trip_before_hold_does_not_change_the_outcome() {
+        let path = scratch_socket("capture-then-hold-drop-then-hold");
+        daemon_at(&path);
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        let sessions = list(&path).unwrap();
+        assert_eq!(sessions.len(), 2, "both sessions must be seen");
+        let a = sessions[0].name.clone();
+        let b = sessions[1].name.clone();
+
+        // The one variable under test: the extra connection #25's refresh()
+        // makes (list + capture_styled) that the sibling diagnostic test
+        // above never makes, right before the hold/drop/hold sequence.
+        capture_styled(&path, &a).unwrap();
+
+        let hold_a = client::hold(&path, &a).unwrap();
+
+        // Stage 1: drop A's Hold on its own thread, watchdog-timed.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(hold_a);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "STAGE 1: Hold::drop for session A did not return within 5s — \
+             see steps/029"
+        );
+
+        // Stage 2: immediately hold B — the exact sequence a click to a
+        // different session while one is attached produces.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let hold_b = client::hold(&path, &b);
+            let _ = tx.send(hold_b.is_ok());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).expect(
+                "STAGE 2: client::hold for session B did not return \
+                     within 5s — see steps/029"
+            ),
+            "STAGE 2: hold B must succeed once A's is released"
+        );
+    }
 }
