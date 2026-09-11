@@ -217,3 +217,176 @@ PR #26. Cherry-picking it onto a branch cut from #25's head collides with
 029 independently, since neither existed on the other's branch when
 written). Renumbered to 030 on this branch only, to satisfy
 `check-steps.py`; #25's and #26's own branches are untouched.
+
+## Run 6 — mechanism reading, before the out-of-process discriminator
+
+Run 5 (above) reproduced a real hang on `windows-latest`: the bare
+same-thread `hold A → drop A → hold B → drop B` sequence (`V2`) got
+`STUCK AFTER STAGE 1` — inside `drop(hold_a)` itself — while the identical
+sequence wrapped in a spawned thread (the cross-thread twin) has now passed
+4-for-4 across every run. Two things had to happen before spending the
+sixth and last budgeted run: read the actual mechanism rather than assume
+it, and confirm that a fix belongs in shared code before touching it.
+
+**A read-only production trace** (`git show 3ccf3b29`, verbatim) confirms
+the TUI itself drops its own `Hold` on its creating thread, no different
+from `V2`'s shape: `take → client::hold` (`tui.rs:1036`) runs inside
+`refresh` (`tui.rs:867`) on the `tui::run` thread (`remuda.rs:48`); Ctrl-\
+detach sets `focus = List` (`tui.rs:152-155`) and the *next* `refresh` does
+`*held = None` (`tui.rs:865`), dropping it right there; quit
+(`Action::Quit => return Ok(())`, `tui.rs:1002`) drops it by falling out of
+scope (`tui.rs:962`). Both are the same-thread shape. Yet 정수님 used the
+Windows TUI all day — detaching and quitting repeatedly — with no hang
+reported. That is a real contradiction to resolve, not a result to explain
+away, and it is why this run tests **process locality** before anything
+gets called a user-facing bug: every diagnostic test so far, including
+`V1`/`V2`, runs the daemon **in-process** (a spawned thread inside the test
+binary — `daemon_at`, `tui.rs:2055-2058`). Real usage always runs the
+daemon as its own OS **process** (`bin/remuda.rs`'s `start_daemon`,
+spawning `remuda -s <server> daemon` and polling for a connect). That
+difference has never been tested. Until it is, nothing here is written as
+"this hangs for users" — only as "this hangs on Windows CI, in-process,
+same-thread" (PR #28, `V2`, 1-for-1 on that specific shape so far).
+
+**First candidate mechanism, already on record before this investigation
+began:** `steps/010-windows.md:271-274` — *"`ipc::wake` on Windows has no
+test... the `CancelIoEx` half is reasoned from the crate's source, not
+measured."* The working theory carried into run 5 was that `hold()`
+(`client.rs:195`) hands the `drain` thread a `try_clone()`-derived (i.e.
+`DuplicateHandle`-derived) handle, while `Hold::drop` (`client.rs:233`)
+calls `ipc::wake`/`CancelIoEx` on the *original*, un-cloned handle — two
+distinct `HANDLE` values for the same pipe object.
+
+**Tested against the discriminator, and it does not fit.** The duplicated
+handle is present in *every* test to date, same-thread and cross-thread
+alike — `hold()` always clones for the drain thread, regardless of which
+thread later calls `drop`. A same-thread-vs-cross-thread outcome difference
+cannot come from a mechanism that is identical in both cases. A theory has
+to explain why the cross-thread wrapping alone flips the result 4-for-4; a
+wrong-handle theory does not, and this is written down rather than carried
+forward unexamined.
+
+**The specific lead the steward asked to check, checked, and closed:**
+is the pipe handle synchronous (non-overlapped), making this
+`CancelSynchronousIo` territory rather than `CancelIoEx`'s? Read from the
+vendored `interprocess-2.4.4` crate source directly (not inferred):
+
+- The Windows named-pipe handle is opened with `FILE_FLAG_OVERLAPPED`
+  (`c_wrappers.rs:157-166` in the vendored crate) — asynchronous, not
+  synchronous.
+- The crate's blocking `read()` is `ReadFileEx` plus an APC completion
+  routine, with the calling thread parked in `SleepEx(_, alertable=1)`
+  until its own APC queue delivers the completion (`c_wrappers.rs:91-104,
+  114-126, 164-166`) — still the overlapped/APC path, not
+  `GetOverlappedResult`/`WaitForSingleObject`, and not a synchronous
+  blocking read either.
+- The crate itself contains zero calls to any `CancelIo*` function — all
+  cancellation is left to the caller, which is this repo's `ipc.rs`.
+
+This closes the synchronous-handle lead: the handle **is** overlapped, so
+`CancelIoEx` is the documented, correct API family for it. `ipc.rs`'s own
+comment ("this is the API that cancels one") is accurate on this point.
+`CancelSynchronousIo` does not apply here and is not the fix.
+
+**What explains the discriminator, stated as a reasoned candidate, not a
+measured one:** `ReadFileEx`-based cancellation is well documented (Win32
+practitioner knowledge, not read from any source in this repo) to be a
+no-op with respect to a read that has not yet been *issued* — `CancelIoEx`
+cancels *pending* I/O, and a call that has not reached the kernel yet is
+not pending. `hold()` spawns the `drain` thread and returns immediately;
+the drain thread must still schedule, run, and call `ReadFileEx` before
+there is anything to cancel. Wrapping `drop(hold_a)` in
+`std::thread::spawn` (as every passing cross-thread test does) costs a new
+OS thread's creation and scheduling — plausibly just enough delay for the
+already-spawned drain thread to reach its `ReadFileEx` call first. Calling
+`drop(hold_a)` inline, immediately after `hold()` returns on the same
+thread (as `V2` and the TUI's own detach/quit do), leaves a much tighter
+window in which `wake()` can fire before the drain thread's read is
+pending — after which nothing will ever cancel it. This is a race, not a
+handle-identity bug, and it would explain why CI (many competing test
+threads, one process, likely under scheduler pressure) hits it reliably
+while a single real `remuda` TUI process detaching after a person has
+looked at the screen for a moment might not.
+
+**What this evidence cannot reach:** nothing in this repository or the
+vendored crate was instrumented to observe the actual ordering of
+`ReadFileEx` issuance versus `CancelIoEx` on real Windows hardware — this
+mechanism is argued from documented `CancelIoEx` semantics and the crate's
+confirmed use of the overlapped/APC path, not measured. Run 6 does not
+test this race directly either; it tests a different, prior question
+(process locality, and human-scale timing) that must be answered first,
+since a hang that only reproduces in-process would mean nothing here is a
+user-facing bug at all.
+
+## Run 6 — the out-of-process discriminator
+
+Two structural questions, tested together in one run since both are free
+once the harness exists:
+
+1. **Locality.** Every test to date runs the daemon in-process. Does the
+   same-thread hang reproduce against a REAL spawned `remuda -s <server>
+   daemon` OS process (`bin/remuda.rs`'s own `start_daemon` shape), or is
+   it an in-process test-harness artifact?
+2. **Timing.** `V2` drops immediately after taking the hold. A person
+   using the TUI looks at the screen for a moment before pressing Ctrl-\.
+   Does a 1-second pause between `hold()` and `drop()` change the outcome?
+
+Three new tests, `native/tests/out_of_process_hold.rs`, all against a real
+spawned `remuda` binary (`Daemon::spawn`, mirroring `tests/daemon.rs`'s own
+real-subprocess helper), each carrying the same stage/watchdog
+instrumentation as `V1`/`V2` (now sharing one registry — see below):
+
+- `out_of_process_hold_a_drop_a_hold_b_drop_b_same_thread` — the bare
+  same-thread sequence, out-of-process.
+- `out_of_process_hold_a_drop_a_hold_b_drop_b_cross_thread` — the
+  cross-thread twin, out-of-process, as the paired comparison run
+  alongside it.
+- `out_of_process_settled_drop_does_not_hang_immediately` — same-thread,
+  with a 1-second pause between `hold()` and `drop()`.
+
+**Instrumentation fix — the run 5 blind spot.** Run 5's `V2` watchdog fired
+`std::process::exit(101)` on its own timeout, which killed the whole test
+binary before `V1`'s own watchdog (also past 60s at that instant) could
+report its stage. `V1` and `V2` now register `(name, stage)` into one
+shared, process-wide table (`StageRegistry`, `tui.rs`); whichever
+watchdog's 60s timer fires first dumps every currently-registered entry
+before exiting, so one test's exit can no longer hide a sibling's stage.
+
+**Positive control, Linux, before use anywhere:** a 70s sleep was injected
+into both `V1` and `V2` at once and run with `--test-threads=4`. The single
+dump that appeared before the process exited named both:
+`STUCK: V1 AFTER STAGE 2` and `STUCK: V2 AFTER STAGE 2`. Both injections
+were then fully removed and the suite reconfirmed green before anything
+was committed.
+
+**Prediction, stated before this run's push, covering every branch:**
+
+1. Out-of-process same-thread hangs → the TUI's own detach/quit path is
+   implicated for real use — this is the branch that would need to be
+   reconciled with 정수님's contradiction-free all-day usage (most likely
+   by the timing-race candidate above: CI's scheduler pressure makes the
+   race far more likely to land than an interactive session's natural
+   pacing does), not dismissed as impossible.
+2. Out-of-process same-thread green while the in-process same-thread test
+   (replicated in this same run) still hangs → an in-process test-harness
+   artifact. Written up as exactly that; no user-facing claim follows from
+   it.
+3. The settled-drop variant passes while the immediate-drop variant (either
+   locality) hangs → consistent with the timing-race candidate: the hang
+   needs a specific, narrow interleaving, and "deterministic in CI, rare at
+   human speed" is a coherent, non-contradictory state — it is not read as
+   one of the two observations (the CI hang, or 정수님's clean day) being
+   wrong.
+4. Both the immediate-drop and settled-drop variants hang, in-process or
+   out-of-process → a 1-second pause is not sufficient insulation, and
+   human timing is not read as protection.
+
+No branch above is pre-registered as requiring either observation (the CI
+hang, or the day of unhung real use) to be the wrong one — both are taken
+as true, and the job is to find the shape that makes both true at once.
+
+Run budget: this is run 6 of 6, the last budgeted `windows-latest` run.
+This run is the discriminator above, not a fix — `client.rs`, `daemon.rs`,
+`ipc.rs`, `protocol.rs`, and `session.rs` are untouched here. If this run's
+result points at a fix, that fix is a separate PR, and any run beyond this
+sixth one needs the steward's explicit extension first.
