@@ -269,10 +269,7 @@ fn respond<T>(
     ok: impl FnOnce(T) -> Response,
 ) -> std::io::Result<()> {
     match result {
-        None => reply(
-            stream,
-            &Response::error(format!("no such session: {name}")),
-        ),
+        None => reply(stream, &Response::error(format!("no such session: {name}"))),
         Some(Err(e)) => reply(stream, &Response::error(e)),
         Some(Ok(v)) => reply(stream, &ok(v)),
     }

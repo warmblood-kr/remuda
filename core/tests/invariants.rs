@@ -597,7 +597,11 @@ fn a_raw_keystroke_carries_no_invented_enter() {
 /// one (measured: a real 60s+ hang under `cargo test --workspace`, twice,
 /// after two different fixed counts). Advancing again on every iteration the
 /// feeder is not yet `is_finished()` has no such bound to guess.
-fn advance_until_finished<T>(clock: &ManualClock, pause: Duration, feeder: &std::thread::JoinHandle<T>) {
+fn advance_until_finished<T>(
+    clock: &ManualClock,
+    pause: Duration,
+    feeder: &std::thread::JoinHandle<T>,
+) {
     for _ in 0..100_000 {
         if feeder.is_finished() {
             return;
@@ -605,7 +609,10 @@ fn advance_until_finished<T>(clock: &ManualClock, pause: Duration, feeder: &std:
         clock.advance(pause);
         std::thread::yield_now();
     }
-    panic!("feed did not finish after {:?} rounds of advancing past its pause", 100_000);
+    panic!(
+        "feed did not finish after {:?} rounds of advancing past its pause",
+        100_000
+    );
 }
 
 #[test]
@@ -653,7 +660,11 @@ fn feed_bursts_and_pauses_are_one_indivisible_act() {
     let got = writes.lock().unwrap().clone();
     assert_eq!(
         got,
-        vec![b"first".to_vec(), b"second".to_vec(), b"interloper".to_vec()],
+        vec![
+            b"first".to_vec(),
+            b"second".to_vec(),
+            b"interloper".to_vec()
+        ],
         "the interloper must land only after the whole feed act finished: {got:?}"
     );
 }
@@ -749,7 +760,9 @@ fn attaching_during_a_feed_pause_refuses_the_remaining_bursts() {
 
     // `attach` takes neither lock a feed act holds, so it must succeed right
     // away — proving there is no deadlock behind an act sitting in a pause.
-    let held = session.attach().expect("attach must not wait on a paused feed");
+    let held = session
+        .attach()
+        .expect("attach must not wait on a paused feed");
 
     advance_until_finished(&clock, Duration::from_secs(1), &feeder);
     let result = feeder.join().unwrap();
