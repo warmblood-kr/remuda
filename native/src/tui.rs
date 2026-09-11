@@ -121,7 +121,7 @@ impl Ui {
 
     /// A press in the list column switches to that row's session, even if
     /// another one already has focus. A press in the session pane forwards
-    /// as a real click to the child instead. See steps/029.
+    /// as a real click to the child instead. See steps/030.
     pub fn on_mouse(&mut self, event: MouseEvent, cols: u16, rows: u16) -> Action {
         if self.mode != Mode::Browse {
             return Action::Nothing;
@@ -962,7 +962,7 @@ fn refresh(
 
 /// Enables SGR mouse reporting on construction, disables it on drop — for
 /// the whole `run` now, not just while the list has focus (steps/028 toggled
-/// this off on attach; steps/029 explains why that changed).
+/// this off on attach; steps/030 explains why that changed).
 struct MouseCapture;
 
 impl MouseCapture {
@@ -986,7 +986,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     // Scoped to the herd screen, not `RawMode` itself: `attach` uses `RawMode`
     // too, forwards every raw byte it reads, and has no list to click — a
     // session reached directly by `remuda attach` has no list to switch to,
-    // so there is nothing for a click there to do. See steps/028 and steps/029.
+    // so there is nothing for a click there to do. See steps/028 and steps/030.
     let _mouse = MouseCapture::enable()?;
     let shell = crate::daemon::default_shell();
     let (sessions, list_err) = match list(path) {
@@ -1062,7 +1062,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
 
 /// [`Action::Focus`]`(name)` just fired. Already held: no-op. A different
 /// name: drop the stale hold (its `Drop` is the detach) and take the new one
-/// immediately — `refresh` must never be the one to notice. See steps/029.
+/// immediately — `refresh` must never be the one to notice. See steps/030.
 fn reconcile_hold(path: &Path, ui: &mut Ui, held: &mut Option<(String, Hold)>, name: &str) {
     if held.as_ref().is_some_and(|(held, _)| held == name) {
         return;
@@ -1314,9 +1314,9 @@ mod tests {
         assert_eq!(ui.selected, 0, "a drag did not select");
     }
 
-    /// steps/029: a click on a *different* list row switches straight to it
+    /// steps/030: a click on a *different* list row switches straight to it
     /// even while another session is already attached — the one-way door
-    /// #028 left. See steps/029 for the full before/after.
+    /// #028 left. See steps/030 for the full before/after.
     #[test]
     fn a_click_on_a_different_list_row_switches_focus_even_while_attached() {
         let mut ui = ui(vec![row("a", true, false), row("b", true, false)]);
@@ -1331,9 +1331,9 @@ mod tests {
         assert_eq!(ui.selected, 1, "the click's row did override it");
     }
 
-    /// The ⒝ half of steps/029: a click inside the session pane forwards as
+    /// The ⒝ half of steps/030: a click inside the session pane forwards as
     /// a real SGR mouse report at the child's OWN coordinates — screen (20,
-    /// 5) lands at child (3, 6), not (20, 5). See steps/029 for the math.
+    /// 5) lands at child (3, 6), not (20, 5). See steps/030 for the math.
     #[test]
     fn a_click_inside_the_session_pane_is_forwarded_to_the_child_as_a_click() {
         let mut ui = ui(vec![row("a", true, false)]);
@@ -1385,7 +1385,7 @@ mod tests {
 
     /// The "wheel-leak" question steps/028 raised: keeping capture on for the
     /// whole run does not forward a wheel scroll to the child — `on_mouse`
-    /// only ever builds bytes for a left-button `Down`. See steps/029.
+    /// only ever builds bytes for a left-button `Down`. See steps/030.
     #[test]
     fn a_scroll_wheel_while_attached_is_not_forwarded() {
         let mut ui = ui(vec![row("a", true, false)]);
@@ -2252,9 +2252,9 @@ mod tests {
         );
     }
 
-    /// [MEASURED] The real bug behind steps/029: which session's pty a real
+    /// [MEASURED] The real bug behind steps/030: which session's pty a real
     /// `Hold` is attached to, not just `Ui` state — proven against a real
-    /// daemon and two real held sessions, not a mock. See steps/029.
+    /// daemon and two real held sessions, not a mock. See steps/030.
     #[test]
     fn reconcile_hold_switches_the_real_attach_not_just_ui_state() {
         let path = scratch_socket("reconcile-hold-switch");

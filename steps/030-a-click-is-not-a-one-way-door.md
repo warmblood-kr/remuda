@@ -1,4 +1,4 @@
-# 029 — a click is not a one-way door
+# 030 — a click is not a one-way door
 
 정수님 tested steps/028's mouse-click PR immediately and hit the hole it
 left, verbatim: "클릭해서 세션 안으로 커서가 들어가면, 바깥 세션 목록을 클릭해도
@@ -135,8 +135,30 @@ $ python3 scripts/check-workflows.py    ok — 3 workflow file(s) parse, 17 job(
 $ python3 scripts/check-install.py      ok — 3 target(s) built and offered (2 via install.sh, 1 via install.ps1): aarch64-apple-darwin, x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu
 ```
 
-`check-steps.py` still says 28 — this file becomes the 29th once counted
-post-merge; the number above is the pre-merge state on this branch's base.
+`check-steps.py` said 28 when this was captured, on a base where this file
+was next in line as 029. A separate PR (a Windows same-thread `Hold::drop`
+race fix) landed on `main` first and claimed 029 for itself, so this file
+is renumbered to 030 on rebase. Rerun after the rename and after every
+`steps/029` reference in `native/src/tui.rs` was updated to `steps/030`,
+on top of `ef39e89` (main, with `029-a-thread-cannot-cancel-a-read-that-has-not-started.md`
+already present):
+
+```
+$ cargo test -p remuda-native --lib tui::tests::reconcile_hold_switches_the_real_attach_not_just_ui_state -- --nocapture
+test tui::tests::reconcile_hold_switches_the_real_attach_not_just_ui_state ... ok
+
+$ cargo test --workspace 2>&1 | grep -E "^test result"
+(every target) test result: ok, 0 failed
+
+$ cargo fmt --all -- --check                                  (exit 0)
+$ cargo clippy --workspace --all-targets -- -D warnings        Finished, no warnings
+$ cargo clippy -p remuda-native --target x86_64-pc-windows-gnu --all-targets -- -D warnings
+                                                                Finished, no warnings
+$ python3 scripts/check-comments.py     ok — 291 doc comment(s) within cap (item 3, module 20)
+$ python3 scripts/check-steps.py        ok — 30 step(s), each with before, desired, expected and captured actual
+$ python3 scripts/check-principles.py   ok — 14 principles, every named mechanism exists (17 CI jobs, 11 denied paths, 305 test fns seen)
+$ python3 scripts/check-workflows.py    ok — 3 workflow file(s) parse, 17 job(s) defined
+```
 
 No CI gate was added, no new denied path.
 
@@ -170,7 +192,7 @@ Both assertions PASS at the pre-fix commit — proving the bug is real and
 reachable through the exact code path a click already used, not merely
 theoretical. The identical assertions, run against the fixed code, would
 fail (selection moves to `second`, the hold follows it) — that reversal is
-what steps/029 changes. The throwaway worktree was removed afterward; this
+what steps/030 changes. The throwaway worktree was removed afterward; this
 test was never committed to the real history.
 
 ## Things checked, per axis
