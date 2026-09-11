@@ -140,7 +140,8 @@ end
 -- will not let a second sender split. Not an MCP tool — a plain stdlib
 -- function beside `send`/`insert`, since remuda itself frames none of this
 -- (no default pause, no paste sequence) and this is the caller that does.
--- SETTLE (seconds before the submitting Return) defaults to 0.1.
+-- SETTLE (seconds before the submitting Return) defaults to 0.1. Like
+-- `remuda.feed`, this blocks the calling Image for SETTLE seconds.
 function remuda.type_text(session, text, settle)
   local body = tostring(text):gsub("\r\n?", "\n"):gsub("\27", "")
   settle = settle or 0.1

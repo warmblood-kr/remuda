@@ -163,6 +163,14 @@ touching. `attach` itself takes neither lock, so an act sitting in a pause
 cannot make it wait — it simply wins the race, and the act's remaining bursts
 lose theirs.
 
+A `feed` act's own pauses are what a caller sits inside of too — `Session::
+feed` runs on the daemon's connection thread, and a script's call blocks
+synchronously for the reply, so every pause in `steps` holds the calling
+Image hostage for that long, same as `sleep` does. `Session::MAX_TOTAL_PAUSE`
+(5s) bounds that: a total over it is refused before anything is written, not
+clamped, so a seconds/millis mixup or a runaway caller errors loudly instead
+of quietly stalling an Image for however long it guessed wrong by.
+
 **Enforced by:** the type system (the method does not exist) · test
 `concurrent_send_lines_never_interleave` and its negative control
 `control_unlocked_writers_do_interleave` · the wider act's own divisibility by
@@ -170,7 +178,8 @@ test `feed_bursts_and_pauses_are_one_indivisible_act` and its negative control
 `control_separate_calls_with_a_gap_do_interleave` · a screen read never
 waiting on a pause, by test `capture_does_not_wait_out_a_feed_pause` · the
 attach race, by test
-`attaching_during_a_feed_pause_refuses_the_remaining_bursts`
+`attaching_during_a_feed_pause_refuses_the_remaining_bursts` · the pause cap,
+by test `feed_refuses_a_total_pause_over_the_cap`
 
 ## 7. Time is injected, never read
 

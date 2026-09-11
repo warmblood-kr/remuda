@@ -96,10 +96,29 @@ impl Session {
         self.write_one_burst(bytes)
     }
 
+    /// Above this, a `feed` act is refused rather than executed — a caller's
+    /// seconds/millis mixup must not hold an Image hostage indefinitely. See
+    /// PRINCIPLES.md §6; settle pauses run ~0.1s, so this leaves ample room.
+    pub const MAX_TOTAL_PAUSE: Duration = Duration::from_secs(5);
+
     /// Deliver a sequence of bursts and pauses as one indivisible input act —
     /// `input_lock` spans the whole thing, but a pause holds no lock
     /// `screen_text`/`capture` need. See PRINCIPLES.md §6 for why.
     pub fn feed(&self, steps: &[Step]) -> Result<()> {
+        let total_pause: Duration = steps
+            .iter()
+            .filter_map(|step| match step {
+                Step::Pause(millis) => Some(Duration::from_millis(*millis)),
+                Step::Burst(_) => None,
+            })
+            .sum();
+        if total_pause > Self::MAX_TOTAL_PAUSE {
+            return Err(AgentError::PauseTooLong {
+                total: total_pause,
+                cap: Self::MAX_TOTAL_PAUSE,
+            });
+        }
+
         let _held = self
             .input_lock
             .lock()

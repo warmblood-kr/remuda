@@ -100,6 +100,13 @@ pub enum AgentError {
     /// Someone is attached and driving this session by hand. Orchestrated
     /// input is refused rather than queued — see [`crate::session::Session`].
     Attached,
+    /// A `feed` act's `Pause`s summed past the caller's cap — refused before
+    /// anything is written, not clamped, so a seconds/millis mixup errors
+    /// instead of silently running a shorter pause than asked for.
+    PauseTooLong {
+        total: core::time::Duration,
+        cap: core::time::Duration,
+    },
     Io(String),
 }
 
@@ -108,6 +115,9 @@ impl fmt::Display for AgentError {
         match self {
             AgentError::Exited => write!(f, "agent process has exited"),
             AgentError::Attached => write!(f, "a human is attached to this session"),
+            AgentError::PauseTooLong { total, cap } => {
+                write!(f, "feed's pauses total {total:?}, over the {cap:?} cap")
+            }
             AgentError::Io(m) => write!(f, "agent io error: {m}"),
         }
     }

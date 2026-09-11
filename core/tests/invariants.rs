@@ -715,10 +715,12 @@ fn capture_does_not_wait_out_a_feed_pause() {
     let feeder = {
         let session = session.clone();
         std::thread::spawn(move || {
+            // Under `Session::MAX_TOTAL_PAUSE` — a pause over the cap is
+            // refused before it writes anything, which is a different test.
             session
                 .feed(&[
                     Step::Burst(b"first".to_vec()),
-                    Step::Pause(60_000),
+                    Step::Pause(2000),
                     Step::Burst(b"second".to_vec()),
                 ])
                 .unwrap();
@@ -733,7 +735,7 @@ fn capture_does_not_wait_out_a_feed_pause() {
     // pause above is not released until the advancing below wakes it.
     session.screen_text().unwrap();
 
-    advance_until_finished(&clock, Duration::from_secs(60), &feeder);
+    advance_until_finished(&clock, Duration::from_secs(2), &feeder);
     feeder.join().unwrap();
 }
 
@@ -777,4 +779,30 @@ fn attaching_during_a_feed_pause_refuses_the_remaining_bursts() {
         "the second burst must never reach the pty once attached"
     );
     drop(held);
+}
+
+#[test]
+fn feed_refuses_a_total_pause_over_the_cap() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
+
+    // Two pauses that individually look modest but sum past the cap — the
+    // sum is what is checked, not any one `Pause`.
+    let over_cap = Session::MAX_TOTAL_PAUSE + Duration::from_millis(1);
+    let result = session.feed(&[
+        Step::Burst(b"first".to_vec()),
+        Step::Pause(over_cap.as_millis() as u64 / 2),
+        Step::Burst(b"second".to_vec()),
+        Step::Pause(over_cap.as_millis() as u64 / 2 + 1),
+        Step::Burst(b"third".to_vec()),
+    ]);
+
+    assert!(
+        matches!(result, Err(AgentError::PauseTooLong { .. })),
+        "a total pause over the cap must be refused: {result:?}"
+    );
+    assert!(
+        writes.lock().unwrap().is_empty(),
+        "nothing may be written once any part of the act is refused"
+    );
 }

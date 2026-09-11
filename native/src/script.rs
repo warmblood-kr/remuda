@@ -149,6 +149,11 @@ pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
     // A sequence of bursts and pauses delivered as one indivisible act — the
     // primitive `send`/`insert` are the one-`Burst` case of. `steps` is a Lua
     // array of `{burst = "..."}` / `{pause = seconds}` entries, in order.
+    // Like `sleep`, this blocks the calling Image — for as long as `steps`'s
+    // pauses sum to: `client::request` waits synchronously for the daemon's
+    // reply, and the daemon does not answer until the whole act is done. The
+    // daemon refuses a total pause over a few seconds rather than trust a
+    // units mistake (or a runaway caller) not to hold an Image hostage.
     let path = at();
     table.set(
         "feed",
@@ -190,6 +195,11 @@ pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
         })?,
     )?;
 
+    // Blocks the WHOLE Image, not just this call: the interpreter is pinned to
+    // one thread (image.rs), so a sleeping script stalls every other job —
+    // the REPL, `-e`, any other script — for the full duration. Not a wait or
+    // a timer primitive; remuda has no periodic-execution mechanism yet, and
+    // faking one with a sleep-and-poll loop holds the Image hostage the same way.
     table.set(
         "sleep",
         lua.create_function(|_, seconds: f64| {
