@@ -122,3 +122,45 @@ visibly written before the outcome.
   confound in that test's own harness/teardown.** If this test comes back
   green, the next step is investigating #25's harness ordering specifically,
   with the core IPC question left open, not closed.
+
+## Run 1 result and what followed
+
+Run 1 (this PR's own test above) came back GREEN on `windows-latest` in
+1m26s — recorded as "not reproduced this run," not as the mechanism ruled
+out, per the prediction's own terms.
+
+A rerun of PR #25's original, unmodified test (`gh run rerun` against the
+same commit that first hung) was then watched by hand: it **hung again**,
+cancelled after 10 minutes. Both the original run and the rerun's own
+"has been running for over 60 seconds" watchdog line name the exact same
+test, character-for-character:
+`tui::tests::reconcile_hold_switches_the_real_attach_not_just_ui_state`.
+This is a confirmed, reproduced, deterministic hang on that specific test —
+not flakiness, not cross-contamination from a different test in the same
+parallel run.
+
+A structural diff between #25's hanging test and this PR's passing one
+found: #25's test calls `refresh()` once before its hold/drop/hold
+sequence. `refresh()` internally performs a `list()` IPC call AND a
+`capture_styled()` IPC call (a full connect/request/respond/disconnect
+round trip that reads a session's vt100 screen) AND a `render_styled()`/
+conditional stdout write. This PR's test above performs only a bare
+`list()` call before its sequence — no `capture_styled`, no render, no
+stdout write.
+
+## Isolation test (run 3): does the extra `capture_styled` round trip matter?
+
+**Prediction, stated before this run's test code is written or pushed:**
+if the extra `list()` + `capture_styled()` connection churn immediately
+before the hold/drop/hold sequence is what changes the outcome (not the
+`CancelIoEx`/handle-identity mechanism alone), this test should FAIL (a
+clean, stage-labeled timeout) on `windows-latest`. If it passes, the
+connection-churn hypothesis is not supported by this run, and whatever
+makes #25's test different must be elsewhere — e.g. going through the full
+`reconcile_hold`/`Ui`/`refresh` production path specifically (three
+`reconcile_hold` calls, not one hold/drop/hold), or genuine
+non-determinism.
+
+This commit contains only this prediction — the test code that exercises
+it is a separate, later commit, so git history itself shows the prediction
+was written first.
