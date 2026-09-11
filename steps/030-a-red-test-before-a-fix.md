@@ -1,4 +1,4 @@
-# 029 — a red test before a fix
+# 030 — a red test before a fix
 
 PR #25's new test — attach session A, drop A's `Hold`, immediately attach a
 different session B — hung `cargo test --workspace --all-targets` on
@@ -171,3 +171,49 @@ non-determinism.
 This commit contains only this prediction — the test code that exercises
 it is a separate, later commit, so git history itself shows the prediction
 was written first.
+
+## Same-thread / reconcile_hold isolation (run 5)
+
+Run 4's `capture_styled` isolation test (`00b9a1d`) came back GREEN on
+`windows-latest` in 1m33s — "not reproduced this run." Two structural gaps
+remained unexamined: (a) every prior diagnostic test does its hold/drop on a
+**spawned** thread behind a channel + `recv_timeout` watchdog, while #25's
+actual hanging test does every hold/drop on the **test thread itself**,
+including an implicit final drop at scope exit; (b) no prior diagnostic test
+goes through the production `reconcile_hold`/`Ui` path, which exists only on
+#25's branch.
+
+This branch (`investigate/hold-drop-same-thread`, cut from #25's head
+`c37a3c3`) cherry-picks the three prior diagnostic commits and adds two more
+tests, both instrumented with a stage counter, a completion sentinel whose
+`Drop` fires last, and a 60s watchdog thread that writes `STUCK AFTER STAGE
+n` to stderr (bypassing libtest capture) and exits 101 — a real hang fails
+fast and names the stage, instead of hanging the job:
+
+- `reconcile_hold_switches_the_real_attach_not_just_ui_state_same_thread` —
+  #25's own test body, verbatim, with no thread spawned around any of it.
+  Stage 1 = refresh done, 2 = attach A done, 3 = switch to B done, 4 =
+  idempotent re-attach to B done, 5 = body's last statement reached.
+- `hold_a_drop_a_hold_b_drop_b_same_thread` — the bare hold/drop/hold/drop
+  sequence, same-thread counterpart of the cross-thread `dropping_one_sessions...`
+  test. Stage 1 = hold A, 2 = drop A, 3 = hold B, 4 = drop B.
+
+The prediction for this run is pre-registered as a GitHub comment on PR #26
+before this branch is pushed, not in this file, per the corrected protocol —
+a server-side comment timestamp proves the order without relying on a second
+commit.
+
+**Instrumentation self-check, done before any push:** a 70s
+`std::thread::sleep` was temporarily inserted before the `hold B` step of
+the same-thread bare-sequence test, run locally with `--test-threads=1`.
+Result: `V2 STUCK AFTER STAGE 2`, process exit code 101, in well under the
+60s watchdog window. The injected sleep was then removed; all five relevant
+tests (the four diagnostic tests plus #25's own original) pass in under
+0.1s on Linux. The injection was never committed.
+
+Renumbering note: this file was `steps/029-a-red-test-before-a-fix.md` on
+PR #26. Cherry-picking it onto a branch cut from #25's head collides with
+#25's own `steps/029-a-click-is-not-a-one-way-door.md` (both PRs claimed
+029 independently, since neither existed on the other's branch when
+written). Renumbered to 030 on this branch only, to satisfy
+`check-steps.py`; #25's and #26's own branches are untouched.
