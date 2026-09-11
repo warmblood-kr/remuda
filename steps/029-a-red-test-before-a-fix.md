@@ -129,8 +129,8 @@ Run 1 (this PR's own test above) came back GREEN on `windows-latest` in
 1m26s — recorded as "not reproduced this run," not as the mechanism ruled
 out, per the prediction's own terms.
 
-A rerun of PR #25's original, unmodified test (`gh run rerun` against the
-same commit that first hung) was then watched by hand: it **hung again**,
+Run 2: a rerun of PR #25's original, unmodified test (`gh run rerun` against
+the same commit that first hung) was then watched by hand: it **hung again**,
 cancelled after 10 minutes. Both the original run and the rerun's own
 "has been running for over 60 seconds" watchdog line name the exact same
 test, character-for-character:
@@ -148,7 +148,14 @@ conditional stdout write. This PR's test above performs only a bare
 `list()` call before its sequence — no `capture_styled`, no render, no
 stdout write.
 
-## Isolation test (run 3): does the extra `capture_styled` round trip matter?
+## Isolation test (run 4): does the extra `capture_styled` round trip matter?
+
+(Budget correction: the prediction-only commit below, `9cac046`, also
+triggered its own `test-windows` run — 1m21s, previously miscounted as
+free. So this section's test is run 4 of 6, not run 3: run 1 = `c12ec69`
+above, run 2 = the `gh run rerun` of #25's original test, run 3 = `9cac046`
+itself, run 4 = `00b9a1d` below. That leaves 2 of 6 remaining before the
+next run.)
 
 **Prediction, stated before this run's test code is written or pushed:**
 if the extra `list()` + `capture_styled()` connection churn immediately
