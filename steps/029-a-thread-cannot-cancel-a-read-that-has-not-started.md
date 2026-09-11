@@ -294,3 +294,12 @@ $ cargo fmt -p remuda-native -- --check
   being coarser than 1ms on some Windows configurations) — expected to only
   ever make the retry loop take slightly longer per iteration, never
   incorrect, but not directly measured.
+- `streaming_drop_loop_{in,out}_of_process` and `null_control_no_attach_out_of_process`
+  never ran against pre-fix code on real Windows hardware — only run 9's
+  post-fix code has. Their green on run 9 shows no regression from adding
+  them, not that they can detect the bug they were written to cover. The
+  only tests with an actual pre-fix-red-on-Windows, post-fix-green
+  discriminating result are `cross_thread_hold_drop_with_injection`,
+  `same_thread_hold_drop_with_injection`, `pause_0ms_{in,out}_of_process`,
+  and the two `immediate_hold_drop_loop_*` tests (all measured red on run 8,
+  green on run 9).
