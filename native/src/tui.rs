@@ -2132,4 +2132,49 @@ mod tests {
              wake never sets skip_list, so it can never lose one"
         );
     }
+
+    /// [DIAGNOSTIC, not a fix] Reproduces #25's `reconcile_hold` sequence:
+    /// drop A's `Hold`, immediately hold B — each stage watchdog-timed since
+    /// `Drop` can't be timed out in place. See steps/029.
+    #[test]
+    fn dropping_one_sessions_hold_then_holding_another_does_not_hang() {
+        let path = scratch_socket("hold-drop-then-hold");
+        daemon_at(&path);
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        let sessions = list(&path).unwrap();
+        assert_eq!(sessions.len(), 2, "both sessions must be seen");
+        let a = sessions[0].name.clone();
+        let b = sessions[1].name.clone();
+
+        let hold_a = client::hold(&path, &a).unwrap();
+
+        // Stage 1: drop A's Hold on its own thread, watchdog-timed.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(hold_a);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "STAGE 1: Hold::drop for session A did not return within 5s — \
+             see steps/029"
+        );
+
+        // Stage 2: immediately hold B — the exact sequence a click to a
+        // different session while one is attached produces.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let hold_b = client::hold(&path, &b);
+            let _ = tx.send(hold_b.is_ok());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).expect(
+                "STAGE 2: client::hold for session B did not return \
+                     within 5s — see steps/029"
+            ),
+            "STAGE 2: hold B must succeed once A's is released"
+        );
+    }
 }
