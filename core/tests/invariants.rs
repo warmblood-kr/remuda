@@ -806,3 +806,53 @@ fn feed_refuses_a_total_pause_over_the_cap() {
         "nothing may be written once any part of the act is refused"
     );
 }
+
+/// A human can attach *and fully detach again* entirely inside one `Pause` —
+/// `attached` is back to `false` by the time the next burst runs, so a check
+/// of the live flag alone would let that burst through. This is the R4
+/// failure `feed` exists to prevent: the orchestrator's own submitting burst
+/// landing right after a human's typing, because nothing remembered the
+/// human was ever there.
+#[test]
+fn attaching_and_detaching_inside_a_pause_still_refuses_the_next_burst() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (session, clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
+    let session = Arc::new(session);
+
+    let feeder = {
+        let session = session.clone();
+        std::thread::spawn(move || {
+            session.feed(&[
+                Step::Burst(b"first".to_vec()),
+                Step::Pause(1000),
+                Step::Burst(b"second".to_vec()),
+            ])
+        })
+    };
+
+    while writes.lock().unwrap().is_empty() {
+        std::thread::yield_now();
+    }
+
+    // Attach AND detach again, fully, before the second burst ever runs.
+    let held = session.attach().expect("attach during the pause");
+    drop(held);
+    assert!(
+        !session.is_attached(),
+        "must be detached again before the next burst runs — that is the point"
+    );
+
+    advance_until_finished(&clock, Duration::from_secs(1), &feeder);
+    let result = feeder.join().unwrap();
+
+    assert!(
+        matches!(result, Err(AgentError::Attached)),
+        "a burst must refuse if attach touched this act anywhere, even if \
+         already detached again by the time the burst runs: {result:?}"
+    );
+    assert_eq!(
+        writes.lock().unwrap().clone(),
+        vec![b"first".to_vec()],
+        "the submitting burst must never reach the pty once attach touched this act"
+    );
+}

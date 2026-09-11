@@ -156,12 +156,16 @@ act, pause included, is a second lock, `input_lock` — the thing a second
 sender cannot land inside at any point in the sequence. That is `feed`
 widening the same **divisibility** property a second time, not repealing it.
 
-Attachment is re-checked on *every* burst, not once at the act's start: a
-human can `attach` mid-pause, and the next burst must see that and refuse
-rather than finish delivering to a session it no longer has any business
-touching. `attach` itself takes neither lock, so an act sitting in a pause
-cannot make it wait — it simply wins the race, and the act's remaining bursts
-lose theirs.
+Attachment is re-checked on *every* burst, not once at the act's start — and
+not just the live flag. A human can `attach` **and detach again**, both
+fully inside one `Pause`, so `attached` reads false again by the time the
+next burst runs; a generation counter bumped on every successful `attach`
+is what a burst actually compares against, refusing if it has changed since
+the act started even though nothing is held *now*. `attach` itself takes
+neither lock, so an act sitting in a pause cannot make it wait — it simply
+wins the race, and the act's remaining bursts lose theirs. The failure this
+buys is a safe one: a refused act leaves its body typed but not submitted,
+never silently corrupted or misdelivered to whoever attached.
 
 A `feed` act's own pauses are what a caller sits inside of too — `Session::
 feed` runs on the daemon's connection thread, and a script's call blocks
@@ -178,8 +182,10 @@ test `feed_bursts_and_pauses_are_one_indivisible_act` and its negative control
 `control_separate_calls_with_a_gap_do_interleave` · a screen read never
 waiting on a pause, by test `capture_does_not_wait_out_a_feed_pause` · the
 attach race, by test
-`attaching_during_a_feed_pause_refuses_the_remaining_bursts` · the pause cap,
-by test `feed_refuses_a_total_pause_over_the_cap`
+`attaching_during_a_feed_pause_refuses_the_remaining_bursts` and the
+attach-then-detach-inside-one-pause case, by test
+`attaching_and_detaching_inside_a_pause_still_refuses_the_next_burst` · the
+pause cap, by test `feed_refuses_a_total_pause_over_the_cap`
 
 ## 7. Time is injected, never read
 
