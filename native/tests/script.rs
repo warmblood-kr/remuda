@@ -221,3 +221,47 @@ fn a_refusal_stops_the_script_instead_of_being_returned() {
         "execution continued past a refusal:\n{screen}"
     );
 }
+
+#[test]
+fn remuda_new_can_set_cwd_and_env_on_the_launched_process() {
+    // The launched process's OWN view — its own `pwd`, its own environment —
+    // not the request/response round trip, and not typed input a pty would
+    // just echo back (PRINCIPLES.md §4): `command` runs immediately as argv.
+    let dir = scratch("new-cwd-env");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let target = scratch("new-cwd-env-target");
+    // Escaped, not interpolated raw: on Windows this path contains `\`, which
+    // a raw insert into Lua source would misparse as an escape sequence.
+    let cwd_literal = target
+        .display()
+        .to_string()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let source = format!(
+        r#"
+        remuda.new("probed", {{"sh", "-c", "pwd && echo $PROBE_VAR"}}, "{cwd_literal}", {{PROBE_VAR = "remuda-env-probe-7f3a"}})
+        "#
+    );
+    script::run(&path, &write(&dir, "cwd-env.lua", &source)).expect("script");
+
+    let needle = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("scratch dir has a name")
+        .to_string();
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let screen = capture(&path, "probed");
+        if screen.contains(&needle) && screen.contains("remuda-env-probe-7f3a") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cwd/env never showed up on screen:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}

@@ -121,8 +121,12 @@ fn call(socket: &Path, id: Value, params: &Value) -> String {
                 })
                 .unwrap_or_default(),
             size: crate::terminal_size(),
-            cwd: None,
-            env: None,
+            cwd: args.get("cwd").and_then(Value::as_str).map(str::to_string),
+            env: args.get("env").and_then(Value::as_object).map(|map| {
+                map.iter()
+                    .filter_map(|(k, v)| Some((k.clone(), v.as_str()?.to_string())))
+                    .collect()
+            }),
         },
         "send" => Request::SendLine {
             name: text("session"),
@@ -256,6 +260,8 @@ fn frame() -> Vec<Value> {
                 "properties": {
                     "name": {"type": "string", "description": "Name for the new session."},
                     "command": {"type": "array", "items": {"type": "string"}},
+                    "cwd": {"type": "string"},
+                    "env": {"type": "object", "additionalProperties": {"type": "string"}},
                 },
             },
         }),
