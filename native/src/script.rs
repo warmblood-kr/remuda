@@ -40,7 +40,7 @@ pub const BINDINGS: [&str; 19] = [
     "ls",
     "mkdir",
     "new",
-    "rmdir",
+    "remove_dir_all",
     "send",
     "sleep",
     "tool",
@@ -253,9 +253,9 @@ fn dir_bindings(
 
     let path = at();
     table.set(
-        "rmdir",
+        "remove_dir_all",
         lua.create_function(move |lua, dir: String| {
-            value(lua, ask(&path, Request::Rmdir { path: dir })?)
+            value(lua, ask(&path, Request::RemoveDirAll { path: dir })?)
         })?,
     )?;
 

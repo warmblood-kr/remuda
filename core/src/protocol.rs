@@ -67,9 +67,9 @@ pub enum Request {
     /// Create a directory and any missing parents; a fresh, existing, or
     /// already-created path all succeed the same way.
     Mkdir { path: String },
-    /// Remove a directory and everything in it. Recursive by design: a topic
-    /// directory holds files, and a non-recursive rmdir could not remove one.
-    Rmdir { path: String },
+    /// Remove a directory and everything in it — named after the `std::fs`
+    /// call it makes, so nobody expects `rmdir`'s empty-directory-only rule.
+    RemoveDirAll { path: String },
     /// What build the daemon was started from, as [`Response::Value`]. A daemon
     /// outlives the binary that spawned it, so this is a client's only way to
     /// learn it is talking to yesterday's code before a field mismatch does.

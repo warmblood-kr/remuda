@@ -272,7 +272,8 @@ fn a_topic_directory_can_be_made_listed_and_removed_even_with_a_space_in_its_nam
         other => panic!("unexpected: {other:?}"),
     }
 
-    let response = client::request(&path, &Request::Rmdir { path: target_str }).expect("rmdir");
+    let response = client::request(&path, &Request::RemoveDirAll { path: target_str })
+        .expect("remove_dir_all");
     assert_eq!(response, Response::Ok);
     assert!(!target.exists());
 }

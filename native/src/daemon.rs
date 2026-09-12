@@ -254,7 +254,7 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
 
         Request::ListDir { path: dir } => reply(&stream, &list_dir(&dir)),
         Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
-        Request::Rmdir { path: dir } => reply(&stream, &rmdir(&dir)),
+        Request::RemoveDirAll { path: dir } => reply(&stream, &remove_dir_all(&dir)),
 
         Request::Eval { code, name } => match image.eval(&code, name.as_deref()) {
             Ok(value) => reply(&stream, &Response::Value(value)),
@@ -302,7 +302,7 @@ fn mkdir(path: &str) -> Response {
     }
 }
 
-fn rmdir(path: &str) -> Response {
+fn remove_dir_all(path: &str) -> Response {
     match std::fs::remove_dir_all(path) {
         Ok(()) => Response::Ok,
         Err(e) => Response::error(e.to_string()),
