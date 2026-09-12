@@ -201,6 +201,8 @@ fn run_session(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             name: name.clone(),
             command: command.clone(),
             size: terminal_size(),
+            cwd: None,
+            env: None,
         };
         match remuda_native::client::request(path, &request) {
             Ok(Response::Value(made)) => ride(path, &made),

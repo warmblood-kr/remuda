@@ -175,6 +175,8 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
             name,
             command,
             size,
+            cwd,
+            env,
         } => {
             let name = match name {
                 Some(given) => given,
@@ -185,7 +187,7 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
                         .as_str(),
                 )),
             };
-            match spawn(&name, &command, size) {
+            match spawn(&name, &command, size, cwd.as_deref(), env.as_ref()) {
                 Err(e) => reply(&stream, &Response::error(e)),
                 Ok(session) => match registry.register(session) {
                     Ok(_) => reply(&stream, &Response::Value(name)),
@@ -275,7 +277,13 @@ fn respond<T>(
     }
 }
 
-fn spawn(name: &str, command: &[String], size: Size) -> Result<Session, String> {
+fn spawn(
+    name: &str,
+    command: &[String],
+    size: Size,
+    cwd: Option<&str>,
+    env: Option<&std::collections::HashMap<String, String>>,
+) -> Result<Session, String> {
     let mut argv = command.to_vec();
     if argv.is_empty() {
         argv.push(default_shell());
@@ -284,14 +292,24 @@ fn spawn(name: &str, command: &[String], size: Size) -> Result<Session, String> 
     for arg in &argv[1..] {
         builder.arg(arg);
     }
-    if let Ok(cwd) = std::env::current_dir() {
-        builder.cwd(cwd);
+    match cwd {
+        Some(cwd) => builder.cwd(cwd),
+        None => {
+            if let Ok(cwd) = std::env::current_dir() {
+                builder.cwd(cwd);
+            }
+        }
     }
     // The daemon inherits its whole environment, and it is often auto-started
     // from something with no terminal — so `TERM` reaches the agent unset or
     // `dumb` and its TUI degrades for a reason nobody can see from inside.
     if std::env::var("TERM").map(|t| t == "dumb").unwrap_or(true) {
         builder.env("TERM", "xterm-256color");
+    }
+    if let Some(env) = env {
+        for (k, v) in env {
+            builder.env(k, v);
+        }
     }
 
     let agent = PtyAgent::spawn(builder, size).map_err(|e| e.to_string())?;

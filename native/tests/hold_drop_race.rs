@@ -96,6 +96,8 @@ fn new_session(path: &Path, name: &str) {
             name: Some(name.to_string()),
             command: vec!["sh".into()],
             size: Size::new(80, 24),
+            cwd: None,
+            env: None,
         },
     )
     .expect("new");
@@ -120,6 +122,8 @@ fn new_streaming_session(path: &Path, name: &str) {
                 "while :; do printf x; done".into(),
             ],
             size: Size::new(80, 24),
+            cwd: None,
+            env: None,
         },
     )
     .expect("new");

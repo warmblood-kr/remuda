@@ -25,13 +25,17 @@ pub enum Request {
     /// Every session this node holds.
     List,
     /// Start a session, answering [`Response::Value`] with the name it got.
-    /// `command` is argv; empty means the user's shell. `None` for `name`
-    /// derives one from argv[0] and de-duplicates it; a given name is exact.
+    /// `command` is argv (empty = shell); unset `name` derives and dedupes one.
+    /// `cwd`/`env` default to the daemon's own directory/environment.
     New {
         #[serde(default)]
         name: Option<String>,
         command: Vec<String>,
         size: Size,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        env: Option<std::collections::HashMap<String, String>>,
     },
     /// Deliver one instruction as an indivisible act. Refused while a human is
     /// attached — see [`crate::session::Session`], invariant 3.

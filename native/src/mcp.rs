@@ -121,6 +121,8 @@ fn call(socket: &Path, id: Value, params: &Value) -> String {
                 })
                 .unwrap_or_default(),
             size: crate::terminal_size(),
+            cwd: None,
+            env: None,
         },
         "send" => Request::SendLine {
             name: text("session"),
