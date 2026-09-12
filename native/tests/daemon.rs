@@ -64,6 +64,8 @@ fn new_session(path: &Path, name: &str) {
             name: Some(name.to_string()),
             command: vec!["sh".into()],
             size: Size::new(80, 24),
+            cwd: None,
+            env: None,
         },
     )
     .expect("new");
@@ -156,6 +158,8 @@ fn an_unnamed_session_names_itself_after_the_program_and_dedupes() {
                 name: None,
                 command: vec!["sh".into()],
                 size: Size::new(80, 24),
+                cwd: None,
+                env: None,
             },
         )
         .expect("new")
@@ -186,6 +190,8 @@ fn a_taken_name_is_refused_in_words() {
             name: Some("only".into()),
             command: vec!["sh".into()],
             size: Size::new(80, 24),
+            cwd: None,
+            env: None,
         },
     )
     .expect("second new");
@@ -197,6 +203,33 @@ fn a_taken_name_is_refused_in_words() {
         ),
         other => panic!("a duplicate name must be refused, got {other:?}"),
     }
+}
+
+#[test]
+fn a_session_launches_into_the_cwd_it_is_given() {
+    // Without a `cwd`, a session inherits the daemon's own directory — this
+    // proves the caller can override that, not merely that the daemon starts.
+    let path = scratch("cwd");
+    let _daemon = daemon_at(&path);
+
+    let dir = scratch_dir("cwd-target");
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("in-tmp".into()),
+            command: vec!["pwd".into()],
+            size: Size::new(80, 24),
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            env: None,
+        },
+    )
+    .expect("new");
+    assert_eq!(response, Response::Value("in-tmp".into()));
+
+    // `pwd` prints its directory and the shell it ran under then exits, so the
+    // path appears on screen once the process has actually run there.
+    let canonical = std::fs::canonicalize(&dir).unwrap_or(dir);
+    wait_for(&path, "in-tmp", canonical.to_string_lossy().as_ref());
 }
 
 #[test]

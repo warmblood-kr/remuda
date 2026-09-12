@@ -89,6 +89,8 @@ pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
                     name,
                     command: argv.unwrap_or_default(),
                     size: crate::terminal_size(),
+                    cwd: None,
+                    env: None,
                 };
                 value(lua, ask(&path, request)?)
             },

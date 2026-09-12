@@ -1126,6 +1126,8 @@ fn start(path: &Path, command: &str, size: Size) -> Result<(), String> {
         name: None,
         command: command.split_whitespace().map(str::to_string).collect(),
         size,
+        cwd: None,
+        env: None,
     };
     match client::request(path, &request) {
         Ok(Response::Value(_)) => Ok(()),
