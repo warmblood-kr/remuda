@@ -8,8 +8,8 @@
 //! `remuda.schedule`/`remuda._run_due_schedules`), not here.
 //!
 //! A registered schedule is in-memory only and does not survive a daemon
-//! restart — the same ceiling `steps/014-a-tool-registry.md:292-295` names
-//! for the tool registry this extends; not solved here, on purpose.
+//! restart — the same ceiling `steps/014-a-tool-registry.md` names for the
+//! tool registry this extends; not solved here, on purpose.
 
 use remuda_core::Clock;
 use std::sync::atomic::{AtomicU64, Ordering};
