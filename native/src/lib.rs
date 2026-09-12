@@ -13,6 +13,7 @@ pub mod ipc;
 pub mod mcp;
 pub mod pty;
 pub mod script;
+pub mod tick;
 pub mod tui;
 
 pub use portable_pty::CommandBuilder;

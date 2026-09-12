@@ -18,7 +18,7 @@ use crate::pty::PtyAgent;
 use interprocess::local_socket::traits::ListenerExt;
 use remuda_core::agent::{Cursor, Result as AgentResult};
 use remuda_core::protocol::{collapse_runs, Request, Response};
-use remuda_core::{Registry, Session, Size};
+use remuda_core::{Clock, Registry, Session, Size};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -128,6 +128,7 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     // a socket that is already accepting — the interpreter's first call cannot
     // race the listener it will talk to.
     let image = Image::spawn(path);
+    spawn_ticker(image.clone());
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let registry = Arc::clone(&registry);
@@ -137,6 +138,28 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
         });
     }
     Ok(())
+}
+
+/// A fixed period, not configurable yet — see `Ticker`'s own doc for why this
+/// is a ceiling to record rather than a knob to build out now.
+const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Wake the image once a period with `remuda._run_due_schedules(now)`. Its own
+/// thread, so a wedged schedule stalls only the tick, never the listener loop.
+fn spawn_ticker(image: Image) {
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let for_submit = Arc::clone(&clock);
+    std::thread::spawn(move || {
+        let ticker = crate::tick::Ticker::new(
+            move || {
+                let now = for_submit.now().as_secs_f64();
+                image.submit(&format!("remuda._run_due_schedules({now})"), None)
+            },
+            clock,
+            TICK_PERIOD,
+        );
+        ticker.run_forever();
+    });
 }
 
 fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result<()> {

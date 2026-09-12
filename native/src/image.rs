@@ -88,10 +88,13 @@ impl Image {
         Self { jobs }
     }
 
-    /// Evaluate `code` in the image and wait for the result. State persists
-    /// between calls — a `-e`, a script and a REPL line are all doors into one
-    /// interpreter, and a variable set by any of them outlives the call.
-    pub fn eval(&self, code: &str, name: Option<&str>) -> Result<String, String> {
+    /// Send `code` without waiting for it to finish — `tick.rs` needs this so
+    /// its own callback's duration never blocks it or the FIFO queue behind it.
+    pub fn submit(
+        &self,
+        code: &str,
+        name: Option<&str>,
+    ) -> Result<std::sync::mpsc::Receiver<Result<String, String>>, String> {
         let (reply, answer) = channel();
         self.jobs
             .send(Job {
@@ -100,7 +103,14 @@ impl Image {
                 reply,
             })
             .map_err(|_| "the image is not running".to_string())?;
-        answer
+        Ok(answer)
+    }
+
+    /// Evaluate `code` in the image and wait for the result. State persists
+    /// between calls — a `-e`, a script and a REPL line are all doors into one
+    /// interpreter, and a variable set by any of them outlives the call.
+    pub fn eval(&self, code: &str, name: Option<&str>) -> Result<String, String> {
+        self.submit(code, name)?
             .recv()
             .map_err(|_| "the image stopped without answering".to_string())?
     }

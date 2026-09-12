@@ -23,12 +23,13 @@ use remuda_core::protocol::{Request, Response, Step};
 use std::path::Path;
 use std::time::Duration;
 
-/// Every name in the live `remuda` table: the protocol operations and `sleep`
-/// bound here, then `tool`/`tools`/`_call`/`_descriptors`/`type_text` added by
-/// `tools.lua`. Asserted against the live table, both directions.
-pub const BINDINGS: [&str; 19] = [
+/// Every name in the live `remuda` table: the operations bound here, plus
+/// what `tools.lua` adds in pure Lua. Asserted against the live table, both
+/// directions.
+pub const BINDINGS: [&str; 22] = [
     "_call",
     "_descriptors",
+    "_run_due_schedules",
     "attach",
     "capture",
     "click",
@@ -41,6 +42,8 @@ pub const BINDINGS: [&str; 19] = [
     "mkdir",
     "new",
     "remove_dir_all",
+    "schedule",
+    "schedules",
     "send",
     "sleep",
     "tool",

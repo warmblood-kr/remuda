@@ -399,6 +399,51 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
 }
 
 #[test]
+fn a_registered_schedule_actually_fires_through_a_real_daemon() {
+    let path = scratch("schedule");
+    let _daemon = daemon_at(&path);
+
+    // `every` is seconds on native's own clock, kept tiny so the test's
+    // PATIENCE window covers many ticks rather than racing a single one.
+    let register = Request::Eval {
+        code: r#"
+            remuda.fired = 0
+            remuda.schedule({
+              name = "test-schedule",
+              every = 0.01,
+              run = function() remuda.fired = remuda.fired + 1 end,
+            })
+        "#
+        .to_string(),
+        name: None,
+    };
+    match client::request(&path, &register).expect("register") {
+        Response::Value(_) => {}
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let fired = client::request(
+            &path,
+            &Request::Eval {
+                code: "return remuda.fired".to_string(),
+                name: None,
+            },
+        )
+        .expect("read fired");
+        if matches!(&fired, Response::Value(v) if v != "0") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the schedule never fired: {fired:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn the_daemon_names_the_build_it_was_started_from() {
     let path = scratch("version");
     let _daemon = daemon_at(&path);
