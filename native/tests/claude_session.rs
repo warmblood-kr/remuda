@@ -77,7 +77,12 @@ fn capture(path: &Path, name: &str) -> String {
     }
 }
 
-fn wait_until(path: &Path, name: &str, patience: Duration, mut ready: impl FnMut(&str) -> bool) -> String {
+fn wait_until(
+    path: &Path,
+    name: &str,
+    patience: Duration,
+    mut ready: impl FnMut(&str) -> bool,
+) -> String {
     let deadline = Instant::now() + patience;
     loop {
         let screen = capture(path, name);
