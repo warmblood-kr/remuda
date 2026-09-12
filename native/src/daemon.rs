@@ -252,6 +252,10 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
             respond(&stream, &name, registry.close(&name), |()| Response::Ok)
         }
 
+        Request::ListDir { path: dir } => reply(&stream, &list_dir(&dir)),
+        Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
+        Request::Rmdir { path: dir } => reply(&stream, &rmdir(&dir)),
+
         Request::Eval { code, name } => match image.eval(&code, name.as_deref()) {
             Ok(value) => reply(&stream, &Response::Value(value)),
             // Lua's own message, which already carries the line and a
@@ -274,6 +278,34 @@ fn respond<T>(
         None => reply(stream, &Response::error(format!("no such session: {name}"))),
         Some(Err(e)) => reply(stream, &Response::error(e)),
         Some(Ok(v)) => reply(stream, &ok(v)),
+    }
+}
+
+fn list_dir(path: &str) -> Response {
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            let mut names: Vec<String> = entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().into_string().ok())
+                .collect();
+            names.sort();
+            Response::Entries(names)
+        }
+        Err(e) => Response::error(e.to_string()),
+    }
+}
+
+fn mkdir(path: &str) -> Response {
+    match std::fs::create_dir_all(path) {
+        Ok(()) => Response::Ok,
+        Err(e) => Response::error(e.to_string()),
+    }
+}
+
+fn rmdir(path: &str) -> Response {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Response::Ok,
+        Err(e) => Response::error(e.to_string()),
     }
 }
 

@@ -238,6 +238,46 @@ fn a_session_launches_into_the_cwd_it_is_given() {
 }
 
 #[test]
+fn a_topic_directory_can_be_made_listed_and_removed_even_with_a_space_in_its_name() {
+    // A space in the name is the whole point: `os.execute("mkdir -p ...")`
+    // would mangle this, real `std::fs` calls do not.
+    let path = scratch("dirverbs");
+    let _daemon = daemon_at(&path);
+
+    let base = scratch_dir("dirverbs-base");
+    let target = base.join("topic with a space");
+    let target_str = target.to_string_lossy().into_owned();
+
+    let response = client::request(
+        &path,
+        &Request::Mkdir {
+            path: target_str.clone(),
+        },
+    )
+    .expect("mkdir");
+    assert_eq!(response, Response::Ok);
+    assert!(target.is_dir());
+
+    std::fs::write(target.join("note.txt"), b"hi").expect("write");
+
+    match client::request(
+        &path,
+        &Request::ListDir {
+            path: target_str.clone(),
+        },
+    )
+    .expect("list_dir")
+    {
+        Response::Entries(names) => assert_eq!(names, vec!["note.txt".to_string()]),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    let response = client::request(&path, &Request::Rmdir { path: target_str }).expect("rmdir");
+    assert_eq!(response, Response::Ok);
+    assert!(!target.exists());
+}
+
+#[test]
 fn a_wire_size_below_the_floor_is_clamped_not_honoured() {
     // A constructor that clamps is worth nothing if a peer can post JSON around
     // it. 11 columns is the width that silently ate keystrokes in the
