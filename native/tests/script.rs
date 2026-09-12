@@ -241,7 +241,7 @@ fn remuda_new_can_set_cwd_and_env_on_the_launched_process() {
         .replace('"', "\\\"");
     let source = format!(
         r#"
-        remuda.new("probed", {{"sh", "-c", "pwd && echo $PROBE_VAR"}}, "{cwd_literal}", {{PROBE_VAR = "remuda-env-probe-7f3a"}})
+        remuda.new("probed", {{"sh", "-c", "pwd && echo $PROBE_VAR && echo path-has:$PATH"}}, "{cwd_literal}", {{PROBE_VAR = "remuda-env-probe-7f3a"}})
         "#
     );
     script::run(&path, &write(&dir, "cwd-env.lua", &source)).expect("script");
@@ -255,7 +255,13 @@ fn remuda_new_can_set_cwd_and_env_on_the_launched_process() {
     let deadline = Instant::now() + PATIENCE;
     loop {
         let screen = capture(&path, "probed");
-        if screen.contains(&needle) && screen.contains("remuda-env-probe-7f3a") {
+        // `path-has:/` proves env is ADDITIVE, not exclusive: the caller's map
+        // only ever sets PROBE_VAR, so an inherited PATH surviving alongside
+        // it means the daemon's own environment was layered under, not wiped.
+        if screen.contains(&needle)
+            && screen.contains("remuda-env-probe-7f3a")
+            && screen.contains("path-has:/")
+        {
             break;
         }
         assert!(
