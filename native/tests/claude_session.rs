@@ -98,6 +98,10 @@ fn wait_until(
 }
 
 #[test]
+#[ignore = "needs a real, authenticated `claude` CLI on PATH — CI runners have \
+            neither the binary nor Anthropic credentials, and installing \
+            either into public CI is out of scope. Run locally with \
+            `cargo test -p remuda-native --test claude_session -- --ignored`."]
 fn typing_into_a_real_claude_session_survives_the_trust_dialog() {
     let dir = scratch("claude");
     let socket = daemon::socket_path_in(&dir, "s");
