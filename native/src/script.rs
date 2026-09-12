@@ -77,15 +77,20 @@ pub fn run(socket: &Path, script: &Path) -> Result<(), String> {
     }
 }
 
-/// `new`'s wire shape. No Lua surface for `cwd`/`env` yet — that is a later
-/// step — this only builds what `Request::New` already requires of a caller.
-fn new_request(name: Option<String>, argv: Option<Vec<String>>) -> Request {
+/// `new`'s wire shape, from the four positional Lua arguments `bindings`
+/// hands it. `env` is a Lua table, already converted by the caller.
+fn new_request(
+    name: Option<String>,
+    argv: Option<Vec<String>>,
+    cwd: Option<String>,
+    env: Option<std::collections::HashMap<String, String>>,
+) -> Request {
     Request::New {
         name,
         command: argv.unwrap_or_default(),
         size: crate::terminal_size(),
-        cwd: None,
-        env: None,
+        cwd,
+        env,
     }
 }
 
@@ -103,15 +108,7 @@ pub fn bindings(
         lua.create_function(move |lua, ()| value(lua, ask(&path, Request::List)?))?,
     )?;
 
-    let path = at();
-    table.set(
-        "new",
-        lua.create_function(
-            move |lua, (name, argv): (Option<String>, Option<Vec<String>>)| {
-                value(lua, ask(&path, new_request(name, argv))?)
-            },
-        )?,
-    )?;
+    new_binding(lua, &table, at())?;
 
     let path = at();
     table.set(
@@ -236,6 +233,27 @@ pub fn bindings(
     Ok(table)
 }
 
+/// `remuda.new(name, argv, cwd, env)` — split out of `bindings` to stay under
+/// its line cap. The last two arguments are trailing and optional, so every
+/// existing 2-argument call site keeps working unchanged.
+fn new_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
+    table.set(
+        "new",
+        lua.create_function(
+            move |lua,
+                  (name, argv, cwd, env): (
+                Option<String>,
+                Option<Vec<String>>,
+                Option<String>,
+                Option<Table>,
+            )| {
+                let env = env.map(lua_env_to_wire).transpose()?;
+                value(lua, ask(&path, new_request(name, argv, cwd, env))?)
+            },
+        )?,
+    )
+}
+
 /// Plain filesystem primitives for topic directories, no session involved —
 /// split out of `bindings` to stay under its line cap. `dir`, not `path`, for
 /// the Lua-supplied argument: `at()` is always this table's own socket path.
@@ -312,6 +330,12 @@ fn lua_steps_to_wire(steps: Table) -> mlua::Result<Vec<Step>> {
         }
     }
     Ok(wire)
+}
+
+/// A Lua table of string keys to string values, into the map `Request::New`'s
+/// `env` field carries. Mirrors `lua_steps_to_wire`'s conversion style.
+fn lua_env_to_wire(env: Table) -> mlua::Result<std::collections::HashMap<String, String>> {
+    env.pairs::<String, String>().collect()
 }
 
 /// Turn a response into what the script sees. Caution: [`Response::Error`]

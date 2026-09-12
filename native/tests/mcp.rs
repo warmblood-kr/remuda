@@ -8,14 +8,20 @@
 //! failure a model turns into a confident story about an idle terminal.
 
 use remuda_core::protocol::{Request, Response};
+use remuda_core::Size;
 use remuda_native::{client, daemon, mcp};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 const PATIENCE: Duration = Duration::from_secs(10);
+
+/// The one `Request::New` field that is server-computed, never caller-supplied
+/// on any surface — excluded from the wire/schema comparison below on purpose.
+const SERVER_COMPUTED_FIELD: &str = "size";
 
 fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("remuda-m{}-{tag}", std::process::id()));
@@ -446,5 +452,119 @@ fn the_real_binary_completes_a_handshake_over_stdio() {
     match client::request(&path, &Request::List) {
         Ok(Response::Sessions(_)) => {}
         other => panic!("daemon unreachable after the handshake: {other:?}"),
+    }
+}
+
+/// The keys `Request::New` actually carries on the wire, minus the one field
+/// that is server-computed rather than caller-supplied.
+fn wire_new_fields() -> BTreeSet<String> {
+    let wire = serde_json::to_value(Request::New {
+        name: None,
+        command: vec![],
+        size: Size::new(80, 24),
+        cwd: None,
+        env: None,
+    })
+    .expect("Request::New serializes");
+    wire["New"]
+        .as_object()
+        .expect("New is externally tagged over an object")
+        .keys()
+        .filter(|k| *k != SERVER_COMPUTED_FIELD)
+        .cloned()
+        .collect()
+}
+
+/// The `new` tool's declared schema keys, the way a real MCP client would see
+/// them via `tools/list` — not read out of `mcp.rs` source.
+fn mcp_new_fields(path: &Path) -> BTreeSet<String> {
+    let reply = ask(
+        path,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    );
+    let tools = reply["result"]["tools"]
+        .as_array()
+        .expect("tools is a list");
+    let new_tool = tools
+        .iter()
+        .find(|t| t["name"] == "new")
+        .expect("the new tool is listed");
+    new_tool["inputSchema"]["properties"]
+        .as_object()
+        .expect("new has an object schema")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn the_new_tools_schema_matches_what_the_wire_actually_carries() {
+    // Today, before this test existed, BOTH surfaces silently lacked `cwd`/
+    // `env` and nothing caught it. This compares them structurally so the two
+    // cannot drift apart again without a test failing.
+    let dir = scratch("schema-parity");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let wire = wire_new_fields();
+    let mcp = mcp_new_fields(&path);
+    assert_eq!(
+        wire,
+        mcp,
+        "wire has {:?} that mcp lacks, mcp has {:?} that the wire lacks",
+        wire.difference(&mcp).collect::<Vec<_>>(),
+        mcp.difference(&wire).collect::<Vec<_>>()
+    );
+
+    // Negative control: drop one field from the wire side and confirm the
+    // comparison actually fails, so a vacuous pass (e.g. two empty sets) is
+    // ruled out.
+    let mut short = wire;
+    short.remove("cwd");
+    assert_ne!(
+        short, mcp,
+        "removing a field from the expectation should have broken the match"
+    );
+}
+
+#[test]
+fn a_tool_call_can_set_cwd_and_env_on_the_launched_process() {
+    // The launched process's OWN view — its own `pwd`, its own environment —
+    // not the request/response round trip, and not typed input a pty would
+    // just echo back (PRINCIPLES.md §4): `command` runs immediately as argv.
+    let dir = scratch("new-cwd-env");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let target = scratch("new-cwd-env-target");
+    let made = call(
+        &path,
+        "new",
+        json!({
+            "name": "probed",
+            "command": ["sh", "-c", "pwd && echo $PROBE_VAR"],
+            "cwd": target.to_string_lossy(),
+            "env": {"PROBE_VAR": "remuda-env-probe-7f3a"},
+        }),
+    );
+    assert_eq!(made["result"]["isError"], false, "new failed: {made}");
+
+    let needle = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("scratch dir has a name")
+        .to_string();
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let seen = text_of(&call(&path, "capture", json!({"session": "probed"})));
+        if seen.contains(&needle) && seen.contains("remuda-env-probe-7f3a") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cwd/env never showed up on screen:\n{seen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
