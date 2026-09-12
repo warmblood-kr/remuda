@@ -23,12 +23,13 @@ use remuda_core::protocol::{Request, Response, Step};
 use std::path::Path;
 use std::time::Duration;
 
-/// Every name in the live `remuda` table: the protocol operations and `sleep`
-/// bound here, then `tool`/`tools`/`_call`/`_descriptors`/`type_text` added by
-/// `tools.lua`. Asserted against the live table, both directions.
-pub const BINDINGS: [&str; 19] = [
+/// Every name in the live `remuda` table: the operations bound here, plus
+/// what `tools.lua` adds in pure Lua. Asserted against the live table, both
+/// directions.
+pub const BINDINGS: [&str; 23] = [
     "_call",
     "_descriptors",
+    "_run_due_schedules",
     "attach",
     "capture",
     "click",
@@ -41,6 +42,9 @@ pub const BINDINGS: [&str; 19] = [
     "mkdir",
     "new",
     "remove_dir_all",
+    "schedule",
+    "schedule_skips",
+    "schedules",
     "send",
     "sleep",
     "tool",
@@ -85,7 +89,11 @@ fn new_request(name: Option<String>, argv: Option<Vec<String>>) -> Request {
     }
 }
 
-pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
+pub fn bindings(
+    lua: &Lua,
+    socket: &Path,
+    counters: std::sync::Arc<crate::tick::SkipCounters>,
+) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
 
@@ -206,6 +214,7 @@ pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
     )?;
 
     dir_bindings(lua, &table, &at)?;
+    tick_bindings(lua, &table, counters)?;
 
     // Blocks the WHOLE Image, not just this call: the interpreter is pinned to
     // one thread (image.rs), so a sleeping script stalls every other job —
@@ -260,6 +269,25 @@ fn dir_bindings(
     )?;
 
     Ok(())
+}
+
+/// The `Ticker`'s own skip counters, read-only — no threshold or alarm here,
+/// split out of `bindings` to stay under its line cap. See `tick.rs`'s own
+/// hook-point comment for why acting on them is a separate, undecided step.
+fn tick_bindings(
+    lua: &Lua,
+    table: &Table,
+    counters: std::sync::Arc<crate::tick::SkipCounters>,
+) -> mlua::Result<()> {
+    table.set(
+        "schedule_skips",
+        lua.create_function(move |lua, ()| {
+            let row = lua.create_table()?;
+            row.set("consecutive", counters.consecutive())?;
+            row.set("total", counters.total())?;
+            Ok(row)
+        })?,
+    )
 }
 
 fn ask(socket: &Path, request: Request) -> mlua::Result<Response> {

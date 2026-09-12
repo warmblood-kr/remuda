@@ -57,6 +57,45 @@ function remuda.tool(spec)
   return word
 end
 
+remuda.schedules = {}
+
+-- 정수님, 2026-09-12: "다른 익스텐션들도 자기 스케쥴들을 등록할 수 있어야 합니다"
+-- — multi-registrant from the first line, the same `remuda.tool` shape. Native
+-- knows only ITS OWN fixed tick period; EVERY seconds and EVERY callback are
+-- this table's business alone, matching remuda.tool's split (Rust reflects,
+-- Lua decides). Does not survive a daemon restart — same ceiling as
+-- `remuda.tools` (`steps/014-a-tool-registry.md:292-295`), not solved here.
+function remuda.schedule(spec)
+  local name = spec.name
+  if type(name) ~= "string" or name == "" then
+    error("a schedule needs a name", 2)
+  end
+  if type(spec.every) ~= "number" or spec.every <= 0 then
+    error("schedule " .. name .. " needs a positive `every` (seconds)", 2)
+  end
+  if type(spec.run) ~= "function" then
+    error("schedule " .. name .. " needs a `run` function", 2)
+  end
+  remuda.schedules[name] = {
+    name = name,
+    every = spec.every,
+    run = spec.run,
+    last_run = 0,
+  }
+end
+
+-- Called once per native tick with the current time (seconds, native's
+-- clock). Fires every schedule whose own interval has elapsed since ITS OWN
+-- last run — native never sees or compares an individual interval itself.
+function remuda._run_due_schedules(now)
+  for _, schedule in pairs(remuda.schedules) do
+    if now - schedule.last_run >= schedule.every then
+      schedule.last_run = now
+      schedule.run()
+    end
+  end
+end
+
 local escapes = {
   ['"'] = '\\"',
   ["\\"] = "\\\\",

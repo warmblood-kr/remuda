@@ -18,7 +18,7 @@ use crate::pty::PtyAgent;
 use interprocess::local_socket::traits::ListenerExt;
 use remuda_core::agent::{Cursor, Result as AgentResult};
 use remuda_core::protocol::{collapse_runs, Request, Response};
-use remuda_core::{Registry, Session, Size};
+use remuda_core::{Clock, Registry, Session, Size};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -127,7 +127,9 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     // It is started *after* the bind, so the `remuda` table it binds points at
     // a socket that is already accepting — the interpreter's first call cannot
     // race the listener it will talk to.
-    let image = Image::spawn(path);
+    let counters = Arc::new(crate::tick::SkipCounters::default());
+    let image = Image::spawn(path, Arc::clone(&counters));
+    spawn_ticker(image.clone(), counters);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let registry = Arc::clone(&registry);
@@ -137,6 +139,30 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
         });
     }
     Ok(())
+}
+
+/// A fixed period, not configurable yet. Fires every period whether or not
+/// anything is registered — an unconditional wakeup rate paid by every
+/// daemon, not just a latency ceiling for schedules; see steps/031.
+const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Wake the image once a period with `remuda._run_due_schedules(now)`. Its own
+/// thread, so a wedged schedule stalls only the tick, never the listener loop.
+fn spawn_ticker(image: Image, counters: Arc<crate::tick::SkipCounters>) {
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let for_submit = Arc::clone(&clock);
+    std::thread::spawn(move || {
+        let ticker = crate::tick::Ticker::new(
+            move || {
+                let now = for_submit.now().as_secs_f64();
+                image.submit(&format!("remuda._run_due_schedules({now})"), None)
+            },
+            clock,
+            TICK_PERIOD,
+            counters,
+        );
+        ticker.run_forever();
+    });
 }
 
 fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result<()> {
