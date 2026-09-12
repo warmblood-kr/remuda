@@ -1,9 +1,10 @@
 //! The periodic clock a registered Lua schedule fires on.
 //!
 //! 「N초마다 깨워준다」는 remuda가 알아도 되지만 「그때 컴팩션을 돌려라」는
-//! remuda가 알면 안 된다 (design/concept-model.md:525-532). This type knows
-//! only its own period and the current time; every registrant's own interval
-//! and every registrant's own callback live in Lua (`tools.lua`'s
+//! remuda가 알면 안 된다 (see
+//! `steps/031-native-keeps-the-clock-lua-keeps-the-calendar.md`). This type
+//! knows only its own period and the current time; every registrant's own
+//! interval and every registrant's own callback live in Lua (`tools.lua`'s
 //! `remuda.schedule`/`remuda._run_due_schedules`), not here.
 //!
 //! A registered schedule is in-memory only and does not survive a daemon
