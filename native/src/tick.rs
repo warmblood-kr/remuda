@@ -18,6 +18,34 @@ use std::time::Duration;
 
 type JobReceiver = Receiver<Result<String, String>>;
 
+/// The skip counters, shared between the `Ticker` that writes them and the
+/// Lua binding that reads them — constructed before either exists, since the
+/// image's bindings are built before `daemon::serve` has a `Ticker` to ask.
+#[derive(Default)]
+pub struct SkipCounters {
+    consecutive: AtomicU64,
+    total: AtomicU64,
+}
+
+impl SkipCounters {
+    pub fn consecutive(&self) -> u64 {
+        self.consecutive.load(Ordering::SeqCst)
+    }
+
+    pub fn total(&self) -> u64 {
+        self.total.load(Ordering::SeqCst)
+    }
+
+    fn record_skip(&self) {
+        self.total.fetch_add(1, Ordering::SeqCst);
+        self.consecutive.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_reset(&self) {
+        self.consecutive.store(0, Ordering::SeqCst);
+    }
+}
+
 /// Fires `submit` once per `period`, never more than one call in flight —
 /// a hung callback must skip a tick, not queue a second job behind the one
 /// still running in the image's single unbounded, strictly FIFO queue.
@@ -26,8 +54,7 @@ pub struct Ticker {
     clock: Arc<dyn Clock>,
     period: Duration,
     in_flight: Mutex<Option<JobReceiver>>,
-    consecutive_skips: AtomicU64,
-    total_skips: AtomicU64,
+    counters: Arc<SkipCounters>,
 }
 
 impl Ticker {
@@ -35,14 +62,14 @@ impl Ticker {
         submit: impl Fn() -> Result<JobReceiver, String> + Send + Sync + 'static,
         clock: Arc<dyn Clock>,
         period: Duration,
+        counters: Arc<SkipCounters>,
     ) -> Self {
         Self {
             submit: Box::new(submit),
             clock,
             period,
             in_flight: Mutex::new(None),
-            consecutive_skips: AtomicU64::new(0),
-            total_skips: AtomicU64::new(0),
+            counters,
         }
     }
 
@@ -73,25 +100,24 @@ impl Ticker {
         };
 
         if ready {
-            self.consecutive_skips.store(0, Ordering::SeqCst);
+            self.counters.record_reset();
             *in_flight = (self.submit)().ok();
         } else {
-            self.total_skips.fetch_add(1, Ordering::SeqCst);
             // Escalation hook-point: one skip is normal (a callback ran a
             // little long). A long CONSECUTIVE run means the image is wedged,
             // not slow — that is the distinction worth surfacing once
             // something acts on it. What threshold and what action are
             // undecided; this counter is where that decision attaches later.
-            self.consecutive_skips.fetch_add(1, Ordering::SeqCst);
+            self.counters.record_skip();
         }
     }
 
     pub fn consecutive_skips(&self) -> u64 {
-        self.consecutive_skips.load(Ordering::SeqCst)
+        self.counters.consecutive()
     }
 
     pub fn total_skips(&self) -> u64 {
-        self.total_skips.load(Ordering::SeqCst)
+        self.counters.total()
     }
 }
 
@@ -116,6 +142,7 @@ mod tests {
             },
             clock,
             std::time::Duration::from_millis(1),
+            std::sync::Arc::new(super::SkipCounters::default()),
         );
         ticker.step(); // submits the one job
         ticker.step(); // still not answered — must skip, not resubmit

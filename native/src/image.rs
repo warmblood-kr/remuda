@@ -23,6 +23,7 @@ use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{channel, Sender};
+use std::sync::Arc;
 
 /// One unit of work for the image: source to evaluate, and where the answer
 /// goes. The reply channel is per-job rather than shared, so two callers
@@ -43,8 +44,8 @@ pub struct Image {
 impl Image {
     /// Start the interpreter and return a handle to it. `socket` is the daemon's
     /// own: the `remuda` table calls back over it rather than reaching the
-    /// `Registry`, keeping one definition of the vocabulary instead of two.
-    pub fn spawn(socket: &Path) -> Self {
+    /// `Registry`. `counters` is the daemon's own `SkipCounters`, shared with `Ticker`.
+    pub fn spawn(socket: &Path, counters: Arc<crate::tick::SkipCounters>) -> Self {
         let (jobs, inbox) = channel::<Job>();
         let socket: PathBuf = socket.to_path_buf();
 
@@ -58,7 +59,7 @@ impl Image {
 
             // A failure here means no image at all, so every eval must say so
             // rather than the thread dying quietly and every caller hanging.
-            let ready = script::bindings(&lua, &socket)
+            let ready = script::bindings(&lua, &socket, counters)
                 .and_then(|table| lua.globals().set("remuda", table))
                 // The tool frame is Lua over those bindings, not a second set of
                 // them. It must load *after* the table exists and *before* any

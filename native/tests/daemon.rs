@@ -432,12 +432,14 @@ fn a_registered_schedule_actually_fires_through_a_real_daemon() {
             },
         )
         .expect("read fired");
-        if matches!(&fired, Response::Value(v) if v != "0") {
+        // >= 2, not != "0" — the name promises PERIODIC firing, and a
+        // scheduler that fires once and stops must fail this test.
+        if matches!(&fired, Response::Value(v) if v.parse::<u32>().is_ok_and(|n| n >= 2)) {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the schedule never fired: {fired:?}"
+            "the schedule did not fire at least twice: {fired:?}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }

@@ -127,8 +127,9 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     // It is started *after* the bind, so the `remuda` table it binds points at
     // a socket that is already accepting — the interpreter's first call cannot
     // race the listener it will talk to.
-    let image = Image::spawn(path);
-    spawn_ticker(image.clone());
+    let counters = Arc::new(crate::tick::SkipCounters::default());
+    let image = Image::spawn(path, Arc::clone(&counters));
+    spawn_ticker(image.clone(), counters);
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let registry = Arc::clone(&registry);
@@ -140,13 +141,14 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A fixed period, not configurable yet — see `Ticker`'s own doc for why this
-/// is a ceiling to record rather than a knob to build out now.
+/// A fixed period, not configurable yet. Fires every period whether or not
+/// anything is registered — an unconditional wakeup rate paid by every
+/// daemon, not just a latency ceiling for schedules; see steps/031.
 const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Wake the image once a period with `remuda._run_due_schedules(now)`. Its own
 /// thread, so a wedged schedule stalls only the tick, never the listener loop.
-fn spawn_ticker(image: Image) {
+fn spawn_ticker(image: Image, counters: Arc<crate::tick::SkipCounters>) {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let for_submit = Arc::clone(&clock);
     std::thread::spawn(move || {
@@ -157,6 +159,7 @@ fn spawn_ticker(image: Image) {
             },
             clock,
             TICK_PERIOD,
+            counters,
         );
         ticker.run_forever();
     });
