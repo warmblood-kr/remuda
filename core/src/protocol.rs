@@ -61,6 +61,15 @@ pub enum Request {
     /// Refused while a human is attached, as `Send`/`SendLine` are. A session
     /// that ended on its own is dropped by `List`; this is for one still alive.
     Close { name: String },
+    /// List a directory's immediate entries by name, sorted. No session
+    /// involved — a plain filesystem primitive for managing topic directories.
+    ListDir { path: String },
+    /// Create a directory and any missing parents; a fresh, existing, or
+    /// already-created path all succeed the same way.
+    Mkdir { path: String },
+    /// Remove a directory and everything in it — named after the `std::fs`
+    /// call it makes, so nobody expects `rmdir`'s empty-directory-only rule.
+    RemoveDirAll { path: String },
     /// What build the daemon was started from, as [`Response::Value`]. A daemon
     /// outlives the binary that spawned it, so this is a client's only way to
     /// learn it is talking to yesterday's code before a field mismatch does.
@@ -109,6 +118,9 @@ pub enum Response {
     /// The reason, in words meant for a person. A client prints this; it does
     /// not parse it.
     Error(String),
+    /// Directory entries, answering [`Request::ListDir`] — names only, no
+    /// path prefix, sorted for a stable diff.
+    Entries(Vec<String>),
 }
 
 impl Response {

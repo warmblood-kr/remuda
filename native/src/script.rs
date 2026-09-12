@@ -26,7 +26,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the protocol operations and `sleep`
 /// bound here, then `tool`/`tools`/`_call`/`_descriptors`/`type_text` added by
 /// `tools.lua`. Asserted against the live table, both directions.
-pub const BINDINGS: [&str; 16] = [
+pub const BINDINGS: [&str; 19] = [
     "_call",
     "_descriptors",
     "attach",
@@ -36,8 +36,11 @@ pub const BINDINGS: [&str; 16] = [
     "feed",
     "insert",
     "key",
+    "list_dir",
     "ls",
+    "mkdir",
     "new",
+    "remove_dir_all",
     "send",
     "sleep",
     "tool",
@@ -202,6 +205,8 @@ pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
         })?,
     )?;
 
+    dir_bindings(lua, &table, &at)?;
+
     // Blocks the WHOLE Image, not just this call: the interpreter is pinned to
     // one thread (image.rs), so a sleeping script stalls every other job —
     // the REPL, `-e`, any other script — for the full duration. Not a wait or
@@ -220,6 +225,41 @@ pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
     )?;
 
     Ok(table)
+}
+
+/// Plain filesystem primitives for topic directories, no session involved —
+/// split out of `bindings` to stay under its line cap. `dir`, not `path`, for
+/// the Lua-supplied argument: `at()` is always this table's own socket path.
+fn dir_bindings(
+    lua: &Lua,
+    table: &Table,
+    at: &impl Fn() -> std::path::PathBuf,
+) -> mlua::Result<()> {
+    let path = at();
+    table.set(
+        "list_dir",
+        lua.create_function(move |lua, dir: String| {
+            value(lua, ask(&path, Request::ListDir { path: dir })?)
+        })?,
+    )?;
+
+    let path = at();
+    table.set(
+        "mkdir",
+        lua.create_function(move |lua, dir: String| {
+            value(lua, ask(&path, Request::Mkdir { path: dir })?)
+        })?,
+    )?;
+
+    let path = at();
+    table.set(
+        "remove_dir_all",
+        lua.create_function(move |lua, dir: String| {
+            value(lua, ask(&path, Request::RemoveDirAll { path: dir })?)
+        })?,
+    )?;
+
+    Ok(())
 }
 
 fn ask(socket: &Path, request: Request) -> mlua::Result<Response> {
@@ -268,6 +308,13 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
                 row.set("cols", session.size.cols())?;
                 row.set("rows", session.size.rows())?;
                 rows.set(index + 1, row)?;
+            }
+            Ok(Value::Table(rows))
+        }
+        Response::Entries(names) => {
+            let rows = lua.create_table()?;
+            for (index, name) in names.into_iter().enumerate() {
+                rows.set(index + 1, name)?;
             }
             Ok(Value::Table(rows))
         }
