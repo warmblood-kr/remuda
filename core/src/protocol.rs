@@ -25,10 +25,8 @@ pub enum Request {
     /// Every session this node holds.
     List,
     /// Start a session, answering [`Response::Value`] with the name it got.
-    /// `command` is argv; empty means the user's shell. `None` for `name`
-    /// derives one from argv[0] and de-duplicates it; a given name is exact.
-    /// `cwd` defaults to the daemon's own directory when `None`; `env` adds
-    /// to (and can override) the inherited environment when `Some`.
+    /// `command` is argv (empty = shell); unset `name` derives and dedupes one.
+    /// `cwd`/`env` default to the daemon's own directory/environment.
     New {
         #[serde(default)]
         name: Option<String>,

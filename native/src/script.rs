@@ -70,6 +70,18 @@ pub fn run(socket: &Path, script: &Path) -> Result<(), String> {
     }
 }
 
+/// `new`'s wire shape. No Lua surface for `cwd`/`env` yet — that is a later
+/// step — this only builds what `Request::New` already requires of a caller.
+fn new_request(name: Option<String>, argv: Option<Vec<String>>) -> Request {
+    Request::New {
+        name,
+        command: argv.unwrap_or_default(),
+        size: crate::terminal_size(),
+        cwd: None,
+        env: None,
+    }
+}
+
 pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
@@ -85,14 +97,7 @@ pub fn bindings(lua: &Lua, socket: &Path) -> mlua::Result<Table> {
         "new",
         lua.create_function(
             move |lua, (name, argv): (Option<String>, Option<Vec<String>>)| {
-                let request = Request::New {
-                    name,
-                    command: argv.unwrap_or_default(),
-                    size: crate::terminal_size(),
-                    cwd: None,
-                    env: None,
-                };
-                value(lua, ask(&path, request)?)
+                value(lua, ask(&path, new_request(name, argv))?)
             },
         )?,
     )?;

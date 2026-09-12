@@ -226,10 +226,15 @@ fn a_session_launches_into_the_cwd_it_is_given() {
     .expect("new");
     assert_eq!(response, Response::Value("in-tmp".into()));
 
-    // `pwd` prints its directory and the shell it ran under then exits, so the
-    // path appears on screen once the process has actually run there.
-    let canonical = std::fs::canonicalize(&dir).unwrap_or(dir);
-    wait_for(&path, "in-tmp", canonical.to_string_lossy().as_ref());
+    // `pwd`'s own rendering of a path is platform-specific (Windows' shell
+    // spells it `\\?\C:\...`, a POSIX shell `/c/...`) — the directory's own
+    // name is the one substring both agree on, so that is what we look for.
+    let needle = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("scratch dir has a name")
+        .to_string();
+    wait_for(&path, "in-tmp", &needle);
 }
 
 #[test]
