@@ -90,7 +90,9 @@ fn listed(path: &Path) -> Vec<String> {
 fn the_tool_surface_is_the_frame_plus_the_image() {
     // Checked in both directions — a tool served but not declared fails, and a
     // name declared but never served fails too. On a fresh daemon the whole
-    // list is `TOOLS` plus what `src/tools.lua` registers, which is `wait_for`.
+    // list is `TOOLS` plus what `src/tools.lua` registers: `wait_for`, plus
+    // `request_counts`/`schedule_skips` (steps/033's follow-up — see
+    // `named_counters_are_reachable_over_a_real_mcp_tools_call` below).
     //
     // `attach` is absent: it hands a terminal to a human and an MCP client has
     // no terminal. The absence is a decision, recorded here so it stays one.
@@ -106,6 +108,8 @@ fn the_tool_surface_is_the_frame_plus_the_image() {
 
     let mut expected = mcp::TOOLS.map(str::to_string).to_vec();
     expected.push("wait_for".to_string());
+    expected.push("request_counts".to_string());
+    expected.push("schedule_skips".to_string());
     expected.sort();
     assert_eq!(
         served, expected,
@@ -375,6 +379,38 @@ fn wait_for_answers_a_screen_and_refuses_a_deadline() {
     assert!(text_of(&never).contains("never matched"), "{never}");
 }
 
+/// [MEASURED] `request_counts`/`schedule_skips` (steps/033's follow-up)
+/// existed as plain Lua bindings, readable from a script but not MCP — MCP's
+/// `tools/call` only reaches `remuda.tools`, a separate registry. This is
+/// the real dispatch (`call`, a real `tools/call` JSON-RPC request through
+/// `mcp::handle`), not an `Eval` shortcut straight to `remuda._call`.
+#[test]
+fn named_counters_are_reachable_over_a_real_mcp_tools_call() {
+    let dir = scratch("named-counters-mcp");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let served = listed(&path);
+    assert!(served.contains(&"request_counts".to_string()), "{served:?}");
+    assert!(served.contains(&"schedule_skips".to_string()), "{served:?}");
+
+    // A real request, so request_counts has something real to report.
+    client::request(&path, &Request::List).expect("list");
+
+    let counts = call(&path, "request_counts", json!({}));
+    assert_eq!(counts["result"]["isError"], false, "{counts}");
+    let text = text_of(&counts);
+    assert!(text.contains("list="), "{text}");
+    assert!(text.contains("eval="), "{text}");
+    assert!(text.contains("capture_styled="), "{text}");
+
+    let skips = call(&path, "schedule_skips", json!({}));
+    assert_eq!(skips["result"]["isError"], false, "{skips}");
+    let text = text_of(&skips);
+    assert!(text.contains("consecutive="), "{text}");
+    assert!(text.contains("total="), "{text}");
+}
+
 #[test]
 fn the_real_binary_completes_a_handshake_over_stdio() {
     // `serve` is a stdlib line loop and the tests above bypass it. This one runs
@@ -440,12 +476,13 @@ fn the_real_binary_completes_a_handshake_over_stdio() {
     );
     let second: Value = serde_json::from_str(lines[1]).expect("reply 2 is JSON");
     assert_eq!(second["id"], 2);
-    // The frame's own five plus whatever the image registered — the shipped
-    // binary must reflect the registry, not just the constant compiled into it.
+    // The frame's own five plus whatever the image registered (wait_for,
+    // request_counts, schedule_skips) — the shipped binary must reflect the
+    // registry, not just the constant compiled into it.
     assert_eq!(
         second["result"]["tools"].as_array().map(Vec::len),
-        Some(mcp::TOOLS.len() + 1),
-        "the binary serves a different tool count than mcp::TOOLS + wait_for"
+        Some(mcp::TOOLS.len() + 3),
+        "the binary serves a different tool count than mcp::TOOLS + the image's registry"
     );
 
     // The daemon really was the one answering, not a stub inside the child.
