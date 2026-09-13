@@ -26,11 +26,14 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 23] = [
+pub const BINDINGS: [&str; 28] = [
     "_call",
     "_descriptors",
+    "_refresh_sessions_buffer",
     "_run_due_schedules",
     "attach",
+    "buffer",
+    "buffers",
     "capture",
     "click",
     "close",
@@ -50,6 +53,8 @@ pub const BINDINGS: [&str; 23] = [
     "tool",
     "tools",
     "type_text",
+    "window",
+    "windows",
 ];
 
 /// Run a script file **in the daemon's image**, never in a fresh `Lua::new()`

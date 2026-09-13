@@ -291,6 +291,37 @@ function remuda.type_text(session, text, settle)
   })
 end
 
+-- The left session list, re-expressed as the "*sessions*" buffer instead of
+-- being drawn straight out of Rust. 정수님, 2026-09-13: *"세션 목록 문서 패널,
+-- 인박스 결정 문서 등 관리하는 것도, lua단에서 이루어져야 할 것 같습니다."*
+--
+-- `tui.rs`'s `list_row` keeps exactly two things it always had: the cursor
+-- mark (which row is selected is a per-viewer fact, not buffer content —
+-- the same reason an Emacs buffer does not store which window's point is
+-- where) and the width-aware padding/truncation math (mechanism, the same
+-- boundary `capture`'s styled-vs-plain split already draws — see
+-- `script.rs`'s doc comment on why color stays in the frame). Everything
+-- this function decides — the tail word, the empty-herd copy — is content,
+-- and content is what a buffer holds.
+--
+-- WIDTH is passed in rather than read from anywhere, because whether the
+-- tail shows `live`/`dead` or just the flag depends on the caller's own
+-- column budget — a fact only the renderer asking for a refresh has.
+function remuda._refresh_sessions_buffer(width)
+  local sessions = remuda.ls()
+  local lines = {}
+  if #sessions == 0 then
+    lines = { "the herd is empty.", "press n to start a session." }
+  else
+    for i, s in ipairs(sessions) do
+      local flag = s.attached and "⚑" or " "
+      local state = s.alive and "live" or "dead"
+      lines[i] = (width >= 22) and (state .. " " .. flag) or flag
+    end
+  end
+  remuda.buffer.new("*sessions*"):set(table.concat(lines, "\n"))
+end
+
 -- The first word, and the one `steps/008` found missing: readiness. Driving an
 -- agent means waiting for it, and every caller so far has written this loop
 -- again — `tests/api/v1.lua` has its own copy.

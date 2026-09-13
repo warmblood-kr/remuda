@@ -79,6 +79,15 @@ pub struct Ui {
     /// One line of feedback under the list — a refusal, or how the last ride
     /// ended. Cleared by the next keypress that does anything.
     pub notice: Option<String>,
+    /// The "*sessions*" buffer's content (`tools.lua`'s
+    /// `remuda._refresh_sessions_buffer`), one line per session in the same
+    /// order as `sessions` (both come from the same sorted-by-name `ls`), or
+    /// the two empty-herd lines when there is no herd. `list_row` reads this
+    /// instead of `sessions[i].alive`/`.attached` directly — the tail word
+    /// and empty-herd copy are Lua's now, not Rust's. Kept across a failed
+    /// refresh, same as `sessions` itself: a transport hiccup is not "the
+    /// buffer went blank".
+    sessions_text: Vec<String>,
 }
 
 impl Ui {
@@ -94,6 +103,7 @@ impl Ui {
             focus: Focus::List,
             shell: shell.to_string(),
             notice,
+            sessions_text: Vec::new(),
         }
     }
 
@@ -836,13 +846,20 @@ pub fn pane_size(ui: &Ui, cols: u16, rows: u16) -> Size {
 /// A row that degrades instead of being cut. When the preview claims most of
 /// the terminal the list can floor at 16 columns, and a truncated row loses
 /// `live`/`dead` — the one field the whole list exists to show.
+///
+/// The tail word and the empty-herd copy are `ui.sessions_text` — the
+/// "*sessions*" buffer's content, Lua's now (`tools.lua`'s
+/// `remuda._refresh_sessions_buffer`). What stays here is the cursor mark
+/// (a per-viewer fact, never buffer content) and the width-aware
+/// padding/truncation math — mechanism, same as `capture`'s styled-vs-plain
+/// split keeping color in the frame.
 fn list_row(ui: &Ui, row: usize, width: u16) -> String {
     if ui.sessions.is_empty() {
         // The empty herd says what it is and what to do about it. It does not
         // open a prompt on its own, and it never starts anything by itself.
         return match row {
-            1 => "  the herd is empty.".into(),
-            3 => "  press n to start a session.".into(),
+            1 => format!("  {}", ui.sessions_text.first().map_or("", String::as_str)),
+            3 => format!("  {}", ui.sessions_text.get(1).map_or("", String::as_str)),
             _ => String::new(),
         };
     }
@@ -850,17 +867,11 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
         return String::new();
     };
     let cursor = if row == ui.selected { "▸" } else { " " };
-    let flag = if session.attached { "⚑" } else { " " };
-    let state = if session.alive { "live" } else { "dead" };
+    let tail = ui.sessions_text.get(row).map_or("", String::as_str);
     // No time-driven field: `idle` never resets on typing (only on `send`,
     // see session.rs), so it read as an uptime clock, not "liveness" — and it
     // was the only per-second repaint source in the whole TUI. See steps/026.
-    let tail = if width >= 22 {
-        format!("{state} {flag}")
-    } else {
-        flag.to_string()
-    };
-    let room = (width as usize).saturating_sub(visible_width(&tail) + 3);
+    let room = (width as usize).saturating_sub(visible_width(tail) + 3);
     format!("{cursor} {} {tail}", fit(&session.name, room as u16))
 }
 
@@ -907,11 +918,23 @@ fn refresh(
     painted: &mut String,
     skip_list: bool,
 ) -> std::io::Result<(u16, u16)> {
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     if !skip_list {
         match list(path) {
             Ok(sessions) => ui.sessions = sessions,
             // Keep the last known herd rather than blanking it: a transport
             // failure is not a report that every session vanished. See steps/021.
+            Err(e) => ui.notice = Some(e),
+        }
+        // Same skip as the relist above, and for the same reason: a
+        // `Type`-forced wake (fast-typing tick) needs none of this, so
+        // paying for it there would be the exact per-keystroke IPC cost
+        // steps/017/022 exist to avoid.
+        let (list_w, _) = layout(cols, widest(ui));
+        match sessions_buffer_lines(path, list_w) {
+            Ok(lines) => ui.sessions_text = lines,
+            // Same fallback as the relist: keep whatever was last drawn
+            // rather than blanking the tail column on a transport hiccup.
             Err(e) => ui.notice = Some(e),
         }
     }
@@ -943,7 +966,6 @@ fn refresh(
         },
         None => (Vec::new(), hidden),
     };
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let frame = render_styled(ui, &cells, cursor, server, cols, rows);
     // The write is gated on change, as it always was — but before
     // `should_refresh` existed, everything ABOVE this line (a relist, an IPC
@@ -1095,6 +1117,21 @@ fn take(path: &Path, ui: &mut Ui) -> Option<(String, Hold)> {
 fn list(path: &Path) -> Result<Vec<SessionSummary>, String> {
     match client::request(path, &Request::List) {
         Ok(Response::Sessions(sessions)) => Ok(sessions),
+        Ok(Response::Error(reason)) => Err(reason),
+        other => Err(format!("{other:?}")),
+    }
+}
+
+/// The "*sessions*" buffer's content, refreshed at WIDTH and fetched in the
+/// same round trip (`tools.lua`'s `remuda._refresh_sessions_buffer`, then
+/// `remuda.buffer.new("*sessions*"):get()`) — one `Eval`, not two requests,
+/// since nothing else needs the buffer to exist as a separate step here.
+fn sessions_buffer_lines(path: &Path, width: u16) -> Result<Vec<String>, String> {
+    let code = format!(
+        "remuda._refresh_sessions_buffer({width}); return remuda.buffer.new('*sessions*'):get()"
+    );
+    match client::request(path, &Request::Eval { code, name: None }) {
+        Ok(Response::Value(text)) => Ok(text.split('\n').map(str::to_string).collect()),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
     }
@@ -1908,7 +1945,14 @@ mod tests {
     /// its internals — stop and report rather than updating the literal.
     #[test]
     fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buffer_migration() {
-        let ui = ui(vec![row("alpha", true, false), row("bravo", true, true)]);
+        let mut ui = ui(vec![row("alpha", true, false), row("bravo", true, true)]);
+        // What a real refresh() would have fetched from the "*sessions*"
+        // buffer at this scenario's list width (16, per `layout(80, 80)`):
+        // unattached is a bare space, attached is the flag — width 16 is
+        // under the 22-column threshold `tools.lua` uses for the live/dead
+        // word, so neither row shows it. This is `render_styled`'s only
+        // input that no longer comes from `ui.sessions` directly.
+        ui.sessions_text = vec![" ".into(), "⚑".into()];
         let cells = vec![text_row(10); 23];
         let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
         assert_eq!(
@@ -1949,7 +1993,14 @@ mod tests {
     #[test]
     fn render_styled_of_the_empty_session_list_is_byte_identical_before_and_after_the_buffer_migration(
     ) {
-        let ui = ui(vec![]);
+        let mut ui = ui(vec![]);
+        // What a real refresh() would have fetched for an empty herd: the
+        // two fixed lines `tools.lua`'s `remuda._refresh_sessions_buffer`
+        // returns, now content rather than a Rust string literal.
+        ui.sessions_text = vec![
+            "the herd is empty.".into(),
+            "press n to start a session.".into(),
+        ];
         let cells: Vec<Vec<StyledCell>> = vec![];
         let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
         assert_eq!(
@@ -2117,6 +2168,7 @@ mod tests {
     fn the_frame_says_what_it_is_showing() {
         let mut ui = ui(vec![row("claude", true, false), row("busy", true, true)]);
         ui.notice = None;
+        ui.sessions_text = vec![" ".into(), "⚑".into()];
         let frame = render(&ui, "hello", "default", 120, 10);
         assert!(frame.contains("remuda · default"));
         assert!(frame.contains("▸ claude"), "the cursor is on the first row");
@@ -2176,15 +2228,22 @@ mod tests {
 
     #[test]
     fn a_squeezed_list_drops_fields_rather_than_being_cut() {
-        // 80-wide terminal, 80-wide sessions: the list floors at 16, and a row
-        // that simply truncated would lose live/dead — the one field it is for.
-        let ui = ui(vec![row("claude", true, false)]);
+        // 80-wide terminal, 80-wide sessions: the list floors at 16. At that
+        // width `tools.lua`'s own `remuda._refresh_sessions_buffer` omits
+        // the live/dead word (width < 22) — simulated here as the tail it
+        // would have supplied at each width, since deciding that is no
+        // longer list_row's job (see the "*sessions*" buffer migration
+        // above list_row's own doc comment). What list_row still owns is
+        // degrading the NAME rather than ever truncating the tail it's given.
+        let mut ui = ui(vec![row("claude", true, false)]);
         let (list_w, _) = layout(80, 80);
         assert_eq!(list_w, 16);
+        ui.sessions_text = vec![" ".into()];
         assert!(
             !list_row(&ui, 0, list_w).contains('→'),
             "it fits, by dropping"
         );
+        ui.sessions_text = vec!["live ".into()];
         assert!(
             list_row(&ui, 0, 40).contains("live"),
             "and keeps it when there is room"
@@ -2195,7 +2254,8 @@ mod tests {
     /// and was the list's only per-second repaint source. See steps/026.
     #[test]
     fn the_list_row_carries_no_seconds_counter() {
-        let ui = ui(vec![row("claude", true, false)]);
+        let mut ui = ui(vec![row("claude", true, false)]);
+        ui.sessions_text = vec!["live ".into()];
         let line = list_row(&ui, 0, 40);
         assert!(
             !line.contains('s'),
@@ -2217,7 +2277,11 @@ mod tests {
 
     #[test]
     fn an_empty_herd_says_so_and_says_what_to_do_about_it() {
-        let ui = ui(vec![]);
+        let mut ui = ui(vec![]);
+        ui.sessions_text = vec![
+            "the herd is empty.".into(),
+            "press n to start a session.".into(),
+        ];
         let frame = render(&ui, "", "default", 80, 10);
         assert!(frame.contains("the herd is empty."));
         assert!(
