@@ -2025,6 +2025,174 @@ mod tests {
         );
     }
 
+    /// Creates a real session the same way `native/tests/daemon.rs` does —
+    /// `sh`, no pty features exercised, just something alive to list.
+    fn new_session(path: &std::path::Path, name: &str) {
+        let response = client::request(
+            path,
+            &Request::New {
+                name: Some(name.to_string()),
+                command: vec!["sh".into()],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            },
+        )
+        .expect("new");
+        assert_eq!(
+            response,
+            Response::Value(name.to_string()),
+            "New answers with the name it gave the session"
+        );
+    }
+
+    /// The e2e counterpart to the two literal oracles above: same expected
+    /// bytes, but fed from a real daemon instead of hand-built fixtures.
+    // Proves the half of the migration the hand-fed oracle can't: that
+    // Lua's flag glyph and 22-column threshold actually produce " " / "⚑"
+    // for this scenario. Measured ~13ms: one daemon thread, two `sh`
+    // children, one held Attach connection, one Eval round trip.
+    #[test]
+    fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon() {
+        let path = scratch_socket("e2e-sessions-oracle");
+        daemon_at(&path);
+
+        new_session(&path, "alpha");
+        new_session(&path, "bravo");
+        let _held = client::hold(&path, "bravo").expect("attach bravo for real");
+
+        let sessions = match client::request(&path, &Request::List).expect("list") {
+            Response::Sessions(s) => s,
+            other => panic!("unexpected: {other:?}"),
+        };
+        let mut ui = Ui::new(sessions, "/bin/sh", None);
+        let (list_w, _) = layout(80, widest(&ui));
+        let lines = sessions_buffer_lines(&path, list_w).expect("refresh sessions buffer");
+        assert_eq!(
+            lines,
+            vec![" ".to_string(), "⚑".to_string()],
+            "real Lua output for this scenario must match the hand-fed oracle's input"
+        );
+        ui.sessions_text = lines;
+
+        let cells = vec![text_row(10); 23];
+        let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
+        assert_eq!(
+            out,
+            "\x1b[?2026h\x1b[H\
+             \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
+             \x1b[2;1H\x1b[K▸ alpha         │xxxxxxxxxx                                                     \
+             \x1b[3;1H\x1b[K  bravo        ⚑│xxxxxxxxxx                                                     \
+             \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[10;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[11;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[12;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[13;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[14;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[15;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[16;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[17;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[18;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[19;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[20;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[21;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[22;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[23;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[24;1H\x1b[K↑↓ select   ⏎ enter   n new   x kill   q quit                                   \
+             \x1b[J\x1b[?25l\x1b[?2026l",
+            "byte-identical oracle for the non-empty session list, fed for real"
+        );
+    }
+
+    /// Empty-herd counterpart, fed by a real (empty) daemon registry.
+    // No sessions created at all, so `remuda.ls()` itself sees a real empty
+    // herd rather than an empty `Vec` constructed by hand. Measured ~13ms:
+    // one daemon thread, one Eval round trip, no children.
+    #[test]
+    fn render_styled_of_the_empty_session_list_is_byte_identical_when_fed_by_a_real_daemon() {
+        let path = scratch_socket("e2e-empty-oracle");
+        daemon_at(&path);
+
+        let lines = sessions_buffer_lines(&path, 16).expect("refresh sessions buffer");
+        assert_eq!(
+            lines,
+            vec![
+                "the herd is empty.".to_string(),
+                "press n to start a session.".to_string()
+            ],
+            "real Lua output for the empty herd must match the hand-fed oracle's input"
+        );
+
+        let mut ui = ui(vec![]);
+        ui.sessions_text = lines;
+        let cells: Vec<Vec<StyledCell>> = vec![];
+        let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
+        assert_eq!(
+            out,
+            "\x1b[?2026h\x1b[H\
+             \x1b[1;1H\x1b[Kremuda · default                        │                                       \
+             \x1b[2;1H\x1b[K                                        │                                       \
+             \x1b[3;1H\x1b[K  the herd is empty.                    │                                       \
+             \x1b[4;1H\x1b[K                                        │                                       \
+             \x1b[5;1H\x1b[K  press n to start a session.           │                                       \
+             \x1b[6;1H\x1b[K                                        │                                       \
+             \x1b[7;1H\x1b[K                                        │                                       \
+             \x1b[8;1H\x1b[K                                        │                                       \
+             \x1b[9;1H\x1b[K                                        │                                       \
+             \x1b[10;1H\x1b[K                                        │                                       \
+             \x1b[11;1H\x1b[K                                        │                                       \
+             \x1b[12;1H\x1b[K                                        │                                       \
+             \x1b[13;1H\x1b[K                                        │                                       \
+             \x1b[14;1H\x1b[K                                        │                                       \
+             \x1b[15;1H\x1b[K                                        │                                       \
+             \x1b[16;1H\x1b[K                                        │                                       \
+             \x1b[17;1H\x1b[K                                        │                                       \
+             \x1b[18;1H\x1b[K                                        │                                       \
+             \x1b[19;1H\x1b[K                                        │                                       \
+             \x1b[20;1H\x1b[K                                        │                                       \
+             \x1b[21;1H\x1b[K                                        │                                       \
+             \x1b[22;1H\x1b[K                                        │                                       \
+             \x1b[23;1H\x1b[K                                        │                                       \
+             \x1b[24;1H\x1b[Kn new   q quit                                                                  \
+             \x1b[J\x1b[?25l\x1b[?2026l",
+            "byte-identical oracle for the empty session list, fed for real"
+        );
+    }
+
+    /// Pins the live/dead word's 22-column threshold against real Lua, not
+    /// just the flag glyph the two oracles above already exercise.
+    // `alpha` unattached, `bravo` attached, both alive. Measured ~13ms: one
+    // daemon thread, two `sh` children, one held Attach, two Eval round
+    // trips (one per width).
+    #[test]
+    fn the_live_dead_word_is_pinned_against_real_lua_at_the_22_column_threshold() {
+        let path = scratch_socket("e2e-live-dead-threshold");
+        daemon_at(&path);
+
+        new_session(&path, "alpha");
+        new_session(&path, "bravo");
+        let _held = client::hold(&path, "bravo").expect("attach bravo for real");
+
+        let wide = sessions_buffer_lines(&path, 22).expect("refresh at width 22");
+        assert_eq!(
+            wide,
+            vec!["live  ".to_string(), "live ⚑".to_string()],
+            "at width >= 22, tools.lua shows the live/dead word before the flag"
+        );
+
+        let narrow = sessions_buffer_lines(&path, 21).expect("refresh at width 21");
+        assert_eq!(
+            narrow,
+            vec![" ".to_string(), "⚑".to_string()],
+            "below width 22, tools.lua drops the word and shows only the flag"
+        );
+    }
+
     fn hidden_cursor() -> Cursor {
         Cursor {
             row: 0,
