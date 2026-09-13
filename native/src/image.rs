@@ -42,10 +42,17 @@ pub struct Image {
 }
 
 impl Image {
-    /// Start the interpreter and return a handle to it. `socket` is the daemon's
-    /// own: the `remuda` table calls back over it rather than reaching the
-    /// `Registry`. `counters` is the daemon's own named `Counters`, shared with `Ticker`.
-    pub fn spawn(socket: &Path, counters: Arc<crate::tick::Counters>) -> Self {
+    /// Start the interpreter and return a handle to it. `socket` is the
+    /// daemon's own, for bindings that act on a session by name (attach,
+    /// capture, ...).
+    // `registry` lets a read-only binding like `ls` answer in-process
+    // instead of looping a request back over that same socket. `counters`
+    // is the daemon's own named `Counters`, shared with `Ticker`.
+    pub fn spawn(
+        socket: &Path,
+        registry: Arc<remuda_core::Registry>,
+        counters: Arc<crate::tick::Counters>,
+    ) -> Self {
         let (jobs, inbox) = channel::<Job>();
         let socket: PathBuf = socket.to_path_buf();
 
@@ -59,7 +66,7 @@ impl Image {
 
             // A failure here means no image at all, so every eval must say so
             // rather than the thread dying quietly and every caller hanging.
-            let ready = script::bindings(&lua, &socket, counters)
+            let ready = script::bindings(&lua, &socket, registry, counters)
                 .and_then(|table| lua.globals().set("remuda", table))
                 // The tool frame is Lua over those bindings, not a second set of
                 // them. It must load *after* the table exists and *before* any
