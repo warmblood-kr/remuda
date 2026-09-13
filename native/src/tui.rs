@@ -1907,8 +1907,7 @@ mod tests {
     /// to pass, the migration changed `render_styled`'s own output, not just
     /// its internals — stop and report rather than updating the literal.
     #[test]
-    fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buffer_migration()
-    {
+    fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buffer_migration() {
         let ui = ui(vec![row("alpha", true, false), row("bravo", true, true)]);
         let cells = vec![text_row(10); 23];
         let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
@@ -1948,8 +1947,8 @@ mod tests {
     /// Same oracle, empty herd — a distinct code path in `list_row` (the two
     /// fixed help lines), so it needs its own captured literal.
     #[test]
-    fn render_styled_of_the_empty_session_list_is_byte_identical_before_and_after_the_buffer_migration()
-    {
+    fn render_styled_of_the_empty_session_list_is_byte_identical_before_and_after_the_buffer_migration(
+    ) {
         let ui = ui(vec![]);
         let cells: Vec<Vec<StyledCell>> = vec![];
         let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);

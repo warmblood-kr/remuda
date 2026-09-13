@@ -124,6 +124,105 @@ local function sorted_keys(table_value)
   return keys
 end
 
+-- buffer and window: named text an extension can create and show, and a
+-- screen rectangle to show it in — Emacs's own split. 정수님, 2026-09-13:
+-- *"익스텐션들이 윈도우를 분할하고, 특정 버퍼를 만들어서 거기에 어떠한 내용을
+-- 써서 사용자에게 표시할 수 있도록 해야할 것 같습니다."* Pure Lua state, the
+-- same shape as `remuda.tools`/`remuda.schedules` above: it does not survive
+-- a daemon restart, and that is not a gap to close — a buffer's whole life
+-- is the daemon's (see the module doc; nothing here reaches for `Registry`).
+-- remuda.buffer knows nothing about what its text MEANS — `Session`'s
+-- alive/attached facts, if a buffer's content is built from them, are
+-- read by the caller and handed over as plain text, never by this table.
+
+remuda.buffers = {}
+
+local Buffer = {}
+Buffer.__index = Buffer
+
+remuda.buffer = {}
+
+-- Create-if-absent, return-if-present — so two extensions naming the same
+-- buffer share it rather than racing to overwrite it.
+function remuda.buffer.new(name)
+  if type(name) ~= "string" or name == "" then
+    error("a buffer needs a name", 2)
+  end
+  local existing = remuda.buffers[name]
+  if existing then
+    return existing
+  end
+  local b = setmetatable({ name = name, text = "" }, Buffer)
+  remuda.buffers[name] = b
+  return b
+end
+
+function remuda.buffer.list()
+  return sorted_keys(remuda.buffers)
+end
+
+function Buffer:set(text)
+  self.text = tostring(text)
+end
+
+function Buffer:append(line)
+  self.text = self.text .. tostring(line)
+end
+
+function Buffer:get()
+  return self.text
+end
+
+-- window: a screen rectangle showing exactly one buffer or attached session,
+-- owning the lifetime of neither — closing one kills nothing it showed
+-- (`steps/006-lifetime.md`'s tmux rejection stays in force; only the naming
+-- that shell "windows" own a session's life is what changed). No layout tree
+-- yet — `split` makes a second, independent window, not a nested pane; a
+-- tree is a later question if one ever actually shows up.
+
+remuda.windows = {}
+local next_window_id = 0
+
+local Window = {}
+Window.__index = Window
+
+remuda.window = {}
+
+-- The one window that exists before anything ever splits: today's whole
+-- screen, in the vocabulary this module adds. Nothing renders through it
+-- yet (`native/src/tui.rs` still owns the real screen) — it exists so a
+-- script can hold a handle without special-casing "there's no window yet".
+function remuda.window.current()
+  local w = remuda.windows["main"]
+  if not w then
+    w = setmetatable({ id = "main", shows = nil }, Window)
+    remuda.windows["main"] = w
+  end
+  return w
+end
+
+-- SIDE is "right" or "below", per the design's own minimal surface — kept as
+-- given rather than validated against a fixed list, since nothing downstream
+-- interprets it yet (no real geometry exists until a later round wires this
+-- into the terminal).
+function Window:split(side)
+  next_window_id = next_window_id + 1
+  local w = setmetatable({ id = "w" .. next_window_id, shows = nil, side = side }, Window)
+  remuda.windows[w.id] = w
+  return w
+end
+
+-- TARGET is a buffer (from `remuda.buffer.new`) or a session name string —
+-- this window's business is only "what is showing here", never the target's
+-- lifetime.
+function Window:show(target)
+  self.shows = target
+end
+
+function Window:close()
+  remuda.windows[self.id] = nil
+end
+
 -- What `tools/list` adds to the frame's own five, as MCP descriptor JSON.
 -- Rust asks for this by name; keep the shape or `mcp.rs` will not parse it.
 function remuda._descriptors()

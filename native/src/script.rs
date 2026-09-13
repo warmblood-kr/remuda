@@ -359,6 +359,12 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
                 row.set("idle", session.idle.as_secs_f64())?;
                 row.set("cols", session.size.cols())?;
                 row.set("rows", session.size.rows())?;
+                // Additive: `tests/api/v1.lua` asserts specific fields exist,
+                // never that no others do, so a new field widens v1 rather
+                // than breaking it. Needed so a Lua-authored panel (the
+                // "*sessions*" buffer, `tools.lua`) can show the same
+                // attached state the list has always drawn.
+                row.set("attached", session.attached)?;
                 rows.set(index + 1, row)?;
             }
             Ok(Value::Table(rows))
