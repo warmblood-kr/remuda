@@ -127,7 +127,7 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     // It is started *after* the bind, so the `remuda` table it binds points at
     // a socket that is already accepting — the interpreter's first call cannot
     // race the listener it will talk to.
-    let counters = Arc::new(crate::tick::SkipCounters::default());
+    let counters = Arc::new(crate::tick::Counters::default());
     let image = Image::spawn(path, Arc::clone(&counters));
     spawn_ticker(image.clone(), counters);
     for stream in listener.incoming() {
@@ -148,7 +148,7 @@ const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Wake the image once a period with `remuda._run_due_schedules(now)`. Its own
 /// thread, so a wedged schedule stalls only the tick, never the listener loop.
-fn spawn_ticker(image: Image, counters: Arc<crate::tick::SkipCounters>) {
+fn spawn_ticker(image: Image, counters: Arc<crate::tick::Counters>) {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let for_submit = Arc::clone(&clock);
     std::thread::spawn(move || {

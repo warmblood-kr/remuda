@@ -102,7 +102,7 @@ fn new_request(
 pub fn bindings(
     lua: &Lua,
     socket: &Path,
-    counters: std::sync::Arc<crate::tick::SkipCounters>,
+    counters: std::sync::Arc<crate::tick::Counters>,
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
@@ -300,14 +300,15 @@ fn dir_bindings(
 fn tick_bindings(
     lua: &Lua,
     table: &Table,
-    counters: std::sync::Arc<crate::tick::SkipCounters>,
+    counters: std::sync::Arc<crate::tick::Counters>,
 ) -> mlua::Result<()> {
     table.set(
         "schedule_skips",
         lua.create_function(move |lua, ()| {
+            let skips = counters.counter("ticker_skip");
             let row = lua.create_table()?;
-            row.set("consecutive", counters.consecutive())?;
-            row.set("total", counters.total())?;
+            row.set("consecutive", skips.consecutive())?;
+            row.set("total", skips.total())?;
             Ok(row)
         })?,
     )
