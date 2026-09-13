@@ -357,3 +357,30 @@ remuda.tool({
     )
   end,
 })
+
+-- request_counts/schedule_skips (steps/033's follow-up) were readable from
+-- Lua but not MCP: remuda._call only reaches remuda.tools, a separate
+-- registry from the top-level remuda table these two already live on.
+-- Registering them here is the fix — the same remuda.tool every other MCP
+-- tool already uses, not a new mechanism.
+remuda.tool({
+  name = "request_counts",
+  about = "The daemon's own request-dispatch counts (list/eval/capture_styled), "
+    .. "counted at the one place every round trip crosses. Use it to measure "
+    .. "how many round trips a real operation actually costs.",
+  run = function()
+    local c = remuda.request_counts()
+    return "list=" .. c.list .. ",eval=" .. c.eval .. ",capture_styled=" .. c.capture_styled
+  end,
+})
+
+remuda.tool({
+  name = "schedule_skips",
+  about = "How many periodic-schedule ticks the daemon has skipped because "
+    .. "the previous tick's callback was still running, and how many of "
+    .. "those skips are still consecutive right now.",
+  run = function()
+    local c = remuda.schedule_skips()
+    return "consecutive=" .. c.consecutive .. ",total=" .. c.total
+  end,
+})
