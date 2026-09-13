@@ -16,6 +16,7 @@
 //! testable on a machine with no tty; everything needing one lives in [`run`].
 
 use crate::client::{self, Hold, RawMode};
+use crate::mcp;
 use remuda_core::agent::{Color, Cursor, StyledCell};
 use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
@@ -947,15 +948,20 @@ fn refresh(
         col: 0,
         visible: false,
     };
-    let (cells, cursor) = match ui.selected().map(|s| s.name.clone()) {
-        Some(name) => match capture_styled(path, &name) {
+    let selected_name = ui.selected().map(|s| s.name.clone());
+    let (cells, cursor) = match window_shown_session(path, selected_name.as_deref()) {
+        Ok(Some(shown)) => match capture_styled(path, &shown) {
             Ok(result) => result,
             Err(e) => {
-                ui.notice = Some(format!("{name}: {e}"));
+                ui.notice = Some(format!("{shown}: {e}"));
                 (Vec::new(), hidden)
             }
         },
-        None => (Vec::new(), hidden),
+        Ok(None) => (Vec::new(), hidden),
+        Err(e) => {
+            ui.notice = Some(e);
+            (Vec::new(), hidden)
+        }
     };
     let frame = render_styled(ui, &cells, cursor, server, cols, rows);
     // The write is gated on change, as it always was — but before
@@ -1122,6 +1128,24 @@ fn sessions_buffer_lines(path: &Path, width: u16) -> Result<Vec<String>, String>
     );
     match client::request(path, &Request::Eval { code, name: None }) {
         Ok(Response::Value(text)) => Ok(text.split('\n').map(str::to_string).collect()),
+        Ok(Response::Error(reason)) => Err(reason),
+        other => Err(format!("{other:?}")),
+    }
+}
+
+/// What the current window shows, after syncing it to NAME (`None` clears
+/// it) — so the window is the real source of truth for what gets captured
+/// below, not `ui.selected()` read directly.
+// One round trip, write then read back. Styled cells never cross into Lua
+// (`script.rs` refuses `CaptureStyled` from scripts on purpose) — only the
+// session's name does.
+fn window_shown_session(path: &Path, name: Option<&str>) -> Result<Option<String>, String> {
+    let target = name.map_or_else(|| "nil".to_string(), mcp::lua_string);
+    let code =
+        format!("remuda.window.current():show({target}); return remuda.window.current().shows");
+    match client::request(path, &Request::Eval { code, name: None }) {
+        Ok(Response::Value(shown)) if shown == "nil" => Ok(None),
+        Ok(Response::Value(shown)) => Ok(Some(shown)),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
     }
@@ -2523,6 +2547,117 @@ mod tests {
             err.contains("no such session"),
             "the fix must surface what the daemon actually said, not a made-up \
              message: {err:?}"
+        );
+    }
+
+    /// The window is real state, not a local variable dressed up: syncing it
+    /// to a name and reading it back returns that name.
+    // Clearing it (`None`) reads back as `None`, not the literal string
+    // "nil" — `Eval`'s own rendering of Lua's `nil` that this function has
+    // to unwrap. Measured ~13ms: one daemon thread, two Eval round trips.
+    #[test]
+    fn window_shown_session_round_trips_a_real_name_and_clears_to_none() {
+        let path = scratch_socket("window-shown-round-trip");
+        daemon_at(&path);
+
+        let shown = window_shown_session(&path, Some("alpha")).expect("show alpha");
+        assert_eq!(shown, Some("alpha".to_string()));
+
+        let cleared = window_shown_session(&path, None).expect("clear");
+        assert_eq!(
+            cleared, None,
+            "a nil target must read back as None, not the string \"nil\""
+        );
+    }
+
+    /// The e2e proof for step ③: the right pane's `cells` come from a real
+    /// session, reached through a real window that was actually asked to
+    /// show it — not `text_row`, and not `ui.selected()` read directly.
+    // `printf` (no shell) makes the screen's content exactly "hello" with no
+    // prompt noise. Polls before capturing, so this doesn't race the child.
+    // Measured ~20ms: one daemon thread, one `printf` child, up to a few
+    // 10ms poll ticks, two Eval/capture round trips.
+    #[test]
+    fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_session() {
+        let path = scratch_socket("window-preview-oracle");
+        daemon_at(&path);
+
+        let response = client::request(
+            &path,
+            &Request::New {
+                name: Some("alpha".to_string()),
+                command: vec!["printf".into(), "hello".into()],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            },
+        )
+        .expect("new");
+        assert_eq!(response, Response::Value("alpha".to_string()));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok((cells, _)) = capture_styled(&path, "alpha") {
+                let first_five: String = cells
+                    .first()
+                    .map(|row| row.iter().take(5).map(|c| c.text.as_str()).collect())
+                    .unwrap_or_default();
+                if first_five == "hello" {
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "\"hello\" never appeared on alpha's real screen"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let shown = window_shown_session(&path, Some("alpha")).expect("show alpha");
+        assert_eq!(
+            shown,
+            Some("alpha".to_string()),
+            "the window must show what it was just asked to show"
+        );
+        let (cells, cursor) =
+            capture_styled(&path, &shown.unwrap()).expect("capture through the window's target");
+
+        let mut ui = Ui::new(vec![row("alpha", true, false)], "/bin/sh", None);
+        ui.sessions_text = vec![" ".into()];
+        // rows=25, not 24: the pty is a real 24-row screen (`Size::MIN_ROWS`
+        // floors it there), and `body = rows - 1` is what the bottom-anchored
+        // crop keeps — 24 would drop row 0, exactly where "hello" printed.
+        let out = render_styled(&ui, &cells, cursor, "default", 80, 25);
+        assert_eq!(
+            out,
+            "\x1b[?2026h\x1b[H\
+             \x1b[1;1H\x1b[Kremuda · default│hello                                                         →\
+             \x1b[2;1H\x1b[K▸ alpha         │                                                              →\
+             \x1b[3;1H\x1b[K                │                                                              →\
+             \x1b[4;1H\x1b[K                │                                                              →\
+             \x1b[5;1H\x1b[K                │                                                              →\
+             \x1b[6;1H\x1b[K                │                                                              →\
+             \x1b[7;1H\x1b[K                │                                                              →\
+             \x1b[8;1H\x1b[K                │                                                              →\
+             \x1b[9;1H\x1b[K                │                                                              →\
+             \x1b[10;1H\x1b[K                │                                                              →\
+             \x1b[11;1H\x1b[K                │                                                              →\
+             \x1b[12;1H\x1b[K                │                                                              →\
+             \x1b[13;1H\x1b[K                │                                                              →\
+             \x1b[14;1H\x1b[K                │                                                              →\
+             \x1b[15;1H\x1b[K                │                                                              →\
+             \x1b[16;1H\x1b[K                │                                                              →\
+             \x1b[17;1H\x1b[K                │                                                              →\
+             \x1b[18;1H\x1b[K                │                                                              →\
+             \x1b[19;1H\x1b[K                │                                                              →\
+             \x1b[20;1H\x1b[K                │                                                              →\
+             \x1b[21;1H\x1b[K                │                                                              →\
+             \x1b[22;1H\x1b[K                │                                                              →\
+             \x1b[23;1H\x1b[K                │                                                              →\
+             \x1b[24;1H\x1b[K                │                                                              →\
+             \x1b[25;1H\x1b[K↑↓ select   ⏎ enter   n new   x kill   showing 63 cols — h/l pans   q quit      \
+             \x1b[J\x1b[1;23H\x1b[?25h\x1b[?2026l",
+            "byte-identical oracle for the right pane, fed through a real window"
         );
     }
 
