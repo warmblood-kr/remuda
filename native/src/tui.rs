@@ -1899,6 +1899,93 @@ mod tests {
         assert!(out.ends_with("\x1b[?2026l"), "end sync: {out:?}");
     }
 
+    /// The regression oracle for moving the left column onto a Lua-authored
+    /// "*sessions*" buffer: captured against today's `list_row`, before that
+    /// migration touches anything, on a fixed scenario chosen to exercise the
+    /// column alignment `list_row`'s `room` math produces (two names of
+    /// different lengths, one attached, one not). If this ever needs editing
+    /// to pass, the migration changed `render_styled`'s own output, not just
+    /// its internals — stop and report rather than updating the literal.
+    #[test]
+    fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buffer_migration()
+    {
+        let ui = ui(vec![row("alpha", true, false), row("bravo", true, true)]);
+        let cells = vec![text_row(10); 23];
+        let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
+        assert_eq!(
+            out,
+            "\x1b[?2026h\x1b[H\
+             \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
+             \x1b[2;1H\x1b[K▸ alpha         │xxxxxxxxxx                                                     \
+             \x1b[3;1H\x1b[K  bravo        ⚑│xxxxxxxxxx                                                     \
+             \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[10;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[11;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[12;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[13;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[14;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[15;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[16;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[17;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[18;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[19;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[20;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[21;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[22;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[23;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[24;1H\x1b[K↑↓ select   ⏎ enter   n new   x kill   q quit                                   \
+             \x1b[J\x1b[?25l\x1b[?2026l",
+            "byte-identical oracle for the non-empty session list, captured \
+             before the buffer migration"
+        );
+    }
+
+    /// Same oracle, empty herd — a distinct code path in `list_row` (the two
+    /// fixed help lines), so it needs its own captured literal.
+    #[test]
+    fn render_styled_of_the_empty_session_list_is_byte_identical_before_and_after_the_buffer_migration()
+    {
+        let ui = ui(vec![]);
+        let cells: Vec<Vec<StyledCell>> = vec![];
+        let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
+        assert_eq!(
+            out,
+            "\x1b[?2026h\x1b[H\
+             \x1b[1;1H\x1b[Kremuda · default                        │                                       \
+             \x1b[2;1H\x1b[K                                        │                                       \
+             \x1b[3;1H\x1b[K  the herd is empty.                    │                                       \
+             \x1b[4;1H\x1b[K                                        │                                       \
+             \x1b[5;1H\x1b[K  press n to start a session.           │                                       \
+             \x1b[6;1H\x1b[K                                        │                                       \
+             \x1b[7;1H\x1b[K                                        │                                       \
+             \x1b[8;1H\x1b[K                                        │                                       \
+             \x1b[9;1H\x1b[K                                        │                                       \
+             \x1b[10;1H\x1b[K                                        │                                       \
+             \x1b[11;1H\x1b[K                                        │                                       \
+             \x1b[12;1H\x1b[K                                        │                                       \
+             \x1b[13;1H\x1b[K                                        │                                       \
+             \x1b[14;1H\x1b[K                                        │                                       \
+             \x1b[15;1H\x1b[K                                        │                                       \
+             \x1b[16;1H\x1b[K                                        │                                       \
+             \x1b[17;1H\x1b[K                                        │                                       \
+             \x1b[18;1H\x1b[K                                        │                                       \
+             \x1b[19;1H\x1b[K                                        │                                       \
+             \x1b[20;1H\x1b[K                                        │                                       \
+             \x1b[21;1H\x1b[K                                        │                                       \
+             \x1b[22;1H\x1b[K                                        │                                       \
+             \x1b[23;1H\x1b[K                                        │                                       \
+             \x1b[24;1H\x1b[Kn new   q quit                                                                  \
+             \x1b[J\x1b[?25l\x1b[?2026l",
+            "byte-identical oracle for the empty session list, captured \
+             before the buffer migration"
+        );
+    }
+
     fn hidden_cursor() -> Cursor {
         Cursor {
             row: 0,
