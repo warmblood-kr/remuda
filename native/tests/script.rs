@@ -60,6 +60,56 @@ fn capture(path: &Path, name: &str) -> String {
     }
 }
 
+/// `request_counts()`'s three fields, read back through one `Eval` — the
+/// same "one object, read from Lua" a runtime caller gets, just parsed here
+/// instead of eyeballed.
+fn request_counts(path: &Path) -> (u64, u64, u64) {
+    let code = "local c = remuda.request_counts(); \
+                 return c.list .. ',' .. c.eval .. ',' .. c.capture_styled";
+    match client::request(
+        path,
+        &Request::Eval {
+            code: code.to_string(),
+            name: None,
+        },
+    ) {
+        Ok(Response::Value(text)) => {
+            let parts: Vec<u64> = text.split(',').map(|n| n.parse().unwrap()).collect();
+            (parts[0], parts[1], parts[2])
+        }
+        other => panic!("request_counts failed: {other:?}"),
+    }
+}
+
+#[test]
+fn daemon_request_counts_reflect_real_requests_seen_at_dispatch() {
+    // "One object, readable two ways": this Rust test is one of those two
+    // ways, reading the same `request_counts()` binding a Lua/MCP caller
+    // would. A direct List (outside any script) and the Eval this test uses
+    // to read the counts are each real, separately dispatched requests, so
+    // the deltas below are exact, not approximate.
+    let dir = scratch("request-counts");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let before = request_counts(&path); // itself one Eval
+    client::request(&path, &Request::List).expect("list");
+    let after = request_counts(&path); // itself one more Eval
+
+    assert_eq!(
+        after.0,
+        before.0 + 1,
+        "one direct List must add exactly one to the list count"
+    );
+    assert_eq!(
+        after.1,
+        before.1 + 1,
+        "exactly one new Eval happened between the two snapshots (the second snapshot's own read) \
+         — the first snapshot's read is already baked into `before`, since the daemon counts a \
+         request before dispatching it"
+    );
+}
+
 #[test]
 fn the_bound_surface_is_exactly_the_protocols() {
     // The property this guards is the reason embedding Lua is safe at all: the
