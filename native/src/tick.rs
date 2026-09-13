@@ -12,6 +12,7 @@
 //! tool registry this extends; not solved here, on purpose.
 
 use remuda_core::Clock;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -19,16 +20,18 @@ use std::time::Duration;
 
 type JobReceiver = Receiver<Result<String, String>>;
 
-/// The skip counters, shared between the `Ticker` that writes them and the
-/// Lua binding that reads them — constructed before either exists, since the
-/// image's bindings are built before `daemon::serve` has a `Ticker` to ask.
+/// One named counter: a running total plus a consecutive-run count that
+/// resets on `record_reset` — the shape the ticker-skip case needs.
+// Other registrants (e.g. round-trip counts) may only ever call
+// `record_hit`, never `record_reset` — `consecutive` then just stays equal
+// to `total`, which is fine.
 #[derive(Default)]
-pub struct SkipCounters {
+pub struct Counter {
     consecutive: AtomicU64,
     total: AtomicU64,
 }
 
-impl SkipCounters {
+impl Counter {
     pub fn consecutive(&self) -> u64 {
         self.consecutive.load(Ordering::SeqCst)
     }
@@ -37,13 +40,35 @@ impl SkipCounters {
         self.total.load(Ordering::SeqCst)
     }
 
-    fn record_skip(&self) {
+    pub fn record_hit(&self) {
         self.total.fetch_add(1, Ordering::SeqCst);
         self.consecutive.fetch_add(1, Ordering::SeqCst);
     }
 
-    fn record_reset(&self) {
+    pub fn record_reset(&self) {
         self.consecutive.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Named counters, shared between whoever writes them and the Lua binding
+/// that reads them by name.
+// Constructed before any registrant exists, since the image's bindings are
+// built before `daemon::serve` has a `Ticker` to ask.
+#[derive(Default)]
+pub struct Counters {
+    named: Mutex<HashMap<&'static str, Arc<Counter>>>,
+}
+
+impl Counters {
+    /// The named counter, creating it on first use. Idempotent: the same
+    /// name always returns the same shared `Counter`.
+    pub fn counter(&self, name: &'static str) -> Arc<Counter> {
+        self.named
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(name)
+            .or_insert_with(|| Arc::new(Counter::default()))
+            .clone()
     }
 }
 
@@ -55,7 +80,7 @@ pub struct Ticker {
     clock: Arc<dyn Clock>,
     period: Duration,
     in_flight: Mutex<Option<JobReceiver>>,
-    counters: Arc<SkipCounters>,
+    skips: Arc<Counter>,
 }
 
 impl Ticker {
@@ -63,14 +88,14 @@ impl Ticker {
         submit: impl Fn() -> Result<JobReceiver, String> + Send + Sync + 'static,
         clock: Arc<dyn Clock>,
         period: Duration,
-        counters: Arc<SkipCounters>,
+        counters: Arc<Counters>,
     ) -> Self {
         Self {
             submit: Box::new(submit),
             clock,
             period,
             in_flight: Mutex::new(None),
-            counters,
+            skips: counters.counter("ticker_skip"),
         }
     }
 
@@ -101,7 +126,7 @@ impl Ticker {
         };
 
         if ready {
-            self.counters.record_reset();
+            self.skips.record_reset();
             *in_flight = (self.submit)().ok();
         } else {
             // Escalation hook-point: one skip is normal (a callback ran a
@@ -109,16 +134,16 @@ impl Ticker {
             // not slow — that is the distinction worth surfacing once
             // something acts on it. What threshold and what action are
             // undecided; this counter is where that decision attaches later.
-            self.counters.record_skip();
+            self.skips.record_hit();
         }
     }
 
     pub fn consecutive_skips(&self) -> u64 {
-        self.counters.consecutive()
+        self.skips.consecutive()
     }
 
     pub fn total_skips(&self) -> u64 {
-        self.counters.total()
+        self.skips.total()
     }
 }
 
@@ -143,7 +168,7 @@ mod tests {
             },
             clock,
             std::time::Duration::from_millis(1),
-            std::sync::Arc::new(super::SkipCounters::default()),
+            std::sync::Arc::new(super::Counters::default()),
         );
         ticker.step(); // submits the one job
         ticker.step(); // still not answered — must skip, not resubmit

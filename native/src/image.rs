@@ -44,8 +44,8 @@ pub struct Image {
 impl Image {
     /// Start the interpreter and return a handle to it. `socket` is the daemon's
     /// own: the `remuda` table calls back over it rather than reaching the
-    /// `Registry`. `counters` is the daemon's own `SkipCounters`, shared with `Ticker`.
-    pub fn spawn(socket: &Path, counters: Arc<crate::tick::SkipCounters>) -> Self {
+    /// `Registry`. `counters` is the daemon's own named `Counters`, shared with `Ticker`.
+    pub fn spawn(socket: &Path, counters: Arc<crate::tick::Counters>) -> Self {
         let (jobs, inbox) = channel::<Job>();
         let socket: PathBuf = socket.to_path_buf();
 
