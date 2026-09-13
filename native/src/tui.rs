@@ -908,6 +908,7 @@ fn refresh(
     ui: &mut Ui,
     held: &mut Option<(String, Hold)>,
     painted: &mut String,
+    shown: &mut Option<String>,
     skip_list: bool,
 ) -> std::io::Result<(u16, u16)> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -948,20 +949,29 @@ fn refresh(
         col: 0,
         visible: false,
     };
-    let selected_name = ui.selected().map(|s| s.name.clone());
-    let (cells, cursor) = match window_shown_session(path, selected_name.as_deref()) {
-        Ok(Some(shown)) => match capture_styled(path, &shown) {
+    // A Type-forced wake can never change the selection (`session_key` never
+    // touches `self.selected`, and the only actions that do are never
+    // `Type` — see the RED test this fixes), so re-syncing the window there
+    // would be a per-keystroke Eval for an answer that can't have changed.
+    if !skip_list {
+        let selected_name = ui.selected().map(|s| s.name.clone());
+        match window_shown_session(path, selected_name.as_deref()) {
+            Ok(name) => *shown = name,
+            Err(e) => {
+                ui.notice = Some(e);
+                *shown = None;
+            }
+        }
+    }
+    let (cells, cursor) = match shown.as_deref() {
+        Some(name) => match capture_styled(path, name) {
             Ok(result) => result,
             Err(e) => {
-                ui.notice = Some(format!("{shown}: {e}"));
+                ui.notice = Some(format!("{name}: {e}"));
                 (Vec::new(), hidden)
             }
         },
-        Ok(None) => (Vec::new(), hidden),
-        Err(e) => {
-            ui.notice = Some(e);
-            (Vec::new(), hidden)
-        }
+        None => (Vec::new(), hidden),
     };
     let frame = render_styled(ui, &cells, cursor, server, cols, rows);
     // The write is gated on change, as it always was — but before
@@ -1020,6 +1030,9 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     // The exclusive hold on the focused session, and the name it was taken on.
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
     let mut held: Option<(String, Hold)> = None;
+    // What the window last reported showing — refreshed only on a
+    // non-skip_list wake, and reused as-is on a Type-forced one.
+    let mut shown: Option<String> = None;
     let mut last_refresh = Instant::now();
     let mut force_refresh = true;
     // Set only by an `Action::Type` below, consumed by the very next refresh,
@@ -1036,7 +1049,15 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
         if should_refresh(force_refresh, last_refresh.elapsed(), tick) {
             force_refresh = false;
             last_refresh = Instant::now();
-            (cols, rows) = refresh(path, server, &mut ui, &mut held, &mut painted, skip_list)?;
+            (cols, rows) = refresh(
+                path,
+                server,
+                &mut ui,
+                &mut held,
+                &mut painted,
+                &mut shown,
+                skip_list,
+            )?;
             skip_list = false;
         }
 
@@ -2673,21 +2694,49 @@ mod tests {
         let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
         let mut held = None;
         let mut painted = String::new();
-        refresh(&path, "default", &mut ui, &mut held, &mut painted, false).unwrap();
+        let mut shown = None;
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
         assert_eq!(ui.sessions.len(), 1, "the first session must be seen");
 
         // A herd change from elsewhere — exactly what a `Kill` from the list
         // (which sets no `skip_list`) or a second client would produce.
         start(&path, "sh", Size::new(80, 24)).unwrap();
 
-        refresh(&path, "default", &mut ui, &mut held, &mut painted, true).unwrap();
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            true,
+        )
+        .unwrap();
         assert_eq!(
             ui.sessions.len(),
             1,
             "skip_list=true must not relist — this is the optimisation"
         );
 
-        refresh(&path, "default", &mut ui, &mut held, &mut painted, false).unwrap();
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             ui.sessions.len(),
             2,
@@ -2730,16 +2779,35 @@ mod tests {
         let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
         let mut held = None;
         let mut painted = String::new();
+        let mut shown = None;
         // Steady state first: one relist, one window sync, one capture. The
         // Type-forced refresh below has no selection change to react to.
-        refresh(&path, "default", &mut ui, &mut held, &mut painted, false).unwrap();
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
         assert!(
             ui.selected().is_some(),
             "one session must be selected before measuring"
         );
 
         let before = request_counts(&path);
-        refresh(&path, "default", &mut ui, &mut held, &mut painted, true).unwrap();
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            true,
+        )
+        .unwrap();
         let after = request_counts(&path);
 
         // `after`'s own read is itself one Eval, counted in `after` but not
@@ -2770,9 +2838,19 @@ mod tests {
         let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
         let mut held = None;
         let mut painted = String::new();
+        let mut shown = None;
 
         let before = request_counts(&path);
-        refresh(&path, "default", &mut ui, &mut held, &mut painted, false).unwrap();
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
         let after = request_counts(&path);
 
         let list = after.0 - before.0;
@@ -2795,7 +2873,17 @@ mod tests {
         let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
         let mut held = None;
         let mut painted = String::new();
-        refresh(&path, "default", &mut ui, &mut held, &mut painted, false).unwrap();
+        let mut shown = None;
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
         assert_eq!(ui.sessions.len(), 2, "both sessions must be seen");
         let first = ui.sessions[0].name.clone();
         let second = ui.sessions[1].name.clone();

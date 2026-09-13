@@ -103,15 +103,24 @@ fn new_request(
 pub fn bindings(
     lua: &Lua,
     socket: &Path,
+    registry: std::sync::Arc<remuda_core::Registry>,
     counters: std::sync::Arc<crate::tick::Counters>,
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
 
-    let path = at();
+    // In-process, not a loopback: the image always runs inside the same
+    // daemon this `Registry` belongs to (image.rs), so asking over the wire
+    // for an answer this call already has bought nothing but a socket round
+    // trip on every non-skip_list tick refresh. See steps/031.
     table.set(
         "ls",
-        lua.create_function(move |lua, ()| value(lua, ask(&path, Request::List)?))?,
+        lua.create_function(move |lua, ()| {
+            if !crate::daemon::keep_exited() {
+                registry.reap();
+            }
+            value(lua, Response::Sessions(registry.list()))
+        })?,
     )?;
 
     new_binding(lua, &table, at())?;

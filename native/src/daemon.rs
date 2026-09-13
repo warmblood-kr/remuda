@@ -105,7 +105,7 @@ fn shell_or_default(configured: Option<String>) -> String {
 /// Whether a session that ended keeps its entry. Off by default: 정수님,
 /// 2026-09-10, asked that a session go away by itself when its program exits.
 /// Read in the DAEMON's environment, so changing it takes a `remuda restart`.
-fn keep_exited() -> bool {
+pub(crate) fn keep_exited() -> bool {
     std::env::var("REMUDA_KEEP_EXITED").is_ok_and(|v| v == "1")
 }
 
@@ -128,7 +128,7 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     // a socket that is already accepting — the interpreter's first call cannot
     // race the listener it will talk to.
     let counters = Arc::new(crate::tick::Counters::default());
-    let image = Image::spawn(path, Arc::clone(&counters));
+    let image = Image::spawn(path, Arc::clone(&registry), Arc::clone(&counters));
     spawn_ticker(image.clone(), Arc::clone(&counters));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
