@@ -26,11 +26,14 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 23] = [
+pub const BINDINGS: [&str; 28] = [
     "_call",
     "_descriptors",
+    "_refresh_sessions_buffer",
     "_run_due_schedules",
     "attach",
+    "buffer",
+    "buffers",
     "capture",
     "click",
     "close",
@@ -50,6 +53,8 @@ pub const BINDINGS: [&str; 23] = [
     "tool",
     "tools",
     "type_text",
+    "window",
+    "windows",
 ];
 
 /// Run a script file **in the daemon's image**, never in a fresh `Lua::new()`
@@ -359,6 +364,12 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
                 row.set("idle", session.idle.as_secs_f64())?;
                 row.set("cols", session.size.cols())?;
                 row.set("rows", session.size.rows())?;
+                // Additive: `tests/api/v1.lua` asserts specific fields exist,
+                // never that no others do, so a new field widens v1 rather
+                // than breaking it. Needed so a Lua-authored panel (the
+                // "*sessions*" buffer, `tools.lua`) can show the same
+                // attached state the list has always drawn.
+                row.set("attached", session.attached)?;
                 rows.set(index + 1, row)?;
             }
             Ok(Value::Table(rows))
