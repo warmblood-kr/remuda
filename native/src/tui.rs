@@ -2696,6 +2696,92 @@ mod tests {
         );
     }
 
+    /// `request_counts()`'s three fields read back through one `Eval` — the
+    /// same shape `native/tests/script.rs`'s sibling helper reads.
+    fn request_counts(path: &std::path::Path) -> (u64, u64, u64) {
+        let code = "local c = remuda.request_counts(); \
+                     return c.list .. ',' .. c.eval .. ',' .. c.capture_styled";
+        match client::request(
+            path,
+            &Request::Eval {
+                code: code.to_string(),
+                name: None,
+            },
+        ) {
+            Ok(Response::Value(text)) => {
+                let parts: Vec<u64> = text.split(',').map(|n| n.parse().unwrap()).collect();
+                (parts[0], parts[1], parts[2])
+            }
+            other => panic!("request_counts failed: {other:?}"),
+        }
+    }
+
+    /// [MEASURED, RED as of PR #46 / 121a64e9] A `Type`-forced refresh
+    /// (`skip_list=true`) must cost exactly one daemon request once the
+    /// window is already synced to the selected session. See steps/022.
+    // Today it costs two: `window_shown_session`'s `Eval` (tui.rs:952) runs
+    // unconditionally, outside the `skip_list` guard, even when nothing changed.
+    #[test]
+    fn a_type_forced_refresh_with_unchanged_selection_costs_one_daemon_request() {
+        let path = scratch_socket("type-forced-request-count");
+        daemon_at(&path);
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        // Steady state first: one relist, one window sync, one capture. The
+        // Type-forced refresh below has no selection change to react to.
+        refresh(&path, "default", &mut ui, &mut held, &mut painted, false).unwrap();
+        assert!(
+            ui.selected().is_some(),
+            "one session must be selected before measuring"
+        );
+
+        let before = request_counts(&path);
+        refresh(&path, "default", &mut ui, &mut held, &mut painted, true).unwrap();
+        let after = request_counts(&path);
+
+        // `after`'s own read is itself one Eval, counted in `after` but not
+        // caused by `refresh()` — subtract it to isolate what refresh() did.
+        let list = after.0 - before.0;
+        let eval = after.1 - before.1 - 1;
+        let capture_styled = after.2 - before.2;
+        let total = list + eval + capture_styled;
+        assert_eq!(
+            total, 1,
+            "a Type-forced refresh with an unchanged selection must cost exactly \
+             one daemon request (just the capture) — got {total} (list={list}, \
+             eval={eval}, capture_styled={capture_styled})"
+        );
+    }
+
+    /// [MEASURED, RED as of PR #46 / 121a64e9] A tick refresh
+    /// (`skip_list=false`) must send exactly one `Request::List`. See steps/031.
+    // Today it sends two: the direct `list(path)` call here, plus
+    // `remuda.ls()`'s own loopback socket connection inside
+    // `_refresh_sessions_buffer`'s `Eval` (`script.rs:110-114`).
+    #[test]
+    fn a_tick_refresh_sends_exactly_one_request_list() {
+        let path = scratch_socket("tick-refresh-list-count");
+        daemon_at(&path);
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+
+        let before = request_counts(&path);
+        refresh(&path, "default", &mut ui, &mut held, &mut painted, false).unwrap();
+        let after = request_counts(&path);
+
+        let list = after.0 - before.0;
+        assert_eq!(
+            list, 1,
+            "a tick refresh must send exactly one Request::List — got {list}"
+        );
+    }
+
     /// [MEASURED] The real bug behind steps/030: which session's pty a real
     /// `Hold` is attached to, not just `Ui` state — proven against a real
     /// daemon and two real held sessions, not a mock. See steps/030.
