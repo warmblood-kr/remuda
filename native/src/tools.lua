@@ -125,9 +125,7 @@ local function sorted_keys(table_value)
 end
 
 -- buffer and window: named text an extension can create and show, and a
--- screen rectangle to show it in — Emacs's own split. 정수님, 2026-09-13:
--- *"익스텐션들이 윈도우를 분할하고, 특정 버퍼를 만들어서 거기에 어떠한 내용을
--- 써서 사용자에게 표시할 수 있도록 해야할 것 같습니다."* Pure Lua state, the
+-- screen rectangle to show it in — Emacs's own split. Pure Lua state, the
 -- same shape as `remuda.tools`/`remuda.schedules` above: it does not survive
 -- a daemon restart, and that is not a gap to close — a buffer's whole life
 -- is the daemon's (see the module doc; nothing here reaches for `Registry`).
@@ -292,8 +290,7 @@ function remuda.type_text(session, text, settle)
 end
 
 -- The left session list, re-expressed as the "*sessions*" buffer instead of
--- being drawn straight out of Rust. 정수님, 2026-09-13: *"세션 목록 문서 패널,
--- 인박스 결정 문서 등 관리하는 것도, lua단에서 이루어져야 할 것 같습니다."*
+-- being drawn straight out of Rust.
 --
 -- `tui.rs`'s `list_row` keeps exactly two things it always had: the cursor
 -- mark (which row is selected is a per-viewer fact, not buffer content —
