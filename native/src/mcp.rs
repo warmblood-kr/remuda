@@ -316,7 +316,9 @@ fn lua_literal(value: &Value) -> String {
 
 /// A Lua string literal. `\ddd` is decimal in Lua; non-ASCII bytes pass through
 /// as they are, because a Lua string is bytes and the source is already UTF-8.
-fn lua_string(text: &str) -> String {
+// `pub(crate)`: `tui.rs` reuses this to embed a session name in an `Eval`
+// call rather than growing its own copy.
+pub(crate) fn lua_string(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
     for c in text.chars() {
