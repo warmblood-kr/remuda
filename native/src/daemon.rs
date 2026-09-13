@@ -129,13 +129,14 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     // race the listener it will talk to.
     let counters = Arc::new(crate::tick::Counters::default());
     let image = Image::spawn(path, Arc::clone(&counters));
-    spawn_ticker(image.clone(), counters);
+    spawn_ticker(image.clone(), Arc::clone(&counters));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let registry = Arc::clone(&registry);
         let image = image.clone();
+        let counters = Arc::clone(&counters);
         std::thread::spawn(move || {
-            let _ = handle(stream, &registry, &image);
+            let _ = handle(stream, &registry, &image, &counters);
         });
     }
     Ok(())
@@ -165,7 +166,23 @@ fn spawn_ticker(image: Image, counters: Arc<crate::tick::Counters>) {
     });
 }
 
-fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result<()> {
+/// The daemon is the one place that sees every round trip, including a
+/// same-process loopback a script's own Eval makes back to itself.
+fn record_request(counters: &crate::tick::Counters, request: &Request) {
+    match request {
+        Request::List => counters.counter("request_list").record_hit(),
+        Request::Eval { .. } => counters.counter("request_eval").record_hit(),
+        Request::CaptureStyled { .. } => counters.counter("request_capture_styled").record_hit(),
+        _ => {}
+    }
+}
+
+fn handle(
+    stream: Stream,
+    registry: &Registry,
+    image: &Image,
+    counters: &crate::tick::Counters,
+) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     if reader.read_line(&mut line)? == 0 {
@@ -176,6 +193,8 @@ fn handle(stream: Stream, registry: &Registry, image: &Image) -> std::io::Result
         Ok(request) => request,
         Err(e) => return reply(&stream, &Response::error(format!("bad request: {e}"))),
     };
+
+    record_request(counters, &request);
 
     match request {
         // Where a session that ended stops being listed. Here rather than on a

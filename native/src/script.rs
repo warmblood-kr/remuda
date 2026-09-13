@@ -26,7 +26,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 28] = [
+pub const BINDINGS: [&str; 29] = [
     "_call",
     "_descriptors",
     "_refresh_sessions_buffer",
@@ -45,6 +45,7 @@ pub const BINDINGS: [&str; 28] = [
     "mkdir",
     "new",
     "remove_dir_all",
+    "request_counts",
     "schedule",
     "schedule_skips",
     "schedules",
@@ -216,7 +217,8 @@ pub fn bindings(
     )?;
 
     dir_bindings(lua, &table, &at)?;
-    tick_bindings(lua, &table, counters)?;
+    tick_bindings(lua, &table, counters.clone())?;
+    request_count_bindings(lua, &table, counters)?;
 
     // Blocks the WHOLE Image, not just this call: the interpreter is pinned to
     // one thread (image.rs), so a sleeping script stalls every other job —
@@ -309,6 +311,32 @@ fn tick_bindings(
             let row = lua.create_table()?;
             row.set("consecutive", skips.consecutive())?;
             row.set("total", skips.total())?;
+            Ok(row)
+        })?,
+    )
+}
+
+/// The daemon's own request-dispatch counts, read-only — one row per
+/// `Request` variant `daemon::handle` counts, under the same names.
+// See `tick.rs`'s `Counters` for the shared registry both sides read; not in
+// `mcp::TOOLS`, so an MCP client can only reach it if something registers it
+// under `remuda.tools` (`remuda._call` looks up only that table, not every
+// top-level `remuda` name) — not done here, on purpose.
+fn request_count_bindings(
+    lua: &Lua,
+    table: &Table,
+    counters: std::sync::Arc<crate::tick::Counters>,
+) -> mlua::Result<()> {
+    table.set(
+        "request_counts",
+        lua.create_function(move |lua, ()| {
+            let row = lua.create_table()?;
+            row.set("list", counters.counter("request_list").total())?;
+            row.set("eval", counters.counter("request_eval").total())?;
+            row.set(
+                "capture_styled",
+                counters.counter("request_capture_styled").total(),
+            )?;
             Ok(row)
         })?,
     )
