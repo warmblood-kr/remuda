@@ -80,13 +80,8 @@ pub struct Ui {
     /// ended. Cleared by the next keypress that does anything.
     pub notice: Option<String>,
     /// The "*sessions*" buffer's content (`tools.lua`'s
-    /// `remuda._refresh_sessions_buffer`), one line per session in the same
-    /// order as `sessions` (both come from the same sorted-by-name `ls`), or
-    /// the two empty-herd lines when there is no herd. `list_row` reads this
-    /// instead of `sessions[i].alive`/`.attached` directly — the tail word
-    /// and empty-herd copy are Lua's now, not Rust's. Kept across a failed
-    /// refresh, same as `sessions` itself: a transport hiccup is not "the
-    /// buffer went blank".
+    /// `remuda._refresh_sessions_buffer`), index-aligned with `sessions`, or
+    /// the two empty-herd lines. See `list_row`.
     sessions_text: Vec<String>,
 }
 
@@ -846,13 +841,9 @@ pub fn pane_size(ui: &Ui, cols: u16, rows: u16) -> Size {
 /// A row that degrades instead of being cut. When the preview claims most of
 /// the terminal the list can floor at 16 columns, and a truncated row loses
 /// `live`/`dead` — the one field the whole list exists to show.
-///
-/// The tail word and the empty-herd copy are `ui.sessions_text` — the
-/// "*sessions*" buffer's content, Lua's now (`tools.lua`'s
-/// `remuda._refresh_sessions_buffer`). What stays here is the cursor mark
-/// (a per-viewer fact, never buffer content) and the width-aware
-/// padding/truncation math — mechanism, same as `capture`'s styled-vs-plain
-/// split keeping color in the frame.
+// The tail word and empty-herd copy are `ui.sessions_text` (Lua's, via
+// `tools.lua`'s `remuda._refresh_sessions_buffer`) — what stays here is the
+// cursor mark (per-viewer, never buffer content) and the width math.
 fn list_row(ui: &Ui, row: usize, width: u16) -> String {
     if ui.sessions.is_empty() {
         // The empty herd says what it is and what to do about it. It does not
@@ -1122,10 +1113,9 @@ fn list(path: &Path) -> Result<Vec<SessionSummary>, String> {
     }
 }
 
-/// The "*sessions*" buffer's content, refreshed at WIDTH and fetched in the
-/// same round trip (`tools.lua`'s `remuda._refresh_sessions_buffer`, then
-/// `remuda.buffer.new("*sessions*"):get()`) — one `Eval`, not two requests,
-/// since nothing else needs the buffer to exist as a separate step here.
+/// The "*sessions*" buffer's content, refreshed at WIDTH and fetched in one
+/// `Eval` round trip (`tools.lua`'s `remuda._refresh_sessions_buffer`, then
+/// `remuda.buffer.new("*sessions*"):get()`).
 fn sessions_buffer_lines(path: &Path, width: u16) -> Result<Vec<String>, String> {
     let code = format!(
         "remuda._refresh_sessions_buffer({width}); return remuda.buffer.new('*sessions*'):get()"
@@ -1936,13 +1926,12 @@ mod tests {
         assert!(out.ends_with("\x1b[?2026l"), "end sync: {out:?}");
     }
 
-    /// The regression oracle for moving the left column onto a Lua-authored
-    /// "*sessions*" buffer: captured against today's `list_row`, before that
-    /// migration touches anything, on a fixed scenario chosen to exercise the
-    /// column alignment `list_row`'s `room` math produces (two names of
-    /// different lengths, one attached, one not). If this ever needs editing
-    /// to pass, the migration changed `render_styled`'s own output, not just
-    /// its internals — stop and report rather than updating the literal.
+    /// The regression oracle for the "*sessions*"-buffer migration, captured
+    /// before it touched anything (two names of different lengths, one
+    /// attached, to exercise `list_row`'s column alignment).
+    // If this ever needs editing to pass, the migration changed
+    // `render_styled`'s own output, not just its internals — stop and
+    // report rather than updating the literal.
     #[test]
     fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buffer_migration() {
         let mut ui = ui(vec![row("alpha", true, false), row("bravo", true, true)]);
