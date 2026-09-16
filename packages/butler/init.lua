@@ -199,6 +199,24 @@ remuda.on("butler-matrix-line", function(line)
     return c == "n" and "\n" or c
   end)
   remuda.send(butler, "[matrix · " .. sender .. "] " .. body)
+  -- `remuda.send`'s text+Enter lands as one write, and this TUI reads a
+  -- burst of printable text immediately followed by \r as paste-in-progress,
+  -- not "text, then a distinct Enter" (measured in
+  -- native/tests/claude_session.rs's `send_and_submit`) -- so the line above
+  -- sits typed but unsubmitted until a separately-timed, empty `send` (a
+  -- bare Enter, its own write) confirms it. `remuda.sleep` would block the
+  -- Image's whole job queue for the delay; a `remuda.process` running `sleep`
+  -- gets the same delay without blocking anything else queued behind it.
+  -- Enter on an already-submitted empty box is a no-op, so this is safe even
+  -- if two lines arrive close together.
+  remuda.process{
+    argv = {"sleep", "2"},
+    on_exit = "butler-matrix-submit",
+  }
+end)
+
+remuda.on("butler-matrix-submit", function()
+  remuda.send(butler, "")
 end)
 
 remuda.process{
