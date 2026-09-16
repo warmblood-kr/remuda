@@ -683,17 +683,32 @@ fn restart_refuses_to_kill_a_live_session_without_being_told_twice() {
 }
 
 /// `exec` runs a built-in package's entry file in the daemon's own image —
-/// not a fresh interpreter — so what it does to a buffer is visible to a
-/// later `-e` against the same daemon. The daemon is pre-started here
-/// (rather than relying on `with_daemon`'s auto-start) to avoid its piped
-/// stderr, which a leaked auto-started daemon can inherit on Windows.
-/// That means `remuda exec`'s real-life auto-start path — invoked from a
-/// script with no daemon already running — is deliberately NOT covered by
-/// this test on Windows; see warmblood-kr/remuda#54.
+/// not a fresh interpreter — so a global it sets is visible to a later `-e`
+/// against the same daemon. The daemon is pre-started here (rather than
+/// relying on `with_daemon`'s auto-start) to avoid its piped stderr, which a
+/// leaked auto-started daemon can inherit on Windows. That means `remuda
+/// exec`'s real-life auto-start path — invoked from a script with no daemon
+/// already running — is deliberately NOT covered by this test on Windows;
+/// see warmblood-kr/remuda#54.
+///
+/// `packages/butler/init.lua` now needs real Matrix config to run past this
+/// point (`REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG`), which this test
+/// deliberately never provides — `remuda._butler_test_mode` is exactly the
+/// escape hatch it exposes for that (see `native/tests/daemon.rs`'s own
+/// `butler_test_daemon` and the tests around it for the full package), so
+/// this test asserts only the general "same living image" property, via the
+/// two globals every mode of `init.lua` sets before that point.
 #[test]
 fn exec_butler_runs_the_builtin_package_in_the_daemons_image() {
     let dir = scratch_dir("exec-butler");
     let _daemon = Daemon::spawn(&dir);
+
+    let mode = remuda_timed(&dir, &["-s", "s", "-e", "remuda._butler_test_mode = true"]);
+    assert!(
+        mode.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mode.stderr)
+    );
 
     let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
     assert!(
@@ -708,7 +723,8 @@ fn exec_butler_runs_the_builtin_package_in_the_daemons_image() {
             "-s",
             "s",
             "-e",
-            "return remuda.buffer.new('butler-boot'):get()",
+            "return (remuda._butler_helper_src ~= nil and remuda._butler_reply_src ~= nil) \
+             and 'ok' or 'missing'",
         ],
     );
     assert!(
@@ -719,7 +735,7 @@ fn exec_butler_runs_the_builtin_package_in_the_daemons_image() {
     assert_eq!(
         String::from_utf8_lossy(&read.stdout).trim(),
         "ok",
-        "the butler package did not set the buffer it was supposed to"
+        "the butler package did not set its embedded-source globals in this image"
     );
 }
 
@@ -1082,4 +1098,568 @@ fn an_unpaced_flood_exercises_real_backpressure_and_the_child_blocks() {
         assert!(Instant::now() < deadline, "exit event never arrived");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+// --- packages/butler: the Matrix bridge's Python/bash helpers -------------
+//
+// Everything below runs against a stub HTTP server of our own
+// (`tests/support/matrix_stub_server.py`), never a real Matrix homeserver.
+// `HELPER_SRC`/`REPLY_SRC` are read straight out of the real
+// `packages/butler/init.lua` by running it (in test mode) in a daemon's
+// living image via `remuda exec butler`, then referenced BY NAME
+// (`remuda._butler_helper_src` / `remuda._butler_reply_src`) from later
+// `remuda.process` calls against that same image — the exact embedded
+// source, with no separate string round-trip through Rust needed.
+
+/// The stub Matrix homeserver, as its own process — plain
+/// `std::process::Command`, not `remuda.process`: this is test
+/// infrastructure standing in for a homeserver, not part of the package
+/// under test.
+struct StubServer {
+    child: std::process::Child,
+    port: u16,
+}
+
+impl StubServer {
+    fn spawn(fixture: &Path, get_log: &Path, put_log: &Path, send_status: u16) -> Self {
+        let mut child = std::process::Command::new("python3")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/support/matrix_stub_server.py"
+            ))
+            .arg(fixture)
+            .arg(get_log)
+            .arg(put_log)
+            .arg(send_status.to_string())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn stub matrix server");
+        let stdout = child.stdout.take().expect("stub stdout piped");
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut reader, &mut line).expect("read stub port line");
+        let port: u16 = line
+            .trim()
+            .parse()
+            .expect("stub printed a port on its first line");
+        Self { child, port }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+}
+
+impl Drop for StubServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// One canned `/sync` response per line, in the shape the stub expects.
+fn write_fixture(path: &Path, responses: &[serde_json::Value]) {
+    let mut text = String::new();
+    for r in responses {
+        text.push_str(&r.to_string());
+        text.push('\n');
+    }
+    std::fs::write(path, text).expect("write fixture");
+}
+
+/// The token file and 3-line config file (`homeserver`, `room id`, `self
+/// mxid`) `HELPER_SRC`/`REPLY_SRC` both expect.
+fn butler_config(
+    dir: &Path,
+    tag: &str,
+    homeserver: &str,
+    room: &str,
+    self_mxid: &str,
+) -> (PathBuf, PathBuf) {
+    let token_path = dir.join(format!("{tag}.token"));
+    let config_path = dir.join(format!("{tag}.config"));
+    std::fs::write(&token_path, "test-token\n").expect("write token");
+    std::fs::write(&config_path, format!("{homeserver}\n{room}\n{self_mxid}\n"))
+        .expect("write config");
+    (token_path, config_path)
+}
+
+/// Pre-start a daemon, then run the real `packages/butler/init.lua` inside
+/// it with `remuda._butler_test_mode` set — the same `remuda exec`
+/// invocation `exec_butler_runs_the_builtin_package_in_the_daemons_image`
+/// uses — so `remuda._butler_helper_src`/`remuda._butler_reply_src` hold
+/// the exact embedded source, without starting a real Claude session or
+/// needing `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG`. Both globals stay
+/// live in this same image afterward, so a later `eval` can reference them
+/// by name directly inside a `remuda.process{argv = {...}}` call.
+fn butler_test_daemon(dir: &Path) -> (Daemon, PathBuf) {
+    let daemon = Daemon::spawn(dir);
+    let path = daemon::socket_path_in(dir, "s");
+    eval(&path, "remuda._butler_test_mode = true");
+    let out = remuda_timed(dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (daemon, path)
+}
+
+#[test]
+fn butler_helper_filters_to_the_allowlisted_room() {
+    let dir = scratch_dir("butler-allowlist");
+    let (_daemon, path) = butler_test_daemon(&dir);
+
+    let allowed_room = "!allowed:example.org";
+    let other_room = "!other:example.org";
+    let self_mxid = "@bot:example.org";
+
+    let get_log = dir.join("allowlist-get.log");
+    let put_log = dir.join("allowlist-put.log");
+    let fixture = dir.join("allowlist-fixture.jsonl");
+    std::fs::write(&get_log, "").unwrap();
+    std::fs::write(&put_log, "").unwrap();
+    write_fixture(
+        &fixture,
+        &[
+            serde_json::json!({"rooms": {"join": {}}, "next_batch": "aw-0"}),
+            serde_json::json!({
+                "rooms": {"join": {
+                    allowed_room: {"timeline": {"events": [
+                        {"type": "m.room.message", "event_id": "$1", "sender": "@alice:example.org",
+                         "content": {"msgtype": "m.text", "body": "hello from allowed room"}}
+                    ]}},
+                    other_room: {"timeline": {"events": [
+                        {"type": "m.room.message", "event_id": "$2", "sender": "@bob:example.org",
+                         "content": {"msgtype": "m.text", "body": "hello from other room"}}
+                    ]}}
+                }},
+                "next_batch": "aw-1"
+            }),
+        ],
+    );
+
+    let stub = StubServer::spawn(&fixture, &get_log, &put_log, 200);
+    let (token_path, config_path) =
+        butler_config(&dir, "allowlist", &stub.base_url(), allowed_room, self_mxid);
+
+    eval(&path, "remuda.allow_lines = {}");
+    eval(
+        &path,
+        "remuda.on('allow-line', function(l) table.insert(remuda.allow_lines, l) end)",
+    );
+    eval(
+        &path,
+        &format!(
+            "remuda.allow_handle = remuda.process{{argv = {{'python3', '-c', remuda._butler_helper_src, {}, {}}}, on_line = 'allow-line'}}",
+            lua_raw_string(&token_path.to_string_lossy()),
+            lua_raw_string(&config_path.to_string_lossy()),
+        ),
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return #remuda.allow_lines") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no line ever arrived from the allowlisted room"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // A message from the non-allowlisted room must produce ZERO emits, not
+    // just "the count happens to work out" — give it a real window to show
+    // up wrongly before checking.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        read_count(&path, "return #remuda.allow_lines"),
+        1,
+        "exactly one emit was expected — the non-allowlisted room's event leaked through"
+    );
+    let line = eval(&path, "return remuda.allow_lines[1]");
+    assert!(
+        line.starts_with("@alice:example.org\t"),
+        "wrong event emitted: {line}"
+    );
+
+    eval(&path, "remuda.kill(remuda.allow_handle)");
+}
+
+#[test]
+fn butler_helper_ignores_its_own_messages() {
+    let dir = scratch_dir("butler-self");
+    let (_daemon, path) = butler_test_daemon(&dir);
+
+    let room = "!self:example.org";
+    let self_mxid = "@bot:example.org";
+
+    let get_log = dir.join("self-get.log");
+    let put_log = dir.join("self-put.log");
+    let fixture = dir.join("self-fixture.jsonl");
+    std::fs::write(&get_log, "").unwrap();
+    std::fs::write(&put_log, "").unwrap();
+    write_fixture(
+        &fixture,
+        &[
+            serde_json::json!({"rooms": {"join": {}}, "next_batch": "sf-0"}),
+            serde_json::json!({
+                "rooms": {"join": {
+                    room: {"timeline": {"events": [
+                        {"type": "m.room.message", "event_id": "$1", "sender": self_mxid,
+                         "content": {"msgtype": "m.text", "body": "an echo of my own reply"}}
+                    ]}}
+                }},
+                "next_batch": "sf-1"
+            }),
+        ],
+    );
+
+    let stub = StubServer::spawn(&fixture, &get_log, &put_log, 200);
+    let (token_path, config_path) = butler_config(&dir, "self", &stub.base_url(), room, self_mxid);
+
+    eval(&path, "remuda.self_lines = {}");
+    eval(
+        &path,
+        "remuda.on('self-line', function(l) table.insert(remuda.self_lines, l) end)",
+    );
+    eval(
+        &path,
+        &format!(
+            "remuda.self_handle = remuda.process{{argv = {{'python3', '-c', remuda._butler_helper_src, {}, {}}}, on_line = 'self-line'}}",
+            lua_raw_string(&token_path.to_string_lossy()),
+            lua_raw_string(&config_path.to_string_lossy()),
+        ),
+    );
+
+    // Proof the fixture's event was actually reached (not just "nothing ran
+    // yet"): wait for the stub to have answered both the baseline call and
+    // the one carrying the self-authored event.
+    let deadline = Instant::now() + PATIENCE;
+    while std::fs::read_to_string(&get_log)
+        .unwrap_or_default()
+        .lines()
+        .count()
+        < 2
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the helper never even polled past the baseline"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        read_count(&path, "return #remuda.self_lines"),
+        0,
+        "a message from the bridge's own account must never be re-ingested"
+    );
+
+    eval(&path, "remuda.kill(remuda.self_handle)");
+}
+
+#[test]
+fn butler_helper_escapes_a_multiline_message_into_exactly_one_line() {
+    let dir = scratch_dir("butler-escape");
+    let (_daemon, path) = butler_test_daemon(&dir);
+
+    let room = "!escape:example.org";
+    let self_mxid = "@bot:example.org";
+    // Includes a real newline, a standalone backslash, AND a literal
+    // backslash-then-"n" (not a real newline) — the last one is what a
+    // naive two-pass unescape (newline-pass then backslash-pass) gets
+    // wrong, since the backslash it doubles for its own escaping can end
+    // up immediately before a literal "n" and be misread as a newline
+    // escape on the first pass.
+    let original_body = "line one\nline two with a \\ backslash and a literal \\n as text";
+
+    let get_log = dir.join("escape-get.log");
+    let put_log = dir.join("escape-put.log");
+    let fixture = dir.join("escape-fixture.jsonl");
+    std::fs::write(&get_log, "").unwrap();
+    std::fs::write(&put_log, "").unwrap();
+    write_fixture(
+        &fixture,
+        &[
+            serde_json::json!({"rooms": {"join": {}}, "next_batch": "es-0"}),
+            serde_json::json!({
+                "rooms": {"join": {
+                    room: {"timeline": {"events": [
+                        {"type": "m.room.message", "event_id": "$1", "sender": "@carol:example.org",
+                         "content": {"msgtype": "m.text", "body": original_body}}
+                    ]}}
+                }},
+                "next_batch": "es-1"
+            }),
+        ],
+    );
+
+    let stub = StubServer::spawn(&fixture, &get_log, &put_log, 200);
+    let (token_path, config_path) =
+        butler_config(&dir, "escape", &stub.base_url(), room, self_mxid);
+
+    eval(&path, "remuda.esc_lines = {}");
+    eval(
+        &path,
+        "remuda.on('esc-line', function(l) table.insert(remuda.esc_lines, l) end)",
+    );
+    eval(
+        &path,
+        &format!(
+            "remuda.esc_handle = remuda.process{{argv = {{'python3', '-c', remuda._butler_helper_src, {}, {}}}, on_line = 'esc-line'}}",
+            lua_raw_string(&token_path.to_string_lossy()),
+            lua_raw_string(&config_path.to_string_lossy()),
+        ),
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return #remuda.esc_lines") == 0 {
+        assert!(Instant::now() < deadline, "no line ever arrived");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Exactly one emit for one Matrix event — not two, not a parse error —
+    // even though the body contains a real newline.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        read_count(&path, "return #remuda.esc_lines"),
+        1,
+        "one Matrix event with an embedded newline must become exactly one physical line"
+    );
+
+    let raw_line = eval(&path, "return remuda.esc_lines[1]");
+    assert!(
+        !raw_line.contains('\n'),
+        "the delivered line itself contained a raw newline: {raw_line:?}"
+    );
+
+    // Round-trip: the exact unescape logic `init.lua`'s own `butler-matrix-line`
+    // hook uses, run against the raw received line.
+    let reconstructed = eval(
+        &path,
+        &format!(
+            r#"
+            local line = {raw}
+            local _, body = line:match("^([^\t]*)\t(.*)$")
+            body = body:gsub("\\(.)", function(c) return c == "n" and "\n" or c end)
+            return body
+            "#,
+            raw = lua_raw_string(&raw_line)
+        ),
+    );
+    assert_eq!(
+        reconstructed, original_body,
+        "the round trip through escape/unescape did not reproduce the original body"
+    );
+
+    eval(&path, "remuda.kill(remuda.esc_handle)");
+}
+
+#[test]
+fn butler_helper_persists_since_across_a_restart() {
+    let dir = scratch_dir("butler-persist");
+    let (_daemon, path) = butler_test_daemon(&dir);
+
+    let room = "!persist:example.org";
+    let self_mxid = "@bot:example.org";
+
+    // First instance: a baseline, then one qualifying event.
+    let get_log1 = dir.join("persist-get1.log");
+    let put_log1 = dir.join("persist-put1.log");
+    let fixture1 = dir.join("persist-fixture1.jsonl");
+    std::fs::write(&get_log1, "").unwrap();
+    std::fs::write(&put_log1, "").unwrap();
+    write_fixture(
+        &fixture1,
+        &[
+            serde_json::json!({"rooms": {"join": {}}, "next_batch": "d-since-0"}),
+            serde_json::json!({
+                "rooms": {"join": {
+                    room: {"timeline": {"events": [
+                        {"type": "m.room.message", "event_id": "$1", "sender": "@dave:example.org",
+                         "content": {"msgtype": "m.text", "body": "first batch"}}
+                    ]}}
+                }},
+                "next_batch": "d-since-1"
+            }),
+        ],
+    );
+
+    let stub1 = StubServer::spawn(&fixture1, &get_log1, &put_log1, 200);
+    let (token_path, config_path) =
+        butler_config(&dir, "persist", &stub1.base_url(), room, self_mxid);
+    let since_path = format!("{}.since", config_path.display());
+
+    eval(&path, "remuda.persist_lines = {}");
+    eval(
+        &path,
+        "remuda.on('persist-line', function(l) table.insert(remuda.persist_lines, l) end)",
+    );
+    eval(
+        &path,
+        &format!(
+            "remuda.persist_handle = remuda.process{{argv = {{'python3', '-c', remuda._butler_helper_src, {}, {}}}, on_line = 'persist-line'}}",
+            lua_raw_string(&token_path.to_string_lossy()),
+            lua_raw_string(&config_path.to_string_lossy()),
+        ),
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return #remuda.persist_lines") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the first instance never emitted its line"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    eval(&path, "remuda.kill(remuda.persist_handle)");
+    std::thread::sleep(Duration::from_millis(200));
+    drop(stub1);
+
+    let since_before = std::fs::read_to_string(&since_path).expect("since file exists");
+    assert!(
+        since_before.contains("d-since-1"),
+        "unexpected since file contents: {since_before}"
+    );
+
+    // Second instance: same config path (so the same since file), a fresh
+    // stub with its own second batch, and the config file repointed at it.
+    let get_log2 = dir.join("persist-get2.log");
+    let put_log2 = dir.join("persist-put2.log");
+    let fixture2 = dir.join("persist-fixture2.jsonl");
+    std::fs::write(&get_log2, "").unwrap();
+    std::fs::write(&put_log2, "").unwrap();
+    write_fixture(
+        &fixture2,
+        &[serde_json::json!({"rooms": {"join": {}}, "next_batch": "d-since-2"})],
+    );
+    let stub2 = StubServer::spawn(&fixture2, &get_log2, &put_log2, 200);
+    std::fs::write(
+        &config_path,
+        format!("{}\n{}\n{}\n", stub2.base_url(), room, self_mxid),
+    )
+    .expect("repoint config at the second stub");
+
+    eval(
+        &path,
+        &format!(
+            "remuda.persist_handle2 = remuda.process{{argv = {{'python3', '-c', remuda._butler_helper_src, {}, {}}}}}",
+            lua_raw_string(&token_path.to_string_lossy()),
+            lua_raw_string(&config_path.to_string_lossy()),
+        ),
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if !std::fs::read_to_string(&get_log2)
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the second instance never called the new stub"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let first_request = std::fs::read_to_string(&get_log2).expect("get log2");
+    let first_line = first_request.lines().next().expect("at least one request");
+    assert!(
+        first_line.contains("since=d-since-1"),
+        "the second instance did not resume from the persisted since token: {first_line}"
+    );
+    assert!(
+        !first_line.contains("since=d-since-0") && !first_line.contains("timeout=0"),
+        "the second instance replayed the baseline instead of resuming: {first_line}"
+    );
+
+    eval(&path, "remuda.kill(remuda.persist_handle2)");
+}
+
+#[test]
+fn matrix_reply_tool_queues_a_send_and_reports_its_own_exit() {
+    let dir = scratch_dir("butler-reply");
+    let (_daemon, path) = butler_test_daemon(&dir);
+
+    let room = "!reply:example.org";
+    let self_mxid = "@bot:example.org";
+    let empty_fixture = dir.join("reply-fixture.jsonl");
+    std::fs::write(&empty_fixture, "").expect("write empty fixture");
+
+    // Success case.
+    let get_log = dir.join("reply-get.log");
+    let put_log = dir.join("reply-put.log");
+    std::fs::write(&get_log, "").unwrap();
+    std::fs::write(&put_log, "").unwrap();
+    let stub_ok = StubServer::spawn(&empty_fixture, &get_log, &put_log, 200);
+    let (token_path, config_path) =
+        butler_config(&dir, "reply-ok", &stub_ok.base_url(), room, self_mxid);
+
+    eval(&path, "remuda.reply_exit_ok = nil");
+    eval(
+        &path,
+        "remuda.on('reply-exit-ok', function(c) remuda.reply_exit_ok = c end)",
+    );
+    eval(
+        &path,
+        &format!(
+            "remuda.process{{argv = {{'bash', '-c', remuda._butler_reply_src, '_', {}, {}, 'hello'}}, on_exit = 'reply-exit-ok'}}",
+            lua_raw_string(&token_path.to_string_lossy()),
+            lua_raw_string(&config_path.to_string_lossy()),
+        ),
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return remuda.reply_exit_ok and 1 or 0") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "on_exit never fired for the successful send"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        read_count(&path, "return remuda.reply_exit_ok"),
+        0,
+        "a successful send must exit 0"
+    );
+    let sent = std::fs::read_to_string(&put_log).expect("put log");
+    assert!(
+        sent.contains("hello"),
+        "the stub never received the reply body: {sent}"
+    );
+
+    // Failure case: a fresh stub configured to answer 400.
+    let get_log2 = dir.join("reply-get2.log");
+    let put_log2 = dir.join("reply-put2.log");
+    std::fs::write(&get_log2, "").unwrap();
+    std::fs::write(&put_log2, "").unwrap();
+    let stub_fail = StubServer::spawn(&empty_fixture, &get_log2, &put_log2, 400);
+    let (token_path2, config_path2) =
+        butler_config(&dir, "reply-fail", &stub_fail.base_url(), room, self_mxid);
+
+    eval(&path, "remuda.reply_exit_fail = nil");
+    eval(
+        &path,
+        "remuda.on('reply-exit-fail', function(c) remuda.reply_exit_fail = c end)",
+    );
+    eval(
+        &path,
+        &format!(
+            "remuda.process{{argv = {{'bash', '-c', remuda._butler_reply_src, '_', {}, {}, 'hello'}}, on_exit = 'reply-exit-fail'}}",
+            lua_raw_string(&token_path2.to_string_lossy()),
+            lua_raw_string(&config_path2.to_string_lossy()),
+        ),
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return remuda.reply_exit_fail and 1 or 0") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "on_exit never fired for the failing send"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        read_count(&path, "return remuda.reply_exit_fail") != 0,
+        "a failing send (HTTP 400) must be observably distinguishable from success via a nonzero exit code"
+    );
 }

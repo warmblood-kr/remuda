@@ -149,3 +149,44 @@ network side of a real inbound helper — a Matrix `/sync` long-poll, printing
 one JSON line per event — is an ordinary `remuda.process` caller, arriving
 in a later change. This primitive's own tests use a small line-printing
 helper and know nothing about Matrix, reconnects, or backoff.
+
+## The Matrix bridge is one package, wired entirely out of existing primitives
+
+`packages/butler` runs one Claude Code session, fed by messages from one
+Matrix room, replying through one MCP tool — the same three shapes as
+everything above it, composed rather than special-cased. The inbound side
+is a small Python `/sync` long-poll (the caller `remuda.process` was built
+for), the outbound side is a small bash sender (a `remuda.process` `run`
+callback), and the session in between is an ordinary `remuda.new` session
+fed with `remuda.send` — nothing about this package needs a new primitive.
+
+The helper and the session talk to each other through the same line-oriented
+channel any `remuda.process` caller gets, so the format has to survive being
+squeezed through it: `sender<TAB>escaped-body`, one physical line per Matrix
+event, however many lines the original message body contained. The body is
+escaped backslash-first, then newline (`\` becomes `\\`, a real newline
+becomes `\n`), and unescaped on the way back in with a single left-to-right
+pass over each backslash-and-next-character pair — not two independent
+passes, which would let an escaped backslash sitting right before a literal
+"n" in the original text be misread as a newline escape that was never
+there. `remuda.process`'s pipe delivers whole lines and nothing else, so a
+message with an embedded newline that arrived as two physical lines would be
+indistinguishable from two separate messages; making it one line here is
+what keeps that guarantee true one level up.
+
+The helper allowlists a single configured room and a single configured
+sender identity (its own account), and treats any other room or its own
+outbound messages as invisible — not filtered after the fact, never read in
+the first place. This is a deliberately narrower scope than an existing
+cross-fleet bridge this design draws on, which polls every joined room on
+purpose for its own multi-room use case; a bridge feeding exactly one
+session on exactly one topic has no such need, and the allowlist is what
+keeps a message from an unrelated room from ever reaching that session.
+
+The reply tool is fire-and-forget on purpose: it returns as soon as the
+outbound send is queued as a `remuda.process`, not once the message is
+actually delivered. Delivery's real outcome — success or the specific
+failure — arrives separately, as that process's `on_exit` event, exactly the
+way any other `remuda.process` caller finds out how its child actually
+ended. A caller that needs to know whether a given reply landed watches for
+that event; nothing about the tool's own return value promises it.
