@@ -151,6 +151,64 @@ register(
   "_run_due_schedules(now) -> nil"
 )
 
+-- hooks: Emacs's augroup model. `on` files a callback under an event name;
+-- `group` is optional on registration but required to clear by, the same
+-- asymmetry augroup has — naming a group costs nothing, but clearing without
+-- one would wipe every extension's hooks at once, not just the caller's own.
+remuda.hooks = {}
+register("hooks", "The `remuda.on` registry table, keyed by event name.", "table")
+
+function remuda.on(event, fn, opts)
+  if type(event) ~= "string" or event == "" then
+    error("a hook needs an event name", 2)
+  end
+  if type(fn) ~= "function" then
+    error("a hook needs a function", 2)
+  end
+  opts = opts or {}
+  remuda.hooks[event] = remuda.hooks[event] or {}
+  table.insert(remuda.hooks[event], { fn = fn, group = opts.group })
+end
+register("on", "Register a callback to run when an event fires.", "on(event, fn, opts?) -> nil")
+
+-- A snapshot, not a live reference to `remuda.hooks[event]` — a hook that
+-- calls `clear_hooks` on its own group must not skip or re-run a sibling
+-- still mid-iteration.
+function remuda.emit(event, ...)
+  local hooks = remuda.hooks[event]
+  if not hooks then
+    return
+  end
+  local snapshot = {}
+  for i, hook in ipairs(hooks) do
+    snapshot[i] = hook
+  end
+  for _, hook in ipairs(snapshot) do
+    hook.fn(...)
+  end
+end
+register("emit", "Fire an event, running every hook registered for it.", "emit(event, ...) -> nil")
+
+-- Every hook in GROUP, across every event — an augroup clears as a unit
+-- regardless of which events its members are on, so one extension's cleanup
+-- can never reach a hook another extension (or group) registered.
+function remuda.clear_hooks(opts)
+  opts = opts or {}
+  if opts.group == nil then
+    error("clear_hooks needs a `group` — clearing every hook at once is not offered", 2)
+  end
+  for event, hooks in pairs(remuda.hooks) do
+    local kept = {}
+    for _, hook in ipairs(hooks) do
+      if hook.group ~= opts.group then
+        kept[#kept + 1] = hook
+      end
+    end
+    remuda.hooks[event] = kept
+  end
+end
+register("clear_hooks", "Remove every hook registered under a group.", "clear_hooks(opts) -> nil")
+
 local escapes = {
   ['"'] = '\\"',
   ["\\"] = "\\\\",

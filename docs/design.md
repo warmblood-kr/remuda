@@ -75,3 +75,21 @@ never replaces a first one also labelled `"x"` the way redefining a
 `remuda.tool` word does on purpose. Cancelling is idempotent — cancelling an
 already-cancelled or unrecognized handle is silent, not an error, since
 "this is no longer registered" is exactly the state a caller was asking for.
+
+## Hooks, on Emacs's augroup model
+
+`remuda.on(event, fn, {group = ...})` registers a callback under a named
+event; `remuda.emit(event, ...)` runs every callback registered for that
+event, in the order they were added. `group` is optional to register with —
+naming one costs nothing — but required to clear by:
+`remuda.clear_hooks({group = ...})` removes every hook in that group, across
+every event it touched, and refuses to run without a group at all. An
+augroup clears as a unit for the same reason a schedule's identity is its
+handle and not its name: without it, one extension's cleanup could reach
+another's hooks, or a script's own second `require` of itself could double
+every hook it thought it was replacing.
+
+remuda defines no events of its own yet — `on`/`emit`/`clear_hooks` are
+general-purpose, the same way Emacs's `add-hook`/`run-hooks` presuppose
+nothing about which hook variable is being run. A caller names its own
+events and calls `emit` at whatever moment matters to it.
