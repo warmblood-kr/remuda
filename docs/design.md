@@ -42,4 +42,23 @@ global that skips the `remuda.` prefix — is something only a handful of the
 highest-frequency verbs would ever earn, decided one at a time rather than
 granted by default; `send`, `new`, and `ls` never get one, since a bare verb
 that common is also common enough to collide with something a script already
-defined.
+defined. No bare-name alias exists today; candidates would be read-only verbs
+such as `capture`/`sleep`, added the day a real ergonomic complaint appears
+rather than speculatively.
+
+## Session ≠ buffer
+
+A session is a live process this daemon runs — `remuda.ls()`'s own rows,
+`remuda.send`/`capture`/`key` and their siblings all name one by its session
+name. A buffer is Lua-owned text with no process behind it, created with
+`remuda.buffer.new(name)` and holding nothing but a name and a string.
+Nothing about a session is a buffer and nothing about a buffer is a session,
+even where they share a name.
+
+`remuda.session(name)` is a handle onto an existing session. `session.buffer`
+is a convenience — the buffer named after that session, created on first
+access — never the session itself; `buffer.set(name, text)` reaches the same
+buffer without going through a session handle at all, for a caller that only
+ever had the name. `session.is_busy` exists because a session is a process
+that can be doing work; a buffer cannot be, so it never carries `is_busy` or
+a `context_left`, no matter whose content it holds.

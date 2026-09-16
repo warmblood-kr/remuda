@@ -350,3 +350,34 @@ fn remuda_new_can_set_cwd_and_env_on_the_launched_process() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn a_session_handle_is_not_a_buffer() {
+    // Both nouns, on purpose: `remuda.session(name).buffer` for the noun
+    // that owns text, `remuda.buffer.set` for the free-function spelling of
+    // the same thing — and `is_busy` must exist on the first and not the
+    // second, since a buffer is inert text with no notion of "working".
+    let dir = scratch("session-buffer");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let source = r#"
+        remuda.new("driven", {"sh"})
+        local s = remuda.session("driven")
+        assert(type(s.is_busy) == "boolean", "session.is_busy must be a boolean")
+
+        s.buffer:set("via session.buffer")
+        assert(remuda.buffer.new("driven"):get() == "via session.buffer",
+          "session.buffer must be the buffer named after the session")
+
+        remuda.buffer.set("driven", "via buffer.set")
+        assert(s.buffer:get() == "via buffer.set",
+          "buffer.set(name, text) must reach the same buffer session.buffer does")
+
+        local b = remuda.buffer.new("standalone")
+        assert(b.is_busy == nil, "a buffer must never carry is_busy")
+        assert(b.context_left == nil, "a buffer must never carry context_left")
+    "#;
+
+    script::run(&path, &write(&dir, "session_buffer.lua", source)).expect("session vs buffer");
+}

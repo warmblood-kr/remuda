@@ -196,6 +196,12 @@ function remuda.buffer.list()
   return sorted_keys(remuda.buffers)
 end
 
+-- The free-function spelling of `buffer.new(name):set(text)`, for a caller
+-- that has a name but never needed the handle itself.
+function remuda.buffer.set(name, text)
+  remuda.buffer.new(name):set(text)
+end
+
 function Buffer:set(text)
   self.text = tostring(text)
 end
@@ -207,6 +213,42 @@ end
 function Buffer:get()
   return self.text
 end
+
+-- session ≠ buffer: a session is a live process this daemon runs, a buffer
+-- is Lua-owned text. `session.buffer` is the buffer named after the session
+-- (create-if-absent, same as `buffer.new`) — a convenience, never the session
+-- itself, so nothing here duplicates what `remuda.ls()` already reports.
+local Session = {}
+Session.__index = function(self, key)
+  if key == "buffer" then
+    return remuda.buffer.new(self.name)
+  elseif key == "is_busy" then
+    for _, row in ipairs(remuda.ls()) do
+      if row.name == self.name then
+        -- A session that just produced output is doing work; one that has
+        -- sat quiet a couple of seconds is waiting on something else. No
+        -- real "is this session working" signal exists — this is a heuristic
+        -- ceiling on top of the idle time `ls()` already tracks, not a fact.
+        return row.idle < 2.0
+      end
+    end
+    return nil
+  end
+  return rawget(Session, key)
+end
+
+-- A handle onto an existing session, by name. `is_busy`/`context_left` live
+-- HERE, never on `remuda.buffer` — a buffer is inert text and has no notion
+-- of busy or of a context budget, whichever session's content it happens to
+-- hold. (`context_left` is not implemented: a generic pty has no channel a
+-- caller's token budget would arrive on. Named so a future one lands here.)
+function remuda.session(name)
+  if type(name) ~= "string" or name == "" then
+    error("a session needs a name", 2)
+  end
+  return setmetatable({ name = name }, Session)
+end
+register("session", "A handle onto an existing session, by name.", "session(name) -> session")
 
 -- window: a screen rectangle showing exactly one buffer or attached session,
 -- owning the lifetime of neither — closing one kills nothing it showed
