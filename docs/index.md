@@ -30,5 +30,7 @@ predictions that turned out wrong:
 
 - [PRINCIPLES.md](https://github.com/warmblood-kr/remuda/blob/main/PRINCIPLES.md)
   — the rules, each naming the mechanism that enforces it
+- [design.md](design.md) — the current shape of the scripting surface, kept
+  in present tense and rewritten in place as it changes
 - [steps/](https://github.com/warmblood-kr/remuda/tree/main/steps) — one
   document per slice: what was wanted, what was expected, what actually happened

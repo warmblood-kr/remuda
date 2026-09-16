@@ -150,6 +150,35 @@ fn the_bound_surface_is_exactly_the_protocols() {
 }
 
 #[test]
+fn every_word_has_a_registry_entry() {
+    // Every BINDINGS name, plus every remuda.tool() registrant (wait_for is
+    // reachable only through remuda.tools, never as a top-level BINDINGS
+    // name) — the two categories the reference manual has to cover.
+    let dir = scratch("registry-completeness");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let names = script::BINDINGS.join(",");
+    let source = format!(
+        r#"
+        local missing = {{}}
+        for name in string.gmatch("{names}", "[^,]+") do
+          if remuda._registry[name] == nil then missing[#missing + 1] = name end
+        end
+        for name in pairs(remuda.tools) do
+          if remuda._registry[name] == nil then missing[#missing + 1] = name end
+        end
+        if #missing > 0 then
+          table.sort(missing)
+          error("no registry entry for: " .. table.concat(missing, ", "))
+        end
+        "#
+    );
+
+    script::run(&path, &write(&dir, "completeness.lua", &source)).expect("registry complete");
+}
+
+#[test]
 fn every_frozen_api_version_still_runs() {
     // 정수님, 2026-09-10: *"그 언어 API 에 대고 사용자들이 자기 함수를 얹어서
     // 설정하거나 플러그인, 워크플로 등을 만들면, 하위호환을 엄격하게 지켜야
