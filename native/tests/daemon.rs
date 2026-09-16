@@ -941,3 +941,145 @@ fn killing_a_process_mid_stream_yields_exit_and_nothing_after() {
         "a line arrived after the exit event"
     );
 }
+
+/// The paced flood above (`a_line_flood_does_not_starve_the_schedule_ticker`)
+/// is deliberately slow enough that `process.rs`'s 4096-line `BUFFER_CAP`
+/// never fills, so backpressure itself is never exercised there. This test
+/// writes as fast as `_print_lines` can (delay 0) and gives it 5x
+/// `BUFFER_CAP` worth of lines, so the buffer must fill — and proves it did,
+/// three independent ways:
+///
+/// 1. The child is *still running* (`remuda.processes()` still lists its id)
+///    well after an unblocked 20000-tiny-line write would already have
+///    exited on its own — it can only still be alive because its own
+///    `write()` is blocked on a full pipe.
+/// 2. Total wall-clock time to drain is far longer than an unpaced write of
+///    20000 short lines takes with no consumer at all (well under 100ms,
+///    unmeasured here, but self-evidently near-instant) — the elapsed time
+///    is explainable only by the child being made to wait.
+/// 3. The schedule ticker keeps advancing throughout, so none of the above
+///    comes at the cost of starving the Image's own FIFO — the property the
+///    paced flood test already covers, still held even under real pressure.
+///
+/// The `on_line` hook itself is a busy loop, not a sleep — Lua has no
+/// builtin sleep, and this is simplest thing that reliably costs enough
+/// real wall time per line to keep the buffer pinned near `BUFFER_CAP` for
+/// long enough to observe, rather than draining in a blink.
+#[test]
+fn an_unpaced_flood_exercises_real_backpressure_and_the_child_blocks() {
+    let dir = scratch_dir("process-unpaced-flood");
+    let _daemon = Daemon::spawn(&dir);
+    let path = daemon::socket_path_in(&dir, "s");
+    let exe = lua_raw_string(env!("CARGO_BIN_EXE_remuda"));
+    const FLOOD_LINES: u32 = 20_000;
+
+    eval(&path, "remuda.up_count = 0");
+    eval(&path, "remuda.up_last = 0");
+    eval(&path, "remuda.up_broken = false");
+    eval(&path, "remuda.up_exit = nil");
+    eval(
+        &path,
+        // Ordering is checked inline, one line at a time, rather than
+        // buffered into a 20000-entry table and checked after: `up_broken`
+        // catches any gap or repeat the instant it happens, and `up_last`
+        // at the end is proof every line 1..N arrived, not a sample of them.
+        "remuda.on('up-line', function(l)
+            local n = tonumber(l)
+            if n ~= remuda.up_last + 1 then remuda.up_broken = true end
+            remuda.up_last = n
+            local busy = 0
+            for i = 1, 10000 do busy = busy + i end
+            remuda.up_count = remuda.up_count + 1
+        end)",
+    );
+    eval(
+        &path,
+        "remuda.on('up-exit', function() remuda.up_exit = true end)",
+    );
+    eval(&path, "remuda.up_ticks = 0");
+    eval(
+        &path,
+        "remuda.schedule{every = 0.05, run = function() remuda.up_ticks = remuda.up_ticks + 1 end}",
+    );
+
+    let spawned_at = Instant::now();
+    eval(
+        &path,
+        &format!(
+            "remuda.up_handle = remuda.process{{argv = {{{exe}, '_print_lines', '{FLOOD_LINES}', '0'}}, on_line = 'up-line', on_exit = 'up-exit'}}"
+        ),
+    );
+
+    // Proof #1: still alive well after an unblocked flood of this size would
+    // have finished. `BUFFER_CAP` (4096) plus a typical OS pipe (tens of
+    // thousands of bytes, a few thousand lines of this size) is nowhere near
+    // 20000 lines, so a child that is still running here is blocked on a
+    // full pipe, not merely "still working".
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        read_count(
+            &path,
+            "return (function() \
+                for _, id in ipairs(remuda.processes()) do \
+                    if id == remuda.up_handle then return 1 end \
+                end \
+                return 0 \
+             end)()"
+        ),
+        1,
+        "the flooding process had already exited after 300ms — \
+         backpressure did not hold it, so the buffer/pipe never filled"
+    );
+
+    let flood_deadline = Instant::now() + Duration::from_secs(60);
+    let mut last_ticks = read_count(&path, "return remuda.up_ticks");
+    let mut ticker_advanced_during_flood = false;
+    loop {
+        let count = read_count(&path, "return remuda.up_count");
+        if count >= FLOOD_LINES {
+            break;
+        }
+        assert!(
+            Instant::now() < flood_deadline,
+            "flood never finished ({count}/{FLOOD_LINES})"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        let ticks = read_count(&path, "return remuda.up_ticks");
+        if ticks > last_ticks {
+            ticker_advanced_during_flood = true;
+        }
+        last_ticks = ticks;
+    }
+
+    // Proof #2: it took distinctly longer than an unpaced, unblocked write
+    // of 20000 short lines could possibly take on its own. Generous enough
+    // to survive a slow CI runner (including Windows), tight enough that
+    // "no backpressure" (near-instant) cannot pass it by accident.
+    let elapsed = spawned_at.elapsed();
+    assert!(
+        elapsed > Duration::from_millis(500),
+        "the flood drained in {elapsed:?} — too fast to have been backpressured"
+    );
+
+    assert!(
+        ticker_advanced_during_flood,
+        "the schedule ticker never advanced during the unpaced flood"
+    );
+
+    assert_eq!(
+        read_count(&path, "return remuda.up_broken and 1 or 0"),
+        0,
+        "a line arrived out of order or was skipped"
+    );
+    assert_eq!(
+        read_count(&path, "return remuda.up_last"),
+        FLOOD_LINES,
+        "the last line received was not the expected final line"
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return remuda.up_exit and 1 or 0") == 0 {
+        assert!(Instant::now() < deadline, "exit event never arrived");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
