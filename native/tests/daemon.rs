@@ -687,6 +687,9 @@ fn restart_refuses_to_kill_a_live_session_without_being_told_twice() {
 /// later `-e` against the same daemon. The daemon is pre-started here
 /// (rather than relying on `with_daemon`'s auto-start) to avoid its piped
 /// stderr, which a leaked auto-started daemon can inherit on Windows.
+/// That means `remuda exec`'s real-life auto-start path — invoked from a
+/// script with no daemon already running — is deliberately NOT covered by
+/// this test on Windows; see warmblood-kr/remuda#54.
 #[test]
 fn exec_butler_runs_the_builtin_package_in_the_daemons_image() {
     let dir = scratch_dir("exec-butler");
@@ -721,7 +724,8 @@ fn exec_butler_runs_the_builtin_package_in_the_daemons_image() {
 }
 
 /// A name with no matching arm is a plain error naming the package, not a
-/// panic or a silent no-op. Daemon pre-started for the same reason as above.
+/// panic or a silent no-op. Daemon pre-started for the same reason as above
+/// (auto-start on Windows not covered here; see warmblood-kr/remuda#54).
 #[test]
 fn exec_of_an_unknown_package_fails_and_names_it() {
     let dir = scratch_dir("exec-unknown");
