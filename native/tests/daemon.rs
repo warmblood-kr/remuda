@@ -1452,6 +1452,23 @@ fn butler_helper_escapes_a_multiline_message_into_exactly_one_line() {
     eval(&path, "remuda.kill(remuda.esc_handle)");
 }
 
+/// Writes an empty get/put log and a fixture, then starts a stub server on
+/// it. Shared by tests that need more than one stub instance in sequence
+/// (e.g. proving persistence across a restart), so each instance is one
+/// line instead of the six it takes to set up by hand.
+fn spawn_stub(dir: &Path, tag: &str, responses: &[serde_json::Value]) -> (StubServer, PathBuf) {
+    let get_log = dir.join(format!("{tag}-get.log"));
+    let put_log = dir.join(format!("{tag}-put.log"));
+    let fixture = dir.join(format!("{tag}-fixture.jsonl"));
+    std::fs::write(&get_log, "").unwrap();
+    std::fs::write(&put_log, "").unwrap();
+    write_fixture(&fixture, responses);
+    (
+        StubServer::spawn(&fixture, &get_log, &put_log, 200),
+        get_log,
+    )
+}
+
 #[test]
 fn butler_helper_persists_since_across_a_restart() {
     let dir = scratch_dir("butler-persist");
@@ -1461,13 +1478,9 @@ fn butler_helper_persists_since_across_a_restart() {
     let self_mxid = "@bot:example.org";
 
     // First instance: a baseline, then one qualifying event.
-    let get_log1 = dir.join("persist-get1.log");
-    let put_log1 = dir.join("persist-put1.log");
-    let fixture1 = dir.join("persist-fixture1.jsonl");
-    std::fs::write(&get_log1, "").unwrap();
-    std::fs::write(&put_log1, "").unwrap();
-    write_fixture(
-        &fixture1,
+    let (stub1, _get_log1) = spawn_stub(
+        &dir,
+        "persist1",
         &[
             serde_json::json!({"rooms": {"join": {}}, "next_batch": "d-since-0"}),
             serde_json::json!({
@@ -1481,8 +1494,6 @@ fn butler_helper_persists_since_across_a_restart() {
             }),
         ],
     );
-
-    let stub1 = StubServer::spawn(&fixture1, &get_log1, &put_log1, 200);
     let (token_path, config_path) =
         butler_config(&dir, "persist", &stub1.base_url(), room, self_mxid);
     let since_path = format!("{}.since", config_path.display());
@@ -1521,16 +1532,11 @@ fn butler_helper_persists_since_across_a_restart() {
 
     // Second instance: same config path (so the same since file), a fresh
     // stub with its own second batch, and the config file repointed at it.
-    let get_log2 = dir.join("persist-get2.log");
-    let put_log2 = dir.join("persist-put2.log");
-    let fixture2 = dir.join("persist-fixture2.jsonl");
-    std::fs::write(&get_log2, "").unwrap();
-    std::fs::write(&put_log2, "").unwrap();
-    write_fixture(
-        &fixture2,
+    let (stub2, get_log2) = spawn_stub(
+        &dir,
+        "persist2",
         &[serde_json::json!({"rooms": {"join": {}}, "next_batch": "d-since-2"})],
     );
-    let stub2 = StubServer::spawn(&fixture2, &get_log2, &put_log2, 200);
     std::fs::write(
         &config_path,
         format!("{}\n{}\n{}\n", stub2.base_url(), room, self_mxid),
@@ -1575,7 +1581,15 @@ fn butler_helper_persists_since_across_a_restart() {
     eval(&path, "remuda.kill(remuda.persist_handle2)");
 }
 
+// `REPLY_SRC` is a bash script by design (packages/butler/init.lua) -- the
+// real deployment target is a single Linux host, and there is no plan to
+// run this specific package's helpers on Windows. Windows CI does have a
+// `bash` on PATH (Git Bash), but the script's coreutils-flavored pieces
+// (`date +%s%N`, `sed -n`) are not guaranteed to behave identically there,
+// and that gap is not worth chasing for a component that will never run on
+// that platform in practice.
 #[test]
+#[cfg(unix)]
 fn matrix_reply_tool_queues_a_send_and_reports_its_own_exit() {
     let dir = scratch_dir("butler-reply");
     let (_daemon, path) = butler_test_daemon(&dir);
