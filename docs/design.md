@@ -93,3 +93,22 @@ remuda defines no events of its own yet — `on`/`emit`/`clear_hooks` are
 general-purpose, the same way Emacs's `add-hook`/`run-hooks` presuppose
 nothing about which hook variable is being run. A caller names its own
 events and calls `emit` at whatever moment matters to it.
+
+## A package is a name and an entry file, nothing more
+
+`remuda exec <name>` runs a package's entry file in the daemon's own living
+image — the same image `remuda lua <path>` and `remuda -e <code>` share, not
+a fresh interpreter, so what the entry file does is visible to whatever runs
+against that daemon afterward. There is no registry: a name either resolves
+to an entry file or it doesn't.
+
+Today, resolution is a built-in lookup compiled into the `remuda` binary
+itself (`packages/<name>/init.lua`, embedded at compile time), because the
+distributed binary carries no source checkout to read a package directory
+from at runtime. A package still lives on disk as a real, editable
+`packages/<name>/init.lua` file in this repo; only how that file reaches the
+running daemon is compiled-in rather than looked up. An install mechanism,
+when it exists, changes only that resolution step — cloning a package into a
+runtime directory and reading its `init.lua` from disk instead of from the
+binary — the entry-file convention itself does not change, so a package
+written today keeps working once installing replaces embedding.

@@ -655,3 +655,57 @@ fn restart_refuses_to_kill_a_live_session_without_being_told_twice() {
     );
     assert!(daemon.left_on_its_own(), "-f did not stop it");
 }
+
+/// `exec` runs a built-in package's entry file in the daemon's own image —
+/// not a fresh interpreter — so what it does to a buffer is visible to a
+/// later `-e` against the same daemon. The daemon auto-starts on first use,
+/// same as every other `with_daemon` verb.
+#[test]
+fn exec_butler_runs_the_builtin_package_in_the_daemons_image() {
+    let dir = scratch_dir("exec-butler");
+
+    let out = remuda(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let read = remuda(
+        &dir,
+        &[
+            "-s",
+            "s",
+            "-e",
+            "return remuda.buffer.new('butler-boot'):get()",
+        ],
+    );
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&read.stdout).trim(),
+        "ok",
+        "the butler package did not set the buffer it was supposed to"
+    );
+}
+
+/// A name with no matching arm is a plain error naming the package, not a
+/// panic or a silent no-op.
+#[test]
+fn exec_of_an_unknown_package_fails_and_names_it() {
+    let dir = scratch_dir("exec-unknown");
+
+    let out = remuda(&dir, &["-s", "s", "exec", "definitely-not-a-real-package"]);
+    assert!(
+        !out.status.success(),
+        "an unknown package should not succeed"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no such package"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

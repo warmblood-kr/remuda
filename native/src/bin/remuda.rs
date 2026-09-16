@@ -102,6 +102,8 @@ fn main() -> ExitCode {
             }
         }),
 
+        ["exec", name] => with_daemon(server, &path, |path| exec_command(path, name)),
+
         // `emacsclient -e` for this runtime: the code runs in the daemon's
         // long-lived image, so what it defines is still there next time.
         ["-e", code] => with_daemon(server, &path, |path| eval_once(path, code)),
@@ -139,6 +141,7 @@ remuda — a pty manager you can attach to
   remuda send <name> <text>     deliver one instruction (body + Enter)
 
   remuda lua <script.lua>       run a Lua script in the daemon's living image
+  remuda exec <name>            run a built-in package's entry file, by name
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
@@ -442,6 +445,30 @@ fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> Exit
         }
     }
     f(path)
+}
+
+/// A built-in package's entry source, embedded at compile time. No install
+/// mechanism and no registry yet — a name either matches one of these arms
+/// or it doesn't.
+fn builtin_package(name: &str) -> Option<&'static str> {
+    match name {
+        "butler" => Some(include_str!("../../../packages/butler/init.lua")),
+        _ => None,
+    }
+}
+
+/// Run a built-in package's entry file in the daemon's image, by name.
+fn exec_command(path: &Path, name: &str) -> ExitCode {
+    match builtin_package(name) {
+        None => fail(format!("no such package: {name}")),
+        Some(source) => {
+            let chunk_name = format!("packages/{name}/init.lua");
+            match remuda_native::script::run_source(path, &chunk_name, source) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => fail(e),
+            }
+        }
+    }
 }
 
 /// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
