@@ -174,14 +174,15 @@ message with an embedded newline that arrived as two physical lines would be
 indistinguishable from two separate messages; making it one line here is
 what keeps that guarantee true one level up.
 
-The helper allowlists a single configured room and a single configured
-sender identity (its own account), and treats any other room or its own
-outbound messages as invisible — not filtered after the fact, never read in
-the first place. This is a deliberately narrower scope than an existing
-cross-fleet bridge this design draws on, which polls every joined room on
-purpose for its own multi-room use case; a bridge feeding exactly one
-session on exactly one topic has no such need, and the allowlist is what
-keeps a message from an unrelated room from ever reaching that session.
+The helper allowlists a single configured room and a configured set of
+human sender mxids, and treats any other room, any sender outside that set,
+or its own outbound messages as invisible — not filtered after the fact,
+never read in the first place. This is a deliberately narrower scope than
+an existing cross-fleet bridge this design draws on, which polls every
+joined room on purpose for its own multi-room use case; a bridge that hands
+one Claude Code session's shell to whoever is behind the message has to
+draw both boundaries — the room and the person — or any member of that room
+could drive the session, not just the person it is meant to answer to.
 
 The reply tool is fire-and-forget on purpose: it returns as soon as the
 outbound send is queued as a `remuda.process`, not once the message is

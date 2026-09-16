@@ -1168,20 +1168,25 @@ fn write_fixture(path: &Path, responses: &[serde_json::Value]) {
     std::fs::write(path, text).expect("write fixture");
 }
 
-/// The token file and 3-line config file (`homeserver`, `room id`, `self
-/// mxid`) `HELPER_SRC`/`REPLY_SRC` both expect.
+/// The token file and 4-line config file (`homeserver`, `room id`, `self
+/// mxid`, comma-separated allowed sender mxids) `HELPER_SRC`/`REPLY_SRC`
+/// both expect.
 fn butler_config(
     dir: &Path,
     tag: &str,
     homeserver: &str,
     room: &str,
     self_mxid: &str,
+    allowed_senders: &str,
 ) -> (PathBuf, PathBuf) {
     let token_path = dir.join(format!("{tag}.token"));
     let config_path = dir.join(format!("{tag}.config"));
     std::fs::write(&token_path, "test-token\n").expect("write token");
-    std::fs::write(&config_path, format!("{homeserver}\n{room}\n{self_mxid}\n"))
-        .expect("write config");
+    std::fs::write(
+        &config_path,
+        format!("{homeserver}\n{room}\n{self_mxid}\n{allowed_senders}\n"),
+    )
+    .expect("write config");
     (token_path, config_path)
 }
 
@@ -1241,8 +1246,14 @@ fn butler_helper_filters_to_the_allowlisted_room() {
     );
 
     let stub = StubServer::spawn(&fixture, &get_log, &put_log, 200);
-    let (token_path, config_path) =
-        butler_config(&dir, "allowlist", &stub.base_url(), allowed_room, self_mxid);
+    let (token_path, config_path) = butler_config(
+        &dir,
+        "allowlist",
+        &stub.base_url(),
+        allowed_room,
+        self_mxid,
+        "@alice:example.org",
+    );
 
     eval(&path, "remuda.allow_lines = {}");
     eval(
@@ -1285,6 +1296,89 @@ fn butler_helper_filters_to_the_allowlisted_room() {
 }
 
 #[test]
+fn butler_helper_drops_a_non_allowlisted_sender_in_the_same_room() {
+    let dir = scratch_dir("butler-sender-allowlist");
+    let (_daemon, path) = butler_test_daemon(&dir);
+
+    let room = "!senders:example.org";
+    let self_mxid = "@bot:example.org";
+    let allowed_sender = "@alice:example.org";
+    let other_member = "@mallory:example.org";
+
+    let get_log = dir.join("senders-get.log");
+    let put_log = dir.join("senders-put.log");
+    let fixture = dir.join("senders-fixture.jsonl");
+    std::fs::write(&get_log, "").unwrap();
+    std::fs::write(&put_log, "").unwrap();
+    write_fixture(
+        &fixture,
+        &[
+            serde_json::json!({"rooms": {"join": {}}, "next_batch": "sa-0"}),
+            serde_json::json!({
+                "rooms": {"join": {
+                    room: {"timeline": {"events": [
+                        {"type": "m.room.message", "event_id": "$1", "sender": other_member,
+                         "content": {"msgtype": "m.text", "body": "not on the allowlist"}},
+                        {"type": "m.room.message", "event_id": "$2", "sender": allowed_sender,
+                         "content": {"msgtype": "m.text", "body": "hello from the allowed sender"}}
+                    ]}}
+                }},
+                "next_batch": "sa-1"
+            }),
+        ],
+    );
+
+    let stub = StubServer::spawn(&fixture, &get_log, &put_log, 200);
+    let (token_path, config_path) = butler_config(
+        &dir,
+        "senders",
+        &stub.base_url(),
+        room,
+        self_mxid,
+        allowed_sender,
+    );
+
+    eval(&path, "remuda.sender_lines = {}");
+    eval(
+        &path,
+        "remuda.on('sender-line', function(l) table.insert(remuda.sender_lines, l) end)",
+    );
+    eval(
+        &path,
+        &format!(
+            "remuda.sender_handle = remuda.process{{argv = {{'python3', '-c', remuda._butler_helper_src, {}, {}}}, on_line = 'sender-line'}}",
+            lua_raw_string(&token_path.to_string_lossy()),
+            lua_raw_string(&config_path.to_string_lossy()),
+        ),
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return #remuda.sender_lines") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "no line ever arrived from the allowlisted sender"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The non-allowlisted member's message must produce ZERO emits, not just
+    // "the count happens to work out" -- give it a real window to show up
+    // wrongly before checking.
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        read_count(&path, "return #remuda.sender_lines"),
+        1,
+        "exactly one emit was expected -- the non-allowlisted sender's event leaked through"
+    );
+    let line = eval(&path, "return remuda.sender_lines[1]");
+    assert!(
+        line.starts_with("@alice:example.org\t"),
+        "wrong event emitted: {line}"
+    );
+
+    eval(&path, "remuda.kill(remuda.sender_handle)");
+}
+
+#[test]
 fn butler_helper_ignores_its_own_messages() {
     let dir = scratch_dir("butler-self");
     let (_daemon, path) = butler_test_daemon(&dir);
@@ -1314,7 +1408,8 @@ fn butler_helper_ignores_its_own_messages() {
     );
 
     let stub = StubServer::spawn(&fixture, &get_log, &put_log, 200);
-    let (token_path, config_path) = butler_config(&dir, "self", &stub.base_url(), room, self_mxid);
+    let (token_path, config_path) =
+        butler_config(&dir, "self", &stub.base_url(), room, self_mxid, "");
 
     eval(&path, "remuda.self_lines = {}");
     eval(
@@ -1393,8 +1488,14 @@ fn butler_helper_escapes_a_multiline_message_into_exactly_one_line() {
     );
 
     let stub = StubServer::spawn(&fixture, &get_log, &put_log, 200);
-    let (token_path, config_path) =
-        butler_config(&dir, "escape", &stub.base_url(), room, self_mxid);
+    let (token_path, config_path) = butler_config(
+        &dir,
+        "escape",
+        &stub.base_url(),
+        room,
+        self_mxid,
+        "@carol:example.org",
+    );
 
     eval(&path, "remuda.esc_lines = {}");
     eval(
@@ -1470,6 +1571,10 @@ fn spawn_stub(dir: &Path, tag: &str, responses: &[serde_json::Value]) -> (StubSe
 }
 
 #[test]
+// The 4th config line (sender allowlist) pushed this back over clippy's
+// too-many-lines threshold; the two-instance restart scenario this proves
+// doesn't split further without losing the point of the test.
+#[allow(clippy::too_many_lines)]
 fn butler_helper_persists_since_across_a_restart() {
     let dir = scratch_dir("butler-persist");
     let (_daemon, path) = butler_test_daemon(&dir);
@@ -1494,8 +1599,14 @@ fn butler_helper_persists_since_across_a_restart() {
             }),
         ],
     );
-    let (token_path, config_path) =
-        butler_config(&dir, "persist", &stub1.base_url(), room, self_mxid);
+    let (token_path, config_path) = butler_config(
+        &dir,
+        "persist",
+        &stub1.base_url(),
+        room,
+        self_mxid,
+        "@dave:example.org",
+    );
     let since_path = format!("{}.since", config_path.display());
 
     eval(&path, "remuda.persist_lines = {}");
@@ -1539,7 +1650,12 @@ fn butler_helper_persists_since_across_a_restart() {
     );
     std::fs::write(
         &config_path,
-        format!("{}\n{}\n{}\n", stub2.base_url(), room, self_mxid),
+        format!(
+            "{}\n{}\n{}\n@dave:example.org\n",
+            stub2.base_url(),
+            room,
+            self_mxid
+        ),
     )
     .expect("repoint config at the second stub");
 
@@ -1606,7 +1722,7 @@ fn matrix_reply_tool_queues_a_send_and_reports_its_own_exit() {
     std::fs::write(&put_log, "").unwrap();
     let stub_ok = StubServer::spawn(&empty_fixture, &get_log, &put_log, 200);
     let (token_path, config_path) =
-        butler_config(&dir, "reply-ok", &stub_ok.base_url(), room, self_mxid);
+        butler_config(&dir, "reply-ok", &stub_ok.base_url(), room, self_mxid, "");
 
     eval(&path, "remuda.reply_exit_ok = nil");
     eval(
@@ -1647,8 +1763,14 @@ fn matrix_reply_tool_queues_a_send_and_reports_its_own_exit() {
     std::fs::write(&get_log2, "").unwrap();
     std::fs::write(&put_log2, "").unwrap();
     let stub_fail = StubServer::spawn(&empty_fixture, &get_log2, &put_log2, 400);
-    let (token_path2, config_path2) =
-        butler_config(&dir, "reply-fail", &stub_fail.base_url(), room, self_mxid);
+    let (token_path2, config_path2) = butler_config(
+        &dir,
+        "reply-fail",
+        &stub_fail.base_url(),
+        room,
+        self_mxid,
+        "",
+    );
 
     eval(&path, "remuda.reply_exit_fail = nil");
     eval(
@@ -1675,5 +1797,83 @@ fn matrix_reply_tool_queues_a_send_and_reports_its_own_exit() {
     assert!(
         read_count(&path, "return remuda.reply_exit_fail") != 0,
         "a failing send (HTTP 400) must be observably distinguishable from success via a nonzero exit code"
+    );
+}
+
+// Fix for "TOKEN IN ARGV": the reply script must never pass the bearer
+// token as a curl argument, since a process's argv is visible to any other
+// user via `ps`. Proven by intercepting curl itself: a fake `curl` on a
+// PATH of our own logs exactly the argv and stdin it received, then exits
+// 0 without ever making a network call -- REPLY_SRC's own token-handling is
+// what's under test here, not the network path (already covered by
+// `matrix_reply_tool_queues_a_send_and_reports_its_own_exit`).
+#[test]
+#[cfg(unix)]
+fn matrix_reply_tool_never_puts_the_token_in_curls_argv() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("butler-reply-token");
+    let (_daemon, path) = butler_test_daemon(&dir);
+    let reply_src = eval(&path, "return remuda._butler_reply_src");
+
+    let token_path = dir.join("token-argv.token");
+    let config_path = dir.join("token-argv.config");
+    let token = "s3cr3t-token-value";
+    std::fs::write(&token_path, format!("{token}\n")).expect("write token");
+    std::fs::write(
+        &config_path,
+        "http://127.0.0.1:1\n!room:example.org\n@bot:example.org\n",
+    )
+    .expect("write config");
+
+    let fake_curl_dir = dir.join("fake-bin");
+    std::fs::create_dir_all(&fake_curl_dir).expect("fake bin dir");
+    let argv_log = dir.join("curl-argv.log");
+    let stdin_log = dir.join("curl-stdin.log");
+    std::fs::write(&argv_log, "").expect("init argv log");
+    let fake_curl = fake_curl_dir.join("curl");
+    std::fs::write(
+        &fake_curl,
+        format!(
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{}'; done\ncat > '{}'\nexit 0\n",
+            argv_log.display(),
+            stdin_log.display(),
+        ),
+    )
+    .expect("write fake curl");
+    std::fs::set_permissions(&fake_curl, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod fake curl");
+
+    let path_with_fake_curl = format!(
+        "{}:{}",
+        fake_curl_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let status = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&reply_src)
+        .arg("_")
+        .arg(&token_path)
+        .arg(&config_path)
+        .arg("hello")
+        .env("PATH", path_with_fake_curl)
+        .status()
+        .expect("run REPLY_SRC with the fake curl on PATH");
+    assert!(
+        status.success(),
+        "REPLY_SRC exited nonzero against the fake curl"
+    );
+
+    let logged_argv = std::fs::read_to_string(&argv_log).expect("read fake curl's argv log");
+    assert!(
+        !logged_argv.contains(token),
+        "the token appeared in curl's own argv: {logged_argv:?}"
+    );
+
+    let logged_stdin = std::fs::read_to_string(&stdin_log).unwrap_or_default();
+    assert!(
+        logged_stdin.contains(&format!("Authorization: Bearer {token}")),
+        "the Authorization header was never delivered to curl via stdin: {logged_stdin:?}"
     );
 }

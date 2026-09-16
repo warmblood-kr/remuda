@@ -13,6 +13,9 @@ TOKEN_PATH, CONFIG_PATH = sys.argv[1], sys.argv[2]
 TOKEN = Path(TOKEN_PATH).read_text().strip()
 _lines = Path(CONFIG_PATH).read_text().splitlines()
 HOMESERVER, ROOM_ID, SELF_MXID = _lines[0].strip(), _lines[1].strip(), _lines[2].strip()
+ALLOWED_SENDERS = set()
+if len(_lines) > 3 and _lines[3].strip():
+    ALLOWED_SENDERS = {s.strip() for s in _lines[3].split(",") if s.strip()}
 
 SYNC_TIMEOUT_MS = 30000
 SINCE_FILE = Path(CONFIG_PATH + ".since")
@@ -57,6 +60,12 @@ def handle_room(room):
             continue
         sender = ev.get("sender")
         if sender == SELF_MXID:
+            continue
+        # Sender allowlist: only a configured human account may reach the
+        # session. `--permission-mode auto` gives that session shell access
+        # with no per-call confirmation, so anyone else in the room must
+        # never be able to feed it input.
+        if sender not in ALLOWED_SENDERS:
             continue
         content = ev.get("content", {})
         if content.get("msgtype") not in ("m.text", "m.notice", "m.emote"):
@@ -111,9 +120,12 @@ TXN_ID="remuda-butler-$(date +%s%N)"
 BODY_JSON="$(python3 -c 'import json,sys; print(json.dumps({"msgtype":"m.text","body":sys.argv[1]}))' "$TEXT")"
 ENC_ROOM="$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$ROOM_ID")"
 
-curl -sf -X PUT \
+# The Authorization header carries the bearer token; passing it via -H would
+# put the token in this process's own argv, visible to any other user via
+# `ps`. -K - reads curl's config (here, just the one header) from stdin
+# instead, which never appears in argv.
+printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -sf -K - -X PUT \
   "$HOMESERVER/_matrix/client/v3/rooms/$ENC_ROOM/send/m.room.message/$TXN_ID" \
-  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d "$BODY_JSON" >/dev/null
 ]==]
