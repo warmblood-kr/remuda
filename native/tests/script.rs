@@ -381,3 +381,35 @@ fn a_session_handle_is_not_a_buffer() {
 
     script::run(&path, &write(&dir, "session_buffer.lua", source)).expect("session vs buffer");
 }
+
+#[test]
+fn clearing_one_group_leaves_the_others_hooks_firing() {
+    // The augroup model: a group clears as a unit, and clearing one must
+    // never reach a hook registered under a different group — even on the
+    // same event.
+    let dir = scratch("hooks");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let source = r#"
+        remuda.fired_a, remuda.fired_b = 0, 0
+        remuda.on("tick", function() remuda.fired_a = remuda.fired_a + 1 end, { group = "a" })
+        remuda.on("tick", function() remuda.fired_b = remuda.fired_b + 1 end, { group = "b" })
+
+        remuda.emit("tick")
+        remuda.emit("tick")
+        assert(remuda.fired_a == 2, "group a must fire on every emit before clearing")
+        assert(remuda.fired_b == 2, "group b must fire on every emit before clearing")
+
+        remuda.clear_hooks({ group = "a" })
+        remuda.emit("tick")
+        remuda.emit("tick")
+        assert(remuda.fired_a == 2, "a cleared group must not fire again")
+        assert(remuda.fired_b == 4, "an untouched group must keep firing")
+
+        local ok = pcall(remuda.clear_hooks, {})
+        assert(not ok, "clear_hooks must refuse to run with no group")
+    "#;
+
+    script::run(&path, &write(&dir, "hooks.lua", source)).expect("hook groups");
+}
