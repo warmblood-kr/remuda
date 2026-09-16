@@ -586,6 +586,32 @@ fn remuda(dir: &Path, args: &[&str]) -> std::process::Output {
         .expect("run remuda")
 }
 
+/// Bounded on purpose, like `Daemon::left_on_its_own` — an unbounded wait on
+/// a command that hangs is the same failure this exists to catch, fast.
+fn remuda_timed(dir: &Path, args: &[&str]) -> std::process::Output {
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(args)
+        .env("REMUDA_RUNTIME_DIR", dir)
+        .env("REMUDA_NO_UPDATE_CHECK", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn remuda");
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if let Ok(Some(_)) = child.try_wait() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{args:?} did not exit within PATIENCE"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.wait_with_output().expect("collect output")
+}
+
 /// `restart` drives the SHIPPED BINARY, not `daemon::serve` on a thread: the
 /// stop is a `process::exit`, so an in-process daemon would take the test
 /// runner with it — which is also why this is the only honest way to test it.
@@ -654,4 +680,65 @@ fn restart_refuses_to_kill_a_live_session_without_being_told_twice() {
         String::from_utf8_lossy(&forced.stderr)
     );
     assert!(daemon.left_on_its_own(), "-f did not stop it");
+}
+
+/// `exec` runs a built-in package's entry file in the daemon's own image —
+/// not a fresh interpreter — so what it does to a buffer is visible to a
+/// later `-e` against the same daemon. The daemon is pre-started here
+/// (rather than relying on `with_daemon`'s auto-start) to avoid its piped
+/// stderr, which a leaked auto-started daemon can inherit on Windows.
+/// That means `remuda exec`'s real-life auto-start path — invoked from a
+/// script with no daemon already running — is deliberately NOT covered by
+/// this test on Windows; see warmblood-kr/remuda#54.
+#[test]
+fn exec_butler_runs_the_builtin_package_in_the_daemons_image() {
+    let dir = scratch_dir("exec-butler");
+    let _daemon = Daemon::spawn(&dir);
+
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let read = remuda_timed(
+        &dir,
+        &[
+            "-s",
+            "s",
+            "-e",
+            "return remuda.buffer.new('butler-boot'):get()",
+        ],
+    );
+    assert!(
+        read.status.success(),
+        "{}",
+        String::from_utf8_lossy(&read.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&read.stdout).trim(),
+        "ok",
+        "the butler package did not set the buffer it was supposed to"
+    );
+}
+
+/// A name with no matching arm is a plain error naming the package, not a
+/// panic or a silent no-op. Daemon pre-started for the same reason as above
+/// (auto-start on Windows not covered here; see warmblood-kr/remuda#54).
+#[test]
+fn exec_of_an_unknown_package_fails_and_names_it() {
+    let dir = scratch_dir("exec-unknown");
+    let _daemon = Daemon::spawn(&dir);
+
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "definitely-not-a-real-package"]);
+    assert!(
+        !out.status.success(),
+        "an unknown package should not succeed"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no such package"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

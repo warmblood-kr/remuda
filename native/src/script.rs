@@ -170,14 +170,13 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
     table.set("_registry", registry)
 }
 
-/// Run a script file **in the daemon's image**, never in a fresh `Lua::new()`
-/// here — a script must see the state `-e` and the REPL share. The chunk name
-/// travels with the source so a traceback still names the file.
-pub fn run(socket: &Path, script: &Path) -> Result<(), String> {
-    let source = std::fs::read_to_string(script).map_err(|e| e.to_string())?;
+/// Run source text **in the daemon's image**, the same as `run` but for a
+/// chunk with no file on disk — a built-in package embedded at compile
+/// time. `name` becomes the chunk name, so a traceback still names it.
+pub fn run_source(socket: &Path, name: &str, source: &str) -> Result<(), String> {
     let request = Request::Eval {
-        code: source,
-        name: Some(script.display().to_string()),
+        code: source.to_string(),
+        name: Some(name.to_string()),
     };
     match client::request(socket, &request).map_err(|e| e.to_string())? {
         // Whatever the script printed comes back in the same string (the
@@ -193,6 +192,14 @@ pub fn run(socket: &Path, script: &Path) -> Result<(), String> {
         Response::Error(reason) => Err(reason),
         other => Err(format!("unexpected response: {other:?}")),
     }
+}
+
+/// Run a script file **in the daemon's image**, never in a fresh `Lua::new()`
+/// here — a script must see the state `-e` and the REPL share. The chunk name
+/// travels with the source so a traceback still names the file.
+pub fn run(socket: &Path, script: &Path) -> Result<(), String> {
+    let source = std::fs::read_to_string(script).map_err(|e| e.to_string())?;
+    run_source(socket, &script.display().to_string(), &source)
 }
 
 /// `new`'s wire shape, from the four positional Lua arguments `bindings`
