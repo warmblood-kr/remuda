@@ -26,10 +26,12 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 29] = [
+pub const BINDINGS: [&str; 31] = [
     "_call",
     "_descriptors",
     "_refresh_sessions_buffer",
+    "_registry",
+    "_registry_dump",
     "_run_due_schedules",
     "attach",
     "buffer",
@@ -57,6 +59,110 @@ pub const BINDINGS: [&str; 29] = [
     "window",
     "windows",
 ];
+
+/// name, about, signature — one row per Rust-bound word. `tools.lua` adds its
+/// own rows for the words it defines in pure Lua, into the same table.
+const WORDS: &[(&str, &str, &str)] = &[
+    (
+        "ls",
+        "List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.",
+        "ls() -> {session...}",
+    ),
+    (
+        "new",
+        "Start a new session, defaulting the command to the user's shell.",
+        "new(name?, argv?, cwd?, env?) -> string",
+    ),
+    (
+        "send",
+        "Deliver a line of text to a session, with Enter appended.",
+        "send(name, text) -> nil",
+    ),
+    (
+        "insert",
+        "Insert raw bytes into a session with nothing appended.",
+        "insert(name, text) -> nil",
+    ),
+    (
+        "key",
+        "Press a named key, in Emacs kbd notation.",
+        "key(name, spec) -> nil",
+    ),
+    (
+        "click",
+        "Send a mouse click at a terminal cell.",
+        "click(name, col, row, button?) -> nil",
+    ),
+    (
+        "feed",
+        "Deliver a sequence of bursts and pauses as one indivisible act.",
+        "feed(name, steps) -> nil",
+    ),
+    (
+        "capture",
+        "Read a session's current screen as plain text.",
+        "capture(name) -> string",
+    ),
+    (
+        "attach",
+        "Enter raw mode on a session (a no-op inside the daemon's own image).",
+        "attach(name) -> nil",
+    ),
+    (
+        "close",
+        "End a session, live or already self-exited.",
+        "close(name) -> nil",
+    ),
+    (
+        "list_dir",
+        "List a directory's entries.",
+        "list_dir(dir) -> {string...}",
+    ),
+    (
+        "mkdir",
+        "Create a directory, including its parents.",
+        "mkdir(dir) -> nil",
+    ),
+    (
+        "remove_dir_all",
+        "Remove a directory and everything under it.",
+        "remove_dir_all(dir) -> nil",
+    ),
+    (
+        "schedule_skips",
+        "How many ticker periods were skipped because the previous callback was still running.",
+        "schedule_skips() -> {consecutive, total}",
+    ),
+    (
+        "request_counts",
+        "The daemon's own request-dispatch counts, by Request variant.",
+        "request_counts() -> {list, eval, capture_styled}",
+    ),
+    (
+        "sleep",
+        "Block the calling image for a number of seconds.",
+        "sleep(seconds) -> nil",
+    ),
+    (
+        "_registry",
+        "The word registry itself: name, about and signature for every bound word.",
+        "table",
+    ),
+];
+
+/// Populate `remuda._registry` with one row per entry in [`WORDS`]. Called
+/// before `tools.lua` loads, so its own registrations land in the same table.
+fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
+    let registry = lua.create_table()?;
+    for (name, about, signature) in WORDS {
+        let row = lua.create_table()?;
+        row.set("name", *name)?;
+        row.set("about", *about)?;
+        row.set("signature", *signature)?;
+        registry.set(*name, row)?;
+    }
+    table.set("_registry", registry)
+}
 
 /// Run a script file **in the daemon's image**, never in a fresh `Lua::new()`
 /// here — a script must see the state `-e` and the REPL share. The chunk name
@@ -228,6 +334,7 @@ pub fn bindings(
     dir_bindings(lua, &table, &at)?;
     tick_bindings(lua, &table, counters.clone())?;
     request_count_bindings(lua, &table, counters)?;
+    registry_bindings(lua, &table)?;
 
     // Blocks the WHOLE Image, not just this call: the interpreter is pinned to
     // one thread (image.rs), so a sleeping script stalls every other job —

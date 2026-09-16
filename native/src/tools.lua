@@ -16,6 +16,32 @@
 
 remuda.tools = {}
 
+-- One row per word, Rust's own bindings included (`script.rs`'s `WORDS`
+-- populates this table before this file loads) — `remuda doc` reads it.
+local function register(name, about, signature)
+  remuda._registry[name] = { name = name, about = about, signature = signature }
+end
+register("tools", "The `remuda.tool` registry table, keyed by tool name.", "table")
+
+-- Required names first (a caller's own order, via `needs`), then everything
+-- else marked optional — the same order a hand-written signature would use.
+local function arg_list(args, needs)
+  local seen, parts = {}, {}
+  for _, key in ipairs(needs) do
+    parts[#parts + 1] = key
+    seen[key] = true
+  end
+  local rest = {}
+  for key in pairs(args) do
+    if not seen[key] then rest[#rest + 1] = key end
+  end
+  table.sort(rest)
+  for _, key in ipairs(rest) do
+    parts[#parts + 1] = key .. "?"
+  end
+  return table.concat(parts, ", ")
+end
+
 -- Every word answers a call, so a tool defined today is a primitive tomorrow.
 local speech = {
   __call = function(word, arguments) return word.run(arguments or {}) end,
@@ -54,10 +80,13 @@ function remuda.tool(spec)
     run = spec.run,
   }, speech)
   remuda.tools[name] = word
+  register(name, spec.about, name .. "(" .. arg_list(args, needs) .. ") -> string")
   return word
 end
+register("tool", "Define a word and export it as an MCP tool.", "tool(spec) -> word")
 
 remuda.schedules = {}
+register("schedules", "The `remuda.schedule` registry table, keyed by schedule name.", "table")
 
 -- 정수님, 2026-09-12: "다른 익스텐션들도 자기 스케쥴들을 등록할 수 있어야 합니다"
 -- — multi-registrant from the first line, the same `remuda.tool` shape. Native
@@ -83,6 +112,7 @@ function remuda.schedule(spec)
     last_run = 0,
   }
 end
+register("schedule", "Register a periodic callback, run every `every` seconds.", "schedule(spec) -> nil")
 
 -- Called once per native tick with the current time (seconds, native's
 -- clock). Fires every schedule whose own interval has elapsed since ITS OWN
@@ -95,6 +125,11 @@ function remuda._run_due_schedules(now)
     end
   end
 end
+register(
+  "_run_due_schedules",
+  "Fire every schedule whose interval has elapsed. Called once per native tick.",
+  "_run_due_schedules(now) -> nil"
+)
 
 local escapes = {
   ['"'] = '\\"',
@@ -134,11 +169,13 @@ end
 -- read by the caller and handed over as plain text, never by this table.
 
 remuda.buffers = {}
+register("buffers", "The `remuda.buffer` registry table, keyed by buffer name.", "table")
 
 local Buffer = {}
 Buffer.__index = Buffer
 
 remuda.buffer = {}
+register("buffer", "Namespace for creating and listing named text buffers.", "table")
 
 -- Create-if-absent, return-if-present — so two extensions naming the same
 -- buffer share it rather than racing to overwrite it.
@@ -179,12 +216,14 @@ end
 -- tree is a later question if one ever actually shows up.
 
 remuda.windows = {}
+register("windows", "The `remuda.window` registry table, keyed by window id.", "table")
 local next_window_id = 0
 
 local Window = {}
 Window.__index = Window
 
 remuda.window = {}
+register("window", "Namespace for the current screen window.", "table")
 
 -- The one window that exists before anything ever splits: today's whole
 -- screen, in the vocabulary this module adds. Nothing renders through it
@@ -250,6 +289,11 @@ function remuda._descriptors()
   end
   return "[" .. table.concat(out, ",") .. "]"
 end
+register(
+  "_descriptors",
+  "MCP tool descriptors for everything `remuda.tool` has registered.",
+  "_descriptors() -> string"
+)
 
 -- One `tools/call`. A missing tool and a missing argument both raise, because
 -- the daemon turns a raise into `isError: true` and a return into success — and
@@ -271,6 +315,7 @@ function remuda._call(name, arguments)
   end
   return tostring(answer)
 end
+register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments) -> string")
 
 -- Type TEXT into SESSION and submit it with Return, as one act `remuda.feed`
 -- will not let a second sender split. Not an MCP tool — a plain stdlib
@@ -288,6 +333,11 @@ function remuda.type_text(session, text, settle)
     { burst = "\r" },
   })
 end
+register(
+  "type_text",
+  "Type text into a session and submit it with Return.",
+  "type_text(session, text, settle?) -> nil"
+)
 
 -- The left session list, re-expressed as the "*sessions*" buffer instead of
 -- being drawn straight out of Rust.
@@ -318,6 +368,23 @@ function remuda._refresh_sessions_buffer(width)
   end
   remuda.buffer.new("*sessions*"):set(table.concat(lines, "\n"))
 end
+register(
+  "_refresh_sessions_buffer",
+  "Rebuild the *sessions* buffer's content.",
+  "_refresh_sessions_buffer(width) -> nil"
+)
+
+-- Sorted "name(signature) -- about", one per line — the manual `remuda doc`
+-- prints. Lives beside `_descriptors` since both walk a registry to render it.
+function remuda._registry_dump()
+  local lines = {}
+  for _, name in ipairs(sorted_keys(remuda._registry)) do
+    local word = remuda._registry[name]
+    lines[#lines + 1] = word.signature .. " -- " .. word.about
+  end
+  return table.concat(lines, "\n")
+end
+register("_registry_dump", "Render the word registry as a sorted, human-readable manual.", "_registry_dump() -> string")
 
 -- The first word, and the one `steps/008` found missing: readiness. Driving an
 -- agent means waiting for it, and every caller so far has written this loop

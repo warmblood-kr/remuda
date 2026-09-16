@@ -106,6 +106,10 @@ fn main() -> ExitCode {
         // long-lived image, so what it defines is still there next time.
         ["-e", code] => with_daemon(server, &path, |path| eval_once(path, code)),
 
+        // The reference manual, generated from the same registry `remuda.tool`
+        // and every Rust binding write into — never hand-maintained.
+        ["doc"] => with_daemon(server, &path, doc_command),
+
         ["repl"] => with_daemon(server, &path, repl),
 
         // Speaks MCP on stdin/stdout, so the thing running *inside* a session
@@ -528,6 +532,23 @@ fn eval_once(path: &Path, code: &str) -> ExitCode {
             if !value.is_empty() {
                 println!("{value}");
             }
+            ExitCode::SUCCESS
+        }
+        other => fail(describe(other)),
+    }
+}
+
+/// One line per registered word, sorted by name.
+fn doc_command(path: &Path) -> ExitCode {
+    match remuda_native::client::request(
+        path,
+        &Request::Eval {
+            code: "return remuda._registry_dump()".to_string(),
+            name: None,
+        },
+    ) {
+        Ok(Response::Value(value)) => {
+            println!("{value}");
             ExitCode::SUCCESS
         }
         other => fail(describe(other)),
