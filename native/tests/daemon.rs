@@ -742,3 +742,202 @@ fn exec_of_an_unknown_package_fails_and_names_it() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// Lua's long-bracket string form has no escape processing at all — safe
+/// for embedding a raw filesystem path (backslashes included) into eval
+/// source text without escaping it first.
+fn lua_raw_string(s: &str) -> String {
+    format!("[[{s}]]")
+}
+
+#[test]
+fn process_delivers_stdout_lines_in_order_then_an_exit_event() {
+    let dir = scratch_dir("process-lines");
+    let _daemon = Daemon::spawn(&dir);
+    let path = daemon::socket_path_in(&dir, "s");
+    let exe = lua_raw_string(env!("CARGO_BIN_EXE_remuda"));
+
+    eval(&path, "remuda.t1_lines = {}");
+    eval(&path, "remuda.t1_exit = nil");
+    eval(
+        &path,
+        "remuda.on('t1-line', function(l) table.insert(remuda.t1_lines, l) end)",
+    );
+    eval(
+        &path,
+        "remuda.on('t1-exit', function(c) remuda.t1_exit = c end)",
+    );
+    eval(
+        &path,
+        &format!(
+            "remuda.process{{argv = {{{exe}, '_print_lines', '5', '0'}}, on_line = 't1-line', on_exit = 't1-exit'}}"
+        ),
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return remuda.t1_exit and 1 or 0") == 0 {
+        assert!(Instant::now() < deadline, "exit event never arrived");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        eval(&path, "return table.concat(remuda.t1_lines, ',')"),
+        "1,2,3,4,5"
+    );
+}
+
+#[test]
+fn a_silent_process_yields_only_the_exit_event() {
+    let dir = scratch_dir("process-silent");
+    let _daemon = Daemon::spawn(&dir);
+    let path = daemon::socket_path_in(&dir, "s");
+    let exe = lua_raw_string(env!("CARGO_BIN_EXE_remuda"));
+
+    eval(&path, "remuda.silent_lines = 0");
+    eval(&path, "remuda.silent_exit = nil");
+    eval(
+        &path,
+        "remuda.on('silent-line', function() remuda.silent_lines = remuda.silent_lines + 1 end)",
+    );
+    eval(
+        &path,
+        "remuda.on('silent-exit', function() remuda.silent_exit = true end)",
+    );
+    eval(
+        &path,
+        &format!(
+            "remuda.process{{argv = {{{exe}, '_print_lines', '0', '0'}}, on_line = 'silent-line', on_exit = 'silent-exit'}}"
+        ),
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return remuda.silent_exit and 1 or 0") == 0 {
+        assert!(Instant::now() < deadline, "exit event never arrived");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(read_count(&path, "return remuda.silent_lines"), 0);
+}
+
+#[test]
+fn a_line_flood_does_not_starve_the_schedule_ticker() {
+    let dir = scratch_dir("process-flood");
+    let _daemon = Daemon::spawn(&dir);
+    let path = daemon::socket_path_in(&dir, "s");
+    let exe = lua_raw_string(env!("CARGO_BIN_EXE_remuda"));
+    const FLOOD_LINES: u32 = 3000;
+    // A per-line delay, not a bare line count: `daemon.rs`'s own `TICK_PERIOD`
+    // is a fixed 1 real second (see its doc comment), independent of the
+    // Lua schedule's own `every`, so the ticker's very first wakeup cannot
+    // come sooner than that regardless of how this test paces its flood. A
+    // delay-free flood of any size a modern machine can push drains in well
+    // under one second — measured at ~0.2s for 100k lines — which starves
+    // the observation window, not the ticker: there is no failure to see if
+    // the flood is already over before the first tick could possibly fire.
+    // Pacing by wall-clock sleep (not raw throughput) makes the minimum
+    // flood duration (here, >= 6s) independent of the machine's speed.
+    const FLOOD_LINE_DELAY_MS: u32 = 2;
+    let flood_deadline = Instant::now() + Duration::from_secs(60);
+
+    eval(&path, "remuda.flood_count = 0");
+    eval(
+        &path,
+        "remuda.on('flood-line', function() remuda.flood_count = remuda.flood_count + 1 end)",
+    );
+    eval(&path, "remuda.ticks = 0");
+    eval(
+        &path,
+        "remuda.schedule{every = 0.05, run = function() remuda.ticks = remuda.ticks + 1 end}",
+    );
+    eval(
+        &path,
+        &format!(
+            "remuda.process{{argv = {{{exe}, '_print_lines', '{FLOOD_LINES}', '{FLOOD_LINE_DELAY_MS}'}}, on_line = 'flood-line'}}"
+        ),
+    );
+
+    let mut last_ticks = read_count(&path, "return remuda.ticks");
+    let mut ticker_advanced_during_flood = false;
+    loop {
+        let count = read_count(&path, "return remuda.flood_count");
+        if count >= FLOOD_LINES {
+            break;
+        }
+        assert!(
+            Instant::now() < flood_deadline,
+            "flood never finished ({count}/{FLOOD_LINES})"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let ticks = read_count(&path, "return remuda.ticks");
+        if ticks > last_ticks {
+            ticker_advanced_during_flood = true;
+        }
+        last_ticks = ticks;
+    }
+    assert!(
+        ticker_advanced_during_flood,
+        "the schedule ticker never advanced during the flood"
+    );
+    assert_eq!(read_count(&path, "return remuda.flood_count"), FLOOD_LINES);
+
+    // A named, generous bound — this asserts "not starved," not a specific
+    // performance target.
+    let consecutive_skips = read_count(&path, "return remuda.schedule_skips().consecutive");
+    assert!(
+        consecutive_skips < 20,
+        "consecutive schedule skips too high under flood: {consecutive_skips}"
+    );
+}
+
+#[test]
+fn killing_a_process_mid_stream_yields_exit_and_nothing_after() {
+    let dir = scratch_dir("process-kill");
+    let _daemon = Daemon::spawn(&dir);
+    let path = daemon::socket_path_in(&dir, "s");
+    let exe = lua_raw_string(env!("CARGO_BIN_EXE_remuda"));
+
+    eval(&path, "remuda.km_lines = 0");
+    eval(&path, "remuda.km_exit = nil");
+    eval(
+        &path,
+        "remuda.on('km-line', function() remuda.km_lines = remuda.km_lines + 1 end)",
+    );
+    eval(
+        &path,
+        "remuda.on('km-exit', function() remuda.km_exit = true end)",
+    );
+    // A slow trickle so there is a real window to kill it mid-stream rather
+    // than racing its own natural exit.
+    eval(
+        &path,
+        &format!(
+            "remuda.km_handle = remuda.process{{argv = {{{exe}, '_print_lines', '100000', '10'}}, on_line = 'km-line', on_exit = 'km-exit'}}"
+        ),
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return remuda.km_lines") < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "process never started producing lines"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    eval(&path, "remuda.kill(remuda.km_handle)");
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return remuda.km_exit and 1 or 0") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "exit event never arrived after kill"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let lines_at_exit = read_count(&path, "return remuda.km_lines");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        read_count(&path, "return remuda.km_lines"),
+        lines_at_exit,
+        "a line arrived after the exit event"
+    );
+}

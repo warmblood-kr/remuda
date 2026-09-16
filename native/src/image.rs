@@ -55,6 +55,8 @@ impl Image {
     ) -> Self {
         let (jobs, inbox) = channel::<Job>();
         let socket: PathBuf = socket.to_path_buf();
+        let image = Self { jobs };
+        let handle = image.clone();
 
         std::thread::spawn(move || {
             let lua = Lua::new();
@@ -66,7 +68,7 @@ impl Image {
 
             // A failure here means no image at all, so every eval must say so
             // rather than the thread dying quietly and every caller hanging.
-            let ready = script::bindings(&lua, &socket, registry, counters)
+            let ready = script::bindings(&lua, &socket, registry, counters, handle)
                 .and_then(|table| lua.globals().set("remuda", table))
                 // The tool frame is Lua over those bindings, not a second set of
                 // them. It must load *after* the table exists and *before* any
@@ -93,7 +95,7 @@ impl Image {
             }
         });
 
-        Self { jobs }
+        image
     }
 
     /// Send `code` without waiting for it to finish — `tick.rs` needs this so
