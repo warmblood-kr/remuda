@@ -445,6 +445,80 @@ fn a_registered_schedule_actually_fires_through_a_real_daemon() {
     }
 }
 
+fn eval(path: &Path, code: &str) -> String {
+    match client::request(
+        path,
+        &Request::Eval {
+            code: code.to_string(),
+            name: None,
+        },
+    )
+    .expect("eval")
+    {
+        Response::Value(v) => v,
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+fn read_count(path: &Path, code: &str) -> u32 {
+    eval(path, code).parse().expect("a number")
+}
+
+#[test]
+fn cancelling_one_same_label_schedule_leaves_the_other_firing() {
+    // The gap measured on 09-13: a name-keyed table means a second
+    // registrant under the same label silently replaces the first. A handle
+    // fixes it — two schedules can share a label and coexist, and only the
+    // handle that was actually cancelled stops.
+    let path = scratch("schedule-cancel");
+    let _daemon = daemon_at(&path);
+
+    eval(
+        &path,
+        r#"
+            remuda.fired_a, remuda.fired_b = 0, 0
+            remuda.handle_a = remuda.schedule({
+              name = "dup",
+              every = 0.01,
+              run = function() remuda.fired_a = remuda.fired_a + 1 end,
+            })
+            remuda.handle_b = remuda.schedule({
+              name = "dup",
+              every = 0.01,
+              run = function() remuda.fired_b = remuda.fired_b + 1 end,
+            })
+        "#,
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return remuda.fired_a") < 2
+        || read_count(&path, "return remuda.fired_b") < 2
+    {
+        assert!(
+            Instant::now() < deadline,
+            "both same-label schedules must fire independently"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    eval(&path, "remuda.cancel(remuda.handle_a)");
+    let a_at_cancel = read_count(&path, "return remuda.fired_a");
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return remuda.fired_b") < a_at_cancel + 2 {
+        assert!(
+            Instant::now() < deadline,
+            "the surviving schedule must keep firing"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        read_count(&path, "return remuda.fired_a"),
+        a_at_cancel,
+        "the cancelled schedule must not fire again"
+    );
+}
+
 #[test]
 fn the_daemon_names_the_build_it_was_started_from() {
     let path = scratch("version");
