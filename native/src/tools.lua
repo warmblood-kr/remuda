@@ -571,3 +571,17 @@ remuda.tool({
     return "consecutive=" .. c.consecutive .. ",total=" .. c.total
   end,
 })
+
+function remuda.process(spec)
+  if type(spec.argv) ~= "table" or #spec.argv == 0 then
+    error("a process needs a non-empty `argv`", 2)
+  end
+  if spec.on_line ~= nil and (type(spec.on_line) ~= "string" or spec.on_line == "") then
+    error("a process's `on_line`, when given, must be a non-empty string", 2)
+  end
+  if spec.on_exit ~= nil and (type(spec.on_exit) ~= "string" or spec.on_exit == "") then
+    error("a process's `on_exit`, when given, must be a non-empty string", 2)
+  end
+  return remuda._process_spawn(spec.argv, spec.on_line, spec.on_exit)
+end
+register("process", "Spawn a plain-pipe child process; its stdout lines and exit arrive as emit events.", "process(spec) -> id")

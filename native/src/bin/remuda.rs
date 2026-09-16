@@ -124,6 +124,11 @@ fn main() -> ExitCode {
             }
         }),
 
+        // Test-only plumbing for `remuda.process`, deliberately absent from
+        // `USAGE`: no daemon involved, just a cross-platform, dependency-free
+        // way to print N lines with a controllable pace.
+        ["_print_lines", n, delay_ms] => print_lines(n, delay_ms),
+
         _ => {
             eprint!("{}", USAGE);
             ExitCode::FAILURE
@@ -669,6 +674,28 @@ fn describe(response: std::io::Result<Response>) -> String {
 fn fail(message: impl std::fmt::Display) -> ExitCode {
     eprintln!("remuda: {message}");
     ExitCode::FAILURE
+}
+
+/// Prints `1..=n`, one per line, flushing after each and sleeping
+/// `delay_ms` between them (0 = no delay).
+// Cross-platform, dependency-free, so `remuda.process` tests can control
+// pacing without a shell loop that behaves differently on Windows vs Unix.
+// Test-only; deliberately absent from `USAGE`.
+fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
+    let (Ok(n), Ok(delay)) = (n.parse::<u64>(), delay_ms.parse::<u64>()) else {
+        return fail("usage: remuda _print_lines <n> <delay_ms>");
+    };
+    let mut out = std::io::stdout().lock();
+    for i in 1..=n {
+        use std::io::Write;
+        if writeln!(out, "{i}").is_err() || out.flush().is_err() {
+            break;
+        }
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

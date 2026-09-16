@@ -112,3 +112,40 @@ when it exists, changes only that resolution step — cloning a package into a
 runtime directory and reading its `init.lua` from disk instead of from the
 binary — the entry-file convention itself does not change, so a package
 written today keeps working once installing replaces embedding.
+
+## A process's output arrives as events, never as something Lua waits on
+
+`remuda.process{argv=, on_line=, on_exit=}` spawns a plain-pipe child — never
+a pty, never a terminal emulator in the way — and delivers its stdout, one
+line at a time, as `remuda.emit(on_line, line)` calls; when it exits,
+`remuda.emit(on_exit, code)` fires once, after every line already produced
+has been delivered. `remuda.kill(id)` ends it; `remuda.processes()` lists
+the ids still running. `remuda.process` returns that id directly — there is
+no opaque handle table, because nothing about a process needs one: unlike a
+schedule, two processes never need to share a label to begin with, so a
+plain id is already unambiguous.
+
+Nothing in this call ever runs inside the Image's own thread except the O(1)
+bookkeeping of a shared buffer. A separate thread owns the child, reads its
+lines, and buffers them; the Image only ever *receives* work, the same
+`on(event, fn)`/`emit` pair hooks already exist for. This is what makes
+`remuda.process` the general answer the schedule ticker and the socket
+handler were already special cases of: something outside the Image posts a
+job, the Image runs it whenever its FIFO gets there, and nothing outside
+ever blocks waiting for that to happen.
+
+The buffer between the reader thread and the Image is capped, on purpose.
+When it fills, the reader thread simply stops reading — the child's own
+`write()` blocks against the now-full OS pipe, exactly the way a slow
+consumer is supposed to make a fast producer wait. Lines are handed to Lua
+in bounded batches, one Image job per batch, and only one such job is ever
+outstanding per process: a batch that does not empty the buffer resubmits
+itself instead of looping in place, so a single flooding process can never
+hold the Image's queue for longer than one batch at a time — the schedule
+ticker and any other caller queued behind it still get a turn in between.
+
+remuda has no Matrix-specific code anywhere, and none is planned here: the
+network side of a real inbound helper — a Matrix `/sync` long-poll, printing
+one JSON line per event — is an ordinary `remuda.process` caller, arriving
+in a later change. This primitive's own tests use a small line-printing
+helper and know nothing about Matrix, reconnects, or backoff.

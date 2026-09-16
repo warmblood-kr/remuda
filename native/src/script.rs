@@ -26,9 +26,11 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 37] = [
+pub const BINDINGS: [&str; 42] = [
     "_call",
     "_descriptors",
+    "_process_drain",
+    "_process_spawn",
     "_refresh_sessions_buffer",
     "_registry",
     "_registry_dump",
@@ -46,11 +48,14 @@ pub const BINDINGS: [&str; 37] = [
     "hooks",
     "insert",
     "key",
+    "kill",
     "list_dir",
     "ls",
     "mkdir",
     "new",
     "on",
+    "process",
+    "processes",
     "remove_dir_all",
     "request_counts",
     "schedule",
@@ -154,6 +159,26 @@ const WORDS: &[(&str, &str, &str)] = &[
         "The word registry itself: name, about and signature for every bound word.",
         "table",
     ),
+    (
+        "_process_spawn",
+        "Spawn a plain-pipe child process; internal, wrapped by `remuda.process`.",
+        "_process_spawn(argv, on_line?, on_exit?) -> id",
+    ),
+    (
+        "_process_drain",
+        "Deliver buffered process output as emit events; internal, an Image job only.",
+        "_process_drain(id) -> nil",
+    ),
+    (
+        "kill",
+        "Terminate a process started with `remuda.process`, by id.",
+        "kill(id) -> nil",
+    ),
+    (
+        "processes",
+        "List the ids of every process started with `remuda.process` that is still running.",
+        "processes() -> {id...}",
+    ),
 ];
 
 /// Populate `remuda._registry` with one row per entry in [`WORDS`]. Called
@@ -224,6 +249,7 @@ pub fn bindings(
     socket: &Path,
     registry: std::sync::Arc<remuda_core::Registry>,
     counters: std::sync::Arc<crate::tick::Counters>,
+    image: crate::image::Image,
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
@@ -348,6 +374,7 @@ pub fn bindings(
     tick_bindings(lua, &table, counters.clone())?;
     request_count_bindings(lua, &table, counters)?;
     registry_bindings(lua, &table)?;
+    process_bindings(lua, &table, image)?;
 
     // Blocks the WHOLE Image, not just this call: the interpreter is pinned to
     // one thread (image.rs), so a sleeping script stalls every other job —
@@ -467,6 +494,52 @@ fn request_count_bindings(
                 counters.counter("request_capture_styled").total(),
             )?;
             Ok(row)
+        })?,
+    )
+}
+
+/// `remuda.process`'s Rust half — split out of `bindings` to stay under its
+/// line cap.
+// `remuda.process` itself (the validated, Lua-facing spec-table word) lives
+// in `tools.lua` and calls `_process_spawn` here; `kill` and `processes` are
+// plain Rust words with nothing to validate.
+fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlua::Result<()> {
+    let processes = crate::process::Processes::new();
+
+    let spawner = processes.clone();
+    let spawn_image = image.clone();
+    table.set(
+        "_process_spawn",
+        lua.create_function(
+            move |_, (argv, on_line, on_exit): (Vec<String>, Option<String>, Option<String>)| {
+                spawner
+                    .spawn(spawn_image.clone(), argv, on_line, on_exit)
+                    .map_err(mlua::Error::external)
+            },
+        )?,
+    )?;
+
+    let drainer = processes.clone();
+    let drain_image = image;
+    table.set(
+        "_process_drain",
+        lua.create_function(move |lua, id: u64| drainer.drain(id, lua, &drain_image))?,
+    )?;
+
+    let killer = processes.clone();
+    table.set(
+        "kill",
+        lua.create_function(move |_, id: u64| killer.kill(id).map_err(mlua::Error::external))?,
+    )?;
+
+    table.set(
+        "processes",
+        lua.create_function(move |lua, ()| {
+            let rows = lua.create_table()?;
+            for (i, id) in processes.list().into_iter().enumerate() {
+                rows.set(i + 1, id)?;
+            }
+            Ok(rows)
         })?,
     )
 }
