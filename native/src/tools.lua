@@ -85,8 +85,14 @@ function remuda.tool(spec)
 end
 register("tool", "Define a word and export it as an MCP tool.", "tool(spec) -> word")
 
+-- Keyed by HANDLE, not name — two schedules may share a label, or carry
+-- none. A Lua table is a legal table key, and the handle already is one, so
+-- there is no separate id to keep in sync with it.
 remuda.schedules = {}
-register("schedules", "The `remuda.schedule` registry table, keyed by schedule name.", "table")
+register("schedules", "The `remuda.schedule` registry table, keyed by the handle `schedule()` returned.", "table")
+
+local Schedule = {}
+Schedule.__index = Schedule
 
 -- 정수님, 2026-09-12: "다른 익스텐션들도 자기 스케쥴들을 등록할 수 있어야 합니다"
 -- — multi-registrant from the first line, the same `remuda.tool` shape. Native
@@ -94,25 +100,39 @@ register("schedules", "The `remuda.schedule` registry table, keyed by schedule n
 -- this table's business alone, matching remuda.tool's split (Rust reflects,
 -- Lua decides). Does not survive a daemon restart — same ceiling as
 -- `remuda.tools` (`steps/014-a-tool-registry.md:292-295`), not solved here.
+--
+-- NAME is an optional label, never an identity — two extensions (or one,
+-- twice) may register under the same name without one silently replacing
+-- the other, the gap measured on 09-13. Ownership is the returned handle;
+-- only `remuda.cancel(handle)` removes it.
 function remuda.schedule(spec)
-  local name = spec.name
-  if type(name) ~= "string" or name == "" then
-    error("a schedule needs a name", 2)
+  if spec.name ~= nil and (type(spec.name) ~= "string" or spec.name == "") then
+    error("a schedule's name, when given, must be a non-empty string", 2)
   end
   if type(spec.every) ~= "number" or spec.every <= 0 then
-    error("schedule " .. name .. " needs a positive `every` (seconds)", 2)
+    error("a schedule needs a positive `every` (seconds)", 2)
   end
   if type(spec.run) ~= "function" then
-    error("schedule " .. name .. " needs a `run` function", 2)
+    error("a schedule needs a `run` function", 2)
   end
-  remuda.schedules[name] = {
-    name = name,
+  local handle = setmetatable({ name = spec.name }, Schedule)
+  remuda.schedules[handle] = {
+    name = spec.name,
     every = spec.every,
     run = spec.run,
     last_run = 0,
   }
+  return handle
 end
-register("schedule", "Register a periodic callback, run every `every` seconds.", "schedule(spec) -> nil")
+register("schedule", "Register a periodic callback, run every `every` seconds.", "schedule(spec) -> handle")
+
+-- A no-op on an already-cancelled or unrecognized handle — a caller racing
+-- its own cancel, or cancelling twice, gets silence rather than an error for
+-- something that already happened.
+function remuda.cancel(handle)
+  remuda.schedules[handle] = nil
+end
+register("cancel", "Cancel a schedule by the handle `schedule()` returned.", "cancel(handle) -> nil")
 
 -- Called once per native tick with the current time (seconds, native's
 -- clock). Fires every schedule whose own interval has elapsed since ITS OWN

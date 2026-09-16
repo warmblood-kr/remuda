@@ -62,3 +62,16 @@ buffer without going through a session handle at all, for a caller that only
 ever had the name. `session.is_busy` exists because a session is a process
 that can be doing work; a buffer cannot be, so it never carries `is_busy` or
 a `context_left`, no matter whose content it holds.
+
+## A schedule's identity is its handle, never its name
+
+`remuda.schedule(spec)` returns a handle; `remuda.cancel(handle)` is the only
+way to remove it. `spec.name` is an optional label — useful for a person
+reading a listing, never used to look a schedule up or to decide whether two
+registrations are "the same" one. Two schedules may share a label, or carry
+none at all, and neither fact changes whether they coexist: the registry is
+keyed by the handle itself, so a second `remuda.schedule{name = "x", ...}`
+never replaces a first one also labelled `"x"` the way redefining a
+`remuda.tool` word does on purpose. Cancelling is idempotent — cancelling an
+already-cancelled or unrecognized handle is silent, not an error, since
+"this is no longer registered" is exactly the state a caller was asking for.
