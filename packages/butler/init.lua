@@ -163,6 +163,17 @@ mcp_file:write(
 )
 mcp_file:close()
 
+-- Without this, the session has no reason to ever call `matrix_reply`: a
+-- line arriving on its terminal is not by itself an instruction to use a
+-- specific tool. This is what turns "text showed up" into "the tool got
+-- called" for an otherwise-unprompted incoming message.
+local SYSTEM_PROMPT = "You are bridged into one Matrix room via remuda. "
+  .. "Every line you receive here that starts with \"[matrix · \" is a "
+  .. "message from that room, not from the person running this terminal. "
+  .. "Reply to it by calling the matrix_reply MCP tool with your response "
+  .. "text -- printing a reply in this terminal does not send it anywhere; "
+  .. "only calling the tool does."
+
 local butler = remuda.new(nil, {
   "claude",
   "--mcp-config",
@@ -170,6 +181,8 @@ local butler = remuda.new(nil, {
   "--strict-mcp-config",
   "--permission-mode",
   "auto",
+  "--append-system-prompt",
+  SYSTEM_PROMPT,
 })
 
 remuda.on("butler-matrix-line", function(line)
