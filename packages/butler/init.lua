@@ -133,7 +133,44 @@ if not token_path or not config_path then
   error("remuda-butler needs REMUDA_BUTLER_TOKEN and REMUDA_BUTLER_CONFIG set", 0)
 end
 
-local butler = remuda.new(nil, {"claude"})
+-- The session needs an `--mcp-config` pointing back at this same daemon, or
+-- it has no way to reach `matrix_reply` at all — a bare `remuda.new(nil,
+-- {"claude"})` starts a session with no MCP server configured. `claude`
+-- only accepts that config as a file path, never inline JSON, so this is a
+-- legitimate, unavoidable use of `io`/`os` (unlike embedding a companion
+-- script, which argv already handles without touching a file).
+-- `REMUDA_BUTLER_SERVER` names the running daemon's own `-s <name>`, so the
+-- spawned `remuda ... mcp` reaches the exact instance running this code,
+-- not some other "default" one; it defaults to "default" to match the CLI's
+-- own default when no `-s` flag was given. `--permission-mode auto` skips
+-- the second, tool-call permission dialog entirely (its default is "Yes",
+-- the opposite framing from the trust dialog's "No, exit" — measured in
+-- native/tests/claude_session.rs) since nothing here can answer it.
+local server = os.getenv("REMUDA_BUTLER_SERVER") or "default"
+local runtime_dir = os.getenv("REMUDA_RUNTIME_DIR")
+local mcp_config_path = config_path .. ".mcp.json"
+local mcp_env = ""
+if runtime_dir then
+  mcp_env = ',"env":{"REMUDA_RUNTIME_DIR":"' .. runtime_dir .. '"}'
+end
+local mcp_file = io.open(mcp_config_path, "w")
+mcp_file:write(
+  '{"mcpServers":{"remuda":{"command":"remuda","args":["-s","'
+    .. server
+    .. '","mcp"]'
+    .. mcp_env
+    .. "}}}"
+)
+mcp_file:close()
+
+local butler = remuda.new(nil, {
+  "claude",
+  "--mcp-config",
+  mcp_config_path,
+  "--strict-mcp-config",
+  "--permission-mode",
+  "auto",
+})
 
 remuda.on("butler-matrix-line", function(line)
   local sender, body = line:match("^([^\t]*)\t(.*)$")
