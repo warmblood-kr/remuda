@@ -696,6 +696,181 @@ fn cancelling_one_same_label_schedule_leaves_the_other_firing() {
 }
 
 #[test]
+fn event_counts_reads_zero_before_any_emit_and_n_after_real_fires() {
+    // `remuda.event_counts()` does not exist yet — this must fail red with a
+    // Lua "attempt to call a nil value" error, not a compile error.
+    let path = scratch("event-counts");
+    let _daemon = daemon_at(&path);
+
+    eval(&path, r#"remuda.on("counter_test_event", function() end)"#);
+
+    // A name `emit` has never been called with is absent, not zero — Lua's
+    // `nil` is the only value that says so.
+    assert_eq!(
+        eval(&path, "return remuda.event_counts()['counter_test_event']"),
+        "nil",
+        "an event never emitted must be absent from event_counts(), not zero"
+    );
+
+    for _ in 0..3 {
+        eval(&path, "remuda.emit('counter_test_event')");
+    }
+
+    assert_eq!(
+        read_count(&path, "return remuda.event_counts()['counter_test_event']"),
+        3,
+        "event_counts() must count every real emit call"
+    );
+}
+
+#[test]
+fn schedule_fires_reads_zero_before_any_run_and_n_after_real_ticks() {
+    // `remuda.schedule_fires()` does not exist yet — same nil-call failure
+    // expected as `event_counts()` above.
+    let path = scratch("schedule-fires");
+    let _daemon = daemon_at(&path);
+
+    eval(
+        &path,
+        r#"
+            remuda.schedule({
+              name = "counter_test_schedule",
+              every = 1,
+              run = function() end,
+            })
+        "#,
+    );
+
+    // Before any tick has elapsed, an unfired named schedule is absent too.
+    assert_eq!(
+        eval(
+            &path,
+            "return remuda.schedule_fires()['counter_test_schedule']"
+        ),
+        "nil",
+        "a schedule that has never fired must be absent, not zero"
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let fires = eval(
+            &path,
+            "return remuda.schedule_fires()['counter_test_schedule']",
+        );
+        if fires.parse::<u32>().is_ok_and(|n| n >= 3) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "counter_test_schedule did not fire at least 3 times: {fires:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // An unnamed schedule (`spec.name` left nil) must never appear as a key
+    // at all — `t[nil] = x` is a Lua error, so the increment must be skipped
+    // rather than crash the daemon. A side-channel counter proves it really
+    // fired even though `schedule_fires()` must stay silent about it.
+    eval(&path, "remuda._unnamed_fired = 0");
+    eval(
+        &path,
+        r#"
+            remuda.schedule({
+              every = 1,
+              run = function() remuda._unnamed_fired = remuda._unnamed_fired + 1 end,
+            })
+        "#,
+    );
+
+    let before_keys = eval(
+        &path,
+        "local n = 0 for _ in pairs(remuda.schedule_fires()) do n = n + 1 end return n",
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return remuda._unnamed_fired") < 3 {
+        assert!(
+            Instant::now() < deadline,
+            "the unnamed schedule never fired"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let after_keys = eval(
+        &path,
+        "local n = 0 for _ in pairs(remuda.schedule_fires()) do n = n + 1 end return n",
+    );
+    assert_eq!(
+        before_keys, after_keys,
+        "an unnamed schedule must add no key to schedule_fires(), even after firing"
+    );
+}
+
+#[test]
+fn mutating_the_returned_event_counts_table_does_not_change_internal_state() {
+    // Both accessors must hand back a snapshot, the same guarantee
+    // `remuda.emit`'s own hook snapshot already keeps for `remuda.hooks`
+    // (see tools.lua) — a caller mutating what it was handed must never
+    // reach back into the daemon's own counters.
+    let path = scratch("counters-are-copies");
+    let _daemon = daemon_at(&path);
+
+    eval(&path, r#"remuda.on("copy_test_event", function() end)"#);
+    eval(&path, "remuda.emit('copy_test_event')");
+    eval(
+        &path,
+        "local t = remuda.event_counts() t['copy_test_event'] = 9999",
+    );
+    assert_eq!(
+        read_count(&path, "return remuda.event_counts()['copy_test_event']"),
+        1,
+        "event_counts() must return a copy, not a live reference"
+    );
+
+    eval(
+        &path,
+        r#"
+            remuda.schedule({
+              name = "copy_test_schedule",
+              every = 1,
+              run = function() end,
+            })
+        "#,
+    );
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let fires = eval(
+            &path,
+            "return remuda.schedule_fires()['copy_test_schedule']",
+        );
+        if fires.parse::<u32>().is_ok_and(|n| n >= 1) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "copy_test_schedule never fired: {fires:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let before = read_count(
+        &path,
+        "return remuda.schedule_fires()['copy_test_schedule']",
+    );
+    eval(
+        &path,
+        "local t = remuda.schedule_fires() t['copy_test_schedule'] = 9999",
+    );
+    assert_eq!(
+        read_count(
+            &path,
+            "return remuda.schedule_fires()['copy_test_schedule']"
+        ),
+        before,
+        "schedule_fires() must return a copy, not a live reference"
+    );
+}
+
+#[test]
 fn the_daemon_names_the_build_it_was_started_from() {
     let path = scratch("version");
     let _daemon = daemon_at(&path);

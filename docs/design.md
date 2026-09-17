@@ -76,6 +76,11 @@ never replaces a first one also labelled `"x"` the way redefining a
 already-cancelled or unrecognized handle is silent, not an error, since
 "this is no longer registered" is exactly the state a caller was asking for.
 
+`remuda.schedule_fires()` returns `{[name]=n}`, a shallow copy counting how
+many times each NAMED schedule's `run` has actually fired (registered or
+skipped ticks don't count). An unnamed schedule is never a key at all — no
+consecutive-skip variant either, `remuda.schedule_skips()` already covers that.
+
 ## Hooks, on Emacs's augroup model
 
 `remuda.on(event, fn, {group = ...})` registers a callback under a named
@@ -96,6 +101,11 @@ matters to it. remuda itself defines exactly one: `session_exited`, whose one
 positional argument is the dead session's name (a Lua string). It fires once
 per session the daemon notices has died, regardless of what triggered the
 detection — a tick, a `List`, or an `ls()` call.
+
+`remuda.event_counts()` returns `{[event]=n}`, a shallow copy counting every
+`emit` call for that name, whether or not any hook is registered for it. A
+name never emitted is absent, not zero; no error-count variant either — YAGNI
+until a caller shows a need.
 
 ## A package is a name and an entry file, nothing more
 

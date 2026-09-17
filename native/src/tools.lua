@@ -91,6 +91,16 @@ register("tool", "Define a word and export it as an MCP tool.", "tool(spec) -> w
 remuda.schedules = {}
 register("schedules", "The `remuda.schedule` registry table, keyed by the handle `schedule()` returned.", "table")
 
+-- Keyed by NAME, unlike `remuda.schedules` above — an unnamed schedule has no
+-- key to count under, so `_run_due_schedules` skips it rather than index a
+-- table with nil.
+remuda._schedule_fire_counts = {}
+register(
+  "_schedule_fire_counts",
+  "Internal named-schedule fire counts. Read via `schedule_fires()`.",
+  "table"
+)
+
 local Schedule = {}
 Schedule.__index = Schedule
 
@@ -141,6 +151,9 @@ function remuda._run_due_schedules(now)
   for _, schedule in pairs(remuda.schedules) do
     if now - schedule.last_run >= schedule.every then
       schedule.last_run = now
+      if schedule.name then
+        remuda._schedule_fire_counts[schedule.name] = (remuda._schedule_fire_counts[schedule.name] or 0) + 1
+      end
       schedule.run()
     end
   end
@@ -151,12 +164,30 @@ register(
   "_run_due_schedules(now) -> nil"
 )
 
+-- A shallow copy, the same discipline `emit`'s own hook snapshot already
+-- keeps — a caller mutating what it was handed must never reach back into
+-- this table.
+function remuda.schedule_fires()
+  local copy = {}
+  for k, v in pairs(remuda._schedule_fire_counts) do
+    copy[k] = v
+  end
+  return copy
+end
+register("schedule_fires", "How many times each named schedule has fired.", "schedule_fires() -> {[name]=n}")
+
 -- hooks: Emacs's augroup model. `on` files a callback under an event name;
 -- `group` is optional on registration but required to clear by, the same
 -- asymmetry augroup has — naming a group costs nothing, but clearing without
 -- one would wipe every extension's hooks at once, not just the caller's own.
 remuda.hooks = {}
 register("hooks", "The `remuda.on` registry table, keyed by event name.", "table")
+
+-- Keyed by event name, counting every `emit` call for it regardless of
+-- whether a hook is registered — `remuda.hooks` above only knows the events
+-- someone `on`'d, not the ones only ever `emit`'d.
+remuda._event_counts = {}
+register("_event_counts", "Internal event-emit counts, keyed by event name. Read via `event_counts()`.", "table")
 
 function remuda.on(event, fn, opts)
   if type(event) ~= "string" or event == "" then
@@ -175,6 +206,7 @@ register("on", "Register a callback to run when an event fires.", "on(event, fn,
 -- calls `clear_hooks` on its own group must not skip or re-run a sibling
 -- still mid-iteration.
 function remuda.emit(event, ...)
+  remuda._event_counts[event] = (remuda._event_counts[event] or 0) + 1
   local hooks = remuda.hooks[event]
   if not hooks then
     return
@@ -188,6 +220,18 @@ function remuda.emit(event, ...)
   end
 end
 register("emit", "Fire an event, running every hook registered for it.", "emit(event, ...) -> nil")
+
+-- A shallow copy, the same discipline `emit` itself already keeps for its own
+-- hook snapshot above — a caller mutating what it was handed must never
+-- reach back into this table.
+function remuda.event_counts()
+  local copy = {}
+  for k, v in pairs(remuda._event_counts) do
+    copy[k] = v
+  end
+  return copy
+end
+register("event_counts", "How many times each event has been emitted.", "event_counts() -> {[event]=n}")
 
 -- Every hook in GROUP, across every event — an augroup clears as a unit
 -- regardless of which events its members are on, so one extension's cleanup
