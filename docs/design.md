@@ -89,10 +89,13 @@ handle and not its name: without it, one extension's cleanup could reach
 another's hooks, or a script's own second `require` of itself could double
 every hook it thought it was replacing.
 
-remuda defines no events of its own yet — `on`/`emit`/`clear_hooks` are
-general-purpose, the same way Emacs's `add-hook`/`run-hooks` presuppose
-nothing about which hook variable is being run. A caller names its own
-events and calls `emit` at whatever moment matters to it.
+`on`/`emit`/`clear_hooks` are general-purpose, the same way Emacs's
+`add-hook`/`run-hooks` presuppose nothing about which hook variable is being
+run — a caller may name its own events and call `emit` at whatever moment
+matters to it. remuda itself defines exactly one: `session_exited`, whose one
+positional argument is the dead session's name (a Lua string). It fires once
+per session the daemon notices has died, regardless of what triggered the
+detection — a tick, a `List`, or an `ls()` call.
 
 ## A package is a name and an entry file, nothing more
 
