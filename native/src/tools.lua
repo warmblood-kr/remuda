@@ -380,6 +380,29 @@ function Window:close()
   remuda.windows[self.id] = nil
 end
 
+-- What `window_shown_session` (tui.rs) calls instead of poking `.shows`
+-- directly: leaves an explicitly shown buffer alone unless SELECTION_CHANGED
+-- says the user just moved the selection — a bare tick must never reclaim
+-- the window. Wire-internal like `_refresh_sessions_buffer`, not a script's
+-- tool, but still registered below: every name on `remuda` is, so the
+-- surface test (`the_bound_surface_is_exactly_the_protocols`) stays exact.
+function remuda._sync_window_shown(name, selection_changed)
+  local w = remuda.window.current()
+  if getmetatable(w.shows) == Buffer and not selection_changed then
+    return "buffer:" .. w.shows.name
+  end
+  w.shows = name
+  if name == nil then
+    return "nil"
+  end
+  return "session:" .. name
+end
+register(
+  "_sync_window_shown",
+  "Reconcile the current window with the session Rust wants to auto-follow.",
+  "_sync_window_shown(name, selection_changed) -> string"
+)
+
 -- What `tools/list` adds to the frame's own five, as MCP descriptor JSON.
 -- Rust asks for this by name; keep the shape or `mcp.rs` will not parse it.
 function remuda._descriptors()

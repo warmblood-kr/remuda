@@ -84,6 +84,9 @@ pub struct Ui {
     /// `remuda._refresh_sessions_buffer`), index-aligned with `sessions`, or
     /// the two empty-herd lines. See `list_row`.
     sessions_text: Vec<String>,
+    /// `ui.selected()` as of the last non-`skip_list` refresh — lets
+    /// `refresh` tell an explicit selection change from a bare tick.
+    last_synced_selection: Option<String>,
 }
 
 impl Ui {
@@ -100,6 +103,7 @@ impl Ui {
             shell: shell.to_string(),
             notice,
             sessions_text: Vec::new(),
+            last_synced_selection: None,
         }
     }
 
@@ -908,7 +912,7 @@ fn refresh(
     ui: &mut Ui,
     held: &mut Option<(String, Hold)>,
     painted: &mut String,
-    shown: &mut Option<String>,
+    shown: &mut Option<ShownTarget>,
     skip_list: bool,
 ) -> std::io::Result<(u16, u16)> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -955,16 +959,30 @@ fn refresh(
     // would be a per-keystroke Eval for an answer that can't have changed.
     if !skip_list {
         let selected_name = ui.selected().map(|s| s.name.clone());
-        match window_shown_session(path, selected_name.as_deref()) {
-            Ok(name) => *shown = name,
+        // Whether the NAME Rust wants to auto-follow moved since the last
+        // sync — never whether the window's own content changed underneath
+        // it. This is the one signal `remuda._sync_window_shown` needs to
+        // tell an explicit selection change (which must reclaim the window
+        // from a shown buffer) apart from a bare tick (which must not).
+        let selection_changed = selected_name != ui.last_synced_selection;
+        ui.last_synced_selection = selected_name.clone();
+        match window_shown_session(path, selected_name.as_deref(), selection_changed) {
+            Ok(target) => *shown = target,
             Err(e) => {
                 ui.notice = Some(e);
                 *shown = None;
             }
         }
     }
-    let (cells, cursor) = match shown.as_deref() {
-        Some(name) => match capture_styled(path, name) {
+    let (cells, cursor) = match shown.as_ref() {
+        Some(ShownTarget::Session(name)) => match capture_styled(path, name) {
+            Ok(result) => result,
+            Err(e) => {
+                ui.notice = Some(format!("{name}: {e}"));
+                (Vec::new(), hidden)
+            }
+        },
+        Some(ShownTarget::Buffer(name)) => match capture_buffer(path, name) {
             Ok(result) => result,
             Err(e) => {
                 ui.notice = Some(format!("{name}: {e}"));
@@ -1032,7 +1050,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     let mut held: Option<(String, Hold)> = None;
     // What the window last reported showing — refreshed only on a
     // non-skip_list wake, and reused as-is on a Type-forced one.
-    let mut shown: Option<String> = None;
+    let mut shown: Option<ShownTarget> = None;
     let mut last_refresh = Instant::now();
     let mut force_refresh = true;
     // Set only by an `Action::Type` below, consumed by the very next refresh,
@@ -1154,22 +1172,40 @@ fn sessions_buffer_lines(path: &Path, width: u16) -> Result<Vec<String>, String>
     }
 }
 
-/// What the current window shows, after syncing it to NAME (`None` clears
-/// it) — so the window is the real source of truth for what gets captured
-/// below, not `ui.selected()` read directly.
-// One round trip, write then read back. Styled cells never cross into Lua
-// (`script.rs` refuses `CaptureStyled` from scripts on purpose) — only the
-// session's name does.
-fn window_shown_session(path: &Path, name: Option<&str>) -> Result<Option<String>, String> {
+/// What the window shows — a real session, a script's own buffer, or
+/// nothing — parsed from `remuda._sync_window_shown`'s return string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShownTarget {
+    Session(String),
+    Buffer(String),
+}
+
+/// Reconciles the window with NAME, the session Rust wants to auto-follow.
+/// SELECTION_CHANGED is the only thing allowed to reclaim the window from a
+/// buffer a script explicitly showed — a bare tick must leave one alone.
+fn window_shown_session(
+    path: &Path,
+    name: Option<&str>,
+    selection_changed: bool,
+) -> Result<Option<ShownTarget>, String> {
     let target = name.map_or_else(|| "nil".to_string(), mcp::lua_string);
-    let code =
-        format!("remuda.window.current():show({target}); return remuda.window.current().shows");
+    let code = format!("return remuda._sync_window_shown({target}, {selection_changed})");
     match client::request(path, &Request::Eval { code, name: None }) {
-        Ok(Response::Value(shown)) if shown == "nil" => Ok(None),
-        Ok(Response::Value(shown)) => Ok(Some(shown)),
+        Ok(Response::Value(shown)) => Ok(parse_shown_target(&shown)),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
     }
+}
+
+/// `remuda._sync_window_shown`'s string, unwrapped: `"nil"`, `"session:<name>"`,
+/// or `"buffer:<name>"` — an unrecognized shape falls back to `None`.
+fn parse_shown_target(text: &str) -> Option<ShownTarget> {
+    text.strip_prefix("session:")
+        .map(|name| ShownTarget::Session(name.to_string()))
+        .or_else(|| {
+            text.strip_prefix("buffer:")
+                .map(|name| ShownTarget::Buffer(name.to_string()))
+        })
 }
 
 /// Styled counterpart of the (now unused) plain `capture` — see steps/020,
@@ -1188,6 +1224,35 @@ fn capture_styled(path: &Path, name: &str) -> Result<(Vec<Vec<StyledCell>>, Curs
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
     }
+}
+
+/// A shown buffer's counterpart to `capture_styled` — same `Eval`/`Value`
+/// round trip `sessions_buffer_lines` already uses, not a new wire path.
+/// Plain text, one default-styled cell per char; no cursor, always hidden.
+fn capture_buffer(path: &Path, name: &str) -> Result<(Vec<Vec<StyledCell>>, Cursor), String> {
+    let code = format!("return remuda.buffer.new({}):get()", mcp::lua_string(name));
+    let text = match client::request(path, &Request::Eval { code, name: None }) {
+        Ok(Response::Value(text)) => text,
+        Ok(Response::Error(reason)) => return Err(reason),
+        other => return Err(format!("{other:?}")),
+    };
+    let hidden = Cursor {
+        row: 0,
+        col: 0,
+        visible: false,
+    };
+    let rows = text
+        .split('\n')
+        .map(|line| {
+            line.chars()
+                .map(|ch| StyledCell {
+                    text: ch.to_string(),
+                    ..Default::default()
+                })
+                .collect()
+        })
+        .collect();
+    Ok((rows, hidden))
 }
 
 /// A session started here is sized to the pane it will live in, and keeps that
@@ -2581,10 +2646,10 @@ mod tests {
         let path = scratch_socket("window-shown-round-trip");
         daemon_at(&path);
 
-        let shown = window_shown_session(&path, Some("alpha")).expect("show alpha");
-        assert_eq!(shown, Some("alpha".to_string()));
+        let shown = window_shown_session(&path, Some("alpha"), false).expect("show alpha");
+        assert_eq!(shown, Some(ShownTarget::Session("alpha".to_string())));
 
-        let cleared = window_shown_session(&path, None).expect("clear");
+        let cleared = window_shown_session(&path, None, false).expect("clear");
         assert_eq!(
             cleared, None,
             "a nil target must read back as None, not the string \"nil\""
@@ -2634,14 +2699,17 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let shown = window_shown_session(&path, Some("alpha")).expect("show alpha");
+        let shown = window_shown_session(&path, Some("alpha"), false).expect("show alpha");
         assert_eq!(
             shown,
-            Some("alpha".to_string()),
+            Some(ShownTarget::Session("alpha".to_string())),
             "the window must show what it was just asked to show"
         );
+        let ShownTarget::Session(name) = shown.unwrap() else {
+            unreachable!("just asserted it above");
+        };
         let (cells, cursor) =
-            capture_styled(&path, &shown.unwrap()).expect("capture through the window's target");
+            capture_styled(&path, &name).expect("capture through the window's target");
 
         let mut ui = Ui::new(vec![row("alpha", true, false)], "/bin/sh", None);
         ui.sessions_text = vec![" ".into()];
@@ -2914,6 +2982,349 @@ mod tests {
             held.as_ref().map(|(name, _)| name.clone()),
             before,
             "already held — must be a no-op, not a needless re-attach"
+        );
+    }
+
+    /// A small `Eval` helper for the buffer tests below — same wire shape as
+    /// `request_counts()`, but for arbitrary Lua rather than the fixed
+    /// counter read.
+    fn eval(path: &std::path::Path, code: &str) -> String {
+        match client::request(
+            path,
+            &Request::Eval {
+                code: code.to_string(),
+                name: None,
+            },
+        ) {
+            Ok(Response::Value(text)) => text,
+            other => panic!("eval failed: {other:?}"),
+        }
+    }
+
+    /// Shows a fresh Lua buffer named `scratch`, with TEXT as its content —
+    /// the real `Window:show(buf)` path a plugin uses, not a stand-in.
+    fn show_scratch_buffer(path: &std::path::Path, text: &str) {
+        eval(
+            path,
+            &format!(
+                "remuda.buffer.new('scratch'):set({}); \
+                 remuda.window.current():show(remuda.buffer.new('scratch'))",
+                mcp::lua_string(text)
+            ),
+        );
+    }
+
+    /// `show(buf)` now survives a refresh: `capture_buffer` renders it,
+    /// not `capture_styled` mistaking a buffer's name for a session's.
+    #[test]
+    fn a_buffer_shown_via_window_renders_its_text_not_a_no_such_session_error() {
+        let path = scratch_socket("buffer-shown-renders-text");
+        daemon_at(&path);
+
+        show_scratch_buffer(&path, "hello from buffer");
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        let mut shown = None;
+
+        // Nothing selected before or after (no sessions at all), so this is
+        // an ordinary tick — no selection change to report.
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(shown, Some(ShownTarget::Buffer("scratch".to_string())));
+        assert!(
+            painted.contains("hello from buffer"),
+            "a shown buffer's own text must reach the screen: {painted:?}"
+        );
+        assert!(
+            !painted.contains("no such session"),
+            "a buffer is not a session — capture_styled must not be asked \
+             to treat one as one: {painted:?}"
+        );
+    }
+
+    /// Unchanged buffer content between two refreshes must not repaint —
+    /// same real text captured twice, not both calls erroring identically.
+    #[test]
+    fn a_shown_buffers_unchanged_update_does_not_repaint() {
+        let path = scratch_socket("buffer-unchanged-no-repaint");
+        daemon_at(&path);
+
+        show_scratch_buffer(&path, "hello from buffer");
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        let mut shown = None;
+
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
+        assert!(
+            painted.contains("hello from buffer"),
+            "sanity: the first refresh must have actually captured the \
+             buffer's real text, or an unchanged second refresh would prove \
+             nothing: {painted:?}"
+        );
+        let after_first = painted.clone();
+
+        // Content unchanged.
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            painted, after_first,
+            "no content change happened, so no repaint should have either"
+        );
+    }
+
+    /// A real content change must repaint, keeping the same no-full-erase /
+    /// synchronized-output shape `render_styled_*` requires of every frame.
+    #[test]
+    fn a_shown_buffers_changed_update_does_repaint_without_full_erase() {
+        let path = scratch_socket("buffer-changed-repaints");
+        daemon_at(&path);
+
+        show_scratch_buffer(&path, "before");
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        let mut shown = None;
+
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
+        let before_frame = painted.clone();
+        assert!(before_frame.contains("before"), "{before_frame:?}");
+
+        eval(&path, "remuda.buffer.new('scratch'):set('after')");
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
+
+        assert_ne!(
+            painted, before_frame,
+            "the buffer's text changed, so the painted frame must too: {painted:?}"
+        );
+        assert!(
+            painted.contains("after") && !painted.contains("before"),
+            "the new frame must show the buffer's NEW text: {painted:?}"
+        );
+        assert!(
+            !painted.contains("\x1b[2J"),
+            "a repaint must still never be a full erase: {painted:?}"
+        );
+        assert!(
+            painted.starts_with("\x1b[?2026h"),
+            "begin sync: {painted:?}"
+        );
+        assert!(painted.ends_with("\x1b[?2026l"), "end sync: {painted:?}");
+    }
+
+    /// Mirrors `a_type_forced_refresh_with_unchanged_selection_costs_one_daemon_request`:
+    /// a buffer shown, unchanged, must also cost exactly one request.
+    #[test]
+    fn a_type_forced_refresh_while_a_buffer_is_shown_costs_one_daemon_request() {
+        let path = scratch_socket("buffer-type-forced-request-count");
+        daemon_at(&path);
+
+        show_scratch_buffer(&path, "hello from buffer");
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        let mut shown = None;
+        // Steady state first, exactly like the session-based test: one
+        // ordinary refresh syncs the window to the buffer.
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            shown,
+            Some(ShownTarget::Buffer("scratch".to_string())),
+            "steady state must have the buffer shown before measuring"
+        );
+
+        let before = request_counts(&path);
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            true,
+        )
+        .unwrap();
+        let after = request_counts(&path);
+
+        let list = after.0 - before.0;
+        let eval_calls = after.1 - before.1 - 1; // `after`'s own read is one Eval
+        let capture_styled = after.2 - before.2;
+        let total = list + eval_calls + capture_styled;
+        assert_eq!(
+            total, 1,
+            "a Type-forced refresh with an unchanged buffer target must \
+             cost exactly one daemon request — got {total} (list={list}, \
+             eval={eval_calls}, capture_styled={capture_styled})"
+        );
+    }
+
+    /// Arrowing the list must reclaim the window from a shown buffer —
+    /// the next refresh shows the newly selected session, not the buffer.
+    #[test]
+    fn a_selection_change_reclaims_the_window_from_a_shown_buffer() {
+        let path = scratch_socket("buffer-selection-change-reclaims");
+        daemon_at(&path);
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        let mut shown = None;
+        // Steady state: both real sessions seen, the first selected and shown.
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
+        assert_eq!(ui.sessions.len(), 2, "both sessions must be seen");
+        let second = ui.sessions[1].name.clone();
+        assert_eq!(
+            shown,
+            Some(ShownTarget::Session(ui.sessions[0].name.clone())),
+            "steady state must have the first session shown"
+        );
+
+        // A script takes the window over.
+        show_scratch_buffer(&path, "hello from buffer");
+
+        // The explicit user act: arrowing down to the other session.
+        ui.on_key(press(KeyCode::Down));
+        assert_eq!(ui.selected, 1, "the selection must have moved");
+
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            shown,
+            Some(ShownTarget::Session(second)),
+            "an explicit selection change must reclaim the window from the \
+             buffer, showing the newly selected session"
+        );
+    }
+
+    /// The defect the fix closes: a tick with no user action must NOT
+    /// clear a shown buffer — only an explicit selection change may.
+    #[test]
+    fn a_tick_refresh_keeps_a_shown_buffer() {
+        let path = scratch_socket("buffer-tick-refresh-keeps-it");
+        daemon_at(&path);
+
+        // No sessions at all, so there is nothing to compete for the window
+        // via a default selection either — isolates "a tick fired" from
+        // "something was already selected".
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        let mut shown = None;
+
+        // Steady state, nothing shown yet.
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
+        assert_eq!(shown, None, "nothing selected, nothing shown yet");
+
+        // A script takes the window over, out of band from any refresh.
+        show_scratch_buffer(&path, "hello from buffer");
+
+        // A tick fires with no user action at all: `run`'s own loop only
+        // ever sets `skip_list=true` right after an `Action::Type`, and
+        // always clears it straight after — a schedule- or TICK-driven wake
+        // is always this shape, and the selection here never moved.
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            shown,
+            Some(ShownTarget::Buffer("scratch".to_string())),
+            "no user action fired — a tick alone must not clear a shown buffer"
         );
     }
 }
