@@ -129,7 +129,7 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     // race the listener it will talk to.
     let counters = Arc::new(crate::tick::Counters::default());
     let image = Image::spawn(path, Arc::clone(&registry), Arc::clone(&counters));
-    spawn_ticker(image.clone(), Arc::clone(&counters));
+    spawn_ticker(image.clone(), Arc::clone(&counters), Arc::clone(&registry));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let registry = Arc::clone(&registry);
@@ -147,15 +147,36 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
 /// daemon, not just a latency ceiling for schedules; see steps/031.
 const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Wake the image once a period with `remuda._run_due_schedules(now)`. Its own
-/// thread, so a wedged schedule stalls only the tick, never the listener loop.
-fn spawn_ticker(image: Image, counters: Arc<crate::tick::Counters>) {
+/// The one path every reap site (the ticker, `Request::List`, `ls()`) must
+/// go through: `Registry::reap()` hands its answer to whoever calls first, so
+/// notifying anywhere else would race it and silently drop the event.
+pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String> {
+    let dead = registry.reap();
+    for name in &dead {
+        let _ = image.submit(
+            &format!(
+                "remuda.emit('session_exited', {})",
+                crate::mcp::lua_string(name)
+            ),
+            None,
+        );
+    }
+    dead
+}
+
+/// Wake the image once a period with `remuda._run_due_schedules(now)`, and
+/// reap dead sessions, firing `session_exited` for each. Its own thread, so a
+/// wedged schedule stalls only the tick, never the listener loop.
+fn spawn_ticker(image: Image, counters: Arc<crate::tick::Counters>, registry: Arc<Registry>) {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let for_submit = Arc::clone(&clock);
     std::thread::spawn(move || {
         let ticker = crate::tick::Ticker::new(
             move || {
                 let now = for_submit.now().as_secs_f64();
+                if !keep_exited() {
+                    reap_and_notify(&registry, &image);
+                }
                 image.submit(&format!("remuda._run_due_schedules({now})"), None)
             },
             clock,
@@ -202,7 +223,7 @@ fn handle(
         // a reaper thread would need a clock this layer is not given.
         Request::List => {
             if !keep_exited() {
-                registry.reap();
+                reap_and_notify(registry, image);
             }
             reply(&stream, &Response::Sessions(registry.list()))
         }

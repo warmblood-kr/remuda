@@ -259,11 +259,12 @@ pub fn bindings(
     // daemon this `Registry` belongs to (image.rs), so asking over the wire
     // for an answer this call already has bought nothing but a socket round
     // trip on every non-skip_list tick refresh. See steps/031.
+    let image_for_ls = image.clone();
     table.set(
         "ls",
         lua.create_function(move |lua, ()| {
             if !crate::daemon::keep_exited() {
-                registry.reap();
+                crate::daemon::reap_and_notify(&registry, &image_for_ls);
             }
             value(lua, Response::Sessions(registry.list()))
         })?,

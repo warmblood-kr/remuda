@@ -465,6 +465,182 @@ fn read_count(path: &Path, code: &str) -> u32 {
 }
 
 #[test]
+fn a_session_exited_hook_fires_when_a_real_session_dies() {
+    // `session_exited` is remuda's own first real event: fired once for each
+    // session the daemon's ticker notices has died. Nothing calls
+    // `remuda.emit("session_exited", ...)` anywhere yet, so this must fail red.
+    let path = scratch("session-exited");
+    let _daemon = daemon_at(&path);
+
+    eval(
+        &path,
+        r#"
+            remuda._session_exited_names = {}
+            remuda.on("session_exited", function(name)
+                table.insert(remuda._session_exited_names, name)
+            end)
+        "#,
+    );
+
+    // Exits on its own almost immediately, so the ticker's very next tick
+    // (TICK_PERIOD is 1s, see daemon.rs) has something dead to reap well
+    // inside PATIENCE.
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("short-lived".into()),
+            command: vec!["sh".into(), "-c".into(), "exit 0".into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new");
+    assert_eq!(response, Response::Value("short-lived".into()));
+
+    // Negative control: a session that stays alive throughout must never be
+    // named — this is fine to trivially hold today too, since nothing fires
+    // the event for anyone yet.
+    new_session(&path, "long-lived");
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let seen = eval(
+            &path,
+            "return table.concat(remuda._session_exited_names, ',')",
+        );
+        if seen.split(',').any(|n| n == "short-lived") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session_exited never fired for short-lived. seen so far: {seen:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let seen = eval(
+        &path,
+        "return table.concat(remuda._session_exited_names, ',')",
+    );
+    assert!(
+        !seen.split(',').any(|n| n == "long-lived"),
+        "a still-alive session must never appear in session_exited names: {seen:?}"
+    );
+}
+
+#[test]
+fn a_session_exited_hook_still_fires_once_when_ls_reaps_before_the_tick() {
+    // `Registry::reap()` removes what it finds and hands it only to whoever
+    // calls first. A `List` that reaps well inside TICK_PERIOD must not make
+    // the ticker's own later reap silently find nothing to emit for — and it
+    // must not double-emit either, once every reap site funnels through one
+    // notifying path.
+    let path = scratch("session-exited-race");
+    let _daemon = daemon_at(&path);
+
+    eval(
+        &path,
+        r#"
+            remuda._race_exited_names = {}
+            remuda.on("session_exited", function(name)
+                table.insert(remuda._race_exited_names, name)
+            end)
+        "#,
+    );
+
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("race-short-lived".into()),
+            command: vec!["sh".into(), "-c".into(), "exit 0".into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new");
+    assert_eq!(response, Response::Value("race-short-lived".into()));
+
+    // Well inside TICK_PERIOD (1s) — this reaps the session before the
+    // ticker's own tick has a chance to.
+    std::thread::sleep(Duration::from_millis(80));
+    client::request(&path, &Request::List).expect("list");
+
+    // Give the ticker a full period too, so a double-emit (both paths firing)
+    // would have every chance to show up if the funnel were not idempotent.
+    std::thread::sleep(Duration::from_millis(1200));
+
+    let names = eval(&path, "return table.concat(remuda._race_exited_names, ',')");
+    let count = names
+        .split(',')
+        .filter(|n| *n == "race-short-lived")
+        .count();
+    assert_eq!(
+        count, 1,
+        "expected exactly one session_exited for race-short-lived, got {count}: {names:?}"
+    );
+}
+
+#[test]
+fn a_hostile_session_name_reaches_the_hook_byte_for_byte() {
+    // `Request::New`'s name has no validation at all beyond uniqueness (see
+    // `spawn`/`Registry::register`) — a caller may hand over anything. The
+    // emit path splices it into a Lua source string via `mcp::lua_string`, so
+    // a quote or backslash proves that escaping is real, not merely untested.
+    let path = scratch("session-exited-hostile");
+    let _daemon = daemon_at(&path);
+    let hostile = r#"it's a "test" \with\backslashes"#;
+
+    eval(&path, "remuda._hostile_exited_names = {}");
+    eval(
+        &path,
+        "remuda.on(\"session_exited\", function(name) \
+            table.insert(remuda._hostile_exited_names, name) \
+         end)",
+    );
+
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some(hostile.to_string()),
+            command: vec!["sh".into(), "-c".into(), "exit 0".into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new");
+    assert_eq!(response, Response::Value(hostile.to_string()));
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let count = read_count(&path, "return #remuda._hostile_exited_names");
+        if count >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session_exited never fired for the hostile name"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Exact match, not a substring or a count — proof the name arrived intact
+    // rather than truncated or escaped-then-left-escaped by a naive splice.
+    assert_eq!(
+        eval(&path, "return remuda._hostile_exited_names[1]"),
+        hostile,
+        "the hostile name did not survive the emit path unchanged"
+    );
+    assert_eq!(
+        read_count(&path, "return #remuda._hostile_exited_names"),
+        1,
+        "no injected code should have run more than once, nor duplicated the entry"
+    );
+}
+
+#[test]
 fn cancelling_one_same_label_schedule_leaves_the_other_firing() {
     // The gap measured on 09-13: a name-keyed table means a second
     // registrant under the same label silently replaces the first. A handle
