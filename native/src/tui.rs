@@ -84,9 +84,6 @@ pub struct Ui {
     /// `remuda._refresh_sessions_buffer`), index-aligned with `sessions`, or
     /// the two empty-herd lines. See `list_row`.
     sessions_text: Vec<String>,
-    /// `ui.selected()` as of the last non-`skip_list` refresh — lets
-    /// `refresh` tell an explicit selection change from a bare tick.
-    last_synced_selection: Option<String>,
 }
 
 impl Ui {
@@ -103,7 +100,6 @@ impl Ui {
             shell: shell.to_string(),
             notice,
             sessions_text: Vec::new(),
-            last_synced_selection: None,
         }
     }
 
@@ -906,6 +902,9 @@ fn should_refresh(forced: bool, since_last: Duration, tick: Duration) -> bool {
 /// The one expensive act of a frame: relist the herd, take or release the
 /// focus hold, capture the focused screen and repaint if that changed
 /// anything. `skip_list` skips the relist for a `Type`-forced wake. See steps/022.
+// ponytail: 8 plain params over clippy's 7 rather than a bundling struct
+// only `refresh` would ever construct — split out if a 9th ever shows up.
+#[allow(clippy::too_many_arguments)]
 fn refresh(
     path: &Path,
     server: &str,
@@ -914,6 +913,7 @@ fn refresh(
     painted: &mut String,
     shown: &mut Option<ShownTarget>,
     skip_list: bool,
+    selection_moved: bool,
 ) -> std::io::Result<(u16, u16)> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     if !skip_list {
@@ -959,14 +959,10 @@ fn refresh(
     // would be a per-keystroke Eval for an answer that can't have changed.
     if !skip_list {
         let selected_name = ui.selected().map(|s| s.name.clone());
-        // Whether the NAME Rust wants to auto-follow moved since the last
-        // sync — never whether the window's own content changed underneath
-        // it. This is the one signal `remuda._sync_window_shown` needs to
-        // tell an explicit selection change (which must reclaim the window
-        // from a shown buffer) apart from a bare tick (which must not).
-        let selection_changed = selected_name != ui.last_synced_selection;
-        ui.last_synced_selection = selected_name.clone();
-        match window_shown_session(path, selected_name.as_deref(), selection_changed) {
+        // `selection_moved` is `true` only for a real Up/Down keypress that
+        // actually moved `ui.selected` (see `run()`) — never a session
+        // first appearing in the list, `clamp()`, or `follow_focus()`.
+        match window_shown_session(path, selected_name.as_deref(), selection_moved) {
             Ok(target) => *shown = target,
             Err(e) => {
                 ui.notice = Some(e);
@@ -1056,6 +1052,10 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     // Set only by an `Action::Type` below, consumed by the very next refresh,
     // then always cleared — never carried into a tick-driven refresh.
     let mut skip_list = false;
+    // Set only by a real Up/Down keypress that moved `ui.selected`, consumed
+    // by the very next refresh, then cleared — never by a session appearing
+    // in the list, `clamp()`, `follow_focus()`, or a mouse click (out of scope).
+    let mut selection_moved = false;
     let (mut cols, mut rows) = (80u16, 24u16);
 
     loop {
@@ -1075,16 +1075,26 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 &mut painted,
                 &mut shown,
                 skip_list,
+                selection_moved,
             )?;
             skip_list = false;
+            selection_moved = false;
         }
 
         if !crossterm::event::poll(tick)? {
             continue;
         }
+        // Reset before every read: a stale `true` from a prior iteration
+        // must never leak into an unrelated tick.
+        selection_moved = false;
         let action = match crossterm::event::read()? {
             // Windows delivers Release as well, and acting on both double-fires.
-            Event::Key(key) if key.kind == KeyEventKind::Press => ui.on_key(key),
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                let before = ui.selected;
+                let action = ui.on_key(key);
+                selection_moved = ui.selected != before;
+                action
+            }
             Event::Mouse(m) => ui.on_mouse(m, cols, rows),
             _ => continue,
         };
@@ -2771,6 +2781,7 @@ mod tests {
             &mut painted,
             &mut shown,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(ui.sessions.len(), 1, "the first session must be seen");
@@ -2787,6 +2798,7 @@ mod tests {
             &mut painted,
             &mut shown,
             true,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -2802,6 +2814,7 @@ mod tests {
             &mut held,
             &mut painted,
             &mut shown,
+            false,
             false,
         )
         .unwrap();
@@ -2858,6 +2871,7 @@ mod tests {
             &mut painted,
             &mut shown,
             false,
+            false,
         )
         .unwrap();
         assert!(
@@ -2874,6 +2888,7 @@ mod tests {
             &mut painted,
             &mut shown,
             true,
+            false,
         )
         .unwrap();
         let after = request_counts(&path);
@@ -2917,6 +2932,7 @@ mod tests {
             &mut painted,
             &mut shown,
             false,
+            false,
         )
         .unwrap();
         let after = request_counts(&path);
@@ -2949,6 +2965,7 @@ mod tests {
             &mut held,
             &mut painted,
             &mut shown,
+            false,
             false,
         )
         .unwrap();
@@ -3038,6 +3055,7 @@ mod tests {
             &mut painted,
             &mut shown,
             false,
+            false,
         )
         .unwrap();
 
@@ -3075,6 +3093,7 @@ mod tests {
             &mut painted,
             &mut shown,
             false,
+            false,
         )
         .unwrap();
         assert!(
@@ -3093,6 +3112,7 @@ mod tests {
             &mut held,
             &mut painted,
             &mut shown,
+            false,
             false,
         )
         .unwrap();
@@ -3125,6 +3145,7 @@ mod tests {
             &mut painted,
             &mut shown,
             false,
+            false,
         )
         .unwrap();
         let before_frame = painted.clone();
@@ -3138,6 +3159,7 @@ mod tests {
             &mut held,
             &mut painted,
             &mut shown,
+            false,
             false,
         )
         .unwrap();
@@ -3184,6 +3206,7 @@ mod tests {
             &mut painted,
             &mut shown,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -3201,6 +3224,7 @@ mod tests {
             &mut painted,
             &mut shown,
             true,
+            false,
         )
         .unwrap();
         let after = request_counts(&path);
@@ -3239,6 +3263,7 @@ mod tests {
             &mut painted,
             &mut shown,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(ui.sessions.len(), 2, "both sessions must be seen");
@@ -3264,6 +3289,7 @@ mod tests {
             &mut painted,
             &mut shown,
             false,
+            true,
         )
         .unwrap();
 
@@ -3299,6 +3325,7 @@ mod tests {
             &mut painted,
             &mut shown,
             false,
+            false,
         )
         .unwrap();
         assert_eq!(shown, None, "nothing selected, nothing shown yet");
@@ -3318,6 +3345,7 @@ mod tests {
             &mut painted,
             &mut shown,
             false,
+            false,
         )
         .unwrap();
 
@@ -3325,6 +3353,227 @@ mod tests {
             shown,
             Some(ShownTarget::Buffer("scratch".to_string())),
             "no user action fired — a tick alone must not clear a shown buffer"
+        );
+    }
+
+    /// A default selection being assigned to a real session (no keypress at
+    /// all) must not reclaim a shown buffer — unlike
+    /// `a_tick_refresh_keeps_a_shown_buffer`, this uses a REAL session.
+    #[test]
+    fn a_shown_buffer_survives_the_first_refresh_when_a_default_selection_is_assigned() {
+        let path = scratch_socket("buffer-first-refresh-default-selection");
+        daemon_at(&path);
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        // Show the buffer BEFORE ever calling refresh() — nothing has
+        // synced yet, and no `selection_moved` is passed below.
+        show_scratch_buffer(&path, "hello from buffer");
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        let mut shown = None;
+
+        // The very first refresh ever: `ui.clamp()` assigns a default
+        // selection (None -> Some), with no key event involved at all.
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            shown,
+            Some(ShownTarget::Buffer("scratch".to_string())),
+            "a default selection being assigned is not a user action — the \
+             shown buffer must survive it"
+        );
+    }
+
+    /// Positive control: a real Down keypress that moves `ui.selected`
+    /// (NOT the mouse-driven `click_list_row`, out of scope) must reclaim
+    /// the window — passed explicitly as `selection_moved` below.
+    #[test]
+    fn a_key_driven_selection_move_still_reclaims_the_window_from_a_shown_buffer() {
+        let path = scratch_socket("buffer-key-driven-selection-reclaims");
+        daemon_at(&path);
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        let mut shown = None;
+        // Steady state: both real sessions seen, the first selected and shown.
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(ui.sessions.len(), 2, "both sessions must be seen");
+        let second = ui.sessions[1].name.clone();
+
+        // A script takes the window over.
+        show_scratch_buffer(&path, "hello from buffer");
+
+        // The explicit user act: a real Down keypress, genuinely moving
+        // `ui.selected` from 0 to 1.
+        ui.on_key(press(KeyCode::Down));
+        assert_eq!(ui.selected, 1, "the selection must have moved");
+
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            shown,
+            Some(ShownTarget::Session(second)),
+            "a real key-driven selection move must reclaim the window from \
+             the buffer, showing the newly selected session"
+        );
+    }
+
+    /// Steady state (already synced once), then a second tick with no key
+    /// event: distinct from the "buffer set before the first-ever refresh"
+    /// case above — here it's set after a session was already selected.
+    #[test]
+    fn a_shown_buffer_survives_a_tick_while_a_real_session_is_selected() {
+        let path = scratch_socket("buffer-tick-with-real-session-selected");
+        daemon_at(&path);
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        let mut shown = None;
+
+        // First, ordinary refresh: a default selection is assigned and
+        // synced. Under today's buggy code this may already have reclaimed
+        // the window — irrelevant here, since no buffer is shown yet.
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // Now a script takes the window over, out of band from any refresh.
+        show_scratch_buffer(&path, "hello from buffer");
+
+        // A second, ordinary tick — no key event, no selection change.
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            shown,
+            Some(ShownTarget::Buffer("scratch".to_string())),
+            "no user action fired while a real session was already \
+             selected — the shown buffer must survive the tick"
+        );
+    }
+
+    /// Sanity companion only — `skip_list=true` never enters the
+    /// selection-sync block at all, so this can't isolate the selection
+    /// bug; it just confirms the one-request invariant with a session too.
+    #[test]
+    fn a_type_forced_refresh_with_a_real_session_and_a_shown_buffer_costs_one_daemon_request() {
+        let path = scratch_socket("buffer-type-forced-request-count-with-session");
+        daemon_at(&path);
+        start(&path, "sh", Size::new(80, 24)).unwrap();
+
+        let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+        let mut held = None;
+        let mut painted = String::new();
+        let mut shown = None;
+        // Steady state: the session is synced first...
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+            false,
+        )
+        .unwrap();
+        // ...then a script takes the window over.
+        show_scratch_buffer(&path, "hello from buffer");
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            shown,
+            Some(ShownTarget::Buffer("scratch".to_string())),
+            "steady state must have the buffer shown before measuring"
+        );
+
+        let before = request_counts(&path);
+        refresh(
+            &path,
+            "default",
+            &mut ui,
+            &mut held,
+            &mut painted,
+            &mut shown,
+            true,
+            false,
+        )
+        .unwrap();
+        let after = request_counts(&path);
+
+        let list = after.0 - before.0;
+        let eval_calls = after.1 - before.1 - 1; // `after`'s own read is one Eval
+        let capture_styled = after.2 - before.2;
+        let total = list + eval_calls + capture_styled;
+        assert_eq!(
+            total, 1,
+            "a Type-forced refresh with an unchanged buffer target and a \
+             real session present must still cost exactly one daemon \
+             request — got {total} (list={list}, eval={eval_calls}, \
+             capture_styled={capture_styled})"
         );
     }
 }
