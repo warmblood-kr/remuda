@@ -84,12 +84,8 @@ pub struct Ui {
     /// `remuda._refresh_sessions_buffer`), index-aligned with `sessions`, or
     /// the two empty-herd lines. See `list_row`.
     sessions_text: Vec<String>,
-    /// What `ui.selected()` named as of the last non-`skip_list` refresh —
-    /// compared against the current name each time to tell `refresh` (and,
-    /// through it, `remuda._sync_window_shown`) an explicit selection change
-    /// from a bare tick with nothing to react to. Only that distinction lets
-    /// a tick leave a shown buffer alone while a real selection change still
-    /// reclaims the window from one.
+    /// `ui.selected()` as of the last non-`skip_list` refresh — lets
+    /// `refresh` tell an explicit selection change from a bare tick.
     last_synced_selection: Option<String>,
 }
 
@@ -1176,25 +1172,17 @@ fn sessions_buffer_lines(path: &Path, width: u16) -> Result<Vec<String>, String>
     }
 }
 
-/// What the window is currently showing — a real session, a script's own
-/// buffer, or nothing — parsed from `remuda._sync_window_shown`'s own
-/// discriminated return string (`tools.lua`). Rust-internal: this never
-/// crosses the wire as anything but that string.
+/// What the window shows — a real session, a script's own buffer, or
+/// nothing — parsed from `remuda._sync_window_shown`'s return string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ShownTarget {
     Session(String),
     Buffer(String),
 }
 
-/// Reconciles the window with NAME (the session Rust wants to auto-follow,
-/// or `None`) — so the window is the real source of truth for what gets
-/// captured below, not `ui.selected()` read directly. SELECTION_CHANGED
-/// tells `remuda._sync_window_shown` whether this call is an explicit
-/// selection change, the only thing allowed to reclaim the window from a
+/// Reconciles the window with NAME, the session Rust wants to auto-follow.
+/// SELECTION_CHANGED is the only thing allowed to reclaim the window from a
 /// buffer a script explicitly showed — a bare tick must leave one alone.
-// One round trip, write then read back. Styled cells never cross into Lua
-// (`script.rs` refuses `CaptureStyled` from scripts on purpose) — only the
-// session's name does.
 fn window_shown_session(
     path: &Path,
     name: Option<&str>,
@@ -1209,10 +1197,8 @@ fn window_shown_session(
     }
 }
 
-/// `remuda._sync_window_shown`'s discriminated string, unwrapped: `"nil"`
-/// (nothing shown), `"session:<name>"`, or `"buffer:<name>"`. Wire-internal
-/// on both ends, not user input — an unrecognized shape falls back to
-/// `None` rather than panicking on an answer only this pair ever produces.
+/// `remuda._sync_window_shown`'s string, unwrapped: `"nil"`, `"session:<name>"`,
+/// or `"buffer:<name>"` — an unrecognized shape falls back to `None`.
 fn parse_shown_target(text: &str) -> Option<ShownTarget> {
     text.strip_prefix("session:")
         .map(|name| ShownTarget::Session(name.to_string()))
@@ -1240,13 +1226,9 @@ fn capture_styled(path: &Path, name: &str) -> Result<(Vec<Vec<StyledCell>>, Curs
     }
 }
 
-/// A shown buffer's counterpart to `capture_styled` — the same
-/// `Request::Eval`/`Response::Value(String)` round trip `sessions_buffer_lines`
-/// already uses for `'*sessions*'`, not a wire change of its own. A buffer is
-/// plain text, so every character becomes one default-styled `StyledCell`
-/// (no ANSI to interpret — that is not what a buffer holds) and `\n` splits
-/// rows. A buffer has no cursor; it always reports the same hidden one a
-/// failed session capture falls back to.
+/// A shown buffer's counterpart to `capture_styled` — same `Eval`/`Value`
+/// round trip `sessions_buffer_lines` already uses, not a new wire path.
+/// Plain text, one default-styled cell per char; no cursor, always hidden.
 fn capture_buffer(path: &Path, name: &str) -> Result<(Vec<Vec<StyledCell>>, Cursor), String> {
     let code = format!("return remuda.buffer.new({}):get()", mcp::lua_string(name));
     let text = match client::request(path, &Request::Eval { code, name: None }) {
@@ -3032,10 +3014,8 @@ mod tests {
         );
     }
 
-    /// A real `remuda.window.current():show(buf)` call now survives a
-    /// refresh and reaches the screen: `ShownTarget::Buffer` is captured
-    /// through `capture_buffer`, not `capture_styled` mistaking a buffer's
-    /// name for a session's.
+    /// `show(buf)` now survives a refresh: `capture_buffer` renders it,
+    /// not `capture_styled` mistaking a buffer's name for a session's.
     #[test]
     fn a_buffer_shown_via_window_renders_its_text_not_a_no_such_session_error() {
         let path = scratch_socket("buffer-shown-renders-text");
@@ -3073,11 +3053,8 @@ mod tests {
         );
     }
 
-    /// With a buffer shown and its content unchanged between two refreshes,
-    /// `painted` (and so the terminal write `refresh` gates on
-    /// `frame != *painted`) must not change on the second call — and, unlike
-    /// the pre-fix version of this test, that is now because the SAME real
-    /// text was captured twice, not because both calls errored identically.
+    /// Unchanged buffer content between two refreshes must not repaint —
+    /// same real text captured twice, not both calls erroring identically.
     #[test]
     fn a_shown_buffers_unchanged_update_does_not_repaint() {
         let path = scratch_socket("buffer-unchanged-no-repaint");
@@ -3126,10 +3103,8 @@ mod tests {
         );
     }
 
-    /// The other half of the pair above: a real content change on the shown
-    /// buffer must repaint, and the new frame must keep the same
-    /// no-full-erase / synchronized-output shape `render_styled_*` already
-    /// requires of every frame.
+    /// A real content change must repaint, keeping the same no-full-erase /
+    /// synchronized-output shape `render_styled_*` requires of every frame.
     #[test]
     fn a_shown_buffers_changed_update_does_repaint_without_full_erase() {
         let path = scratch_socket("buffer-changed-repaints");
@@ -3179,16 +3154,15 @@ mod tests {
             !painted.contains("\x1b[2J"),
             "a repaint must still never be a full erase: {painted:?}"
         );
-        assert!(painted.starts_with("\x1b[?2026h"), "begin sync: {painted:?}");
+        assert!(
+            painted.starts_with("\x1b[?2026h"),
+            "begin sync: {painted:?}"
+        );
         assert!(painted.ends_with("\x1b[?2026l"), "end sync: {painted:?}");
     }
 
-    /// [Mirrors `a_type_forced_refresh_with_unchanged_selection_costs_one_daemon_request`]
-    /// A `Type`-forced refresh (`skip_list=true`) with a buffer shown and
-    /// its target unchanged must cost exactly one daemon request, the same
-    /// invariant the analogous session test already holds `refresh` to —
-    /// here the one request is `capture_buffer`'s `Eval`, not
-    /// `capture_styled`, but the total is the same.
+    /// Mirrors `a_type_forced_refresh_with_unchanged_selection_costs_one_daemon_request`:
+    /// a buffer shown, unchanged, must also cost exactly one request.
     #[test]
     fn a_type_forced_refresh_while_a_buffer_is_shown_costs_one_daemon_request() {
         let path = scratch_socket("buffer-type-forced-request-count");
@@ -3243,9 +3217,8 @@ mod tests {
         );
     }
 
-    /// An explicit user selection change (arrowing the list) must reclaim
-    /// the window from a shown buffer: the very next non-`skip_list`
-    /// refresh shows the newly selected session, not the buffer.
+    /// Arrowing the list must reclaim the window from a shown buffer —
+    /// the next refresh shows the newly selected session, not the buffer.
     #[test]
     fn a_selection_change_reclaims_the_window_from_a_shown_buffer() {
         let path = scratch_socket("buffer-selection-change-reclaims");
@@ -3302,10 +3275,8 @@ mod tests {
         );
     }
 
-    /// The actual defect the fix closes: a scheduled/tick-driven refresh
-    /// (`skip_list=false`, no user action of any kind) must NOT clear a
-    /// shown buffer back to whatever session is or is not selected — only
-    /// an explicit selection change (previous test) reclaims the window.
+    /// The defect the fix closes: a tick with no user action must NOT
+    /// clear a shown buffer — only an explicit selection change may.
     #[test]
     fn a_tick_refresh_keeps_a_shown_buffer() {
         let path = scratch_socket("buffer-tick-refresh-keeps-it");
