@@ -13,18 +13,21 @@ ignore = []
 
 [licenses]
 # Every license actually in this workspace's dependency tree, checked with
-# `cargo deny check licenses` against the real Cargo.lock. Add to this list
-# only after confirming a new dependency's license with the same command.
+# `cargo deny check licenses` against the real Cargo.lock.
 #
-# This list is intentionally closed, not just populated: cargo-deny 0.20
-# removed the old `[licenses] deny` key (see PR #611), so there is no
-# separate deny-list mechanism any more — everything not named below is
-# already rejected. That is a deliberate choice here, not a side effect:
-# the GPL family (GPL/LGPL/AGPL, `-only`/`-or-later`) must never appear in
-# this allow list, because a copyleft dependency would compromise this
-# package's ability to be licensed commercially. None is present in the
-# tree today (verified with `cargo deny list` and `cargo deny check
-# licenses`) — if one is ever added, this check fails closed, not open.
+# 1) Why closed, not just populated: the GPL family (GPL/LGPL/AGPL,
+#    `-only`/`-or-later`) must never appear here. Basis: 정수님, 2026-09-18,
+#    verbatim — "oh, then, let's avoid GPL family, not to prevent to make
+#    this package commercial." None is present in the tree today (checked
+#    with `cargo deny list` and `cargo deny check licenses`).
+# 2) How: cargo-deny 0.20 removed the old `[licenses] deny` key (tested
+#    directly against this repo's installed 0.20.2 — it errors
+#    "this key has been removed", see PR #611), so a closed allow-list is
+#    the only implementation route; anything not named below is rejected.
+# 3) If a NEW dependency gets blocked here and its license is NOT in the
+#    GPL family (e.g. ISC, MPL): that's maintenance, not policy — add it
+#    to `allow` below and move on, no need to ask. If it IS GPL-family:
+#    stop, don't add it, and report instead.
 allow = [
     "MIT",
     "Apache-2.0",
