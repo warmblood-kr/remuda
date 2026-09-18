@@ -130,11 +130,21 @@ printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -sf -K - -X PUT \
   -d "$BODY_JSON" >/dev/null
 ]==]
 
+-- No cwd binding exists on the `remuda` table, so PWD (set by the shell that
+-- started the daemon) is the only directory this Lua code can see. A root
+-- or absent PWD has no usable basename, so it falls back to "butler".
+local function initial_butler_name()
+  local pwd = os.getenv("PWD")
+  local base = pwd and pwd:gsub("/+$", ""):match("([^/]+)$")
+  return base or "butler"
+end
+
 -- Exposed so tests can extract the exact embedded source without triggering
 -- the side effects below (starting a real process/session needs real
 -- config this test harness doesn't have, and shouldn't start one anyway).
 remuda._butler_helper_src = HELPER_SRC
 remuda._butler_reply_src = REPLY_SRC
+remuda._butler_initial_name = initial_butler_name()
 if remuda._butler_test_mode then
   return
 end
@@ -186,7 +196,7 @@ local SYSTEM_PROMPT = "You are bridged into one Matrix room via remuda. "
   .. "text -- printing a reply in this terminal does not send it anywhere; "
   .. "only calling the tool does."
 
-local butler = remuda.new(nil, {
+local BUTLER_ARGV = {
   "claude",
   "--mcp-config",
   mcp_config_path,
@@ -197,7 +207,26 @@ local butler = remuda.new(nil, {
   "mcp__remuda__run_script",
   "--append-system-prompt",
   SYSTEM_PROMPT,
-})
+}
+
+-- Reused both for the initial launch and every respawn, so the watchdog
+-- below can never drift from what a fresh start would have done. Keeps the
+-- name across respawns by feeding the previous result back in as the name.
+local butler_name = nil
+local function launch_butler()
+  butler_name = remuda.new(butler_name or remuda._butler_initial_name, BUTLER_ARGV)
+end
+launch_butler()
+
+-- `exec butler` re-running this file in the same daemon image would
+-- otherwise double this hook (see docs/design.md's augroup note) --
+-- clearing the group first keeps exactly one watchdog alive.
+remuda.clear_hooks({ group = "butler" })
+remuda.on("session_exited", function(name)
+  if name == butler_name then
+    launch_butler()
+  end
+end, { group = "butler" })
 
 remuda.on("butler-matrix-line", function(line)
   local sender, body = line:match("^([^\t]*)\t(.*)$")
@@ -212,7 +241,7 @@ remuda.on("butler-matrix-line", function(line)
   body = body:gsub("\\(.)", function(c)
     return c == "n" and "\n" or c
   end)
-  remuda.send(butler, "[matrix · " .. sender .. "] " .. body)
+  remuda.send(butler_name, "[matrix · " .. sender .. "] " .. body)
   -- `remuda.send`'s text+Enter lands as one write, and this TUI reads a
   -- burst of printable text immediately followed by \r as paste-in-progress,
   -- not "text, then a distinct Enter" (measured in
@@ -230,7 +259,7 @@ remuda.on("butler-matrix-line", function(line)
 end)
 
 remuda.on("butler-matrix-submit", function()
-  remuda.send(butler, "")
+  remuda.send(butler_name, "")
 end)
 
 remuda.process{
