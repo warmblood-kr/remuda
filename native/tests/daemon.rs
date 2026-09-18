@@ -2370,7 +2370,9 @@ fn butler_launch_argv_allows_the_run_script_tool_for_schedule_registration() {
 /// registering (so a second `exec butler` can't double-launch a session).
 #[test]
 fn butler_session_exited_hook_relaunches_via_the_shared_launch_function() {
-    let init_lua = include_str!("../../packages/butler/init.lua");
+    // Normalized once: a `\n`-only search below would miss a real call on a
+    // checkout where git converts this file to CRLF (Windows runners do).
+    let init_lua = include_str!("../../packages/butler/init.lua").replace("\r\n", "\n");
 
     let launch_fn_idx = init_lua
         .find("local function launch_butler()")
