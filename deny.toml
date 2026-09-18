@@ -1,0 +1,59 @@
+# cargo-deny config. CI runs `cargo deny check bans licenses sources` —
+# `advisories` is deliberately never passed on the command line: the
+# `cargo-audit` job in ci.yml already gates RUSTSEC advisories with
+# `--deny warnings`, and duplicating that exact check with a second tool
+# buys nothing. The [advisories] table below is unused as a result.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[advisories]
+ignore = []
+
+[licenses]
+# Every license actually in this workspace's dependency tree, checked with
+# `cargo deny check licenses` against the real Cargo.lock. Add to this list
+# only after confirming a new dependency's license with the same command.
+#
+# This list is intentionally closed, not just populated: cargo-deny 0.20
+# removed the old `[licenses] deny` key (see PR #611), so there is no
+# separate deny-list mechanism any more — everything not named below is
+# already rejected. That is a deliberate choice here, not a side effect:
+# the GPL family (GPL/LGPL/AGPL, `-only`/`-or-later`) must never appear in
+# this allow list, because a copyleft dependency would compromise this
+# package's ability to be licensed commercially. None is present in the
+# tree today (verified with `cargo deny list` and `cargo deny check
+# licenses`) — if one is ever added, this check fails closed, not open.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "0BSD",
+    "BSD-2-Clause",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+
+[bans]
+# `cargo deny check bans` currently reports pre-existing duplicates (syn,
+# unicode-width, windows-sys, and others) that are unrelated to this task.
+# "deny" would fail CI immediately over conditions nobody asked this gate
+# to fix, so this stays "warn" until those are deduplicated separately.
+multiple-versions = "warn"
+wildcards = "allow"
+workspace-default-features = "allow"
+external-default-features = "allow"
+
+[sources]
+# This workspace has no git dependencies (checked in Cargo.lock) — only
+# crates.io. Anything else is rejected.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
