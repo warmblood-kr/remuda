@@ -151,6 +151,79 @@ jobs:
       - name: Gate on findings
         run: cargo audit --no-fetch --deny warnings
 
+  cargo-deny:
+    # Bans duplicate crate versions (warn — pre-existing duplicates in this
+    # workspace's Cargo.lock make "deny" fail over conditions unrelated to
+    # this gate; see deny.toml), enforces the license allow-list, and
+    # restricts dependencies to crates.io. `advisories` is left out of the
+    # command on purpose: `cargo-audit` above already gates RUSTSEC.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Report duplicate/license/source finding counts
+        run: |
+          cargo deny -f json check bans licenses sources 2> deny.jsonl
+          summary=$(jq -c 'select(.type == "summary")' deny.jsonl)
+          {
+            echo "### cargo deny"
+            echo "- bans: $(echo "$summary" | jq -r '.fields.bans.errors') errors, $(echo "$summary" | jq -r '.fields.bans.warnings') warnings"
+            echo "- licenses: $(echo "$summary" | jq -r '.fields.licenses.errors') errors"
+            echo "- sources: $(echo "$summary" | jq -r '.fields.sources.errors') errors"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Gate on bans, licenses, and sources
+        run: cargo deny check bans licenses sources
+
+  code-metrics:
+    # Informational only — coverage, lines of code, and per-file complexity.
+    # `continue-on-error` at the job level so a metrics-tool hiccup, or a
+    # number nobody likes, can never turn this build red. No threshold is
+    # ever added here; if one is wanted, it belongs in its own real gate.
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Coverage
+        run: |
+          {
+            echo "## Coverage"
+            echo '```'
+            cargo llvm-cov --workspace --all-targets --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Lines of code
+        run: |
+          cargo install tokei --locked
+          {
+            echo "## Lines of code"
+            echo '```'
+            tokei .
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Complexity
+        # rust-code-analysis-cli (per-function cyclomatic/cognitive complexity)
+        # over both crates' src/ trees, reduced to one line per file — its
+        # JSON is per-space/per-function and too deep to paste raw and stay
+        # readable.
+        run: |
+          cargo install rust-code-analysis-cli --locked
+          mkdir -p rca-out
+          rust-code-analysis-cli -p core/src -p native/src -m -O json -o rca-out
+          {
+            echo "## Complexity"
+            echo '```'
+            printf '%-30s %10s %10s\n' file cyclomatic cognitive
+            find rca-out -name '*.json' -exec jq -r '[.name, .metrics.cyclomatic.sum, .metrics.cognitive.sum] | @tsv' {} \; \
+              | sort -t $'\t' -k2 -rn \
+              | while IFS=$'\t' read -r f c g; do printf '%-30s %10s %10s\n' "$f" "$c" "$g"; done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   wasm-boundary:
     # The policy layer must build for a target that has no fork, no pty, no tty.
     # This catches a host CRATE leaking into core — the axis portable-pty sits
