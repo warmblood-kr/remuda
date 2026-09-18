@@ -905,6 +905,33 @@ impl Daemon {
         Self(child)
     }
 
+    /// Like `spawn`, but pins the daemon process's own `PWD` -- `None` unsets
+    /// it entirely, rather than leaving whatever the test runner happened to
+    /// have, so a directory-derived name test is not at the mercy of `cargo
+    /// test`'s own working directory.
+    fn spawn_with_pwd(dir: &Path, pwd: Option<&str>) -> Self {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"));
+        cmd.args(["-s", "s", "daemon"])
+            .env("REMUDA_RUNTIME_DIR", dir);
+        match pwd {
+            Some(p) => cmd.env("PWD", p),
+            None => cmd.env_remove("PWD"),
+        };
+        let child = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn daemon");
+        let path = daemon::socket_path_in(dir, "s");
+        let deadline = Instant::now() + PATIENCE;
+        while remuda_native::ipc::connect(&path).is_err() {
+            assert!(Instant::now() < deadline, "daemon never bound {path:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Self(child)
+    }
+
     /// Bounded on purpose: an unbounded `wait` on a daemon that did not stop is
     /// the same hang this whole struct exists to avoid.
     fn left_on_its_own(&mut self) -> bool {
@@ -1088,6 +1115,74 @@ fn exec_butler_runs_the_builtin_package_in_the_daemons_image() {
         "ok",
         "the butler package did not set its embedded-source globals in this image"
     );
+}
+
+/// `remuda._butler_initial_name` is set before the test-mode return (see
+/// `init.lua`), so this reaches real code without needing the live `claude`
+/// launch that `remuda._butler_test_mode` exists to avoid.
+#[test]
+fn butler_initial_name_is_the_launch_directorys_basename() {
+    let dir = scratch_dir("butler-name-basename");
+    let _daemon = Daemon::spawn_with_pwd(&dir, Some("/home/x/my-project/"));
+
+    let mode = remuda_timed(&dir, &["-s", "s", "-e", "remuda._butler_test_mode = true"]);
+    assert!(
+        mode.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mode.stderr)
+    );
+
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let name = remuda_timed(
+        &dir,
+        &["-s", "s", "-e", "return remuda._butler_initial_name"],
+    );
+    assert!(
+        name.status.success(),
+        "{}",
+        String::from_utf8_lossy(&name.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&name.stdout).trim(), "my-project");
+}
+
+/// Negative control for the same code path: no `PWD` at all (never set for
+/// a daemon started outside an interactive shell) must not panic or produce
+/// an empty name -- it must fall back to the literal "butler".
+#[test]
+fn butler_initial_name_falls_back_to_butler_without_a_pwd() {
+    let dir = scratch_dir("butler-name-fallback");
+    let _daemon = Daemon::spawn_with_pwd(&dir, None);
+
+    let mode = remuda_timed(&dir, &["-s", "s", "-e", "remuda._butler_test_mode = true"]);
+    assert!(
+        mode.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mode.stderr)
+    );
+
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let name = remuda_timed(
+        &dir,
+        &["-s", "s", "-e", "return remuda._butler_initial_name"],
+    );
+    assert!(
+        name.status.success(),
+        "{}",
+        String::from_utf8_lossy(&name.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&name.stdout).trim(), "butler");
 }
 
 /// A name with no matching arm is a plain error naming the package, not a
@@ -2265,5 +2360,52 @@ fn butler_launch_argv_allows_the_run_script_tool_for_schedule_registration() {
          --append-system-prompt in the butler launch argv, got byte offsets: \
          permission-mode={permission_mode_idx} allowedTools={allowed_tools_idx} \
          run_script={run_script_idx} append-system-prompt={append_system_prompt_idx}"
+    );
+}
+
+/// Same live-`claude` limitation as the test above blocks a real kill-and-
+/// watch-it-come-back test for the respawn watchdog. This checks, at the
+/// source level, that the watchdog reuses one launch function (so a
+/// respawn can't drift from a fresh start) and clears its hook group before
+/// registering (so a second `exec butler` can't double-launch a session).
+#[test]
+fn butler_session_exited_hook_relaunches_via_the_shared_launch_function() {
+    // Normalized once: a `\n`-only search below would miss a real call on a
+    // checkout where git converts this file to CRLF (Windows runners do).
+    let init_lua = include_str!("../../packages/butler/init.lua").replace("\r\n", "\n");
+
+    let launch_fn_idx = init_lua
+        .find("local function launch_butler()")
+        .expect("butler package lost its shared launch function");
+    let initial_call_idx = init_lua
+        .find("launch_butler()\n")
+        .expect("butler package never calls launch_butler() at load time");
+    let clear_hooks_idx = init_lua
+        .find("remuda.clear_hooks({ group = \"butler\" })")
+        .expect("butler package lost its clear_hooks guard against a second exec");
+    let session_exited_idx = init_lua
+        .find("remuda.on(\"session_exited\",")
+        .expect("butler package lost its session_exited watchdog");
+
+    assert!(
+        launch_fn_idx < initial_call_idx && initial_call_idx < clear_hooks_idx,
+        "expected launch_butler to be defined, then called once, before the \
+         watchdog is registered"
+    );
+    assert!(
+        clear_hooks_idx < session_exited_idx,
+        "expected clear_hooks({{group = \"butler\"}}) to run before the \
+         session_exited hook is (re-)registered, so a second exec can't double it"
+    );
+
+    let hook_body_end = init_lua[session_exited_idx..]
+        .find("end, { group = \"butler\" })")
+        .map(|i| session_exited_idx + i)
+        .expect("session_exited hook is not registered in the \"butler\" group");
+    let hook_body = &init_lua[session_exited_idx..hook_body_end];
+    assert!(
+        hook_body.contains("launch_butler()"),
+        "the session_exited watchdog must relaunch via launch_butler(), not \
+         its own remuda.new call: {hook_body:?}"
     );
 }
