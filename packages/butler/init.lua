@@ -193,6 +193,8 @@ local butler = remuda.new(nil, {
   "--strict-mcp-config",
   "--permission-mode",
   "auto",
+  "--allowedTools",
+  "mcp__remuda__run_script",
   "--append-system-prompt",
   SYSTEM_PROMPT,
 })

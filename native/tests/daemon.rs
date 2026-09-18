@@ -2228,3 +2228,42 @@ fn matrix_reply_tool_never_puts_the_token_in_curls_argv() {
         "the Authorization header was never delivered to curl via stdin: {logged_stdin:?}"
     );
 }
+
+/// No test in this file drives `init.lua` past `_butler_test_mode`'s early
+/// return (see `butler_test_daemon`), so nothing here ever reaches the real
+/// `remuda.new(nil, {"claude", ...})` launch and its argv. Reproducing that
+/// live would mean giving the daemon process itself (not the CLI call that
+/// asks it to `exec butler`) a `claude` on `PATH` plus real
+/// `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG` — machinery this suite
+/// doesn't have today. This is the proportionate substitute: a compile-time
+/// check, via `include_str!`, that the shipped launch argv still carries
+/// `--allowedTools`/`mcp__remuda__run_script` in the right slot (between
+/// `--permission-mode auto` and `--append-system-prompt`), so a later edit
+/// can't silently drop or reorder it.
+#[test]
+fn butler_launch_argv_allows_the_run_script_tool_for_schedule_registration() {
+    let init_lua = include_str!("../../packages/butler/init.lua");
+
+    let permission_mode_idx = init_lua
+        .find("\"--permission-mode\",")
+        .expect("butler launch argv lost --permission-mode");
+    let allowed_tools_idx = init_lua
+        .find("\"--allowedTools\",")
+        .expect("butler launch argv is missing --allowedTools");
+    let run_script_idx = init_lua
+        .find("\"mcp__remuda__run_script\",")
+        .expect("butler launch argv is missing the mcp__remuda__run_script tool name");
+    let append_system_prompt_idx = init_lua
+        .find("\"--append-system-prompt\",")
+        .expect("butler launch argv lost --append-system-prompt");
+
+    assert!(
+        permission_mode_idx < allowed_tools_idx
+            && allowed_tools_idx < run_script_idx
+            && run_script_idx < append_system_prompt_idx,
+        "expected --allowedTools, mcp__remuda__run_script between --permission-mode and \
+         --append-system-prompt in the butler launch argv, got byte offsets: \
+         permission-mode={permission_mode_idx} allowedTools={allowed_tools_idx} \
+         run_script={run_script_idx} append-system-prompt={append_system_prompt_idx}"
+    );
+}
