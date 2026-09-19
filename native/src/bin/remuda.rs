@@ -452,14 +452,11 @@ fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> Exit
     f(path)
 }
 
-/// A built-in package's entry source, embedded at compile time. No install
-/// mechanism and no registry yet — a name either matches one of these arms
-/// or it doesn't.
+/// Delegates to the lib crate's one table of built-in packages — the
+/// `remuda.exec()` Lua binding (script.rs) resolves the same names through
+/// the same table, so there is exactly one list, not two.
 fn builtin_package(name: &str) -> Option<&'static str> {
-    match name {
-        "butler" => Some(include_str!("../../../packages/butler/init.lua")),
-        _ => None,
-    }
+    remuda_native::packages::builtin(name)
 }
 
 /// Run a built-in package's entry file in the daemon's image, by name.

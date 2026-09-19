@@ -81,6 +81,17 @@ jobs:
       - run: sh -n docs/install.sh
       - run: pwsh -NoProfile -File scripts/check-powershell.ps1
 
+  butler-path-convention-is-consistent:
+    # install-butler.sh and init.lua each hardcode
+    # `${XDG_CONFIG_HOME:-$HOME/.config}/remuda/butler/{token,config}` independently,
+    # one shell, one Lua. Nothing else compares them, so a literal edited on only
+    # one side would otherwise resolve silently to two different paths -- the
+    # daemon looking in a place the installer never wrote to.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 scripts/check-butler-path-convention.py
+
   nightly-stale-index:
     # latest.json is cached for up to ten minutes, but the nightly tag is
     # fixed and every release replaces its assets — so a real install can hit

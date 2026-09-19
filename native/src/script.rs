@@ -26,7 +26,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 47] = [
+pub const BINDINGS: [&str; 48] = [
     "_call",
     "_descriptors",
     "_event_counts",
@@ -48,6 +48,7 @@ pub const BINDINGS: [&str; 47] = [
     "close",
     "emit",
     "event_counts",
+    "exec",
     "feed",
     "hooks",
     "insert",
@@ -128,6 +129,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "close",
         "End a session, live or already self-exited.",
         "close(name) -> nil",
+    ),
+    (
+        "exec",
+        "Run a built-in package's entry source, by name, in this same image.",
+        "exec(name) -> nil",
     ),
     (
         "list_dir",
@@ -376,6 +382,8 @@ pub fn bindings(
         })?,
     )?;
 
+    exec_binding(lua, &table)?;
+
     dir_bindings(lua, &table, &at)?;
     tick_bindings(lua, &table, counters.clone())?;
     request_count_bindings(lua, &table, counters)?;
@@ -420,6 +428,22 @@ fn new_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Resu
                 value(lua, ask(&path, new_request(name, argv, cwd, env))?)
             },
         )?,
+    )
+}
+
+/// `remuda.exec(name)` — split out of `bindings` for its line cap. Reentrant-
+/// safe: a nested `lua.load(...).exec()` on this same `Lua`, not a new
+/// interpreter. Resolves through `crate::packages::builtin`, same as CLI `exec`.
+fn exec_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
+    table.set(
+        "exec",
+        lua.create_function(move |lua, name: String| {
+            let source = crate::packages::builtin(&name)
+                .ok_or_else(|| mlua::Error::runtime(format!("no such package: {name}")))?;
+            lua.load(source)
+                .set_name(format!("packages/{name}/init.lua"))
+                .exec()
+        })?,
     )
 }
 
