@@ -960,6 +960,36 @@ impl Daemon {
         Self(child)
     }
 
+    /// Like `spawn_with_env`, but for the birth-environment-poisoning
+    /// scenario itself: a daemon born with `HOME` pinned to a scratch
+    /// directory and NEITHER `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG`
+    /// nor `XDG_CONFIG_HOME` present at all (`env_remove`, not merely
+    /// unset-by-omission -- `cargo test`'s own process could otherwise leak
+    /// either through, making the test non-deterministic on a machine where
+    /// they happen to be set).
+    fn spawn_with_home(dir: &Path, home: &Path) -> Self {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"));
+        cmd.args(["-s", "s", "daemon"])
+            .env("REMUDA_RUNTIME_DIR", dir)
+            .env("HOME", home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("REMUDA_BUTLER_TOKEN")
+            .env_remove("REMUDA_BUTLER_CONFIG");
+        let child = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn daemon");
+        let path = daemon::socket_path_in(dir, "s");
+        let deadline = Instant::now() + PATIENCE;
+        while remuda_native::ipc::connect(&path).is_err() {
+            assert!(Instant::now() < deadline, "daemon never bound {path:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Self(child)
+    }
+
     /// Bounded on purpose: an unbounded `wait` on a daemon that did not stop is
     /// the same hang this whole struct exists to avoid.
     fn left_on_its_own(&mut self) -> bool {
@@ -2782,4 +2812,107 @@ fn a_supervisor_polling_remuda_ls_can_relaunch_butler_after_a_restart() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// The actual bug this suite exists to catch: a daemon born with ZERO
+/// butler env vars (the exact poisoning scenario -- some unrelated `remuda`
+/// command lazily birthing a daemon before butler's own installer/env ever
+/// gets a chance to run) must still be able to register butler, as long as
+/// the token/config files sit at `init.lua`'s conventional default path
+/// under `HOME`. Every other test in this file that reaches past
+/// `_butler_test_mode` sets `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG`
+/// explicitly via `Daemon::spawn_with_env` -- none of them cover this path.
+#[test]
+#[cfg(unix)]
+fn butler_exec_finds_credentials_at_the_conventional_path_with_zero_env_vars() {
+    let dir = scratch_dir("butler-conventional");
+    let home = dir.join("home");
+    let butler_dir = home.join(".config/remuda/butler");
+    std::fs::create_dir_all(&butler_dir).expect("mkdir conventional butler dir");
+    std::fs::write(butler_dir.join("token"), "test-token\n").expect("write token");
+    std::fs::write(
+        butler_dir.join("config"),
+        "http://127.0.0.1:1\n!room:example.org\n@butler:example.org\n\n",
+    )
+    .expect("write config");
+
+    let daemon = Daemon::spawn_with_home(&dir, &home);
+    let path = daemon::socket_path_in(&dir, "s");
+
+    // Same test-mode substitution as the watchdog/restart tests: a short-
+    // lived real process stands in for `claude`, and the relay (which would
+    // otherwise retry forever against these dummy credentials) is skipped.
+    eval(
+        &path,
+        r#"remuda._butler_argv = {"sh", "-c", "sleep 0.3; exit 0"}"#,
+    );
+    eval(&path, "remuda._butler_skip_relay = true");
+
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "expected exec butler to succeed using only the conventional HOME-based \
+         path, with no REMUDA_BUTLER_TOKEN/CONFIG at all -- stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let initial_name = eval(&path, "return remuda._butler_initial_name");
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let listed = remuda(&dir, &["-s", "s", "ls"]);
+        if String::from_utf8_lossy(&listed.stdout).contains(&initial_name) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the butler session never showed up in `ls`"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    drop(daemon);
+}
+
+/// The other half of the same fix: when neither the conventional file nor
+/// the env override exists, this must fail loudly and immediately -- never
+/// silently proceed with a bad path, and never get partway into writing the
+/// `.mcp.json` companion file `init.lua` builds right after resolving
+/// `config_path`.
+#[test]
+#[cfg(unix)]
+fn butler_exec_fails_loudly_with_no_token_file_and_no_env_override() {
+    let dir = scratch_dir("butler-no-creds");
+    let home = dir.join("home-empty");
+    std::fs::create_dir_all(&home).expect("mkdir empty home");
+
+    let daemon = Daemon::spawn_with_home(&dir, &home);
+
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        !out.status.success(),
+        "expected exec butler to fail with no token file and no env override"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let expected_path = home
+        .join(".config/remuda/butler/token")
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        stderr.contains("no token file at") && stderr.contains(&expected_path),
+        "expected the error to name the exact conventional path it tried: {stderr:?}"
+    );
+    assert!(
+        stderr.contains("REMUDA_BUTLER_TOKEN"),
+        "expected the error to mention the override var: {stderr:?}"
+    );
+
+    // Never got far enough to write the `.mcp.json` companion file -- proof
+    // this failed before doing anything else, not partway through.
+    let mcp_json = home.join(".config/remuda/butler/config.mcp.json");
+    assert!(
+        !mcp_json.exists(),
+        "exec butler wrote {mcp_json:?} despite failing to resolve the token file first"
+    );
+
+    drop(daemon);
 }

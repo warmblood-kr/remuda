@@ -149,11 +149,62 @@ if remuda._butler_test_mode then
   return
 end
 
-local token_path = os.getenv("REMUDA_BUTLER_TOKEN")
-local config_path = os.getenv("REMUDA_BUTLER_CONFIG")
-if not token_path or not config_path then
-  error("remuda-butler needs REMUDA_BUTLER_TOKEN and REMUDA_BUTLER_CONFIG set", 0)
+-- `os.getenv` here reads the *daemon's own* environment, fixed forever at
+-- whichever moment first birthed that daemon (see docs/install-butler.sh's
+-- ceiling comment) -- so a butler-specific env var as the primary source
+-- means anything else that races to auto-start a daemon first leaves no
+-- later `exec butler` call able to inject a corrected value (that's the bug
+-- this resolves). `HOME` (or `XDG_CONFIG_HOME`) is present in essentially
+-- every process's environment regardless of what happened to birth the
+-- daemon, so a conventional path under it survives that race.
+-- `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG` remain a supported override,
+-- checked first, for a caller who wants a different location -- this is
+-- also what keeps every existing test that sets them via
+-- `Daemon::spawn_with_env` unchanged. Mirrors install-butler.sh's own
+-- `${XDG_CONFIG_HOME:-$HOME/.config}/remuda/butler/{token,config}` exactly,
+-- so the shell-side and Lua-side conventions can never drift apart.
+local function default_config_home()
+  local xdg = os.getenv("XDG_CONFIG_HOME")
+  if xdg and xdg ~= "" then
+    return xdg
+  end
+  local home = os.getenv("HOME")
+  if not home or home == "" then
+    return nil
+  end
+  return home .. "/.config"
 end
+
+-- Fails loudly the same way the installer already does -- naming the exact
+-- path it tried and mentioning the override -- rather than silently
+-- proceeding with a path that doesn't resolve to a real file.
+local function resolve_path(override_env, filename, what)
+  local path = os.getenv(override_env)
+  if not path or path == "" then
+    local config_home = default_config_home()
+    if not config_home then
+      error(
+        "remuda-butler: HOME is not set and " .. override_env .. " was not "
+          .. "given -- cannot locate the " .. what,
+        0
+      )
+    end
+    path = config_home .. "/remuda/butler/" .. filename
+  end
+  local f = io.open(path, "r")
+  if not f then
+    error(
+      "remuda-butler: no " .. what .. " at " .. path .. " -- create it, or "
+        .. "set " .. override_env .. " to override",
+      0
+    )
+  end
+  f:close()
+  return path
+end
+
+local token_path = resolve_path("REMUDA_BUTLER_TOKEN", "token", "token file")
+local config_path = resolve_path("REMUDA_BUTLER_CONFIG", "config", "config file")
 
 -- The session needs an `--mcp-config` pointing back at this same daemon, or
 -- it has no way to reach `matrix_reply` at all — a bare `remuda.new(nil,

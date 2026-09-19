@@ -36,6 +36,15 @@
 # actually keeps the --user instance alive through a real logout/reboot
 # cycle, needs a machine a human can reboot on purpose. Open limitation, not
 # a verified claim.
+#
+# Ceiling, recorded not fixed: `init.lua` no longer depends on the daemon's
+# birth environment for the token/config *paths* (this script's own copy step
+# below plus init.lua's conventional-path default is what makes that true),
+# but every OTHER environment variable the daemon's Lua image reads via
+# `os.getenv` still has that same birth-environment property -- fixed forever
+# at whichever moment first auto-started the daemon, never re-read per
+# client/request. That's a `remuda`-architecture-level question, not this
+# feature's to solve; naming it here so it isn't rediscovered as a surprise.
 
 set -eu
 
@@ -71,6 +80,27 @@ else
 	token_mode=$(stat -f '%Lp' "$token_file")
 fi
 [ "$token_mode" = 600 ] || die "chmod 600 on $token_file did not take (mode is now $token_mode) -- refusing to proceed with a wider-than-600 token file"
+
+# `init.lua`'s own default lookup (no env override) is the fixed path
+# $XDG_CONFIG_HOME/remuda/butler/{token,config} -- copy the resolved files
+# there if an override pointed elsewhere, so the daemon's default resolves
+# regardless of what/when first birthed it (no butler env var required in
+# the persistent unit below). A no-op when the override already matches the
+# default -- comparing paths first instead of always copying.
+canonical_token_file="$config_home/remuda/butler/token"
+canonical_config_file="$config_home/remuda/butler/config"
+if [ "$token_file" != "$canonical_token_file" ]; then
+	mkdir -p "$(dirname "$canonical_token_file")"
+	cp "$token_file" "$canonical_token_file"
+	chmod 600 "$canonical_token_file"
+	status "copied $token_file to $canonical_token_file (init.lua's default lookup)"
+fi
+if [ "$config_file" != "$canonical_config_file" ]; then
+	mkdir -p "$(dirname "$canonical_config_file")"
+	cp "$config_file" "$canonical_config_file"
+	chmod 600 "$canonical_config_file"
+	status "copied $config_file to $canonical_config_file (init.lua's default lookup)"
+fi
 
 remuda_bin=$(command -v remuda) || die "remuda is not on PATH -- install it first: curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | sh"
 remuda_bin_dir=$(dirname "$remuda_bin")
@@ -122,10 +152,11 @@ mkdir -p "$remuda_dir"
 poll_script="$remuda_dir/butler-poll.sh"
 cat >"$poll_script" <<POLL
 #!/bin/sh
-# Written by install-butler.sh. REMUDA_BUTLER_TOKEN/REMUDA_BUTLER_CONFIG are
-# set by the caller (the systemd unit's Environment= lines, or the launchd
-# plist's EnvironmentVariables dict) -- both are file paths, never raw
-# secret values.
+# Written by install-butler.sh. No REMUDA_BUTLER_TOKEN/REMUDA_BUTLER_CONFIG
+# here (and none in the systemd unit / launchd plist that run this) --
+# init.lua's own default lookup finds the token/config files this script
+# already copied to the conventional path above, no matter what first
+# birthed the daemon.
 set -eu
 export PATH="$remuda_bin_dir:\$PATH"
 env -u PWD remuda ls | awk '\$1 == "butler" { found = 1 } END { exit !found }' && exit 0
@@ -133,11 +164,6 @@ exec env -u PWD remuda exec butler
 POLL
 chmod 755 "$poll_script"
 status "wrote $poll_script"
-
-home_pattern=$(printf '%s' "$HOME" | sed 's/[\/&]/\\&/g')
-in_unit_path() {
-	printf '%s' "$1" | sed "s/^$home_pattern/%h/"
-}
 
 case "$os" in
 Linux)
@@ -152,8 +178,6 @@ Description=remuda-butler: relaunch the butler session if it is not running
 
 [Service]
 Type=oneshot
-Environment=REMUDA_BUTLER_TOKEN=$(in_unit_path "$token_file")
-Environment=REMUDA_BUTLER_CONFIG=$(in_unit_path "$config_file")
 ExecStart=%h/.config/remuda/butler-poll.sh
 EOF
 
@@ -199,13 +223,6 @@ Darwin)
 <dict>
 	<key>Label</key>
 	<string>kr.warmblood.remuda.butler</string>
-	<key>EnvironmentVariables</key>
-	<dict>
-		<key>REMUDA_BUTLER_TOKEN</key>
-		<string>$token_file</string>
-		<key>REMUDA_BUTLER_CONFIG</key>
-		<string>$config_file</string>
-	</dict>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/bin/sh</string>
