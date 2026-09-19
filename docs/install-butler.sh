@@ -26,6 +26,16 @@
 # Windows has no systemd/launchd equivalent wired up here yet: run `remuda
 # exec butler` by hand after a restart, or via Task Scheduler, until someone
 # builds that lane.
+#
+# The reboot leg is unproven, by construction: the daemon-restart/relaunch
+# logic below was verified for real (`restart -f`, a genuine registration,
+# a kill, a by-hand relaunch matching the poll loop), but never across an
+# actual `reboot` -- this was developed on the shared fleet substrate, where
+# rebooting would kill every concurrent session on it. Whether OnBootSec=10s
+# actually fires after a real reboot, and whether `loginctl enable-linger`
+# actually keeps the --user instance alive through a real logout/reboot
+# cycle, needs a machine a human can reboot on purpose. Open limitation, not
+# a verified claim.
 
 set -eu
 
@@ -78,6 +88,23 @@ if ! env -u PWD REMUDA_BUTLER_TOKEN="$token_file" REMUDA_BUTLER_CONFIG="$config_
 	fi
 	cat "$probe_err" >&2
 	die "remuda exec butler failed -- see the error above; not installing any persistence layer"
+fi
+
+# Exit 0 here only proves the daemon didn't reject the package name -- it does
+# NOT prove butler did anything. Between the `exec` verb landing and the real
+# butler package replacing its old 2-line stub, `remuda exec butler` already
+# exited 0 with empty stderr while registering no process, tool, or session at
+# all. Assert the positive post-condition instead of trusting the exit code.
+#
+# This makes the exact-match `remuda ls` check the THIRD consumer of one
+# liveness instrument, alongside butler-poll.sh below and
+# native/tests/daemon.rs's a_daemon_restart_does_not_relaunch_the_butler_session.
+# That repetition is only safe because the daemon.rs test is a negative
+# control on `remuda ls` itself -- if `remuda ls` ever lied about a session's
+# presence, that test goes red. Weakening or deleting it re-enables a known
+# false-positive across all three consumers, not just loosens one test.
+if ! env -u PWD remuda ls | awk '$1 == "butler" { found = 1 } END { exit !found }'; then
+	die "remuda exec butler exited successfully but registered no session named 'butler' -- this remuda build is between the 'exec' verb landing and the real butler package landing (a real but narrow window); run 'remuda upgrade' and try again"
 fi
 status "butler registered for this run."
 
