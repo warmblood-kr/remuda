@@ -180,7 +180,26 @@ status "wrote $init_lua"
 # loader did not do its job.
 status "restarting the daemon to verify the new loader actually re-registers butler..."
 env -u PWD remuda restart -f >&2
-if ! env -u PWD remuda ls | awk '$1 == "butler" { found = 1 } END { exit !found }'; then
+
+# Bounded retry, not a single immediate check: native/src/daemon.rs's
+# load_user_config runs on its own thread, CONCURRENTLY with
+# listener.incoming() starting, not strictly before it (see steps/035's "A
+# real deadlock" section) -- so there is a real, if narrow, window right
+# after a fresh daemon starts accepting connections where `remuda ls` can
+# run before the loader's own `remuda.exec("butler")` call has finished.
+# 20 attempts * 500ms = 10s, matching native/tests/daemon.rs's own
+# PATIENCE deadline for the identical race.
+attempt=0
+found=0
+while [ "$attempt" -lt 20 ]; do
+	if env -u PWD remuda ls | awk '$1 == "butler" { found = 1 } END { exit !found }'; then
+		found=1
+		break
+	fi
+	attempt=$((attempt + 1))
+	sleep 0.5
+done
+if [ "$found" -ne 1 ]; then
 	die "butler did not come back on its own after a daemon restart -- the boot-time loader ($init_lua) did not work; this build may predate it (try 'remuda upgrade' and re-run this installer)"
 fi
 status "confirmed: butler came back automatically after a daemon restart, with no 'remuda exec butler' call."

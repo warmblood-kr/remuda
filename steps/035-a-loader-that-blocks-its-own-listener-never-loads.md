@@ -233,6 +233,184 @@ $ python3 scripts/check-workflows.py
 ok — 3 workflow file(s) parse, 21 job(s) defined
 ```
 
+### Follow-up: the installer's own post-restart check was still single-shot
+
+The "Known ceilings" bullet above originally claimed "every test and the
+installer's own verification account for this with a bounded retry" — true
+for `native/tests/daemon.rs`, false for `docs/install-butler.sh` as first
+shipped in this step: its post-restart check was one `if ! ... remuda ls |
+awk ...`, no loop, no sleep. A real colleague on a slower/more loaded machine
+could see a spurious `die` even though the loader would have registered
+butler a moment later. Fixed by giving that one check the same bounded-retry
+discipline as the Rust tests: 20 attempts, 500ms apart (10s total, the same
+order of magnitude as `PATIENCE`), `die`ing with the original message only on
+the final attempt.
+
+Reproduced for real, not just argued: `native/src/daemon.rs`'s
+`load_user_config` was temporarily patched to sleep 800ms (gated behind a
+throwaway env var, `REMUDA_TEST_ARTIFICIAL_LOADER_DELAY_MS`, reverted before
+committing — `git diff --stat` after the revert shows only
+`docs/install-butler.sh` touched) to widen the normally sub-millisecond race
+window enough to observe it on purpose. Same scratch recipe as above (`HOME`
+under this session's scratchpad, short `REMUDA_RUNTIME_DIR`, stand-in
+`claude` shim, scratch token/config fixtures):
+
+```
+$ env HOME="$SCRATCH/home-old" PATH="$SCRATCH/bin:$PATH" \
+    REMUDA_RUNTIME_DIR="$SHORT_RUNTIME" \
+    REMUDA_BUTLER_TOKEN_FILE="$SCRATCH/fixtures/token" \
+    REMUDA_BUTLER_CONFIG_FILE="$SCRATCH/fixtures/config" \
+    REMUDA_NO_UPDATE_CHECK=1 \
+    REMUDA_TEST_ARTIFICIAL_LOADER_DELAY_MS=1 \
+    sh install-butler-OLD.sh   # the single-shot check, as first shipped
+install-butler.sh: registering butler in the running daemon (this starts one if none is up)...
+install-butler.sh: butler registered for this run.
+install-butler.sh: wrote .../home-old/.config/remuda/init.lua
+install-butler.sh: restarting the daemon to verify the new loader actually re-registers butler...
+remuda: stopped the daemon for "default" — the next command starts a fresh one
+remuda: started a daemon for "default"
+install-butler.sh: butler did not come back on its own after a daemon restart -- the boot-time loader (.../init.lua) did not work; this build may predate it (try 'remuda upgrade' and re-run this installer)
+$ echo EXIT=$?
+EXIT=1
+```
+
+A spurious failure: butler's process (the stand-in `claude`, `sleep 300`)
+showed up under the daemon moments later, confirmed by PID, then killed:
+
+```
+$ ps -eo pid,ppid,args | grep -F 'target/debug/remuda -s default daemon'
+2813913 ... target/debug/remuda -s default daemon
+$ ps -eo pid,ppid,args | grep 'sleep 300'
+2813958 2813913 sleep 300
+$ kill -9 2813913 2813958
+$ ps -p 2813913 -p 2813958; echo exit=$?
+    PID TTY          TIME CMD
+exit=1
+```
+
+Same artificial delay, the fixed retry-loop version, run three times for
+reliability, all green:
+
+```
+$ env HOME="$SCRATCH/home-new" PATH="$SCRATCH/bin:$PATH" \
+    REMUDA_RUNTIME_DIR="$SHORT_RUNTIME" \
+    REMUDA_BUTLER_TOKEN_FILE="$SCRATCH/fixtures/token" \
+    REMUDA_BUTLER_CONFIG_FILE="$SCRATCH/fixtures/config" \
+    REMUDA_NO_UPDATE_CHECK=1 \
+    REMUDA_TEST_ARTIFICIAL_LOADER_DELAY_MS=1 \
+    sh install-butler-NEW.sh   # the bounded-retry check
+...
+install-butler.sh: restarting the daemon to verify the new loader actually re-registers butler...
+remuda: stopped the daemon for "default" — the next command starts a fresh one
+remuda: started a daemon for "default"
+install-butler.sh: confirmed: butler came back automatically after a daemon restart, with no 'remuda exec butler' call.
+...
+$ echo EXIT=$?
+EXIT=0
+$ # repeated two more times against fresh scratch $HOMEs, same artificial delay
+run 1 exit=0
+run 2 exit=0
+run 3 exit=0
+```
+
+Teardown confirmed by PID for every daemon (and its stand-in `claude` child)
+spawned across all of the above runs — none left running:
+
+```
+$ ps -eo pid,ppid,args | grep -F 'target/debug/remuda -s default daemon'
+2814931 ...
+2815313 ...
+2815447 ...
+2815582 ...
+$ for pid in 2814931 2815313 2815447 2815582; do pgrep -P "$pid"; done
+2814963
+2815351
+2815490
+2815616
+$ kill -9 2814931 2814963 2815313 2815351 2815447 2815490 2815582 2815616
+$ ps -p 2814931 -p 2814963 -p 2815313 -p 2815351 -p 2815447 -p 2815490 -p 2815582 -p 2815616
+    PID TTY          TIME CMD
+$ echo exit=$?
+exit=1
+```
+
+A final real run against the actual (non-patched) fixed installer, no
+artificial delay, passes on the first attempt as expected (the race window
+without the artificial widening is normally sub-millisecond):
+
+```
+$ env HOME="$SCRATCH/home-final" PATH="$SCRATCH/bin:$PATH" \
+    REMUDA_RUNTIME_DIR="$SHORT_RUNTIME" \
+    REMUDA_BUTLER_TOKEN_FILE="$SCRATCH/fixtures/token" \
+    REMUDA_BUTLER_CONFIG_FILE="$SCRATCH/fixtures/config" \
+    REMUDA_NO_UPDATE_CHECK=1 sh docs/install-butler.sh
+...
+install-butler.sh: confirmed: butler came back automatically after a daemon restart, with no 'remuda exec butler' call.
+...
+$ echo EXIT=$?
+EXIT=0
+$ ps -eo pid,ppid,args | grep -F 'target/debug/remuda -s default daemon'
+2817834 ...
+$ pgrep -P 2817834
+2817841
+$ kill -9 2817834 2817841
+$ ps -p 2817834 -p 2817841; echo exit=$?
+    PID TTY          TIME CMD
+exit=1
+```
+
+The real host's own systemd user session and `$HOME` were checked after
+every run above, not assumed untouched:
+
+```
+$ systemctl --user list-units 'remuda*' --all
+0 loaded units listed.
+$ systemctl --user list-timers 'remuda*' --all
+0 timers listed.
+$ ls ~/.config/remuda
+ls: cannot access '/home/toracle/.config/remuda': No such file or directory
+```
+
+Full gate, re-run after reverting the temporary artificial-delay
+instrumentation (`git diff --stat` at this point shows only
+`docs/install-butler.sh` changed), all still green:
+
+```
+$ cargo test --workspace --all-targets 2>&1 | grep -E "FAILED|error\[|error:|test result"
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 27 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 107 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 45 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.20s
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.74s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+$ cargo fmt --all -- --check
+$ shellcheck docs/install-butler.sh
+$ cargo clippy --workspace --all-targets -- -D warnings
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.52s
+
+$ python3 scripts/check-butler-path-convention.py
+ok — install-butler.sh and init.lua agree: $HOME/.config fallback, segments ['/remuda/butler/config', '/remuda/butler/token']
+ok — install-butler.sh and daemon.rs agree: $HOME/.config fallback, init.lua at $config_home/remuda/init.lua
+$ python3 scripts/check-comments.py
+ok — 357 doc comment(s) within cap (item 3, module 20)
+$ python3 scripts/check-install.py
+ok — 3 target(s) built and offered (2 via install.sh, 1 via install.ps1): aarch64-apple-darwin, x86_64-pc-windows-msvc, x86_64-unknown-linux-gnu
+$ python3 scripts/check-principles.py
+ok — 14 principles, every named mechanism exists (21 CI jobs, 11 denied paths, 412 test fns seen)
+$ python3 scripts/check-steps.py
+ok — 35 step(s), each with before, desired, expected and captured actual
+$ python3 scripts/check-workflows.py
+ok — 3 workflow file(s) parse, 21 job(s) defined
+```
+
 ## Known ceilings
 
 - The poller (`butler-poll.sh`/timer/plist) is now redundant for the
@@ -252,7 +430,12 @@ ok — 3 workflow file(s) parse, 21 job(s) defined
   connection and the loader's own `remuda.new` call finishing could
   legitimately not see butler yet. Every test and the installer's own
   verification account for this with a bounded retry, never a single
-  immediate check.
+  immediate check — `native/tests/daemon.rs` polls every ~50ms against a
+  10s `PATIENCE` deadline; `docs/install-butler.sh`'s post-restart check
+  (originally shipped as a single-shot check in this same step — see the
+  follow-up transcript in `## Actual` below) polls every 500ms, up to 20
+  attempts (10s total), the same order of magnitude as `PATIENCE` for the
+  identical race.
 - The reboot leg (`OnBootSec=10s` actually firing, `loginctl enable-linger`
   surviving a real logout/reboot) is a pre-existing, already-named limitation
   in `docs/install-butler.sh`, untouched by this change.
