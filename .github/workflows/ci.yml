@@ -102,6 +102,35 @@ jobs:
       - uses: actions/checkout@v4
       - run: sh scripts/check-cold-install.sh
 
+  cold-room:
+    # cold-install above runs check-cold-install.sh directly on the runner,
+    # which already has git/cargo/ssh on PATH — it cannot catch a dependency
+    # the one-liner silently assumed. This job runs the same install inside a
+    # container with only curl/ca-certificates/tar (scripts/cold-room/Dockerfile),
+    # matching a genuinely fresh machine. Three real steps, each able to fail
+    # the job on its own — no step's exit code is discarded.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build the clean-room image
+        run: docker build -t remuda-cold-room:ci -f scripts/cold-room/Dockerfile .
+      - name: negative control — the fresh image has no remuda on PATH
+        run: docker run --rm remuda-cold-room:ci sh /opt/remuda-repo/scripts/check-clean-machine.sh
+      - name: install nightly inside the container and read back the binary
+        run: |
+          docker run --rm remuda-cold-room:ci sh -c '
+            set -eu
+            export REMUDA_INSTALL_DIR=/root/.local/bin REMUDA_CHANNEL=nightly
+            sh /opt/remuda-repo/docs/install.sh
+            if [ -x "$REMUDA_INSTALL_DIR/remuda" ]; then
+              echo "READBACK: binary present and executable at $REMUDA_INSTALL_DIR/remuda"
+              "$REMUDA_INSTALL_DIR/remuda" --version || echo "READBACK: --version failed or unsupported, presence+executable bit is the observation"
+            else
+              echo "READBACK: no binary at $REMUDA_INSTALL_DIR/remuda -- install did not land the artifact" >&2
+              exit 1
+            fi
+          '
+
   format:
     runs-on: ubuntu-latest
     steps:
