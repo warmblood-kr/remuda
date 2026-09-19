@@ -45,6 +45,21 @@
 # at whichever moment first auto-started the daemon, never re-read per
 # client/request. That's a `remuda`-architecture-level question, not this
 # feature's to solve; naming it here so it isn't rediscovered as a surprise.
+#
+# This script also writes $config_home/remuda/init.lua (sibling to
+# remuda/butler/, not inside it) -- native/src/daemon.rs's `load_user_config`
+# evaluates that file automatically, once, every time a FRESH daemon boots
+# (mirroring how Neovim/Hammerspoon/WezTerm auto-load a user init file). That
+# makes the poller (`butler-poll.sh` below) redundant for the *daemon-restart*
+# scenario specifically -- butler is back the instant the next command
+# lazily starts a fresh daemon, not up to 15s later. The timer/agent itself
+# is still necessary for two other reasons the loader does not cover: (1)
+# nothing else causes a daemon to exist at all after a reboot -- the loader
+# only ever runs as *part of* a daemon boot, it cannot trigger one -- and (2)
+# it remains a safety net if the loader itself ever fails (a typo, a stale
+# binary). An older remuda binary (built before the loader existed) silently
+# ignores $config_home/remuda/init.lua, exactly as if it were absent -- a
+# fact to know, not a trap to design around.
 
 set -eu
 
@@ -137,6 +152,38 @@ if ! env -u PWD remuda ls | awk '$1 == "butler" { found = 1 } END { exit !found 
 	die "remuda exec butler exited successfully but registered no session named 'butler' -- this remuda build is between the 'exec' verb landing and the real butler package landing (a real but narrow window); run 'remuda upgrade' and try again"
 fi
 status "butler registered for this run."
+
+# Sibling to remuda/butler/, not inside it: the generic per-daemon loader
+# (native/src/daemon.rs's `load_user_config`), evaluated automatically by
+# every FRESH remuda daemon at boot -- this is what re-registers butler
+# after a `remuda restart` or a reboot, with no human hand and no need to
+# wait for butler-poll.sh's next tick below. Unconditional: nothing else
+# writes this file, so there is nothing of the reader's own to preserve.
+mkdir -p "$config_home/remuda"
+init_lua="$config_home/remuda/init.lua"
+cat >"$init_lua" <<'LUA'
+-- Written by install-butler.sh. Evaluated automatically by every fresh
+-- remuda daemon at startup -- this is what re-registers butler after a
+-- daemon restart or machine reboot, with no human hand and no need to
+-- wait for butler-poll.sh's next tick. An older remuda binary (built
+-- before this loader existed) silently ignores this file, exactly as if
+-- it were absent -- no trap, unlike the earlier package-stub window.
+remuda.exec("butler")
+LUA
+status "wrote $init_lua"
+
+# Real functional verification, same discipline as the probe above (assert
+# the positive post-condition, never trust an exit code alone): kill the
+# daemon and let the next command lazily start a fresh one, then check for
+# an exact-match 'butler' session again -- WITHOUT calling `remuda exec
+# butler` a second time. If butler does not come back on its own, the
+# loader did not do its job.
+status "restarting the daemon to verify the new loader actually re-registers butler..."
+env -u PWD remuda restart -f >&2
+if ! env -u PWD remuda ls | awk '$1 == "butler" { found = 1 } END { exit !found }'; then
+	die "butler did not come back on its own after a daemon restart -- the boot-time loader ($init_lua) did not work; this build may predate it (try 'remuda upgrade' and re-run this installer)"
+fi
+status "confirmed: butler came back automatically after a daemon restart, with no 'remuda exec butler' call."
 
 # The poll-and-relaunch logic lives in its own small script rather than
 # inline in the unit/plist ExecStart -- both systemd unit files and plist

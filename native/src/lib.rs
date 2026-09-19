@@ -11,6 +11,7 @@ pub mod dist;
 pub mod image;
 pub mod ipc;
 pub mod mcp;
+pub mod packages;
 pub mod process;
 pub mod pty;
 pub mod script;

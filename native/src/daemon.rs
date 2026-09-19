@@ -109,6 +109,32 @@ pub(crate) fn keep_exited() -> bool {
     std::env::var("REMUDA_KEEP_EXITED").is_ok_and(|v| v == "1")
 }
 
+/// Where a user's own auto-loaded config lives (XDG `$XDG_CONFIG_HOME`,
+/// else `$HOME/.config`) — mirrors `remuda.rs`'s `history_path` shape, not
+/// `dist.rs`'s `base_dir` (see steps/035 for why).
+fn user_config_path() -> Option<PathBuf> {
+    let config_home = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
+    };
+    Some(config_home.join("remuda").join("init.lua"))
+}
+
+/// Evaluate the user's `~/.config/remuda/init.lua`, once, at daemon boot.
+/// Absence is silent; a broken file is reported but never poisons the
+/// image the way an `Err` in `Image::spawn`'s `ready` chain would (steps/035).
+fn load_user_config(image: &Image) {
+    let Some(path) = user_config_path() else {
+        return;
+    };
+    let Ok(source) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    if let Err(e) = image.eval(&source, Some(&path.display().to_string())) {
+        eprintln!("remuda: error loading {}: {e}", path.display());
+    }
+}
+
 /// Serve until the listener dies. Caution: connect before unlinking — an
 /// unconditional unlink displaces a *live* peer, which then keeps running
 /// unreachable and holds its pty children forever.
@@ -129,6 +155,26 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     // race the listener it will talk to.
     let counters = Arc::new(crate::tick::Counters::default());
     let image = Image::spawn(path, Arc::clone(&registry), Arc::clone(&counters));
+    // Its own thread, not a synchronous call here — measured, not foreseen:
+    // an inline call deadlocks the moment a real `init.lua` does what
+    // butler's actually does, calling `remuda.new` (or `send`/`close`/...).
+    // Every one of those bindings is `ask()` in script.rs, a real IPC round
+    // trip back to THIS daemon's own socket — answered only by the
+    // `listener.incoming()` loop below. Calling `load_user_config` inline,
+    // before that loop starts, blocks this very thread on a reply that only
+    // this same (now-blocked) thread could ever produce. Off on its own
+    // thread instead, the load can lag an instant behind the daemon's first
+    // accepted connection (a `remuda ls` run in that instant would race it —
+    // never poisoned, just possibly early), but it can never wedge startup.
+    // Never inside `Image::spawn`'s own `ready` chain either: `tools.lua`
+    // (image.rs) is compiled-in and safe to let poison `ready` forever on
+    // failure, but this file is user-authored, on the reading machine, not
+    // this repo's — a typo here must degrade to "no butler session", never
+    // brick every future eval this daemon ever answers.
+    {
+        let image = image.clone();
+        std::thread::spawn(move || load_user_config(&image));
+    }
     spawn_ticker(image.clone(), Arc::clone(&counters), Arc::clone(&registry));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };

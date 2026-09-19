@@ -2919,3 +2919,183 @@ fn butler_exec_fails_loudly_with_no_token_file_and_no_env_override() {
 
     drop(daemon);
 }
+
+/// The whole point of this step (steps/NNN): a `~/.config/remuda/init.lua`
+/// present before the daemon exists at all is evaluated automatically --
+/// with no human hand and no `remuda exec`/`eval` call anywhere in THIS
+/// test -- every time a FRESH daemon boots, mirroring how Neovim/Hammerspoon
+/// /WezTerm auto-load a user init file. The instrument is `remuda ls`'s
+/// session list, never "the loader ran without erroring".
+///
+/// The `_butler_argv`/`_butler_skip_relay` test substitutions that every
+/// other butler test injects via a separate `eval` *before* calling `exec
+/// butler` are, here, baked into the auto-loaded file itself -- so it is the
+/// DAEMON's own boot-time load that performs the substitution and the exec,
+/// never this test. Real `docs/install-butler.sh` output has no such
+/// substitutions (it can't know about `claude` not existing on a test box);
+/// this is the same mechanism with a stand-in child process, same as every
+/// other butler test that can't spawn a real `claude`.
+///
+/// The restart leg is the DoD's own wording: after killing and restarting
+/// the daemon, with no human hand, `remuda ls` must show butler AGAIN, from
+/// the SAME home dir with the SAME (unchanged) config file -- proving the
+/// mechanism survives the exact scenario it exists for, not just a first
+/// boot.
+#[test]
+#[cfg(unix)]
+fn a_fresh_daemon_auto_loads_the_user_config_and_registers_butler_with_no_human_hand() {
+    let dir = scratch_dir("boot-loader-positive");
+    let home = dir.join("home");
+    let butler_dir = home.join(".config/remuda/butler");
+    std::fs::create_dir_all(&butler_dir).expect("mkdir conventional butler dir");
+    std::fs::write(butler_dir.join("token"), "test-token\n").expect("write token");
+    std::fs::write(
+        butler_dir.join("config"),
+        "http://127.0.0.1:1\n!room:example.org\n@butler:example.org\n\n",
+    )
+    .expect("write config");
+    std::fs::create_dir_all(home.join(".config/remuda")).expect("mkdir config dir");
+    std::fs::write(
+        home.join(".config/remuda/init.lua"),
+        "remuda._butler_argv = {\"sh\", \"-c\", \"sleep 0.3; exit 0\"}\n\
+         remuda._butler_skip_relay = true\n\
+         remuda.exec(\"butler\")\n",
+    )
+    .expect("write init.lua");
+
+    let mut daemon = Daemon::spawn_with_home(&dir, &home);
+    let path = daemon::socket_path_in(&dir, "s");
+
+    // No `exec butler` and no `eval` calling `remuda.exec` anywhere in this
+    // test -- if butler shows up, the daemon's own boot-time loader did it.
+    let deadline = Instant::now() + PATIENCE;
+    let initial_name = loop {
+        let name = eval(&path, "return remuda._butler_initial_name or ''");
+        if !name.is_empty() {
+            let listed = remuda(&dir, &["-s", "s", "ls"]);
+            if String::from_utf8_lossy(&listed.stdout).contains(&name) {
+                break name;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon never auto-registered a butler session from its own \
+             boot-time config load"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // Restart leg. `-f`: a live butler session makes a bare `restart` refuse
+    // (see `restart_refuses_to_kill_a_live_session_without_being_told_twice`).
+    let out = remuda(&dir, &["-s", "s", "restart", "-f"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        daemon.left_on_its_own(),
+        "the old daemon did not exit on its own"
+    );
+
+    // A fresh daemon, same home dir, config file untouched on disk. Again:
+    // no `exec butler` call anywhere in this test.
+    let _daemon2 = Daemon::spawn_with_home(&dir, &home);
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let listed = remuda(&dir, &["-s", "s", "ls"]);
+        if String::from_utf8_lossy(&listed.stdout).contains(&initial_name) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "after killing and restarting the daemon, remuda ls never showed \
+             butler again -- the boot-time loader must run on EVERY fresh \
+             daemon, not just the first"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Negative control for the whole mechanism above (steps/NNN's own DoD
+/// wording: "with the feature turned off, the same procedure must go RED —
+/// if it does not go red, the instrument is not measuring the feature").
+/// Absence of `~/.config/remuda/init.lua` IS "feature off" here, the same
+/// way a vanilla Neovim/Hammerspoon install with no config is: valid
+/// credentials sit at the conventional butler path (same fixture as the
+/// positive test above), but with no init.lua to call `remuda.exec("butler")`
+/// a fresh daemon must never show a butler session. Without this test, the
+/// positive test above could pass for the wrong reason (e.g. `remuda ls`
+/// always reporting butler present regardless of what actually ran).
+#[test]
+#[cfg(unix)]
+fn a_fresh_daemon_with_no_user_config_never_auto_registers_butler() {
+    let dir = scratch_dir("boot-loader-negative");
+    let home = dir.join("home-empty");
+    let butler_dir = home.join(".config/remuda/butler");
+    std::fs::create_dir_all(&butler_dir).expect("mkdir conventional butler dir");
+    std::fs::write(butler_dir.join("token"), "test-token\n").expect("write token");
+    std::fs::write(
+        butler_dir.join("config"),
+        "http://127.0.0.1:1\n!room:example.org\n@butler:example.org\n\n",
+    )
+    .expect("write config");
+    // Deliberately: no `~/.config/remuda/init.lua` written at all.
+
+    let _daemon = Daemon::spawn_with_home(&dir, &home);
+
+    // A couple of TICK_PERIODs' worth of margin (same as
+    // `a_daemon_restart_does_not_relaunch_the_butler_session`'s own wait) to
+    // rule out a delayed load, not just an instant-after check.
+    std::thread::sleep(Duration::from_millis(1200));
+    let listed = remuda(&dir, &["-s", "s", "ls"]);
+    let listed_out = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed_out.contains("no sessions"),
+        "a fresh daemon with no init.lua at all auto-registered something: {listed_out}"
+    );
+}
+
+/// Regression test against the exact hazard `load_user_config`'s own doc
+/// comment (daemon.rs) names: because `Image::spawn`'s `ready` chain (image.rs)
+/// is checked on EVERY job forever, an `Err` inside it poisons the image
+/// PERMANENTLY -- moving the user-config load back inside that chain (as
+/// opposed to the separate, later `image.eval` call it uses today) would let
+/// one colleague's own typo in their `~/.config/remuda/init.lua` brick every
+/// other session on their daemon, forever, until a manual restart. A broken
+/// file must be reported and then the daemon must go on being an entirely
+/// ordinary, working daemon.
+#[test]
+#[cfg(unix)]
+fn a_broken_user_config_is_reported_but_never_bricks_the_daemon() {
+    let dir = scratch_dir("boot-loader-blast-radius");
+    let home = dir.join("home");
+    std::fs::create_dir_all(home.join(".config/remuda")).expect("mkdir config dir");
+    std::fs::write(
+        home.join(".config/remuda/init.lua"),
+        "this is not valid lua $$$\n",
+    )
+    .expect("write broken init.lua");
+
+    let _daemon = Daemon::spawn_with_home(&dir, &home);
+    let path = daemon::socket_path_in(&dir, "s");
+
+    // The daemon is still a normal, working daemon: `ls` answers cleanly --
+    // if the hazard above ever regressed, this would instead come back as
+    // an error containing "image failed to start".
+    match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(s) => assert!(s.is_empty(), "a fresh daemon holds nothing"),
+        other => panic!("unexpected: {other:?}"),
+    }
+
+    // Direct proof the image itself is not poisoned, not merely that `ls`
+    // (which never touches the `ready` chain either) happens to still work:
+    // an entirely unrelated, ordinary session can still be created.
+    new_session(&path, "plain");
+    let listed = remuda(&dir, &["-s", "s", "ls"]);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("plain"),
+        "an ordinary session could not be created after a broken user config \
+         -- the image is poisoned"
+    );
+}
