@@ -2554,20 +2554,19 @@ fn butler_watchdog_relaunches_a_session_that_really_died() {
     );
 }
 
-/// A documented ceiling, not a bug this test is waiting to catch: nothing in
-/// this repository ever auto-starts the butler layer on its own, restart or
-/// not. There is no writer of `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG`
-/// anywhere but `init.lua`'s own `os.getenv` reads, and no systemd/launchd/
-/// cron/@reboot/profile mechanism anywhere in this repo's install scripts —
-/// the only way `packages/butler/init.lua`'s real code ever runs at all is
-/// an explicit `remuda exec butler`. So this is not "restart loses the
-/// watchdog" (nothing about restart is special here) -- it is "nothing
-/// re-execs butler for you, ever, and a restart is simply one more way for
-/// that to be true." This is expected to stay red forever until someone
-/// builds an auto-loader (an unbuilt next step already named elsewhere in
-/// this repo's own design notes); if this test ever fails because a session
-/// DID come back, that is a real capability change and the L6 cell's DoD
-/// must be revisited, not this assertion loosened.
+/// This documents the case where NO persistence layer is installed: `remuda`
+/// itself never re-execs butler on its own, restart or not — the only way
+/// `packages/butler/init.lua`'s real code ever runs is an explicit `remuda
+/// exec butler`. That stays true regardless of `docs/install-butler.sh`,
+/// because the systemd timer / launchd agent it installs lives entirely
+/// outside this binary; this test's daemon has none of that wired in, so it
+/// still shows the session does not come back unassisted. It is not proof
+/// that persistence is unsolved in general — see the sibling test below,
+/// `a_supervisor_polling_remuda_ls_can_relaunch_butler_after_a_restart`, for
+/// the positive leg with an external poller in the loop. If this test ever
+/// fails with nothing installed, that's a real capability change in `remuda`
+/// itself and the L6 cell's DoD must be revisited, not this assertion
+/// loosened.
 #[test]
 #[cfg(unix)]
 fn a_daemon_restart_does_not_relaunch_the_butler_session() {
@@ -2657,4 +2656,130 @@ fn a_daemon_restart_does_not_relaunch_the_butler_session() {
         "the butler session came back after a restart with no `exec butler` -- \
          this is a real capability change; see this test's own doc comment: {listed_out}"
     );
+}
+
+/// The positive leg: nothing in `remuda` itself auto-relaunches butler (the
+/// test above), but the mechanism an external supervisor would drive --
+/// poll `remuda ls` for the exact session name, and if it is absent re-run
+/// `remuda exec butler` -- already works today with no production-code
+/// change. This pins that fact down so it can't silently regress.
+///
+/// Shared-instrument note: this test and the ceiling test above both use
+/// "does a session named exactly `butler` exist" as ground truth. That is
+/// only a safe foundation *because* the ceiling test exists as a negative
+/// control -- if `remuda ls` ever reported the name present when the
+/// process structurally is not, this test would go green for the wrong
+/// reason, and a real supervisor built on the same check would silently
+/// never relaunch. Don't delete or loosen either test in isolation.
+#[test]
+#[cfg(unix)]
+fn a_supervisor_polling_remuda_ls_can_relaunch_butler_after_a_restart() {
+    let dir = scratch_dir("butler-restart-relaunch");
+    let (token_path, config_path) = butler_config(
+        &dir,
+        "restart-relaunch",
+        "http://127.0.0.1:1",
+        "!room:example.org",
+        "@butler:example.org",
+        "",
+    );
+    let token_str = token_path.to_string_lossy().to_string();
+    let config_str = config_path.to_string_lossy().to_string();
+    let mut daemon = Daemon::spawn_with_env(
+        &dir,
+        &[
+            ("REMUDA_BUTLER_TOKEN", token_str.as_str()),
+            ("REMUDA_BUTLER_CONFIG", config_str.as_str()),
+        ],
+    );
+    let path = daemon::socket_path_in(&dir, "s");
+
+    eval(
+        &path,
+        r#"remuda._butler_argv = {"sh", "-c", "sleep 0.3; exit 0"}"#,
+    );
+    eval(&path, "remuda._butler_skip_relay = true");
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let initial_name = eval(&path, "return remuda._butler_initial_name");
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let listed = remuda(&dir, &["-s", "s", "ls"]);
+        if String::from_utf8_lossy(&listed.stdout).contains(&initial_name) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the butler session never showed up in `ls` before the restart"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let out = remuda(&dir, &["-s", "s", "restart", "-f"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        daemon.left_on_its_own(),
+        "the old daemon did not exit on its own"
+    );
+
+    // A fresh daemon, same credentials on disk and still exported into this
+    // new process's env -- the same shape the systemd/launchd unit's daemon
+    // auto-start would produce after a crash.
+    let _daemon2 = Daemon::spawn_with_env(
+        &dir,
+        &[
+            ("REMUDA_BUTLER_TOKEN", token_str.as_str()),
+            ("REMUDA_BUTLER_CONFIG", config_str.as_str()),
+        ],
+    );
+
+    // Same test-mode wiring as the first `exec butler` above -- a real
+    // supervisor's poll would start a genuine Claude Code session, which
+    // this harness cannot exercise; `_butler_argv`/`_butler_skip_relay` swap
+    // in a `sleep` in its place while leaving every other line of
+    // `init.lua` (the actual relaunch mechanism under test) untouched.
+    eval(
+        &path,
+        r#"remuda._butler_argv = {"sh", "-c", "sleep 0.3; exit 0"}"#,
+    );
+    eval(&path, "remuda._butler_skip_relay = true");
+
+    // This is exactly what the supervisor's poll runs after finding the name
+    // absent from `remuda ls`: re-`exec butler`. `os.getenv("PWD")` inside
+    // `init.lua` reads the *daemon's* own env (the eval request carries only
+    // source text, not this CLI call's env), and `daemon2` above already
+    // inherited the same ambient `PWD` as the first daemon -- so this call
+    // reproduces the same session name without needing to touch `PWD` here.
+    // A real installer still unsets `PWD` on its own `exec butler` call
+    // (`docs/install-butler.sh`), because in the wild that call may be the
+    // one lazily auto-starting a dead daemon from scratch (`with_daemon`),
+    // which is a different `PWD` than this test's pre-spawned `daemon2`.
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let listed = remuda(&dir, &["-s", "s", "ls"]);
+        if String::from_utf8_lossy(&listed.stdout).contains(&initial_name) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the re-`exec butler` call never produced a session named {initial_name:?} after restart"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
