@@ -2920,7 +2920,7 @@ fn butler_exec_fails_loudly_with_no_token_file_and_no_env_override() {
     drop(daemon);
 }
 
-/// The whole point of this step (steps/NNN): a `~/.config/remuda/init.lua`
+/// The whole point of this step (steps/035): a `~/.config/remuda/init.lua`
 /// present before the daemon exists at all is evaluated automatically --
 /// with no human hand and no `remuda exec`/`eval` call anywhere in THIS
 /// test -- every time a FRESH daemon boots, mirroring how Neovim/Hammerspoon
@@ -3017,7 +3017,7 @@ fn a_fresh_daemon_auto_loads_the_user_config_and_registers_butler_with_no_human_
     }
 }
 
-/// Negative control for the whole mechanism above (steps/NNN's own DoD
+/// Negative control for the whole mechanism above (steps/035's own DoD
 /// wording: "with the feature turned off, the same procedure must go RED —
 /// if it does not go red, the instrument is not measuring the feature").
 /// Absence of `~/.config/remuda/init.lua` IS "feature off" here, the same
