@@ -196,7 +196,7 @@ local SYSTEM_PROMPT = "You are bridged into one Matrix room via remuda. "
   .. "text -- printing a reply in this terminal does not send it anywhere; "
   .. "only calling the tool does."
 
-local BUTLER_ARGV = {
+local BUTLER_ARGV = remuda._butler_argv or {
   "claude",
   "--mcp-config",
   mcp_config_path,
@@ -262,11 +262,13 @@ remuda.on("butler-matrix-submit", function()
   remuda.send(butler_name, "")
 end)
 
-remuda.process{
-  argv = {"python3", "-c", HELPER_SRC, token_path, config_path},
-  on_line = "butler-matrix-line",
-  on_exit = "butler-matrix-sync-exit",
-}
+if not remuda._butler_skip_relay then
+  remuda.process{
+    argv = {"python3", "-c", HELPER_SRC, token_path, config_path},
+    on_line = "butler-matrix-line",
+    on_exit = "butler-matrix-sync-exit",
+  }
+end
 
 remuda.tool{
   name = "matrix_reply",

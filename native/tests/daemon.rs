@@ -932,6 +932,34 @@ impl Daemon {
         Self(child)
     }
 
+    /// Like `spawn`, but layers extra environment variables onto the daemon
+    /// process itself -- not the CLI client that later asks it to `exec`
+    /// something. `os.getenv` inside `init.lua` reads the daemon's own
+    /// environment, so a real (non-`_butler_test_mode`) run needs
+    /// `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG` set here, additive to
+    /// `spawn`'s existing behavior.
+    fn spawn_with_env(dir: &Path, extra_env: &[(&str, &str)]) -> Self {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"));
+        cmd.args(["-s", "s", "daemon"])
+            .env("REMUDA_RUNTIME_DIR", dir);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let child = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn daemon");
+        let path = daemon::socket_path_in(dir, "s");
+        let deadline = Instant::now() + PATIENCE;
+        while remuda_native::ipc::connect(&path).is_err() {
+            assert!(Instant::now() < deadline, "daemon never bound {path:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Self(child)
+    }
+
     /// Bounded on purpose: an unbounded `wait` on a daemon that did not stop is
     /// the same hang this whole struct exists to avoid.
     fn left_on_its_own(&mut self) -> bool {
@@ -2407,5 +2435,226 @@ fn butler_session_exited_hook_relaunches_via_the_shared_launch_function() {
         hook_body.contains("launch_butler()"),
         "the session_exited watchdog must relaunch via launch_butler(), not \
          its own remuda.new call: {hook_body:?}"
+    );
+}
+
+/// The watchdog end to end, proven by a real effect rather than a call
+/// record. `_butler_test_mode` is never set here -- this is the first test
+/// in this file to run the real `launch_butler`/`session_exited` code past
+/// `init.lua`'s test-mode early return (the source-level substitutes are the
+/// two tests just above this one). `remuda._butler_argv` stands in for a
+/// real `claude` with a short-but-real self-exiting process, and
+/// `remuda._butler_skip_relay` keeps the forever-retrying Matrix relay (see
+/// `HELPER_SRC`'s `while True`) from ever spawning against these dummy
+/// credentials -- see the teardown assertion at the end of this test for why
+/// that belief alone is not trusted.
+#[test]
+#[cfg(unix)]
+fn butler_watchdog_relaunches_a_session_that_really_died() {
+    let dir = scratch_dir("butler-watchdog");
+    let (token_path, config_path) = butler_config(
+        &dir,
+        "watchdog",
+        "http://127.0.0.1:1",
+        "!room:example.org",
+        "@butler:example.org",
+        "",
+    );
+    let token_str = token_path.to_string_lossy().to_string();
+    let config_str = config_path.to_string_lossy().to_string();
+    let daemon = Daemon::spawn_with_env(
+        &dir,
+        &[
+            ("REMUDA_BUTLER_TOKEN", token_str.as_str()),
+            ("REMUDA_BUTLER_CONFIG", config_str.as_str()),
+        ],
+    );
+    let path = daemon::socket_path_in(&dir, "s");
+
+    // A separate hook group: `init.lua` clears the "butler" group itself on
+    // every `exec` (see its own comment above `remuda.clear_hooks`), so an
+    // observer registered there would be wiped the moment `exec butler` runs.
+    eval(
+        &path,
+        r#"
+            remuda._watchdog_exits = {}
+            remuda.on("session_exited", function(name)
+                table.insert(remuda._watchdog_exits, name)
+            end, { group = "test-observer" })
+        "#,
+    );
+    // A real, short-but-nonzero-lived self-exiting process standing in for
+    // `claude` -- 0.3s per life is long enough that two full lives can't
+    // complete in near-zero time, which is what the latency-floor assertion
+    // below turns into a real check rather than a comment's promise.
+    eval(
+        &path,
+        r#"remuda._butler_argv = {"sh", "-c", "sleep 0.3; exit 0"}"#,
+    );
+    eval(&path, "remuda._butler_skip_relay = true");
+
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let initial_name = eval(&path, "return remuda._butler_initial_name");
+
+    let start = Instant::now();
+    let deadline = start + PATIENCE;
+    loop {
+        let seen = eval(&path, "return table.concat(remuda._watchdog_exits, ',')");
+        let count = seen.split(',').filter(|n| *n == initial_name).count();
+        if count >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected at least 2 session_exited events for {initial_name:?}, saw: {seen:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let elapsed = start.elapsed();
+    // A name can only exit twice if a genuinely new process was registered
+    // under it between the two deaths: `Registry::register` refuses a name
+    // still in use, and only `remove`/`close` clear that entry (see
+    // core/src/registry.rs) -- so 2 real `session_exited` events for one
+    // name is direct evidence `launch_butler()` itself ran and spawned a
+    // fresh process, not merely that the callback fired. Two full lives at
+    // 0.3s each, plus at least one reap cycle, cannot land here in
+    // near-zero time; a value that small would mean the exit/relaunch never
+    // actually happened.
+    assert!(
+        elapsed >= Duration::from_millis(400),
+        "two real respawn cycles took only {elapsed:?} -- implausibly fast for two \
+         `sleep 0.3` lives, suggesting the observation was short-circuited"
+    );
+
+    // Teardown is verified by the resource, not the belief that
+    // `_butler_skip_relay` prevented anything: kill the daemon, then prove
+    // via a real `ps` snapshot that nothing survives referencing this
+    // test's own (unique per invocation) token path. If the relay guard
+    // ever failed silently, its forever-retrying `while True` loop (see
+    // `HELPER_SRC`) would still be running right here -- nothing in this
+    // codebase reaps a `remuda.process{}` child when the daemon dies
+    // (`native/src/process.rs` spawns a plain `std::process::Command`, no
+    // process group).
+    drop(daemon);
+    let ps = std::process::Command::new("ps")
+        .args(["-eo", "pid,args"])
+        .output()
+        .expect("ps");
+    let ps_out = String::from_utf8_lossy(&ps.stdout);
+    let leaked: Vec<&str> = ps_out.lines().filter(|l| l.contains(&token_str)).collect();
+    assert!(
+        leaked.is_empty(),
+        "orphan process(es) still reference this test's own token path after teardown: {leaked:?}"
+    );
+}
+
+/// A documented ceiling, not a bug this test is waiting to catch: nothing in
+/// this repository ever auto-starts the butler layer on its own, restart or
+/// not. There is no writer of `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG`
+/// anywhere but `init.lua`'s own `os.getenv` reads, and no systemd/launchd/
+/// cron/@reboot/profile mechanism anywhere in this repo's install scripts —
+/// the only way `packages/butler/init.lua`'s real code ever runs at all is
+/// an explicit `remuda exec butler`. So this is not "restart loses the
+/// watchdog" (nothing about restart is special here) -- it is "nothing
+/// re-execs butler for you, ever, and a restart is simply one more way for
+/// that to be true." This is expected to stay red forever until someone
+/// builds an auto-loader (an unbuilt next step already named elsewhere in
+/// this repo's own design notes); if this test ever fails because a session
+/// DID come back, that is a real capability change and the L6 cell's DoD
+/// must be revisited, not this assertion loosened.
+#[test]
+#[cfg(unix)]
+fn a_daemon_restart_does_not_relaunch_the_butler_session() {
+    let dir = scratch_dir("butler-restart-ceiling");
+    let (token_path, config_path) = butler_config(
+        &dir,
+        "restart-ceiling",
+        "http://127.0.0.1:1",
+        "!room:example.org",
+        "@butler:example.org",
+        "",
+    );
+    let token_str = token_path.to_string_lossy().to_string();
+    let config_str = config_path.to_string_lossy().to_string();
+    let mut daemon = Daemon::spawn_with_env(
+        &dir,
+        &[
+            ("REMUDA_BUTLER_TOKEN", token_str.as_str()),
+            ("REMUDA_BUTLER_CONFIG", config_str.as_str()),
+        ],
+    );
+    let path = daemon::socket_path_in(&dir, "s");
+
+    eval(
+        &path,
+        r#"remuda._butler_argv = {"sh", "-c", "sleep 0.3; exit 0"}"#,
+    );
+    eval(&path, "remuda._butler_skip_relay = true");
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let initial_name = eval(&path, "return remuda._butler_initial_name");
+
+    // Confirm the watchdog is genuinely live before the restart -- otherwise
+    // "it's not there after" would prove nothing. `list` names the current
+    // session under its (possibly-respawned) butler name.
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let listed = remuda(&dir, &["-s", "s", "ls"]);
+        if String::from_utf8_lossy(&listed.stdout).contains(&initial_name) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the butler session never showed up in `ls` before the restart"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Same restart path as `restart_stops_a_daemon_and_leaves_the_next_command_free_to_start_one`,
+    // with `-f`: the live butler session makes a bare `restart` refuse (see
+    // `restart_refuses_to_kill_a_live_session_without_being_told_twice`).
+    let out = remuda(&dir, &["-s", "s", "restart", "-f"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        daemon.left_on_its_own(),
+        "the old daemon did not exit on its own"
+    );
+
+    // A fresh daemon against the same runtime dir/socket -- the same
+    // credentials are still on disk and still exported into this new
+    // process's own environment, so if anything anywhere auto-relaunched
+    // butler, this daemon has everything it would need to do so.
+    let _daemon2 = Daemon::spawn_with_env(
+        &dir,
+        &[
+            ("REMUDA_BUTLER_TOKEN", token_str.as_str()),
+            ("REMUDA_BUTLER_CONFIG", config_str.as_str()),
+        ],
+    );
+
+    // Wait through a couple of TICK_PERIODs (1s each, see daemon.rs) to rule
+    // out some delayed auto-recovery this comment doesn't know about, not
+    // just an instant-after check.
+    std::thread::sleep(Duration::from_millis(2500));
+    let listed = remuda(&dir, &["-s", "s", "ls"]);
+    let listed_out = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        !listed_out.contains(&initial_name),
+        "the butler session came back after a restart with no `exec butler` -- \
+         this is a real capability change; see this test's own doc comment: {listed_out}"
     );
 }
