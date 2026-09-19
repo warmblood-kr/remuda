@@ -2596,7 +2596,10 @@ fn butler_watchdog_relaunches_a_session_that_really_died() {
 /// the positive leg with an external poller in the loop. If this test ever
 /// fails with nothing installed, that's a real capability change in `remuda`
 /// itself and the L6 cell's DoD must be revisited, not this assertion
-/// loosened.
+/// loosened. Separately: this test is also the negative-control leg for
+/// `remuda ls`'s exact-match liveness check -- the generated `butler-poll.sh`,
+/// `install-butler.sh`'s install-time probe, and the sibling positive-leg
+/// test below all depend on it staying true.
 #[test]
 #[cfg(unix)]
 fn a_daemon_restart_does_not_relaunch_the_butler_session() {

@@ -156,13 +156,16 @@ end
 -- later `exec butler` call able to inject a corrected value (that's the bug
 -- this resolves). `HOME` (or `XDG_CONFIG_HOME`) is present in essentially
 -- every process's environment regardless of what happened to birth the
--- daemon, so a conventional path under it survives that race.
--- `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG` remain a supported override,
--- checked first, for a caller who wants a different location -- this is
--- also what keeps every existing test that sets them via
+-- daemon (the known exception: a systemd *system* unit with `User=` set but
+-- no PAM session, or a process launched via `env -i`) -- `resolve_path`
+-- below fails loudly by name when it's genuinely absent, rather than
+-- guessing. `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG` remain a supported
+-- override, checked first, for a caller who wants a different location --
+-- this is also what keeps every existing test that sets them via
 -- `Daemon::spawn_with_env` unchanged. Mirrors install-butler.sh's own
 -- `${XDG_CONFIG_HOME:-$HOME/.config}/remuda/butler/{token,config}` exactly,
--- so the shell-side and Lua-side conventions can never drift apart.
+-- kept in sync with install-butler.sh's own default by
+-- scripts/check-butler-path-convention.py, which fails if the two diverge.
 local function default_config_home()
   local xdg = os.getenv("XDG_CONFIG_HOME")
   if xdg and xdg ~= "" then

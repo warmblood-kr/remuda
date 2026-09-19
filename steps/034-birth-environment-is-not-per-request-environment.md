@@ -39,8 +39,11 @@ indistinguishable from silence.
 
 `exec butler` finds its token/config regardless of what first birthed the
 daemon, as long as the files sit at a conventional path under `HOME` — a
-value present in essentially every process's environment, unlike a
-butler-specific var only a caller who already knows about butler would set.
+value present in essentially every process's environment (the known
+exception: a systemd *system* unit with `User=` set but no PAM session, or
+a process launched via `env -i`), unlike a butler-specific var only a
+caller who already knows about butler would set; when it's genuinely
+absent, `resolve_path` fails loudly by name rather than guessing.
 `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG` remain a supported override,
 so every existing test that sets them via `Daemon::spawn_with_env` keeps
 working unchanged. A missing or malformed file still fails loudly,
@@ -100,7 +103,9 @@ test butler_exec_finds_credentials_at_the_conventional_path_with_zero_env_vars .
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 40 filtered out; finished in 0.04s
 ```
 
-Full gate:
+Full gate. `cargo fmt --all --check` and `shellcheck` print nothing at all on
+success (their absence from the transcript below is the real, empty stdout,
+not an omission) — every command shown exited 0:
 
 ```
 $ cargo test --workspace --all-targets 2>&1 | grep -E "FAILED|error\[|error:|test result"
@@ -119,15 +124,9 @@ test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fin
 test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
 
 $ cargo fmt --all --check
-(clean, exit 0)
-
 $ cargo clippy --workspace --all-targets -- -D warnings
-Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.35s
-(exit 0, no warnings)
-
+Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
 $ shellcheck -s sh docs/install-butler.sh
-(clean, exit 0)
-
 $ python3 scripts/check-comments.py
 ok — 353 doc comment(s) within cap (item 3, module 20)
 $ python3 scripts/check-install.py
@@ -165,10 +164,33 @@ exec exit=0
 — where `$SCRATCH/home/.config/remuda/butler/{token,config}` held the
 credentials, and this `exec butler` call's own environment carried zero
 butler vars, exactly like the daemon that birthed it. Confirmed the session
-actually registered (`remuda ls` showed it flicker through the 0.3s
-respawn cycle), then tore the daemon down (`restart -f`) and confirmed via
-`ps -eo pid,args | grep $SCRATCH` — zero hits — before deleting the scratch
-tree.
+actually registered, then tore the daemon down and confirmed it gone by PID
+(not by exit code):
+
+```
+$ env REMUDA_RUNTIME_DIR=$SCRATCH/runtime REMUDA_NO_UPDATE_CHECK=1 ./target/debug/remuda -s repro ls
+remuda-fresh           80x24   live  idle 0s
+remuda-fresh           80x24   live  idle 0s
+no sessions
+remuda-fresh           80x24   live  idle 0s
+
+$ ps -eo pid,ppid,args | grep -F 'repro daemon'
+2428133     948 /.../target/debug/remuda -s repro daemon
+
+$ env REMUDA_RUNTIME_DIR=$SCRATCH/runtime REMUDA_NO_UPDATE_CHECK=1 ./target/debug/remuda -s repro restart -f
+remuda: stopped the daemon for "repro" — the next command starts a fresh one
+
+$ ps -p 2428133; echo "exit=$?"
+    PID TTY          TIME CMD
+exit=1
+```
+
+The `ls` output flickering between the session and "no sessions" is the
+0.3s respawn cycle running for real; `ps -p <the daemon's own pid>`, not a
+grep for the scratch path (nothing in this daemon's argv ever names it —
+`_butler_skip_relay` was set, so no python3 relay child exists either), is
+what actually proves the process is gone, and it is, before the scratch
+tree was deleted.
 
 The installer's own copy-to-canonical step, run for real with a
 `REMUDA_BUTLER_TOKEN_FILE`/`REMUDA_BUTLER_CONFIG_FILE` pointing at a
@@ -212,9 +234,25 @@ after: token=7789571 1789836289 config=7789572 1789836289
 NO-OP CONFIRMED (inode+mtime unchanged)
 ```
 
-All scratch daemons from both installer runs were torn down with `restart
--f` and confirmed gone via `ps -eo pid,args | grep <scratch-path>` (zero
-hits) before the scratch trees were deleted.
+This run's own daemon and fake-`claude` child were torn down and confirmed
+gone by PID, the same way as above:
+
+```
+$ ps -eo pid,ppid,args | grep -F "$SCRATCH"
+2431424 2431416 /bin/sh $SCRATCH/bin/claude --mcp-config $SCRATCH/vault/config.mcp.json ...
+
+$ ./target/debug/remuda restart -f
+remuda: stopped the daemon for "default" — the next command starts a fresh one
+
+$ ps -p 2431416,2431424; echo "exit=$?"
+    PID TTY          TIME CMD
+exit=1
+```
+
+before the scratch tree was deleted. (This is a re-verification, not the
+original session's own transcript, so it re-runs the override case above,
+not a second, separate default-location daemon — the property being proven,
+"the installer's own daemon leaves no residue," is the same either way.)
 
 ## Known ceilings
 
