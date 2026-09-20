@@ -487,6 +487,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "interprocess",
+ "libc",
  "mlua",
  "nix",
  "portable-pty",

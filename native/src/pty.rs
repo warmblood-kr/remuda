@@ -76,6 +76,11 @@ impl PtyAgent {
             .map_err(io)?;
 
         let child = pair.slave.spawn_command(command).map_err(io)?;
+        // No child_guard here on purpose — this child already dies with the
+        // daemon by kernel accident (the master fd closes on any daemon
+        // exit, SIGHUP-ing this session leader). See child_guard.rs and
+        // native/tests/pty_survives_daemon_death.rs, which pins it.
+        crate::child_guard::documented_pty_hangup_accident();
         drop(pair.slave); // Or the master never sees EOF when the child exits.
 
         let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer().map_err(io)?));

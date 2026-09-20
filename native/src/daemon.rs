@@ -244,6 +244,16 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
     }
 }
 
+/// Best-effort group-wide reap before a clean `Request::Shutdown` exits —
+/// covers a grandchild PDEATHSIG alone can't reach (see child_guard.rs).
+/// Only THIS death mode runs any code at all; SIGTERM/SIGKILL run none.
+fn reap_processes_before_exit(image: &Image) {
+    let _ = image.eval(
+        "for _, id in ipairs(remuda.processes()) do remuda._process_killpg(id) end",
+        Some("@remuda/shutdown-reap"),
+    );
+}
+
 fn handle(
     stream: Stream,
     registry: &Registry,
@@ -280,6 +290,7 @@ fn handle(
         // cannot tell "it stopped" from "it never heard me".
         Request::Shutdown => {
             reply(&stream, &Response::Ok)?;
+            reap_processes_before_exit(image);
             std::process::exit(0);
         }
 
