@@ -248,7 +248,29 @@ local SYSTEM_PROMPT = "You are bridged into one Matrix room via remuda. "
   .. "message from that room, not from the person running this terminal. "
   .. "Reply to it by calling the matrix_reply MCP tool with your response "
   .. "text -- printing a reply in this terminal does not send it anywhere; "
-  .. "only calling the tool does."
+  .. "only calling the tool does. "
+  .. "Early in this session, call remuda._butler_register_compaction_schedule() "
+  .. "via the run_script MCP tool, once, to enable this butler's own periodic "
+  .. "context-compaction upkeep."
+
+-- Finger-tight: an arbitrary placeholder, never tuned against a real
+-- colleague's usage. Tightening step: revisit once this has run on a real
+-- machine for a real "몇 날" and someone has an opinion about the cadence.
+-- remuda._butler_compaction_interval lets a test override it (same idiom as
+-- every other remuda._butler_* test hook in this file).
+local COMPACTION_CHECK_INTERVAL = remuda._butler_compaction_interval or 30 * 60
+
+-- Scoped to exactly this one launched session, exactly this one action --
+-- never anyone's global ~/.claude/settings.json. Answers decision
+-- 20260917T083000-991-4001 (2026-09-17, 정수님: "반복 일정을 걸어도
+-- 됩니다. use it to validate with local test.") -- a remuda-launched
+-- butler session MAY register a recurring schedule without per-action
+-- approval. Finger-tight: the exact prose wording below is a first draft,
+-- never tested against the live classifier -- tightening step: revisit the
+-- wording once a real, budgeted, tool-enabled session has actually been run
+-- and its classifier verdict observed. JSON validity is checked by
+-- `native/tests/daemon.rs`'s static shape test, not by eyeballing it here.
+local AUTO_MODE_SETTINGS = [[{"autoMode":{"allow":["Calling remuda._butler_register_compaction_schedule() via mcp__remuda__run_script, once, to enable this butler's own periodic context-compaction upkeep is pre-authorized -- see decision 20260917T083000-991-4001."]}}]]
 
 local BUTLER_ARGV = remuda._butler_argv or {
   "claude",
@@ -259,6 +281,8 @@ local BUTLER_ARGV = remuda._butler_argv or {
   "auto",
   "--allowedTools",
   "mcp__remuda__run_script",
+  "--settings",
+  AUTO_MODE_SETTINGS,
   "--append-system-prompt",
   SYSTEM_PROMPT,
 }
@@ -272,6 +296,43 @@ local function launch_butler()
 end
 launch_butler()
 
+-- Reused across every re-`exec` and every later call from the launched
+-- session's own run_script -- a plain Lua local would NOT survive either
+-- (each `exec butler` is a fresh chunk with fresh locals; a later run_script
+-- call is a wholly separate Eval). `remuda._butler_compaction_schedule`
+-- lives on the persistent `remuda` table, so only a slot on that same table
+-- can hold "the one we already registered" across calls -- same reasoning
+-- as `remuda._butler_argv` and friends, just read back instead of only
+-- written. `run_script` needs no separate registration step to reach this:
+-- it evals arbitrary Lua against the daemon's live globals (`mcp.rs`'s
+-- `run_script => Request::Eval{code}`), so a plain function assigned onto
+-- `remuda` is already callable by name from a later run_script call, exactly
+-- like `remuda._butler_initial_name` already is.
+function remuda._butler_register_compaction_schedule()
+  if remuda._butler_compaction_schedule then
+    remuda.cancel(remuda._butler_compaction_schedule)
+  end
+  remuda._butler_compaction_schedule = remuda.schedule({
+    name = "butler-compaction",
+    every = COMPACTION_CHECK_INTERVAL,
+    run = function()
+      -- `context_left` is unimplemented (tools.lua:362-366, canon says "지금
+      -- 안 만든다") -- `is_busy` (idle-time heuristic, never a real token
+      -- count) is the proxy the canon names instead: only ever nudge
+      -- compaction while the session looks idle, never mid-task.
+      if butler_name and remuda.session(butler_name).is_busy == false then
+        remuda.send(butler_name, "/compact")
+        -- Same "type it, wait, then submit" hand-off the Matrix relay below
+        -- already uses -- `remuda.send`'s text+Enter lands as one write,
+        -- which this TUI reads as paste-in-progress rather than a distinct
+        -- Enter, so a separately-timed bare Enter confirms it.
+        remuda.process({ argv = { "sleep", "2" }, on_exit = "butler-compaction-submit" })
+      end
+    end,
+  })
+  return remuda._butler_compaction_schedule
+end
+
 -- `exec butler` re-running this file in the same daemon image would
 -- otherwise double this hook (see docs/design.md's augroup note) --
 -- clearing the group first keeps exactly one watchdog alive.
@@ -280,6 +341,10 @@ remuda.on("session_exited", function(name)
   if name == butler_name then
     launch_butler()
   end
+end, { group = "butler" })
+
+remuda.on("butler-compaction-submit", function()
+  remuda.send(butler_name, "")
 end, { group = "butler" })
 
 remuda.on("butler-matrix-line", function(line)
