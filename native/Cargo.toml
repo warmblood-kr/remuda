@@ -40,6 +40,12 @@ unicode-width = "0.2"
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28.0", features = ["socket"] }
 
+# `libc` (linux-only): `prctl`/`getppid`/`killpg` for `child_guard.rs` —
+# nothing else in this crate needs it directly, though it's already in the
+# graph transitively via several other deps (mio, parking_lot_core, ...).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_System_IO"] }
 

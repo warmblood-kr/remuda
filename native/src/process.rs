@@ -12,6 +12,7 @@
 //! batch at a time — the schedule ticker and any other caller queued behind
 //! it still gets a turn between batches.
 
+use crate::child_guard;
 use crate::image::Image;
 use std::collections::{HashMap, VecDeque};
 use std::io::BufRead;
@@ -68,13 +69,16 @@ impl Processes {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| "a process needs a non-empty argv".to_string())?;
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| e.to_string())?;
+            .stderr(Stdio::null());
+        // Every plain-pipe child funnels through the one seam that keeps it
+        // from outliving this daemon — see child_guard.rs.
+        child_guard::harden(&mut command);
+        let mut child = command.spawn().map_err(|e| e.to_string())?;
         let stdout = child.stdout.take().expect("stdout was piped");
 
         let state = Arc::new(ProcessState {
@@ -169,6 +173,35 @@ impl Processes {
             Some(c) => c.kill().map_err(|e| e.to_string()),
             None => Ok(()),
         }
+    }
+
+    /// Reap a tracked child's WHOLE process group (Linux, via
+    /// `child_guard::harden`) — covers a grandchild it forked before this
+    /// runs. Best-effort: an already-gone child is nothing to signal.
+    pub fn killpg(&self, id: u64) -> Result<(), String> {
+        let Some(state) = self.0.lock().unwrap().get(&id).cloned() else {
+            return Ok(());
+        };
+        let child = state.child.lock().unwrap();
+        let Some(c) = child.as_ref() else {
+            return Ok(());
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let pid = c.id() as libc::pid_t;
+            // SAFETY: killpg with a plain pid, no memory involved.
+            if unsafe { libc::killpg(pid, libc::SIGKILL) } != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(err.to_string());
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = c;
+        }
+        Ok(())
     }
 
     pub fn list(&self) -> Vec<u64> {
