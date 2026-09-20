@@ -2781,6 +2781,183 @@ fn butler_watchdog_relaunches_a_session_that_really_died() {
     );
 }
 
+/// Registration itself needs no live session at all -- `remuda.schedule`
+/// does not touch `butler_name`, only the `run` callback does when it later
+/// fires -- so this exercises `remuda._butler_register_compaction_schedule()`
+/// exactly the way a launched session's own `run_script` call would: a
+/// separate `eval` against an already-running daemon, called twice, standing
+/// in for a re-`exec` or a confused agent calling it more than once.
+/// `remuda.schedule` has no group-based bulk-cancel (only `remuda.clear_hooks`
+/// does, and only for hooks -- see `tools.lua`'s own doc comment on
+/// `remuda.schedule`), so without the cancel-before-register guard this would
+/// leave TWO handles both named "butler-compaction" in `remuda.schedules`.
+#[test]
+#[cfg(unix)]
+fn butler_compaction_schedule_registration_is_idempotent() {
+    let dir = scratch_dir("butler-compaction-idem");
+    let (token_path, config_path) = butler_config(
+        &dir,
+        "compaction-idem",
+        "http://127.0.0.1:1",
+        "!room:example.org",
+        "@butler:example.org",
+        "",
+    );
+    let token_str = token_path.to_string_lossy().to_string();
+    let config_str = config_path.to_string_lossy().to_string();
+    let daemon = Daemon::spawn_with_env(
+        &dir,
+        &[
+            ("REMUDA_BUTLER_TOKEN", token_str.as_str()),
+            ("REMUDA_BUTLER_CONFIG", config_str.as_str()),
+        ],
+    );
+    let path = daemon::socket_path_in(&dir, "s");
+
+    eval(
+        &path,
+        r#"remuda._butler_argv = {"sh", "-c", "sleep 5; exit 0"}"#,
+    );
+    eval(&path, "remuda._butler_skip_relay = true");
+
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Two separate Eval requests, exactly like two separate `run_script`
+    // calls would arrive -- a plain Lua local inside init.lua would not even
+    // be reachable a second time this way, which is the whole reason the
+    // handle lives on `remuda` itself.
+    eval(&path, "remuda._butler_register_compaction_schedule()");
+    eval(&path, "remuda._butler_register_compaction_schedule()");
+
+    let live = read_count(
+        &path,
+        r#"
+            local n = 0
+            for _, s in pairs(remuda.schedules) do
+                if s.name == "butler-compaction" then n = n + 1 end
+            end
+            return n
+        "#,
+    );
+    assert_eq!(
+        live, 1,
+        "two calls to remuda._butler_register_compaction_schedule() left {live} live \
+         \"butler-compaction\" schedules -- expected exactly 1 (cancel-before-register)"
+    );
+
+    drop(daemon);
+    let ps = std::process::Command::new("ps")
+        .args(["-eo", "pid,args"])
+        .output()
+        .expect("ps");
+    let ps_out = String::from_utf8_lossy(&ps.stdout);
+    let leaked: Vec<&str> = ps_out.lines().filter(|l| l.contains(&token_str)).collect();
+    assert!(
+        leaked.is_empty(),
+        "orphan process(es) still reference this test's own token path after teardown: {leaked:?}"
+    );
+}
+
+/// The schedule end to end, on a real spawned `sh` standing in for the
+/// launched `claude` session -- the same substitution
+/// `butler_watchdog_relaunches_a_session_that_really_died` uses. Split into
+/// two phases against ONE session's one life: busy (kept below the 2s idle
+/// threshold `Session::idle_for`/`Session.is_busy` read, by repeatedly
+/// sending a bare Enter -- the same proven-harmless no-op the Matrix relay's
+/// own submit hook already relies on) must never show `/compact`; idle
+/// (input stops) must eventually show it, typed and echoed by the pty the
+/// moment `remuda.send` writes it. `remuda._butler_compaction_interval` is
+/// set tiny, but the daemon's own tick (`native/src/daemon.rs::TICK_PERIOD`,
+/// 1s) is the real firing granularity -- so a "tiny" interval only means
+/// "fires every tick", not sub-second.
+#[test]
+#[cfg(unix)]
+fn butler_compaction_schedule_sends_compact_when_idle_but_not_when_busy() {
+    let dir = scratch_dir("butler-compaction-fire");
+    let (token_path, config_path) = butler_config(
+        &dir,
+        "compaction-fire",
+        "http://127.0.0.1:1",
+        "!room:example.org",
+        "@butler:example.org",
+        "",
+    );
+    let token_str = token_path.to_string_lossy().to_string();
+    let config_str = config_path.to_string_lossy().to_string();
+    let daemon = Daemon::spawn_with_env(
+        &dir,
+        &[
+            ("REMUDA_BUTLER_TOKEN", token_str.as_str()),
+            ("REMUDA_BUTLER_CONFIG", config_str.as_str()),
+        ],
+    );
+    let path = daemon::socket_path_in(&dir, "s");
+
+    eval(&path, "remuda._butler_compaction_interval = 0.05");
+    eval(&path, r#"remuda._butler_argv = {"sh"}"#);
+    eval(&path, "remuda._butler_skip_relay = true");
+
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let butler_name = eval(&path, "return remuda._butler_initial_name");
+
+    // Simulates the launched session's own one-time `run_script` call the
+    // system prompt asks for.
+    eval(&path, "remuda._butler_register_compaction_schedule()");
+
+    // Busy phase: outrun the 2s idle threshold for a few seconds, spanning
+    // at least two real 1s daemon ticks, and confirm the guard actually
+    // holds the send back.
+    let busy_until = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < busy_until {
+        eval(&path, &format!("remuda.send({butler_name:?}, \"\")"));
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let screen_while_busy = capture(&path, &butler_name);
+    assert!(
+        !screen_while_busy.contains("/compact"),
+        "compaction fired while the session was kept busy:\n{screen_while_busy}"
+    );
+
+    // Idle phase: stop feeding input and wait for the next tick to see the
+    // guard flip and /compact actually get typed (echoed immediately by the
+    // pty, no need to wait for the delayed Enter confirm).
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let screen = capture(&path, &butler_name);
+        if screen.contains("/compact") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "compaction never fired once the session went idle. last screen:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    drop(daemon);
+    let ps = std::process::Command::new("ps")
+        .args(["-eo", "pid,args"])
+        .output()
+        .expect("ps");
+    let ps_out = String::from_utf8_lossy(&ps.stdout);
+    let leaked: Vec<&str> = ps_out.lines().filter(|l| l.contains(&token_str)).collect();
+    assert!(
+        leaked.is_empty(),
+        "orphan process(es) still reference this test's own token path after teardown: {leaked:?}"
+    );
+}
+
 /// This documents the case where NO persistence layer is installed: `remuda`
 /// itself never re-execs butler on its own, restart or not — the only way
 /// `packages/butler/init.lua`'s real code ever runs is an explicit `remuda
