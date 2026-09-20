@@ -254,3 +254,43 @@ hook) is registered with no `group`, so a second `exec butler` would double
 it too — same class of bug the new `butler-compaction-submit` hook was
 deliberately given a group to avoid. This is a pre-existing gap, out of this
 round's scope per the dispatch; noted here rather than fixed.
+
+## Before
+
+*(This section and "Desired outcome"/"Expected" below are the reviewer's reconstruction of this branch's own stated intent, drawn from its "Design" and "Known ceiling" sections above — the original author's session no longer exists to write these in their own words. "Actual" below is the reviewer's own independently re-run measurement, attributed as such.)*
+
+Before this branch, `packages/butler/init.lua` has no compaction-schedule registration: a launched butler session has no way to ask remuda to prompt it toward `/compact` on any schedule. `remuda.schedule` exists in the native layer but had zero production call sites (confirmed independently: zero occurrences of "schedule" in `packages/butler/init.lua` on `main`).
+
+## Desired outcome
+
+A launched session can register its own periodic compaction upkeep — `remuda._butler_register_compaction_schedule()` — with an idle/busy check (`is_busy`) gating the `/compact` send, and a cancel-before-register guard so re-registering doesn't stack duplicate schedules. The registration call should be reachable by the session itself via `run_script`, without requiring a bypass of Claude Code's own auto-mode classifier (see "Retraction" above — a bypass was tried, found unapproved against decision 4055, and removed).
+
+## Expected
+
+The registration logic, its idle/busy gating, its `/compact` send, and its cancel-before-register guard would be exercised deterministically by tests that do not require a live authenticated `claude` session (see "What's deterministically tested" above). Whether a live launched session can actually invoke the registration call through the real auto-mode classifier, with no bypass, was expected to remain open — a live-model classifier behavior this round's code cannot resolve on its own (see "Known ceiling" above).
+
+## Actual
+
+Re-run by the reviewer on 2026-09-20, detached at `e316911c` (independent of the original author, whose session no longer exists):
+
+```
+$ cargo test -p remuda-native --test daemon -- --test-threads=1
+running 49 tests
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 40.15s
+
+$ cargo test -p remuda-native --test mcp -- --test-threads=1
+running 10 tests
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
+
+$ cargo test -p remuda-native --test script -- --test-threads=1
+running 9 tests
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+
+$ cargo fmt --all --check
+(clean, exit 0)
+
+$ cargo clippy --workspace --all-targets -- -D warnings
+(clean, exit 0)
+```
+
+49/49 daemon, 10/10 mcp, 9/9 script, fmt and clippy clean — matching the original author's self-report exactly under this independent re-execution. The two `claude_session.rs` tests remain `0 passed, 2 ignored` by explicit, documented design (they require a live authenticated `claude` CLI, not present in this environment) — a stated skip, not a silent gap. The live-classifier question named in "Known ceiling" above is unchanged by this re-run: it reports what was reproduced, not a resolution of what remains unresolved.
