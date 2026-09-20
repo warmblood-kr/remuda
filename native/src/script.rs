@@ -26,11 +26,12 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 48] = [
+pub const BINDINGS: [&str; 49] = [
     "_call",
     "_descriptors",
     "_event_counts",
     "_process_drain",
+    "_process_killpg",
     "_process_spawn",
     "_refresh_sessions_buffer",
     "_registry",
@@ -184,6 +185,12 @@ const WORDS: &[(&str, &str, &str)] = &[
         "kill",
         "Terminate a process started with `remuda.process`, by id.",
         "kill(id) -> nil",
+    ),
+    (
+        "_process_killpg",
+        "Reap a process's whole process group (Linux only); internal, called \
+         by the daemon's own clean-shutdown sweep, not meant for scripts.",
+        "_process_killpg(id) -> nil",
     ),
     (
         "processes",
@@ -560,6 +567,12 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
     table.set(
         "kill",
         lua.create_function(move |_, id: u64| killer.kill(id).map_err(mlua::Error::external))?,
+    )?;
+
+    let pg_killer = processes.clone();
+    table.set(
+        "_process_killpg",
+        lua.create_function(move |_, id: u64| pg_killer.killpg(id).map_err(mlua::Error::external))?,
     )?;
 
     table.set(
