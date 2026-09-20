@@ -16,15 +16,31 @@ So: **a remuda-launched butler session MAY register a recurring
 per-action approval.** The thing that decision resolved was never a remuda
 limitation — it was Claude Code's own auto-mode safety classifier
 ("[Unauthorized Persistence]"), a product-level gate on the *launched*
-`claude` process, unrelated to remuda's code. The fix is therefore a *scoped*
-`--settings` JSON passed to that one launched session's own argv, not a
-change to `init.lua`'s own registration story and not anyone's global
-`~/.claude/settings.json`.
+`claude` process, unrelated to remuda's code.
 
 This round built the real thing: `remuda._butler_register_compaction_schedule()`,
 a function the launched session calls itself, once, via `run_script`.
 `packages/butler/init.lua` never calls it automatically — only the
 system-prompt nudge asks the live agent to.
+
+**Retraction — the `--settings`/`autoMode.allow` bypass does NOT ship.** A
+prior version of this round added a scoped `--settings '{"autoMode":{"allow":
+[...]}}'` flag to `BUTLER_ARGV`, intended to pre-authorize the launched
+session's own `run_script` call past Claude Code's auto-mode classifier. That
+was checked against the actual decision record
+(`/home/toracle/.local/state/cc-butler/mail/decisions/done/20260917T214500-991-4055.org`)
+and found **not approved**: the human's own verbatim answer there names only
+two nouns — `allowedTools` and `mcp__remuda__run_script` (already shipped,
+pre-existing, unrelated to this addition). `--settings`/`autoMode.allow` is a
+different noun that appears in zero decision-file approvals anywhere in the
+queue. The decision record's own text is also explicit that if the live
+classifier blocks an action, that block IS the result to report — not a wall
+to route around with a different flag or mechanism. The flag, its
+`AUTO_MODE_SETTINGS` constant, and the Rust test that pinned its JSON shape
+(`butler_launch_argv_carries_valid_json_auto_mode_settings`) have all been
+removed. Everything below that still describes `--settings` is retained only
+as a historical record of what was tried and retracted — it is not current
+behavior.
 
 ## Design
 
@@ -74,7 +90,9 @@ keeps its own handle at `remuda._butler_compaction_schedule` and calls
 `remuda.cancel()` on it before registering again — the only correct
 cancel-by-identity a schedule offers.
 
-**Why `--settings` is scoped, not global.** `--settings <json-or-path>` is a
+**Why `--settings` is scoped, not global (retracted — see "Retraction" above;
+kept here only as a record of the reasoning that was checked and rejected,
+not as current design).** `--settings <json-or-path>` is a
 real, confirmed-live flag on this machine's `claude` CLI (`claude --help`).
 Passed as one inline JSON argv element in `BUTLER_ARGV`'s real branch only
 (`remuda._butler_argv or {...}` — the `or` branch, never touching a
@@ -96,9 +114,12 @@ dependency, `native/Cargo.toml`).
 
 ## What's deterministically tested (guaranteed, real tests)
 
-All four in `native/tests/daemon.rs`, following `butler_watchdog_relaunches_a_session_that_really_died`'s
+The following two in `native/tests/daemon.rs`, following `butler_watchdog_relaunches_a_session_that_really_died`'s
 own template (`remuda._butler_argv`/`remuda._butler_skip_relay` standing in
-for a real `claude`, plus its `ps`-based orphan-leak teardown check):
+for a real `claude`, plus its `ps`-based orphan-leak teardown check). (A third,
+`butler_launch_argv_carries_valid_json_auto_mode_settings`, existed briefly
+alongside the now-retracted `--settings` flag and was removed with it — see
+"Retraction" above.)
 
 1. **`butler_compaction_schedule_registration_is_idempotent`** — calls
    `remuda._butler_register_compaction_schedule()` twice via two separate
@@ -117,22 +138,14 @@ for a real `claude`, plus its `ps`-based orphan-leak teardown check):
    sending, wait for `/compact` to appear (typed characters are echoed by
    the pty immediately, no need to wait for the delayed confirm-Enter).
 3. **Red-then-green on test 2** — see transcript below.
-4. **`butler_launch_argv_carries_valid_json_auto_mode_settings`** — static,
-   `include_str!`-based, same idiom as the existing
-   `butler_launch_argv_allows_the_run_script_tool_for_schedule_registration`:
-   confirms `--settings` sits between `mcp__remuda__run_script` and
-   `--append-system-prompt`, extracts the `AUTO_MODE_SETTINGS` long-bracket
-   string literal by byte offset, and actually parses it with `serde_json`
-   (not eyeballed), then checks the one `allow` rule mentions the
-   registration function by name.
 
-Full suite: `cargo test -p remuda-native --test daemon` → **50 passed, 0
-failed** (all pre-existing tests plus the 3 new ones — the static shape check
-above is the 4th "new" test but shares its name-search style with an existing
-one already counted). `cargo test -p remuda-native --test mcp --test script`
-→ **10 + 9 passed**, confirming the surface/registry tests are untouched and
-still pass (see "No separate registration/reflection step needed" above for
-why).
+Full suite after the `--settings` strip: `cargo test -p remuda-native --test
+daemon` → **49 passed, 0 failed** (all pre-existing tests plus the 2 new ones
+above; the retracted static shape test is gone, not failing). `cargo test -p
+remuda-native --test mcp --test script` → **10 + 9 passed**, confirming the
+surface/registry tests are untouched and still pass (see "No separate
+registration/reflection step needed" above for why). `cargo fmt --check -p
+remuda-native` → clean, no output.
 
 ### Red-then-green transcript (test 2)
 
@@ -171,11 +184,31 @@ test butler_compaction_schedule_sends_compact_when_idle_but_not_when_busy ... ok
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 49 filtered out; finished in 5.06s
 ```
 
-## What's NOT deterministically testable — a named ceiling, not a faked test
+## Known ceiling
+
+The compaction-schedule registration logic
+(`remuda._butler_register_compaction_schedule()`, its idle/busy check via
+`is_busy`, its `/compact` send, and its cancel-before-register guard) is real,
+tested, and correct — see "What's deterministically tested" above. What this
+round's code cannot do, and does not attempt to do, is get the launched
+session's own `run_script` call past Claude Code's live auto-mode classifier.
+No `--settings`/`autoMode.allow` bypass ships (see "Retraction" above): the
+only pre-authorized noun on this path is the pre-existing `--allowedTools
+mcp__remuda__run_script`. Whether a live launched session can actually invoke
+`remuda._butler_register_compaction_schedule()` via `run_script` without the
+classifier blocking it is **unresolved**, and is not something this round's
+code — or any future flag/wrapper that tries to grant the bypass a different
+way — can guarantee or unlock. That is the honest deliverable for this half
+of the work: the mechanism is built and proven; whether a real session gets
+to actually call it, live, is a live-model classifier question outside this
+code's control, and a classifier block there is a result to report, not a gap
+to route around.
+
+## What's NOT deterministically testable — additional detail
 
 - **Whether the live Claude Code auto-mode classifier actually approves the
-  real `mcp__remuda__run_script` call the real agent makes, given this exact
-  `AUTO_MODE_SETTINGS` prose.** This is evidence-at-best territory: it needs a
+  real `mcp__remuda__run_script` call the real agent makes.** This is
+  evidence-at-best territory: it needs a
   real, budgeted, tool-enabled `claude` session, which this dispatch is not
   authorized to spend (local dev only, no credentials this worker holds
   anyway, and boundaries explicitly rule out a full agentic run). No test in

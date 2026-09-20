@@ -260,18 +260,6 @@ local SYSTEM_PROMPT = "You are bridged into one Matrix room via remuda. "
 -- every other remuda._butler_* test hook in this file).
 local COMPACTION_CHECK_INTERVAL = remuda._butler_compaction_interval or 30 * 60
 
--- Scoped to exactly this one launched session, exactly this one action --
--- never anyone's global ~/.claude/settings.json. Answers decision
--- 20260917T083000-991-4001 (2026-09-17, 정수님: "반복 일정을 걸어도
--- 됩니다. use it to validate with local test.") -- a remuda-launched
--- butler session MAY register a recurring schedule without per-action
--- approval. Finger-tight: the exact prose wording below is a first draft,
--- never tested against the live classifier -- tightening step: revisit the
--- wording once a real, budgeted, tool-enabled session has actually been run
--- and its classifier verdict observed. JSON validity is checked by
--- `native/tests/daemon.rs`'s static shape test, not by eyeballing it here.
-local AUTO_MODE_SETTINGS = [[{"autoMode":{"allow":["Calling remuda._butler_register_compaction_schedule() via mcp__remuda__run_script, once, to enable this butler's own periodic context-compaction upkeep is pre-authorized -- see decision 20260917T083000-991-4001."]}}]]
-
 local BUTLER_ARGV = remuda._butler_argv or {
   "claude",
   "--mcp-config",
@@ -281,8 +269,6 @@ local BUTLER_ARGV = remuda._butler_argv or {
   "auto",
   "--allowedTools",
   "mcp__remuda__run_script",
-  "--settings",
-  AUTO_MODE_SETTINGS,
   "--append-system-prompt",
   SYSTEM_PROMPT,
 }

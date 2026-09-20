@@ -2958,58 +2958,6 @@ fn butler_compaction_schedule_sends_compact_when_idle_but_not_when_busy() {
     );
 }
 
-/// Compile-time proof that `--settings` carries the `AUTO_MODE_SETTINGS`
-/// JSON in the right argv slot, and that the JSON itself actually parses --
-/// via a real decoder (`serde_json`, already a direct dependency, see
-/// `native/Cargo.toml`), not by eyeballing the long-bracket string literal.
-/// Same live-`claude` limitation as
-/// `butler_launch_argv_allows_the_run_script_tool_for_schedule_registration`
-/// blocks proving the real classifier honors this at runtime -- see
-/// `steps/` for that ceiling, named rather than faked here.
-#[test]
-fn butler_launch_argv_carries_valid_json_auto_mode_settings() {
-    let init_lua = include_str!("../../packages/butler/init.lua");
-
-    let run_script_idx = init_lua
-        .find("\"mcp__remuda__run_script\",")
-        .expect("butler launch argv is missing the mcp__remuda__run_script tool name");
-    let settings_flag_idx = init_lua
-        .find("\"--settings\",")
-        .expect("butler launch argv is missing --settings");
-    let append_system_prompt_idx = init_lua
-        .find("\"--append-system-prompt\",")
-        .expect("butler launch argv lost --append-system-prompt");
-    assert!(
-        run_script_idx < settings_flag_idx && settings_flag_idx < append_system_prompt_idx,
-        "expected --settings between mcp__remuda__run_script and --append-system-prompt, \
-         got byte offsets: run_script={run_script_idx} settings={settings_flag_idx} \
-         append_system_prompt={append_system_prompt_idx}"
-    );
-
-    let marker = "local AUTO_MODE_SETTINGS = [[";
-    let start = init_lua
-        .find(marker)
-        .expect("AUTO_MODE_SETTINGS definition not found")
-        + marker.len();
-    let end = init_lua[start..]
-        .find("]]")
-        .map(|i| start + i)
-        .expect("AUTO_MODE_SETTINGS long-bracket string literal never closes");
-    let json_text = &init_lua[start..end];
-
-    let value: serde_json::Value = serde_json::from_str(json_text)
-        .unwrap_or_else(|e| panic!("AUTO_MODE_SETTINGS is not valid JSON: {e}\n{json_text}"));
-    let allow = value["autoMode"]["allow"]
-        .as_array()
-        .expect("AUTO_MODE_SETTINGS.autoMode.allow must be an array");
-    assert!(
-        allow.iter().any(|rule| rule
-            .as_str()
-            .is_some_and(|s| s.contains("_butler_register_compaction_schedule"))),
-        "AUTO_MODE_SETTINGS.autoMode.allow never mentions the registration function: {allow:?}"
-    );
-}
-
 /// This documents the case where NO persistence layer is installed: `remuda`
 /// itself never re-execs butler on its own, restart or not — the only way
 /// `packages/butler/init.lua`'s real code ever runs is an explicit `remuda
