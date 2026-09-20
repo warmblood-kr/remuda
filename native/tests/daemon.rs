@@ -1337,6 +1337,203 @@ fn a_silent_process_yields_only_the_exit_event() {
     assert_eq!(read_count(&path, "return remuda.silent_lines"), 0);
 }
 
+/// A pid this daemon spawned is gone: `kill(pid, 0)` — no signal delivered,
+/// only whether one *could* be — is ESRCH once the pid is reaped. Anything
+/// else (success, or a permission error) means it is still around.
+#[cfg(target_os = "linux")]
+fn pid_alive(pid: i32) -> bool {
+    let rc = unsafe { libc::kill(pid, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+/// Find a pid's own child, by exact pid, one time — never a glob/grep
+/// pattern (this investigation's own history: zsh's globber has produced a
+/// false "no matches" from `ps -ef | grep [r]emuda` more than once).
+#[cfg(target_os = "linux")]
+fn child_pid_of(parent: i32, deadline: Instant) -> Option<i32> {
+    loop {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "pid=", "--ppid", &parent.to_string()])
+            .output()
+            .expect("ps");
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(pid) = text.split_whitespace().next().and_then(|s| s.parse().ok()) {
+            return Some(pid);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// [MEASURED, Linux] This is the actual leak (`process.rs`'s plain-pipe
+/// children, "ALWAYS survive daemon death... zero process-group isolation,
+/// zero signal handling anywhere") and this is `child_guard::harden`'s fix
+/// for it: a real out-of-process daemon, SIGKILLed for real, and its DIRECT
+/// `remuda.process` child is gone within PATIENCE — not by any daemon code
+/// running (none does, on SIGKILL), but because the kernel itself delivers
+/// PDEATHSIG the moment the daemon dies.
+///
+/// The GRANDCHILD (`sleep`, forked by the `sh` direct child before the kill)
+/// is asserted to *survive* the same SIGKILL, on purpose: PDEATHSIG is
+/// registered on the direct child alone and is cleared across fork(2), so it
+/// cannot reach a process it never touched, and nothing else runs on a raw
+/// SIGKILL to sweep the group. This pins the exact boundary named in
+/// child_guard.rs's own doc comment and in steps/ "Known ceilings", rather
+/// than asserting past it. See
+/// `a_clean_shutdown_reaps_a_processs_whole_group_including_a_grandchild`
+/// for the one path that DOES reach this grandchild.
+///
+/// Negative control, run by hand for this round (see steps/ writeup): with
+/// `child_guard::harden`'s call in `process.rs::spawn` commented out, this
+/// test's first `while pid_alive(direct_pid)` loop times out — nothing tells
+/// the kernel to kill the direct child when the daemon dies. Restoring the
+/// call makes it pass again.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_sigkilled_daemon_reaps_its_direct_process_child_but_not_an_already_forked_grandchild() {
+    let dir = scratch_dir("orphan-reap");
+    let daemon = Daemon::spawn(&dir);
+    let path = daemon::socket_path_in(&dir, "s");
+
+    eval(&path, "remuda.og_lines = {}");
+    eval(
+        &path,
+        "remuda.on('og-line', function(l) table.insert(remuda.og_lines, l) end)",
+    );
+    eval(
+        &path,
+        "remuda.process{argv = {'sh', '-c', 'echo $$; sleep 60'}, on_line = 'og-line'}",
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return #remuda.og_lines") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the direct child never printed its own pid"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let direct_pid: i32 = eval(&path, "return remuda.og_lines[1]")
+        .trim()
+        .parse()
+        .expect("the printed $$ is a pid");
+
+    let deadline = Instant::now() + PATIENCE;
+    let grandchild_pid = child_pid_of(direct_pid, deadline)
+        .unwrap_or_else(|| panic!("sleep never forked as a child of {direct_pid}"));
+    assert!(
+        pid_alive(direct_pid),
+        "sanity: direct child must be alive before the kill"
+    );
+    assert!(
+        pid_alive(grandchild_pid),
+        "sanity: grandchild must be alive before the kill"
+    );
+
+    let daemon_pid = daemon.0.id() as libc::pid_t;
+    assert_eq!(
+        unsafe { libc::kill(daemon_pid, libc::SIGKILL) },
+        0,
+        "SIGKILL of the real daemon pid must succeed"
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while pid_alive(direct_pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the direct child ({direct_pid}) outlived a SIGKILLed daemon — child_guard::harden \
+             did not reap it"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Pin the ceiling: give the kernel a beat, then confirm the grandchild
+    // is still here — a raw SIGKILL of the daemon runs no code, so nothing
+    // built this round could have reached it.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        pid_alive(grandchild_pid),
+        "a grandchild dying too would mean either this test's premise changed or something \
+         now reaps process groups on a signal this round never wired that to — worth knowing, \
+         not assuming"
+    );
+
+    // Clean up the leak this test just proved exists, so it doesn't actually
+    // linger on the machine that ran it.
+    unsafe {
+        libc::kill(grandchild_pid, libc::SIGKILL);
+    }
+}
+
+/// [MEASURED, Linux] The one path that DOES reach a grandchild: a clean
+/// `remuda restart` sends `Request::Shutdown`, which runs
+/// `reap_processes_before_exit` (daemon.rs) before the process exits —
+/// `remuda.processes()` + `remuda._process_killpg(id)`, which `killpg`s the
+/// whole process group `child_guard::harden` put the direct child in. Both
+/// the direct child and the grandchild it already forked are gone.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_clean_shutdown_reaps_a_processs_whole_group_including_a_grandchild() {
+    let dir = scratch_dir("orphan-reap-clean");
+    let _daemon = Daemon::spawn(&dir);
+    let path = daemon::socket_path_in(&dir, "s");
+
+    eval(&path, "remuda.cg_lines = {}");
+    eval(
+        &path,
+        "remuda.on('cg-line', function(l) table.insert(remuda.cg_lines, l) end)",
+    );
+    eval(
+        &path,
+        "remuda.process{argv = {'sh', '-c', 'echo $$; sleep 60'}, on_line = 'cg-line'}",
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, "return #remuda.cg_lines") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the direct child never printed its own pid"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let direct_pid: i32 = eval(&path, "return remuda.cg_lines[1]")
+        .trim()
+        .parse()
+        .expect("the printed $$ is a pid");
+
+    let deadline = Instant::now() + PATIENCE;
+    let grandchild_pid = child_pid_of(direct_pid, deadline)
+        .unwrap_or_else(|| panic!("sleep never forked as a child of {direct_pid}"));
+    assert!(
+        pid_alive(direct_pid) && pid_alive(grandchild_pid),
+        "sanity: both alive pre-restart"
+    );
+
+    // No live pty session was ever created here, so `remuda restart` (no
+    // `-f`) proceeds straight to `Request::Shutdown` without a confirmation
+    // prompt — see `confirm_losses` in src/bin/remuda.rs.
+    let out = remuda(&dir, &["-s", "s", "restart"]);
+    assert!(
+        out.status.success(),
+        "restart failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let deadline = Instant::now() + PATIENCE;
+    while pid_alive(direct_pid) || pid_alive(grandchild_pid) {
+        assert!(
+            Instant::now() < deadline,
+            "a clean shutdown left something behind: direct {direct_pid} alive={}, grandchild \
+             {grandchild_pid} alive={}",
+            pid_alive(direct_pid),
+            pid_alive(grandchild_pid)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 #[test]
 fn a_line_flood_does_not_starve_the_schedule_ticker() {
     let dir = scratch_dir("process-flood");
