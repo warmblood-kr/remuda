@@ -515,7 +515,7 @@ remuda.tool{
 
 local butler_token = next_token("butler")
 bus.tokens[butler_token] = "butler"
-bus.agents.butler = { kind = os.getenv("REMUDA_BUTLER_KIND") or "claude", token = butler_token }
+bus.agents.butler = { kind = os.getenv("REMUDA_BUTLER_AGENT") or "claude", token = butler_token }
 mailbox("butler")
 local mcp_file = io.open(mcp_config_path, "w")
 mcp_file:write(agent_mcp_json(butler_token))
@@ -576,7 +576,7 @@ local function _butler_trace(event, detail)
   end)
 end
 
-local butler_kind = os.getenv("REMUDA_BUTLER_KIND") or "claude"
+local butler_kind = os.getenv("REMUDA_BUTLER_AGENT") or "claude"
 local BUTLER_ARGV = remuda._butler_argv
 if not BUTLER_ARGV then
   BUTLER_ARGV = build_agent_argv(butler_kind, {
