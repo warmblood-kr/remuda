@@ -260,6 +260,37 @@ local SYSTEM_PROMPT = "You are bridged into one Matrix room via remuda. "
 -- every other remuda._butler_* test hook in this file).
 local COMPACTION_CHECK_INTERVAL = remuda._butler_compaction_interval or 30 * 60
 
+-- remuda._butler_compaction_trace_path lets a test redirect the append-only
+-- trace below to a throwaway tempfile instead of the real config dir (same
+-- idiom as remuda._butler_compaction_interval just above). nil in
+-- production falls back to the real default, matching the token/config
+-- path convention already used by default_config_home() above.
+-- Confirmed at the source level (lua-src's vendored loslib.c, the "lua54"
+-- feature this crate builds with): a leading "!" in os.date's format
+-- routes through l_gmtime, not l_localtime -- so "!%Y-%m-%dT%H:%M:%SZ"
+-- below is genuinely UTC, not merely assumed to be.
+local function _butler_trace(event, detail)
+  pcall(function()
+    local path = remuda._butler_compaction_trace_path
+      or (os.getenv("XDG_CONFIG_HOME") or (os.getenv("HOME") .. "/.config"))
+        .. "/remuda/compaction-trace.log"
+    local f = io.open(path, "a")
+    if not f then
+      -- Stock Lua's io has no mkdir; a one-time `mkdir -p` on first-open
+      -- failure is smaller than documenting "the directory must already
+      -- exist" as a precondition every caller (including every test) has
+      -- to remember to satisfy.
+      os.execute('mkdir -p "' .. path:match("^(.*)/[^/]+$") .. '"')
+      f = io.open(path, "a")
+    end
+    if not f then
+      return
+    end
+    f:write(os.date("!%Y-%m-%dT%H:%M:%SZ") .. "\t" .. event .. "\t" .. (detail or "") .. "\n")
+    f:close()
+  end)
+end
+
 local BUTLER_ARGV = remuda._butler_argv or {
   "claude",
   "--mcp-config",
@@ -298,6 +329,7 @@ function remuda._butler_register_compaction_schedule()
   if remuda._butler_compaction_schedule then
     remuda.cancel(remuda._butler_compaction_schedule)
   end
+  _butler_trace("registered")
   remuda._butler_compaction_schedule = remuda.schedule({
     name = "butler-compaction",
     every = COMPACTION_CHECK_INTERVAL,
@@ -307,12 +339,19 @@ function remuda._butler_register_compaction_schedule()
       -- count) is the proxy the canon names instead: only ever nudge
       -- compaction while the session looks idle, never mid-task.
       if butler_name and remuda.session(butler_name).is_busy == false then
-        remuda.send(butler_name, "/compact")
+        local ok, err = pcall(remuda.send, butler_name, "/compact")
+        if ok then
+          _butler_trace("sent")
+        else
+          _butler_trace("error", tostring(err))
+        end
         -- Same "type it, wait, then submit" hand-off the Matrix relay below
         -- already uses -- `remuda.send`'s text+Enter lands as one write,
         -- which this TUI reads as paste-in-progress rather than a distinct
         -- Enter, so a separately-timed bare Enter confirms it.
         remuda.process({ argv = { "sleep", "2" }, on_exit = "butler-compaction-submit" })
+      else
+        _butler_trace("skipped_busy")
       end
     end,
   })
