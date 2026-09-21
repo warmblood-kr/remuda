@@ -1,5 +1,25 @@
 local builders = assert(remuda._butler_agent_builders)
 local support = assert(remuda._butler_agent_support)
+local telemetry = assert(remuda._butler_telemetry_adapters)
+
+telemetry.claude = {
+  setup = function(spec)
+    local status_path = spec.status_path or (os.tmpname() .. "." .. spec.name .. ".status")
+    return { status_path = status_path, settings_path = support.status_settings(status_path) }
+  end,
+  read = function(state)
+    local status = state.status_path and io.open(state.status_path, "r")
+    if not status then return {} end
+    local line = status:read("*l")
+    status:close()
+    if not line then return {} end
+    local model, used, window, percent = line:match(
+      "^MODEL:([A-Za-z0-9_.%-?]+) CTX:([0-9?]+) CTXWIN:([0-9?]+) CTXPCT:([0-9?]+)$"
+    )
+    if not model then return {} end
+    return { model = model, context_used = used, context_window = window, context_percent = percent }
+  end,
+}
 
 builders.claude = function(spec)
   local argv = { "claude" }

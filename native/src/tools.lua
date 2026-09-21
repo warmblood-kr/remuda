@@ -554,20 +554,11 @@ function remuda._refresh_sessions_buffer(width)
     local bus = remuda._butler_bus
     local agent = bus and bus.agents and bus.agents[session.name]
     if not agent then return nil end
-    local model, used, window, percent = agent.model or "?", "?", "?", "?"
-    local status = agent.status_path and io.open(agent.status_path, "r")
-    if status then
-      local line = status:read("*l")
-      status:close()
-      if line then
-        local seen_model, seen_used, seen_window, seen_percent = line:match(
-          "^MODEL:([A-Za-z0-9_.%-?]+) CTX:([0-9?]+) CTXWIN:([0-9?]+) CTXPCT:([0-9?]+)$"
-        )
-        if seen_model then
-          model, used, window, percent = seen_model, seen_used, seen_window, seen_percent
-        end
-      end
-    end
+    local telemetry = remuda._butler_telemetry_for(agent)
+    local model = telemetry.model
+    local used = telemetry.context_used
+    local window = telemetry.context_window
+    local percent = telemetry.context_percent
     local context = "CTX " .. context_k(used) .. "/" .. context_k(window)
     if percent ~= "?" then context = context .. " " .. percent .. "%" end
     return (agent.kind or "agent") .. " · " .. model .. " · " .. context

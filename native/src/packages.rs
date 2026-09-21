@@ -19,6 +19,11 @@ const BUILTINS: &[Builtin] = &[
         subcommand: Some("butler"),
     },
     Builtin {
+        name: "butler/telemetry",
+        source: include_str!("../../packages/butler/telemetry.lua"),
+        subcommand: None,
+    },
+    Builtin {
         name: "butler/agents/claudecode",
         source: include_str!("../../packages/butler/agents/claudecode.lua"),
         subcommand: None,
