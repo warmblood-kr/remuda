@@ -27,6 +27,7 @@ remuda butler — lightweight coordination for managed agents
 
   remuda butler sessions
   remuda butler launch <claude|codex> [name]
+  remuda butler topic new <name> [--template T] [--agent A]
   remuda butler send <from> <to> <message...>
   remuda butler inbox <name>
 
@@ -60,6 +61,17 @@ fn butler_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                 ),
             )
         }),
+        ["topic", "new", name] => topic_new(server, path, name, None, None),
+        ["topic", "new", name, "--template", template] => {
+            topic_new(server, path, name, Some(template), None)
+        }
+        ["topic", "new", name, "--agent", agent] => {
+            topic_new(server, path, name, None, Some(agent))
+        }
+        ["topic", "new", name, "--template", template, "--agent", agent]
+        | ["topic", "new", name, "--agent", agent, "--template", template] => {
+            topic_new(server, path, name, Some(template), Some(agent))
+        }
         ["send", from, to, message @ ..] if !message.is_empty() => {
             with_daemon(server, path, |path| {
                 eval(
@@ -84,6 +96,26 @@ fn butler_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn topic_new(
+    server: &str,
+    path: &Path,
+    name: &str,
+    template: Option<&str>,
+    agent: Option<&str>,
+) -> ExitCode {
+    with_daemon(server, path, |path| {
+        eval(
+            path,
+            &format!(
+                "return remuda._butler_topic_new({}, {}, {})",
+                lua_string(name),
+                template.map(lua_string).unwrap_or_else(|| "nil".into()),
+                agent.map(lua_string).unwrap_or_else(|| "nil".into()),
+            ),
+        )
+    })
 }
 
 pub(crate) fn lua_string(value: &str) -> String {
