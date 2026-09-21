@@ -235,6 +235,34 @@ local function default_config_home()
   return home .. "/.config"
 end
 
+local function default_data_home()
+  local xdg = os.getenv("XDG_DATA_HOME")
+  if xdg and xdg ~= "" then return xdg end
+  local home = os.getenv("HOME")
+  return home and home ~= "" and home .. "/.local/share" or nil
+end
+
+local function expand_home(path)
+  local home = os.getenv("HOME") or ""
+  return path:gsub("^~", home)
+end
+
+local topic_config = {
+  project_home = expand_home(os.getenv("REMUDA_BUTLER_PROJECT_HOME") or "~/projects"),
+  templates = {},
+}
+
+remuda.butler = remuda.butler or {}
+function remuda.butler.project_home(path)
+  topic_config.project_home = expand_home(path)
+end
+function remuda.butler.template(name, setup)
+  topic_config.templates[name] = setup
+end
+
+local data_home = default_data_home()
+local butler_session_cwd = data_home and data_home .. "/remuda/butler/sessions/butler"
+
 -- Fails loudly when Matrix has been configured -- naming the exact path it
 -- tried and mentioning the override -- rather than silently proceeding with
 -- a path that doesn't resolve to a real file.
@@ -273,6 +301,17 @@ local function file_exists(path)
   end
   f:close()
   return true
+end
+
+local function load_topic_config()
+  local path = os.getenv("REMUDA_BUTLER_TOPICS")
+    or (default_config_home() and default_config_home() .. "/remuda/butler/topics.lua")
+  if not path or not file_exists(path) then return end
+  local configured = assert(loadfile(path))()
+  if configured == nil then return end
+  assert(type(configured) == "table", "Butler topics config must return a table")
+  if configured.project_home then remuda.butler.project_home(configured.project_home) end
+  for name, setup in pairs(configured.templates or {}) do remuda.butler.template(name, setup) end
 end
 
 -- Matrix is an optional Butler integration. An explicit override means its
@@ -435,6 +474,30 @@ local function launch_agent(kind, requested_name, cwd, model)
   return actual
 end
 
+local function make_topic(name, template, kind)
+  load_topic_config()
+  local root = topic_config.project_home .. "/" .. name
+  remuda.mkdir(root)
+  local topic = { name = name, root = root }
+  function topic.write(relative_path, contents)
+    local f = assert(io.open(root .. "/" .. relative_path, "w"))
+    f:write(contents)
+    f:close()
+  end
+  function topic.run(argv)
+    local words = { "cd", shell_quote(root), "&&" }
+    for _, word in ipairs(argv) do words[#words + 1] = shell_quote(word) end
+    assert(os.execute(table.concat(words, " ")))
+  end
+  if template then
+    local setup = topic_config.templates[template]
+    assert(setup, "unknown Butler topic template: " .. template)
+    assert(type(setup) == "function", "Butler topic template must be a function: " .. template)
+    setup(topic)
+  end
+  return launch_agent(kind or "claude", name, root)
+end
+
 -- Shell-facing doors into the same deliberately mutable bus.  These are not
 -- capability checks: Butler is a workshop, and the `from` name is simply the
 -- attribution a human (or an agent using the CLI) chose to leave on a note.
@@ -442,6 +505,9 @@ end
 -- a REPL without having to know this chunk's private locals.
 function remuda._butler_launch(kind, name)
   return launch_agent(kind, name)
+end
+function remuda._butler_topic_new(name, template, kind)
+  return make_topic(name, template, kind)
 end
 function remuda._butler_send(from, to, text)
   if not bus.agents[to] then error("no Butler agent named " .. tostring(to), 0) end
@@ -590,7 +656,8 @@ end
 -- name across respawns by feeding the previous result back in as the name.
 local butler_name = nil
 local function launch_butler()
-  butler_name = remuda.new(butler_name or remuda._butler_initial_name, BUTLER_ARGV)
+  if butler_session_cwd then remuda.mkdir(butler_session_cwd) end
+  butler_name = remuda.new(butler_name or remuda._butler_initial_name, BUTLER_ARGV, butler_session_cwd)
 end
 launch_butler()
 

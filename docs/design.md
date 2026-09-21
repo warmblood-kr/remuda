@@ -174,6 +174,38 @@ for), the outbound side is a small bash sender (a `remuda.process` `run`
 callback), and the session in between is an ordinary `remuda.new` session
 fed with `remuda.send` — nothing about this package needs a new primitive.
 
+### Topics
+
+Butler's own service session has a stable, Remuda-owned workspace at
+`${XDG_DATA_HOME:-$HOME/.local/share}/remuda/butler/sessions/butler`. Agent
+work belongs elsewhere: `remuda butler topic new NAME` creates
+`NAME` below `~/projects` by default and launches its agent with that topic
+directory as its cwd. `REMUDA_BUTLER_PROJECT_HOME` overrides that default.
+
+Topics are configured in the trusted user file
+`${XDG_CONFIG_HOME:-$HOME/.config}/remuda/butler/topics.lua` (or an explicit
+`REMUDA_BUTLER_TOPICS` path). It is read only when a topic is created, so an
+absent or broken optional template does not prevent the Butler service from
+starting. The file returns a table; a template is ordinary Lua and is free to
+write files or run setup commands:
+
+```lua
+return {
+  project_home = "~/projects",
+  templates = {
+    monocle = function(topic)
+      topic.write("CLAUDE.md", "# Monocle topic\n")
+      topic.run({"gh", "repo", "clone", "warmblood-kr/monocle", "."})
+    end,
+  },
+}
+```
+
+`remuda butler topic new research --template monocle` creates the directory,
+runs the template from inside it, and starts a `claude` session named
+`research`. `--agent codex` selects another registered agent builder. With no
+template, a topic is simply an empty directory.
+
 The helper and the session talk to each other through the same line-oriented
 channel any `remuda.process` caller gets, so the format has to survive being
 squeezed through it: `sender<TAB>escaped-body`, one physical line per Matrix
