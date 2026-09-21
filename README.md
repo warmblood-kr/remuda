@@ -60,10 +60,13 @@ scrollback and prompt come back, and a line says how to get back.
 
 ## Install
 
+No stable release has been published yet (see [Channels](#channels) below),
+so install from `nightly` — every commit on `main`:
+
 **Linux and macOS** (x86_64, and Apple Silicon):
 
 ```sh
-curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | sh
+curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh
 ```
 
 It downloads a signed-by-checksum tarball, verifies it against the release's
@@ -73,7 +76,7 @@ put it elsewhere.
 **Windows** (x86_64), in PowerShell:
 
 ```powershell
-irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
+$env:REMUDA_CHANNEL='nightly'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
 ```
 
 Same shape: verified against `SHA256SUMS`, landed in `~\.local\bin`, and
@@ -100,17 +103,11 @@ Two, in the shape rustup uses:
 | `stable` (default) | a `vX.Y.Z` tag | `0.1.0` |
 | `nightly` | every commit on `main` | `0.1.0-nightly.20260910.abc1234` |
 
-```sh
-curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh
-```
-
-```powershell
-$env:REMUDA_CHANNEL='nightly'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
-```
-
-⚠ No stable release has been published yet, so the default channel above
-currently fails with a message pointing at the `nightly` one-liner — use it
-directly until a `stable` build exists.
+No stable release has been published yet, so the [Install](#install) command
+above already pins `REMUDA_CHANNEL` to `nightly` explicitly — the plain
+one-liner without it would hit the missing `stable` default and fail. Once a
+`stable` build exists, switch by passing `REMUDA_CHANNEL=stable` (sh) or
+setting `$env:REMUDA_CHANNEL='stable'` (PowerShell) instead.
 
 The chosen channel is remembered in `$XDG_DATA_HOME/remuda/channel`, so
 upgrading stays on the track you picked:
