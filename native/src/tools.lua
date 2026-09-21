@@ -546,13 +546,44 @@ register(
 function remuda._refresh_sessions_buffer(width)
   local sessions = remuda.ls()
   local lines = {}
+  local function context_k(tokens)
+    if tokens == "?" then return "?" end
+    return string.format("%.0fk", tonumber(tokens) / 1000)
+  end
+  local function butler_detail(session)
+    local bus = remuda._butler_bus
+    local agent = bus and bus.agents and bus.agents[session.name]
+    if not agent then return nil end
+    local model, used, window, percent = agent.model or "?", "?", "?", "?"
+    local status = agent.status_path and io.open(agent.status_path, "r")
+    if status then
+      local line = status:read("*l")
+      status:close()
+      if line then
+        local seen_model, seen_used, seen_window, seen_percent = line:match(
+          "^MODEL:([A-Za-z0-9_.%-?]+) CTX:([0-9?]+) CTXWIN:([0-9?]+) CTXPCT:([0-9?]+)$"
+        )
+        if seen_model then
+          model, used, window, percent = seen_model, seen_used, seen_window, seen_percent
+        end
+      end
+    end
+    local context = "CTX " .. context_k(used) .. "/" .. context_k(window)
+    if percent ~= "?" then context = context .. " " .. percent .. "%" end
+    return (agent.kind or "agent") .. " · " .. model .. " · " .. context
+  end
   if #sessions == 0 then
     lines = { "the herd is empty.", "press n to start a session." }
   else
     for i, s in ipairs(sessions) do
-      local flag = s.attached and "⚑" or " "
-      local state = s.alive and "live" or "dead"
-      lines[i] = (width >= 22) and (state .. " " .. flag) or flag
+      local detail = butler_detail(s)
+      if detail then
+        lines[i] = detail
+      else
+        local flag = s.attached and "⚑" or " "
+        local state = s.alive and "live" or "dead"
+        lines[i] = (width >= 22) and (state .. " " .. flag) or flag
+      end
     end
   end
   remuda.buffer.new("*sessions*"):set(table.concat(lines, "\n"))
