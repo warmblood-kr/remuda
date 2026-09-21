@@ -163,12 +163,13 @@ one JSON line per event — is an ordinary `remuda.process` caller, arriving
 in a later change. This primitive's own tests use a small line-printing
 helper and know nothing about Matrix, reconnects, or backoff.
 
-## The Matrix bridge is one package, wired entirely out of existing primitives
+## Butler is a local session manager with an optional Matrix bridge
 
-`packages/butler` runs one Claude Code session, fed by messages from one
-Matrix room, replying through one MCP tool — the same three shapes as
-everything above it, composed rather than special-cased. The inbound side
-is a small Python `/sync` long-poll (the caller `remuda.process` was built
+`packages/butler` runs one Claude Code session. It works locally with no
+Matrix configuration. When both Matrix credential files are configured, it
+also bridges one Matrix room and exposes one reply MCP tool — the same three
+shapes as everything above it, composed rather than special-cased. The inbound
+side is a small Python `/sync` long-poll (the caller `remuda.process` was built
 for), the outbound side is a small bash sender (a `remuda.process` `run`
 callback), and the session in between is an ordinary `remuda.new` session
 fed with `remuda.send` — nothing about this package needs a new primitive.

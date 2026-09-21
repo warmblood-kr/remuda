@@ -32,6 +32,16 @@ pub const TOOLS: [&str; 5] = ["capture", "ls", "new", "run_script", "send"];
 
 /// Serve MCP over stdin/stdout until the client closes the stream.
 pub fn serve(socket: &Path) -> std::io::Result<()> {
+    let capability = std::env::var("REMUDA_BUTLER_SESSION_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty());
+    serve_with_capability(socket, capability.as_deref())
+}
+
+/// Serve MCP with the daemon-issued capability for this child process.  The
+/// capability is deliberately process configuration rather than an MCP
+/// argument: an MCP caller must not be able to claim another session.
+pub fn serve_with_capability(socket: &Path, capability: Option<&str>) -> std::io::Result<()> {
     let stdin = std::io::stdin().lock();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lines() {
@@ -41,7 +51,7 @@ pub fn serve(socket: &Path) -> std::io::Result<()> {
         }
         // A notification has no id and takes no reply. Answering one is a
         // protocol error, so `handle` returns None rather than an empty object.
-        if let Some(reply) = handle(socket, &line) {
+        if let Some(reply) = handle_with_capability(socket, &line, capability) {
             writeln!(stdout, "{reply}")?;
             stdout.flush()?;
         }
@@ -52,6 +62,17 @@ pub fn serve(socket: &Path) -> std::io::Result<()> {
 /// One request in, at most one reply out. Public so tests can drive the real
 /// dispatch against a real daemon with no subprocess in between.
 pub fn handle(socket: &Path, line: &str) -> Option<String> {
+    handle_with_capability(socket, line, None)
+}
+
+/// Like [`handle`], but passes an optional daemon-issued session capability to
+/// dynamically registered Lua tools. Frame tools intentionally remain
+/// capability-blind until they need an authorization rule of their own.
+pub fn handle_with_capability(
+    socket: &Path,
+    line: &str,
+    capability: Option<&str>,
+) -> Option<String> {
     let request: Value = match serde_json::from_str(line) {
         Ok(value) => value,
         // -32700 is JSON-RPC's parse error. There is no id to answer with,
@@ -82,7 +103,7 @@ pub fn handle(socket: &Path, line: &str) -> Option<String> {
         "tools/list" => ok_reply(id, json!({"tools": descriptors(socket)})),
         "tools/call" => {
             let params = request.get("params").cloned().unwrap_or(Value::Null);
-            call(socket, id, &params)
+            call(socket, id, &params, capability)
         }
         "ping" => ok_reply(id, json!({})),
         other => error_reply(id, -32601, &format!("method not found: {other}")),
@@ -93,7 +114,7 @@ pub fn handle(socket: &Path, line: &str) -> Option<String> {
 /// Run one tool call. Caution: a refusal must come back as `isError: true` with
 /// the daemon's own words, never as success with empty content — a model reads
 /// an empty screen as an idle session and narrates a story about it.
-fn call(socket: &Path, id: Value, params: &Value) -> String {
+fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> String {
     let name = params.get("name").and_then(Value::as_str).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
     let text = |key: &str| {
@@ -149,9 +170,14 @@ fn call(socket: &Path, id: Value, params: &Value) -> String {
         // "no such tool" — the registry is what knows, so it is what says so.
         other => Request::Eval {
             code: format!(
-                "remuda._call({}, {})",
+                "remuda._call({}, {}, {})",
                 lua_string(other),
-                lua_literal(&args)
+                lua_literal(&args),
+                lua_literal(
+                    &capability
+                        .map(|capability| json!({"capability": capability}))
+                        .unwrap_or(Value::Null)
+                ),
             ),
             name: None,
         },

@@ -44,7 +44,7 @@ end
 
 -- Every word answers a call, so a tool defined today is a primitive tomorrow.
 local speech = {
-  __call = function(word, arguments) return word.run(arguments or {}) end,
+  __call = function(word, arguments, caller) return word.run(arguments or {}, caller) end,
   __tostring = function(word) return "tool " .. word.name end,
 }
 
@@ -485,7 +485,7 @@ register(
 -- One `tools/call`. A missing tool and a missing argument both raise, because
 -- the daemon turns a raise into `isError: true` and a return into success — and
 -- a model reads a successful empty answer as an answer.
-function remuda._call(name, arguments)
+function remuda._call(name, arguments, caller)
   local word = remuda.tools[name]
   if not word then
     error("no such tool: " .. tostring(name), 0)
@@ -496,13 +496,15 @@ function remuda._call(name, arguments)
       error(name .. " needs `" .. key .. "`", 0)
     end
   end
-  local answer = word(arguments)
+  -- `caller` is daemon-issued process context, never MCP input.  Existing
+  -- tools keep working because Lua ignores the optional second argument.
+  local answer = word(arguments, caller)
   if answer == nil then
     return ""
   end
   return tostring(answer)
 end
-register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments) -> string")
+register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments, caller) -> string")
 
 -- Type TEXT into SESSION and submit it with Return, as one act `remuda.feed`
 -- will not let a second sender split. Not an MCP tool — a plain stdlib
