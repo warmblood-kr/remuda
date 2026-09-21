@@ -3223,6 +3223,114 @@ fn butler_watchdog_records_session_exit_and_relaunch_in_a_trace_file() {
     );
 }
 
+/// Sibling of `butler_watchdog_records_session_exit_and_relaunch_in_a_trace_file`,
+/// but proving the DEFAULT-fallback branch itself: `remuda._butler_session_trace_path`
+/// is never set here, so this only passes if `_butler_session_trace` in
+/// `packages/butler/init.lua` actually falls back to
+/// `$HOME/.config/remuda/session-trace.log`, the same default-path idiom
+/// `_butler_trace` (compaction) already uses. Same `Daemon::spawn_with_home`
+/// HOME-redirection precedent as
+/// `butler_exec_finds_credentials_at_the_conventional_path_with_zero_env_vars`,
+/// so this never touches a real machine's real `~/.config/remuda/`.
+#[test]
+#[cfg(unix)]
+fn butler_session_trace_defaults_to_the_conventional_path_with_no_seam_set() {
+    let dir = scratch_dir("butler-session-trace-default");
+    let home = dir.join("home");
+    let butler_dir = home.join(".config/remuda/butler");
+    std::fs::create_dir_all(&butler_dir).expect("mkdir conventional butler dir");
+    std::fs::write(butler_dir.join("token"), "test-token\n").expect("write token");
+    std::fs::write(
+        butler_dir.join("config"),
+        "http://127.0.0.1:1\n!room:example.org\n@butler:example.org\n\n",
+    )
+    .expect("write config");
+
+    // Negative control: the default-derived trace file must not exist before
+    // any session close is ever triggered.
+    let trace_path = home.join(".config/remuda/session-trace.log");
+    assert!(
+        !trace_path.exists(),
+        "default session trace file already exists before any session closed: {trace_path:?}"
+    );
+
+    // `remuda._butler_session_trace_path` is deliberately left unset here --
+    // exercising the real default-fallback branch, not the test seam
+    // `butler_watchdog_records_session_exit_and_relaunch_in_a_trace_file`
+    // already covers.
+    let daemon = Daemon::spawn_with_home(&dir, &home);
+    let path = daemon::socket_path_in(&dir, "s");
+
+    // Same observer group as the sibling watchdog trace test -- `init.lua`
+    // clears the "butler" group on every `exec`, so a hook registered there
+    // would not survive it.
+    eval(
+        &path,
+        r#"
+            remuda._watchdog_exits = {}
+            remuda.on("session_exited", function(name)
+                table.insert(remuda._watchdog_exits, name)
+            end, { group = "test-observer" })
+        "#,
+    );
+    eval(
+        &path,
+        r#"remuda._butler_argv = {"sh", "-c", "sleep 0.3; exit 0"}"#,
+    );
+    eval(&path, "remuda._butler_skip_relay = true");
+
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let initial_name = eval(&path, "return remuda._butler_initial_name");
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let seen = eval(&path, "return table.concat(remuda._watchdog_exits, ',')");
+        let count = seen.split(',').filter(|n| *n == initial_name).count();
+        if count >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected at least 2 session_exited events for {initial_name:?}, saw: {seen:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Witness discipline: read the ACTUAL bytes back from disk, from the
+    // DEFAULT-derived path, never a seam-supplied one.
+    let content = std::fs::read_to_string(&trace_path)
+        .unwrap_or_else(|e| panic!("read default trace file {trace_path:?}: {e}"));
+    let lines: Vec<Vec<&str>> = content.lines().map(|l| l.split('\t').collect()).collect();
+    assert!(!lines.is_empty(), "default trace file was empty");
+    for fields in &lines {
+        assert_eq!(fields.len(), 3, "not 3 tab-separated fields: {fields:?}");
+        assert!(
+            looks_like_iso8601_utc(fields[0]),
+            "not a parseable ISO-8601 UTC timestamp: {fields:?}"
+        );
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|f| f[1] == "session_exited" && f[2] == initial_name),
+        "no \"session_exited\" trace line for {initial_name:?}:\n{content}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|f| f[1] == "relaunching" && f[2] == initial_name),
+        "no \"relaunching\" trace line for {initial_name:?}:\n{content}"
+    );
+
+    drop(daemon);
+}
+
 /// This documents the case where NO persistence layer is installed: `remuda`
 /// itself never re-execs butler on its own, restart or not — the only way
 /// `packages/butler/init.lua`'s real code ever runs is an explicit `remuda

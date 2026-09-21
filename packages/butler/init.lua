@@ -360,14 +360,13 @@ end
 
 -- remuda._butler_session_trace_path lets a test redirect this to a throwaway
 -- tempfile, same idiom as remuda._butler_compaction_trace_path above; nil in
--- production means tracing is simply off (no default path wired in yet --
--- that's a separate decision for whoever turns this on for real installs).
+-- production falls back to the real default, matching the token/config path
+-- convention already used by default_config_home() above.
 local function _butler_session_trace(event, detail)
   pcall(function()
     local path = remuda._butler_session_trace_path
-    if not path then
-      return
-    end
+      or (os.getenv("XDG_CONFIG_HOME") or (os.getenv("HOME") .. "/.config"))
+        .. "/remuda/session-trace.log"
     local f = io.open(path, "a")
     if not f then
       os.execute('mkdir -p "' .. path:match("^(.*)/[^/]+$") .. '"')
