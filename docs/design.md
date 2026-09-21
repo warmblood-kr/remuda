@@ -206,6 +206,10 @@ runs the template from inside it, and starts a `claude` session named
 `research`. `--agent codex` selects another registered agent builder. With no
 template, a topic is simply an empty directory.
 
+Template parsing and setup happen only within `topic new`. A bad Lua template
+or a failed setup command reports that topic command as an error; it never
+stops the already-running Butler service or its other agents.
+
 The helper and the session talk to each other through the same line-oriented
 channel any `remuda.process` caller gets, so the format has to survive being
 squeezed through it: `sender<TAB>escaped-body`, one physical line per Matrix
