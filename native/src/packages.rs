@@ -6,12 +6,27 @@
 //! there used to be two copies of this match, one per crate; this replaces
 //! both.
 
-/// A built-in package's entry source, embedded at compile time. No install
-/// mechanism and no registry yet — a name either matches one of these arms
-/// or it doesn't.
+pub struct Builtin {
+    pub name: &'static str,
+    pub source: &'static str,
+    pub subcommand: Option<&'static str>,
+}
+
+const BUILTINS: &[Builtin] = &[Builtin {
+    name: "butler",
+    source: include_str!("../../packages/butler/init.lua"),
+    subcommand: Some("butler"),
+}];
+
 pub fn builtin(name: &str) -> Option<&'static str> {
-    match name {
-        "butler" => Some(include_str!("../../packages/butler/init.lua")),
-        _ => None,
-    }
+    BUILTINS
+        .iter()
+        .find(|package| package.name == name)
+        .map(|package| package.source)
+}
+
+pub fn subcommand(name: &str) -> Option<&'static Builtin> {
+    BUILTINS
+        .iter()
+        .find(|package| package.subcommand == Some(name))
 }
