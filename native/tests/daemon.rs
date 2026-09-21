@@ -3398,45 +3398,34 @@ fn butler_exec_finds_credentials_at_the_conventional_path_with_zero_env_vars() {
     drop(daemon);
 }
 
-/// The other half of the same fix: when neither the conventional file nor
-/// the env override exists, this must fail loudly and immediately -- never
-/// silently proceed with a bad path, and never get partway into writing the
-/// `.mcp.json` companion file `init.lua` builds right after resolving
-/// `config_path`.
+/// Matrix is an optional Butler layer. With no conventional credential files
+/// and no overrides, `exec butler` must still launch its local Claude session.
 #[test]
 #[cfg(unix)]
-fn butler_exec_fails_loudly_with_no_token_file_and_no_env_override() {
+fn butler_exec_starts_without_matrix_credentials() {
     let dir = scratch_dir("butler-no-creds");
     let home = dir.join("home-empty");
     std::fs::create_dir_all(&home).expect("mkdir empty home");
 
     let daemon = Daemon::spawn_with_home(&dir, &home);
+    let path = daemon::socket_path_in(&dir, "s");
+    eval(
+        &path,
+        r#"remuda._butler_argv = {"sh", "-c", "sleep 5; exit 0"}"#,
+    );
 
     let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
     assert!(
-        !out.status.success(),
-        "expected exec butler to fail with no token file and no env override"
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let expected_path = home
-        .join(".config/remuda/butler/token")
-        .to_string_lossy()
-        .to_string();
-    assert!(
-        stderr.contains("no token file at") && stderr.contains(&expected_path),
-        "expected the error to name the exact conventional path it tried: {stderr:?}"
-    );
-    assert!(
-        stderr.contains("REMUDA_BUTLER_TOKEN"),
-        "expected the error to mention the override var: {stderr:?}"
+        out.status.success(),
+        "expected local-only exec butler to succeed with no Matrix credentials: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 
-    // Never got far enough to write the `.mcp.json` companion file -- proof
-    // this failed before doing anything else, not partway through.
-    let mcp_json = home.join(".config/remuda/butler/config.mcp.json");
+    let initial_name = eval(&path, "return remuda._butler_initial_name");
+    let listed = remuda(&dir, &["-s", "s", "ls"]);
     assert!(
-        !mcp_json.exists(),
-        "exec butler wrote {mcp_json:?} despite failing to resolve the token file first"
+        String::from_utf8_lossy(&listed.stdout).contains(&initial_name),
+        "local-only butler session never appeared in ls"
     );
 
     drop(daemon);

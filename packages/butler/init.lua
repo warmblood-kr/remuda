@@ -1,5 +1,5 @@
--- remuda-butler: runs one Claude Code session fed by Matrix messages,
--- replying via an MCP tool. See docs/design.md.
+-- remuda-butler: runs one Claude Code session, optionally bridged to Matrix
+-- and replying there via an MCP tool. See docs/design.md.
 
 local HELPER_SRC = [==[
 import json
@@ -178,9 +178,9 @@ local function default_config_home()
   return home .. "/.config"
 end
 
--- Fails loudly the same way the installer already does -- naming the exact
--- path it tried and mentioning the override -- rather than silently
--- proceeding with a path that doesn't resolve to a real file.
+-- Fails loudly when Matrix has been configured -- naming the exact path it
+-- tried and mentioning the override -- rather than silently proceeding with
+-- a path that doesn't resolve to a real file.
 local function resolve_path(override_env, filename, what)
   local path = os.getenv(override_env)
   if not path or path == "" then
@@ -206,8 +206,38 @@ local function resolve_path(override_env, filename, what)
   return path
 end
 
-local token_path = resolve_path("REMUDA_BUTLER_TOKEN", "token", "token file")
-local config_path = resolve_path("REMUDA_BUTLER_CONFIG", "config", "config file")
+local function file_exists(path)
+  if not path then
+    return false
+  end
+  local f = io.open(path, "r")
+  if not f then
+    return false
+  end
+  f:close()
+  return true
+end
+
+-- Matrix is an optional Butler integration. An explicit override means its
+-- caller intended to enable it, and either conventional credential file
+-- means a half-configured relay should still fail loudly. With neither,
+-- Butler remains a local Claude-session manager and simply omits the relay.
+local token_override = os.getenv("REMUDA_BUTLER_TOKEN")
+local config_override = os.getenv("REMUDA_BUTLER_CONFIG")
+local config_home = default_config_home()
+local default_token_path = config_home and config_home .. "/remuda/butler/token"
+local default_config_path = config_home and config_home .. "/remuda/butler/config"
+local matrix_requested = (token_override and token_override ~= "")
+  or (config_override and config_override ~= "")
+  or file_exists(default_token_path)
+  or file_exists(default_config_path)
+
+local token_path = nil
+local config_path = nil
+if matrix_requested then
+  token_path = resolve_path("REMUDA_BUTLER_TOKEN", "token", "token file")
+  config_path = resolve_path("REMUDA_BUTLER_CONFIG", "config", "config file")
+end
 
 -- The session needs an `--mcp-config` pointing back at this same daemon, or
 -- it has no way to reach `matrix_reply` at all — a bare `remuda.new(nil,
@@ -224,7 +254,10 @@ local config_path = resolve_path("REMUDA_BUTLER_CONFIG", "config", "config file"
 -- native/tests/claude_session.rs) since nothing here can answer it.
 local server = os.getenv("REMUDA_BUTLER_SERVER") or "default"
 local runtime_dir = os.getenv("REMUDA_RUNTIME_DIR")
-local mcp_config_path = config_path .. ".mcp.json"
+-- Matrix-enabled installs keep this beside their relay configuration. The
+-- local-only mode has no configuration directory to rely on, so use a private
+-- temporary filename for the same short-lived Claude MCP configuration.
+local mcp_config_path = config_path and (config_path .. ".mcp.json") or (os.tmpname() .. ".mcp.json")
 local mcp_env = ""
 if runtime_dir then
   mcp_env = ',"env":{"REMUDA_RUNTIME_DIR":"' .. runtime_dir .. '"}'
@@ -243,15 +276,18 @@ mcp_file:close()
 -- line arriving on its terminal is not by itself an instruction to use a
 -- specific tool. This is what turns "text showed up" into "the tool got
 -- called" for an otherwise-unprompted incoming message.
-local SYSTEM_PROMPT = "You are bridged into one Matrix room via remuda. "
-  .. "Every line you receive here that starts with \"[matrix · \" is a "
-  .. "message from that room, not from the person running this terminal. "
-  .. "Reply to it by calling the matrix_reply MCP tool with your response "
-  .. "text -- printing a reply in this terminal does not send it anywhere; "
-  .. "only calling the tool does. "
-  .. "Early in this session, call remuda._butler_register_compaction_schedule() "
+local SYSTEM_PROMPT = "Early in this session, call remuda._butler_register_compaction_schedule() "
   .. "via the run_script MCP tool, once, to enable this butler's own periodic "
   .. "context-compaction upkeep."
+if token_path then
+  SYSTEM_PROMPT = "You are bridged into one Matrix room via remuda. "
+    .. "Every line you receive here that starts with \"[matrix · \" is a "
+    .. "message from that room, not from the person running this terminal. "
+    .. "Reply to it by calling the matrix_reply MCP tool with your response "
+    .. "text -- printing a reply in this terminal does not send it anywhere; "
+    .. "only calling the tool does. "
+    .. SYSTEM_PROMPT
+end
 
 -- Finger-tight: an arbitrary placeholder, never tuned against a real
 -- colleague's usage. Tightening step: revisit once this has run on a real
@@ -406,7 +442,7 @@ remuda.on("butler-matrix-submit", function()
   remuda.send(butler_name, "")
 end)
 
-if not remuda._butler_skip_relay then
+if token_path and not remuda._butler_skip_relay then
   remuda.process{
     argv = {"python3", "-c", HELPER_SRC, token_path, config_path},
     on_line = "butler-matrix-line",
@@ -414,6 +450,7 @@ if not remuda._butler_skip_relay then
   }
 end
 
+if token_path then
 remuda.tool{
   name = "matrix_reply",
   about = "Send a text reply into the bridged Matrix room. Fire-and-forget: "
@@ -429,3 +466,4 @@ remuda.tool{
     return "queued"
   end,
 }
+end
