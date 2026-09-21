@@ -66,7 +66,7 @@ fn skew(detail: &str) -> String {
     format!(
         "the daemon is not this build — run `remuda restart`, then this again. \
          This command is {}; the daemon: {detail}",
-        crate::dist::VERSION,
+        crate::dist::BUILD_VERSION,
     )
 }
 

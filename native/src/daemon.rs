@@ -284,7 +284,7 @@ fn handle(
             reply(&stream, &Response::Sessions(registry.list()))
         }
 
-        Request::Version => reply(&stream, &Response::Value(crate::dist::VERSION.into())),
+        Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
 
         // Answer before going. A client left guessing from a hung-up socket
         // cannot tell "it stopped" from "it never heard me".

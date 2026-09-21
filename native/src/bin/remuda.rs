@@ -23,6 +23,9 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
+#[path = "remuda/butler_cli.rs"]
+mod butler_cli;
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (server, rest) = split_server_flag(&args);
@@ -58,7 +61,7 @@ fn main() -> ExitCode {
         }
 
         ["--version"] | ["-V"] | ["version"] => {
-            println!("remuda {}", dist::VERSION);
+            println!("remuda {}", dist::BUILD_VERSION);
             ExitCode::SUCCESS
         }
 
@@ -105,7 +108,7 @@ fn main() -> ExitCode {
         ["exec", name] => with_daemon(server, &path, |path| exec_command(path, name)),
 
         [command, rest @ ..] if remuda_native::packages::subcommand(command).is_some() => {
-            extension_command(server, &path, command, rest)
+            butler_cli::extension_command(server, &path, command, rest)
         }
 
         // `emacsclient -e` for this runtime: the code runs in the daemon's
@@ -392,7 +395,7 @@ fn version_skew(argv: &[&str], path: &Path) -> Option<String> {
 /// steps/024.
 fn skew_notice(response: std::io::Result<Response>) -> Option<String> {
     let theirs = match response {
-        Ok(Response::Value(theirs)) if theirs == dist::VERSION => return None,
+        Ok(Response::Value(theirs)) if theirs == dist::BUILD_VERSION => return None,
         Ok(Response::Value(theirs)) => theirs,
         // Cure first, same reason as the message below: this can reach a TUI
         // footer that crops the tail at the terminal's width.
@@ -401,7 +404,7 @@ fn skew_notice(response: std::io::Result<Response>) -> Option<String> {
                 "the daemon could not confirm its version — `remuda restart` \
                  replaces it if something still seems off. The check itself \
                  failed partway through; this command is {}",
-                dist::VERSION
+                dist::BUILD_VERSION
             ))
         }
         // Older than the handshake itself. Not knowing is itself the answer.
@@ -412,7 +415,7 @@ fn skew_notice(response: std::io::Result<Response>) -> Option<String> {
     Some(format!(
         "the daemon is not this build — `remuda restart` replaces it, and its \
          sessions and Lua image go with it. It is {theirs}; this command is {}",
-        dist::VERSION
+        dist::BUILD_VERSION
     ))
 }
 
@@ -485,123 +488,6 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
                 Err(e) => fail(e),
             }
         }
-    }
-}
-
-type ExtensionHandler = fn(&str, &Path, &[&str]) -> ExitCode;
-
-const EXTENSION_HANDLERS: &[(&str, ExtensionHandler)] = &[("butler", butler_command)];
-
-fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) -> ExitCode {
-    if args.is_empty() {
-        let package = remuda_native::packages::subcommand(command)
-            .expect("subcommand dispatch was checked above");
-        return with_daemon(server, path, |path| exec_command(path, package.name));
-    }
-    match EXTENSION_HANDLERS
-        .iter()
-        .find(|(name, _)| *name == command)
-        .map(|(_, handler)| handler)
-    {
-        Some(handler) => handler(server, path, args),
-        None => fail(format!("extension {command} does not accept subcommands")),
-    }
-}
-
-const BUTLER_USAGE: &str = "\
-remuda butler — lightweight coordination for managed agents
-
-  remuda butler sessions
-  remuda butler launch <claude|codex> [name]
-  remuda butler send <from> <to> <message...>
-  remuda butler inbox <name>
-
-Butler is live state in the remuda daemon. Start it with:
-
-  remuda butler
-";
-
-/// The deliberately thin CLI face of Butler's live Lua post-office. Keeping
-/// the data and operations in Lua means a person can inspect or change them
-/// at `remuda repl`; this is just pleasant shell syntax, not a second policy
-/// layer.
-fn butler_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
-    match args {
-        [] | ["help"] | ["-h"] | ["--help"] => {
-            print!("{BUTLER_USAGE}");
-            ExitCode::SUCCESS
-        }
-        ["sessions"] => with_daemon(server, path, |path| {
-            butler_eval(path, "return remuda._butler_sessions()")
-        }),
-        ["launch", kind] => with_daemon(server, path, |path| {
-            butler_eval(
-                path,
-                &format!("return remuda._butler_launch({}, nil)", lua_string(kind)),
-            )
-        }),
-        ["launch", kind, name] => with_daemon(server, path, |path| {
-            butler_eval(
-                path,
-                &format!(
-                    "return remuda._butler_launch({}, {})",
-                    lua_string(kind),
-                    lua_string(name)
-                ),
-            )
-        }),
-        ["send", from, to, message @ ..] if !message.is_empty() => {
-            with_daemon(server, path, |path| {
-                butler_eval(
-                    path,
-                    &format!(
-                        "return remuda._butler_send({}, {}, {})",
-                        lua_string(from),
-                        lua_string(to),
-                        lua_string(&message.join(" "))
-                    ),
-                )
-            })
-        }
-        ["inbox", name] => with_daemon(server, path, |path| {
-            butler_eval(
-                path,
-                &format!("return remuda._butler_inbox({})", lua_string(name)),
-            )
-        }),
-        _ => {
-            eprint!("{BUTLER_USAGE}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// A JSON string literal is also a Lua string literal. `serde_json` handles
-/// newlines, quotes, and backslashes so a coordination message can never turn
-/// into extra code in the daemon image.
-fn lua_string(value: &str) -> String {
-    serde_json::to_string(value).expect("strings always serialize")
-}
-
-fn butler_eval(path: &Path, code: &str) -> ExitCode {
-    match remuda_native::client::request(
-        path,
-        &Request::Eval {
-            code: code.to_string(),
-            name: Some("butler-cli".into()),
-        },
-    ) {
-        Ok(Response::Value(value)) => {
-            if !value.is_empty() {
-                println!("{value}");
-            }
-            ExitCode::SUCCESS
-        }
-        Ok(Response::Error(error)) if error.contains("_butler_") && error.contains("nil value") => {
-            eprintln!("remuda: Butler is not running; start it with `remuda butler`");
-            ExitCode::FAILURE
-        }
-        other => fail(describe(other)),
     }
 }
 
@@ -849,7 +735,7 @@ mod tests {
         let message = "hello\" ); remuda.close('butler') --\nnext";
         let code = format!(
             "return remuda._butler_send(\"a\", \"b\", {})",
-            lua_string(message)
+            butler_cli::lua_string(message)
         );
         assert_eq!(
             code,

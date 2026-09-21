@@ -97,7 +97,7 @@ pub fn handle_with_capability(
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "remuda", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "remuda", "version": crate::dist::BUILD_VERSION},
             }),
         ),
         "tools/list" => ok_reply(id, json!({"tools": descriptors(socket)})),
