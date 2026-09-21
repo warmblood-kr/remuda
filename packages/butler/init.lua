@@ -428,7 +428,7 @@ local function agent_mcp_path(name, token)
   f:close()
   return path
 end
-local function codex_mcp_flags(token)
+local function agent_mcp_flags(token)
   local env = 'REMUDA_BUTLER_SESSION_TOKEN="' .. token .. '"'
   if runtime_dir then env = env .. ',REMUDA_RUNTIME_DIR="' .. runtime_dir .. '"' end
   return {
@@ -437,27 +437,11 @@ local function codex_mcp_flags(token)
     "-c", "mcp_servers.remuda.env={" .. env .. "}",
   }
 end
--- Adapters build argv; Butler owns lifecycle and mail.
-local AGENT_BUILDERS = {}
-AGENT_BUILDERS.claude = function(spec)
-  local argv = { "claude" }
-  if spec.settings_path then argv[#argv + 1] = "--settings"; argv[#argv + 1] = spec.settings_path end
-  argv[#argv + 1] = "--mcp-config"; argv[#argv + 1] = spec.mcp_config_path or agent_mcp_path(spec.name, spec.token)
-  argv[#argv + 1] = "--strict-mcp-config"
-  argv[#argv + 1] = "--permission-mode"; argv[#argv + 1] = "auto"
-  argv[#argv + 1] = "--append-system-prompt"
-  argv[#argv + 1] = spec.system_prompt
-    or "This session is managed by Remuda Butler. The remuda butler CLI is available for coordination."
-  if spec.model and spec.model ~= "" then argv[#argv + 1] = "--model"; argv[#argv + 1] = spec.model end
-  return argv
-end
-AGENT_BUILDERS.codex = function(spec)
-  local argv = { "codex" }
-  for _, flag in ipairs(codex_mcp_flags(spec.token)) do argv[#argv + 1] = flag end
-  argv[#argv + 1] = "--approve-for-me"
-  if spec.model and spec.model ~= "" then argv[#argv + 1] = "--model"; argv[#argv + 1] = spec.model end
-  return argv
-end
+remuda._butler_agent_builders = remuda._butler_agent_builders or {}
+remuda._butler_agent_support = { mcp_config_path = agent_mcp_path, mcp_flags = agent_mcp_flags }
+remuda.exec("butler/agents/claudecode")
+remuda.exec("butler/agents/codex")
+local AGENT_BUILDERS = remuda._butler_agent_builders
 local function build_agent_argv(kind, spec)
   local builder = AGENT_BUILDERS[kind]
   if not builder then error("unknown agent kind: " .. tostring(kind), 0) end

@@ -12,11 +12,23 @@ pub struct Builtin {
     pub subcommand: Option<&'static str>,
 }
 
-const BUILTINS: &[Builtin] = &[Builtin {
-    name: "butler",
-    source: include_str!("../../packages/butler/init.lua"),
-    subcommand: Some("butler"),
-}];
+const BUILTINS: &[Builtin] = &[
+    Builtin {
+        name: "butler",
+        source: include_str!("../../packages/butler/init.lua"),
+        subcommand: Some("butler"),
+    },
+    Builtin {
+        name: "butler/agents/claudecode",
+        source: include_str!("../../packages/butler/agents/claudecode.lua"),
+        subcommand: None,
+    },
+    Builtin {
+        name: "butler/agents/codex",
+        source: include_str!("../../packages/butler/agents/codex.lua"),
+        subcommand: None,
+    },
+];
 
 pub fn builtin(name: &str) -> Option<&'static str> {
     BUILTINS

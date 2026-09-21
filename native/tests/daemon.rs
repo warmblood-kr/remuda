@@ -2579,12 +2579,12 @@ fn matrix_reply_tool_never_puts_the_token_in_curls_argv() {
 
 #[test]
 fn butler_claude_builder_keeps_its_noninteractive_cli_hint() {
-    let init_lua = include_str!("../../packages/butler/init.lua");
+    let adapter = include_str!("../../packages/butler/agents/claudecode.lua");
 
-    let permission_mode_idx = init_lua
+    let permission_mode_idx = adapter
         .find("\"--permission-mode\"")
         .expect("butler launch argv lost --permission-mode");
-    let append_system_prompt_idx = init_lua
+    let append_system_prompt_idx = adapter
         .find("\"--append-system-prompt\"")
         .expect("butler launch argv lost --append-system-prompt");
 
@@ -2592,6 +2592,12 @@ fn butler_claude_builder_keeps_its_noninteractive_cli_hint() {
         permission_mode_idx < append_system_prompt_idx,
         "expected --permission-mode before --append-system-prompt"
     );
+}
+
+#[test]
+fn butler_codex_builder_uses_automatic_approval() {
+    let adapter = include_str!("../../packages/butler/agents/codex.lua");
+    assert!(adapter.contains("\"--approve-for-me\""));
 }
 
 /// Same live-`claude` limitation as the test above blocks a real kill-and-
