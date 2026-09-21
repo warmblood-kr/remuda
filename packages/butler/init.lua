@@ -654,10 +654,17 @@ end
 -- Reused both for the initial launch and every respawn, so the watchdog
 -- below can never drift from what a fresh start would have done. Keeps the
 -- name across respawns by feeding the previous result back in as the name.
-local butler_name = nil
+local butler_name = remuda._butler_name
 local function launch_butler()
+  local requested_name = butler_name or remuda._butler_initial_name
+  if pcall(remuda.session, requested_name) then
+    butler_name = requested_name
+    remuda._butler_name = butler_name
+    return
+  end
   if butler_session_cwd then remuda.mkdir(butler_session_cwd) end
-  butler_name = remuda.new(butler_name or remuda._butler_initial_name, BUTLER_ARGV, butler_session_cwd)
+  butler_name = remuda.new(requested_name, BUTLER_ARGV, butler_session_cwd)
+  remuda._butler_name = butler_name
 end
 launch_butler()
 
