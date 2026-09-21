@@ -398,20 +398,36 @@ local function codex_mcp_flags(token)
     "-c", "mcp_servers.remuda.env={" .. env .. "}",
   }
 end
+-- Adapters build argv; Butler owns lifecycle and mail.
+local AGENT_BUILDERS = {}
+AGENT_BUILDERS.claude = function(spec)
+  local argv = { "claude" }
+  if spec.settings_path then argv[#argv + 1] = "--settings"; argv[#argv + 1] = spec.settings_path end
+  argv[#argv + 1] = "--mcp-config"; argv[#argv + 1] = spec.mcp_config_path or agent_mcp_path(spec.name, spec.token)
+  argv[#argv + 1] = "--strict-mcp-config"
+  argv[#argv + 1] = "--permission-mode"; argv[#argv + 1] = "auto"
+  argv[#argv + 1] = "--append-system-prompt"
+  argv[#argv + 1] = spec.system_prompt
+    or "This session is managed by Remuda Butler. The remuda butler CLI is available for coordination."
+  if spec.model and spec.model ~= "" then argv[#argv + 1] = "--model"; argv[#argv + 1] = spec.model end
+  return argv
+end
+AGENT_BUILDERS.codex = function(spec)
+  local argv = { "codex" }
+  for _, flag in ipairs(codex_mcp_flags(spec.token)) do argv[#argv + 1] = flag end
+  argv[#argv + 1] = "--approve-for-me"
+  if spec.model and spec.model ~= "" then argv[#argv + 1] = "--model"; argv[#argv + 1] = spec.model end
+  return argv
+end
+local function build_agent_argv(kind, spec)
+  local builder = AGENT_BUILDERS[kind]
+  if not builder then error("unknown agent kind: " .. tostring(kind), 0) end
+  return builder(spec)
+end
 local function launch_agent(kind, requested_name, cwd, model)
-  if kind ~= "claude" and kind ~= "codex" then error("unknown agent kind: " .. tostring(kind), 0) end
   local name = requested_name or kind
   local token = next_token(name)
-  local argv
-  if kind == "claude" then
-    argv = { "claude", "--mcp-config", agent_mcp_path(name, token), "--strict-mcp-config", "--permission-mode", "auto", "--append-system-prompt", "This session is managed by Remuda Butler. The remuda butler CLI is available for coordination." }
-    if model and model ~= "" then argv[#argv + 1] = "--model"; argv[#argv + 1] = model end
-  else
-    argv = { "codex" }
-    for _, flag in ipairs(codex_mcp_flags(token)) do argv[#argv + 1] = flag end
-    argv[#argv + 1] = "--approve-for-me"
-    if model and model ~= "" then argv[#argv + 1] = "--model"; argv[#argv + 1] = model end
-  end
+  local argv = build_agent_argv(kind, { name = name, token = token, model = model })
   local actual = remuda.new(name, argv, cwd)
   bus.tokens[token] = actual
   bus.agents[actual] = { kind = kind, token = token }
@@ -562,18 +578,11 @@ end
 
 local butler_kind = os.getenv("REMUDA_BUTLER_KIND") or "claude"
 local BUTLER_ARGV = remuda._butler_argv
-if not BUTLER_ARGV and butler_kind == "claude" then
-  BUTLER_ARGV = {
-    "claude", "--settings", settings_path, "--mcp-config", mcp_config_path,
-    "--strict-mcp-config", "--permission-mode", "auto", "--allowedTools",
-    "mcp__remuda__run_script", "--append-system-prompt", SYSTEM_PROMPT,
-  }
-elseif not BUTLER_ARGV and butler_kind == "codex" then
-  BUTLER_ARGV = { "codex" }
-  for _, flag in ipairs(codex_mcp_flags(butler_token)) do BUTLER_ARGV[#BUTLER_ARGV + 1] = flag end
-  BUTLER_ARGV[#BUTLER_ARGV + 1] = "--approve-for-me"
-elseif not BUTLER_ARGV then
-  error("unknown Butler kind: " .. butler_kind, 0)
+if not BUTLER_ARGV then
+  BUTLER_ARGV = build_agent_argv(butler_kind, {
+    name = "butler", token = butler_token, mcp_config_path = mcp_config_path, settings_path = settings_path,
+    system_prompt = SYSTEM_PROMPT,
+  })
 end
 
 -- Reused both for the initial launch and every respawn, so the watchdog
