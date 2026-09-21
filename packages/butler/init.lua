@@ -168,13 +168,8 @@ if not isinstance(used, (int, float)):
     used = sum(parts) if parts else None
 
 model = snapshot.get("model") or {}
-# Claude Code 2.1.278 supplies `effort` at the top level when it has a
-# reading.  Do not infer it from a model name or a launch option: /effort can
-# change during a session, and absent really means unknown.
-effort = snapshot.get("effort")
-line = "MODEL:{model} EFFORT:{effort} CTX:{used} CTXWIN:{capacity} CTXPCT:{percent}".format(
+line = "MODEL:{model} CTX:{used} CTXWIN:{capacity} CTXPCT:{percent}".format(
     model=tag(model.get("display_name") or model.get("id")),
-    effort=tag(effort),
     used=integer(used),
     capacity=integer(window.get("context_window_size")),
     percent=integer(window.get("used_percentage")),
@@ -346,17 +341,17 @@ remuda._butler_status_path = status_path
 
 remuda.tool{
   name = "butler_status",
-  about = "Read Butler's latest Claude Code status-line telemetry: model, effort, context tokens, window, and percentage.",
+  about = "Read Butler's latest Claude Code status-line telemetry: model, context tokens, window, and percentage.",
   run = function()
     local f = io.open(remuda._butler_status_path or "", "r")
     if not f then
-      return "MODEL:? EFFORT:? CTX:? CTXWIN:? CTXPCT:? (no status reading yet)"
+      return "MODEL:? CTX:? CTXWIN:? CTXPCT:? (no status reading yet)"
     end
     local line = f:read("*l")
     f:close()
     -- The helper owns this file.  Refuse a malformed or externally replaced
     -- record instead of presenting arbitrary file contents as Claude status.
-    if not line or not line:match("^MODEL:[A-Za-z0-9_.%-?]+ EFFORT:[A-Za-z0-9_.%-?]+ CTX:[0-9?]+ CTXWIN:[0-9?]+ CTXPCT:[0-9?]+$") then
+    if not line or not line:match("^MODEL:[A-Za-z0-9_.%-?]+ CTX:[0-9?]+ CTXWIN:[0-9?]+ CTXPCT:[0-9?]+$") then
       error("butler status record is malformed", 0)
     end
     return line

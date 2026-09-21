@@ -338,30 +338,29 @@ fn butler_status_is_a_live_mcp_tool_not_a_terminal_scrape() {
         .stdin
         .take()
         .expect("helper stdin")
-        .write_all(br#"{"model":{"display_name":"Claude Opus 4.6"},"effort":"high","context_window":{"total_input_tokens":12345,"context_window_size":200000,"used_percentage":6}}"#)
+        .write_all(br#"{"model":{"display_name":"Claude Opus 4.6"},"context_window":{"total_input_tokens":12345,"context_window_size":200000,"used_percentage":6}}"#)
         .expect("write Claude status snapshot");
     let output = helper.wait_with_output().expect("wait for status helper");
     assert!(output.status.success(), "status helper failed: {output:?}");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "MODEL:Claude-Opus-4.6 EFFORT:high CTX:12345 CTXWIN:200000 CTXPCT:6"
+        "MODEL:Claude-Opus-4.6 CTX:12345 CTXWIN:200000 CTXPCT:6"
     );
     let reply = call(&path, "butler_status", json!({}));
     assert_eq!(reply["result"]["isError"], false, "status failed: {reply}");
     assert_eq!(
         text_of(&reply),
-        "MODEL:Claude-Opus-4.6 EFFORT:high CTX:12345 CTXWIN:200000 CTXPCT:6"
+        "MODEL:Claude-Opus-4.6 CTX:12345 CTXWIN:200000 CTXPCT:6"
     );
 
-    // Effort is intentionally not derived from model or launch arguments:
-    // when Claude omits the field, consumers must see unknown rather than a
-    // plausible but stale setting.
+    // Missing context data remains explicit rather than being invented from
+    // launch arguments or terminal rendering.
     let mut helper = Command::new("python3")
         .args(["-c", &source, &status_path])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
-        .expect("start status helper without effort");
+        .expect("start status helper without context data");
     helper
         .stdin
         .take()
@@ -372,7 +371,7 @@ fn butler_status_is_a_live_mcp_tool_not_a_terminal_scrape() {
     assert!(output.status.success(), "status helper failed: {output:?}");
     assert_eq!(
         text_of(&call(&path, "butler_status", json!({}))),
-        "MODEL:sonnet EFFORT:? CTX:? CTXWIN:? CTXPCT:?"
+        "MODEL:sonnet CTX:? CTXWIN:? CTXPCT:?"
     );
 }
 
