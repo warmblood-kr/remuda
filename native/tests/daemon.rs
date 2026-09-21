@@ -2958,6 +2958,154 @@ fn butler_compaction_schedule_sends_compact_when_idle_but_not_when_busy() {
     );
 }
 
+/// Minimal shape check for `os.date("!%Y-%m-%dT%H:%M:%SZ")` -- exactly what
+/// `_butler_trace` in `packages/butler/init.lua` writes -- without pulling a
+/// date-parsing crate into this test binary for one field.
+fn looks_like_iso8601_utc(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 20
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b[10] == b'T'
+        && b[13] == b':'
+        && b[16] == b':'
+        && b[19] == b'Z'
+        && s[0..4].bytes().all(|c| c.is_ascii_digit())
+        && s[5..7].bytes().all(|c| c.is_ascii_digit())
+        && s[8..10].bytes().all(|c| c.is_ascii_digit())
+        && s[11..13].bytes().all(|c| c.is_ascii_digit())
+        && s[14..16].bytes().all(|c| c.is_ascii_digit())
+        && s[17..19].bytes().all(|c| c.is_ascii_digit())
+}
+
+/// The screen-based witness just above (`..._sends_compact_when_idle...`)
+/// proves the *effect* fired, but nothing about it survives past that pty --
+/// gone the moment the session closes, and gone entirely across a daemon
+/// restart, which is exactly the gap `_butler_trace` closes. Same busy/idle
+/// two-phase control as that test, but the witness here is the trace FILE's
+/// real bytes read back from disk, proving what a human opening this file on
+/// some later day, with no session left to look at, would actually see.
+#[test]
+#[cfg(unix)]
+fn butler_compaction_trace_records_registered_skipped_and_sent() {
+    let dir = scratch_dir("butler-compaction-trace");
+    let (token_path, config_path) = butler_config(
+        &dir,
+        "compaction-trace",
+        "http://127.0.0.1:1",
+        "!room:example.org",
+        "@butler:example.org",
+        "",
+    );
+    let token_str = token_path.to_string_lossy().to_string();
+    let config_str = config_path.to_string_lossy().to_string();
+    let daemon = Daemon::spawn_with_env(
+        &dir,
+        &[
+            ("REMUDA_BUTLER_TOKEN", token_str.as_str()),
+            ("REMUDA_BUTLER_CONFIG", config_str.as_str()),
+        ],
+    );
+    let path = daemon::socket_path_in(&dir, "s");
+
+    // This test's own tempdir, never the real `~/.config/remuda/`.
+    let trace_path = dir.join("compaction-trace.log");
+    eval(&path, "remuda._butler_compaction_interval = 0.05");
+    eval(
+        &path,
+        &format!(
+            "remuda._butler_compaction_trace_path = {}",
+            lua_raw_string(&trace_path.to_string_lossy())
+        ),
+    );
+    eval(&path, r#"remuda._butler_argv = {"sh"}"#);
+    eval(&path, "remuda._butler_skip_relay = true");
+
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let butler_name = eval(&path, "return remuda._butler_initial_name");
+
+    // Simulates the launched session's own one-time `run_script` call the
+    // system prompt asks for -- this alone must already leave a "registered"
+    // line, before any tick has had a chance to run.
+    eval(&path, "remuda._butler_register_compaction_schedule()");
+    let registered = std::fs::read_to_string(&trace_path).unwrap_or_default();
+    assert!(
+        registered.contains("\tregistered\t"),
+        "no \"registered\" trace line after registration:\n{registered}"
+    );
+
+    // Busy phase, same as the sibling screen-based test: outrun the 2s idle
+    // threshold for a few seconds, spanning several real 1s daemon ticks,
+    // and prove the guard actually left a "skipped_busy" line for it — not
+    // just that /compact was withheld.
+    let busy_until = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < busy_until {
+        eval(&path, &format!("remuda.send({butler_name:?}, \"\")"));
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let while_busy = std::fs::read_to_string(&trace_path).unwrap_or_default();
+    assert!(
+        while_busy.contains("\tskipped_busy\t"),
+        "no \"skipped_busy\" trace line recorded during the busy phase:\n{while_busy}"
+    );
+    assert!(
+        !while_busy.contains("\tsent\t"),
+        "a \"sent\" trace line appeared while the session was kept busy:\n{while_busy}"
+    );
+
+    // Idle phase: stop feeding input and wait for the next tick to record a
+    // real "sent" line.
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let content = std::fs::read_to_string(&trace_path).unwrap_or_default();
+        if content.contains("\tsent\t") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no \"sent\" trace line ever appeared once the session went idle:\n{content}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Witness discipline: read the ACTUAL bytes back from disk and validate
+    // every line's shape, not just substring presence.
+    let content = std::fs::read_to_string(&trace_path).expect("read trace file");
+    let lines: Vec<&str> = content.lines().collect();
+    assert!(!lines.is_empty(), "trace file was empty");
+    for line in &lines {
+        let fields: Vec<&str> = line.split('\t').collect();
+        assert_eq!(
+            fields.len(),
+            3,
+            "line {line:?} does not have exactly 3 tab-separated fields"
+        );
+        assert!(
+            looks_like_iso8601_utc(fields[0]),
+            "first field {:?} is not a parseable ISO-8601 UTC timestamp in line {line:?}",
+            fields[0]
+        );
+    }
+
+    drop(daemon);
+    let ps = std::process::Command::new("ps")
+        .args(["-eo", "pid,args"])
+        .output()
+        .expect("ps");
+    let ps_out = String::from_utf8_lossy(&ps.stdout);
+    let leaked: Vec<&str> = ps_out.lines().filter(|l| l.contains(&token_str)).collect();
+    assert!(
+        leaked.is_empty(),
+        "orphan process(es) still reference this test's own token path after teardown: {leaked:?}"
+    );
+}
+
 /// This documents the case where NO persistence layer is installed: `remuda`
 /// itself never re-execs butler on its own, restart or not — the only way
 /// `packages/butler/init.lua`'s real code ever runs is an explicit `remuda
