@@ -119,6 +119,7 @@ jobs:
       - name: build
         env:
           REMUDA_VERSION: ${{ needs.plan.outputs.version }}
+          REMUDA_BUILD: gha.${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}
         run: cargo build --release --bin remuda --target ${{ matrix.target }}
 
       - name: the binary reports the version it was built with
@@ -133,7 +134,7 @@ jobs:
         run: |
           set -eu
           got=$(./target/${{ matrix.target }}/release/${{ matrix.bin }} --version)
-          [ "$got" = "remuda ${{ needs.plan.outputs.version }}" ] \
+          [ "$got" = "remuda ${{ needs.plan.outputs.version }}+gha.${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}" ] \
             || { echo "::error::--version said '$got'"; exit 1; }
 
       - name: package

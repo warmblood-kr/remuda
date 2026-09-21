@@ -17,6 +17,10 @@ pub const VERSION: &str = match option_env!("REMUDA_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+/// `VERSION` determines update ordering; this identifies the exact build.
+pub const BUILD: &str = env!("REMUDA_BUILD");
+pub const BUILD_VERSION: &str = env!("REMUDA_BUILD_VERSION");
+
 pub const INDEX_URL: &str = "https://warmblood-kr.github.io/remuda/latest.json";
 
 /// The installer this binary re-runs to upgrade itself. Two scripts, one
