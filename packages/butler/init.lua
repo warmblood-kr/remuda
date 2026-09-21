@@ -471,7 +471,10 @@ local function make_topic(name, template, kind)
   function topic.run(argv)
     local words = { "cd", shell_quote(root), "&&" }
     for _, word in ipairs(argv) do words[#words + 1] = shell_quote(word) end
-    assert(os.execute(table.concat(words, " ")))
+    local ok, why, code = os.execute(table.concat(words, " "))
+    if not ok then
+      error("Butler topic command failed (" .. tostring(why) .. " " .. tostring(code) .. "): " .. argv[1], 0)
+    end
   end
   if template then
     local setup = topic_config.templates[template]
