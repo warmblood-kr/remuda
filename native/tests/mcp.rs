@@ -64,6 +64,16 @@ fn call(path: &Path, name: &str, arguments: Value) -> Value {
     )
 }
 
+/// A dynamic MCP call made by a child whose capability came from its process
+/// environment, not from the JSON request.
+fn call_as(path: &Path, capability: Option<&str>, name: &str, arguments: Value) -> Value {
+    let request = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                         "params": {"name": name, "arguments": arguments}});
+    let line = mcp::handle_with_capability(path, &request.to_string(), capability)
+        .expect("a request with an id gets a reply");
+    serde_json::from_str(&line).expect("the reply is JSON")
+}
+
 fn text_of(reply: &Value) -> String {
     reply["result"]["content"][0]["text"]
         .as_str()
@@ -292,6 +302,44 @@ fn a_tool_defined_in_lua_is_listed_and_dispatched() {
     let echoed = call(&path, "echo", json!({"text": hostile}));
     assert_eq!(echoed["result"]["isError"], false, "{echoed}");
     assert_eq!(text_of(&echoed), hostile, "the argument was not escaped");
+}
+
+#[test]
+fn dynamic_tools_receive_only_daemon_issued_caller_context() {
+    let dir = scratch("mcp-caller-context");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let defined = call(
+        &path,
+        "run_script",
+        json!({"code": r#"
+            remuda.tool{
+              name = "who_called",
+              about = "Return the MCP caller capability supplied by the daemon.",
+              run = function(_, caller)
+                return caller and caller.capability or "anonymous"
+              end,
+            }
+            return "defined"
+        "#}),
+    );
+    assert_eq!(defined["result"]["isError"], false, "define: {defined}");
+
+    // The request tries to spoof a capability in its own arguments. It is not
+    // the caller context and cannot replace the daemon-issued one.
+    let identified = call_as(
+        &path,
+        Some("capability-issued-by-butler"),
+        "who_called",
+        json!({"capability": "spoofed-by-mcp-client"}),
+    );
+    assert_eq!(identified["result"]["isError"], false, "{identified}");
+    assert_eq!(text_of(&identified), "capability-issued-by-butler");
+
+    let anonymous = call_as(&path, None, "who_called", json!({}));
+    assert_eq!(anonymous["result"]["isError"], false, "{anonymous}");
+    assert_eq!(text_of(&anonymous), "anonymous");
 }
 
 #[test]

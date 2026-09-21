@@ -357,18 +357,152 @@ remuda.tool{
     return line
   end,
 }
-local mcp_env = ""
-if runtime_dir then
-  mcp_env = ',"env":{"REMUDA_RUNTIME_DIR":"' .. runtime_dir .. '"}'
+
+-- A small, cooperative post office for every agent Butler launches.  This is
+-- deliberately live-image state, like Emacs: callers may inspect or extend it
+-- through `run_script`.  `caller.capability` is attribution supplied by that
+-- session's MCP child, not an access-control boundary.
+remuda._butler_bus = remuda._butler_bus or { agents = {}, tokens = {}, inboxes = {}, next = 0 }
+local bus = remuda._butler_bus
+local function next_token(name)
+  bus.next = bus.next + 1
+  return name .. "-" .. os.time() .. "-" .. bus.next
 end
+local function caller_name(caller)
+  local token = caller and caller.capability
+  return (token and bus.tokens[token]) or "outside"
+end
+local function mailbox(name)
+  bus.inboxes[name] = bus.inboxes[name] or {}
+  return bus.inboxes[name]
+end
+local function agent_mcp_json(token)
+  local env = '"REMUDA_BUTLER_SESSION_TOKEN":"' .. token .. '"'
+  if runtime_dir then env = env .. ',"REMUDA_RUNTIME_DIR":"' .. runtime_dir .. '"' end
+  return '{"mcpServers":{"remuda":{"command":"remuda","args":["-s","'
+    .. server .. '","mcp"],"env":{' .. env .. '}}}}'
+end
+local function agent_mcp_path(name, token)
+  local path = os.tmpname() .. "." .. name .. ".mcp.json"
+  local f = assert(io.open(path, "w"))
+  f:write(agent_mcp_json(token))
+  f:close()
+  return path
+end
+local function codex_mcp_flags(token)
+  local env = 'REMUDA_BUTLER_SESSION_TOKEN="' .. token .. '"'
+  if runtime_dir then env = env .. ',REMUDA_RUNTIME_DIR="' .. runtime_dir .. '"' end
+  return {
+    "-c", 'mcp_servers.remuda.command="remuda"',
+    "-c", 'mcp_servers.remuda.args=["-s","' .. server .. '","mcp"]',
+    "-c", "mcp_servers.remuda.env={" .. env .. "}",
+  }
+end
+local function launch_agent(kind, requested_name, cwd, model)
+  if kind ~= "claude" and kind ~= "codex" then error("unknown agent kind: " .. tostring(kind), 0) end
+  local name = requested_name or kind
+  local token = next_token(name)
+  local argv
+  if kind == "claude" then
+    argv = { "claude", "--mcp-config", agent_mcp_path(name, token), "--strict-mcp-config", "--permission-mode", "auto", "--append-system-prompt", "This session is managed by Remuda Butler. The remuda butler CLI is available for coordination." }
+    if model and model ~= "" then argv[#argv + 1] = "--model"; argv[#argv + 1] = model end
+  else
+    argv = { "codex" }
+    for _, flag in ipairs(codex_mcp_flags(token)) do argv[#argv + 1] = flag end
+    argv[#argv + 1] = "--approve-for-me"
+    if model and model ~= "" then argv[#argv + 1] = "--model"; argv[#argv + 1] = model end
+  end
+  local actual = remuda.new(name, argv, cwd)
+  bus.tokens[token] = actual
+  bus.agents[actual] = { kind = kind, token = token }
+  mailbox(actual)
+  return actual
+end
+
+-- Shell-facing doors into the same deliberately mutable bus.  These are not
+-- capability checks: Butler is a workshop, and the `from` name is simply the
+-- attribution a human (or an agent using the CLI) chose to leave on a note.
+-- Keeping them on `remuda` also makes the post office pleasant to explore from
+-- a REPL without having to know this chunk's private locals.
+function remuda._butler_launch(kind, name)
+  return launch_agent(kind, name)
+end
+function remuda._butler_send(from, to, text)
+  if not bus.agents[to] then error("no Butler agent named " .. tostring(to), 0) end
+  bus.next = bus.next + 1
+  local id = "message-" .. bus.next
+  mailbox(to)[#mailbox(to) + 1] = { id = id, from = from or "outside", body = text }
+  return "queued " .. id .. " for " .. to
+end
+function remuda._butler_inbox(name)
+  if not bus.agents[name] then error("no Butler agent named " .. tostring(name), 0) end
+  local messages = mailbox(name)
+  if #messages == 0 then return "inbox empty" end
+  local out = {}
+  for _, message in ipairs(messages) do
+    out[#out + 1] = "[" .. message.id .. " from " .. message.from .. "] " .. message.body
+  end
+  bus.inboxes[name] = {}
+  return table.concat(out, "\n")
+end
+function remuda._butler_sessions()
+  local out = {}
+  for name, agent in pairs(bus.agents) do out[#out + 1] = name .. "\t" .. agent.kind end
+  table.sort(out)
+  return #out == 0 and "no Butler agents" or table.concat(out, "\n")
+end
+
+remuda.tool{
+  name = "butler_launch",
+  about = "Launch a Claude Code or Codex agent with this Butler's shared MCP mailbox.",
+  args = { kind = "Agent kind: claude or codex.", name = "Optional session name.", cwd = "Optional working directory.", model = "Optional model override." },
+  needs = { "kind" },
+  run = function(a)
+    return "launched " .. launch_agent(a.kind, a.name, a.cwd, a.model)
+  end,
+}
+remuda.tool{
+  name = "butler_send",
+  about = "Queue a message for another Butler agent without typing its body into that agent's terminal.",
+  args = { to = "Recipient session name.", text = "Message body." },
+  needs = { "to", "text" },
+  run = function(a, caller)
+    return remuda._butler_send(caller_name(caller), a.to, a.text)
+  end,
+}
+remuda.tool{
+  name = "butler_inbox",
+  about = "Drain this agent's Butler inbox and return its queued messages in arrival order.",
+  run = function(_, caller)
+    return remuda._butler_inbox(caller_name(caller))
+  end,
+}
+remuda.tool{
+  name = "butler_reply",
+  about = "Reply to a received Butler message by its message id; the reply goes to its recorded sender.",
+  args = { to = "Recipient session name.", text = "Reply body." },
+  needs = { "to", "text" },
+  run = function(a, caller)
+    if not bus.agents[a.to] then error("no Butler agent named " .. a.to, 0) end
+    bus.next = bus.next + 1
+    mailbox(a.to)[#mailbox(a.to) + 1] = { id = "message-" .. bus.next, from = caller_name(caller), body = a.text }
+    return "reply queued for " .. a.to
+  end,
+}
+remuda.tool{
+  name = "butler_sessions",
+  about = "List Butler-managed Claude Code and Codex agent sessions and their adapter kinds.",
+  run = function()
+    return remuda._butler_sessions()
+  end,
+}
+
+local butler_token = next_token("butler")
+bus.tokens[butler_token] = "butler"
+bus.agents.butler = { kind = os.getenv("REMUDA_BUTLER_KIND") or "claude", token = butler_token }
+mailbox("butler")
 local mcp_file = io.open(mcp_config_path, "w")
-mcp_file:write(
-  '{"mcpServers":{"remuda":{"command":"remuda","args":["-s","'
-    .. server
-    .. '","mcp"]'
-    .. mcp_env
-    .. "}}}"
-)
+mcp_file:write(agent_mcp_json(butler_token))
 mcp_file:close()
 
 -- Without this, the session has no reason to ever call `matrix_reply`: a
@@ -426,20 +560,21 @@ local function _butler_trace(event, detail)
   end)
 end
 
-local BUTLER_ARGV = remuda._butler_argv or {
-  "claude",
-  "--settings",
-  settings_path,
-  "--mcp-config",
-  mcp_config_path,
-  "--strict-mcp-config",
-  "--permission-mode",
-  "auto",
-  "--allowedTools",
-  "mcp__remuda__run_script",
-  "--append-system-prompt",
-  SYSTEM_PROMPT,
-}
+local butler_kind = os.getenv("REMUDA_BUTLER_KIND") or "claude"
+local BUTLER_ARGV = remuda._butler_argv
+if not BUTLER_ARGV and butler_kind == "claude" then
+  BUTLER_ARGV = {
+    "claude", "--settings", settings_path, "--mcp-config", mcp_config_path,
+    "--strict-mcp-config", "--permission-mode", "auto", "--allowedTools",
+    "mcp__remuda__run_script", "--append-system-prompt", SYSTEM_PROMPT,
+  }
+elseif not BUTLER_ARGV and butler_kind == "codex" then
+  BUTLER_ARGV = { "codex" }
+  for _, flag in ipairs(codex_mcp_flags(butler_token)) do BUTLER_ARGV[#BUTLER_ARGV + 1] = flag end
+  BUTLER_ARGV[#BUTLER_ARGV + 1] = "--approve-for-me"
+elseif not BUTLER_ARGV then
+  error("unknown Butler kind: " .. butler_kind, 0)
+end
 
 -- Reused both for the initial launch and every respawn, so the watchdog
 -- below can never drift from what a fresh start would have done. Keeps the

@@ -104,6 +104,13 @@ fn main() -> ExitCode {
 
         ["exec", name] => with_daemon(server, &path, |path| exec_command(path, name)),
 
+        // Butler is a package living in the daemon image, but its small
+        // post-office is useful often enough to deserve shell-shaped doors.
+        // The commands below deliberately only evaluate the package's public
+        // live-state functions; they do not duplicate a second registry in
+        // Rust.
+        ["butler", rest @ ..] => butler_command(server, &path, rest),
+
         // `emacsclient -e` for this runtime: the code runs in the daemon's
         // long-lived image, so what it defines is still there next time.
         ["-e", code] => with_daemon(server, &path, |path| eval_once(path, code)),
@@ -118,7 +125,12 @@ fn main() -> ExitCode {
         // can reach the manager. Not meant to be typed by hand — a client
         // spawns it and owns both pipes.
         ["mcp"] => with_daemon(server, &path, |path| {
-            match remuda_native::mcp::serve(path) {
+            // Butler puts an unforgeable per-session capability in this child
+            // process's environment. MCP JSON never supplies caller identity.
+            let capability = std::env::var("REMUDA_BUTLER_SESSION_TOKEN")
+                .ok()
+                .filter(|token| !token.is_empty());
+            match remuda_native::mcp::serve_with_capability(path, capability.as_deref()) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(format!("mcp: {e}")),
             }
@@ -147,6 +159,11 @@ remuda — a pty manager you can attach to
 
   remuda lua <script.lua>       run a Lua script in the daemon's living image
   remuda exec <name>            run a built-in package's entry file, by name
+  remuda butler help             show Butler coordination commands
+  remuda butler sessions         list Butler-managed agent sessions
+  remuda butler launch KIND [N]  launch a claude or codex session
+  remuda butler send FROM TO MSG queue a message for an agent
+  remuda butler inbox NAME       drain an agent's queued messages
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
@@ -473,6 +490,103 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
     }
 }
 
+const BUTLER_USAGE: &str = "\
+remuda butler — lightweight coordination for managed agents
+
+  remuda butler sessions
+  remuda butler launch <claude|codex> [name]
+  remuda butler send <from> <to> <message...>
+  remuda butler inbox <name>
+
+Butler is live state in the remuda daemon. Start it first with:
+
+  remuda exec butler
+";
+
+/// The deliberately thin CLI face of Butler's live Lua post-office. Keeping
+/// the data and operations in Lua means a person can inspect or change them
+/// at `remuda repl`; this is just pleasant shell syntax, not a second policy
+/// layer.
+fn butler_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    match args {
+        [] | ["help"] | ["-h"] | ["--help"] => {
+            print!("{BUTLER_USAGE}");
+            ExitCode::SUCCESS
+        }
+        ["sessions"] => with_daemon(server, path, |path| {
+            butler_eval(path, "return remuda._butler_sessions()")
+        }),
+        ["launch", kind] => with_daemon(server, path, |path| {
+            butler_eval(
+                path,
+                &format!("return remuda._butler_launch({}, nil)", lua_string(kind)),
+            )
+        }),
+        ["launch", kind, name] => with_daemon(server, path, |path| {
+            butler_eval(
+                path,
+                &format!(
+                    "return remuda._butler_launch({}, {})",
+                    lua_string(kind),
+                    lua_string(name)
+                ),
+            )
+        }),
+        ["send", from, to, message @ ..] if !message.is_empty() => {
+            with_daemon(server, path, |path| {
+                butler_eval(
+                    path,
+                    &format!(
+                        "return remuda._butler_send({}, {}, {})",
+                        lua_string(from),
+                        lua_string(to),
+                        lua_string(&message.join(" "))
+                    ),
+                )
+            })
+        }
+        ["inbox", name] => with_daemon(server, path, |path| {
+            butler_eval(
+                path,
+                &format!("return remuda._butler_inbox({})", lua_string(name)),
+            )
+        }),
+        _ => {
+            eprint!("{BUTLER_USAGE}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// A JSON string literal is also a Lua string literal. `serde_json` handles
+/// newlines, quotes, and backslashes so a coordination message can never turn
+/// into extra code in the daemon image.
+fn lua_string(value: &str) -> String {
+    serde_json::to_string(value).expect("strings always serialize")
+}
+
+fn butler_eval(path: &Path, code: &str) -> ExitCode {
+    match remuda_native::client::request(
+        path,
+        &Request::Eval {
+            code: code.to_string(),
+            name: Some("butler-cli".into()),
+        },
+    ) {
+        Ok(Response::Value(value)) => {
+            if !value.is_empty() {
+                println!("{value}");
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(Response::Error(error)) if error.contains("_butler_") && error.contains("nil value") => {
+            eprintln!("remuda: Butler is not running; start it with `remuda exec butler`");
+            ExitCode::FAILURE
+        }
+        other => fail(describe(other)),
+    }
+}
+
 /// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
 /// successful *connect*, not on the file existing, and pass `-s <server>`
 /// through — a bare `remuda daemon` re-derives `"default"` and never matches.
@@ -696,7 +810,7 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 }
 
 #[cfg(test)]
-mod version_skew_tests {
+mod tests {
     use super::*;
 
     /// [MEASURED] A request failure must not read as a confirmed match —
@@ -710,5 +824,18 @@ mod version_skew_tests {
              not silently read as a confirmed match"
         );
         assert!(notice.unwrap().contains("remuda restart"));
+    }
+
+    #[test]
+    fn butler_message_is_one_lua_string_not_extra_lua() {
+        let message = "hello\" ); remuda.close('butler') --\nnext";
+        let code = format!(
+            "return remuda._butler_send(\"a\", \"b\", {})",
+            lua_string(message)
+        );
+        assert_eq!(
+            code,
+            "return remuda._butler_send(\"a\", \"b\", \"hello\\\" ); remuda.close('butler') --\\nnext\")"
+        );
     }
 }
