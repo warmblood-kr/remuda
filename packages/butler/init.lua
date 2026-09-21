@@ -465,7 +465,7 @@ function remuda._butler_sessions()
   local out = {}
   for name, agent in pairs(bus.agents) do out[#out + 1] = name .. "\t" .. agent.kind end
   table.sort(out)
-  return #out == 0 and "no Butler agents" or table.concat(out, "\n")
+  return #out == 0 and "no Butler agents" or "SESSION\tAGENT\n" .. table.concat(out, "\n")
 end
 
 remuda.tool{
