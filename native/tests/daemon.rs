@@ -3106,6 +3106,123 @@ fn butler_compaction_trace_records_registered_skipped_and_sent() {
     );
 }
 
+/// Same real-process substitution as
+/// `butler_watchdog_relaunches_a_session_that_really_died`, but the witness
+/// here is the trace FILE `_butler_session_trace` in `packages/butler/init.lua`
+/// writes from the `session_exited` hook, not the in-memory
+/// `remuda._watchdog_exits` list -- proving the watchdog's own trace records
+/// both the exit and the relaunch it triggers, not just that they happened.
+#[test]
+#[cfg(unix)]
+fn butler_watchdog_records_session_exit_and_relaunch_in_a_trace_file() {
+    let dir = scratch_dir("butler-watchdog-trace");
+    let (token_path, config_path) = butler_config(
+        &dir,
+        "watchdog-trace",
+        "http://127.0.0.1:1",
+        "!room:example.org",
+        "@butler:example.org",
+        "",
+    );
+    let token_str = token_path.to_string_lossy().to_string();
+    let config_str = config_path.to_string_lossy().to_string();
+    let daemon = Daemon::spawn_with_env(
+        &dir,
+        &[
+            ("REMUDA_BUTLER_TOKEN", token_str.as_str()),
+            ("REMUDA_BUTLER_CONFIG", config_str.as_str()),
+        ],
+    );
+    let path = daemon::socket_path_in(&dir, "s");
+
+    // This test's own tempdir, never the real `~/.config/remuda/`.
+    let trace_path = dir.join("session-trace.log");
+    eval(
+        &path,
+        &format!(
+            "remuda._butler_session_trace_path = {}",
+            lua_raw_string(&trace_path.to_string_lossy())
+        ),
+    );
+    // Same observer group as `butler_watchdog_relaunches_a_session_that_really_died`
+    // -- `init.lua` clears the "butler" group on every `exec`, so a hook
+    // registered there would not survive it.
+    eval(
+        &path,
+        r#"
+            remuda._watchdog_exits = {}
+            remuda.on("session_exited", function(name)
+                table.insert(remuda._watchdog_exits, name)
+            end, { group = "test-observer" })
+        "#,
+    );
+    eval(
+        &path,
+        r#"remuda._butler_argv = {"sh", "-c", "sleep 0.3; exit 0"}"#,
+    );
+    eval(&path, "remuda._butler_skip_relay = true");
+
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let initial_name = eval(&path, "return remuda._butler_initial_name");
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let seen = eval(&path, "return table.concat(remuda._watchdog_exits, ',')");
+        let count = seen.split(',').filter(|n| *n == initial_name).count();
+        if count >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected at least 2 session_exited events for {initial_name:?}, saw: {seen:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Witness discipline: read the ACTUAL bytes back from disk, same as
+    // `butler_compaction_trace_records_registered_skipped_and_sent`.
+    let content = std::fs::read_to_string(&trace_path).expect("read trace file");
+    let lines: Vec<Vec<&str>> = content.lines().map(|l| l.split('\t').collect()).collect();
+    assert!(!lines.is_empty(), "trace file was empty");
+    for fields in &lines {
+        assert_eq!(fields.len(), 3, "not 3 tab-separated fields: {fields:?}");
+        assert!(
+            looks_like_iso8601_utc(fields[0]),
+            "not a parseable ISO-8601 UTC timestamp: {fields:?}"
+        );
+    }
+    assert!(
+        lines
+            .iter()
+            .any(|f| f[1] == "session_exited" && f[2] == initial_name),
+        "no \"session_exited\" trace line for {initial_name:?}:\n{content}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|f| f[1] == "relaunching" && f[2] == initial_name),
+        "no \"relaunching\" trace line for {initial_name:?}:\n{content}"
+    );
+
+    drop(daemon);
+    let ps = std::process::Command::new("ps")
+        .args(["-eo", "pid,args"])
+        .output()
+        .expect("ps");
+    let ps_out = String::from_utf8_lossy(&ps.stdout);
+    let leaked: Vec<&str> = ps_out.lines().filter(|l| l.contains(&token_str)).collect();
+    assert!(
+        leaked.is_empty(),
+        "orphan process(es) still reference this test's own token path after teardown: {leaked:?}"
+    );
+}
+
 /// This documents the case where NO persistence layer is installed: `remuda`
 /// itself never re-execs butler on its own, restart or not — the only way
 /// `packages/butler/init.lua`'s real code ever runs is an explicit `remuda

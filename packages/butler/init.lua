@@ -358,12 +358,37 @@ function remuda._butler_register_compaction_schedule()
   return remuda._butler_compaction_schedule
 end
 
+-- remuda._butler_session_trace_path lets a test redirect this to a throwaway
+-- tempfile, same idiom as remuda._butler_compaction_trace_path above; nil in
+-- production means tracing is simply off (no default path wired in yet --
+-- that's a separate decision for whoever turns this on for real installs).
+local function _butler_session_trace(event, detail)
+  pcall(function()
+    local path = remuda._butler_session_trace_path
+    if not path then
+      return
+    end
+    local f = io.open(path, "a")
+    if not f then
+      os.execute('mkdir -p "' .. path:match("^(.*)/[^/]+$") .. '"')
+      f = io.open(path, "a")
+    end
+    if not f then
+      return
+    end
+    f:write(os.date("!%Y-%m-%dT%H:%M:%SZ") .. "\t" .. event .. "\t" .. (detail or "") .. "\n")
+    f:close()
+  end)
+end
+
 -- `exec butler` re-running this file in the same daemon image would
 -- otherwise double this hook (see docs/design.md's augroup note) --
 -- clearing the group first keeps exactly one watchdog alive.
 remuda.clear_hooks({ group = "butler" })
 remuda.on("session_exited", function(name)
+  _butler_session_trace("session_exited", name)
   if name == butler_name then
+    _butler_session_trace("relaunching", name)
     launch_butler()
   end
 end, { group = "butler" })
