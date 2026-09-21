@@ -104,12 +104,9 @@ fn main() -> ExitCode {
 
         ["exec", name] => with_daemon(server, &path, |path| exec_command(path, name)),
 
-        // Butler is a package living in the daemon image, but its small
-        // post-office is useful often enough to deserve shell-shaped doors.
-        // The commands below deliberately only evaluate the package's public
-        // live-state functions; they do not duplicate a second registry in
-        // Rust.
-        ["butler", rest @ ..] => butler_command(server, &path, rest),
+        [command, rest @ ..] if remuda_native::packages::subcommand(command).is_some() => {
+            extension_command(server, &path, command, rest)
+        }
 
         // `emacsclient -e` for this runtime: the code runs in the daemon's
         // long-lived image, so what it defines is still there next time.
@@ -159,6 +156,7 @@ remuda — a pty manager you can attach to
 
   remuda lua <script.lua>       run a Lua script in the daemon's living image
   remuda exec <name>            run a built-in package's entry file, by name
+  remuda butler                 run the Butler extension
   remuda butler help             show Butler coordination commands
   remuda butler sessions         list Butler-managed agent sessions
   remuda butler launch KIND [N]  launch a claude or codex session
@@ -490,6 +488,26 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
     }
 }
 
+type ExtensionHandler = fn(&str, &Path, &[&str]) -> ExitCode;
+
+const EXTENSION_HANDLERS: &[(&str, ExtensionHandler)] = &[("butler", butler_command)];
+
+fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) -> ExitCode {
+    if args.is_empty() {
+        let package = remuda_native::packages::subcommand(command)
+            .expect("subcommand dispatch was checked above");
+        return with_daemon(server, path, |path| exec_command(path, package.name));
+    }
+    match EXTENSION_HANDLERS
+        .iter()
+        .find(|(name, _)| *name == command)
+        .map(|(_, handler)| handler)
+    {
+        Some(handler) => handler(server, path, args),
+        None => fail(format!("extension {command} does not accept subcommands")),
+    }
+}
+
 const BUTLER_USAGE: &str = "\
 remuda butler — lightweight coordination for managed agents
 
@@ -498,9 +516,9 @@ remuda butler — lightweight coordination for managed agents
   remuda butler send <from> <to> <message...>
   remuda butler inbox <name>
 
-Butler is live state in the remuda daemon. Start it first with:
+Butler is live state in the remuda daemon. Start it with:
 
-  remuda exec butler
+  remuda butler
 ";
 
 /// The deliberately thin CLI face of Butler's live Lua post-office. Keeping
@@ -580,7 +598,7 @@ fn butler_eval(path: &Path, code: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Response::Error(error)) if error.contains("_butler_") && error.contains("nil value") => {
-            eprintln!("remuda: Butler is not running; start it with `remuda exec butler`");
+            eprintln!("remuda: Butler is not running; start it with `remuda butler`");
             ExitCode::FAILURE
         }
         other => fail(describe(other)),
