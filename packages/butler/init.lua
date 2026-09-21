@@ -655,9 +655,15 @@ end
 -- below can never drift from what a fresh start would have done. Keeps the
 -- name across respawns by feeding the previous result back in as the name.
 local butler_name = remuda._butler_name
+local function session_exists(name)
+  for _, session in ipairs(remuda.ls()) do
+    if session.name == name then return true end
+  end
+  return false
+end
 local function launch_butler()
   local requested_name = butler_name or remuda._butler_initial_name
-  if pcall(remuda.session, requested_name) then
+  if session_exists(requested_name) then
     butler_name = requested_name
     remuda._butler_name = butler_name
     return
