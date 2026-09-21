@@ -130,6 +130,68 @@ printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -sf -K - -X PUT \
   -d "$BODY_JSON" >/dev/null
 ]==]
 
+-- Claude calls statusLine commands with a JSON snapshot on stdin.  This
+-- helper is deliberately the sole producer of Butler's telemetry: it emits a
+-- fixed marker for people in the terminal and atomically publishes that exact
+-- marker to a private file for `butler_status`.  Reading Claude's terminal
+-- would make the latter depend on escape sequences and layout rather than the
+-- protocol Claude itself supplies.
+local STATUSLINE_SRC = [==[
+import json
+import os
+import re
+import sys
+
+path = sys.argv[1]
+
+def tag(value):
+    if not isinstance(value, str) or not value:
+        return "?"
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
+    return value or "?"
+
+def integer(value):
+    return str(int(value)) if isinstance(value, (int, float)) else "?"
+
+try:
+    snapshot = json.load(sys.stdin)
+except Exception:
+    snapshot = {}
+
+window = snapshot.get("context_window") or {}
+used = window.get("total_input_tokens")
+if not isinstance(used, (int, float)):
+    current = window.get("current_usage") or {}
+    parts = [current.get(key) for key in (
+        "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")]
+    parts = [part for part in parts if isinstance(part, (int, float))]
+    used = sum(parts) if parts else None
+
+model = snapshot.get("model") or {}
+# Claude Code 2.1.278 supplies `effort` at the top level when it has a
+# reading.  Do not infer it from a model name or a launch option: /effort can
+# change during a session, and absent really means unknown.
+effort = snapshot.get("effort")
+line = "MODEL:{model} EFFORT:{effort} CTX:{used} CTXWIN:{capacity} CTXPCT:{percent}".format(
+    model=tag(model.get("display_name") or model.get("id")),
+    effort=tag(effort),
+    used=integer(used),
+    capacity=integer(window.get("context_window_size")),
+    percent=integer(window.get("used_percentage")),
+)
+
+try:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as out:
+        out.write(line + "\n")
+    os.replace(tmp, path)
+except Exception:
+    # A status line must never make Claude's UI fail merely because its
+    # observer cannot write (for example a cleaned-up temporary directory).
+    pass
+print(line)
+]==]
+
 -- This is the one service session installed by the package, not an ordinary
 -- user-created session. Its stable name is its public control surface:
 -- `remuda send butler ...`, installer liveness checks, and restart recovery
@@ -143,6 +205,7 @@ end
 -- config this test harness doesn't have, and shouldn't start one anyway).
 remuda._butler_helper_src = HELPER_SRC
 remuda._butler_reply_src = REPLY_SRC
+remuda._butler_statusline_src = STATUSLINE_SRC
 remuda._butler_initial_name = initial_butler_name()
 if remuda._butler_test_mode then
   return
@@ -257,6 +320,48 @@ local runtime_dir = os.getenv("REMUDA_RUNTIME_DIR")
 -- local-only mode has no configuration directory to rely on, so use a private
 -- temporary filename for the same short-lived Claude MCP configuration.
 local mcp_config_path = config_path and (config_path .. ".mcp.json") or (os.tmpname() .. ".mcp.json")
+local status_path = config_path and (config_path .. ".status") or (os.tmpname() .. ".status")
+local status_helper_path = status_path .. ".py"
+local settings_path = status_path .. ".settings.json"
+
+-- The helper is embedded with the package so a local `remuda` binary is
+-- self-contained: no dotfile, PATH helper, or repository checkout has to
+-- survive after it starts Claude.  These paths are generated once per Butler
+-- registration and reused by respawns through BUTLER_ARGV below.
+local status_helper = assert(io.open(status_helper_path, "w"))
+status_helper:write(STATUSLINE_SRC)
+status_helper:close()
+local function shell_quote(s)
+  return "'" .. s:gsub("'", "'\\\"'\\\"'") .. "'"
+end
+local function json_quote(s)
+  return '"' .. s:gsub('\\', '\\\\'):gsub('"', '\\"') .. '"'
+end
+local settings = assert(io.open(settings_path, "w"))
+settings:write('{"statusLine":{"type":"command","command":'
+  .. json_quote("python3 " .. shell_quote(status_helper_path) .. " " .. shell_quote(status_path))
+  .. ',"refreshInterval":2}}')
+settings:close()
+remuda._butler_status_path = status_path
+
+remuda.tool{
+  name = "butler_status",
+  about = "Read Butler's latest Claude Code status-line telemetry: model, effort, context tokens, window, and percentage.",
+  run = function()
+    local f = io.open(remuda._butler_status_path or "", "r")
+    if not f then
+      return "MODEL:? EFFORT:? CTX:? CTXWIN:? CTXPCT:? (no status reading yet)"
+    end
+    local line = f:read("*l")
+    f:close()
+    -- The helper owns this file.  Refuse a malformed or externally replaced
+    -- record instead of presenting arbitrary file contents as Claude status.
+    if not line or not line:match("^MODEL:[A-Za-z0-9_.%-?]+ EFFORT:[A-Za-z0-9_.%-?]+ CTX:[0-9?]+ CTXWIN:[0-9?]+ CTXPCT:[0-9?]+$") then
+      error("butler status record is malformed", 0)
+    end
+    return line
+  end,
+}
 local mcp_env = ""
 if runtime_dir then
   mcp_env = ',"env":{"REMUDA_RUNTIME_DIR":"' .. runtime_dir .. '"}'
@@ -328,6 +433,8 @@ end
 
 local BUTLER_ARGV = remuda._butler_argv or {
   "claude",
+  "--settings",
+  settings_path,
   "--mcp-config",
   mcp_config_path,
   "--strict-mcp-config",

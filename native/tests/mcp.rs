@@ -295,6 +295,88 @@ fn a_tool_defined_in_lua_is_listed_and_dispatched() {
 }
 
 #[test]
+fn butler_status_is_a_live_mcp_tool_not_a_terminal_scrape() {
+    // Run the real built-in package, but substitute a harmless long-lived
+    // process for Claude.  This exercises the same package registration and
+    // MCP registry path without needing an authenticated Claude account.
+    let dir = scratch("butler-status");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+    let status_path = match client::request(
+        &path,
+        &Request::Eval {
+            code: "remuda._butler_argv = {'sh'}; remuda.exec('butler'); return remuda._butler_status_path".into(),
+            name: None,
+        },
+    )
+    .expect("load butler")
+    {
+        Response::Value(value) => value,
+        other => panic!("butler did not return its status path: {other:?}"),
+    };
+
+    assert!(listed(&path).contains(&"butler_status".to_string()));
+    let source = match client::request(
+        &path,
+        &Request::Eval {
+            code: "return remuda._butler_statusline_src".into(),
+            name: None,
+        },
+    )
+    .expect("read embedded status helper")
+    {
+        Response::Value(value) => value,
+        other => panic!("butler has no embedded status helper: {other:?}"),
+    };
+    let mut helper = Command::new("python3")
+        .args(["-c", &source, &status_path])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start embedded status helper");
+    helper
+        .stdin
+        .take()
+        .expect("helper stdin")
+        .write_all(br#"{"model":{"display_name":"Claude Opus 4.6"},"effort":"high","context_window":{"total_input_tokens":12345,"context_window_size":200000,"used_percentage":6}}"#)
+        .expect("write Claude status snapshot");
+    let output = helper.wait_with_output().expect("wait for status helper");
+    assert!(output.status.success(), "status helper failed: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "MODEL:Claude-Opus-4.6 EFFORT:high CTX:12345 CTXWIN:200000 CTXPCT:6"
+    );
+    let reply = call(&path, "butler_status", json!({}));
+    assert_eq!(reply["result"]["isError"], false, "status failed: {reply}");
+    assert_eq!(
+        text_of(&reply),
+        "MODEL:Claude-Opus-4.6 EFFORT:high CTX:12345 CTXWIN:200000 CTXPCT:6"
+    );
+
+    // Effort is intentionally not derived from model or launch arguments:
+    // when Claude omits the field, consumers must see unknown rather than a
+    // plausible but stale setting.
+    let mut helper = Command::new("python3")
+        .args(["-c", &source, &status_path])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start status helper without effort");
+    helper
+        .stdin
+        .take()
+        .expect("helper stdin")
+        .write_all(br#"{"model":{"id":"sonnet"},"context_window":{}}"#)
+        .expect("write partial Claude status snapshot");
+    let output = helper.wait_with_output().expect("wait for status helper");
+    assert!(output.status.success(), "status helper failed: {output:?}");
+    assert_eq!(
+        text_of(&call(&path, "butler_status", json!({}))),
+        "MODEL:sonnet EFFORT:? CTX:? CTXWIN:? CTXPCT:?"
+    );
+}
+
+#[test]
 fn run_script_reaches_the_one_shared_image() {
     // Ruling ②, 정수님 2026-09-10: one daemon, `RunScript` from outside and
     // inside alike. What makes it the *shared* image rather than a fresh
