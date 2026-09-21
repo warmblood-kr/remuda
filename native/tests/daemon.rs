@@ -1179,7 +1179,7 @@ fn exec_butler_runs_the_builtin_package_in_the_daemons_image() {
 /// `init.lua`), so this reaches real code without needing the live `claude`
 /// launch that `remuda._butler_test_mode` exists to avoid.
 #[test]
-fn butler_initial_name_is_the_launch_directorys_basename() {
+fn butler_initial_name_is_butler_even_with_a_launch_directory() {
     let dir = scratch_dir("butler-name-basename");
     let _daemon = Daemon::spawn_with_pwd(&dir, Some("/home/x/my-project/"));
 
@@ -1206,12 +1206,10 @@ fn butler_initial_name_is_the_launch_directorys_basename() {
         "{}",
         String::from_utf8_lossy(&name.stderr)
     );
-    assert_eq!(String::from_utf8_lossy(&name.stdout).trim(), "my-project");
+    assert_eq!(String::from_utf8_lossy(&name.stdout).trim(), "butler");
 }
 
-/// Negative control for the same code path: no `PWD` at all (never set for
-/// a daemon started outside an interactive shell) must not panic or produce
-/// an empty name -- it must fall back to the literal "butler".
+/// A daemon without `PWD` has the same stable service name.
 #[test]
 fn butler_initial_name_falls_back_to_butler_without_a_pwd() {
     let dir = scratch_dir("butler-name-fallback");
@@ -3309,15 +3307,8 @@ fn a_supervisor_polling_remuda_ls_can_relaunch_butler_after_a_restart() {
     eval(&path, "remuda._butler_skip_relay = true");
 
     // This is exactly what the supervisor's poll runs after finding the name
-    // absent from `remuda ls`: re-`exec butler`. `os.getenv("PWD")` inside
-    // `init.lua` reads the *daemon's* own env (the eval request carries only
-    // source text, not this CLI call's env), and `daemon2` above already
-    // inherited the same ambient `PWD` as the first daemon -- so this call
-    // reproduces the same session name without needing to touch `PWD` here.
-    // A real installer still unsets `PWD` on its own `exec butler` call
-    // (`docs/install-butler.sh`), because in the wild that call may be the
-    // one lazily auto-starting a dead daemon from scratch (`with_daemon`),
-    // which is a different `PWD` than this test's pre-spawned `daemon2`.
+    // absent from `remuda ls`: re-`exec butler`. The package owns the stable
+    // name "butler", independent of the daemon's ambient environment.
     let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
     assert!(
         out.status.success(),

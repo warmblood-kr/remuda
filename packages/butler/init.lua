@@ -130,13 +130,12 @@ printf 'header = "Authorization: Bearer %s"\n' "$TOKEN" | curl -sf -K - -X PUT \
   -d "$BODY_JSON" >/dev/null
 ]==]
 
--- No cwd binding exists on the `remuda` table, so PWD (set by the shell that
--- started the daemon) is the only directory this Lua code can see. A root
--- or absent PWD has no usable basename, so it falls back to "butler".
+-- This is the one service session installed by the package, not an ordinary
+-- user-created session. Its stable name is its public control surface:
+-- `remuda send butler ...`, installer liveness checks, and restart recovery
+-- must never depend on the directory that happened to start the daemon.
 local function initial_butler_name()
-  local pwd = os.getenv("PWD")
-  local base = pwd and pwd:gsub("/+$", ""):match("([^/]+)$")
-  return base or "butler"
+  return "butler"
 end
 
 -- Exposed so tests can extract the exact embedded source without triggering
