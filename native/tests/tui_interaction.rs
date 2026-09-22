@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use remuda_core::{SessionSummary, Size};
-use remuda_native::tui::{Action, Ui};
+use remuda_native::tui::{pane_size, render, Action, Ui};
 use std::time::Duration;
 
 fn ui() -> Ui {
@@ -57,4 +57,18 @@ fn visual_yank_is_local_but_input_mode_keeps_vim_keys_for_the_child() {
     for ch in ['v', 'y', 'p'] {
         assert_eq!(ui.on_key(key(ch)), Action::Type(vec![ch as u8]));
     }
+}
+
+#[test]
+fn l_hides_the_list_and_gives_the_preview_the_full_terminal_width() {
+    let mut ui = ui();
+    assert_eq!(ui.on_key(key('l')), Action::Nothing);
+    assert_eq!(pane_size(&ui, 120, 30), Size::new(120, 29));
+    let hidden = render(&ui, "child screen", "default", 120, 30);
+    assert!(!hidden.contains("remuda · default"));
+    assert!(!hidden.contains('│'));
+
+    assert_eq!(ui.on_key(key('l')), Action::Nothing);
+    let shown = render(&ui, "child screen", "default", 120, 30);
+    assert!(shown.contains("remuda · default"));
 }

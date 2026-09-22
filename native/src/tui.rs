@@ -90,9 +90,9 @@ pub struct Ui {
     pub sessions: Vec<SessionSummary>,
     pub selected: usize,
     pub pan: u16,
-    /// `None` follows the normal content-aware width; `Some` is a user drag
-    /// or the compact-list toggle.
+    /// `None` follows the normal content-aware width; `Some` is a user drag.
     pub list_width: Option<u16>,
+    list_visible: bool,
     dragging_divider: bool,
     selecting_text: bool,
     text_selection: Option<TextSelection>,
@@ -126,6 +126,7 @@ impl Ui {
             selected: 0,
             pan: 0,
             list_width: None,
+            list_visible: true,
             dragging_divider: false,
             selecting_text: false,
             text_selection: None,
@@ -196,31 +197,42 @@ impl Ui {
             return Action::Nothing;
         }
 
+        let preview_offset = if self.list_visible { list_w + 1 } else { 0 };
         if matches!(event.kind, MouseEventKind::ScrollUp)
             && event.modifiers.contains(KeyModifiers::SHIFT)
-            && col > list_w + 1
+            && col > preview_offset
         {
-            return self.wheel_session("wheel-up", row.saturating_sub(1), col - list_w - 1, body);
+            return self.wheel_session(
+                "wheel-up",
+                row.saturating_sub(1),
+                col - preview_offset,
+                body,
+            );
         }
         if matches!(event.kind, MouseEventKind::ScrollDown)
             && event.modifiers.contains(KeyModifiers::SHIFT)
-            && col > list_w + 1
+            && col > preview_offset
         {
-            return self.wheel_session("wheel-down", row.saturating_sub(1), col - list_w - 1, body);
+            return self.wheel_session(
+                "wheel-down",
+                row.saturating_sub(1),
+                col - preview_offset,
+                body,
+            );
         }
-        if matches!(event.kind, MouseEventKind::ScrollUp) && col > list_w + 1 {
+        if matches!(event.kind, MouseEventKind::ScrollUp) && col > preview_offset {
             return Action::Scroll(3);
         }
-        if matches!(event.kind, MouseEventKind::ScrollDown) && col > list_w + 1 {
+        if matches!(event.kind, MouseEventKind::ScrollDown) && col > preview_offset {
             return Action::Scroll(-3);
         }
 
-        if col <= list_w {
+        if self.list_visible && col <= list_w {
             return self.click_list_row(event.kind, row, body);
         }
         // `col == list_w + 1` is the divider itself — between the two panes,
         // part of neither. Anything past it is the session pane.
-        if col == list_w + 1 {
+        if self.list_visible && col == list_w + 1 {
             match event.kind {
                 MouseEventKind::Down(MouseButton::Left) => self.dragging_divider = true,
                 _ => {}
@@ -235,9 +247,9 @@ impl Ui {
                     | MouseEventKind::Up(MouseButton::Left)
             )
         {
-            return self.select_session_text(event.kind, row, col - list_w - 1, body);
+            return self.select_session_text(event.kind, row, col - preview_offset, body);
         }
-        self.click_session_pane(event.kind, row, col - list_w - 1, body, preview_w)
+        self.click_session_pane(event.kind, row, col - preview_offset, body, preview_w)
     }
 
     fn select_session_text(
@@ -421,7 +433,7 @@ impl Ui {
                 Action::Nothing
             }
             KeyCode::Char('l') => {
-                self.toggle_compact_list();
+                self.list_visible = !self.list_visible;
                 Action::Nothing
             }
             KeyCode::Char('n') => {
@@ -573,14 +585,6 @@ impl Ui {
         }
     }
 
-    fn toggle_compact_list(&mut self) {
-        self.list_width = if self.list_width.is_some() {
-            None
-        } else {
-            Some(16)
-        };
-    }
-
     fn set_list_width(&mut self, width: u16, cols: u16) {
         let usable = cols.saturating_sub(1);
         self.list_width = Some(width.clamp(16, usable.saturating_sub(16)));
@@ -642,6 +646,9 @@ pub fn layout(term_cols: u16, widest: u16) -> (u16, u16) {
 }
 
 fn ui_layout(ui: &Ui, term_cols: u16) -> (u16, u16) {
+    if !ui.list_visible {
+        return (0, term_cols);
+    }
     let usable = term_cols.saturating_sub(1);
     let automatic = layout(term_cols, widest(ui)).0;
     let list = ui
@@ -848,9 +855,13 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
     let body = rows.saturating_sub(1);
     // The border, and the only thing on screen that is always saying where the
     // keyboard is pointing. A prefix key's state is invisible; this is not.
-    let divider = match ui.focus {
-        Focus::List => "│",
-        Focus::Session => "\x1b[7m┃\x1b[0m",
+    let divider = if ui.list_visible {
+        match ui.focus {
+            Focus::List => "│",
+            Focus::Session => "\x1b[7m┃\x1b[0m",
+        }
+    } else {
+        ""
     };
 
     let (lines, cut) = crop(screen, preview_w, body, ui.pan);
@@ -860,16 +871,18 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
         // The left column has a header; the preview deliberately has none, so
         // its first row is the session's own first row — the same thing a ride
         // shows, at the same place on the screen.
-        let left = if row == 0 {
-            format!("remuda · {server}")
-        } else {
-            list_row(
-                ui,
-                row as usize - 1 + list_viewport(ui, body) * ui.session_rows,
-                list_w,
-            )
-        };
-        out.push_str(&fit(&left, list_w));
+        if ui.list_visible {
+            let left = if row == 0 {
+                format!("remuda · {server}")
+            } else {
+                list_row(
+                    ui,
+                    row as usize - 1 + list_viewport(ui, body) * ui.session_rows,
+                    list_w,
+                )
+            };
+            out.push_str(&fit(&left, list_w));
+        }
         out.push_str(divider);
         let line = lines.get(row as usize).map_or("", String::as_str);
         out.push_str(&fit(line, preview_w));
@@ -1046,7 +1059,14 @@ fn locate_cursor(
         viewport.map_cursor(cells, cursor.row as usize, cursor.col as usize)?;
     // +1 for the header row above row 0 of the pane; list_w + divider + 1 for
     // the preview pane's own left edge; both again for 1-based addressing.
-    Some((panel_row + 1, list_w + panel_col + 2))
+    Some((
+        panel_row + 1,
+        if list_w == 0 {
+            panel_col + 1
+        } else {
+            list_w + panel_col + 2
+        },
+    ))
 }
 
 /// Same frame as [`render`], but the preview column carries real colour, is
@@ -1062,9 +1082,13 @@ pub fn render_styled(
 ) -> String {
     let (list_w, preview_w) = ui_layout(ui, cols);
     let body = rows.saturating_sub(1);
-    let divider = match ui.focus {
-        Focus::List => "│",
-        Focus::Session => "\x1b[7m┃\x1b[0m",
+    let divider = if ui.list_visible {
+        match ui.focus {
+            Focus::List => "│",
+            Focus::Session => "\x1b[7m┃\x1b[0m",
+        }
+    } else {
+        ""
     };
 
     let selected = cells_with_selection(ui, cells);
@@ -1073,16 +1097,18 @@ pub fn render_styled(
     let mut out = String::from("\x1b[?2026h\x1b[H");
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
-        let left = if row == 0 {
-            format!("remuda · {server}")
-        } else {
-            list_row(
-                ui,
-                row as usize - 1 + list_viewport(ui, body) * ui.session_rows,
-                list_w,
-            )
-        };
-        out.push_str(&fit(&left, list_w));
+        if ui.list_visible {
+            let left = if row == 0 {
+                format!("remuda · {server}")
+            } else {
+                list_row(
+                    ui,
+                    row as usize - 1 + list_viewport(ui, body) * ui.session_rows,
+                    list_w,
+                )
+            };
+            out.push_str(&fit(&left, list_w));
+        }
         out.push_str(divider);
         let line = lines.get(row as usize).map_or("", String::as_str);
         out.push_str(&fit_styled(line, preview_w));
@@ -2089,19 +2115,6 @@ mod tests {
         };
         ui.on_mouse(up, 120, 24);
         assert!(!ui.dragging_divider);
-    }
-
-    #[test]
-    fn l_toggles_a_compact_list_and_jk_move_selection() {
-        let mut ui = ui(vec![row("a", true, false), row("b", true, false)]);
-        ui.on_key(press(KeyCode::Char('l')));
-        assert_eq!(ui.list_width, Some(16));
-        ui.on_key(press(KeyCode::Char('l')));
-        assert_eq!(ui.list_width, None);
-        ui.on_key(press(KeyCode::Char('j')));
-        assert_eq!(ui.selected, 1);
-        ui.on_key(press(KeyCode::Char('k')));
-        assert_eq!(ui.selected, 0);
     }
 
     /// Nothing is attached, so a click landing where the pane *would* be has
