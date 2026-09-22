@@ -121,6 +121,8 @@ fn main() -> ExitCode {
 
         // The reference manual, generated from the same registry `remuda.tool`
         // and every Rust binding write into — never hand-maintained.
+        ["extension", "list", rest @ ..] => extension_list_command(rest),
+
         ["doc", rest @ ..] | ["extension", "info", rest @ ..] => {
             with_daemon(server, &path, |path| doc_command(path, rest))
         }
@@ -174,6 +176,8 @@ remuda — a pty manager you can attach to
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda extension info [--format F]
                                   alias for remuda doc
+  remuda extension list [--format F]
+                                  list installed extensions
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
@@ -624,6 +628,55 @@ fn doc_command(path: &Path, args: &[&str]) -> ExitCode {
         }
         other => fail(describe(other)),
     }
+}
+
+fn extension_list_command(args: &[&str]) -> ExitCode {
+    let format = match args {
+        [] => "rst",
+        ["--format", format @ ("rst" | "markdown" | "json")] => format,
+        _ => return fail("usage: remuda extension list [--format rst|markdown|json]"),
+    };
+    let manifests: Vec<_> = remuda_native::packages::manifests().collect();
+    match format {
+        "json" => {
+            let extensions: Vec<_> = manifests
+                .iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "name": entry.name,
+                        "version": entry.version,
+                        "source": entry.source,
+                        "status": entry.status,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::json!({ "extensions": extensions }));
+        }
+        "markdown" => {
+            println!("# Remuda extensions\n");
+            for entry in manifests {
+                println!(
+                    "## `{}`\n\n- version: `{}`\n- source: `{}`\n- status: `{}`\n",
+                    entry.name, entry.version, entry.source, entry.status
+                );
+            }
+        }
+        "rst" => {
+            println!("Remuda extensions\n==================\n");
+            for entry in manifests {
+                println!(
+                    "{}\n{}\n\n* version: ``{}``\n* source: ``{}``\n* status: ``{}``\n",
+                    entry.name,
+                    "-".repeat(entry.name.len()),
+                    entry.version,
+                    entry.source,
+                    entry.status
+                );
+            }
+        }
+        _ => unreachable!(),
+    }
+    ExitCode::SUCCESS
 }
 
 /// A line-at-a-time REPL against the image. `rustyline` because arrow keys

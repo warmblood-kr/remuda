@@ -126,6 +126,10 @@ runtime directory and reading its `init.lua` from disk instead of from the
 binary — the entry-file convention itself does not change, so a package
 written today keeps working once installing replaces embedding.
 
+The same embedded manifest drives `remuda extension list`. It reports each
+embedded package's name, build version, source, and `installed` status in RST,
+Markdown, or JSON; the command does not maintain a second package catalog.
+
 ## A process's output arrives as events, never as something Lua waits on
 
 `remuda.process{argv=, on_line=, on_exit=}` spawns a plain-pipe child — never

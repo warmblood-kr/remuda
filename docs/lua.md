@@ -13,12 +13,17 @@ remuda doc
 remuda doc --format markdown
 remuda doc --format json
 remuda extension info --format markdown
+remuda extension list --format json
 ```
 
 The default output is reStructuredText. `extension info` is an alias for
 `doc`, and the JSON form is intended for project-site tooling and other
 consumers that need structured metadata. No separate extension catalog is
 maintained.
+
+`remuda extension list` reports the embedded package manifest with name,
+build version, source, and installation status. It uses the same RST/Markdown/
+JSON format selector and reads the manifest compiled into the binary.
 
 The runtime registry also covers words added with `remuda.tool`, so an
 extension can document itself when it registers its function:

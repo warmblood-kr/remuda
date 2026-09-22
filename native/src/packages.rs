@@ -12,6 +12,14 @@ pub struct Builtin {
     pub subcommand: Option<&'static str>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Manifest {
+    pub name: &'static str,
+    pub version: &'static str,
+    pub source: &'static str,
+    pub status: &'static str,
+}
+
 const BUILTINS: &[Builtin] = &[
     Builtin {
         name: "butler",
@@ -51,4 +59,28 @@ pub fn subcommand(name: &str) -> Option<&'static Builtin> {
     BUILTINS
         .iter()
         .find(|package| package.subcommand == Some(name))
+}
+
+pub fn manifests() -> impl Iterator<Item = Manifest> {
+    BUILTINS.iter().map(|package| Manifest {
+        name: package.name,
+        version: crate::dist::BUILD_VERSION,
+        source: "embedded",
+        status: "installed",
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::manifests;
+
+    #[test]
+    fn every_builtin_has_manifest_metadata() {
+        let entries: Vec<_> = manifests().collect();
+        assert!(!entries.is_empty());
+        assert!(entries.iter().all(|entry| !entry.name.is_empty()
+            && !entry.version.is_empty()
+            && entry.source == "embedded"
+            && entry.status == "installed"));
+    }
 }
