@@ -121,7 +121,9 @@ fn main() -> ExitCode {
 
         // The reference manual, generated from the same registry `remuda.tool`
         // and every Rust binding write into — never hand-maintained.
-        ["doc"] => with_daemon(server, &path, doc_command),
+        ["doc", rest @ ..] | ["extension", "info", rest @ ..] => {
+            with_daemon(server, &path, |path| doc_command(path, rest))
+        }
 
         ["repl"] => with_daemon(server, &path, repl),
 
@@ -169,6 +171,9 @@ remuda — a pty manager you can attach to
   remuda butler launch KIND [N]  launch a claude or codex session
   remuda butler send FROM TO MSG queue a message for an agent
   remuda butler inbox NAME       drain an agent's queued messages
+  remuda doc [--format F]        print live Lua documentation (rst by default)
+  remuda extension info [--format F]
+                                  alias for remuda doc
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
@@ -598,12 +603,18 @@ fn eval_once(path: &Path, code: &str) -> ExitCode {
     }
 }
 
-/// One line per registered word, sorted by name.
-fn doc_command(path: &Path) -> ExitCode {
+/// Render the live registry in the requested documentation format.
+fn doc_command(path: &Path, args: &[&str]) -> ExitCode {
+    let format = match args {
+        [] => "rst",
+        ["--format", format @ ("rst" | "markdown" | "json")] => format,
+        _ => return fail("usage: remuda doc [--format rst|markdown|json]"),
+    };
+    let encoded = serde_json::to_string(format).expect("format names are valid strings");
     match remuda_native::client::request(
         path,
         &Request::Eval {
-            code: "return remuda._registry_dump()".to_string(),
+            code: format!("return remuda._registry_dump({encoded})"),
             name: None,
         },
     ) {

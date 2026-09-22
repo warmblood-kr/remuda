@@ -20,6 +20,10 @@ remuda.send("reviewer", "review the diff on this branch\n")
 print(remuda.capture("reviewer"))
 ```
 
+The complete Lua reference is generated from the live runtime registry:
+[Lua extension documentation](lua.md). Butler's local session manager and
+optional Matrix bridge are described in [Butler](butler.md).
+
 The same herd is reachable over MCP — `new`, `ls`, `send`, `capture` — so an
 agent can drive other agents.
 

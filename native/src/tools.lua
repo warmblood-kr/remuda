@@ -1,9 +1,8 @@
 -- The tool vocabulary: the frame is Rust, the words are Lua.
 --
--- 정수님, 2026-09-10: *"MCP server는 제공을 하고, 필요에 따라서 tool을 추가해나갈 수
--- 있도록."* A tool here is an ordinary Lua function that has been marked
--- exported. `mcp.rs` reflects this table into `tools/list` and dispatches
--- `tools/call` back into it, so a new tool costs no rebuild and no redeploy.
+-- A tool is an ordinary Lua function that has been marked exported. `mcp.rs`
+-- reflects this table into `tools/list` and dispatches `tools/call` back into
+-- it, so a new tool costs no rebuild and no redeploy.
 --
 -- Written in Lua rather than Rust on purpose. Building the frame's own
 -- vocabulary in the host would be doing there the job the guest was embedded to
@@ -50,8 +49,7 @@ local speech = {
 
 -- Define a word and export it as an MCP tool. `args` maps each argument to a
 -- description a model reads; `needs` lists the ones that are not optional.
--- Redefining an existing word replaces it — 정수님, 2026-09-10: 내부에서
--- 스스로를 변경할 수 있어도 돼요.
+-- Redefining an existing word replaces it.
 function remuda.tool(spec)
   local name = spec.name
   if type(name) ~= "string" or name == "" then
@@ -104,12 +102,9 @@ register(
 local Schedule = {}
 Schedule.__index = Schedule
 
--- 정수님, 2026-09-12: "다른 익스텐션들도 자기 스케쥴들을 등록할 수 있어야 합니다"
--- — multi-registrant from the first line, the same `remuda.tool` shape. Native
--- knows only ITS OWN fixed tick period; EVERY seconds and EVERY callback are
--- this table's business alone, matching remuda.tool's split (Rust reflects,
--- Lua decides). Does not survive a daemon restart — same ceiling as
--- `remuda.tools` (`steps/014-a-tool-registry.md:292-295`), not solved here.
+-- Schedules are multi-registrant, using the same split as `remuda.tool`:
+-- native code provides the fixed tick while this table owns the interval and
+-- callback behavior. Schedules do not survive a daemon restart.
 --
 -- NAME is an optional label, never an identity — two extensions (or one,
 -- twice) may register under the same name without one silently replacing
@@ -591,17 +586,72 @@ register(
   "_refresh_sessions_buffer(width, selected) -> nil"
 )
 
--- Sorted "name(signature) -- about", one per line — the manual `remuda doc`
--- prints. Lives beside `_descriptors` since both walk a registry to render it.
-function remuda._registry_dump()
-  local lines = {}
+-- Render the live registry for the manual command. The registry is the source
+-- of truth for every built-in and Lua-defined word; format changes only affect
+-- presentation.
+local function registry_rows()
+  local rows = {}
   for _, name in ipairs(sorted_keys(remuda._registry)) do
     local word = remuda._registry[name]
-    lines[#lines + 1] = word.signature .. " -- " .. word.about
+    rows[#rows + 1] = {
+      name = word.name,
+      signature = word.signature,
+      description = word.about,
+      kind = word.signature == "table" and "variable" or "function",
+    }
+  end
+  return rows
+end
+
+local function registry_json(rows)
+  local functions, variables = {}, {}
+  for _, row in ipairs(rows) do
+    local encoded = '{"name":' .. quoted(row.name)
+      .. ',"signature":' .. quoted(row.signature)
+      .. ',"description":' .. quoted(row.description) .. '}'
+    if row.kind == "variable" then
+      variables[#variables + 1] = encoded
+    else
+      functions[#functions + 1] = encoded
+    end
+  end
+  return '{"name":"remuda","runtime":{"functions":['
+    .. table.concat(functions, ",")
+    .. '],"classes":[],"variables":['
+    .. table.concat(variables, ",") .. ']}}'
+end
+
+local function registry_markdown(rows)
+  local lines = {"# Remuda Lua runtime", ""}
+  for _, row in ipairs(rows) do
+    lines[#lines + 1] = "## `" .. row.name .. "`"
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "`" .. row.signature .. "` — " .. row.description
+    lines[#lines + 1] = ""
   end
   return table.concat(lines, "\n")
 end
-register("_registry_dump", "Render the word registry as a sorted, human-readable manual.", "_registry_dump() -> string")
+
+local function registry_rst(rows)
+  local lines = {"Remuda Lua runtime", "==================", ""}
+  for _, row in ipairs(rows) do
+    lines[#lines + 1] = row.name
+    lines[#lines + 1] = string.rep("-", #row.name)
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = "``" .. row.signature .. "`` — " .. row.description
+    lines[#lines + 1] = ""
+  end
+  return table.concat(lines, "\n")
+end
+
+function remuda._registry_dump(format)
+  local rows = registry_rows()
+  if format == "json" then return registry_json(rows) end
+  if format == "markdown" then return registry_markdown(rows) end
+  if format == nil or format == "rst" then return registry_rst(rows) end
+  error("unknown documentation format: " .. tostring(format), 0)
+end
+register("_registry_dump", "Render the live word registry as documentation.", "_registry_dump(format?) -> string")
 
 -- The first word, and the one `steps/008` found missing: readiness. Driving an
 -- agent means waiting for it, and every caller so far has written this loop

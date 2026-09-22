@@ -1,14 +1,8 @@
 //! The Lua runtime: what it can reach, and what it does when refused.
-//!
-//! 정수님, 2026-09-10: *"programming runtime을 심어서 코드를 실행할 수 있게 만들고
-//! atomic function들을 물려서 연결합니다."* The three claims worth exercising are
-//! that a script can *react* to a screen (which the shell could not), that the
-//! bound surface is exactly the protocol's (embedding a language must not widen
-//! the API), and that a refusal **stops** the script rather than being returned
-//! for it to ignore.
 
 use remuda_core::protocol::{Request, Response};
 use remuda_native::{client, daemon, script};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -184,11 +178,45 @@ fn every_word_has_a_registry_entry() {
 }
 
 #[test]
+fn registry_documentation_formats_are_live_and_structured() {
+    let dir = scratch("registry-docs");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let eval = |code: &str| match client::request(
+        &path,
+        &Request::Eval {
+            code: code.to_string(),
+            name: None,
+        },
+    ) {
+        Ok(Response::Value(value)) => value,
+        other => panic!("documentation evaluation failed: {other:?}"),
+    };
+
+    let document: Value = serde_json::from_str(&eval("return remuda._registry_dump('json')"))
+        .expect("JSON documentation must be valid JSON");
+    assert_eq!(document["name"], "remuda");
+    assert!(document["runtime"]["classes"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(document["runtime"]["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["name"] == "ls"));
+    assert!(document["runtime"]["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["name"] == "tools"));
+    assert!(eval("return remuda._registry_dump('markdown')").starts_with("# Remuda Lua runtime"));
+    assert!(eval("return remuda._registry_dump('rst')").starts_with("Remuda Lua runtime"));
+}
+
+#[test]
 fn every_frozen_api_version_still_runs() {
-    // 정수님, 2026-09-10: *"그 언어 API 에 대고 사용자들이 자기 함수를 얹어서
-    // 설정하거나 플러그인, 워크플로 등을 만들면, 하위호환을 엄격하게 지켜야
-    // 합니다."*
-    //
     // `tests/api/vN.lua` is a script written against version N of the Lua API,
     // and it is frozen: widening the surface means adding `v2.lua`, never
     // editing `v1.lua`. That is what makes this a control rather than a
