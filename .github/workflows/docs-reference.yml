@@ -1,0 +1,27 @@
+name: generated Lua reference
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - core/**
+      - native/**
+      - packages/**
+      - scripts/generate-lua-reference.sh
+      - docs/lua-reference.rst
+      - docs/lua-reference.html
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install RST renderer
+        run: sudo apt-get update && sudo apt-get install --yes pandoc
+      - name: regenerate runtime reference
+        run: sh scripts/generate-lua-reference.sh
+      - name: verify generated files are committed
+        run: git diff --exit-code -- docs/lua-reference.rst docs/lua-reference.html

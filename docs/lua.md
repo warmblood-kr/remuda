@@ -1,5 +1,8 @@
 # Lua extensions
 
+<nav aria-label="Language"><a href="lua.html" lang="en">English</a> ·
+<a href="ko-lua.html" lang="ko">한국어</a></nav>
+
 Remuda keeps one Lua image for the lifetime of its daemon. Rust exposes the
 small host surface, while Lua defines the extension vocabulary on top of it.
 Every installed mod and registered tool writes metadata to the same runtime
@@ -64,13 +67,12 @@ end, "review(name) -> string")
 The reference below is extracted from the built Remuda runtime; it is not a
 second catalog maintained in the site source.
 
-<details>
-<summary>Show the generated reStructuredText reference</summary>
+<div class="generated-reference">
+{% include_relative lua-reference.html %}
+</div>
 
-<pre>
-{% include_relative lua-reference.rst %}
-</pre>
-</details>
+The source remains available as [reStructuredText](lua-reference.rst) for
+publishing systems that consume RST directly.
 
 To regenerate it after changing a Rust binding or Lua registration, run this
 from the repository root:
@@ -80,7 +82,11 @@ sh scripts/generate-lua-reference.sh
 ```
 
 The script builds `remuda`, starts an isolated daemon runtime, writes
-`docs/lua-reference.rst` from `remuda doc`, and checks the generated heading.
+`docs/lua-reference.rst` from `remuda doc`, and converts that RST to
+`docs/lua-reference.html` with Pandoc. The GitHub Actions
+[reference check](../.github/workflows/docs-reference.yml) installs Pandoc
+explicitly and verifies that the checked-in artifacts are current. It checks
+both generated headings.
 The CLI's `--format markdown` and `--format json` outputs remain available for
 other site or tooling integrations.
 

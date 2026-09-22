@@ -1,0 +1,101 @@
+<h1 id="remuda-lua-runtime">Remuda Lua runtime</h1>
+<h2 id="call">_call</h2>
+<p><code>_call(name, arguments, caller) -&gt; string</code> — Dispatch one MCP tools/call by name.</p>
+<h2 id="descriptors">_descriptors</h2>
+<p><code>_descriptors() -&gt; string</code> — MCP tool descriptors for everything <span class="title-ref">remuda.tool</span> has registered.</p>
+<h2 id="event_counts">_event_counts</h2>
+<p><code>table</code> — Internal event-emit counts, keyed by event name. Read via <span class="title-ref">event_counts()</span>.</p>
+<h2 id="process_drain">_process_drain</h2>
+<p><code>_process_drain(id) -&gt; nil</code> — Deliver buffered process output as emit events; internal, an Image job only.</p>
+<h2 id="process_killpg">_process_killpg</h2>
+<p><code>_process_killpg(id) -&gt; nil</code> — Reap a process's whole process group (Linux only); internal, called by the daemon's own clean-shutdown sweep, not meant for scripts.</p>
+<h2 id="process_spawn">_process_spawn</h2>
+<p><code>_process_spawn(argv, on_line?, on_exit?) -&gt; id</code> — Spawn a plain-pipe child process; internal, wrapped by <span class="title-ref">remuda.process</span>.</p>
+<h2 id="refresh_sessions_buffer">_refresh_sessions_buffer</h2>
+<p><code>_refresh_sessions_buffer(width, selected) -&gt; nil</code> — Rebuild the <em>sessions</em> buffer's content.</p>
+<h2 id="registry">_registry</h2>
+<p><code>table</code> — The word registry itself: name, about and signature for every bound word.</p>
+<h2 id="registry_dump">_registry_dump</h2>
+<p><code>_registry_dump(format?) -&gt; string</code> — Render the live word registry as documentation.</p>
+<h2 id="run_due_schedules">_run_due_schedules</h2>
+<p><code>_run_due_schedules(now) -&gt; nil</code> — Fire every schedule whose interval has elapsed. Called once per native tick.</p>
+<h2 id="schedule_fire_counts">_schedule_fire_counts</h2>
+<p><code>table</code> — Internal named-schedule fire counts. Read via <span class="title-ref">schedule_fires()</span>.</p>
+<h2 id="sync_window_shown">_sync_window_shown</h2>
+<p><code>_sync_window_shown(name, selection_changed) -&gt; string</code> — Reconcile the current window with the session Rust wants to auto-follow.</p>
+<h2 id="attach">attach</h2>
+<p><code>attach(name) -&gt; nil</code> — Enter raw mode on a session (a no-op inside the daemon's own image).</p>
+<h2 id="buffer">buffer</h2>
+<p><code>table</code> — Namespace for creating and listing named text buffers.</p>
+<h2 id="buffers">buffers</h2>
+<p><code>table</code> — The <span class="title-ref">remuda.buffer</span> registry table, keyed by buffer name.</p>
+<h2 id="cancel">cancel</h2>
+<p><code>cancel(handle) -&gt; nil</code> — Cancel a schedule by the handle <span class="title-ref">schedule()</span> returned.</p>
+<h2 id="capture">capture</h2>
+<p><code>capture(name) -&gt; string</code> — Read a session's current screen as plain text.</p>
+<h2 id="clear_hooks">clear_hooks</h2>
+<p><code>clear_hooks(opts) -&gt; nil</code> — Remove every hook registered under a group.</p>
+<h2 id="click">click</h2>
+<p><code>click(name, col, row, button?) -&gt; nil</code> — Send a mouse click at a terminal cell.</p>
+<h2 id="close">close</h2>
+<p><code>close(name) -&gt; nil</code> — End a session, live or already self-exited.</p>
+<h2 id="emit">emit</h2>
+<p><code>emit(event, ...) -&gt; nil</code> — Fire an event, running every hook registered for it.</p>
+<h2 id="event_counts-1">event_counts</h2>
+<p><code>event_counts() -&gt; {[event]=n}</code> — How many times each event has been emitted.</p>
+<h2 id="exec">exec</h2>
+<p><code>exec(name) -&gt; nil</code> — Run an installed mod's entry source, by name, in this same image.</p>
+<h2 id="feed">feed</h2>
+<p><code>feed(name, steps) -&gt; nil</code> — Deliver a sequence of bursts and pauses as one indivisible act.</p>
+<h2 id="hooks">hooks</h2>
+<p><code>table</code> — The <span class="title-ref">remuda.on</span> registry table, keyed by event name.</p>
+<h2 id="insert">insert</h2>
+<p><code>insert(name, text) -&gt; nil</code> — Insert raw bytes into a session with nothing appended.</p>
+<h2 id="key">key</h2>
+<p><code>key(name, spec) -&gt; nil</code> — Press a named key, in Emacs kbd notation.</p>
+<h2 id="kill">kill</h2>
+<p><code>kill(id) -&gt; nil</code> — Terminate a process started with <span class="title-ref">remuda.process</span>, by id.</p>
+<h2 id="list_dir">list_dir</h2>
+<p><code>list_dir(dir) -&gt; {string...}</code> — List a directory's entries.</p>
+<h2 id="ls">ls</h2>
+<p><code>ls() -&gt; {session...}</code> — List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.</p>
+<h2 id="mkdir">mkdir</h2>
+<p><code>mkdir(dir) -&gt; nil</code> — Create a directory, including its parents.</p>
+<h2 id="new">new</h2>
+<p><code>new(name?, argv?, cwd?, env?) -&gt; string</code> — Start a new session, defaulting the command to the user's shell.</p>
+<h2 id="on">on</h2>
+<p><code>on(event, fn, opts?) -&gt; nil</code> — Register a callback to run when an event fires.</p>
+<h2 id="process">process</h2>
+<p><code>process(spec) -&gt; id</code> — Spawn a plain-pipe child process; its stdout lines and exit arrive as emit events.</p>
+<h2 id="processes">processes</h2>
+<p><code>processes() -&gt; {id...}</code> — List the ids of every process started with <span class="title-ref">remuda.process</span> that is still running.</p>
+<h2 id="remove_dir_all">remove_dir_all</h2>
+<p><code>remove_dir_all(dir) -&gt; nil</code> — Remove a directory and everything under it.</p>
+<h2 id="request_counts">request_counts</h2>
+<p><code>request_counts() -&gt; string</code> — The daemon's own request-dispatch counts (list/eval/capture_styled), counted at the one place every round trip crosses. Use it to measure how many round trips a real operation actually costs.</p>
+<h2 id="schedule">schedule</h2>
+<p><code>schedule(spec) -&gt; handle</code> — Register a periodic callback, run every <span class="title-ref">every</span> seconds.</p>
+<h2 id="schedule_fires">schedule_fires</h2>
+<p><code>schedule_fires() -&gt; {[name]=n}</code> — How many times each named schedule has fired.</p>
+<h2 id="schedule_skips">schedule_skips</h2>
+<p><code>schedule_skips() -&gt; string</code> — How many periodic-schedule ticks the daemon has skipped because the previous tick's callback was still running, and how many of those skips are still consecutive right now.</p>
+<h2 id="schedules">schedules</h2>
+<p><code>table</code> — The <span class="title-ref">remuda.schedule</span> registry table, keyed by the handle <span class="title-ref">schedule()</span> returned.</p>
+<h2 id="send">send</h2>
+<p><code>send(name, text) -&gt; nil</code> — Deliver a line of text to a session, with Enter appended.</p>
+<h2 id="session">session</h2>
+<p><code>session(name) -&gt; session</code> — A handle onto an existing session, by name.</p>
+<h2 id="sleep">sleep</h2>
+<p><code>sleep(seconds) -&gt; nil</code> — Block the calling image for a number of seconds.</p>
+<h2 id="tool">tool</h2>
+<p><code>tool(spec) -&gt; word</code> — Define a word and export it as an MCP tool.</p>
+<h2 id="tools">tools</h2>
+<p><code>table</code> — The <span class="title-ref">remuda.tool</span> registry table, keyed by tool name.</p>
+<h2 id="type_text">type_text</h2>
+<p><code>type_text(session, text, settle?) -&gt; nil</code> — Type text into a session and submit it with Return.</p>
+<h2 id="wait_for">wait_for</h2>
+<p><code>wait_for(session, pattern, seconds?) -&gt; string</code> — Wait until a session's screen matches a Lua pattern, then answer with that screen. Fails when the deadline passes instead of answering with a screen that does not match. Use it after <span class="title-ref">send</span> rather than guessing a sleep.</p>
+<h2 id="window">window</h2>
+<p><code>table</code> — Namespace for the current screen window.</p>
+<h2 id="windows">windows</h2>
+<p><code>table</code> — The <span class="title-ref">remuda.window</span> registry table, keyed by window id.</p>
