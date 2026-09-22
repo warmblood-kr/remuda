@@ -810,8 +810,12 @@ fn mod_remove_command(args: &[&str]) -> ExitCode {
         return fail("usage: remuda mod remove NAME");
     };
     match remuda_native::packages::remove(name) {
-        Ok(manifest) => {
-            println!("removed mod {}", manifest.name);
+        Ok(report) => {
+            println!(
+                "removed mod {} from {}",
+                report.manifest.name,
+                report.path.display()
+            );
             println!(
                 "a running daemon keeps its loaded Lua definitions until restart; no session was stopped"
             );

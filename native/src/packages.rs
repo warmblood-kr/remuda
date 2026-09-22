@@ -42,6 +42,12 @@ pub struct InstallReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveReport {
+    pub manifest: Manifest,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionSpec {
     pub name: String,
     pub version: String,
@@ -176,7 +182,7 @@ pub fn update_all() -> Result<Vec<InstallReport>, String> {
 /// Remove one explicitly installed mod. The manifest is checked before the
 /// directory is removed, so a malformed or substituted path is never treated
 /// as an extension owned by Remuda.
-pub fn remove(name: &str) -> Result<Manifest, String> {
+pub fn remove(name: &str) -> Result<RemoveReport, String> {
     if !valid_component(name) {
         return Err(format!("invalid installed mod name {name:?}"));
     }
@@ -195,7 +201,10 @@ pub fn remove(name: &str) -> Result<Manifest, String> {
         ));
     }
     fs::remove_dir_all(&root).map_err(|error| format!("cannot remove mod {name}: {error}"))?;
-    Ok(manifest_from_spec(spec, "removed"))
+    Ok(RemoveReport {
+        manifest: manifest_from_spec(spec, "removed"),
+        path: root,
+    })
 }
 
 /// Validate a local mod checkout without installing or mutating a daemon.
