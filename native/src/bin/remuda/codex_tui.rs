@@ -74,35 +74,98 @@ fn monitor(socket: &std::path::Path, status: &str) {
             let _ = writeln!(writer, "{}", json!({"method":"initialized","params":{}}));
             let _ = writer.flush();
         }
-        if event.get("method").and_then(Value::as_str) == Some("thread/started") {
+        update_status(&event, &mut model, status);
+    }
+}
+
+/// Publish a complete record as soon as Codex announces its thread.  Context
+/// capacity is intentionally unknown until its first token-usage event: the
+/// App Server does not include it in `thread/started`.
+fn update_status(event: &Value, model: &mut String, status: &str) {
+    match event.get("method").and_then(Value::as_str) {
+        Some("thread/started") => {
             if let Some(value) = event
                 .pointer("/params/thread/model")
                 .and_then(Value::as_str)
             {
-                model = value.into();
+                *model = value.into();
             }
+            write_status(status, model, "?", "?");
         }
-        if event.get("method").and_then(Value::as_str) != Some("thread/tokenUsage/updated") {
-            continue;
+        Some("thread/tokenUsage/updated") => {
+            let usage = &event["params"]["tokenUsage"];
+            let Some(window) = usage["modelContextWindow"].as_u64() else {
+                return;
+            };
+            let last = &usage["last"];
+            let used = ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens"]
+                .iter()
+                .map(|key| last[*key].as_u64().unwrap_or(0))
+                .sum::<u64>();
+            write_status(status, model, &used.to_string(), &window.to_string());
         }
-        let usage = &event["params"]["tokenUsage"];
-        let Some(window) = usage["modelContextWindow"].as_u64() else {
-            continue;
-        };
-        let last = &usage["last"];
-        let used = ["inputTokens", "cachedInputTokens", "cacheWriteInputTokens"]
-            .iter()
-            .map(|key| last[*key].as_u64().unwrap_or(0))
-            .sum::<u64>();
-        let percent = used * 100 / window;
-        let _ = std::fs::write(
-            status,
-            format!("MODEL:{model} CTX:{used} CTXWIN:{window} CTXPCT:{percent}\n"),
-        );
+        _ => {}
     }
+}
+
+fn write_status(status: &str, model: &str, used: &str, window: &str) {
+    let percent = match (used.parse::<u64>(), window.parse::<u64>()) {
+        (Ok(used), Ok(window)) if window > 0 => (used * 100 / window).to_string(),
+        _ => "?".into(),
+    };
+    let _ = std::fs::write(
+        status,
+        format!("MODEL:{model} CTX:{used} CTXWIN:{window} CTXPCT:{percent}\n"),
+    );
 }
 
 fn fail(error: impl std::fmt::Display) -> ExitCode {
     eprintln!("remuda: Codex TUI: {error}");
     ExitCode::FAILURE
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn status_path(test: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("remuda-codex-{test}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn thread_start_publishes_the_model_before_any_usage_event() {
+        let path = status_path("thread-start");
+        let _ = std::fs::remove_file(&path);
+        let mut model = "?".to_string();
+        update_status(
+            &json!({"method":"thread/started","params":{"thread":{"model":"gpt-5.4"}}}),
+            &mut model,
+            &path.to_string_lossy(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "MODEL:gpt-5.4 CTX:? CTXWIN:? CTXPCT:?\n"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn token_usage_replaces_unknown_context_with_real_capacity() {
+        let path = status_path("token-usage");
+        let _ = std::fs::remove_file(&path);
+        let mut model = "gpt-5.4".to_string();
+        update_status(
+            &json!({"method":"thread/tokenUsage/updated","params":{"tokenUsage":{
+                "modelContextWindow":200000,
+                "last":{"inputTokens":12000,"cachedInputTokens":3000,"cacheWriteInputTokens":0}
+            }}}),
+            &mut model,
+            &path.to_string_lossy(),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "MODEL:gpt-5.4 CTX:15000 CTXWIN:200000 CTXPCT:7\n"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 }
