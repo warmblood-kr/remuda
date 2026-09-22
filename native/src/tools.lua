@@ -15,19 +15,19 @@
 
 remuda.tools = {}
 
--- Installed extensions may claim a manifest-declared shell command. The core
--- forwards its remaining words here after the extension has been explicitly
+-- Installed mods may claim a manifest-declared shell command. The core
+-- forwards its remaining words here after the mod has been explicitly
 -- loaded; it never imports an extension's command parser.
 remuda._extension_commands = {}
 function remuda.extension_command(name, handler)
-  if type(name) ~= "string" or name == "" then error("an extension command needs a name", 2) end
-  if type(handler) ~= "function" then error("an extension command needs a handler", 2) end
+  if type(name) ~= "string" or name == "" then error("a mod command needs a name", 2) end
+  if type(handler) ~= "function" then error("a mod command needs a handler", 2) end
   remuda._extension_commands[name] = handler
 end
 function remuda._dispatch_extension_command(name, args)
   local handler = remuda._extension_commands[name]
   if not handler then
-    error("extension command " .. tostring(name) .. " is not loaded; run `remuda " .. tostring(name) .. "` first", 2)
+    error("mod command " .. tostring(name) .. " is not loaded; run `remuda " .. tostring(name) .. "` first", 2)
   end
   return handler(args or {})
 end
@@ -123,7 +123,7 @@ Schedule.__index = Schedule
 -- native code provides the fixed tick while this table owns the interval and
 -- callback behavior. Schedules do not survive a daemon restart.
 --
--- NAME is an optional label, never an identity — two extensions (or one,
+-- NAME is an optional label, never an identity — two mods (or one,
 -- twice) may register under the same name without one silently replacing
 -- the other, the gap measured on 09-13. Ownership is the returned handle;
 -- only `remuda.cancel(handle)` removes it.
@@ -311,7 +311,7 @@ Buffer.__index = Buffer
 remuda.buffer = {}
 register("buffer", "Namespace for creating and listing named text buffers.", "table")
 
--- Create-if-absent, return-if-present — so two extensions naming the same
+-- Create-if-absent, return-if-present — so two mods naming the same
 -- buffer share it rather than racing to overwrite it.
 function remuda.buffer.new(name)
   if type(name) ~= "string" or name == "" then

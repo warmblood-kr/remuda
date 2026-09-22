@@ -1,4 +1,4 @@
-# Lua extensions
+# Lua mods
 
 Remuda keeps one Lua image for the lifetime of its daemon. Rust exposes the
 small host surface, while Lua defines the extension vocabulary on top of it.
@@ -30,7 +30,7 @@ shows one manifest. Both use the same RST/Markdown/JSON format selector.
 
 `remuda mod install OWNER/REPO` accepts a GitHub shorthand or HTTPS URL,
 validates the repository's `extension.toml`, and atomically stores its Lua
-package under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/extensions`. Add
+package under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/mods`. Add
 `--ref REF` to select a branch, tag, or commit. Installation never changes a
 live Lua image, so run `remuda exec NAME` or `remuda restart` to reload it.
 When a manifest declares `command = "NAME"`, `remuda NAME` loads that
@@ -41,7 +41,7 @@ extension-specific parser.
 `remuda mod update NAME` and `remuda mod update --all` reuse each installed
 mod's recorded GitHub source and ref, validate the new checkout, and replace
 the old copy only after validation succeeds.
-`remuda mod remove NAME` removes an installed extension directory. It does not
+`remuda mod remove NAME` removes an installed mod directory. It does not
 restart a daemon or stop sessions; already-loaded Lua definitions remain live
 until the next daemon restart.
 

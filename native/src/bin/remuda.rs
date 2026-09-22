@@ -693,7 +693,7 @@ fn mod_list_command(args: &[&str]) -> ExitCode {
     };
     match format {
         "json" => {
-            let extensions: Vec<_> = manifests
+            let mods: Vec<_> = manifests
                 .iter()
                 .map(|entry| {
                     serde_json::json!({
@@ -707,7 +707,7 @@ fn mod_list_command(args: &[&str]) -> ExitCode {
                     })
                 })
                 .collect();
-            println!("{}", serde_json::json!({ "mods": extensions }));
+            println!("{}", serde_json::json!({ "mods": mods }));
         }
         "markdown" => {
             println!("# Remuda mods\n");

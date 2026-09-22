@@ -48,7 +48,7 @@ pub struct RemoveReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExtensionSpec {
+pub struct ModSpec {
     pub name: String,
     pub version: String,
     pub api: String,
@@ -103,7 +103,7 @@ pub fn manifest(name: &str) -> Result<Option<Manifest>, String> {
     Ok(None)
 }
 
-fn manifest_from_spec(spec: ExtensionSpec, source: &str) -> Manifest {
+fn manifest_from_spec(spec: ModSpec, source: &str) -> Manifest {
     Manifest {
         name: spec.name,
         version: spec.version,
@@ -148,7 +148,7 @@ pub fn update(name: &str) -> Result<InstallReport, String> {
     if !valid_component(name) {
         return Err(format!("invalid installed mod name {name:?}"));
     }
-    let root = extensions_dir()?.join(name);
+    let root = mods_dir()?.join(name);
     let metadata = fs::symlink_metadata(&root)
         .map_err(|error| format!("cannot inspect installed mod {name}: {error}"))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -186,7 +186,7 @@ pub fn remove(name: &str) -> Result<RemoveReport, String> {
     if !valid_component(name) {
         return Err(format!("invalid installed mod name {name:?}"));
     }
-    let root = extensions_dir()?.join(name);
+    let root = mods_dir()?.join(name);
     let metadata = fs::symlink_metadata(&root)
         .map_err(|error| format!("cannot inspect installed mod {name}: {error}"))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -211,7 +211,7 @@ pub fn remove(name: &str) -> Result<RemoveReport, String> {
 /// This is the deterministic half of the extension development harness:
 /// manifest, paths, symlinks, Lua syntax, and the host API version are checked
 /// before an integration test installs the mod into an isolated data home.
-pub fn test_path(path: &Path) -> Result<ExtensionSpec, String> {
+pub fn test_path(path: &Path) -> Result<ModSpec, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect mod checkout {}: {error}", path.display()))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -275,7 +275,7 @@ fn install_from_checkout(
     let package_relative = package_root
         .strip_prefix(checkout)
         .map_err(|_| "manifest entry escaped checkout".to_string())?;
-    let data = extensions_dir()?;
+    let data = mods_dir()?;
     fs::create_dir_all(&data)
         .map_err(|error| format!("cannot create {}: {error}", data.display()))?;
     let target = data.join(&spec.name);
@@ -414,7 +414,7 @@ fn parse_quoted(value: &str) -> Result<String, String> {
     Ok(output)
 }
 
-pub fn parse_manifest(text: &str) -> Result<ExtensionSpec, String> {
+pub fn parse_manifest(text: &str) -> Result<ModSpec, String> {
     let mut name = None;
     let mut version = None;
     let mut api = None;
@@ -441,7 +441,7 @@ pub fn parse_manifest(text: &str) -> Result<ExtensionSpec, String> {
             return Err(format!("extension.toml repeats key {:?}", key.trim()));
         }
     }
-    let spec = ExtensionSpec {
+    let spec = ModSpec {
         name: name.ok_or_else(|| "extension.toml is missing name".to_string())?,
         version: version.unwrap_or_else(|| "0.1.0".into()),
         api: api.ok_or_else(|| "extension.toml is missing api".to_string())?,
@@ -452,7 +452,7 @@ pub fn parse_manifest(text: &str) -> Result<ExtensionSpec, String> {
     Ok(spec)
 }
 
-fn validate_spec(spec: &ExtensionSpec) -> Result<(), String> {
+fn validate_spec(spec: &ModSpec) -> Result<(), String> {
     if !valid_component(&spec.name) {
         return Err(format!("invalid mod name {:?}", spec.name));
     }
@@ -527,7 +527,7 @@ fn safe_relative_path(value: &str, label: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn read_manifest(path: &Path) -> Result<ExtensionSpec, String> {
+fn read_manifest(path: &Path) -> Result<ModSpec, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     if !metadata.file_type().is_file() || metadata.len() > MAX_MANIFEST_BYTES {
@@ -566,7 +566,7 @@ fn installed_source(name: &str) -> Result<Option<PackageSource>, String> {
         return Ok(None);
     }
     let extension = name.split('/').next().unwrap_or(name);
-    let root = extensions_dir()?.join(extension);
+    let root = mods_dir()?.join(extension);
     let root_type = match fs::symlink_metadata(&root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -619,8 +619,8 @@ fn installed_source(name: &str) -> Result<Option<PackageSource>, String> {
     }))
 }
 
-fn installed_specs() -> Result<Vec<ExtensionSpec>, String> {
-    let root = extensions_dir()?;
+fn installed_specs() -> Result<Vec<ModSpec>, String> {
+    let root = mods_dir()?;
     let Ok(entries) = fs::read_dir(&root) else {
         return Ok(Vec::new());
     };
@@ -639,14 +639,26 @@ fn installed_specs() -> Result<Vec<ExtensionSpec>, String> {
     Ok(specs)
 }
 
-fn extensions_dir() -> Result<PathBuf, String> {
+fn mods_dir() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     let base = std::env::var_os("XDG_DATA_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(|| home.map(|home| PathBuf::from(home).join(".local/share")))
         .ok_or_else(|| "HOME or XDG_DATA_HOME is required for mods".to_string())?;
-    Ok(base.join("remuda").join("extensions"))
+    let remuda = base.join("remuda");
+    let mods = remuda.join("mods");
+    let legacy = remuda.join("extensions");
+    if !mods.exists() && legacy.is_dir() {
+        fs::rename(&legacy, &mods).map_err(|error| {
+            format!(
+                "cannot migrate legacy mod directory {} to {}: {error}",
+                legacy.display(),
+                mods.display()
+            )
+        })?;
+    }
+    Ok(mods)
 }
 
 fn temporary_path(label: &str) -> Result<PathBuf, String> {
@@ -710,7 +722,7 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
 }
 
 fn ensure_safe_extension_target(path: &Path) -> Result<(), String> {
-    let root = extensions_dir()?;
+    let root = mods_dir()?;
     if path.parent() != Some(root.as_path()) {
         return Err("refusing to replace a mod outside the mod directory".into());
     }
