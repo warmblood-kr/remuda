@@ -221,9 +221,25 @@ impl Ui {
             );
         }
         if matches!(event.kind, MouseEventKind::ScrollUp) && col > preview_offset {
+            if self.focus == Focus::Session {
+                return self.wheel_session(
+                    "wheel-up",
+                    row.saturating_sub(1),
+                    col - preview_offset,
+                    body,
+                );
+            }
             return Action::Scroll(3);
         }
         if matches!(event.kind, MouseEventKind::ScrollDown) && col > preview_offset {
+            if self.focus == Focus::Session {
+                return self.wheel_session(
+                    "wheel-down",
+                    row.saturating_sub(1),
+                    col - preview_offset,
+                    body,
+                );
+            }
             return Action::Scroll(-3);
         }
 
@@ -2131,21 +2147,6 @@ mod tests {
         };
         assert_eq!(ui.on_mouse(event, 80, 24), Action::Nothing);
         assert_eq!(ui.focus, Focus::List, "unmoved — nothing was attached");
-    }
-
-    /// The wheel remains out of the child's input stream; it controls
-    /// Remuda's retained terminal history instead.
-    #[test]
-    fn a_scroll_wheel_while_attached_moves_remuda_scrollback_not_the_child() {
-        let mut ui = ui(vec![row("a", true, false)]);
-        ui.on_key(press(KeyCode::Enter));
-        let wheel = MouseEvent {
-            kind: MouseEventKind::ScrollDown,
-            column: 19,
-            row: 4,
-            modifiers: KeyModifiers::NONE,
-        };
-        assert_eq!(ui.on_mouse(wheel, 80, 24), Action::Scroll(-3));
     }
 
     #[test]

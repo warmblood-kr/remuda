@@ -72,3 +72,24 @@ fn l_hides_the_list_and_gives_the_preview_the_full_terminal_width() {
     let shown = render(&ui, "child screen", "default", 120, 30);
     assert!(shown.contains("remuda · default"));
 }
+
+#[test]
+fn wheel_reaches_a_focused_agent_but_scrolls_remuda_history_in_browse_mode() {
+    let wheel = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 19,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    };
+    let mut ui = ui();
+    assert_eq!(ui.on_mouse(wheel, 80, 24), Action::Scroll(-3));
+
+    assert_eq!(
+        ui.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Action::Focus("agent".into())
+    );
+    assert_eq!(
+        ui.on_mouse(wheel, 80, 24),
+        Action::Type(remuda_core::keys::mouse("wheel-down", 3, 5).unwrap())
+    );
+}
