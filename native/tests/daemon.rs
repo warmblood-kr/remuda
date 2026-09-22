@@ -2597,7 +2597,7 @@ fn butler_claude_builder_keeps_its_noninteractive_cli_hint() {
 #[test]
 fn butler_codex_builder_uses_automatic_approval() {
     let adapter = include_str!("../../packages/butler/agents/codex.lua");
-    assert!(adapter.contains("\"--approve-for-me\""));
+    assert!(adapter.contains("\"approvalsReviewer\":\"auto_review\""));
 }
 
 /// Same live-`claude` limitation as the test above blocks a real kill-and-
