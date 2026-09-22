@@ -253,7 +253,7 @@ fn help_command() -> ExitCode {
             if !commands.is_empty() {
                 eprintln!("Installed mod commands:");
                 for command in commands {
-                    eprintln!("  remuda {command} [--headless]");
+                    eprintln!("  remuda {command} [--agent AGENT] [--headless]");
                 }
             }
             ExitCode::SUCCESS
@@ -741,8 +741,7 @@ fn mod_install_command(args: &[&str]) -> ExitCode {
                 report.manifest.name, report.manifest.version, report.repository, report.commit
             );
             println!(
-                "reload with `remuda exec {}` or restart the daemon; installation does not mutate a live Lua image",
-                report.manifest.name
+                "the running daemon keeps its current Lua image; use `remuda stop` before its next start to load this update"
             );
             ExitCode::SUCCESS
         }
@@ -867,7 +866,7 @@ fn mod_update_command(args: &[&str]) -> ExitCode {
                     report.manifest.name, report.manifest.version, report.repository, report.commit
                 );
             }
-            println!("reload with `remuda exec NAME` or restart the daemon");
+            println!("the running daemon keeps its current Lua image; use `remuda stop` before its next start to load updates");
             ExitCode::SUCCESS
         }
         Err(error) => fail(error),
