@@ -25,8 +25,8 @@ use std::process::ExitCode;
 
 #[path = "remuda/butler_cli.rs"]
 mod butler_cli;
-#[path = "remuda/codex_app_server.rs"]
-mod codex_app_server;
+#[path = "remuda/json_rpc_terminal.rs"]
+mod json_rpc_terminal;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -67,7 +67,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
 
-        ["_codex_app_server", rest @ ..] => codex_app_server::run(rest),
+        ["_json_rpc_terminal", rest @ ..] => json_rpc_terminal::run(rest),
 
         // No daemon involved: this replaces the binary, it does not talk to one.
         ["upgrade", rest @ ..] => run_upgrade(rest),
