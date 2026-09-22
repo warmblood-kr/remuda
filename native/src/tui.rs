@@ -21,6 +21,7 @@ use remuda_core::agent::{Color, Cursor, StyledCell};
 use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
 use remuda_core::Size;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -67,6 +68,8 @@ pub enum Action {
     /// `run`'s `reconcile_hold` re-attaches if it differs from what's held.
     Focus(String),
     Scroll(i16),
+    Copy(String),
+    Paste,
 }
 
 pub struct Ui {
@@ -78,6 +81,10 @@ pub struct Ui {
     pub list_width: Option<u16>,
     dragging_divider: bool,
     last_resized: Option<(String, Size)>,
+    /// Remuda's own kill ring. It deliberately does not require or alter the
+    /// host OS clipboard.
+    yank: String,
+    scrollback: HashMap<String, usize>,
     pub mode: Mode,
     pub focus: Focus,
     /// What `n` prefills the prompt with. Held rather than read at the prompt,
@@ -103,6 +110,8 @@ impl Ui {
             list_width: None,
             dragging_divider: false,
             last_resized: None,
+            yank: String::new(),
+            scrollback: HashMap::new(),
             // An empty herd asks rather than acting: it says what to press and
             // waits. It must never spawn a shell on its own — that silent spawn
             // is half of the incident `steps/012` is named after.
@@ -161,6 +170,18 @@ impl Ui {
             return Action::Nothing;
         }
 
+        if matches!(event.kind, MouseEventKind::ScrollUp)
+            && event.modifiers.contains(KeyModifiers::SHIFT)
+            && col > list_w + 1
+        {
+            return self.wheel_session("wheel-up", row.saturating_sub(1), col - list_w - 1, body);
+        }
+        if matches!(event.kind, MouseEventKind::ScrollDown)
+            && event.modifiers.contains(KeyModifiers::SHIFT)
+            && col > list_w + 1
+        {
+            return self.wheel_session("wheel-down", row.saturating_sub(1), col - list_w - 1, body);
+        }
         if matches!(event.kind, MouseEventKind::ScrollUp) && col > list_w + 1 {
             return Action::Scroll(3);
         }
@@ -238,6 +259,20 @@ impl Ui {
         }
     }
 
+    fn wheel_session(&self, button: &str, pane_row: u16, pane_col: u16, body: u16) -> Action {
+        if self.focus != Focus::Session || pane_row < 1 || pane_row > body || pane_col == 0 {
+            return Action::Nothing;
+        }
+        let Some(session) = self.selected() else {
+            return Action::Nothing;
+        };
+        let child_row =
+            (session.size.rows() as usize).saturating_sub(body as usize) + pane_row as usize;
+        let child_col = self.pan as usize + pane_col as usize;
+        remuda_core::keys::mouse(button, child_col as u16, child_row as u16)
+            .map_or(Action::Nothing, Action::Type)
+    }
+
     /// Everything reaches the pty except the one key that comes back. Checked
     /// first and unconditionally, so no remuda command can be typed by accident
     /// into a shell — the whole reason focus exists rather than modeless keys.
@@ -246,6 +281,9 @@ impl Ui {
             self.focus = Focus::List;
             self.notice = None;
             return Action::Nothing;
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
+            return Action::Paste;
         }
         to_bytes(key).map_or(Action::Nothing, Action::Type)
     }
@@ -294,6 +332,9 @@ impl Ui {
                 Action::Nothing
             }
             KeyCode::Char('x') => self.kill_selected(),
+            KeyCode::Char('y') => self
+                .selected()
+                .map_or(Action::Nothing, |s| Action::Copy(s.name.clone())),
             KeyCode::Enter => self.focus_session(),
             _ => Action::Nothing,
         }
@@ -1088,13 +1129,15 @@ fn refresh(
         ui.last_resized = None;
     }
     let (cells, cursor) = match shown.as_ref() {
-        Some(ShownTarget::Session(name)) => match capture_styled(path, name) {
-            Ok(result) => result,
-            Err(e) => {
-                ui.notice = Some(format!("{name}: {e}"));
-                (Vec::new(), hidden)
+        Some(ShownTarget::Session(name)) => {
+            match capture_styled(path, name, *ui.scrollback.get(name).unwrap_or(&0)) {
+                Ok(result) => result,
+                Err(e) => {
+                    ui.notice = Some(format!("{name}: {e}"));
+                    (Vec::new(), hidden)
+                }
             }
-        },
+        }
         Some(ShownTarget::Buffer(name)) => match capture_buffer(path, name) {
             Ok(result) => result,
             Err(e) => {
@@ -1243,8 +1286,40 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             Action::Focus(name) => reconcile_hold(path, &mut ui, &mut held, &name),
             Action::Scroll(delta) => {
                 if let Some(session) = ui.selected() {
-                    if let Err(e) = scrollback(path, &session.name, delta) {
-                        ui.notice = Some(e);
+                    let offset = ui.scrollback.entry(session.name.clone()).or_default();
+                    *offset = if delta >= 0 {
+                        offset.saturating_add(delta as usize)
+                    } else {
+                        offset.saturating_sub((-delta) as usize)
+                    };
+                }
+            }
+            Action::Copy(name) => match capture_styled(path, &name, 0) {
+                Ok((cells, _)) => {
+                    ui.yank = cells
+                        .into_iter()
+                        .map(|row| {
+                            row.into_iter()
+                                .map(|cell| cell.text)
+                                .collect::<String>()
+                                .trim_end()
+                                .to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    ui.notice = Some(format!(
+                        "copied {} bytes; ctrl-y pastes into the focused session",
+                        ui.yank.len()
+                    ));
+                }
+                Err(e) => ui.notice = Some(format!("{name}: {e}")),
+            },
+            Action::Paste => {
+                if ui.yank.is_empty() {
+                    ui.notice = Some("kill ring is empty".into());
+                } else if let Some((name, hold)) = &held {
+                    if let Err(e) = hold.keys(ui.yank.as_bytes()) {
+                        ui.notice = Some(format!("{name}: {e}"));
                     }
                 }
             }
@@ -1366,11 +1441,16 @@ fn parse_shown_target(text: &str) -> Option<ShownTarget> {
 /// Styled counterpart of the (now unused) plain `capture` — see steps/020,
 /// 021. The wire carries runs, expanded back to cells here — see steps/022.
 /// The cursor rides the same round trip — see steps/027.
-fn capture_styled(path: &Path, name: &str) -> Result<(Vec<Vec<StyledCell>>, Cursor), String> {
+fn capture_styled(
+    path: &Path,
+    name: &str,
+    scrollback: usize,
+) -> Result<(Vec<Vec<StyledCell>>, Cursor), String> {
     match client::request(
         path,
         &Request::CaptureStyled {
             name: name.to_string(),
+            scrollback,
         },
     ) {
         Ok(Response::StyledScreen { rows, cursor }) => {
@@ -1433,20 +1513,6 @@ fn resize(path: &Path, name: &str, size: Size) -> Result<(), String> {
         &Request::Resize {
             name: name.to_string(),
             size,
-        },
-    ) {
-        Ok(Response::Ok) => Ok(()),
-        Ok(Response::Error(reason)) => Err(reason),
-        other => Err(format!("{other:?}")),
-    }
-}
-
-fn scrollback(path: &Path, name: &str, delta: i16) -> Result<(), String> {
-    match client::request(
-        path,
-        &Request::Scrollback {
-            name: name.into(),
-            delta,
         },
     ) {
         Ok(Response::Ok) => Ok(()),
@@ -1766,11 +1832,10 @@ mod tests {
         assert_eq!(ui.focus, Focus::List, "unmoved — nothing was attached");
     }
 
-    /// The "wheel-leak" question steps/028 raised: keeping capture on for the
-    /// whole run does not forward a wheel scroll to the child — `on_mouse`
-    /// only ever builds bytes for a left-button `Down`. See steps/030.
+    /// The wheel remains out of the child's input stream; it controls
+    /// Remuda's retained terminal history instead.
     #[test]
-    fn a_scroll_wheel_while_attached_is_not_forwarded() {
+    fn a_scroll_wheel_while_attached_moves_remuda_scrollback_not_the_child() {
         let mut ui = ui(vec![row("a", true, false)]);
         ui.on_key(press(KeyCode::Enter));
         let wheel = MouseEvent {
@@ -1779,7 +1844,37 @@ mod tests {
             row: 4,
             modifiers: KeyModifiers::NONE,
         };
-        assert_eq!(ui.on_mouse(wheel, 80, 24), Action::Nothing);
+        assert_eq!(ui.on_mouse(wheel, 80, 24), Action::Scroll(-3));
+    }
+
+    #[test]
+    fn shift_wheel_is_forwarded_to_the_child_tui() {
+        let mut ui = ui(vec![row("a", true, false)]);
+        ui.on_key(press(KeyCode::Enter));
+        let wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 19,
+            row: 4,
+            modifiers: KeyModifiers::SHIFT,
+        };
+        assert_eq!(
+            ui.on_mouse(wheel, 80, 24),
+            Action::Type(remuda_core::keys::mouse("wheel-down", 3, 5).unwrap())
+        );
+    }
+
+    #[test]
+    fn y_copies_the_selected_session_and_ctrl_y_pastes_while_focused() {
+        let mut ui = ui(vec![row("a", true, false)]);
+        assert_eq!(
+            ui.on_key(press(KeyCode::Char('y'))),
+            Action::Copy("a".into())
+        );
+        ui.on_key(press(KeyCode::Enter));
+        assert_eq!(
+            ui.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
+            Action::Paste
+        );
     }
 
     /// The bug this whole mode exists to make impossible: in the list `x` kills
@@ -2935,7 +3030,7 @@ mod tests {
         let path = scratch_socket("capture-no-session");
         daemon_at(&path);
 
-        let result = capture_styled(&path, "no-such-session");
+        let result = capture_styled(&path, "no-such-session", 0);
         let err = result.expect_err(
             "the daemon has no session by this name — Ok(vec![]) here is the \
              exact defect: a blank pane where a real error was available",
@@ -2994,7 +3089,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Ok((cells, _)) = capture_styled(&path, "alpha") {
+            if let Ok((cells, _)) = capture_styled(&path, "alpha", 0) {
                 let first_five: String = cells
                     .first()
                     .map(|row| row.iter().take(5).map(|c| c.text.as_str()).collect())
@@ -3020,7 +3115,7 @@ mod tests {
             unreachable!("just asserted it above");
         };
         let (cells, cursor) =
-            capture_styled(&path, &name).expect("capture through the window's target");
+            capture_styled(&path, &name, 0).expect("capture through the window's target");
 
         let mut ui = Ui::new(vec![row("alpha", true, false)], "/bin/sh", None);
         ui.sessions_text = vec![" ".into()];

@@ -161,6 +161,10 @@ pub trait AgentProcess: Send {
             .collect())
     }
 
+    fn screen_cells_at(&mut self, _scrollback: usize) -> Result<Vec<Vec<StyledCell>>> {
+        self.screen_cells()
+    }
+
     /// Subscribe to output as it arrives, for a viewer that must not poll.
     /// `None` means this backend cannot stream; that caller falls back to
     /// `screen_bytes`.
@@ -185,9 +189,6 @@ pub trait AgentProcess: Send {
 
     /// Move through retained terminal history. Positive values move toward
     /// older output; negative values return toward the live screen.
-    fn scrollback(&mut self, _delta: i16) -> Result<()> {
-        Ok(())
-    }
 
     /// The current terminal size.
     fn size(&self) -> Size;

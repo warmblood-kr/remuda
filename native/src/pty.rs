@@ -161,6 +161,36 @@ fn answer_cursor_query(writer: &SharedWriter, (row, col): (u16, u16)) {
     }
 }
 
+fn styled_cells(screen: &vt100::Screen, size: Size) -> Vec<Vec<StyledCell>> {
+    (0..size.rows())
+        .map(|row| {
+            (0..size.cols())
+                .map(|col| {
+                    let cell = screen.cell(row, col);
+                    let continuation = cell.is_some_and(|c| c.is_wide_continuation());
+                    let text = if continuation {
+                        String::new()
+                    } else {
+                        let t = cell.map_or("", |c| c.contents());
+                        (if t.is_empty() { " " } else { t }).to_string()
+                    };
+                    StyledCell {
+                        text,
+                        wide: cell.is_some_and(|c| c.is_wide()),
+                        fg: color(cell.map_or(vt100::Color::Default, |c| c.fgcolor())),
+                        bg: color(cell.map_or(vt100::Color::Default, |c| c.bgcolor())),
+                        bold: cell.is_some_and(|c| c.bold()),
+                        dim: cell.is_some_and(|c| c.dim()),
+                        italic: cell.is_some_and(|c| c.italic()),
+                        underline: cell.is_some_and(|c| c.underline()),
+                        inverse: cell.is_some_and(|c| c.inverse()),
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 impl AgentProcess for PtyAgent {
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         if !self.is_alive() {
@@ -189,38 +219,14 @@ impl AgentProcess for PtyAgent {
     /// it — this is the path that actually keeps colour. See steps/020, 023.
     fn screen_cells(&mut self) -> Result<Vec<Vec<StyledCell>>> {
         let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
-        let screen = parser.screen();
-        Ok((0..self.size.rows())
-            .map(|row| {
-                (0..self.size.cols())
-                    .map(|col| {
-                        let cell = screen.cell(row, col);
-                        // A wide cell's continuation carries no text of its
-                        // own — the wide cell before it already claims both
-                        // columns. Only a genuinely blank ordinary cell gets
-                        // the space substitute, so it still claims 1 column.
-                        let continuation = cell.is_some_and(|c| c.is_wide_continuation());
-                        let text = if continuation {
-                            String::new()
-                        } else {
-                            let t = cell.map_or("", |c| c.contents());
-                            (if t.is_empty() { " " } else { t }).to_string()
-                        };
-                        StyledCell {
-                            text,
-                            wide: cell.is_some_and(|c| c.is_wide()),
-                            fg: color(cell.map_or(vt100::Color::Default, |c| c.fgcolor())),
-                            bg: color(cell.map_or(vt100::Color::Default, |c| c.bgcolor())),
-                            bold: cell.is_some_and(|c| c.bold()),
-                            dim: cell.is_some_and(|c| c.dim()),
-                            italic: cell.is_some_and(|c| c.italic()),
-                            underline: cell.is_some_and(|c| c.underline()),
-                            inverse: cell.is_some_and(|c| c.inverse()),
-                        }
-                    })
-                    .collect()
-            })
-            .collect())
+        Ok(styled_cells(parser.screen(), self.size))
+    }
+
+    fn screen_cells_at(&mut self, scrollback: usize) -> Result<Vec<Vec<StyledCell>>> {
+        let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
+        let mut view = parser.screen().clone();
+        view.set_scrollback(scrollback);
+        Ok(styled_cells(&view, self.size))
     }
 
     fn subscribe(&mut self) -> Option<Receiver<Vec<u8>>> {
@@ -269,14 +275,6 @@ impl AgentProcess for PtyAgent {
             .screen_mut()
             .set_size(size.rows(), size.cols());
         self.size = size;
-        Ok(())
-    }
-
-    fn scrollback(&mut self, delta: i16) -> Result<()> {
-        let mut parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
-        let screen = parser.screen_mut();
-        let next = (screen.scrollback() as i64 + i64::from(delta)).max(0) as usize;
-        screen.set_scrollback(next);
         Ok(())
     }
 

@@ -174,16 +174,20 @@ impl Registry {
         self.get(name).map(|s| s.resize(size))
     }
 
-    pub fn scrollback(&self, name: &str, delta: i16) -> Option<Result<()>> {
-        self.get(name).map(|s| s.scrollback(delta))
-    }
-
     pub fn screen_text(&self, name: &str) -> Option<Result<String>> {
         self.get(name).map(|s| s.screen_text())
     }
 
     pub fn screen_cells(&self, name: &str) -> Option<Result<Vec<Vec<StyledCell>>>> {
         self.get(name).map(|s| s.screen_cells())
+    }
+
+    pub fn screen_cells_at(
+        &self,
+        name: &str,
+        scrollback: usize,
+    ) -> Option<Result<Vec<Vec<StyledCell>>>> {
+        self.get(name).map(|s| s.screen_cells_at(scrollback))
     }
 
     pub fn cursor(&self, name: &str) -> Option<Result<Cursor>> {

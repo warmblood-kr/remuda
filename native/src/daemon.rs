@@ -343,12 +343,6 @@ fn handle(
             })
         }
 
-        Request::Scrollback { name, delta } => {
-            respond(&stream, &name, registry.scrollback(&name, delta), |()| {
-                Response::Ok
-            })
-        }
-
         Request::Capture { name } => respond(
             &stream,
             &name,
@@ -356,30 +350,41 @@ fn handle(
             Response::Screen,
         ),
 
-        Request::CaptureStyled { name } => match registry.screen_cells(&name) {
-            None => reply(
-                &stream,
-                &Response::error(format!("no such session: {name}")),
-            ),
-            Some(Err(e)) => reply(&stream, &Response::error(e)),
-            Some(Ok(cells)) => {
-                // Runs on the wire, not cells — see steps/022 for the 44x+
-                // measured on a real screen.
-                let rows = cells.iter().map(|row| collapse_runs(row)).collect();
-                // The session existed a line above (`screen_cells` answered),
-                // so this only fails on a poisoned lock — hide rather than
-                // guess a position. See steps/027.
-                let cursor = registry
-                    .cursor(&name)
-                    .and_then(Result::ok)
-                    .unwrap_or(Cursor {
-                        row: 0,
-                        col: 0,
-                        visible: false,
-                    });
-                reply(&stream, &Response::StyledScreen { rows, cursor })
+        Request::CaptureStyled { name, scrollback } => {
+            match registry.screen_cells_at(&name, scrollback) {
+                None => reply(
+                    &stream,
+                    &Response::error(format!("no such session: {name}")),
+                ),
+                Some(Err(e)) => reply(&stream, &Response::error(e)),
+                Some(Ok(cells)) => {
+                    // Runs on the wire, not cells — see steps/022 for the 44x+
+                    // measured on a real screen.
+                    let rows = cells.iter().map(|row| collapse_runs(row)).collect();
+                    // The session existed a line above (`screen_cells` answered),
+                    // so this only fails on a poisoned lock — hide rather than
+                    // guess a position. See steps/027.
+                    let cursor = registry
+                        .cursor(&name)
+                        .and_then(Result::ok)
+                        .unwrap_or(Cursor {
+                            row: 0,
+                            col: 0,
+                            visible: false,
+                        });
+                    let cursor = if scrollback == 0 {
+                        cursor
+                    } else {
+                        Cursor {
+                            row: 0,
+                            col: 0,
+                            visible: false,
+                        }
+                    };
+                    reply(&stream, &Response::StyledScreen { rows, cursor })
+                }
             }
-        },
+        }
 
         Request::Attach { name } => attach(stream, reader, registry, &name),
 

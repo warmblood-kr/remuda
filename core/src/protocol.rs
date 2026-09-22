@@ -52,13 +52,16 @@ pub enum Request {
     /// during deserialization just like `New`.
     Resize { name: String, size: Size },
     /// Move a session's retained terminal history; positive means older.
-    Scrollback { name: String, delta: i16 },
     /// Read the screen as text without taking the session over. Needs no
     /// terminal, raw mode or exclusivity, so it works while a human is attached.
     Capture { name: String },
     /// Like `Capture`, but styled cells instead of plain text — what a
     /// croppable colour pane reads. See [`Response::StyledScreen`].
-    CaptureStyled { name: String },
+    CaptureStyled {
+        name: String,
+        #[serde(default)]
+        scrollback: usize,
+    },
     /// Take the session over for a human at a terminal. On `Ok`, this
     /// connection becomes a byte pipe.
     Attach { name: String },

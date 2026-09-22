@@ -85,14 +85,6 @@ impl Session {
         Ok(())
     }
 
-    pub fn scrollback(&self, delta: i16) -> Result<()> {
-        let mut agent = self
-            .agent
-            .lock()
-            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-        agent.scrollback(delta)
-    }
-
     /// Deliver one instruction: the text, then Enter, as one indivisible act.
     /// Carriage return, not newline — canonical mode takes CR as submit, and
     /// raw-key TUIs expect the byte a real Enter produces. Decided only here.
@@ -191,6 +183,14 @@ impl Session {
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
         agent.screen_cells()
+    }
+
+    pub fn screen_cells_at(&self, scrollback: usize) -> Result<Vec<Vec<StyledCell>>> {
+        let mut agent = self
+            .agent
+            .lock()
+            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        agent.screen_cells_at(scrollback)
     }
 
     pub fn is_alive(&self) -> bool {
