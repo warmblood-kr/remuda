@@ -544,18 +544,35 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
     }
 }
 
-/// Dispatch a manifest-declared mod command. With no arguments it starts the
-/// mod and opens the regular Remuda screen; `--headless` starts only the mod.
-/// Other arguments belong entirely to the installed Lua mod.
+/// Dispatch a manifest-declared mod command. The launch form may select an
+/// agent and/or skip the screen; other arguments belong to the Lua mod.
 fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) -> ExitCode {
     let package = match remuda_native::packages::subcommand(command) {
         Ok(Some(package)) => package,
         Ok(None) => return fail(format!("no installed mod provides command {command}")),
         Err(error) => return fail(error),
     };
-    if args.is_empty() || args == ["--headless"] {
-        let headless = args == ["--headless"];
+    let launch = match args {
+        [] => Some((false, None)),
+        ["--headless"] => Some((true, None)),
+        ["--agent", agent] => Some((false, Some(*agent))),
+        ["--agent", agent, "--headless"] | ["--headless", "--agent", agent] => {
+            Some((true, Some(*agent)))
+        }
+        _ => None,
+    };
+    if let Some((headless, agent)) = launch {
         return with_daemon(server, path, |path| {
+            if let Some(agent) = agent {
+                let code = format!(
+                    "remuda._mod_launch_options = remuda._mod_launch_options or {{}}; remuda._mod_launch_options[{}] = {{agent = {}}}",
+                    serde_json::to_string(command).expect("command serializes"),
+                    serde_json::to_string(agent).expect("agent serializes")
+                );
+                if eval_once(path, &code) != ExitCode::SUCCESS {
+                    return ExitCode::FAILURE;
+                }
+            }
             let started = exec_command(path, &package);
             if started != ExitCode::SUCCESS
                 || headless
