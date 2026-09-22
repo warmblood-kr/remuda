@@ -475,8 +475,8 @@ local function team_member_prompt(parent)
     .. "Work on the task sent to this terminal. When a work loop is complete, "
     .. "use `remuda butler send-to-leader RESULT...` to report "
     .. "a concise result. The Butler CLI is your coordination interface; you may "
-    .. "create a child team with `remuda butler topic delegate NAME --leader " .. parent
-    .. " TASK...` when useful."
+    .. "create a Remuda-managed child team with `remuda butler topic delegate NAME TASK...` "
+    .. "when useful. Internal agent subagents are separate from Butler team members."
 end
 local function write_agent_guidance(root, text)
   local path = root .. "/AGENTS.md"
@@ -495,7 +495,12 @@ local function launch_agent(kind, requested_name, cwd, model, parent, task)
     telemetry = agent_telemetry,
     system_prompt = parent and team_member_prompt(parent) or nil,
   })
-  local actual = remuda.new(name, argv, cwd, { REMUDA_BUTLER_SESSION_NAME = name })
+  local actual = remuda.new(name, argv, cwd, {
+    REMUDA_BUTLER_SESSION_NAME = name,
+    REMUDA_BUTLER_AGENT_ID = name,
+    REMUDA_BUTLER_LEADER_ID = parent or "",
+    REMUDA_BUTLER_AGENT_KIND = kind,
+  })
   bus.tokens[token] = actual
   bus.agents[actual] = {
     kind = kind, token = token, model = model, telemetry = agent_telemetry,
@@ -696,13 +701,12 @@ mcp_file:close()
 local SYSTEM_PROMPT = "Early in this session, call remuda._butler_register_compaction_schedule() "
   .. "via the run_script MCP tool, once, to enable this butler's own periodic "
   .. "context-compaction upkeep. You lead a Butler team. For every delegation, create a "
-  .. "Remuda-managed member with `remuda butler topic delegate NAME --agent codex --leader butler TASK`. "
-  .. "Do not use Codex or Claude built-in background agents, subagents, or task tools: they are "
-  .. "not Remuda sessions and cannot report through Butler. Use `remuda butler sessions` to inspect "
-  .. "members, `inbox` to read reports, and `send` for follow-up direction."
+  .. "Remuda-managed member with `remuda butler topic delegate NAME TASK`. "
+  .. "Internal agent subagents are separate from Butler team members. Use `remuda butler sessions` to "
+  .. "inspect members, `inbox` to read reports, and `send` for follow-up direction."
 local BUTLER_GUIDANCE = "You are Butler, manager of this household. Create team members only with "
-  .. "`remuda butler topic delegate NAME --agent codex --leader butler TASK`; never use an agent "
-  .. "CLI's built-in background or subagent facility. Supervise members through `remuda butler sessions`, "
+  .. "`remuda butler topic delegate NAME TASK`. Internal agent subagents are separate from Butler "
+  .. "team members. Supervise Butler members through `remuda butler sessions`, "
   .. "`inbox`, and `send`."
 if token_path then
   SYSTEM_PROMPT = "You are bridged into one Matrix room via remuda. "
@@ -782,7 +786,12 @@ local function launch_butler()
     remuda._butler_name = butler_name
     return
   end
-  butler_name = remuda.new(requested_name, BUTLER_ARGV, butler_session_cwd)
+  butler_name = remuda.new(requested_name, BUTLER_ARGV, butler_session_cwd, {
+    REMUDA_BUTLER_SESSION_NAME = requested_name,
+    REMUDA_BUTLER_AGENT_ID = requested_name,
+    REMUDA_BUTLER_LEADER_ID = "",
+    REMUDA_BUTLER_AGENT_KIND = butler_kind,
+  })
   remuda._butler_name = butler_name
   return butler_name
 end
