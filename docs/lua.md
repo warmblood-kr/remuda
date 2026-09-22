@@ -29,6 +29,31 @@ remuda.tool("review", "Review a session", function(name)
 end, "review(name) -> string")
 ```
 
+## Generated reference
+
+The reference below is extracted from the built Remuda runtime; it is not a
+second catalog maintained in the site source.
+
+<details>
+<summary>Show the generated reStructuredText reference</summary>
+
+<pre>
+{% include_relative lua-reference.rst %}
+</pre>
+</details>
+
+To regenerate it after changing a Rust binding or Lua registration, run this
+from the repository root:
+
+```sh
+sh scripts/generate-lua-reference.sh
+```
+
+The script builds `remuda`, starts an isolated daemon runtime, writes
+`docs/lua-reference.rst` from `remuda doc`, and checks the generated heading.
+The CLI's `--format markdown` and `--format json` outputs remain available for
+other site or tooling integrations.
+
 See [the design notes](design.md#one-registry-for-every-word) for the registry
 model and [the project source](https://github.com/warmblood-kr/remuda) for the
 current implementation.

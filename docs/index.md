@@ -24,6 +24,9 @@ The complete Lua reference is generated from the live runtime registry:
 [Lua extension documentation](lua.md). Butler's local session manager and
 optional Matrix bridge are described in [Butler](butler.md).
 
+The [generated RST reference](lua-reference.rst) is included in the Lua page
+and can also be consumed directly by documentation tooling.
+
 The same herd is reachable over MCP — `new`, `ls`, `send`, `capture` — so an
 agent can drive other agents.
 
