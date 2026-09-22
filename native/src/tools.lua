@@ -531,19 +531,15 @@ register(
 -- The left session list, re-expressed as the "*sessions*" buffer instead of
 -- being drawn straight out of Rust.
 --
--- `tui.rs`'s `list_row` keeps exactly two things it always had: the cursor
--- mark (which row is selected is a per-viewer fact, not buffer content —
--- the same reason an Emacs buffer does not store which window's point is
--- where) and the width-aware padding/truncation math (mechanism, the same
--- boundary `capture`'s styled-vs-plain split already draws — see
--- `script.rs`'s doc comment on why color stays in the frame). Everything
--- this function decides — the tail word, the empty-herd copy — is content,
--- and content is what a buffer holds.
+-- `tui.rs` keeps the cursor mark only: which row is selected is a per-viewer
+-- fact, not buffer content.  Everything else people see in the session list
+-- — status color, detail, and the breathing room between sessions — belongs
+-- here, where a live Lua image can revise it without rebuilding the TUI.
 --
 -- WIDTH is passed in rather than read from anywhere, because whether the
 -- tail shows `live`/`dead` or just the flag depends on the caller's own
 -- column budget — a fact only the renderer asking for a refresh has.
-function remuda._refresh_sessions_buffer(width)
+function remuda._refresh_sessions_buffer(width, selected)
   local sessions = remuda.ls()
   local lines = {}
   local function context_k(tokens)
@@ -568,21 +564,31 @@ function remuda._refresh_sessions_buffer(width)
   else
     for i, s in ipairs(sessions) do
       local detail = butler_detail(s)
-      if detail then
-        lines[i] = detail
-      else
-        local flag = s.attached and "⚑" or " "
-        local state = s.alive and "live" or "dead"
-        lines[i] = (width >= 22) and (state .. " " .. flag) or flag
-      end
+      local state_color = s.alive and "\27[32m" or "\27[31m"
+      local reset = "\27[0m"
+      local flag = s.attached and "  ⚑" or ""
+      local state = s.alive and "live" or "dead"
+      local base = (i - 1) * 3
+      -- Names remain neutral and readable; state carries the color. Keeping
+      -- an actually blank third row gives entries whitespace rather than a
+      -- second competing visual treatment.
+      local name_style = (i - 1 == selected) and "\27[1;36m" or "\27[1m"
+      lines[base + 1] = name_style .. s.name .. reset
+      local detail_text = detail and ("  \27[2m" .. detail .. reset) or ""
+      lines[base + 2] = "  " .. state_color .. state .. reset .. detail_text .. flag
+      lines[base + 3] = ""
     end
   end
+  -- The private first line is the native bridge contract: Lua selects the
+  -- number of rows and all visual treatment, while Rust only maps input and
+  -- viewport positions onto those rows.
+  table.insert(lines, 1, "\30" .. tostring(3))
   remuda.buffer.new("*sessions*"):set(table.concat(lines, "\n"))
 end
 register(
   "_refresh_sessions_buffer",
   "Rebuild the *sessions* buffer's content.",
-  "_refresh_sessions_buffer(width) -> nil"
+  "_refresh_sessions_buffer(width, selected) -> nil"
 )
 
 -- Sorted "name(signature) -- about", one per line — the manual `remuda doc`

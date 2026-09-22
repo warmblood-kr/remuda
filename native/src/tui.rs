@@ -80,10 +80,12 @@ pub struct Ui {
     /// One line of feedback under the list — a refusal, or how the last ride
     /// ended. Cleared by the next keypress that does anything.
     pub notice: Option<String>,
-    /// The "*sessions*" buffer's content (`tools.lua`'s
-    /// `remuda._refresh_sessions_buffer`), index-aligned with `sessions`, or
-    /// the two empty-herd lines. See `list_row`.
+    /// The "*sessions*" buffer's rendered rows (`tools.lua`'s
+    /// `remuda._refresh_sessions_buffer`).  Lua owns its presentation; Rust
+    /// only adds the per-viewer cursor and maps rows back to sessions.
     sessions_text: Vec<String>,
+    /// Rows per session, supplied by the Lua sessions-buffer contract.
+    session_rows: usize,
 }
 
 impl Ui {
@@ -100,6 +102,7 @@ impl Ui {
             shell: shell.to_string(),
             notice,
             sessions_text: Vec::new(),
+            session_rows: 1,
         }
     }
 
@@ -158,7 +161,7 @@ impl Ui {
         if row < 2 || row > body {
             return Action::Nothing;
         }
-        let index = ((row - 2) / 2) as usize;
+        let index = ((row - 2) as usize / self.session_rows) + list_viewport(self, body);
         if index >= self.sessions.len() {
             return Action::Nothing;
         }
@@ -553,13 +556,29 @@ fn fit(text: &str, width: u16) -> String {
     if visible_width(text) > width {
         let mut out = String::new();
         let mut used = 0usize;
-        for c in text.chars() {
+        let mut chars = text.chars();
+        let mut styled = false;
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                styled = true;
+                out.push(c);
+                for escape in chars.by_ref() {
+                    out.push(escape);
+                    if escape == 'm' {
+                        break;
+                    }
+                }
+                continue;
+            }
             let w = c.width().unwrap_or(1);
             if used + w > width.saturating_sub(1) {
                 break;
             }
             out.push(c);
             used += w;
+        }
+        if styled {
+            out.push_str("\x1b[0m");
         }
         out.push('→');
         out.push_str(&" ".repeat(width.saturating_sub(used + 1)));
@@ -593,7 +612,11 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
         let left = if row == 0 {
             format!("remuda · {server}")
         } else {
-            list_row(ui, row as usize - 1, list_w)
+            list_row(
+                ui,
+                row as usize - 1 + list_viewport(ui, body) * ui.session_rows,
+                list_w,
+            )
         };
         out.push_str(&fit(&left, list_w));
         out.push_str(divider);
@@ -801,7 +824,11 @@ pub fn render_styled(
         let left = if row == 0 {
             format!("remuda · {server}")
         } else {
-            list_row(ui, row as usize - 1, list_w)
+            list_row(
+                ui,
+                row as usize - 1 + list_viewport(ui, body) * ui.session_rows,
+                list_w,
+            )
         };
         out.push_str(&fit(&left, list_w));
         out.push_str(divider);
@@ -831,6 +858,18 @@ fn widest(ui: &Ui) -> u16 {
     ui.sessions.iter().map(|s| s.size.cols()).max().unwrap_or(0)
 }
 
+/// The first session shown in the list, based on Lua's rows-per-session
+/// contract rather than a native presentation policy.
+fn list_viewport(ui: &Ui, body: u16) -> usize {
+    let visible = body.saturating_sub(1) as usize / ui.session_rows;
+    if visible == 0 {
+        return 0;
+    }
+    ui.selected
+        .saturating_sub(visible - 1)
+        .min(ui.sessions.len().saturating_sub(visible))
+}
+
 /// The size a session started from here is given: the pane it will live in.
 /// Nothing can resize a pty afterwards (PRINCIPLES §6), so this is the only
 /// chance to make it fit — and `Size::new` still floors it at 80×24.
@@ -842,9 +881,8 @@ pub fn pane_size(ui: &Ui, cols: u16, rows: u16) -> Size {
 /// A row that degrades instead of being cut. When the preview claims most of
 /// the terminal the list can floor at 16 columns, and a truncated row loses
 /// `live`/`dead` — the one field the whole list exists to show.
-// The tail word and empty-herd copy are `ui.sessions_text` (Lua's, via
-// `tools.lua`'s `remuda._refresh_sessions_buffer`) — what stays here is the
-// cursor mark (per-viewer, never buffer content) and the width math.
+// Lua owns the content, spacing, and colour of every list row.  The cursor is
+// intentionally still per-viewer state, never buffer content.
 fn list_row(ui: &Ui, row: usize, width: u16) -> String {
     if ui.sessions.is_empty() {
         // The empty herd says what it is and what to do about it. It does not
@@ -855,27 +893,32 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
             _ => String::new(),
         };
     }
-    let session_index = row / 2;
+    let session_index = row / ui.session_rows;
     let Some(session) = ui.sessions.get(session_index) else {
         return String::new();
     };
-    let detail = ui
-        .sessions_text
-        .get(session_index)
-        .map_or("", String::as_str);
-    if row % 2 == 1 {
-        return format!("  {}", fit(detail, width.saturating_sub(2)));
+    // A failed or not-yet-completed Lua refresh must not turn a real session
+    // into a blank selectable row. The buffer supplies the styled version in
+    // normal operation; this fallback keeps the name readable until then.
+    let content = ui.sessions_text.get(row).map_or_else(
+        || {
+            if row % ui.session_rows == 0 {
+                session.name.as_str()
+            } else {
+                ""
+            }
+        },
+        String::as_str,
+    );
+    if row % ui.session_rows != 0 {
+        return fit(content, width);
     }
     let cursor = if session_index == ui.selected {
         "▸"
     } else {
         " "
     };
-    // No time-driven field: `idle` never resets on typing (only on `send`,
-    // see session.rs), so it read as an uptime clock, not "liveness" — and it
-    // was the only per-second repaint source in the whole TUI. See steps/026.
-    let room = (width as usize).saturating_sub(2);
-    format!("{cursor} {}", fit(&session.name, room as u16))
+    format!("{cursor} {}", fit(content, width.saturating_sub(2)))
 }
 
 /// The crop notice moved here when the preview lost its title band: a crop that
@@ -939,8 +982,11 @@ fn refresh(
         // paying for it there would be the exact per-keystroke IPC cost
         // steps/017/022 exist to avoid.
         let (list_w, _) = layout(cols, widest(ui));
-        match sessions_buffer_lines(path, list_w) {
-            Ok(lines) => ui.sessions_text = lines,
+        match sessions_buffer_lines(path, list_w, ui.selected) {
+            Ok((session_rows, lines)) => {
+                ui.session_rows = session_rows;
+                ui.sessions_text = lines;
+            }
             // Same fallback as the relist: keep whatever was last drawn
             // rather than blanking the tail column on a transport hiccup.
             Err(e) => ui.notice = Some(e),
@@ -1182,15 +1228,32 @@ fn list(path: &Path) -> Result<Vec<SessionSummary>, String> {
 /// The "*sessions*" buffer's content, refreshed at WIDTH and fetched in one
 /// `Eval` round trip (`tools.lua`'s `remuda._refresh_sessions_buffer`, then
 /// `remuda.buffer.new("*sessions*"):get()`).
-fn sessions_buffer_lines(path: &Path, width: u16) -> Result<Vec<String>, String> {
+fn sessions_buffer_lines(
+    path: &Path,
+    width: u16,
+    selected: usize,
+) -> Result<(usize, Vec<String>), String> {
     let code = format!(
-        "remuda._refresh_sessions_buffer({width}); return remuda.buffer.new('*sessions*'):get()"
+        "remuda._refresh_sessions_buffer({width}, {selected}); return remuda.buffer.new('*sessions*'):get()"
     );
     match client::request(path, &Request::Eval { code, name: None }) {
-        Ok(Response::Value(text)) => Ok(text.split('\n').map(str::to_string).collect()),
+        Ok(Response::Value(text)) => parse_sessions_buffer(&text),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
     }
+}
+
+/// Decode Lua's private sessions-buffer header. The body stays ordinary
+/// newline-separated styled text; only the row grouping crosses the boundary.
+fn parse_sessions_buffer(text: &str) -> Result<(usize, Vec<String>), String> {
+    let mut lines = text.split('\n');
+    let rows = lines
+        .next()
+        .and_then(|line| line.strip_prefix('\x1e'))
+        .and_then(|rows| rows.parse::<usize>().ok())
+        .filter(|rows| *rows > 0)
+        .ok_or_else(|| "invalid sessions-buffer layout contract".to_string())?;
+    Ok((rows, lines.map(str::to_string).collect()))
 }
 
 /// What the window shows — a real session, a script's own buffer, or
@@ -1382,7 +1445,10 @@ mod tests {
     }
 
     fn ui(rows: Vec<SessionSummary>) -> Ui {
-        Ui::new(rows, "/bin/sh", None)
+        let mut ui = Ui::new(rows, "/bin/sh", None);
+        // Unit fixtures use the same row contract the Lua renderer publishes.
+        ui.session_rows = 3;
+        ui
     }
 
     fn press(code: KeyCode) -> KeyEvent {
@@ -1397,6 +1463,26 @@ mod tests {
         ui.on_key(press(KeyCode::Down));
         ui.on_key(press(KeyCode::Down));
         assert_eq!(ui.selected, 1, "down at the bottom stays");
+    }
+
+    #[test]
+    fn selected_session_stays_visible_when_the_list_exceeds_a_short_terminal() {
+        let mut ui = ui((0..12)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect());
+        for _ in 0..11 {
+            ui.on_key(press(KeyCode::Down));
+        }
+
+        let frame = render(&ui, "", "test", 80, 24);
+        assert!(
+            frame.contains("\x1b[20;1H▸ session-11"),
+            "the selected final session must be rendered in the 24-row viewport: {frame:?}"
+        );
+        assert!(
+            !frame.contains("session-0"),
+            "the list must have advanced rather than rendering only its initial rows"
+        );
     }
 
     #[test]
@@ -1440,9 +1526,9 @@ mod tests {
         );
         assert_eq!(ui.selected, 0, "unmoved by the header click");
         assert_eq!(ui.focus, Focus::List, "unmoved by the header click");
-        // Screen row 6 (0-based 5) is past "b" — the herd has only 4 rows.
+        // Screen row 8 (0-based 7) is past "b" — the herd has 6 rows.
         assert_eq!(
-            ui.on_mouse(click(5, 5), 80, 24),
+            ui.on_mouse(click(5, 7), 80, 24),
             Action::Nothing,
             "past the last row"
         );
@@ -1964,15 +2050,30 @@ mod tests {
     }
 
     #[test]
-    fn a_session_uses_a_name_row_and_a_detail_row() {
+    fn a_session_uses_spaced_name_and_state_rows() {
         let mut ui = ui(vec![row("monocle", true, false)]);
-        ui.sessions_text = vec!["claude · opus · CTX 12k/200k 6%".into()];
+        ui.sessions_text = vec![
+            "\x1b[1;36mmonocle\x1b[0m".into(),
+            "  \x1b[32mlive\x1b[0m  \x1b[2mclaude · opus · CTX 12k/200k 6%\x1b[0m".into(),
+            String::new(),
+        ];
         assert!(list_row(&ui, 0, 40).contains("monocle"));
+        assert!(list_row(&ui, 0, 40).contains("\x1b[1;36mmonocle\x1b[0m"));
         assert!(list_row(&ui, 1, 40).contains("CTX 12k/200k 6%"));
+        assert!(list_row(&ui, 1, 40).contains("\x1b[32mlive\x1b[0m"));
+        assert_eq!(list_row(&ui, 2, 40).trim(), "");
         assert_eq!(
             ui.click_list_row(MouseEventKind::Down(MouseButton::Left), 3, 23),
             Action::Focus("monocle".into())
         );
+    }
+
+    #[test]
+    fn sessions_buffer_contract_leaves_entry_height_to_lua() {
+        let (rows, lines) = parse_sessions_buffer("\x1e3\nname\nstate\n\nnext\nstate\n").unwrap();
+        assert_eq!(rows, 3);
+        assert_eq!(lines, vec!["name", "state", "", "next", "state", ""]);
+        assert!(parse_sessions_buffer("name\nstate").is_err());
     }
 
     /// Two style groups must emit exactly two style-change points, not one
@@ -2082,7 +2183,14 @@ mod tests {
         // under the 22-column threshold `tools.lua` uses for the live/dead
         // word, so neither row shows it. This is `render_styled`'s only
         // input that no longer comes from `ui.sessions` directly.
-        ui.sessions_text = vec![" ".into(), "⚑".into()];
+        ui.sessions_text = vec![
+            "claude".into(),
+            "live".into(),
+            String::new(),
+            "busy".into(),
+            "live  ⚑".into(),
+            String::new(),
+        ];
         let cells = vec![text_row(10); 23];
         let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
         assert_eq!(
@@ -2208,7 +2316,9 @@ mod tests {
         };
         let mut ui = Ui::new(sessions, "/bin/sh", None);
         let (list_w, _) = layout(80, widest(&ui));
-        let lines = sessions_buffer_lines(&path, list_w).expect("refresh sessions buffer");
+        let lines = sessions_buffer_lines(&path, list_w, 0)
+            .expect("refresh sessions buffer")
+            .1;
         assert_eq!(
             lines,
             vec![" ".to_string(), "⚑".to_string()],
@@ -2259,7 +2369,9 @@ mod tests {
         let path = scratch_socket("e2e-empty-oracle");
         daemon_at(&path);
 
-        let lines = sessions_buffer_lines(&path, 16).expect("refresh sessions buffer");
+        let lines = sessions_buffer_lines(&path, 16, 0)
+            .expect("refresh sessions buffer")
+            .1;
         assert_eq!(
             lines,
             vec![
@@ -2319,14 +2431,18 @@ mod tests {
         new_session(&path, "bravo");
         let _held = client::hold(&path, "bravo").expect("attach bravo for real");
 
-        let wide = sessions_buffer_lines(&path, 22).expect("refresh at width 22");
+        let wide = sessions_buffer_lines(&path, 22, 0)
+            .expect("refresh at width 22")
+            .1;
         assert_eq!(
             wide,
             vec!["live  ".to_string(), "live ⚑".to_string()],
             "at width >= 22, tools.lua shows the live/dead word before the flag"
         );
 
-        let narrow = sessions_buffer_lines(&path, 21).expect("refresh at width 21");
+        let narrow = sessions_buffer_lines(&path, 21, 0)
+            .expect("refresh at width 21")
+            .1;
         assert_eq!(
             narrow,
             vec![" ".to_string(), "⚑".to_string()],
@@ -2466,7 +2582,14 @@ mod tests {
     fn the_frame_says_what_it_is_showing() {
         let mut ui = ui(vec![row("claude", true, false), row("busy", true, true)]);
         ui.notice = None;
-        ui.sessions_text = vec![" ".into(), "⚑".into()];
+        ui.sessions_text = vec![
+            "claude".into(),
+            "live".into(),
+            String::new(),
+            "busy".into(),
+            "live  ⚑".into(),
+            String::new(),
+        ];
         let frame = render(&ui, "hello", "default", 120, 10);
         assert!(frame.contains("remuda · default"));
         assert!(frame.contains("▸ claude"), "the cursor is on the first row");
@@ -2476,11 +2599,29 @@ mod tests {
     }
 
     /// The preview column of each row — where a ride puts the same content.
-    fn preview_rows(frame: &str, list_w: usize) -> Vec<String> {
+    fn preview_rows(frame: &str, _list_w: usize) -> Vec<String> {
+        fn without_sgr(text: &str) -> String {
+            let mut out = String::new();
+            let mut chars = text.chars();
+            while let Some(c) = chars.next() {
+                if c == '\x1b' {
+                    for escape in chars.by_ref() {
+                        if escape == 'm' {
+                            break;
+                        }
+                    }
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
         frame
-            .split("\x1b[")
-            .filter_map(|chunk| chunk.split_once(";1H"))
-            .map(|(_, row)| row.chars().skip(list_w + 1).collect())
+            .split('│')
+            .skip(1)
+            .filter_map(|row| row.split_once("\x1b["))
+            .map(|(preview, _)| without_sgr(preview))
             .collect()
     }
 
@@ -2536,12 +2677,12 @@ mod tests {
         let mut ui = ui(vec![row("claude", true, false)]);
         let (list_w, _) = layout(80, 80);
         assert_eq!(list_w, 16);
-        ui.sessions_text = vec![" ".into()];
+        ui.sessions_text = vec!["claude".into(), "".into(), String::new()];
         assert!(
             !list_row(&ui, 0, list_w).contains('→'),
             "it fits, by dropping"
         );
-        ui.sessions_text = vec!["live ".into()];
+        ui.sessions_text = vec!["claude".into(), "live".into(), String::new()];
         assert!(
             list_row(&ui, 1, 40).contains("live"),
             "and keeps it when there is room"
@@ -2553,8 +2694,8 @@ mod tests {
     #[test]
     fn the_list_row_carries_no_seconds_counter() {
         let mut ui = ui(vec![row("claude", true, false)]);
-        ui.sessions_text = vec!["live ".into()];
-        let line = list_row(&ui, 0, 40);
+        ui.sessions_text = vec!["claude".into(), "live".into(), String::new()];
+        let line = list_row(&ui, 1, 40);
         assert!(
             !line.contains('s'),
             "no seconds suffix even at full width: {line:?}"
