@@ -55,10 +55,7 @@ fn main() -> ExitCode {
             })
         }
 
-        [] | ["help"] | ["-h"] | ["--help"] => {
-            eprint!("{}", USAGE);
-            ExitCode::SUCCESS
-        }
+        [] | ["help"] | ["-h"] | ["--help"] => help_command(),
 
         ["--version"] | ["-V"] | ["version"] => {
             println!("remuda {}", dist::BUILD_VERSION);
@@ -155,7 +152,8 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "\
+#[allow(dead_code)]
+const DETAILED_USAGE: &str = "\
 remuda — a pty manager you can attach to
 
   remuda                        open the herd (a terminal is required)
@@ -223,6 +221,46 @@ In a script they live on one table, and a refusal is raised, not returned:
 `mcp` is for a program running inside a session to reach the manager holding
 it — a client spawns it and owns both pipes, so there is nothing to type here.
 ";
+
+const USAGE: &str = "\
+remuda — terminal orchestration for coding agents
+
+  remuda                         open the session screen
+  remuda run [-n NAME] COMMAND   start and enter a session
+  remuda attach NAME             enter a session; Ctrl-\\ detaches
+  remuda ls | send NAME TEXT     inspect or message sessions
+  remuda stop [-f]               stop the daemon (sessions are lost)
+
+  remuda mod install OWNER/REPO  install a mod from GitHub
+  remuda mod list | info NAME    inspect installed mods
+  remuda mod update NAME|--all   update a mod
+  remuda mod remove NAME         remove a mod
+
+  remuda doc | repl | -e CODE    use the persistent Lua runtime
+  remuda --version
+
+Run `remuda mod list` for installed mods and `remuda doc` for the live Lua API.
+";
+
+fn help_command() -> ExitCode {
+    eprint!("{USAGE}");
+    match remuda_native::packages::manifests() {
+        Ok(mods) => {
+            let commands: Vec<_> = mods
+                .into_iter()
+                .filter_map(|mod_spec| mod_spec.command)
+                .collect();
+            if !commands.is_empty() {
+                eprintln!("Installed mod commands:");
+                for command in commands {
+                    eprintln!("  remuda {command} [--headless]");
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error),
+    }
+}
 
 /// `run [-n name] <argv…>`: create a session and ride it, in one act. argv
 /// comes first, so no leading positional can eat the program name — which is
@@ -506,17 +544,31 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
     }
 }
 
-/// Dispatch a manifest-declared extension command. The core only knows the
-/// manifest command name; the installed Lua extension owns every argument and
-/// behavior behind it.
+/// Dispatch a manifest-declared mod command. With no arguments it starts the
+/// mod and opens the regular Remuda screen; `--headless` starts only the mod.
+/// Other arguments belong entirely to the installed Lua mod.
 fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) -> ExitCode {
     let package = match remuda_native::packages::subcommand(command) {
         Ok(Some(package)) => package,
         Ok(None) => return fail(format!("no installed mod provides command {command}")),
         Err(error) => return fail(error),
     };
-    if args.is_empty() {
-        return with_daemon(server, path, |path| exec_command(path, &package));
+    if args.is_empty() || args == ["--headless"] {
+        let headless = args == ["--headless"];
+        return with_daemon(server, path, |path| {
+            let started = exec_command(path, &package);
+            if started != ExitCode::SUCCESS
+                || headless
+                || !std::io::stdin().is_terminal()
+                || !std::io::stdout().is_terminal()
+            {
+                return started;
+            }
+            match remuda_native::tui::run(path, server, None) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(format!("tui: {error}")),
+            }
+        });
     }
     let arguments = args
         .iter()

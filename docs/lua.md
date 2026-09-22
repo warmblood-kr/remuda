@@ -34,9 +34,10 @@ package under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/mods`. Add
 `--ref REF` to select a branch, tag, or commit. Installation never changes a
 live Lua image, so run `remuda exec NAME` or `remuda stop` to reload it.
 When a manifest declares `command = "NAME"`, `remuda NAME` loads that
-extension explicitly. Further words (`remuda NAME ...`) are dispatched to the
-already-loaded extension's Lua command handler; the core does not embed an
-extension-specific parser.
+mod explicitly and opens the regular Remuda screen when attached to a terminal.
+Use `remuda NAME --headless` to load it without opening the screen. Further
+words (`remuda NAME ...`) are dispatched to the already-loaded mod's Lua
+command handler; the core does not embed a mod-specific parser.
 
 `remuda mod update NAME` and `remuda mod update --all` reuse each installed
 mod's recorded GitHub source and ref, validate the new checkout, and replace
