@@ -104,7 +104,7 @@ fn shell_or_default(configured: Option<String>) -> String {
 
 /// Whether a session that ended keeps its entry. Off by default: 정수님,
 /// 2026-09-10, asked that a session go away by itself when its program exits.
-/// Read in the DAEMON's environment, so changing it takes a `remuda restart`.
+/// Read in the DAEMON's environment, so changing it takes a `remuda stop`.
 pub(crate) fn keep_exited() -> bool {
     std::env::var("REMUDA_KEEP_EXITED").is_ok_and(|v| v == "1")
 }

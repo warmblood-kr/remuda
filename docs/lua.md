@@ -32,7 +32,7 @@ shows one manifest. Both use the same RST/Markdown/JSON format selector.
 validates the repository's `extension.toml`, and atomically stores its Lua
 package under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/mods`. Add
 `--ref REF` to select a branch, tag, or commit. Installation never changes a
-live Lua image, so run `remuda exec NAME` or `remuda restart` to reload it.
+live Lua image, so run `remuda exec NAME` or `remuda stop` to reload it.
 When a manifest declares `command = "NAME"`, `remuda NAME` loads that
 extension explicitly. Further words (`remuda NAME ...`) are dispatched to the
 already-loaded extension's Lua command handler; the core does not embed an

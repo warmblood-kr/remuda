@@ -160,7 +160,7 @@ status "butler registered for this run."
 # Sibling to remuda/butler/, not inside it: the generic per-daemon loader
 # (native/src/daemon.rs's `load_user_config`), evaluated automatically by
 # every FRESH remuda daemon at boot -- this is what re-registers butler
-# after a `remuda restart` or a reboot, with no human hand and no need to
+# after a `remuda stop` or a reboot, with no human hand and no need to
 # wait for butler-poll.sh's next tick below. Unconditional: nothing else
 # writes this file, so there is nothing of the reader's own to preserve.
 mkdir -p "$config_home/remuda"
@@ -183,7 +183,7 @@ status "wrote $init_lua"
 # butler` a second time. If butler does not come back on its own, the
 # loader did not do its job.
 status "restarting the daemon to verify the new loader actually re-registers butler..."
-env -u PWD remuda restart -f >&2
+env -u PWD remuda stop -f >&2
 
 # Bounded retry, not a single immediate check: native/src/daemon.rs's
 # load_user_config runs on its own thread, CONCURRENTLY with

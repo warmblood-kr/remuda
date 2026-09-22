@@ -79,7 +79,7 @@ fn main() -> ExitCode {
         // Deliberately NOT behind `with_daemon`: the daemon this stops is often
         // exactly the one that cannot be talked to, and starting one to stop it
         // is not a thing to do.
-        ["restart", rest @ ..] => restart(server, &path, rest),
+        ["stop", rest @ ..] => stop(server, &path, rest),
 
         ["ls"] => with_daemon(server, &path, list_sessions),
 
@@ -179,7 +179,7 @@ remuda — a pty manager you can attach to
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
   remuda upgrade [--channel C]  re-run the installer on stable or nightly
-  remuda restart [-f]           stop the daemon; the next command starts a fresh
+  remuda stop [-f]              stop the daemon; the next command starts a fresh
                                   one. Its sessions and Lua image die with it,
                                   so a live herd is named and confirmed first.
   remuda --version              the version this binary was built with
@@ -292,14 +292,14 @@ fn fate(path: &Path, name: &str) -> String {
     }
 }
 
-/// `restart [-f]`: stop this server's daemon so the next command starts a fresh
-/// one. `remuda upgrade` replaces the binary and cannot touch a daemon already
-/// running — this is the verb that closes that gap.
-fn restart(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+/// `stop [-f]`: stop this server's daemon. `remuda upgrade` replaces the
+/// binary but cannot touch a daemon already running — this is the verb that
+/// closes that gap.
+fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     let force = match args {
         [] => false,
         ["-f"] | ["--force"] => true,
-        _ => return fail("usage: remuda restart [-f]"),
+        _ => return fail("usage: remuda stop [-f]"),
     };
     if remuda_native::ipc::connect(path).is_err() {
         eprintln!("remuda: no daemon running for {server:?} — the next command starts one");
@@ -346,7 +346,7 @@ fn confirm_losses(path: &Path) -> Result<(), String> {
     );
     eprintln!("remuda: their processes, their last screens and the Lua image are all lost.");
     if !std::io::stdin().is_terminal() {
-        return Err("nothing to ask on — `remuda restart -f` if that is what you want".into());
+        return Err("nothing to ask on — `remuda stop -f` if that is what you want".into());
     }
     eprint!("remuda: type y to go ahead: ");
     let mut answer = String::new();
@@ -393,7 +393,7 @@ fn stop_daemon(path: &Path) -> Result<(), String> {
 /// most skews are harmless, and stranding someone mid-work behind a version
 /// string is its own incident. `None` when nothing is listening — it will be us.
 fn version_skew(argv: &[&str], path: &Path) -> Option<String> {
-    if matches!(argv, ["daemon"] | ["mcp"] | ["restart", ..]) {
+    if matches!(argv, ["daemon"] | ["mcp"] | ["stop", ..]) {
         return None;
     }
     remuda_native::ipc::connect(path).ok()?;
@@ -411,7 +411,7 @@ fn skew_notice(response: std::io::Result<Response>) -> Option<String> {
         // footer that crops the tail at the terminal's width.
         Err(_) => {
             return Some(format!(
-                "the daemon could not confirm its version — `remuda restart` \
+                "the daemon could not confirm its version — `remuda stop` \
                  replaces it if something still seems off. The check itself \
                  failed partway through; this command is {}",
                 dist::BUILD_VERSION
@@ -423,7 +423,7 @@ fn skew_notice(response: std::io::Result<Response>) -> Option<String> {
     // Cure first, and no "remuda:" prefix — the caller adds one, and this also
     // goes to a TUI footer that crops the tail at the terminal's width.
     Some(format!(
-        "the daemon is not this build — `remuda restart` replaces it, and its \
+        "the daemon is not this build — `remuda stop` replaces it, and its \
          sessions and Lua image go with it. It is {theirs}; this command is {}",
         dist::BUILD_VERSION
     ))
@@ -968,6 +968,6 @@ mod tests {
             "a transport failure on the version check must say something, \
              not silently read as a confirmed match"
         );
-        assert!(notice.unwrap().contains("remuda restart"));
+        assert!(notice.unwrap().contains("remuda stop"));
     }
 }

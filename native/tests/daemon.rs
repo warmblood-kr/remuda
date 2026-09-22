@@ -1099,8 +1099,8 @@ fn remuda_timed(dir: &Path, args: &[&str]) -> std::process::Output {
 /// stop is a `process::exit`, so an in-process daemon would take the test
 /// runner with it — which is also why this is the only honest way to test it.
 #[test]
-fn restart_stops_a_daemon_and_leaves_the_next_command_free_to_start_one() {
-    let dir = scratch_dir("restart");
+fn stop_stops_a_daemon_and_leaves_the_next_command_free_to_start_one() {
+    let dir = scratch_dir("stop");
     let path = daemon::socket_path_in(&dir, "s");
     let mut daemon = Daemon::spawn(&dir);
 
@@ -1111,7 +1111,7 @@ fn restart_stops_a_daemon_and_leaves_the_next_command_free_to_start_one() {
         "the daemon was not answering to begin with"
     );
 
-    let out = remuda(&dir, &["-s", "s", "restart"]);
+    let out = remuda(&dir, &["-s", "s", "stop"]);
     let said = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(out.status.success(), "restart failed: {said}");
     assert!(said.contains("stopped the daemon"), "{said}");
@@ -1123,9 +1123,9 @@ fn restart_stops_a_daemon_and_leaves_the_next_command_free_to_start_one() {
 }
 
 #[test]
-fn restart_with_no_daemon_running_is_not_an_error() {
-    let dir = scratch_dir("restart-empty");
-    let out = remuda(&dir, &["-s", "s", "restart"]);
+fn stop_with_no_daemon_running_is_not_an_error() {
+    let dir = scratch_dir("stop-empty");
+    let out = remuda(&dir, &["-s", "s", "stop"]);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("no daemon running"));
 }
@@ -1134,13 +1134,13 @@ fn restart_with_no_daemon_running_is_not_an_error() {
 /// With no terminal to ask on, the refusal names the flag rather than prompting
 /// into a pipe that will never answer.
 #[test]
-fn restart_refuses_to_kill_a_live_session_without_being_told_twice() {
-    let dir = scratch_dir("restart-live");
+fn stop_refuses_to_kill_a_live_session_without_being_told_twice() {
+    let dir = scratch_dir("stop-live");
     let path = daemon::socket_path_in(&dir, "s");
     let mut daemon = Daemon::spawn(&dir);
     new_session(&path, "keeper");
 
-    let out = remuda(&dir, &["-s", "s", "restart"]);
+    let out = remuda(&dir, &["-s", "s", "stop"]);
     let said = String::from_utf8_lossy(&out.stderr).to_string();
     assert!(
         !out.status.success(),
@@ -1156,7 +1156,7 @@ fn restart_refuses_to_kill_a_live_session_without_being_told_twice() {
     );
 
     // -f is the way past it, and the same daemon now goes.
-    let forced = remuda(&dir, &["-s", "s", "restart", "-f"]);
+    let forced = remuda(&dir, &["-s", "s", "stop", "-f"]);
     assert!(
         forced.status.success(),
         "{}",
@@ -1513,7 +1513,7 @@ fn a_sigkilled_daemon_reaps_its_direct_process_child_but_not_an_already_forked_g
 }
 
 /// [MEASURED, Linux] The one path that DOES reach a grandchild: a clean
-/// `remuda restart` sends `Request::Shutdown`, which runs
+/// `remuda stop` sends `Request::Shutdown`, which runs
 /// `reap_processes_before_exit` (daemon.rs) before the process exits —
 /// `remuda.processes()` + `remuda._process_killpg(id)`, which `killpg`s the
 /// whole process group `child_guard::harden` put the direct child in. Both
@@ -1556,10 +1556,10 @@ fn a_clean_shutdown_reaps_a_processs_whole_group_including_a_grandchild() {
         "sanity: both alive pre-restart"
     );
 
-    // No live pty session was ever created here, so `remuda restart` (no
+    // No live pty session was ever created here, so `remuda stop` (no
     // `-f`) proceeds straight to `Request::Shutdown` without a confirmation
     // prompt — see `confirm_losses` in src/bin/remuda.rs.
-    let out = remuda(&dir, &["-s", "s", "restart"]);
+    let out = remuda(&dir, &["-s", "s", "stop"]);
     assert!(
         out.status.success(),
         "restart failed: {}",
@@ -3642,7 +3642,7 @@ fn a_daemon_restart_does_not_relaunch_the_butler_session() {
     // Same restart path as `restart_stops_a_daemon_and_leaves_the_next_command_free_to_start_one`,
     // with `-f`: the live butler session makes a bare `restart` refuse (see
     // `restart_refuses_to_kill_a_live_session_without_being_told_twice`).
-    let out = remuda(&dir, &["-s", "s", "restart", "-f"]);
+    let out = remuda(&dir, &["-s", "s", "stop", "-f"]);
     assert!(
         out.status.success(),
         "{}",
@@ -3740,7 +3740,7 @@ fn a_supervisor_polling_remuda_ls_can_relaunch_butler_after_a_restart() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let out = remuda(&dir, &["-s", "s", "restart", "-f"]);
+    let out = remuda(&dir, &["-s", "s", "stop", "-f"]);
     assert!(
         out.status.success(),
         "{}",
@@ -3956,7 +3956,7 @@ fn a_fresh_daemon_auto_loads_the_user_config_and_registers_butler_with_no_human_
 
     // Restart leg. `-f`: a live butler session makes a bare `restart` refuse
     // (see `restart_refuses_to_kill_a_live_session_without_being_told_twice`).
-    let out = remuda(&dir, &["-s", "s", "restart", "-f"]);
+    let out = remuda(&dir, &["-s", "s", "stop", "-f"]);
     assert!(
         out.status.success(),
         "{}",
