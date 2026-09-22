@@ -512,7 +512,7 @@ fn close_is_refused_while_attached_and_the_session_survives() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn orchestrated_input_is_refused_while_a_human_is_attached() {
+fn orchestrated_input_reaches_a_session_while_a_human_is_attached() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
 
@@ -524,22 +524,16 @@ fn orchestrated_input_is_refused_while_a_human_is_attached() {
 
     let held = session.attach().expect("first attach");
     assert!(session.is_attached());
-    assert!(
-        matches!(session.send_line("during"), Err(AgentError::Attached)),
-        "the core must be told, not queued behind the human"
-    );
-    // The raw vocabulary added in 004 goes through the same refusal. Checked
-    // separately from `send_line` because a keystroke reaching a session a
-    // person is driving is the original incident, and `send` is the newest and
-    // easiest way to arrive there.
-    assert!(
-        matches!(session.send(b"\x1b[A"), Err(AgentError::Attached)),
-        "raw input must be refused while a human holds the session"
-    );
+    session
+        .send_line("during")
+        .expect("a viewer does not block a message");
+    session
+        .send(b"\x1b[A")
+        .expect("a viewer does not block raw input");
     assert_eq!(
         writes.lock().unwrap().len(),
-        1,
-        "neither refused act may have reached the pty at all"
+        3,
+        "both messages reach the pty while a human monitors it"
     );
 
     drop(held);
@@ -547,7 +541,7 @@ fn orchestrated_input_is_refused_while_a_human_is_attached() {
     session
         .send_line("after")
         .expect("detach restores the core");
-    assert_eq!(writes.lock().unwrap().len(), 2);
+    assert_eq!(writes.lock().unwrap().len(), 4);
 }
 
 #[test]
@@ -740,7 +734,7 @@ fn capture_does_not_wait_out_a_feed_pause() {
 }
 
 #[test]
-fn attaching_during_a_feed_pause_refuses_the_remaining_bursts() {
+fn attaching_during_a_feed_pause_does_not_block_the_remaining_bursts() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let (session, clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
     let session = Arc::new(session);
@@ -769,14 +763,11 @@ fn attaching_during_a_feed_pause_refuses_the_remaining_bursts() {
     advance_until_finished(&clock, Duration::from_secs(1), &feeder);
     let result = feeder.join().unwrap();
 
-    assert!(
-        matches!(result, Err(AgentError::Attached)),
-        "the act must refuse once a human has attached mid-pause: {result:?}"
-    );
+    result.expect("a viewer must not interrupt a queued delivery");
     assert_eq!(
         writes.lock().unwrap().clone(),
-        vec![b"first".to_vec()],
-        "the second burst must never reach the pty once attached"
+        vec![b"first".to_vec(), b"second".to_vec()],
+        "the second burst reaches the pty while a human monitors it"
     );
     drop(held);
 }
@@ -807,14 +798,8 @@ fn feed_refuses_a_total_pause_over_the_cap() {
     );
 }
 
-/// A human can attach *and fully detach again* entirely inside one `Pause` —
-/// `attached` is back to `false` by the time the next burst runs, so a check
-/// of the live flag alone would let that burst through. This is the R4
-/// failure `feed` exists to prevent: the orchestrator's own submitting burst
-/// landing right after a human's typing, because nothing remembered the
-/// human was ever there.
 #[test]
-fn attaching_and_detaching_inside_a_pause_still_refuses_the_next_burst() {
+fn attaching_and_detaching_inside_a_pause_does_not_block_the_next_burst() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let (session, clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
     let session = Arc::new(session);
@@ -845,14 +830,10 @@ fn attaching_and_detaching_inside_a_pause_still_refuses_the_next_burst() {
     advance_until_finished(&clock, Duration::from_secs(1), &feeder);
     let result = feeder.join().unwrap();
 
-    assert!(
-        matches!(result, Err(AgentError::Attached)),
-        "a burst must refuse if attach touched this act anywhere, even if \
-         already detached again by the time the burst runs: {result:?}"
-    );
+    result.expect("a brief viewer attachment must not cancel delivery");
     assert_eq!(
         writes.lock().unwrap().clone(),
-        vec![b"first".to_vec()],
-        "the submitting burst must never reach the pty once attach touched this act"
+        vec![b"first".to_vec(), b"second".to_vec()],
+        "the submitting burst reaches the pty after a viewer leaves"
     );
 }

@@ -37,16 +37,16 @@ pub enum Request {
         #[serde(default)]
         env: Option<std::collections::HashMap<String, String>>,
     },
-    /// Deliver one instruction as an indivisible act. Refused while a human is
-    /// attached — see [`crate::session::Session`], invariant 3.
+    /// Deliver one instruction as an indivisible act. An attached terminal is
+    /// a viewer, not a delivery lock.
     SendLine { name: String, text: String },
     /// Deliver a burst of input bytes as an indivisible act, appending nothing —
     /// the primitive [`Request::SendLine`] is made of. Indivisible is the
-    /// load-bearing word; refused while a human is attached, as `SendLine` is.
+    /// load-bearing word; an attached terminal does not block it.
     Send { name: String, bytes: Vec<u8> },
     /// Deliver a sequence of [`Step`]s as one indivisible act — `Send`/
-    /// `SendLine` are its one-`Burst` case. Refused while a human is
-    /// attached, as they are; see [`crate::session::Session`].
+    /// `SendLine` are its one-`Burst` case. An attached terminal does not
+    /// block it.
     Feed { name: String, steps: Vec<Step> },
     /// Read the screen as text without taking the session over. Needs no
     /// terminal, raw mode or exclusivity, so it works while a human is attached.
@@ -58,8 +58,8 @@ pub enum Request {
     /// connection becomes a byte pipe.
     Attach { name: String },
     /// End a session — live or already self-exited — and stop tracking it.
-    /// Refused while a human is attached, as `Send`/`SendLine` are. A session
-    /// that ended on its own is dropped by `List`; this is for one still alive.
+    /// Refused while a human is attached. A session that ended on its own is
+    /// dropped by `List`; this is for one still alive.
     Close { name: String },
     /// List a directory's immediate entries by name, sorted. No session
     /// involved — a plain filesystem primitive for managing topic directories.
