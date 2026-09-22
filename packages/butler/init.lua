@@ -355,27 +355,25 @@ local runtime_dir = os.getenv("REMUDA_RUNTIME_DIR")
 -- temporary filename for the same short-lived Claude MCP configuration.
 local mcp_config_path = config_path and (config_path .. ".mcp.json") or (os.tmpname() .. ".mcp.json")
 local status_path = config_path and (config_path .. ".status") or (os.tmpname() .. ".status")
-local status_helper_path = status_path .. ".py"
-local settings_path = status_path .. ".settings.json"
-
--- The helper is embedded with the package so a local `remuda` binary is
--- self-contained: no dotfile, PATH helper, or repository checkout has to
--- survive after it starts Claude.  These paths are generated once per Butler
--- registration and reused by respawns through BUTLER_ARGV below.
-local status_helper = assert(io.open(status_helper_path, "w"))
-status_helper:write(STATUSLINE_SRC)
-status_helper:close()
 local function shell_quote(s)
   return "'" .. s:gsub("'", "'\\\"'\\\"'") .. "'"
 end
 local function json_quote(s)
   return '"' .. s:gsub('\\', '\\\\'):gsub('"', '\\"') .. '"'
 end
-local settings = assert(io.open(settings_path, "w"))
-settings:write('{"statusLine":{"type":"command","command":'
-  .. json_quote("python3 " .. shell_quote(status_helper_path) .. " " .. shell_quote(status_path))
-  .. ',"refreshInterval":2}}')
-settings:close()
+local function status_settings(path)
+  local helper_path = path .. ".py"
+  local settings_path = path .. ".settings.json"
+  local helper = assert(io.open(helper_path, "w"))
+  helper:write(STATUSLINE_SRC)
+  helper:close()
+  local settings = assert(io.open(settings_path, "w"))
+  settings:write('{"statusLine":{"type":"command","command":'
+    .. json_quote("python3 " .. shell_quote(helper_path) .. " " .. shell_quote(path))
+    .. ',"refreshInterval":2}}')
+  settings:close()
+  return settings_path
+end
 remuda._butler_status_path = status_path
 
 remuda.tool{
@@ -437,23 +435,45 @@ local function agent_mcp_flags(token)
     "-c", "mcp_servers.remuda.env={" .. env .. "}",
   }
 end
+local function agent_mcp_config(token)
+  local env = '"REMUDA_BUTLER_SESSION_TOKEN":"' .. token .. '"'
+  if runtime_dir then env = env .. ',"REMUDA_RUNTIME_DIR":"' .. runtime_dir .. '"' end
+  return '{"mcp_servers":{"remuda":{"command":"remuda","args":["-s","'
+    .. server .. '","mcp"],"env":{' .. env .. '}}}}'
+end
 remuda._butler_agent_builders = remuda._butler_agent_builders or {}
-remuda._butler_agent_support = { mcp_config_path = agent_mcp_path, mcp_flags = agent_mcp_flags }
+remuda._butler_agent_support = {
+  mcp_config_path = agent_mcp_path,
+  mcp_flags = agent_mcp_flags,
+  mcp_config = agent_mcp_config,
+  status_settings = status_settings,
+}
+remuda.exec("butler/telemetry")
 remuda.exec("butler/agents/claudecode")
 remuda.exec("butler/agents/codex")
 local AGENT_BUILDERS = remuda._butler_agent_builders
+local TELEMETRY_ADAPTERS = remuda._butler_telemetry_adapters
 local function build_agent_argv(kind, spec)
   local builder = AGENT_BUILDERS[kind]
   if not builder then error("unknown agent kind: " .. tostring(kind), 0) end
   return builder(spec)
 end
+local function setup_telemetry(kind, spec)
+  local adapter = TELEMETRY_ADAPTERS[kind]
+  return adapter and adapter.setup and adapter.setup(spec) or {}
+end
 local function launch_agent(kind, requested_name, cwd, model)
   local name = requested_name or kind
   local token = next_token(name)
-  local argv = build_agent_argv(kind, { name = name, token = token, model = model })
+  local agent_telemetry = setup_telemetry(kind, { name = name, model = model })
+  local argv = build_agent_argv(kind, {
+    name = name, token = token, model = model,
+    settings_path = agent_telemetry.settings_path,
+    telemetry = agent_telemetry,
+  })
   local actual = remuda.new(name, argv, cwd)
   bus.tokens[token] = actual
-  bus.agents[actual] = { kind = kind, token = token }
+  bus.agents[actual] = { kind = kind, token = token, model = model, telemetry = agent_telemetry }
   mailbox(actual)
   return actual
 end
@@ -568,7 +588,14 @@ remuda.tool{
 
 local butler_token = next_token("butler")
 bus.tokens[butler_token] = "butler"
-bus.agents.butler = { kind = os.getenv("REMUDA_BUTLER_AGENT") or "claude", token = butler_token }
+local butler_kind = os.getenv("REMUDA_BUTLER_AGENT") or "claude"
+local butler_telemetry = setup_telemetry(butler_kind, { name = "butler", status_path = status_path })
+local settings_path = butler_telemetry.settings_path
+bus.agents.butler = {
+  kind = butler_kind,
+  token = butler_token,
+  telemetry = butler_telemetry,
+}
 mailbox("butler")
 local mcp_file = io.open(mcp_config_path, "w")
 mcp_file:write(agent_mcp_json(butler_token))
@@ -629,11 +656,11 @@ local function _butler_trace(event, detail)
   end)
 end
 
-local butler_kind = os.getenv("REMUDA_BUTLER_AGENT") or "claude"
 local BUTLER_ARGV = remuda._butler_argv
 if not BUTLER_ARGV then
   BUTLER_ARGV = build_agent_argv(butler_kind, {
     name = "butler", token = butler_token, mcp_config_path = mcp_config_path, settings_path = settings_path,
+    telemetry = butler_telemetry,
     system_prompt = SYSTEM_PROMPT,
   })
 end

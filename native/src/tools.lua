@@ -546,13 +546,35 @@ register(
 function remuda._refresh_sessions_buffer(width)
   local sessions = remuda.ls()
   local lines = {}
+  local function context_k(tokens)
+    if tokens == "?" then return "?" end
+    return string.format("%.0fk", tonumber(tokens) / 1000)
+  end
+  local function butler_detail(session)
+    local bus = remuda._butler_bus
+    local agent = bus and bus.agents and bus.agents[session.name]
+    if not agent then return nil end
+    local telemetry = remuda._butler_telemetry_for(agent)
+    local model = telemetry.model
+    local used = telemetry.context_used
+    local window = telemetry.context_window
+    local percent = telemetry.context_percent
+    local context = "CTX " .. context_k(used) .. "/" .. context_k(window)
+    if percent ~= "?" then context = context .. " " .. percent .. "%" end
+    return (agent.kind or "agent") .. " · " .. model .. " · " .. context
+  end
   if #sessions == 0 then
     lines = { "the herd is empty.", "press n to start a session." }
   else
     for i, s in ipairs(sessions) do
-      local flag = s.attached and "⚑" or " "
-      local state = s.alive and "live" or "dead"
-      lines[i] = (width >= 22) and (state .. " " .. flag) or flag
+      local detail = butler_detail(s)
+      if detail then
+        lines[i] = detail
+      else
+        local flag = s.attached and "⚑" or " "
+        local state = s.alive and "live" or "dead"
+        lines[i] = (width >= 22) and (state .. " " .. flag) or flag
+      end
     end
   end
   remuda.buffer.new("*sessions*"):set(table.concat(lines, "\n"))

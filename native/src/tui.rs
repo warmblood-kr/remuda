@@ -158,7 +158,7 @@ impl Ui {
         if row < 2 || row > body {
             return Action::Nothing;
         }
-        let index = (row - 2) as usize;
+        let index = ((row - 2) / 2) as usize;
         if index >= self.sessions.len() {
             return Action::Nothing;
         }
@@ -855,16 +855,27 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
             _ => String::new(),
         };
     }
-    let Some(session) = ui.sessions.get(row) else {
+    let session_index = row / 2;
+    let Some(session) = ui.sessions.get(session_index) else {
         return String::new();
     };
-    let cursor = if row == ui.selected { "▸" } else { " " };
-    let tail = ui.sessions_text.get(row).map_or("", String::as_str);
+    let detail = ui
+        .sessions_text
+        .get(session_index)
+        .map_or("", String::as_str);
+    if row % 2 == 1 {
+        return format!("  {}", fit(detail, width.saturating_sub(2)));
+    }
+    let cursor = if session_index == ui.selected {
+        "▸"
+    } else {
+        " "
+    };
     // No time-driven field: `idle` never resets on typing (only on `send`,
     // see session.rs), so it read as an uptime clock, not "liveness" — and it
     // was the only per-second repaint source in the whole TUI. See steps/026.
-    let room = (width as usize).saturating_sub(visible_width(tail) + 3);
-    format!("{cursor} {} {tail}", fit(&session.name, room as u16))
+    let room = (width as usize).saturating_sub(2);
+    format!("{cursor} {}", fit(&session.name, room as u16))
 }
 
 /// The crop notice moved here when the preview lost its title band: a crop that
@@ -1408,13 +1419,11 @@ mod tests {
         }
     }
 
-    /// steps/028: a click is the same `Action` `↓ ↓ ⏎` already produces. "b"
-    /// is screen row 3 (1-based: header, "a", "b") — crossterm's 0-based
-    /// `row` 2; column 5 sits inside `layout(80, 80)`'s 16-wide list.
+    /// steps/028: a click is the same `Action` `↓ ↓ ⏎` already produces.
     #[test]
     fn a_click_on_a_list_row_selects_and_enters_it_like_arrow_plus_enter() {
         let mut ui = ui(vec![row("a", true, false), row("b", true, false)]);
-        assert_eq!(ui.on_mouse(click(5, 2), 80, 24), Action::Focus("b".into()));
+        assert_eq!(ui.on_mouse(click(5, 4), 80, 24), Action::Focus("b".into()));
         assert_eq!(ui.selected, 1, "clicked the second row");
         assert_eq!(ui.focus, Focus::Session, "a click enters, same as Enter");
     }
@@ -1431,9 +1440,9 @@ mod tests {
         );
         assert_eq!(ui.selected, 0, "unmoved by the header click");
         assert_eq!(ui.focus, Focus::List, "unmoved by the header click");
-        // Screen row 4 (0-based 3) is past "b" — the herd has only 2 rows.
+        // Screen row 6 (0-based 5) is past "b" — the herd has only 4 rows.
         assert_eq!(
-            ui.on_mouse(click(5, 3), 80, 24),
+            ui.on_mouse(click(5, 5), 80, 24),
             Action::Nothing,
             "past the last row"
         );
@@ -1472,7 +1481,7 @@ mod tests {
         assert_eq!(ui.on_key(press(KeyCode::Enter)), Action::Focus("a".into()));
         assert_eq!(ui.focus, Focus::Session);
         assert_eq!(
-            ui.on_mouse(click(5, 2), 80, 24),
+            ui.on_mouse(click(5, 4), 80, 24),
             Action::Focus("b".into()),
             "row 2 (0-based) is \"b\" — clicking it must switch, not be ignored"
         );
@@ -1954,6 +1963,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_session_uses_a_name_row_and_a_detail_row() {
+        let mut ui = ui(vec![row("monocle", true, false)]);
+        ui.sessions_text = vec!["claude · opus · CTX 12k/200k 6%".into()];
+        assert!(list_row(&ui, 0, 40).contains("monocle"));
+        assert!(list_row(&ui, 1, 40).contains("CTX 12k/200k 6%"));
+        assert_eq!(
+            ui.click_list_row(MouseEventKind::Down(MouseButton::Left), 3, 23),
+            Action::Focus("monocle".into())
+        );
+    }
+
     /// Two style groups must emit exactly two style-change points, not one
     /// per cell — and a trailing reset only because the row used colour.
     #[test]
@@ -2069,9 +2090,9 @@ mod tests {
             "\x1b[?2026h\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
              \x1b[2;1H\x1b[K▸ alpha         │xxxxxxxxxx                                                     \
-             \x1b[3;1H\x1b[K  bravo        ⚑│xxxxxxxxxx                                                     \
-             \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[4;1H\x1b[K  bravo         │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K  ⚑             │xxxxxxxxxx                                                     \
              \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -2202,9 +2223,9 @@ mod tests {
             "\x1b[?2026h\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
              \x1b[2;1H\x1b[K▸ alpha         │xxxxxxxxxx                                                     \
-             \x1b[3;1H\x1b[K  bravo        ⚑│xxxxxxxxxx                                                     \
-             \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[4;1H\x1b[K  bravo         │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K  ⚑             │xxxxxxxxxx                                                     \
              \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -2522,7 +2543,7 @@ mod tests {
         );
         ui.sessions_text = vec!["live ".into()];
         assert!(
-            list_row(&ui, 0, 40).contains("live"),
+            list_row(&ui, 1, 40).contains("live"),
             "and keeps it when there is room"
         );
     }
