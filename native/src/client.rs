@@ -285,7 +285,12 @@ impl Drop for RawMode {
     /// Leave the alternate screen *before* termios goes back, so the last thing
     /// the terminal does in raw mode is the buffer switch.
     fn drop(&mut self) {
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::cursor::Show,
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
