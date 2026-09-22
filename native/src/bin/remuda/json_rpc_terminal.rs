@@ -2,6 +2,7 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, ExitCode, Stdio};
 
+#[allow(clippy::too_many_lines)]
 pub fn run(args: &[&str]) -> ExitCode {
     let mut status_path = None;
     let mut spec_text = None;

@@ -2090,9 +2090,9 @@ mod tests {
             "\x1b[?2026h\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
              \x1b[2;1H\x1b[K▸ alpha         │xxxxxxxxxx                                                     \
-             \x1b[3;1H\x1b[K  bravo        ⚑│xxxxxxxxxx                                                     \
-             \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[4;1H\x1b[K  bravo         │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K  ⚑             │xxxxxxxxxx                                                     \
              \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -2223,9 +2223,9 @@ mod tests {
             "\x1b[?2026h\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
              \x1b[2;1H\x1b[K▸ alpha         │xxxxxxxxxx                                                     \
-             \x1b[3;1H\x1b[K  bravo        ⚑│xxxxxxxxxx                                                     \
-             \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[4;1H\x1b[K  bravo         │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K  ⚑             │xxxxxxxxxx                                                     \
              \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
