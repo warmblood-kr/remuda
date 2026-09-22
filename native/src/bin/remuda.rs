@@ -23,8 +23,6 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
-#[path = "remuda/butler_cli.rs"]
-mod butler_cli;
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
 
@@ -112,7 +110,7 @@ fn main() -> ExitCode {
         ["exec", name] => with_daemon(server, &path, |path| exec_command(path, name)),
 
         [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
-            butler_cli::extension_command(server, &path, command, rest)
+            extension_command(server, &path, command, rest)
         }
 
         // `emacsclient -e` for this runtime: the code runs in the daemon's
@@ -133,9 +131,9 @@ fn main() -> ExitCode {
         // can reach the manager. Not meant to be typed by hand — a client
         // spawns it and owns both pipes.
         ["mcp"] => with_daemon(server, &path, |path| {
-            // Butler puts an unforgeable per-session capability in this child
-            // process's environment. MCP JSON never supplies caller identity.
-            let capability = std::env::var("REMUDA_BUTLER_SESSION_TOKEN")
+            // An extension may put an unforgeable per-session capability in
+            // this child process's environment. MCP JSON never supplies caller identity.
+            let capability = std::env::var("REMUDA_SESSION_CAPABILITY")
                 .ok()
                 .filter(|token| !token.is_empty());
             match remuda_native::mcp::serve_with_capability(path, capability.as_deref()) {
@@ -167,12 +165,6 @@ remuda — a pty manager you can attach to
 
   remuda lua <script.lua>       run a Lua script in the daemon's living image
   remuda exec <name>            run an installed Lua mod
-  remuda butler                 run the installed Butler mod
-  remuda butler help             show Butler coordination commands
-  remuda butler sessions         list Butler-managed agent sessions
-  remuda butler launch KIND [N]  launch a claude or codex session
-  remuda butler send FROM TO MSG queue a message for an agent
-  remuda butler inbox NAME       drain an agent's queued messages
   remuda mod install OWNER/REPO [--ref REF] [--force]
                                   install a Lua mod from GitHub
   remuda mod list [--format F]    list installed mods
@@ -510,6 +502,30 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
             }
         }
     }
+}
+
+/// Dispatch a manifest-declared extension command. The core only knows the
+/// manifest command name; the installed Lua extension owns every argument and
+/// behavior behind it.
+fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) -> ExitCode {
+    let package = match remuda_native::packages::subcommand(command) {
+        Ok(Some(package)) => package,
+        Ok(None) => return fail(format!("no installed mod provides command {command}")),
+        Err(error) => return fail(error),
+    };
+    if args.is_empty() {
+        return with_daemon(server, path, |path| exec_command(path, &package));
+    }
+    let arguments = args
+        .iter()
+        .map(|argument| serde_json::to_string(argument).expect("argument serializes"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let code = format!(
+        "return remuda._dispatch_extension_command({}, {{{arguments}}})",
+        serde_json::to_string(command).expect("command serializes")
+    );
+    with_daemon(server, path, |path| eval_once(path, &code))
 }
 
 /// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
@@ -931,18 +947,5 @@ mod tests {
              not silently read as a confirmed match"
         );
         assert!(notice.unwrap().contains("remuda restart"));
-    }
-
-    #[test]
-    fn butler_message_is_one_lua_string_not_extra_lua() {
-        let message = "hello\" ); remuda.close('butler') --\nnext";
-        let code = format!(
-            "return remuda._butler_send(\"a\", \"b\", {})",
-            butler_cli::lua_string(message)
-        );
-        assert_eq!(
-            code,
-            "return remuda._butler_send(\"a\", \"b\", \"hello\\\" ); remuda.close('butler') --\\nnext\")"
-        );
     }
 }

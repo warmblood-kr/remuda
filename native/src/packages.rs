@@ -725,17 +725,17 @@ mod tests {
     use super::{parse_manifest, parse_repository, validate_reference};
 
     #[test]
-    fn parses_the_published_butler_manifest_shape() {
+    fn parses_a_manifest_with_a_declared_command() {
         let manifest = parse_manifest(
             r#"
-            name = "butler"
-            entry = "packages/butler/init.lua"
+            name = "example"
+            entry = "packages/example/init.lua"
             api = "remuda-lua-v1"
-            command = "remuda-butler"
+            command = "example"
             "#,
         )
         .expect("manifest");
-        assert_eq!(manifest.name, "butler");
+        assert_eq!(manifest.name, "example");
         assert_eq!(manifest.version, "0.1.0");
     }
 

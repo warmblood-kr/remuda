@@ -32,7 +32,7 @@ pub const TOOLS: [&str; 5] = ["capture", "ls", "new", "run_script", "send"];
 
 /// Serve MCP over stdin/stdout until the client closes the stream.
 pub fn serve(socket: &Path) -> std::io::Result<()> {
-    let capability = std::env::var("REMUDA_BUTLER_SESSION_TOKEN")
+    let capability = std::env::var("REMUDA_SESSION_CAPABILITY")
         .ok()
         .filter(|token| !token.is_empty());
     serve_with_capability(socket, capability.as_deref())
