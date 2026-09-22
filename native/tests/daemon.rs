@@ -2596,8 +2596,23 @@ fn butler_claude_builder_keeps_its_noninteractive_cli_hint() {
 
 #[test]
 fn butler_codex_builder_uses_automatic_approval() {
-    let adapter = include_str!("../../packages/butler/agents/codex.lua");
-    assert!(adapter.contains("\"approvalsReviewer\":\"auto_review\""));
+    let path = scratch("butler-codex-builder");
+    let _daemon = daemon_at(&path);
+    eval(&path, r#"remuda._butler_argv = {"sh", "-c", "sleep 1"}; remuda.exec("butler")"#);
+    let argv = eval(
+        &path,
+        r#"local a = remuda._butler_agent_builders.codex({name="codex", token="token", telemetry={status_path="/tmp/status"}}); return table.concat(a, "\n")"#,
+    );
+    let argv: Vec<&str> = argv.lines().collect();
+    assert_eq!(&argv[..2], ["remuda", "_json_rpc_terminal"]);
+    let spec = argv
+        .iter()
+        .position(|arg| *arg == "--spec")
+        .and_then(|index| argv.get(index + 1))
+        .expect("Codex adapter argv has a JSON-RPC spec");
+    let spec: serde_json::Value = serde_json::from_str(spec).expect("valid JSON-RPC spec");
+    assert_eq!(spec["start"]["method"], "thread/start");
+    assert_eq!(spec["start"]["params"]["approvalsReviewer"], "auto_review");
 }
 
 /// Same live-`claude` limitation as the test above blocks a real kill-and-
