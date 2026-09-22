@@ -20,7 +20,8 @@ print(remuda.capture("reviewer"))
 
 The complete Lua reference is generated from the live runtime registry:
 [Lua extension documentation](lua.md). Butler's local session manager and
-optional Matrix bridge are described in [Butler](butler.md).
+optional Matrix bridge are documented on the [remuda-butler project
+site](https://warmblood-kr.github.io/remuda-butler/).
 
 The [generated Lua reference](lua-reference.html) is rendered on the Lua page;
 the [RST source](lua-reference.rst) is also available to documentation tools.
