@@ -478,9 +478,9 @@ local function team_member_prompt(parent)
     .. "create a Remuda-managed child team with `remuda butler topic delegate NAME TASK...` "
     .. "when useful. Internal agent subagents are separate from Butler team members."
 end
-local function write_agent_guidance(root, text)
+local function write_agent_guidance(root, text, replace)
   local path = root .. "/AGENTS.md"
-  if file_exists(path) then return end
+  if not replace and file_exists(path) then return end
   local f = assert(io.open(path, "w"))
   f:write(text)
   f:close()
@@ -779,7 +779,7 @@ local function launch_butler()
   local requested_name = butler_name or remuda._butler_initial_name
   if butler_session_cwd then
     remuda.mkdir(butler_session_cwd)
-    write_agent_guidance(butler_session_cwd, BUTLER_GUIDANCE)
+    write_agent_guidance(butler_session_cwd, BUTLER_GUIDANCE, true)
   end
   if session_exists(requested_name) then
     butler_name = requested_name
