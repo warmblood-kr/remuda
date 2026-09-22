@@ -2598,7 +2598,10 @@ fn butler_claude_builder_keeps_its_noninteractive_cli_hint() {
 fn butler_codex_builder_uses_automatic_approval() {
     let path = scratch("butler-codex-builder");
     let _daemon = daemon_at(&path);
-    eval(&path, r#"remuda._butler_argv = {"sh", "-c", "sleep 1"}; remuda.exec("butler")"#);
+    eval(
+        &path,
+        r#"remuda._butler_argv = {"sh", "-c", "sleep 1"}; remuda.exec("butler")"#,
+    );
     let argv = eval(
         &path,
         r#"local a = remuda._butler_agent_builders.codex({name="codex", token="token", telemetry={status_path="/tmp/status"}}); return table.concat(a, "\n")"#,
