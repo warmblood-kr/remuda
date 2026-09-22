@@ -114,7 +114,7 @@ event_counts
 exec
 ----
 
-``exec(name) -> nil`` — Run a built-in package's entry source, by name, in this same image.
+``exec(name) -> nil`` — Run an installed mod's entry source, by name, in this same image.
 
 feed
 ----

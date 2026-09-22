@@ -133,7 +133,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "exec",
-        "Run a built-in package's entry source, by name, in this same image.",
+        "Run an installed mod's entry source, by name, in this same image.",
         "exec(name) -> nil",
     ),
     (
@@ -214,8 +214,8 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
 }
 
 /// Run source text **in the daemon's image**, the same as `run` but for a
-/// chunk with no file on disk — a built-in package embedded at compile
-/// time. `name` becomes the chunk name, so a traceback still names it.
+/// chunk with no file on disk. `name` becomes the chunk name, so a traceback
+/// still names it.
 pub fn run_source(socket: &Path, name: &str, source: &str) -> Result<(), String> {
     let request = Request::Eval {
         code: source.to_string(),
@@ -440,7 +440,7 @@ fn new_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Resu
 
 /// `remuda.exec(name)` — split out of `bindings` for its line cap. Reentrant-
 /// safe: a nested `lua.load(...).exec()` on this same `Lua`, not a new
-/// interpreter. Installed modules take precedence over embedded modules.
+/// interpreter. Mods must be installed independently of the Remuda binary.
 fn exec_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
     table.set(
         "exec",

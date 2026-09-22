@@ -111,7 +111,7 @@ fn main() -> ExitCode {
 
         ["exec", name] => with_daemon(server, &path, |path| exec_command(path, name)),
 
-        [command, rest @ ..] if remuda_native::packages::subcommand(command).is_some() => {
+        [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
             butler_cli::extension_command(server, &path, command, rest)
         }
 
@@ -122,6 +122,8 @@ fn main() -> ExitCode {
         ["mod", "install", rest @ ..] => mod_install_command(rest),
         ["mod", "list", rest @ ..] => mod_list_command(rest),
         ["mod", "info", rest @ ..] => mod_info_command(rest),
+        ["mod", "test", rest @ ..] => mod_test_command(rest),
+        ["mod", "update", rest @ ..] => mod_update_command(rest),
 
         ["doc", rest @ ..] => with_daemon(server, &path, |path| doc_command(path, rest)),
 
@@ -164,8 +166,8 @@ remuda — a pty manager you can attach to
   remuda send <name> <text>     deliver one instruction (body + Enter)
 
   remuda lua <script.lua>       run a Lua script in the daemon's living image
-  remuda exec <name>            run an installed or built-in Lua package
-  remuda butler                 run the Butler extension
+  remuda exec <name>            run an installed Lua mod
+  remuda butler                 run the installed Butler mod
   remuda butler help             show Butler coordination commands
   remuda butler sessions         list Butler-managed agent sessions
   remuda butler launch KIND [N]  launch a claude or codex session
@@ -173,8 +175,11 @@ remuda — a pty manager you can attach to
   remuda butler inbox NAME       drain an agent's queued messages
   remuda mod install OWNER/REPO [--ref REF] [--force]
                                   install a Lua mod from GitHub
-  remuda mod list [--format F]    list installed and embedded mods
+  remuda mod list [--format F]    list installed mods
   remuda mod info NAME            show a mod manifest
+  remuda mod test PATH            validate a local mod checkout
+  remuda mod update NAME          update one installed mod
+  remuda mod update --all         update all installed mods
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
@@ -490,10 +495,10 @@ fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> Exit
     f(path)
 }
 
-/// Delegates to the lib crate's installed-first package resolver — the
+/// Delegates to the lib crate's installed package resolver — the
 /// `remuda.exec()` Lua binding (script.rs) resolves through the same resolver,
 /// so there is exactly one list, not two.
-/// Run an installed or embedded package's entry file in the daemon's image.
+/// Run an installed mod's entry file in the daemon's image.
 fn exec_command(path: &Path, name: &str) -> ExitCode {
     match remuda_native::packages::resolve(name) {
         Err(error) => fail(error),
@@ -759,6 +764,45 @@ fn mod_info_command(args: &[&str]) -> ExitCode {
         _ => unreachable!(),
     }
     ExitCode::SUCCESS
+}
+
+fn mod_update_command(args: &[&str]) -> ExitCode {
+    let reports = match args {
+        ["--all"] => remuda_native::packages::update_all(),
+        [name] => remuda_native::packages::update(name).map(|report| vec![report]),
+        _ => return fail("usage: remuda mod update NAME|--all"),
+    };
+    match reports {
+        Ok(reports) => {
+            for report in reports {
+                println!(
+                    "updated mod {} {} from {} at {}",
+                    report.manifest.name, report.manifest.version, report.repository, report.commit
+                );
+            }
+            println!("reload with `remuda exec NAME` or restart the daemon");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error),
+    }
+}
+
+fn mod_test_command(args: &[&str]) -> ExitCode {
+    let [path] = args else {
+        return fail("usage: remuda mod test PATH");
+    };
+    match remuda_native::packages::test_path(Path::new(path)) {
+        Ok(spec) => {
+            println!(
+                "valid mod {} {} ({})",
+                spec.name,
+                spec.version,
+                remuda_native::packages::LUA_API_VERSION
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error),
+    }
 }
 
 /// A line-at-a-time REPL against the image. `rustyline` because arrow keys

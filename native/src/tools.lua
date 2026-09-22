@@ -587,7 +587,7 @@ register(
 )
 
 -- Render the live registry for the manual command. The registry is the source
--- of truth for every built-in and Lua-defined word; format changes only affect
+-- of truth for every host-bound and Lua-defined word; format changes only affect
 -- presentation.
 local function registry_rows()
   local rows = {}

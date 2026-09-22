@@ -8,9 +8,12 @@ const HANDLERS: &[(&str, Handler)] = &[("butler", butler_command)];
 
 pub fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) -> ExitCode {
     if args.is_empty() {
-        let package = remuda_native::packages::subcommand(command)
-            .expect("subcommand dispatch was checked above");
-        return with_daemon(server, path, |path| exec_command(path, package.name));
+        let package = match remuda_native::packages::subcommand(command) {
+            Ok(Some(package)) => package,
+            Ok(None) => return fail(format!("no installed mod provides command {command}")),
+            Err(error) => return fail(error),
+        };
+        return with_daemon(server, path, |path| exec_command(path, &package));
     }
     match HANDLERS
         .iter()

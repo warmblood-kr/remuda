@@ -120,16 +120,20 @@ fi
 remuda_bin=$(command -v remuda) || die "remuda is not on PATH -- install it first: curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | sh"
 remuda_bin_dir=$(dirname "$remuda_bin")
 
+status "installing the independent Butler mod..."
+if ! remuda mod install warmblood-kr/remuda-butler --force; then
+	die "could not install the Butler mod"
+fi
+
 # A real functional probe, not a version-string parse: reuse the exact error
-# text the binary already produces (`no such package: butler`) rather than
-# hardcoding a date or commit that will rot the moment the package is
-# renamed or the check is run against a future release scheme.
+# text the binary already produces rather than hardcoding a date or commit
+# that will rot when the package or release scheme changes.
 status "registering butler in the running daemon (this starts one if none is up)..."
 probe_err=$(mktemp)
 trap 'rm -f "$probe_err"' EXIT INT TERM
 if ! env -u PWD REMUDA_BUTLER_TOKEN="$token_file" REMUDA_BUTLER_CONFIG="$config_file" remuda exec butler 2>"$probe_err"; then
 	if grep -q 'no such package: butler' "$probe_err"; then
-		die "this remuda build predates the butler package -- run 'remuda upgrade', then re-run this installer"
+		die "the Butler mod did not install into this remuda data directory"
 	fi
 	cat "$probe_err" >&2
 	die "remuda exec butler failed -- see the error above; not installing any persistence layer"

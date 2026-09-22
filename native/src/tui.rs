@@ -786,16 +786,70 @@ impl Viewport {
             return None;
         }
         let source_row = source.get(row)?;
-        let target: u32 = source_row[..col.min(source_row.len())]
-            .iter()
-            .map(|c| u32::from(c.width()))
-            .sum();
+        // `Cursor::col` is already a terminal display column: the PTY
+        // emulator indexes its grid by columns, including the continuation
+        // cell of a wide character. Do not sum cell widths here. Doing so
+        // counts a wide lead cell as two before the cursor has crossed its
+        // continuation cell, putting the caret one column too far right for
+        // CJK input. The row crop still uses `Cell::width` because it emits
+        // the lead cell and omits zero-width continuation cells.
+        let target = col.min(source_row.len()) as u32;
         let offset = u32::from(self.col_offset);
         let panel_col = target.checked_sub(offset)?;
         if panel_col >= u32::from(self.width) {
             return None;
         }
         Some((panel_row as u16, panel_col as u16))
+    }
+}
+
+#[cfg(test)]
+mod cursor_width_tests {
+    use super::Viewport;
+    use remuda_core::agent::StyledCell;
+
+    fn cell(text: &str, wide: bool) -> StyledCell {
+        StyledCell {
+            text: text.into(),
+            wide,
+            ..StyledCell::default()
+        }
+    }
+
+    fn cursor_col(row: &[StyledCell], col: usize) -> u16 {
+        Viewport::bottom_anchored(1, 0, 20, 1)
+            .map_cursor(&[row.to_vec()], 0, col)
+            .expect("cursor is visible")
+            .1
+    }
+
+    #[test]
+    fn latin_cursor_uses_terminal_column() {
+        assert_eq!(cursor_col(&[cell("a", false), cell("b", false)], 2), 2);
+    }
+
+    #[test]
+    fn korean_cursor_does_not_double_count_wide_lead_cell() {
+        let row = [cell("안", true), cell("", false), cell("b", false)];
+        assert_eq!(cursor_col(&row, 2), 2);
+        assert_eq!(cursor_col(&row, 3), 3);
+    }
+
+    #[test]
+    fn combining_text_stays_in_one_terminal_column() {
+        let row = [cell("e\u{301}", false), cell("x", false)];
+        assert_eq!(cursor_col(&row, 1), 1);
+    }
+
+    #[test]
+    fn mixed_korean_and_ascii_tracks_the_terminal_grid() {
+        let row = [
+            cell("A", false),
+            cell("한", true),
+            cell("", false),
+            cell("B", false),
+        ];
+        assert_eq!(cursor_col(&row, 4), 4);
     }
 }
 

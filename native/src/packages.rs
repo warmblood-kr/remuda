@@ -1,4 +1,4 @@
-//! Built-in and installed Lua modules.
+//! Installed Lua mods.
 //!
 //! Installed modules are validated and copied atomically below the user's
 //! Remuda data directory. The daemon does not preload disk modules: each
@@ -13,12 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_REPOSITORY_PART: usize = 128;
-
-pub struct Builtin {
-    pub name: &'static str,
-    pub source: &'static str,
-    pub subcommand: Option<&'static str>,
-}
+pub const LUA_API_VERSION: &str = "remuda-lua-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -35,7 +30,6 @@ pub struct Manifest {
 pub struct PackageSource {
     pub source: String,
     pub chunk_name: String,
-    pub origin: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,86 +50,28 @@ pub struct ExtensionSpec {
     pub command: Option<String>,
 }
 
-const BUILTINS: &[Builtin] = &[
-    Builtin {
-        name: "butler",
-        source: include_str!("../../packages/butler/init.lua"),
-        subcommand: Some("butler"),
-    },
-    Builtin {
-        name: "butler/telemetry",
-        source: include_str!("../../packages/butler/telemetry.lua"),
-        subcommand: None,
-    },
-    Builtin {
-        name: "butler/mail",
-        source: include_str!("../../packages/butler/mail.lua"),
-        subcommand: None,
-    },
-    Builtin {
-        name: "butler/agents/claudecode",
-        source: include_str!("../../packages/butler/agents/claudecode.lua"),
-        subcommand: None,
-    },
-    Builtin {
-        name: "butler/agents/codex",
-        source: include_str!("../../packages/butler/agents/codex.lua"),
-        subcommand: None,
-    },
-];
-
-pub fn builtin(name: &str) -> Option<&'static str> {
-    BUILTINS
-        .iter()
-        .find(|package| package.name == name)
-        .map(|package| package.source)
+/// Return the installed mod name that owns a CLI command. Commands are
+/// discovered from manifests; no mod command is compiled into Remuda.
+pub fn subcommand(name: &str) -> Result<Option<String>, String> {
+    Ok(installed_specs()?
+        .into_iter()
+        .find(|spec| spec.command.as_deref() == Some(name))
+        .map(|spec| spec.name))
 }
 
-pub fn subcommand(name: &str) -> Option<&'static Builtin> {
-    BUILTINS
-        .iter()
-        .find(|package| package.subcommand == Some(name))
+pub fn has_subcommand(name: &str) -> bool {
+    subcommand(name).ok().flatten().is_some()
 }
 
-fn builtin_entry(name: &str) -> String {
-    if name.contains('/') {
-        format!("packages/{name}.lua")
-    } else {
-        format!("packages/{name}/init.lua")
-    }
-}
-
-/// Resolve an installed module first, then the embedded compatibility copy.
+/// Resolve only installed modules. Mods are deliberately independent from the
+/// Remuda binary; there is no embedded compatibility copy.
 pub fn resolve(name: &str) -> Result<Option<PackageSource>, String> {
-    if let Some(source) = installed_source(name)? {
-        return Ok(Some(source));
-    }
-    Ok(builtin(name).map(|source| PackageSource {
-        source: source.to_string(),
-        chunk_name: builtin_entry(name),
-        origin: "embedded".into(),
-    }))
+    installed_source(name)
 }
 
 pub fn manifests() -> Result<Vec<Manifest>, String> {
     let installed = installed_specs()?;
     let mut entries = Vec::new();
-    for package in BUILTINS {
-        if installed.iter().any(|spec| {
-            package.name == spec.name || package.name.starts_with(&format!("{}/", spec.name))
-        }) {
-            continue;
-        }
-        entries.push(Manifest {
-            name: package.name.into(),
-            version: crate::dist::BUILD_VERSION.into(),
-            api: "embedded".into(),
-            entry: builtin_entry(package.name),
-            command: package.subcommand.map(str::to_string),
-            source: "embedded".into(),
-            status: "installed".into(),
-        });
-    }
     for spec in installed {
         entries.push(Manifest {
             name: spec.name,
@@ -158,18 +94,7 @@ pub fn manifest(name: &str) -> Result<Option<Manifest>, String> {
     {
         return Ok(Some(manifest_from_spec(spec, "disk")));
     }
-    Ok(BUILTINS
-        .iter()
-        .find(|package| package.name == name)
-        .map(|package| Manifest {
-            name: package.name.into(),
-            version: crate::dist::BUILD_VERSION.into(),
-            api: "embedded".into(),
-            entry: builtin_entry(package.name),
-            command: package.subcommand.map(str::to_string),
-            source: "embedded".into(),
-            status: "installed".into(),
-        }))
+    Ok(None)
 }
 
 fn manifest_from_spec(spec: ExtensionSpec, source: &str) -> Manifest {
@@ -204,9 +129,72 @@ pub fn install(
         &url,
         reference.map(str::to_string),
         force,
+        None,
     );
     let _ = fs::remove_dir_all(&checkout);
     result
+}
+
+/// Update one installed mod from the repository and reference recorded at
+/// install time. The clone is fully validated before the existing directory
+/// is moved aside, so a failed fetch or validation leaves the old mod intact.
+pub fn update(name: &str) -> Result<InstallReport, String> {
+    if !valid_component(name) {
+        return Err(format!("invalid installed mod name {name:?}"));
+    }
+    let root = extensions_dir()?.join(name);
+    let metadata = fs::symlink_metadata(&root)
+        .map_err(|error| format!("cannot inspect installed mod {name}: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("installed mod {name} is not a real directory"));
+    }
+    let spec = read_manifest(&root.join("extension.toml"))?;
+    if spec.name != name {
+        return Err(format!(
+            "installed mod directory {name} disagrees with manifest name {}",
+            spec.name
+        ));
+    }
+    let (repository, reference) = read_source_metadata(&root.join("source"))?;
+    let (owner, repo, url) = github_repository(&repository)?;
+    let checkout = temporary_path("update")?;
+    let result = install_from_checkout(&checkout, &owner, &repo, &url, reference, true, Some(name));
+    let _ = fs::remove_dir_all(&checkout);
+    result
+}
+
+/// Update every installed root mod, preserving each mod's recorded source.
+pub fn update_all() -> Result<Vec<InstallReport>, String> {
+    let mut names: Vec<_> = installed_specs()?
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect();
+    names.sort();
+    names.into_iter().map(|name| update(&name)).collect()
+}
+
+/// Validate a local mod checkout without installing or mutating a daemon.
+/// This is the deterministic half of the extension development harness:
+/// manifest, paths, symlinks, Lua syntax, and the host API version are checked
+/// before an integration test installs the mod into an isolated data home.
+pub fn test_path(path: &Path) -> Result<ExtensionSpec, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect mod checkout {}: {error}", path.display()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "mod checkout {} must be a real directory",
+            path.display()
+        ));
+    }
+    let spec = read_manifest(&path.join("extension.toml"))?;
+    let entry = safe_relative_path(&spec.entry, "entry")?;
+    let entry_path = path.join(&entry);
+    ensure_regular_file(&entry_path, "manifest entry")?;
+    let package_root = entry_path
+        .parent()
+        .ok_or_else(|| "manifest entry has no package directory".to_string())?;
+    validate_lua_tree(package_root)?;
+    Ok(spec)
 }
 
 fn install_from_checkout(
@@ -216,6 +204,7 @@ fn install_from_checkout(
     url: &str,
     reference: Option<String>,
     force: bool,
+    expected_name: Option<&str>,
 ) -> Result<InstallReport, String> {
     let mut command = Command::new("git");
     command.args(["clone", "--depth", "1", "--no-tags"]);
@@ -234,12 +223,21 @@ fn install_from_checkout(
     }
     let manifest_path = checkout.join("extension.toml");
     let spec = read_manifest(&manifest_path)?;
+    if let Some(expected_name) = expected_name {
+        if spec.name != expected_name {
+            return Err(format!(
+                "repository manifest {} does not match requested mod {}",
+                spec.name, expected_name
+            ));
+        }
+    }
     let entry = safe_relative_path(&spec.entry, "entry")?;
     let entry_path = checkout.join(&entry);
     ensure_regular_file(&entry_path, "manifest entry")?;
     let package_root = entry_path
         .parent()
         .ok_or_else(|| "manifest entry has no package directory".to_string())?;
+    validate_lua_tree(package_root)?;
     let package_relative = package_root
         .strip_prefix(checkout)
         .map_err(|_| "manifest entry escaped checkout".to_string())?;
@@ -253,12 +251,15 @@ fn install_from_checkout(
     fs::copy(&manifest_path, staging.join("extension.toml"))
         .map_err(|error| format!("cannot copy extension.toml: {error}"))?;
     let commit = git_commit(checkout)?;
-    fs::write(
-        staging.join("source"),
-        format!("https://github.com/{owner}/{repo}.git\ncommit={commit}\n"),
-    )
-    .map_err(|error| format!("cannot write source metadata: {error}"))?;
-    if target.exists() {
+    let mut source = format!("https://github.com/{owner}/{repo}.git\ncommit={commit}\n");
+    if let Some(reference) = &reference {
+        source.push_str("ref=");
+        source.push_str(reference);
+        source.push('\n');
+    }
+    fs::write(staging.join("source"), source)
+        .map_err(|error| format!("cannot write source metadata: {error}"))?;
+    if fs::symlink_metadata(&target).is_ok() {
         if !force {
             let _ = fs::remove_dir_all(&staging);
             return Err(format!(
@@ -267,10 +268,22 @@ fn install_from_checkout(
             ));
         }
         ensure_safe_extension_target(&target)?;
-        fs::remove_dir_all(&target)
-            .map_err(|error| format!("cannot replace {}: {error}", target.display()))?;
+        let backup = temporary_path_in(&data, "backup")?;
+        fs::remove_dir_all(&backup)
+            .map_err(|error| format!("cannot prepare backup {}: {error}", backup.display()))?;
+        fs::rename(&target, &backup)
+            .map_err(|error| format!("cannot stage existing mod {}: {error}", target.display()))?;
+        if let Err(error) = fs::rename(&staging, &target) {
+            let _ = fs::rename(&backup, &target);
+            let _ = fs::remove_dir_all(&staging);
+            return Err(format!("cannot commit mod install: {error}"));
+        }
+        fs::remove_dir_all(&backup)
+            .map_err(|error| format!("cannot remove old mod backup: {error}"))?;
+    } else {
+        fs::rename(&staging, &target)
+            .map_err(|error| format!("cannot commit mod install: {error}"))?;
     }
-    fs::rename(&staging, &target).map_err(|error| format!("cannot commit mod install: {error}"))?;
     Ok(InstallReport {
         manifest: manifest_from_spec(spec, "disk"),
         path: target,
@@ -409,7 +422,7 @@ fn validate_spec(spec: &ExtensionSpec) -> Result<(), String> {
     if !valid_component(&spec.name) {
         return Err(format!("invalid mod name {:?}", spec.name));
     }
-    if spec.api != "remuda-lua-v1" {
+    if spec.api != LUA_API_VERSION {
         return Err(format!("unsupported mod API {:?}", spec.api));
     }
     let expected = format!("packages/{}/init.lua", spec.name);
@@ -420,6 +433,43 @@ fn validate_spec(spec: &ExtensionSpec) -> Result<(), String> {
     if let Some(command) = &spec.command {
         if !valid_component(command) {
             return Err(format!("invalid mod command {:?}", command));
+        }
+    }
+    Ok(())
+}
+
+fn validate_lua_tree(path: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(path)
+        .map_err(|error| format!("cannot read mod package {}: {error}", path.display()))?
+    {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let child = entry.path();
+        let metadata = fs::symlink_metadata(&child)
+            .map_err(|error| format!("cannot inspect {}: {error}", child.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("mod package contains symlink {}", child.display()));
+        }
+        if metadata.is_dir() {
+            validate_lua_tree(&child)?;
+        } else if metadata.is_file() {
+            if child.extension() != Some(std::ffi::OsStr::new("lua")) {
+                return Err(format!(
+                    "mod package contains non-Lua file {}",
+                    child.display()
+                ));
+            }
+            let source = fs::read_to_string(&child)
+                .map_err(|error| format!("cannot read {}: {error}", child.display()))?;
+            mlua::Lua::new()
+                .load(&source)
+                .set_name(child.to_string_lossy())
+                .into_function()
+                .map_err(|error| format!("Lua syntax error in {}: {error}", child.display()))?;
+        } else {
+            return Err(format!(
+                "mod package contains unsupported file {}",
+                child.display()
+            ));
         }
     }
     Ok(())
@@ -452,6 +502,29 @@ fn read_manifest(path: &Path) -> Result<ExtensionSpec, String> {
     let text =
         fs::read_to_string(path).map_err(|error| format!("cannot read extension.toml: {error}"))?;
     parse_manifest(&text)
+}
+
+fn read_source_metadata(path: &Path) -> Result<(String, Option<String>), String> {
+    let text = fs::read_to_string(path).map_err(|error| {
+        format!(
+            "cannot read mod source metadata {}: {error}",
+            path.display()
+        )
+    })?;
+    let mut repository = None;
+    let mut reference = None;
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("https://github.com/") {
+            repository = Some(value.strip_suffix(".git").unwrap_or(value).to_string());
+        } else if let Some(value) = line.strip_prefix("ref=") {
+            validate_reference(value)?;
+            reference = Some(value.to_string());
+        }
+    }
+    let repository =
+        repository.ok_or_else(|| "mod source metadata has no GitHub repository".to_string())?;
+    github_repository(&repository)?;
+    Ok((repository, reference))
 }
 
 fn installed_source(name: &str) -> Result<Option<PackageSource>, String> {
@@ -509,7 +582,6 @@ fn installed_source(name: &str) -> Result<Option<PackageSource>, String> {
             format!("cannot read installed package {}: {error}", path.display())
         })?,
         chunk_name,
-        origin: format!("disk:{}", root.display()),
     }))
 }
 

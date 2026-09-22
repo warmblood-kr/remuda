@@ -2,7 +2,7 @@
 
 Remuda keeps one Lua image for the lifetime of its daemon. Rust exposes the
 small host surface, while Lua defines the extension vocabulary on top of it.
-Every built-in and registered tool writes metadata to the same runtime
+Every installed mod and registered tool writes metadata to the same runtime
 registry; the reference output is generated from that registry at request
 time.
 
@@ -15,21 +15,40 @@ remuda doc --format json
 remuda mod info butler --format markdown
 remuda mod list --format json
 remuda mod install warmblood-kr/remuda-butler
+remuda mod test path/to/remuda-mod
+remuda mod update butler
+remuda mod update --all
+remuda mod update butler
+remuda mod update --all
 ```
 
 The default output is reStructuredText, and the JSON form is intended for
 project-site tooling and other consumers that need structured metadata.
 
-`remuda mod list` reports embedded and installed mod manifests with name,
+`remuda mod list` reports installed mod manifests with name,
 version, API, entry, source, and installation status. `remuda mod info NAME`
 shows one manifest. Both use the same RST/Markdown/JSON format selector.
 
 `remuda mod install OWNER/REPO` accepts a GitHub shorthand or HTTPS URL,
 validates the repository's `extension.toml`, and atomically stores its Lua
 package under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/extensions`. Add
-`--ref REF` to select a branch, tag, or commit. Installed modules take
-precedence over embedded compatibility modules; installation never changes a
+`--ref REF` to select a branch, tag, or commit. Installation never changes a
 live Lua image, so run `remuda exec NAME` or `remuda restart` to reload it.
+`remuda mod update NAME` and `remuda mod update --all` reuse each installed
+mod's recorded GitHub source and ref, validate the new checkout, and replace
+the old copy only after validation succeeds.
+
+An extension repository declares `api = "remuda-lua-v1"` in its
+`extension.toml`. `remuda mod test PATH` is the deterministic local check: it
+validates the manifest, package paths, symlinks, Lua-only contents, and Lua
+syntax without installing or mutating a daemon. Integration tests should run
+the same mod in an isolated `XDG_DATA_HOME`, then use the real Remuda daemon
+and host bindings; unit tests can use fixture implementations of the small
+`remuda` API surface. Keep the API string pinned until a deliberate host
+compatibility version is published.
+`remuda mod update NAME` and `remuda mod update --all` reuse each installed
+mod's recorded GitHub source and ref, validate the new checkout, and replace
+the old copy only after validation succeeds.
 
 The runtime registry also covers words added with `remuda.tool`, so an
 extension can document itself when it registers its function:

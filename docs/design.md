@@ -115,16 +115,22 @@ a fresh interpreter, so what the entry file does is visible to whatever runs
 against that daemon afterward. There is no registry: a name either resolves
 to an entry file or it doesn't.
 
-Today, resolution first checks validated packages installed below
-`${XDG_DATA_HOME:-$HOME/.local/share}/remuda/extensions/<name>` and then falls
-back to the built-in lookup compiled into the `remuda` binary. `remuda mod
-install OWNER/REPO` clones a GitHub repository shallowly, validates its
+Today, resolution checks only validated packages installed below
+`${XDG_DATA_HOME:-$HOME/.local/share}/remuda/extensions/<name>`; mods are not
+embedded in the `remuda` binary. `remuda mod install OWNER/REPO` clones a GitHub repository shallowly, validates its
 `extension.toml` and `packages/<name>/init.lua` tree, and swaps the complete
 extension directory into place. A running Lua image is not changed by an
 install; `remuda exec <name>` or a daemon restart is the explicit reload.
+`remuda mod update NAME` reuses the source and optional ref recorded during
+installation; `--all` applies the same operation to every installed root mod.
+Extension repositories can run `remuda mod test PATH` before installation to
+check the pinned `remuda-lua-v1` contract, manifest paths, Lua-only contents,
+and syntax. Runtime integration tests should use an isolated data home and
+the real daemon; pure unit tests should provide deterministic fixtures for
+the host API.
 
-The same manifest drives `remuda mod list`. It reports each built-in or
-installed package's name, version, source, and `installed` status in RST,
+The same manifest drives `remuda mod list`. It reports each installed
+package's name, version, source, and `installed` status in RST,
 Markdown, or JSON; the command does not maintain a second package catalog.
 
 ## A process's output arrives as events, never as something Lua waits on
@@ -166,7 +172,7 @@ helper and know nothing about Matrix, reconnects, or backoff.
 
 ## Butler is a local session manager with an optional Matrix bridge
 
-`packages/butler` runs one Claude Code session. It works locally with no
+The installed Butler mod runs one Claude Code session. It works locally with no
 Matrix configuration. When both Matrix credential files are configured, it
 also bridges one Matrix room and exposes one reply MCP tool — the same three
 shapes as everything above it, composed rather than special-cased. The inbound
