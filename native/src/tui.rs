@@ -193,15 +193,13 @@ impl Ui {
         let Some(session) = self.selected() else {
             return Action::Nothing;
         };
-        // The pane is bottom-anchored (`Viewport::bottom_anchored`) and never
-        // resizes the pty (PRINCIPLES §6), so the session's own fixed size —
-        // already known from the herd list — is enough; no live capture
-        // needed just to place a click.
+        // The pane is bottom-anchored (`Viewport::bottom_anchored`); the
+        // current session dimensions from the herd place the click.
         let row_offset = (session.size.rows() as usize).saturating_sub(body as usize);
         let child_row = row_offset + pane_row as usize;
         let child_col = self.pan as usize + pane_col as usize;
         // Only reachable if the outer terminal grew taller/the pan scrolled
-        // further than this session's own (fixed, PRINCIPLES §6) pty extends.
+        // further than this session's pty extends.
         if child_row > session.size.rows() as usize || child_col > session.size.cols() as usize {
             return Action::Nothing;
         }
@@ -870,9 +868,8 @@ fn list_viewport(ui: &Ui, body: u16) -> usize {
         .min(ui.sessions.len().saturating_sub(visible))
 }
 
-/// The size a session started from here is given: the pane it will live in.
-/// Nothing can resize a pty afterwards (PRINCIPLES §6), so this is the only
-/// chance to make it fit — and `Size::new` still floors it at 80×24.
+/// The current size requested for the selected session panel. `Size::new`
+/// still floors it at 80×24 so agent TUIs retain a usable compositor.
 pub fn pane_size(ui: &Ui, cols: u16, rows: u16) -> Size {
     let (_, preview_w) = layout(cols, widest(ui));
     Size::new(preview_w, rows.saturating_sub(1))
@@ -966,6 +963,7 @@ fn refresh(
     held: &mut Option<(String, Hold)>,
     painted: &mut String,
     shown: &mut Option<ShownTarget>,
+    resized: &mut Option<(String, Size)>,
     skip_list: bool,
     selection_moved: bool,
 ) -> std::io::Result<(u16, u16)> {
@@ -1026,6 +1024,17 @@ fn refresh(
                 *shown = None;
             }
         }
+    }
+    if let Some(ShownTarget::Session(name)) = shown.as_ref() {
+        let target = pane_size(ui, cols, rows);
+        if resized.as_ref() != Some(&(name.clone(), target)) {
+            match resize(path, name, target) {
+                Ok(()) => *resized = Some((name.clone(), target)),
+                Err(e) => ui.notice = Some(format!("{name}: {e}")),
+            }
+        }
+    } else {
+        *resized = None;
     }
     let (cells, cursor) = match shown.as_ref() {
         Some(ShownTarget::Session(name)) => match capture_styled(path, name) {
@@ -1104,6 +1113,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     // What the window last reported showing — refreshed only on a
     // non-skip_list wake, and reused as-is on a Type-forced one.
     let mut shown: Option<ShownTarget> = None;
+    let mut resized: Option<(String, Size)> = None;
     let mut last_refresh = Instant::now();
     let mut force_refresh = true;
     // Set only by an `Action::Type` below, consumed by the very next refresh,
@@ -1131,6 +1141,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 &mut held,
                 &mut painted,
                 &mut shown,
+                &mut resized,
                 skip_list,
                 selection_moved,
             )?;
@@ -1153,6 +1164,10 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 action
             }
             Event::Mouse(m) => ui.on_mouse(m, cols, rows),
+            Event::Resize(_, _) => {
+                force_refresh = true;
+                continue;
+            }
             _ => continue,
         };
         skip_list = matches!(action, Action::Type(_));
@@ -1339,9 +1354,8 @@ fn capture_buffer(path: &Path, name: &str) -> Result<(Vec<Vec<StyledCell>>, Curs
     Ok((rows, hidden))
 }
 
-/// A session started here is sized to the pane it will live in, and keeps that
-/// size for life — nothing can resize a pty (PRINCIPLES §6). Sizing it to the
-/// whole terminal instead would guarantee a crop the list can never give back.
+/// A session started here begins at its panel size; later panel changes resize
+/// the PTY through the same path.
 fn start(path: &Path, command: &str, size: Size) -> Result<(), String> {
     let request = Request::New {
         name: None,
@@ -1352,6 +1366,20 @@ fn start(path: &Path, command: &str, size: Size) -> Result<(), String> {
     };
     match client::request(path, &request) {
         Ok(Response::Value(_)) => Ok(()),
+        Ok(Response::Error(reason)) => Err(reason),
+        other => Err(format!("{other:?}")),
+    }
+}
+
+fn resize(path: &Path, name: &str, size: Size) -> Result<(), String> {
+    match client::request(
+        path,
+        &Request::Resize {
+            name: name.to_string(),
+            size,
+        },
+    ) {
+        Ok(Response::Ok) => Ok(()),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
     }

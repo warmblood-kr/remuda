@@ -62,9 +62,7 @@ pub struct PtyAgent {
 }
 
 impl PtyAgent {
-    /// Spawn `command` on a new pty of `size`. The pty is opened at `size` and
-    /// never resized, so a viewer attaching later cannot shrink the terminal
-    /// out from under a running agent.
+    /// Spawn `command` on a new pty of `size`.
     pub fn spawn(command: CommandBuilder, size: Size) -> Result<Self> {
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -249,6 +247,24 @@ impl AgentProcess for PtyAgent {
             return Ok(());
         }
         self.child.kill().map_err(io)
+    }
+
+    fn resize(&mut self, size: Size) -> Result<()> {
+        self._master
+            .resize(PtySize {
+                rows: size.rows(),
+                cols: size.cols(),
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(io)?;
+        self.screen
+            .lock()
+            .map_err(|_| io("screen lock poisoned"))?
+            .screen_mut()
+            .set_size(size.rows(), size.cols());
+        self.size = size;
+        Ok(())
     }
 
     fn size(&self) -> Size {

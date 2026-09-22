@@ -337,6 +337,12 @@ fn handle(
             })
         }
 
+        Request::Resize { name, size } => {
+            respond(&stream, &name, registry.resize(&name, size), |()| {
+                Response::Ok
+            })
+        }
+
         Request::Capture { name } => respond(
             &stream,
             &name,

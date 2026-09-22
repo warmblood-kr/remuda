@@ -81,7 +81,7 @@ pub enum Left {
 
 /// Give this terminal to a session until the user presses [`DETACH`] or the
 /// session ends. Leaving does not disturb the session: the process keeps
-/// running and the pty keeps its size, since nothing here can resize it.
+/// running and this direct attach never changes its size.
 pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
     let stream = ipc::connect(path)?;
     send(

@@ -95,11 +95,10 @@ reading.)*
 
 Where a rule would say "never call X", delete X from the API instead.
 
-**Why.** `Session` has no `resize` method, so an attaching viewer cannot shrink
-the terminal under a running agent — the defect where attaching resized a shared
-session down to the smallest client. `Session` exposes no raw write either, so
-body-and-Enter cannot be separated by a second writer. Both are properties of the
-API's *shape*, not of caller discipline.
+**Why.** An attaching viewer cannot resize the terminal. The TUI alone resizes a
+session to its own panel, through one explicit request, rather than letting the
+smallest attached client change a shared pty. `Session` exposes no raw write
+either, so body-and-Enter cannot be separated by a second writer.
 
 ### The three invariants this buys
 
@@ -112,11 +111,10 @@ implementation had exactly this bug shape: a stray submit landed on whatever was
 highlighted, and the intended text was swallowed **with both sides reporting
 success**.
 
-**2 — nobody can resize the pty.** There is no `resize`, and `Size` is immutable
-once constructed. Attaching is meant to be routine — it is how a human logs the
-agent in — and in zellij, whose behaviour was measured for this design, attaching
-resizes the shared session down to the smallest client. Here an attacher gets a
-view and may scroll or crop; the program underneath never sees SIGWINCH.
+**2 — only the panel owner resizes the pty.** Attaching is meant to be routine
+and never changes size. The TUI sends a resize only when its selected session's
+panel size changes, so the program sees SIGWINCH for an intentional panel change,
+not because a viewer joined from a smaller terminal.
 
 **3 — raw keystrokes exist only while exactly one human holds the session.** A
 human at an attached terminal types Enter themselves, so attaching needs the very

@@ -170,6 +170,10 @@ impl Registry {
         self.get(name).map(|s| s.feed(steps))
     }
 
+    pub fn resize(&self, name: &str, size: Size) -> Option<Result<()>> {
+        self.get(name).map(|s| s.resize(size))
+    }
+
     pub fn screen_text(&self, name: &str) -> Option<Result<String>> {
         self.get(name).map(|s| s.screen_text())
     }

@@ -1,7 +1,7 @@
 //! A programming runtime, with the atomic functions wired to it.
 //!
 //! This is safe to do because the vocabulary handed to Lua is exactly
-//! [`Request`] — the surface that already has no raw write and no resize. A
+//! [`Request`] — the surface that has no raw write. A
 //! script gets Turing-completeness over *which* operations run in *what order*;
 //! it gets no operation the CLI lacks, because there is no such variant to
 //! bind. Invariant 3 is enforced by the daemon when the call arrives, not by

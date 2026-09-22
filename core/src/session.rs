@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 pub struct Session {
     name: String,
     agent: Mutex<Box<dyn AgentProcess>>,
-    size: Size,
+    size: Mutex<Size>,
     clock: Arc<dyn Clock>,
     /// Reading of [`Clock::now`] taken at the last successful `send_line`.
     /// Meaningful only as a difference against a later reading.
@@ -51,7 +51,7 @@ impl Session {
         Self {
             name: name.into(),
             agent: Mutex::new(agent),
-            size,
+            size: Mutex::new(size),
             clock,
             last_input_at: Mutex::new(started),
             attached: AtomicBool::new(false),
@@ -63,10 +63,26 @@ impl Session {
         &self.name
     }
 
-    /// The size fixed when the agent was spawned. Read-only by design; see
-    /// invariant 2 on this type.
+    /// The current terminal size.
     pub fn size(&self) -> Size {
-        self.size
+        self.size.lock().map(|size| *size).unwrap_or_default()
+    }
+
+    /// Resize the backing terminal and publish its new dimensions together.
+    /// The agent lock serializes this with output capture and input delivery;
+    /// a failed backend resize leaves the advertised session size unchanged.
+    pub fn resize(&self, size: Size) -> Result<()> {
+        let mut agent = self
+            .agent
+            .lock()
+            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        agent.resize(size)?;
+        let mut current = self
+            .size
+            .lock()
+            .map_err(|_| AgentError::Io("session size lock poisoned".into()))?;
+        *current = size;
+        Ok(())
     }
 
     /// Deliver one instruction: the text, then Enter, as one indivisible act.

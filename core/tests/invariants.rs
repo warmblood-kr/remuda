@@ -192,13 +192,13 @@ fn size_is_clamped_to_the_floor_that_keeps_input_visible() {
 }
 
 #[test]
-fn session_size_is_fixed_at_spawn() {
+fn session_size_tracks_a_resize() {
     let agent = ScriptedAgent::new(vec![]).with_size(Size::new(120, 40));
     let (session, _clock) = session_with(Box::new(agent));
 
     assert_eq!(session.size(), Size::new(120, 40));
-    // There is no resize method to call. A viewer attaching cannot change
-    // this value, which is the whole point of invariant 2 on Session.
+    session.resize(Size::new(100, 30)).expect("resize");
+    assert_eq!(session.size(), Size::new(100, 30));
 }
 
 #[test]

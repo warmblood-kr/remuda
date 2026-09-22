@@ -13,7 +13,7 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc::Receiver;
 
-/// Terminal dimensions. Immutable by construction — see [`Size::new`].
+/// Terminal dimensions, clamped to the smallest usable interactive terminal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Size {
     cols: u16,
@@ -177,8 +177,13 @@ pub trait AgentProcess: Send {
     /// not be punished for the race it could not have won.
     fn terminate(&mut self) -> Result<()>;
 
-    /// The size fixed at spawn. There is deliberately no setter; see
-    /// [`crate::session::Session`].
+    /// Resize the terminal. Backends without a real terminal can accept this
+    /// as a no-op; a PTY backend updates both its PTY and screen parser.
+    fn resize(&mut self, _size: Size) -> Result<()> {
+        Ok(())
+    }
+
+    /// The current terminal size.
     fn size(&self) -> Size;
 }
 
@@ -266,6 +271,11 @@ impl AgentProcess for ScriptedAgent {
         // close calls. Both mean "this process is done" to a scripted double
         // that has no real process to signal.
         self.kill();
+        Ok(())
+    }
+
+    fn resize(&mut self, size: Size) -> Result<()> {
+        self.size = size;
         Ok(())
     }
 

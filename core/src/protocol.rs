@@ -48,6 +48,9 @@ pub enum Request {
     /// `SendLine` are its one-`Burst` case. An attached terminal does not
     /// block it.
     Feed { name: String, steps: Vec<Step> },
+    /// Resize a session's terminal to its viewer panel. The size is clamped
+    /// during deserialization just like `New`.
+    Resize { name: String, size: Size },
     /// Read the screen as text without taking the session over. Needs no
     /// terminal, raw mode or exclusivity, so it works while a human is attached.
     Capture { name: String },

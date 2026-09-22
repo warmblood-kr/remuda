@@ -251,6 +251,40 @@ fn a_session_launches_into_the_cwd_it_is_given() {
 }
 
 #[test]
+fn a_live_session_resizes_and_reports_its_new_size() {
+    let path = scratch("resize");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "resizable");
+
+    let target = Size::new(120, 36);
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::Resize {
+                name: "resizable".into(),
+                size: target
+            },
+        )
+        .expect("resize"),
+        Response::Ok
+    );
+    let sessions = match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(sessions) => sessions,
+        other => panic!("unexpected: {other:?}"),
+    };
+    assert_eq!(sessions[0].size, target);
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "resizable".into(),
+            text: "stty size".into(),
+        },
+    )
+    .expect("ask terminal size");
+    wait_for(&path, "resizable", "36 120");
+}
+
+#[test]
 fn a_topic_directory_can_be_made_listed_and_removed_even_with_a_space_in_its_name() {
     // A space in the name is the whole point: `os.execute("mkdir -p ...")`
     // would mangle this, real `std::fs` calls do not.
