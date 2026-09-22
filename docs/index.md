@@ -1,16 +1,11 @@
 ![A small herd of horses waiting in a rope corral at first light, with one
 already saddled and stepped forward](remuda.jpg)
 
-<nav aria-label="Language"><a href="index.html" lang="en">English</a> ·
-<a href="ko.html" lang="ko">한국어</a></nav>
-
 ## tmux for coding agents
 
 A terminal orchestrator with a programmable layer. You keep a herd of agent
 sessions running, attach to one and ride it, swap to another. The herd outlives
 any single ride.
-
-[Source on GitHub](https://github.com/warmblood-kr/remuda)
 
 ### Programmable
 
@@ -27,13 +22,11 @@ The complete Lua reference is generated from the live runtime registry:
 [Lua extension documentation](lua.md). Butler's local session manager and
 optional Matrix bridge are described in [Butler](butler.md).
 
-The [generated RST reference](lua-reference.rst) is included in the Lua page
-and can also be consumed directly by documentation tooling.
+The [generated Lua reference](lua-reference.html) is rendered on the Lua page;
+the [RST source](lua-reference.rst) is also available to documentation tools.
 
 The same [Lua extensions page](lua.md) documents the live mod inventory
 exposed by `remuda mod list`.
-
-[한국어 안내](ko.md)와 [한국어 Lua 안내](ko-lua.md)도 제공합니다.
 
 The same herd is reachable over MCP — `new`, `ls`, `send`, `capture` — so an
 agent can drive other agents.
