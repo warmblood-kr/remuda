@@ -1394,7 +1394,12 @@ fn which_pane_has_the_keyboard_is_on_screen_either_way() {
 }
 
 fn scratch_socket(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("remuda-tuitest-{}-{tag}", std::process::id()));
+    let root = if cfg!(unix) {
+        std::path::PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let dir = root.join(format!("remuda-tuitest-{}-{tag}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
     crate::daemon::socket_path_in(&dir, "s")

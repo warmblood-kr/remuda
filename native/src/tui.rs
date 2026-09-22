@@ -22,6 +22,7 @@ use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
 use remuda_core::Size;
 use std::collections::HashMap;
+#[cfg(not(test))]
 use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -1398,9 +1399,23 @@ fn refresh(
     // focus cost ~25 times a second while sitting idle, and every keystroke
     // on top of that.
     if frame != *painted {
-        let mut stdout = std::io::stdout();
-        stdout.write_all(frame.as_bytes())?;
-        stdout.flush()?;
+        #[cfg(not(test))]
+        {
+            let mut stdout = std::io::stdout();
+            let previous_content = painted
+                .rsplit_once("\x1b[J")
+                .map_or(painted.as_str(), |(content, _)| content);
+            let current_content = frame
+                .rsplit_once("\x1b[J")
+                .map_or(frame.as_str(), |(content, _)| content);
+            if previous_content == current_content {
+                let cursor = frame.rsplit_once("\x1b[J").map_or("", |(_, cursor)| cursor);
+                stdout.write_all(cursor.as_bytes())?;
+            } else {
+                stdout.write_all(frame.as_bytes())?;
+            }
+            stdout.flush()?;
+        }
         *painted = frame;
     }
     Ok((cols, rows))
