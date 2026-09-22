@@ -116,6 +116,8 @@ pub enum Response {
     /// pane's caret and its content are always the same frame. See steps/027.
     StyledScreen {
         rows: Vec<Vec<StyledRun>>,
+        #[serde(default)]
+        wrapped: Vec<bool>,
         cursor: Cursor,
     },
     /// What an [`Request::Eval`] returned, already rendered to text. Kept

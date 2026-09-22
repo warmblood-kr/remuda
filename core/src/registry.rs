@@ -190,6 +190,10 @@ impl Registry {
         self.get(name).map(|s| s.screen_cells_at(scrollback))
     }
 
+    pub fn row_wrapped_at(&self, name: &str, scrollback: usize) -> Option<Result<Vec<bool>>> {
+        self.get(name).map(|s| s.row_wrapped_at(scrollback))
+    }
+
     pub fn cursor(&self, name: &str) -> Option<Result<Cursor>> {
         self.get(name).map(|s| s.cursor())
     }

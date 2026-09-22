@@ -193,6 +193,14 @@ impl Session {
         agent.screen_cells_at(scrollback)
     }
 
+    pub fn row_wrapped_at(&self, scrollback: usize) -> Result<Vec<bool>> {
+        let mut agent = self
+            .agent
+            .lock()
+            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        agent.row_wrapped_at(scrollback)
+    }
+
     pub fn is_alive(&self) -> bool {
         match self.agent.lock() {
             Ok(mut agent) => agent.is_alive(),

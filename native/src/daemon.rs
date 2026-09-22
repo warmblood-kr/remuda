@@ -361,6 +361,10 @@ fn handle(
                     // Runs on the wire, not cells — see steps/022 for the 44x+
                     // measured on a real screen.
                     let rows = cells.iter().map(|row| collapse_runs(row)).collect();
+                    let wrapped = registry
+                        .row_wrapped_at(&name, scrollback)
+                        .and_then(Result::ok)
+                        .unwrap_or_default();
                     // The session existed a line above (`screen_cells` answered),
                     // so this only fails on a poisoned lock — hide rather than
                     // guess a position. See steps/027.
@@ -381,7 +385,14 @@ fn handle(
                             visible: false,
                         }
                     };
-                    reply(&stream, &Response::StyledScreen { rows, cursor })
+                    reply(
+                        &stream,
+                        &Response::StyledScreen {
+                            rows,
+                            wrapped,
+                            cursor,
+                        },
+                    )
                 }
             }
         }

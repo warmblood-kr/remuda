@@ -165,6 +165,10 @@ pub trait AgentProcess: Send {
         self.screen_cells()
     }
 
+    fn row_wrapped_at(&mut self, _scrollback: usize) -> Result<Vec<bool>> {
+        Ok(Vec::new())
+    }
+
     /// Subscribe to output as it arrives, for a viewer that must not poll.
     /// `None` means this backend cannot stream; that caller falls back to
     /// `screen_bytes`.

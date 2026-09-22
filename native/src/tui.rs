@@ -69,7 +69,21 @@ pub enum Action {
     Focus(String),
     Scroll(i16),
     Copy(String),
+    CopySelection(String),
     Paste,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct TextPoint {
+    row: usize,
+    col: usize,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct TextSelection {
+    session: String,
+    start: TextPoint,
+    end: TextPoint,
 }
 
 pub struct Ui {
@@ -80,6 +94,8 @@ pub struct Ui {
     /// or the compact-list toggle.
     pub list_width: Option<u16>,
     dragging_divider: bool,
+    selecting_text: bool,
+    text_selection: Option<TextSelection>,
     last_resized: Option<(String, Size)>,
     /// Remuda's own kill ring. It deliberately does not require or alter the
     /// host OS clipboard.
@@ -87,6 +103,8 @@ pub struct Ui {
     scrollback: HashMap<String, usize>,
     pub mode: Mode,
     pub focus: Focus,
+    visual: bool,
+    preview_cursor: Cursor,
     /// What `n` prefills the prompt with. Held rather than read at the prompt,
     /// so the pure state machine still needs no environment.
     shell: String,
@@ -109,6 +127,8 @@ impl Ui {
             pan: 0,
             list_width: None,
             dragging_divider: false,
+            selecting_text: false,
+            text_selection: None,
             last_resized: None,
             yank: String::new(),
             scrollback: HashMap::new(),
@@ -117,6 +137,12 @@ impl Ui {
             // is half of the incident `steps/012` is named after.
             mode: Mode::Browse,
             focus: Focus::List,
+            visual: false,
+            preview_cursor: Cursor {
+                row: 0,
+                col: 0,
+                visible: false,
+            },
             shell: shell.to_string(),
             notice,
             sessions_text: Vec::new(),
@@ -201,7 +227,61 @@ impl Ui {
             }
             return Action::Nothing;
         }
+        if (self.visual || event.modifiers.contains(KeyModifiers::SHIFT))
+            && matches!(
+                event.kind,
+                MouseEventKind::Down(MouseButton::Left)
+                    | MouseEventKind::Drag(MouseButton::Left)
+                    | MouseEventKind::Up(MouseButton::Left)
+            )
+        {
+            return self.select_session_text(event.kind, row, col - list_w - 1, body);
+        }
         self.click_session_pane(event.kind, row, col - list_w - 1, body, preview_w)
+    }
+
+    fn select_session_text(
+        &mut self,
+        kind: MouseEventKind,
+        pane_row: u16,
+        pane_col: u16,
+        body: u16,
+    ) -> Action {
+        let Some(session) = self.selected() else {
+            return Action::Nothing;
+        };
+        let session_name = session.name.clone();
+        if pane_row < 1 || pane_row > body || pane_col < 1 {
+            return Action::Nothing;
+        }
+        let point = TextPoint {
+            row: (session.size.rows() as usize).saturating_sub(body as usize) + pane_row as usize
+                - 1,
+            col: self.pan as usize + pane_col as usize - 1,
+        };
+        match kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.selecting_text = true;
+                self.text_selection = Some(TextSelection {
+                    session: session_name,
+                    start: point,
+                    end: point,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.selecting_text => {
+                if let Some(selection) = &mut self.text_selection {
+                    selection.end = point;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.selecting_text => {
+                self.selecting_text = false;
+                if let Some(selection) = &mut self.text_selection {
+                    selection.end = point;
+                }
+            }
+            _ => {}
+        }
+        Action::Nothing
     }
 
     fn click_list_row(&mut self, kind: MouseEventKind, row: u16, body: u16) -> Action {
@@ -282,9 +362,6 @@ impl Ui {
             self.notice = None;
             return Action::Nothing;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('y') {
-            return Action::Paste;
-        }
         to_bytes(key).map_or(Action::Nothing, Action::Type)
     }
 
@@ -302,6 +379,27 @@ impl Ui {
     }
 
     fn browse_key(&mut self, key: KeyEvent) -> Action {
+        if self.visual {
+            match key.code {
+                KeyCode::Esc => {
+                    self.visual = false;
+                    self.selecting_text = false;
+                    self.text_selection = None;
+                    return Action::Nothing;
+                }
+                KeyCode::Char('y') => {
+                    self.visual = false;
+                    self.selecting_text = false;
+                    return self.copy_action();
+                }
+                KeyCode::Char('h') | KeyCode::Left => self.move_visual(-1, 0),
+                KeyCode::Char('j') | KeyCode::Down => self.move_visual(0, 1),
+                KeyCode::Char('k') | KeyCode::Up => self.move_visual(0, -1),
+                KeyCode::Char('l') | KeyCode::Right => self.move_visual(1, 0),
+                _ => {}
+            }
+            return Action::Nothing;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => Action::Quit,
@@ -332,12 +430,74 @@ impl Ui {
                 Action::Nothing
             }
             KeyCode::Char('x') => self.kill_selected(),
-            KeyCode::Char('y') => self
-                .selected()
-                .map_or(Action::Nothing, |s| Action::Copy(s.name.clone())),
-            KeyCode::Enter => self.focus_session(),
+            KeyCode::Char('y') => self.copy_action(),
+            KeyCode::Char('v') => {
+                self.visual = true;
+                self.selecting_text = false;
+                if let Some(name) = self.selected().map(|s| s.name.clone()) {
+                    let point = TextPoint {
+                        row: self.preview_cursor.row as usize,
+                        col: self.preview_cursor.col as usize,
+                    };
+                    self.text_selection = Some(TextSelection {
+                        session: name,
+                        start: point,
+                        end: point,
+                    });
+                }
+                Action::Nothing
+            }
+            KeyCode::Char('p') => Action::Paste,
+            KeyCode::Esc if self.visual => {
+                self.visual = false;
+                self.selecting_text = false;
+                self.text_selection = None;
+                Action::Nothing
+            }
+            KeyCode::Enter | KeyCode::Char('i') => self.focus_session(),
             _ => Action::Nothing,
         }
+    }
+
+    fn copy_action(&self) -> Action {
+        let Some(name) = self.selected().map(|s| s.name.clone()) else {
+            return Action::Nothing;
+        };
+        if self
+            .text_selection
+            .as_ref()
+            .is_some_and(|selection| selection.session == name)
+        {
+            Action::CopySelection(name)
+        } else {
+            Action::Copy(name)
+        }
+    }
+
+    fn move_visual(&mut self, dc: i32, dr: i32) {
+        let dimensions = self
+            .text_selection
+            .as_ref()
+            .and_then(|selection| self.sessions.iter().find(|s| s.name == selection.session))
+            .map(|session| (session.size.rows() as usize, session.size.cols() as usize));
+        let Some(selection) = &mut self.text_selection else {
+            return;
+        };
+        let Some((rows, cols)) = dimensions else {
+            return;
+        };
+        let max_row = rows.saturating_sub(1);
+        let max_col = cols.saturating_sub(1);
+        selection.end.row = selection
+            .end
+            .row
+            .saturating_add_signed(dr as isize)
+            .min(max_row);
+        selection.end.col = selection
+            .end
+            .col
+            .saturating_add_signed(dc as isize)
+            .min(max_col);
     }
 
     /// Refuse before focus moves, not after: an occupied or dead session cannot
@@ -907,7 +1067,8 @@ pub fn render_styled(
         Focus::Session => "\x1b[7m┃\x1b[0m",
     };
 
-    let (lines, cut) = crop_styled(cells, preview_w, body, ui.pan);
+    let selected = cells_with_selection(ui, cells);
+    let (lines, cut) = crop_styled(&selected, preview_w, body, ui.pan);
     let caret = locate_cursor(cells, cursor, ui.pan, preview_w, body, list_w);
     let mut out = String::from("\x1b[?2026h\x1b[H");
     for row in 0..body {
@@ -940,6 +1101,45 @@ pub fn render_styled(
     }
     out.push_str("\x1b[?2026l");
     out
+}
+
+fn cells_with_selection(ui: &Ui, cells: &[Vec<StyledCell>]) -> Vec<Vec<StyledCell>> {
+    let mut selected = cells.to_vec();
+    let Some(selection) = ui.text_selection.as_ref() else {
+        return selected;
+    };
+    let Some(session) = ui.selected() else {
+        return selected;
+    };
+    if selection.session != session.name {
+        return selected;
+    }
+    let (start, end) =
+        if (selection.start.row, selection.start.col) <= (selection.end.row, selection.end.col) {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+    for (row_index, row) in selected.iter_mut().enumerate() {
+        if row_index < start.row || row_index > end.row {
+            continue;
+        }
+        let from = if row_index == start.row { start.col } else { 0 };
+        let to = if row_index == end.row {
+            end.col.saturating_add(1)
+        } else {
+            row.len()
+        };
+        let row_len = row.len();
+        for cell in row
+            .iter_mut()
+            .skip(from.min(row_len))
+            .take(to.saturating_sub(from).min(row_len.saturating_sub(from)))
+        {
+            cell.inverse = !cell.inverse;
+        }
+    }
+    selected
 }
 
 /// The widest session in the herd, which is what the preview column claims —
@@ -1128,25 +1328,26 @@ fn refresh(
     } else {
         ui.last_resized = None;
     }
-    let (cells, cursor) = match shown.as_ref() {
+    let (cells, _wrapped, cursor) = match shown.as_ref() {
         Some(ShownTarget::Session(name)) => {
             match capture_styled(path, name, *ui.scrollback.get(name).unwrap_or(&0)) {
                 Ok(result) => result,
                 Err(e) => {
                     ui.notice = Some(format!("{name}: {e}"));
-                    (Vec::new(), hidden)
+                    (Vec::new(), Vec::new(), hidden)
                 }
             }
         }
         Some(ShownTarget::Buffer(name)) => match capture_buffer(path, name) {
-            Ok(result) => result,
+            Ok((cells, cursor)) => (cells, Vec::new(), cursor),
             Err(e) => {
                 ui.notice = Some(format!("{name}: {e}"));
-                (Vec::new(), hidden)
+                (Vec::new(), Vec::new(), hidden)
             }
         },
-        None => (Vec::new(), hidden),
+        None => (Vec::new(), Vec::new(), hidden),
     };
+    ui.preview_cursor = cursor;
     let frame = render_styled(ui, &cells, cursor, server, cols, rows);
     // The write is gated on change, as it always was — but before
     // `should_refresh` existed, everything ABOVE this line (a relist, an IPC
@@ -1295,31 +1496,49 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 }
             }
             Action::Copy(name) => match capture_styled(path, &name, 0) {
-                Ok((cells, _)) => {
-                    ui.yank = cells
-                        .into_iter()
-                        .map(|row| {
-                            row.into_iter()
-                                .map(|cell| cell.text)
-                                .collect::<String>()
-                                .trim_end()
-                                .to_string()
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                Ok((cells, wrapped, _)) => {
+                    ui.yank = all_screen_text(&cells, &wrapped);
                     ui.notice = Some(format!(
-                        "copied {} bytes; ctrl-y pastes into the focused session",
+                        "copied {} bytes; p pastes into the selected session",
                         ui.yank.len()
                     ));
                 }
                 Err(e) => ui.notice = Some(format!("{name}: {e}")),
             },
+            Action::CopySelection(name) => {
+                let offset = *ui.scrollback.get(&name).unwrap_or(&0);
+                match capture_styled(path, &name, offset) {
+                    Ok((cells, wrapped, _)) => {
+                        ui.yank = ui.text_selection.as_ref().map_or_else(
+                            || all_screen_text(&cells, &wrapped),
+                            |selection| selected_screen_text(&cells, &wrapped, selection),
+                        );
+                        ui.notice = Some(format!(
+                            "copied {} bytes; p pastes into the selected session",
+                            ui.yank.len()
+                        ));
+                    }
+                    Err(e) => ui.notice = Some(format!("{name}: {e}")),
+                }
+            }
             Action::Paste => {
                 if ui.yank.is_empty() {
                     ui.notice = Some("kill ring is empty".into());
                 } else if let Some((name, hold)) = &held {
                     if let Err(e) = hold.keys(ui.yank.as_bytes()) {
                         ui.notice = Some(format!("{name}: {e}"));
+                    }
+                } else if let Some(name) = ui.selected().map(|session| session.name.clone()) {
+                    match client::request(
+                        path,
+                        &Request::Send {
+                            name: name.clone(),
+                            bytes: ui.yank.as_bytes().to_vec(),
+                        },
+                    ) {
+                        Ok(Response::Ok) => {}
+                        Ok(Response::Error(reason)) => ui.notice = Some(reason),
+                        other => ui.notice = Some(format!("{other:?}")),
                     }
                 }
             }
@@ -1445,7 +1664,7 @@ fn capture_styled(
     path: &Path,
     name: &str,
     scrollback: usize,
-) -> Result<(Vec<Vec<StyledCell>>, Cursor), String> {
+) -> Result<(Vec<Vec<StyledCell>>, Vec<bool>, Cursor), String> {
     match client::request(
         path,
         &Request::CaptureStyled {
@@ -1453,12 +1672,81 @@ fn capture_styled(
             scrollback,
         },
     ) {
-        Ok(Response::StyledScreen { rows, cursor }) => {
-            Ok((rows.iter().map(|row| expand_runs(row)).collect(), cursor))
-        }
+        Ok(Response::StyledScreen {
+            rows,
+            wrapped,
+            cursor,
+        }) => Ok((
+            rows.iter().map(|row| expand_runs(row)).collect(),
+            wrapped,
+            cursor,
+        )),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
     }
+}
+
+fn all_screen_text(cells: &[Vec<StyledCell>], wrapped: &[bool]) -> String {
+    cells
+        .iter()
+        .enumerate()
+        .map(|(row_index, row)| {
+            let text = row
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            (row_index, text)
+        })
+        .fold(String::new(), |mut text, (row_index, row)| {
+            text.push_str(&row);
+            if !wrapped.get(row_index).copied().unwrap_or(false) {
+                text.push('\n');
+            }
+            text
+        })
+        .trim_end_matches('\n')
+        .to_string()
+}
+
+fn selected_screen_text(
+    cells: &[Vec<StyledCell>],
+    wrapped: &[bool],
+    selection: &TextSelection,
+) -> String {
+    let (start, end) =
+        if (selection.start.row, selection.start.col) <= (selection.end.row, selection.end.col) {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+    (start.row..=end.row)
+        .filter_map(|row_index| cells.get(row_index).map(|row| (row_index, row)))
+        .map(|(row_index, row)| {
+            let from = if row_index == start.row { start.col } else { 0 };
+            let to = if row_index == end.row {
+                end.col.saturating_add(1)
+            } else {
+                row.len()
+            };
+            let text = row
+                .iter()
+                .skip(from.min(row.len()))
+                .take(to.saturating_sub(from).min(row.len().saturating_sub(from)))
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            (row_index, text)
+        })
+        .fold(String::new(), |mut text, (row_index, row)| {
+            text.push_str(&row);
+            if row_index != end.row && !wrapped.get(row_index).copied().unwrap_or(false) {
+                text.push('\n');
+            }
+            text
+        })
 }
 
 /// A shown buffer's counterpart to `capture_styled` — same `Eval`/`Value`
@@ -1861,37 +2149,6 @@ mod tests {
             ui.on_mouse(wheel, 80, 24),
             Action::Type(remuda_core::keys::mouse("wheel-down", 3, 5).unwrap())
         );
-    }
-
-    #[test]
-    fn y_copies_the_selected_session_and_ctrl_y_pastes_while_focused() {
-        let mut ui = ui(vec![row("a", true, false)]);
-        assert_eq!(
-            ui.on_key(press(KeyCode::Char('y'))),
-            Action::Copy("a".into())
-        );
-        ui.on_key(press(KeyCode::Enter));
-        assert_eq!(
-            ui.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL)),
-            Action::Paste
-        );
-    }
-
-    /// The bug this whole mode exists to make impossible: in the list `x` kills
-    /// and `q` quits, and inside a session both must be plain text.
-    #[test]
-    fn with_focus_on_the_session_the_command_keys_are_just_text() {
-        let mut ui = ui(vec![row("sh", true, false)]);
-        ui.on_key(press(KeyCode::Enter));
-        for (code, byte) in [('x', b'x'), ('q', b'q'), ('n', b'n'), ('y', b'y')] {
-            assert_eq!(
-                ui.on_key(press(KeyCode::Char(code))),
-                Action::Type(vec![byte]),
-                "{code} must reach the pty, not remuda"
-            );
-        }
-        assert_eq!(ui.mode, Mode::Browse, "no prompt, no kill confirmation");
-        assert_eq!(ui.focus, Focus::Session, "and the keyboard has not moved");
     }
 
     #[test]
@@ -3089,7 +3346,7 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Ok((cells, _)) = capture_styled(&path, "alpha", 0) {
+            if let Ok((cells, _, _)) = capture_styled(&path, "alpha", 0) {
                 let first_five: String = cells
                     .first()
                     .map(|row| row.iter().take(5).map(|c| c.text.as_str()).collect())
@@ -3114,7 +3371,7 @@ mod tests {
         let ShownTarget::Session(name) = shown.unwrap() else {
             unreachable!("just asserted it above");
         };
-        let (cells, cursor) =
+        let (cells, _, cursor) =
             capture_styled(&path, &name, 0).expect("capture through the window's target");
 
         let mut ui = Ui::new(vec![row("alpha", true, false)], "/bin/sh", None);

@@ -229,6 +229,15 @@ impl AgentProcess for PtyAgent {
         Ok(styled_cells(&view, self.size))
     }
 
+    fn row_wrapped_at(&mut self, scrollback: usize) -> Result<Vec<bool>> {
+        let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
+        let mut view = parser.screen().clone();
+        view.set_scrollback(scrollback);
+        Ok((0..self.size.rows())
+            .map(|row| view.row_wrapped(row))
+            .collect())
+    }
+
     fn subscribe(&mut self) -> Option<Receiver<Vec<u8>>> {
         let (tx, rx) = channel();
         self.watchers.lock().ok()?.push(tx);
