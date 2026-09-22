@@ -13,7 +13,7 @@
 
 use remuda_core::protocol::{Request, Response};
 use remuda_core::{Session, Size};
-use remuda_native::{client, daemon, CommandBuilder, PtyAgent, SystemClock};
+use remuda_native::{client, daemon, ipc, CommandBuilder, PtyAgent, SystemClock};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -101,6 +101,19 @@ fn wait_for(path: &Path, name: &str, needle: &str) -> String {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn a_second_listener_cannot_unlink_a_live_daemons_socket() {
+    let path = scratch("live-listener");
+    let _first = ipc::listen(&path).expect("first listener binds");
+
+    let second = ipc::listen(&path).expect_err("a live listener must keep its address");
+    assert_eq!(second.kind(), std::io::ErrorKind::AddrInUse);
+    assert!(
+        ipc::connect(&path).is_ok(),
+        "the first daemon remains reachable"
+    );
 }
 
 #[test]
@@ -2607,15 +2620,212 @@ fn butler_codex_builder_uses_automatic_approval() {
         r#"local a = remuda._butler_agent_builders.codex({name="codex", token="token", telemetry={status_path="/tmp/status"}}); return table.concat(a, "\n")"#,
     );
     let argv: Vec<&str> = argv.lines().collect();
-    assert_eq!(&argv[..2], ["remuda", "_json_rpc_terminal"]);
-    let spec = argv
-        .iter()
-        .position(|arg| *arg == "--spec")
-        .and_then(|index| argv.get(index + 1))
-        .expect("Codex adapter argv has a JSON-RPC spec");
-    let spec: serde_json::Value = serde_json::from_str(spec).expect("valid JSON-RPC spec");
-    assert_eq!(spec["start"]["method"], "thread/start");
-    assert_eq!(spec["start"]["params"]["approvalsReviewer"], "auto_review");
+    assert_eq!(&argv[..2], ["remuda", "_codex_tui"]);
+    assert!(argv
+        .windows(2)
+        .any(|pair| pair == ["--status", "/tmp/status"]));
+}
+
+#[test]
+#[cfg(unix)]
+fn reexecuting_butler_keeps_the_root_telemetry_identity() {
+    let dir = scratch_dir("butler-telemetry-reexec");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).expect("test home");
+    let daemon = Daemon::spawn_with_home(&dir, &home);
+    let path = daemon::socket_path_in(&dir, "s");
+    eval(
+        &path,
+        r#"
+          remuda._butler_argv = {"sh", "-c", "sleep 30"}
+          remuda._butler_skip_relay = true
+        "#,
+    );
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let before = eval(
+        &path,
+        r#"
+          local a = remuda._butler_bus.agents.butler
+          return a.token .. "\n" .. a.telemetry.status_path
+        "#,
+    );
+    let mut before_lines = before.lines();
+    let token = before_lines.next().expect("root token").to_owned();
+    let status_path = before_lines.next().expect("status path").to_owned();
+    std::fs::write(&status_path, "MODEL:claude CTX:1234 CTXWIN:200000 CTXPCT:1")
+        .expect("status record");
+
+    let again = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        again.status.success(),
+        "{}",
+        String::from_utf8_lossy(&again.stderr)
+    );
+    assert_eq!(
+        eval(
+            &path,
+            r#"
+              local a = remuda._butler_bus.agents.butler
+              local t = remuda._butler_telemetry_for(a)
+              return a.token .. "\n" .. a.telemetry.status_path .. "\n"
+                .. t.model .. ":" .. t.context_used .. ":" .. t.context_window .. ":" .. t.context_percent
+            "#,
+        ),
+        format!("{token}\n{status_path}\nclaude:1234:200000:1")
+    );
+    drop(daemon);
+}
+
+#[test]
+fn butler_mail_separates_the_envelope_from_its_body_object() {
+    let path = scratch("butler-mail");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+          remuda._butler_mail_config = {
+            bus = { inboxes = {}, messages = {}, objects = {}, next = 0 },
+            json_quote = function(value) return '"' .. value .. '"' end,
+          }
+          remuda.exec("butler/mail")
+        "#,
+    );
+    let result = eval(
+        &path,
+        r#"
+          local message = remuda._butler_mail.queue("butler", "fixer", "private body")
+          local object = remuda._butler_mail_config.bus.objects[message.body.object_id]
+          return message.from.host .. ":" .. message.from.session .. "\n"
+            .. message.body.object_id .. "\n" .. object.content .. "\n"
+            .. remuda._butler_mail.inbox("fixer")
+        "#,
+    );
+    let lines: Vec<&str> = result.lines().collect();
+    assert_eq!(lines[0], "local:butler");
+    assert!(lines[1].starts_with("object-"));
+    assert_eq!(lines[2], "private body");
+    assert!(result.contains("Message from butler\nprivate body"));
+}
+
+#[test]
+fn butler_mail_survives_a_fresh_lua_mailbox_and_remembers_reads() {
+    let dir = scratch_dir("butler-mail-reload");
+    let root = dir.join("mail");
+    let root_lua = lua_raw_string(&root.to_string_lossy());
+    let path = scratch("butler-mail-reload");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        &format!(
+            r#"
+              remuda._butler_mail_config = {{
+                bus = {{ inboxes = {{}}, messages = {{}}, objects = {{}}, next = 0 }},
+                root = {root_lua}, json_quote = function(value) return '"' .. value .. '"' end,
+              }}
+              remuda.exec("butler/mail")
+              return remuda._butler_mail.queue("butler", "fixer", "survives a restart").id
+            "#
+        ),
+    );
+    let received = eval(
+        &path,
+        &format!(
+            r#"
+              remuda._butler_mail_config = {{
+                bus = {{ inboxes = {{}}, messages = {{}}, objects = {{}}, next = 0 }},
+                root = {root_lua}, json_quote = function(value) return '"' .. value .. '"' end,
+              }}
+              remuda.exec("butler/mail")
+              return remuda._butler_mail.inbox("fixer")
+            "#
+        ),
+    );
+    assert!(received.contains("survives a restart"), "{received:?}");
+    let after_read = eval(
+        &path,
+        &format!(
+            r#"
+              remuda._butler_mail_config = {{
+                bus = {{ inboxes = {{}}, messages = {{}}, objects = {{}}, next = 0 }},
+                root = {root_lua}, json_quote = function(value) return '"' .. value .. '"' end,
+              }}
+              remuda.exec("butler/mail")
+              return remuda._butler_mail.inbox("fixer")
+            "#
+        ),
+    );
+    assert_eq!(after_read, "inbox empty");
+}
+
+#[test]
+#[cfg(unix)]
+fn butler_initializes_mail_and_persists_a_sent_message() {
+    let dir = scratch_dir("butler-mail-init");
+    let data_home = dir.join("data");
+    let (token_path, config_path) = butler_config(
+        &dir,
+        "mail-init",
+        "http://127.0.0.1:1",
+        "!room:example.org",
+        "@butler:example.org",
+        "",
+    );
+    let token = token_path.to_string_lossy().to_string();
+    let config = config_path.to_string_lossy().to_string();
+    let data = data_home.to_string_lossy().to_string();
+    let daemon = Daemon::spawn_with_env(
+        &dir,
+        &[
+            ("REMUDA_BUTLER_TOKEN", token.as_str()),
+            ("REMUDA_BUTLER_CONFIG", config.as_str()),
+            ("XDG_DATA_HOME", data.as_str()),
+        ],
+    );
+    let path = daemon::socket_path_in(&dir, "s");
+    eval(
+        &path,
+        r#"
+          remuda._butler_argv = {"sh", "-c", "while read line; do :; done"}
+          remuda._butler_skip_relay = true
+        "#,
+    );
+    let out = remuda_timed(&dir, &["-s", "s", "exec", "butler"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let sent = eval(
+        &path,
+        r#"return remuda._butler_send("butler", "butler", "private body")"#,
+    );
+    assert!(sent.starts_with("queued message-"), "{sent:?}");
+    assert!(sent.ends_with(" and notified butler"), "{sent:?}");
+    let mail = data_home.join("remuda/butler/mail");
+    let objects: Vec<_> = std::fs::read_dir(mail.join("objects"))
+        .expect("body objects")
+        .collect::<Result<_, _>>()
+        .expect("read body objects");
+    assert_eq!(objects.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(objects[0].path()).expect("body object"),
+        "private body"
+    );
+    let envelopes: Vec<_> = std::fs::read_dir(mail.join("messages"))
+        .expect("message envelopes")
+        .collect::<Result<_, _>>()
+        .expect("read message envelopes");
+    assert_eq!(envelopes.len(), 1);
+    let envelope = std::fs::read_to_string(envelopes[0].path()).expect("message envelope");
+    assert!(envelope.contains("\"body\":{\"object_id\":\"object-"));
+    assert!(mail.join("inboxes/6275746c6572.jsonl").is_file());
+    drop(daemon);
 }
 
 /// Same live-`claude` limitation as the test above blocks a real kill-and-
@@ -2632,9 +2842,6 @@ fn butler_session_exited_hook_relaunches_via_the_shared_launch_function() {
     let launch_fn_idx = init_lua
         .find("local function launch_butler()")
         .expect("butler package lost its shared launch function");
-    let initial_call_idx = init_lua
-        .find("launch_butler()\n")
-        .expect("butler package never calls launch_butler() at load time");
     let clear_hooks_idx = init_lua
         .find("remuda.clear_hooks({ group = \"butler\" })")
         .expect("butler package lost its clear_hooks guard against a second exec");
@@ -2643,14 +2850,8 @@ fn butler_session_exited_hook_relaunches_via_the_shared_launch_function() {
         .expect("butler package lost its session_exited watchdog");
 
     assert!(
-        launch_fn_idx < initial_call_idx && initial_call_idx < clear_hooks_idx,
-        "expected launch_butler to be defined, then called once, before the \
-         watchdog is registered"
-    );
-    assert!(
-        clear_hooks_idx < session_exited_idx,
-        "expected clear_hooks({{group = \"butler\"}}) to run before the \
-         session_exited hook is (re-)registered, so a second exec can't double it"
+        launch_fn_idx < clear_hooks_idx && clear_hooks_idx < session_exited_idx,
+        "expected launch_butler to be defined before the guarded watchdog is registered"
     );
 
     let hook_body_end = init_lua[session_exited_idx..]
@@ -2659,9 +2860,13 @@ fn butler_session_exited_hook_relaunches_via_the_shared_launch_function() {
         .expect("session_exited hook is not registered in the \"butler\" group");
     let hook_body = &init_lua[session_exited_idx..hook_body_end];
     assert!(
-        hook_body.contains("launch_butler()"),
-        "the session_exited watchdog must relaunch via launch_butler(), not \
-         its own remuda.new call: {hook_body:?}"
+        hook_body.contains("remuda._butler_reconcile()"),
+        "the session_exited watchdog must use the shared reconciler: {hook_body:?}"
+    );
+    assert!(
+        init_lua.contains("name = \"butler-reconcile\"")
+            && init_lua.contains("remuda._butler_reconcile()\n"),
+        "butler needs a periodic reconciler as well as an exit event hook"
     );
 }
 
@@ -3235,7 +3440,8 @@ fn butler_watchdog_records_session_exit_and_relaunch_in_a_trace_file() {
 #[test]
 #[cfg(unix)]
 fn butler_session_trace_defaults_to_the_conventional_path_with_no_seam_set() {
-    let dir = scratch_dir("butler-session-trace-default");
+    // Keep the Unix socket path below macOS's short sockaddr_un limit.
+    let dir = scratch_dir("butler-trace-def");
     let home = dir.join("home");
     let butler_dir = home.join(".config/remuda/butler");
     std::fs::create_dir_all(&butler_dir).expect("mkdir conventional butler dir");

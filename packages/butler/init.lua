@@ -262,6 +262,7 @@ end
 
 local data_home = default_data_home()
 local butler_session_cwd = data_home and data_home .. "/remuda/butler/sessions/butler"
+local mail_root = data_home and data_home .. "/remuda/butler/mail"
 
 -- Fails loudly when Matrix has been configured -- naming the exact path it
 -- tried and mentioning the override -- rather than silently proceeding with
@@ -354,12 +355,14 @@ local runtime_dir = os.getenv("REMUDA_RUNTIME_DIR")
 -- local-only mode has no configuration directory to rely on, so use a private
 -- temporary filename for the same short-lived Claude MCP configuration.
 local mcp_config_path = config_path and (config_path .. ".mcp.json") or (os.tmpname() .. ".mcp.json")
-local status_path = config_path and (config_path .. ".status") or (os.tmpname() .. ".status")
+local status_path = remuda._butler_status_path
+  or (config_path and (config_path .. ".status") or (os.tmpname() .. ".status"))
 local function shell_quote(s)
   return "'" .. s:gsub("'", "'\\\"'\\\"'") .. "'"
 end
 local function json_quote(s)
-  return '"' .. s:gsub('\\', '\\\\'):gsub('"', '\\"') .. '"'
+  return '"' .. s:gsub('\\', '\\\\'):gsub('"', '\\"')
+    :gsub('\r', '\\r'):gsub('\n', '\\n'):gsub('\t', '\\t') .. '"'
 end
 local function status_settings(path)
   local helper_path = path .. ".py"
@@ -399,8 +402,12 @@ remuda.tool{
 -- deliberately live-image state, like Emacs: callers may inspect or extend it
 -- through `run_script`.  `caller.capability` is attribution supplied by that
 -- session's MCP child, not an access-control boundary.
-remuda._butler_bus = remuda._butler_bus or { agents = {}, tokens = {}, inboxes = {}, next = 0 }
+remuda._butler_bus = remuda._butler_bus or {
+  agents = {}, tokens = {}, inboxes = {}, messages = {}, objects = {}, next = 0,
+}
 local bus = remuda._butler_bus
+bus.messages = bus.messages or {}
+bus.objects = bus.objects or {}
 local function next_token(name)
   bus.next = bus.next + 1
   return name .. "-" .. os.time() .. "-" .. bus.next
@@ -409,10 +416,11 @@ local function caller_name(caller)
   local token = caller and caller.capability
   return (token and bus.tokens[token]) or "outside"
 end
-local function mailbox(name)
-  bus.inboxes[name] = bus.inboxes[name] or {}
-  return bus.inboxes[name]
-end
+remuda._butler_mail_config = { bus = bus, root = mail_root, json_quote = json_quote }
+remuda.exec("butler/mail")
+local mail = assert(remuda._butler_mail)
+local mailbox = mail.mailbox
+local queue_message = mail.queue
 local function agent_mcp_json(token)
   local env = '"REMUDA_BUTLER_SESSION_TOKEN":"' .. token .. '"'
   if runtime_dir then env = env .. ',"REMUDA_RUNTIME_DIR":"' .. runtime_dir .. '"' end
@@ -462,7 +470,22 @@ local function setup_telemetry(kind, spec)
   local adapter = TELEMETRY_ADAPTERS[kind]
   return adapter and adapter.setup and adapter.setup(spec) or {}
 end
-local function launch_agent(kind, requested_name, cwd, model)
+local function team_member_prompt(parent)
+  return "You are a Butler team member. Your leader is " .. parent .. ". "
+    .. "Work on the task sent to this terminal. When a work loop is complete, "
+    .. "use `remuda butler send-to-leader RESULT...` to report "
+    .. "a concise result. The Butler CLI is your coordination interface; you may "
+    .. "create a child team with `remuda butler topic delegate NAME --leader " .. parent
+    .. " TASK...` when useful."
+end
+local function write_agent_guidance(root, text)
+  local path = root .. "/AGENTS.md"
+  if file_exists(path) then return end
+  local f = assert(io.open(path, "w"))
+  f:write(text)
+  f:close()
+end
+local function launch_agent(kind, requested_name, cwd, model, parent, task)
   local name = requested_name or kind
   local token = next_token(name)
   local agent_telemetry = setup_telemetry(kind, { name = name, model = model })
@@ -470,15 +493,42 @@ local function launch_agent(kind, requested_name, cwd, model)
     name = name, token = token, model = model,
     settings_path = agent_telemetry.settings_path,
     telemetry = agent_telemetry,
+    system_prompt = parent and team_member_prompt(parent) or nil,
   })
-  local actual = remuda.new(name, argv, cwd)
+  local actual = remuda.new(name, argv, cwd, { REMUDA_BUTLER_SESSION_NAME = name })
   bus.tokens[token] = actual
-  bus.agents[actual] = { kind = kind, token = token, model = model, telemetry = agent_telemetry }
+  bus.agents[actual] = {
+    kind = kind, token = token, model = model, telemetry = agent_telemetry,
+    parent = parent, children = {},
+  }
+  if parent and bus.agents[parent] then
+    local children = bus.agents[parent].children
+    children[#children + 1] = actual
+  end
   mailbox(actual)
+  if task and task ~= "" then
+    local poke, attempts = nil, 0
+    poke = remuda.schedule({ every = 0.5, run = function()
+      attempts = attempts + 1
+      -- A short-lived launcher (or a failed executable) can disappear before
+      -- Codex has painted its composer. A deferred poke is best-effort; it
+      -- must not leave a throwing callback in the daemon's shared Lua image.
+      local captured, screen = pcall(remuda.capture, actual)
+      if not captured then
+        remuda.cancel(poke)
+        return
+      end
+      local ready = screen:find("Ask Codex", 1, true)
+      if ready or attempts >= 20 then
+        remuda.cancel(poke)
+        pcall(remuda.type_text, actual, task)
+      end
+    end })
+  end
   return actual
 end
 
-local function make_topic(name, template, kind)
+local function make_topic(name, template, kind, parent, task)
   load_topic_config()
   local root = topic_config.project_home .. "/" .. name
   remuda.mkdir(root)
@@ -502,7 +552,8 @@ local function make_topic(name, template, kind)
     assert(type(setup) == "function", "Butler topic template must be a function: " .. template)
     setup(topic)
   end
-  return launch_agent(kind or "claude", name, root)
+  write_agent_guidance(root, team_member_prompt(parent or "butler"))
+  return launch_agent(kind or "claude", name, root, nil, parent, task)
 end
 
 -- Shell-facing doors into the same deliberately mutable bus.  These are not
@@ -511,43 +562,68 @@ end
 -- Keeping them on `remuda` also makes the post office pleasant to explore from
 -- a REPL without having to know this chunk's private locals.
 function remuda._butler_launch(kind, name)
-  return launch_agent(kind, name)
+  return launch_agent(kind, name, nil, nil, "butler")
 end
 function remuda._butler_topic_new(name, template, kind)
-  return make_topic(name, template, kind)
+  return make_topic(name, template, kind, "butler")
+end
+function remuda._butler_topic_delegate(name, task, template, kind, parent)
+  parent = parent or "butler"
+  local leader = bus.agents[parent]
+  if not leader then error("no Butler leader named " .. tostring(parent), 0) end
+  return make_topic(name, template, kind or leader.kind, parent, task)
 end
 function remuda._butler_send(from, to, text)
   if not bus.agents[to] then error("no Butler agent named " .. tostring(to), 0) end
-  bus.next = bus.next + 1
-  local id = "message-" .. bus.next
-  mailbox(to)[#mailbox(to) + 1] = { id = id, from = from or "outside", body = text }
-  return "queued " .. id .. " for " .. to
+  local message, err = queue_message(from, to, text)
+  if not message then error(err, 0) end
+  local notice = "Butler message " .. message.id .. " from " .. message.from.session
+    .. " arrived. Read it: remuda butler inbox " .. to
+  local delivered, why = pcall(remuda.type_text, to, notice)
+  if delivered then return "queued " .. message.id .. " and notified " .. to end
+  return "queued " .. message.id .. " for " .. to .. "; terminal delivery deferred: " .. tostring(why)
 end
 function remuda._butler_inbox(name)
   if not bus.agents[name] then error("no Butler agent named " .. tostring(name), 0) end
-  local messages = mailbox(name)
-  if #messages == 0 then return "inbox empty" end
-  local out = {}
-  for _, message in ipairs(messages) do
-    out[#out + 1] = "[" .. message.id .. " from " .. message.from .. "] " .. message.body
-  end
-  bus.inboxes[name] = {}
-  return table.concat(out, "\n")
+  return mail.inbox(name)
+end
+function remuda._butler_report(from, text)
+  local agent = bus.agents[from]
+  if not agent then error("no Butler agent named " .. tostring(from), 0) end
+  if not agent.parent then error("Butler agent " .. from .. " has no leader to report to", 0) end
+  local queued = remuda._butler_send(from, agent.parent, text)
+  remuda.emit("butler/report", from, agent.parent, text)
+  return queued
 end
 function remuda._butler_sessions()
   local out = {}
-  for name, agent in pairs(bus.agents) do out[#out + 1] = name .. "\t" .. agent.kind end
+  for name, agent in pairs(bus.agents) do
+    out[#out + 1] = name .. "\t" .. agent.kind .. "\t" .. (agent.parent or "-")
+  end
   table.sort(out)
-  return #out == 0 and "no Butler agents" or "SESSION\tAGENT\n" .. table.concat(out, "\n")
+  return #out == 0 and "no Butler agents" or "SESSION\tAGENT\tLEADER\n" .. table.concat(out, "\n")
 end
 
 remuda.tool{
   name = "butler_launch",
-  about = "Launch a Claude Code or Codex agent with this Butler's shared MCP mailbox.",
+  about = "Launch a Claude Code or Codex child agent with this Butler's shared MCP mailbox.",
   args = { kind = "Agent kind: claude or codex.", name = "Optional session name.", cwd = "Optional working directory.", model = "Optional model override." },
   needs = { "kind" },
-  run = function(a)
-    return "launched " .. launch_agent(a.kind, a.name, a.cwd, a.model)
+  run = function(a, caller)
+    local parent = caller_name(caller)
+    if not bus.agents[parent] then parent = "butler" end
+    return "launched " .. launch_agent(a.kind, a.name, a.cwd, a.model, parent)
+  end,
+}
+remuda.tool{
+  name = "butler_delegate",
+  about = "Create a topic, start a child agent in it, and give it an initial task. The child reports each completed work loop to this leader.",
+  args = { name = "Topic and child-session name.", task = "Initial task for the child.", template = "Optional Butler topic template.", kind = "Optional agent kind; defaults to the leader's kind." },
+  needs = { "name", "task" },
+  run = function(a, caller)
+    local parent = caller_name(caller)
+    if not bus.agents[parent] then parent = "butler" end
+    return "delegated " .. remuda._butler_topic_delegate(a.name, a.task, a.template, a.kind, parent)
   end,
 }
 remuda.tool{
@@ -567,15 +643,21 @@ remuda.tool{
   end,
 }
 remuda.tool{
+  name = "butler_report",
+  about = "Report a completed work loop to this team member's Butler leader. This also emits the live butler/report hook.",
+  args = { text = "Concise result for the leader." },
+  needs = { "text" },
+  run = function(a, caller)
+    return remuda._butler_report(caller_name(caller), a.text)
+  end,
+}
+remuda.tool{
   name = "butler_reply",
-  about = "Reply to a received Butler message by its message id; the reply goes to its recorded sender.",
+  about = "Reply to a Butler agent.",
   args = { to = "Recipient session name.", text = "Reply body." },
   needs = { "to", "text" },
   run = function(a, caller)
-    if not bus.agents[a.to] then error("no Butler agent named " .. a.to, 0) end
-    bus.next = bus.next + 1
-    mailbox(a.to)[#mailbox(a.to) + 1] = { id = "message-" .. bus.next, from = caller_name(caller), body = a.text }
-    return "reply queued for " .. a.to
+    return remuda._butler_send(caller_name(caller), a.to, a.text)
   end,
 }
 remuda.tool{
@@ -586,15 +668,21 @@ remuda.tool{
   end,
 }
 
-local butler_token = next_token("butler")
+local existing_butler = bus.agents.butler
+local butler_kind = existing_butler and existing_butler.kind
+  or os.getenv("REMUDA_BUTLER_AGENT") or "claude"
+local butler_token = existing_butler and existing_butler.token or next_token("butler")
 bus.tokens[butler_token] = "butler"
-local butler_kind = os.getenv("REMUDA_BUTLER_AGENT") or "claude"
-local butler_telemetry = setup_telemetry(butler_kind, { name = "butler", status_path = status_path })
+local butler_telemetry = existing_butler and existing_butler.telemetry
+  or setup_telemetry(butler_kind, { name = "butler", status_path = status_path })
+status_path = butler_telemetry.status_path or status_path
+remuda._butler_status_path = status_path
 local settings_path = butler_telemetry.settings_path
-bus.agents.butler = {
+bus.agents.butler = existing_butler or {
   kind = butler_kind,
   token = butler_token,
   telemetry = butler_telemetry,
+  children = {},
 }
 mailbox("butler")
 local mcp_file = io.open(mcp_config_path, "w")
@@ -607,7 +695,11 @@ mcp_file:close()
 -- called" for an otherwise-unprompted incoming message.
 local SYSTEM_PROMPT = "Early in this session, call remuda._butler_register_compaction_schedule() "
   .. "via the run_script MCP tool, once, to enable this butler's own periodic "
-  .. "context-compaction upkeep."
+  .. "context-compaction upkeep. You lead a Butler team. Use the `remuda butler` CLI: "
+  .. "delegate a focused task with `topic delegate`, read completed work with `inbox`, "
+  .. "and give the next direction with `send`. Team members may lead children of their own."
+local BUTLER_GUIDANCE = "You are Butler, a manager of this household. You may spawn a new member session "
+  .. "and delegate things to do. Supervise it and manage the things to be done."
 if token_path then
   SYSTEM_PROMPT = "You are bridged into one Matrix room via remuda. "
     .. "Every line you receive here that starts with \"[matrix · \" is a "
@@ -671,22 +763,25 @@ end
 local butler_name = remuda._butler_name
 local function session_exists(name)
   for _, session in ipairs(remuda.ls()) do
-    if session.name == name then return true end
+    if session.name == name and session.alive then return true end
   end
   return false
 end
 local function launch_butler()
   local requested_name = butler_name or remuda._butler_initial_name
+  if butler_session_cwd then
+    remuda.mkdir(butler_session_cwd)
+    write_agent_guidance(butler_session_cwd, BUTLER_GUIDANCE)
+  end
   if session_exists(requested_name) then
     butler_name = requested_name
     remuda._butler_name = butler_name
     return
   end
-  if butler_session_cwd then remuda.mkdir(butler_session_cwd) end
   butler_name = remuda.new(requested_name, BUTLER_ARGV, butler_session_cwd)
   remuda._butler_name = butler_name
+  return butler_name
 end
-launch_butler()
 
 -- Reused across every re-`exec` and every later call from the launched
 -- session's own run_script -- a plain Lua local would NOT survive either
@@ -759,13 +854,33 @@ end
 -- otherwise double this hook (see docs/design.md's augroup note) --
 -- clearing the group first keeps exactly one watchdog alive.
 remuda.clear_hooks({ group = "butler" })
+function remuda._butler_reconcile()
+  local ok, result = pcall(launch_butler)
+  if not ok then
+    _butler_session_trace("reconcile_error", tostring(result))
+    return nil, result
+  end
+  return result
+end
 remuda.on("session_exited", function(name)
   _butler_session_trace("session_exited", name)
   if name == butler_name then
     _butler_session_trace("relaunching", name)
-    launch_butler()
+    remuda._butler_reconcile()
   end
 end, { group = "butler" })
+
+if remuda._butler_reconcile_schedule then
+  remuda.cancel(remuda._butler_reconcile_schedule)
+end
+remuda._butler_reconcile_schedule = remuda.schedule({
+  name = "butler-reconcile",
+  every = remuda._butler_reconcile_interval or 2,
+  run = function()
+    remuda._butler_reconcile()
+  end,
+})
+remuda._butler_reconcile()
 
 remuda.on("butler-compaction-submit", function()
   remuda.send(butler_name, "")

@@ -28,7 +28,9 @@ remuda butler — lightweight coordination for managed agents
   remuda butler sessions
   remuda butler launch <claude|codex> [name]
   remuda butler topic new <name> [--template T] [--agent A]
+  remuda butler topic delegate <name> <task...> [--agent A] [--leader L]
   remuda butler send <from> <to> <message...>
+  remuda butler send-to-leader <message...>
   remuda butler inbox <name>
 
 Butler is live state in the remuda daemon. Start it with:
@@ -72,6 +74,28 @@ fn butler_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         | ["topic", "new", name, "--agent", agent, "--template", template] => {
             topic_new(server, path, name, Some(template), Some(agent))
         }
+        ["topic", "delegate", name, "--leader", leader, "--agent", agent, task @ ..]
+        | ["topic", "delegate", name, "--agent", agent, "--leader", leader, task @ ..]
+            if !task.is_empty() =>
+        {
+            topic_delegate(
+                server,
+                path,
+                name,
+                &task.join(" "),
+                Some(agent),
+                Some(leader),
+            )
+        }
+        ["topic", "delegate", name, "--leader", leader, task @ ..] if !task.is_empty() => {
+            topic_delegate(server, path, name, &task.join(" "), None, Some(leader))
+        }
+        ["topic", "delegate", name, "--agent", agent, task @ ..] if !task.is_empty() => {
+            topic_delegate(server, path, name, &task.join(" "), Some(agent), None)
+        }
+        ["topic", "delegate", name, task @ ..] if !task.is_empty() => {
+            topic_delegate(server, path, name, &task.join(" "), None, None)
+        }
         ["send", from, to, message @ ..] if !message.is_empty() => {
             with_daemon(server, path, |path| {
                 eval(
@@ -85,6 +109,9 @@ fn butler_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                 )
             })
         }
+        ["send-to-leader", message @ ..] if !message.is_empty() => {
+            send_to_leader(server, path, message)
+        }
         ["inbox", name] => with_daemon(server, path, |path| {
             eval(
                 path,
@@ -96,6 +123,48 @@ fn butler_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn send_to_leader(server: &str, path: &Path, message: &[&str]) -> ExitCode {
+    let Ok(from) = std::env::var("REMUDA_BUTLER_SESSION_NAME") else {
+        return fail(
+            "send-to-leader needs REMUDA_BUTLER_SESSION_NAME; run it inside a Butler agent session",
+        );
+    };
+    with_daemon(server, path, |path| {
+        eval(
+            path,
+            &format!(
+                "return remuda._butler_report({}, {})",
+                lua_string(&from),
+                lua_string(&message.join(" "))
+            ),
+        )
+    })
+}
+
+fn topic_delegate(
+    server: &str,
+    path: &Path,
+    name: &str,
+    task: &str,
+    agent: Option<&str>,
+    leader: Option<&str>,
+) -> ExitCode {
+    with_daemon(server, path, |path| {
+        eval(
+            path,
+            &format!(
+                "return remuda._butler_topic_delegate({}, {}, nil, {}, {})",
+                lua_string(name),
+                lua_string(task),
+                agent.map(lua_string).unwrap_or_else(|| "nil".into()),
+                leader
+                    .map(lua_string)
+                    .unwrap_or_else(|| "\"butler\"".into()),
+            ),
+        )
+    })
 }
 
 fn topic_new(

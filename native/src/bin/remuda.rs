@@ -25,8 +25,8 @@ use std::process::ExitCode;
 
 #[path = "remuda/butler_cli.rs"]
 mod butler_cli;
-#[path = "remuda/json_rpc_terminal.rs"]
-mod json_rpc_terminal;
+#[path = "remuda/codex_tui.rs"]
+mod codex_tui;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -67,7 +67,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
 
-        ["_json_rpc_terminal", rest @ ..] => json_rpc_terminal::run(rest),
+        ["_codex_tui", rest @ ..] => codex_tui::run(rest),
 
         // No daemon involved: this replaces the binary, it does not talk to one.
         ["upgrade", rest @ ..] => run_upgrade(rest),
@@ -466,9 +466,18 @@ fn split_server_flag(args: &[String]) -> (&str, &[String]) {
 
 /// Run `f`, starting the named daemon first if nothing is listening yet.
 fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> ExitCode {
-    if remuda_native::ipc::connect(path).is_err() {
-        if let Err(e) = start_daemon(server, path) {
-            return fail(e);
+    match remuda_native::ipc::connect(path) {
+        Ok(_) => {}
+        Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => {
+            if let Err(e) = start_daemon(server, path) {
+                return fail(e);
+            }
+        }
+        Err(error) => {
+            return fail(format!(
+                "cannot connect to remuda daemon at {}: {error}; refusing to start a second daemon",
+                path.display()
+            ));
         }
     }
     f(path)

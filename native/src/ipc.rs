@@ -29,6 +29,21 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
     Stream::connect(name(path)?)
 }
 
+/// Whether a failed client connection is evidence that it is safe to start a
+/// daemon.  A missing endpoint is safe.  On Unix, a refused connection to an
+/// existing socket is the normal stale-socket case after a crash.  Other
+/// failures (permissions, bad address, transient I/O) must remain visible:
+/// treating them as "no daemon" can start a second daemon and split control
+/// state from the sessions the first daemon still owns.
+pub fn may_start_daemon(path: &Path, error: &io::Error) -> bool {
+    match error.kind() {
+        io::ErrorKind::NotFound => true,
+        #[cfg(unix)]
+        io::ErrorKind::ConnectionRefused => path.exists(),
+        _ => false,
+    }
+}
+
 /// Bind, after clearing what a crashed daemon left behind. That cleanup is the
 /// one genuinely platform-shaped step: a unix socket is a file in a directory
 /// that may not exist yet, and a named pipe is neither.
@@ -38,12 +53,56 @@ pub fn listen(path: &Path) -> io::Result<Listener> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        // Nothing answered at this address (the caller checked), so any file
-        // here is stale. Removing it is what lets bind succeed instead of
-        // failing forever on an address already in use.
-        let _ = std::fs::remove_file(path);
+        if path.exists() {
+            match connect(path) {
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "Remuda daemon is already listening",
+                    ));
+                }
+                Err(error) if may_start_daemon(path, &error) => {
+                    std::fs::remove_file(path)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
     ListenerOptions::new().name(name(path)?).create_sync()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_absence_or_a_refused_existing_unix_socket_allows_autostart() {
+        let path = std::env::temp_dir().join(format!("remuda-ipc-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        assert!(may_start_daemon(
+            &path,
+            &io::Error::from(io::ErrorKind::NotFound)
+        ));
+        assert!(!may_start_daemon(
+            &path,
+            &io::Error::from(io::ErrorKind::PermissionDenied)
+        ));
+
+        #[cfg(unix)]
+        {
+            assert!(!may_start_daemon(
+                &path,
+                &io::Error::from(io::ErrorKind::ConnectionRefused)
+            ));
+            std::fs::write(&path, "not a socket").expect("temporary endpoint marker");
+            assert!(may_start_daemon(
+                &path,
+                &io::Error::from(io::ErrorKind::ConnectionRefused)
+            ));
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Wake a thread blocked reading `stream`, from another thread. Not a close:

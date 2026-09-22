@@ -210,6 +210,39 @@ Template parsing and setup happen only within `topic new`. A bad Lua template
 or a failed setup command reports that topic command as an error; it never
 stops the already-running Butler service or its other agents.
 
+### Teams and completed work loops
+
+`remuda butler topic delegate NAME TASK...` creates a topic and makes its
+agent a child of the root Butler. It immediately sends `TASK` to that child.
+The default child adapter is its leader's adapter, so a Codex Butler creates a
+Codex child; `--agent codex` selects it explicitly. `remuda butler sessions`
+shows each session's `LEADER` column.
+
+The coordination contract is CLI-first, not an MCP tool schema repeatedly
+injected into every agent context. A child reports a completed loop with
+`remuda butler send-to-leader RESULT...`. Butler injects
+`REMUDA_BUTLER_SESSION_NAME` into every agent process, and its leader is found
+from the stored relationship. The result is queued for the leader's `butler inbox` and
+emitted as the live `butler/report` hook (`from`, `to`, `text`). A team member
+creates a nested child with `remuda butler topic delegate NAME --leader SELF
+TASK...`, then directs it with `remuda butler send SELF CHILD MESSAGE...`.
+
+### Local mail
+
+Butler messages have an email-shaped JSON envelope: stable message ID, local
+`{host, session}` sender and recipient addresses, subject, UTC creation time,
+content type, and a body object reference. The terminal receives only a short
+notification with the message ID and sender; `remuda butler inbox NAME` reads
+the body. The body is not duplicated into the terminal transcript.
+
+For now, each local send also writes durable files below
+`${XDG_DATA_HOME:-$HOME/.local/share}/remuda/butler/mail`: a raw body object,
+a JSON envelope, a recipient inbox JSONL entry, and read-state. A new Butler
+Lua mailbox reloads unread entries from those files; read entries remain read.
+This is local-only materialization, not yet a remote relay or hash worker.
+Keeping the envelope and object reference distinct makes those later additions
+compatible rather than migratory.
+
 The helper and the session talk to each other through the same line-oriented
 channel any `remuda.process` caller gets, so the format has to survive being
 squeezed through it: `sender<TAB>escaped-body`, one physical line per Matrix
