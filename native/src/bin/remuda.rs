@@ -25,6 +25,8 @@ use std::process::ExitCode;
 
 #[path = "remuda/butler_cli.rs"]
 mod butler_cli;
+#[path = "remuda/codex_app_server.rs"]
+mod codex_app_server;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -64,6 +66,8 @@ fn main() -> ExitCode {
             println!("remuda {}", dist::BUILD_VERSION);
             ExitCode::SUCCESS
         }
+
+        ["_codex_app_server", rest @ ..] => codex_app_server::run(rest),
 
         // No daemon involved: this replaces the binary, it does not talk to one.
         ["upgrade", rest @ ..] => run_upgrade(rest),

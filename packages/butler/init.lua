@@ -435,10 +435,17 @@ local function agent_mcp_flags(token)
     "-c", "mcp_servers.remuda.env={" .. env .. "}",
   }
 end
+local function agent_mcp_config(token)
+  local env = '"REMUDA_BUTLER_SESSION_TOKEN":"' .. token .. '"'
+  if runtime_dir then env = env .. ',"REMUDA_RUNTIME_DIR":"' .. runtime_dir .. '"' end
+  return '{"mcp_servers":{"remuda":{"command":"remuda","args":["-s","'
+    .. server .. '","mcp"],"env":{' .. env .. '}}}}'
+end
 remuda._butler_agent_builders = remuda._butler_agent_builders or {}
 remuda._butler_agent_support = {
   mcp_config_path = agent_mcp_path,
   mcp_flags = agent_mcp_flags,
+  mcp_config = agent_mcp_config,
   status_settings = status_settings,
 }
 remuda.exec("butler/telemetry")
@@ -462,6 +469,7 @@ local function launch_agent(kind, requested_name, cwd, model)
   local argv = build_agent_argv(kind, {
     name = name, token = token, model = model,
     settings_path = agent_telemetry.settings_path,
+    telemetry = agent_telemetry,
   })
   local actual = remuda.new(name, argv, cwd)
   bus.tokens[token] = actual
@@ -652,6 +660,7 @@ local BUTLER_ARGV = remuda._butler_argv
 if not BUTLER_ARGV then
   BUTLER_ARGV = build_agent_argv(butler_kind, {
     name = "butler", token = butler_token, mcp_config_path = mcp_config_path, settings_path = settings_path,
+    telemetry = butler_telemetry,
     system_prompt = SYSTEM_PROMPT,
   })
 end
