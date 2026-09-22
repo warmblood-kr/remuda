@@ -173,6 +173,31 @@ pub fn update_all() -> Result<Vec<InstallReport>, String> {
     names.into_iter().map(|name| update(&name)).collect()
 }
 
+/// Remove one explicitly installed mod. The manifest is checked before the
+/// directory is removed, so a malformed or substituted path is never treated
+/// as an extension owned by Remuda.
+pub fn remove(name: &str) -> Result<Manifest, String> {
+    if !valid_component(name) {
+        return Err(format!("invalid installed mod name {name:?}"));
+    }
+    let root = extensions_dir()?.join(name);
+    let metadata = fs::symlink_metadata(&root)
+        .map_err(|error| format!("cannot inspect installed mod {name}: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!("installed mod {name} is not a real directory"));
+    }
+    ensure_safe_extension_target(&root)?;
+    let spec = read_manifest(&root.join("extension.toml"))?;
+    if spec.name != name {
+        return Err(format!(
+            "installed mod directory {name} disagrees with manifest name {}",
+            spec.name
+        ));
+    }
+    fs::remove_dir_all(&root).map_err(|error| format!("cannot remove mod {name}: {error}"))?;
+    Ok(manifest_from_spec(spec, "removed"))
+}
+
 /// Validate a local mod checkout without installing or mutating a daemon.
 /// This is the deterministic half of the extension development harness:
 /// manifest, paths, symlinks, Lua syntax, and the host API version are checked

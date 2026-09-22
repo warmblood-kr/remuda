@@ -18,6 +18,7 @@ remuda mod install warmblood-kr/remuda-butler
 remuda mod test path/to/remuda-mod
 remuda mod update butler
 remuda mod update --all
+remuda mod remove butler
 ```
 
 The default output is reStructuredText, and the JSON form is intended for
@@ -40,6 +41,9 @@ extension-specific parser.
 `remuda mod update NAME` and `remuda mod update --all` reuse each installed
 mod's recorded GitHub source and ref, validate the new checkout, and replace
 the old copy only after validation succeeds.
+`remuda mod remove NAME` removes an installed extension directory. It does not
+restart a daemon or stop sessions; already-loaded Lua definitions remain live
+until the next daemon restart.
 
 An extension repository declares `api = "remuda-lua-v1"` in its
 `extension.toml`. `remuda mod test PATH` is the deterministic local check: it

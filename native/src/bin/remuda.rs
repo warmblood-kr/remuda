@@ -122,6 +122,7 @@ fn main() -> ExitCode {
         ["mod", "info", rest @ ..] => mod_info_command(rest),
         ["mod", "test", rest @ ..] => mod_test_command(rest),
         ["mod", "update", rest @ ..] => mod_update_command(rest),
+        ["mod", "remove", rest @ ..] => mod_remove_command(rest),
 
         ["doc", rest @ ..] => with_daemon(server, &path, |path| doc_command(path, rest)),
 
@@ -172,6 +173,7 @@ remuda — a pty manager you can attach to
   remuda mod test PATH            validate a local mod checkout
   remuda mod update NAME          update one installed mod
   remuda mod update --all         update all installed mods
+  remuda mod remove NAME          remove one installed mod
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
@@ -797,6 +799,22 @@ fn mod_update_command(args: &[&str]) -> ExitCode {
                 );
             }
             println!("reload with `remuda exec NAME` or restart the daemon");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error),
+    }
+}
+
+fn mod_remove_command(args: &[&str]) -> ExitCode {
+    let [name] = args else {
+        return fail("usage: remuda mod remove NAME");
+    };
+    match remuda_native::packages::remove(name) {
+        Ok(manifest) => {
+            println!("removed mod {}", manifest.name);
+            println!(
+                "a running daemon keeps its loaded Lua definitions until restart; no session was stopped"
+            );
             ExitCode::SUCCESS
         }
         Err(error) => fail(error),
