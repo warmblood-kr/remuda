@@ -66,12 +66,18 @@ pub enum Action {
     /// `focus_session` succeeded: keyboard and mouse now point at this name.
     /// `run`'s `reconcile_hold` re-attaches if it differs from what's held.
     Focus(String),
+    Scroll(i16),
 }
 
 pub struct Ui {
     pub sessions: Vec<SessionSummary>,
     pub selected: usize,
     pub pan: u16,
+    /// `None` follows the normal content-aware width; `Some` is a user drag
+    /// or the compact-list toggle.
+    pub list_width: Option<u16>,
+    dragging_divider: bool,
+    last_resized: Option<(String, Size)>,
     pub mode: Mode,
     pub focus: Focus,
     /// What `n` prefills the prompt with. Held rather than read at the prompt,
@@ -94,6 +100,9 @@ impl Ui {
             sessions,
             selected: 0,
             pan: 0,
+            list_width: None,
+            dragging_divider: false,
+            last_resized: None,
             // An empty herd asks rather than acting: it says what to press and
             // waits. It must never spawn a shell on its own — that silent spawn
             // is half of the incident `steps/012` is named after.
@@ -135,7 +144,7 @@ impl Ui {
         if self.mode != Mode::Browse {
             return Action::Nothing;
         }
-        let (list_w, preview_w) = layout(cols, widest(self));
+        let (list_w, preview_w) = ui_layout(self, cols);
         let body = rows.saturating_sub(1);
         // crossterm's column/row are 0-based; the frame's own rows are
         // 1-based (row 1 is the header, row `body+1` is the footer — see
@@ -143,12 +152,32 @@ impl Ui {
         let col = event.column + 1;
         let row = event.row + 1;
 
+        if self.dragging_divider {
+            match event.kind {
+                MouseEventKind::Drag(MouseButton::Left) => self.set_list_width(col, cols),
+                MouseEventKind::Up(MouseButton::Left) => self.dragging_divider = false,
+                _ => {}
+            }
+            return Action::Nothing;
+        }
+
+        if matches!(event.kind, MouseEventKind::ScrollUp) && col > list_w + 1 {
+            return Action::Scroll(3);
+        }
+        if matches!(event.kind, MouseEventKind::ScrollDown) && col > list_w + 1 {
+            return Action::Scroll(-3);
+        }
+
         if col <= list_w {
             return self.click_list_row(event.kind, row, body);
         }
         // `col == list_w + 1` is the divider itself — between the two panes,
         // part of neither. Anything past it is the session pane.
-        if col <= list_w + 1 {
+        if col == list_w + 1 {
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left) => self.dragging_divider = true,
+                _ => {}
+            }
             return Action::Nothing;
         }
         self.click_session_pane(event.kind, row, col - list_w - 1, body, preview_w)
@@ -252,11 +281,11 @@ impl Ui {
                 Action::Nothing
             }
             KeyCode::Char('h') => {
-                self.pan = self.pan.saturating_sub(8);
+                self.list_width = None;
                 Action::Nothing
             }
             KeyCode::Char('l') => {
-                self.pan = self.pan.saturating_add(8);
+                self.toggle_compact_list();
                 Action::Nothing
             }
             KeyCode::Char('n') => {
@@ -342,6 +371,19 @@ impl Ui {
             _ => Action::Nothing,
         }
     }
+
+    fn toggle_compact_list(&mut self) {
+        self.list_width = if self.list_width.is_some() {
+            None
+        } else {
+            Some(16)
+        };
+    }
+
+    fn set_list_width(&mut self, width: u16, cols: u16) {
+        let usable = cols.saturating_sub(1);
+        self.list_width = Some(width.clamp(16, usable.saturating_sub(16)));
+    }
 }
 
 /// Ctrl-\, the key `remuda attach` already detaches by. ⚠ Also true of Ctrl-4:
@@ -396,6 +438,16 @@ pub fn layout(term_cols: u16, widest: u16) -> (u16, u16) {
     let usable = term_cols.saturating_sub(1);
     let list = usable.saturating_sub(widest).clamp(16, 40).min(usable);
     (list, usable - list)
+}
+
+fn ui_layout(ui: &Ui, term_cols: u16) -> (u16, u16) {
+    let usable = term_cols.saturating_sub(1);
+    let automatic = layout(term_cols, widest(ui)).0;
+    let list = ui
+        .list_width
+        .unwrap_or(automatic)
+        .clamp(16, usable.saturating_sub(16));
+    (list, usable.saturating_sub(list))
 }
 
 /// Display columns a unit of session content claims. `char`'s answer of 1
@@ -591,7 +643,7 @@ fn fit(text: &str, width: u16) -> String {
 /// The whole frame as one string of text and ANSI cursor moves. Pure on
 /// purpose: this is the part a test can read without owning a terminal.
 pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> String {
-    let (list_w, preview_w) = layout(cols, widest(ui));
+    let (list_w, preview_w) = ui_layout(ui, cols);
     let body = rows.saturating_sub(1);
     // The border, and the only thing on screen that is always saying where the
     // keyboard is pointing. A prefix key's state is invisible; this is not.
@@ -807,7 +859,7 @@ pub fn render_styled(
     cols: u16,
     rows: u16,
 ) -> String {
-    let (list_w, preview_w) = layout(cols, widest(ui));
+    let (list_w, preview_w) = ui_layout(ui, cols);
     let body = rows.saturating_sub(1);
     let divider = match ui.focus {
         Focus::List => "│",
@@ -871,7 +923,7 @@ fn list_viewport(ui: &Ui, body: u16) -> usize {
 /// The current size requested for the selected session panel. `Size::new`
 /// still floors it at 80×24 so agent TUIs retain a usable compositor.
 pub fn pane_size(ui: &Ui, cols: u16, rows: u16) -> Size {
-    let (_, preview_w) = layout(cols, widest(ui));
+    let (_, preview_w) = ui_layout(ui, cols);
     Size::new(preview_w, rows.saturating_sub(1))
 }
 
@@ -936,9 +988,9 @@ fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
             Some(notice) => format!("remuda: {notice}"),
             None if ui.sessions.is_empty() => "n new   q quit".into(),
             None if cut => format!(
-                "↑↓ select   ⏎ enter   n new   x kill   showing {preview_w} cols — h/l pans   q quit"
+                "↑↓/jk select   ⏎ enter   n new   x kill   l list   showing {preview_w} cols   q quit"
             ),
-            None => "↑↓ select   ⏎ enter   n new   x kill   q quit".into(),
+            None => "↑↓/jk select   ⏎ enter   n new   x kill   l list   q quit".into(),
         },
     }
 }
@@ -963,7 +1015,6 @@ fn refresh(
     held: &mut Option<(String, Hold)>,
     painted: &mut String,
     shown: &mut Option<ShownTarget>,
-    resized: &mut Option<(String, Size)>,
     skip_list: bool,
     selection_moved: bool,
 ) -> std::io::Result<(u16, u16)> {
@@ -979,7 +1030,7 @@ fn refresh(
         // `Type`-forced wake (fast-typing tick) needs none of this, so
         // paying for it there would be the exact per-keystroke IPC cost
         // steps/017/022 exist to avoid.
-        let (list_w, _) = layout(cols, widest(ui));
+        let (list_w, _) = ui_layout(ui, cols);
         match sessions_buffer_lines(path, list_w, ui.selected) {
             Ok((session_rows, lines)) => {
                 ui.session_rows = session_rows;
@@ -1027,14 +1078,14 @@ fn refresh(
     }
     if let Some(ShownTarget::Session(name)) = shown.as_ref() {
         let target = pane_size(ui, cols, rows);
-        if resized.as_ref() != Some(&(name.clone(), target)) {
+        if ui.last_resized.as_ref() != Some(&(name.clone(), target)) {
             match resize(path, name, target) {
-                Ok(()) => *resized = Some((name.clone(), target)),
+                Ok(()) => ui.last_resized = Some((name.clone(), target)),
                 Err(e) => ui.notice = Some(format!("{name}: {e}")),
             }
         }
     } else {
-        *resized = None;
+        ui.last_resized = None;
     }
     let (cells, cursor) = match shown.as_ref() {
         Some(ShownTarget::Session(name)) => match capture_styled(path, name) {
@@ -1113,7 +1164,6 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     // What the window last reported showing — refreshed only on a
     // non-skip_list wake, and reused as-is on a Type-forced one.
     let mut shown: Option<ShownTarget> = None;
-    let mut resized: Option<(String, Size)> = None;
     let mut last_refresh = Instant::now();
     let mut force_refresh = true;
     // Set only by an `Action::Type` below, consumed by the very next refresh,
@@ -1141,7 +1191,6 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 &mut held,
                 &mut painted,
                 &mut shown,
-                &mut resized,
                 skip_list,
                 selection_moved,
             )?;
@@ -1192,6 +1241,13 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             }
             Action::Kill(name) => ui.notice = kill(path, &name).err(),
             Action::Focus(name) => reconcile_hold(path, &mut ui, &mut held, &name),
+            Action::Scroll(delta) => {
+                if let Some(session) = ui.selected() {
+                    if let Err(e) = scrollback(path, &session.name, delta) {
+                        ui.notice = Some(e);
+                    }
+                }
+            }
         }
         // Not `painted.clear()`: the frame-vs-`painted` compare in `refresh`
         // already skips the write when a key changed nothing visible — see
@@ -1377,6 +1433,20 @@ fn resize(path: &Path, name: &str, size: Size) -> Result<(), String> {
         &Request::Resize {
             name: name.to_string(),
             size,
+        },
+    ) {
+        Ok(Response::Ok) => Ok(()),
+        Ok(Response::Error(reason)) => Err(reason),
+        other => Err(format!("{other:?}")),
+    }
+}
+
+fn scrollback(path: &Path, name: &str, delta: i16) -> Result<(), String> {
+    match client::request(
+        path,
+        &Request::Scrollback {
+            name: name.into(),
+            delta,
         },
     ) {
         Ok(Response::Ok) => Ok(()),
@@ -1637,6 +1707,47 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(ui.on_mouse(event, 80, 24), Action::Nothing);
+    }
+
+    #[test]
+    fn dragging_the_divider_sets_a_clamped_list_width() {
+        let mut ui = ui(vec![row("a", true, false)]);
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 39,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        ui.on_mouse(down, 120, 24);
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 54,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        ui.on_mouse(drag, 120, 24);
+        assert_eq!(ui.list_width, Some(55));
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 54,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+        ui.on_mouse(up, 120, 24);
+        assert!(!ui.dragging_divider);
+    }
+
+    #[test]
+    fn l_toggles_a_compact_list_and_jk_move_selection() {
+        let mut ui = ui(vec![row("a", true, false), row("b", true, false)]);
+        ui.on_key(press(KeyCode::Char('l')));
+        assert_eq!(ui.list_width, Some(16));
+        ui.on_key(press(KeyCode::Char('l')));
+        assert_eq!(ui.list_width, None);
+        ui.on_key(press(KeyCode::Char('j')));
+        assert_eq!(ui.selected, 1);
+        ui.on_key(press(KeyCode::Char('k')));
+        assert_eq!(ui.selected, 0);
     }
 
     /// Nothing is attached, so a click landing where the pane *would* be has
@@ -2739,7 +2850,7 @@ mod tests {
             frame.contains("showing"),
             "a crop that reads as absence is the bug"
         );
-        assert!(frame.contains("h/l pans"));
+        assert!(frame.contains("l list"));
     }
 
     #[test]

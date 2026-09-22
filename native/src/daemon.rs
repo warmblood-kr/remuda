@@ -343,6 +343,12 @@ fn handle(
             })
         }
 
+        Request::Scrollback { name, delta } => {
+            respond(&stream, &name, registry.scrollback(&name, delta), |()| {
+                Response::Ok
+            })
+        }
+
         Request::Capture { name } => respond(
             &stream,
             &name,

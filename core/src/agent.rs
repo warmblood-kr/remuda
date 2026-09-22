@@ -183,6 +183,12 @@ pub trait AgentProcess: Send {
         Ok(())
     }
 
+    /// Move through retained terminal history. Positive values move toward
+    /// older output; negative values return toward the live screen.
+    fn scrollback(&mut self, _delta: i16) -> Result<()> {
+        Ok(())
+    }
+
     /// The current terminal size.
     fn size(&self) -> Size;
 }

@@ -36,6 +36,7 @@ type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 /// BEFORE emitting anything and waits: unanswered, the child is alive and the
 /// screen is blank forever. Measured on a windows-latest runner; see steps/010.
 const DSR_CURSOR: &[u8] = b"\x1b[6n";
+const SCROLLBACK_ROWS: usize = 10_000;
 
 fn io<E: std::fmt::Display>(e: E) -> AgentError {
     AgentError::Io(e.to_string())
@@ -83,7 +84,11 @@ impl PtyAgent {
 
         let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer().map_err(io)?));
         let reader = pair.master.try_clone_reader().map_err(io)?;
-        let screen = Arc::new(Mutex::new(vt100::Parser::new(size.rows(), size.cols(), 0)));
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(
+            size.rows(),
+            size.cols(),
+            SCROLLBACK_ROWS,
+        )));
         let watchers: Watchers = Arc::new(Mutex::new(Vec::new()));
         spawn_reader(
             reader,
@@ -264,6 +269,14 @@ impl AgentProcess for PtyAgent {
             .screen_mut()
             .set_size(size.rows(), size.cols());
         self.size = size;
+        Ok(())
+    }
+
+    fn scrollback(&mut self, delta: i16) -> Result<()> {
+        let mut parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
+        let screen = parser.screen_mut();
+        let next = (screen.scrollback() as i64 + i64::from(delta)).max(0) as usize;
+        screen.set_scrollback(next);
         Ok(())
     }
 

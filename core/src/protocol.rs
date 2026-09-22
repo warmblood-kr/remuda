@@ -51,6 +51,8 @@ pub enum Request {
     /// Resize a session's terminal to its viewer panel. The size is clamped
     /// during deserialization just like `New`.
     Resize { name: String, size: Size },
+    /// Move a session's retained terminal history; positive means older.
+    Scrollback { name: String, delta: i16 },
     /// Read the screen as text without taking the session over. Needs no
     /// terminal, raw mode or exclusivity, so it works while a human is attached.
     Capture { name: String },

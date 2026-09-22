@@ -174,6 +174,10 @@ impl Registry {
         self.get(name).map(|s| s.resize(size))
     }
 
+    pub fn scrollback(&self, name: &str, delta: i16) -> Option<Result<()>> {
+        self.get(name).map(|s| s.scrollback(delta))
+    }
+
     pub fn screen_text(&self, name: &str) -> Option<Result<String>> {
         self.get(name).map(|s| s.screen_text())
     }
