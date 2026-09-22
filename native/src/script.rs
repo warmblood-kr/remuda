@@ -440,15 +440,16 @@ fn new_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Resu
 
 /// `remuda.exec(name)` — split out of `bindings` for its line cap. Reentrant-
 /// safe: a nested `lua.load(...).exec()` on this same `Lua`, not a new
-/// interpreter. Resolves through `crate::packages::builtin`, same as CLI `exec`.
+/// interpreter. Installed modules take precedence over embedded modules.
 fn exec_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
     table.set(
         "exec",
         lua.create_function(move |lua, name: String| {
-            let source = crate::packages::builtin(&name)
+            let package = crate::packages::resolve(&name)
+                .map_err(mlua::Error::runtime)?
                 .ok_or_else(|| mlua::Error::runtime(format!("no such package: {name}")))?;
-            lua.load(source)
-                .set_name(format!("packages/{name}/init.lua"))
+            lua.load(&package.source)
+                .set_name(package.chunk_name)
                 .exec()
         })?,
     )

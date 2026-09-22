@@ -119,13 +119,11 @@ fn main() -> ExitCode {
         // long-lived image, so what it defines is still there next time.
         ["-e", code] => with_daemon(server, &path, |path| eval_once(path, code)),
 
-        // The reference manual, generated from the same registry `remuda.tool`
-        // and every Rust binding write into — never hand-maintained.
-        ["extension", "list", rest @ ..] => extension_list_command(rest),
+        ["mod", "install", rest @ ..] => mod_install_command(rest),
+        ["mod", "list", rest @ ..] => mod_list_command(rest),
+        ["mod", "info", rest @ ..] => mod_info_command(rest),
 
-        ["doc", rest @ ..] | ["extension", "info", rest @ ..] => {
-            with_daemon(server, &path, |path| doc_command(path, rest))
-        }
+        ["doc", rest @ ..] => with_daemon(server, &path, |path| doc_command(path, rest)),
 
         ["repl"] => with_daemon(server, &path, repl),
 
@@ -166,18 +164,18 @@ remuda — a pty manager you can attach to
   remuda send <name> <text>     deliver one instruction (body + Enter)
 
   remuda lua <script.lua>       run a Lua script in the daemon's living image
-  remuda exec <name>            run a built-in package's entry file, by name
+  remuda exec <name>            run an installed or built-in Lua package
   remuda butler                 run the Butler extension
   remuda butler help             show Butler coordination commands
   remuda butler sessions         list Butler-managed agent sessions
   remuda butler launch KIND [N]  launch a claude or codex session
   remuda butler send FROM TO MSG queue a message for an agent
   remuda butler inbox NAME       drain an agent's queued messages
+  remuda mod install OWNER/REPO [--ref REF] [--force]
+                                  install a Lua mod from GitHub
+  remuda mod list [--format F]    list installed and embedded mods
+  remuda mod info NAME            show a mod manifest
   remuda doc [--format F]        print live Lua documentation (rst by default)
-  remuda extension info [--format F]
-                                  alias for remuda doc
-  remuda extension list [--format F]
-                                  list installed extensions
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
@@ -492,20 +490,16 @@ fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> Exit
     f(path)
 }
 
-/// Delegates to the lib crate's one table of built-in packages — the
-/// `remuda.exec()` Lua binding (script.rs) resolves the same names through
-/// the same table, so there is exactly one list, not two.
-fn builtin_package(name: &str) -> Option<&'static str> {
-    remuda_native::packages::builtin(name)
-}
-
-/// Run a built-in package's entry file in the daemon's image, by name.
+/// Delegates to the lib crate's installed-first package resolver — the
+/// `remuda.exec()` Lua binding (script.rs) resolves through the same resolver,
+/// so there is exactly one list, not two.
+/// Run an installed or embedded package's entry file in the daemon's image.
 fn exec_command(path: &Path, name: &str) -> ExitCode {
-    match builtin_package(name) {
-        None => fail(format!("no such package: {name}")),
-        Some(source) => {
-            let chunk_name = format!("packages/{name}/init.lua");
-            match remuda_native::script::run_source(path, &chunk_name, source) {
+    match remuda_native::packages::resolve(name) {
+        Err(error) => fail(error),
+        Ok(None) => fail(format!("no such package: {name}")),
+        Ok(Some(package)) => {
+            match remuda_native::script::run_source(path, &package.chunk_name, &package.source) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(e),
             }
@@ -630,13 +624,50 @@ fn doc_command(path: &Path, args: &[&str]) -> ExitCode {
     }
 }
 
-fn extension_list_command(args: &[&str]) -> ExitCode {
+fn mod_install_command(args: &[&str]) -> ExitCode {
+    let Some(repository) = args.first() else {
+        return fail("usage: remuda mod install OWNER/REPO [--ref REF] [--force]");
+    };
+    let mut reference = None;
+    let mut force = false;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index] {
+            "--force" if !force => force = true,
+            "--ref" if reference.is_none() && index + 1 < args.len() => {
+                index += 1;
+                reference = Some(args[index]);
+            }
+            _ => return fail("usage: remuda mod install OWNER/REPO [--ref REF] [--force]"),
+        }
+        index += 1;
+    }
+    match remuda_native::packages::install(repository, reference, force) {
+        Ok(report) => {
+            println!(
+                "installed mod {} {} from {} at {}",
+                report.manifest.name, report.manifest.version, report.repository, report.commit
+            );
+            println!(
+                "reload with `remuda exec {}` or restart the daemon; installation does not mutate a live Lua image",
+                report.manifest.name
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error),
+    }
+}
+
+fn mod_list_command(args: &[&str]) -> ExitCode {
     let format = match args {
         [] => "rst",
         ["--format", format @ ("rst" | "markdown" | "json")] => format,
-        _ => return fail("usage: remuda extension list [--format rst|markdown|json]"),
+        _ => return fail("usage: remuda mod list [--format rst|markdown|json]"),
     };
-    let manifests: Vec<_> = remuda_native::packages::manifests().collect();
+    let manifests = match remuda_native::packages::manifests() {
+        Ok(manifests) => manifests,
+        Err(error) => return fail(error),
+    };
     match format {
         "json" => {
             let extensions: Vec<_> = manifests
@@ -645,35 +676,86 @@ fn extension_list_command(args: &[&str]) -> ExitCode {
                     serde_json::json!({
                         "name": entry.name,
                         "version": entry.version,
+                        "api": entry.api,
+                        "entry": entry.entry,
+                        "command": entry.command,
                         "source": entry.source,
                         "status": entry.status,
                     })
                 })
                 .collect();
-            println!("{}", serde_json::json!({ "extensions": extensions }));
+            println!("{}", serde_json::json!({ "mods": extensions }));
         }
         "markdown" => {
-            println!("# Remuda extensions\n");
+            println!("# Remuda mods\n");
             for entry in manifests {
                 println!(
-                    "## `{}`\n\n- version: `{}`\n- source: `{}`\n- status: `{}`\n",
-                    entry.name, entry.version, entry.source, entry.status
+                    "## `{}`\n\n- version: `{}`\n- api: `{}`\n- entry: `{}`\n- source: `{}`\n- status: `{}`\n",
+                    entry.name, entry.version, entry.api, entry.entry, entry.source, entry.status
                 );
             }
         }
         "rst" => {
-            println!("Remuda extensions\n==================\n");
+            println!("Remuda mods\n===========\n");
             for entry in manifests {
                 println!(
-                    "{}\n{}\n\n* version: ``{}``\n* source: ``{}``\n* status: ``{}``\n",
+                    "{}\n{}\n\n* version: ``{}``\n* api: ``{}``\n* entry: ``{}``\n* source: ``{}``\n* status: ``{}``\n",
                     entry.name,
                     "-".repeat(entry.name.len()),
                     entry.version,
+                    entry.api,
+                    entry.entry,
                     entry.source,
                     entry.status
                 );
             }
         }
+        _ => unreachable!(),
+    }
+    ExitCode::SUCCESS
+}
+
+fn mod_info_command(args: &[&str]) -> ExitCode {
+    let Some(name) = args.first() else {
+        return fail("usage: remuda mod info NAME [--format rst|markdown|json]");
+    };
+    let format = match args.get(1..) {
+        Some([]) => "rst",
+        Some(["--format", format @ ("rst" | "markdown" | "json")]) => format,
+        _ => return fail("usage: remuda mod info NAME [--format rst|markdown|json]"),
+    };
+    let manifest = match remuda_native::packages::manifest(name) {
+        Ok(Some(manifest)) => manifest,
+        Ok(None) => return fail(format!("no such mod: {name}")),
+        Err(error) => return fail(error),
+    };
+    match format {
+        "json" => println!(
+            "{}",
+            serde_json::json!({
+                "name": manifest.name,
+                "version": manifest.version,
+                "api": manifest.api,
+                "entry": manifest.entry,
+                "command": manifest.command,
+                "source": manifest.source,
+                "status": manifest.status,
+            })
+        ),
+        "markdown" => println!(
+            "# `{}`\n\n- version: `{}`\n- api: `{}`\n- entry: `{}`\n- source: `{}`\n- status: `{}`",
+            manifest.name, manifest.version, manifest.api, manifest.entry, manifest.source, manifest.status
+        ),
+        "rst" => println!(
+            "{}\n{}\n\n* version: ``{}``\n* api: ``{}``\n* entry: ``{}``\n* source: ``{}``\n* status: ``{}``",
+            manifest.name,
+            "-".repeat(manifest.name.len()),
+            manifest.version,
+            manifest.api,
+            manifest.entry,
+            manifest.source,
+            manifest.status
+        ),
         _ => unreachable!(),
     }
     ExitCode::SUCCESS

@@ -12,18 +12,24 @@ time.
 remuda doc
 remuda doc --format markdown
 remuda doc --format json
-remuda extension info --format markdown
-remuda extension list --format json
+remuda mod info butler --format markdown
+remuda mod list --format json
+remuda mod install warmblood-kr/remuda-butler
 ```
 
-The default output is reStructuredText. `extension info` is an alias for
-`doc`, and the JSON form is intended for project-site tooling and other
-consumers that need structured metadata. No separate extension catalog is
-maintained.
+The default output is reStructuredText, and the JSON form is intended for
+project-site tooling and other consumers that need structured metadata.
 
-`remuda extension list` reports the embedded package manifest with name,
-build version, source, and installation status. It uses the same RST/Markdown/
-JSON format selector and reads the manifest compiled into the binary.
+`remuda mod list` reports embedded and installed mod manifests with name,
+version, API, entry, source, and installation status. `remuda mod info NAME`
+shows one manifest. Both use the same RST/Markdown/JSON format selector.
+
+`remuda mod install OWNER/REPO` accepts a GitHub shorthand or HTTPS URL,
+validates the repository's `extension.toml`, and atomically stores its Lua
+package under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/extensions`. Add
+`--ref REF` to select a branch, tag, or commit. Installed modules take
+precedence over embedded compatibility modules; installation never changes a
+live Lua image, so run `remuda exec NAME` or `remuda restart` to reload it.
 
 The runtime registry also covers words added with `remuda.tool`, so an
 extension can document itself when it registers its function:

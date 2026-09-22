@@ -115,19 +115,16 @@ a fresh interpreter, so what the entry file does is visible to whatever runs
 against that daemon afterward. There is no registry: a name either resolves
 to an entry file or it doesn't.
 
-Today, resolution is a built-in lookup compiled into the `remuda` binary
-itself (`packages/<name>/init.lua`, embedded at compile time), because the
-distributed binary carries no source checkout to read a package directory
-from at runtime. A package still lives on disk as a real, editable
-`packages/<name>/init.lua` file in this repo; only how that file reaches the
-running daemon is compiled-in rather than looked up. An install mechanism,
-when it exists, changes only that resolution step — cloning a package into a
-runtime directory and reading its `init.lua` from disk instead of from the
-binary — the entry-file convention itself does not change, so a package
-written today keeps working once installing replaces embedding.
+Today, resolution first checks validated packages installed below
+`${XDG_DATA_HOME:-$HOME/.local/share}/remuda/extensions/<name>` and then falls
+back to the built-in lookup compiled into the `remuda` binary. `remuda mod
+install OWNER/REPO` clones a GitHub repository shallowly, validates its
+`extension.toml` and `packages/<name>/init.lua` tree, and swaps the complete
+extension directory into place. A running Lua image is not changed by an
+install; `remuda exec <name>` or a daemon restart is the explicit reload.
 
-The same embedded manifest drives `remuda extension list`. It reports each
-embedded package's name, build version, source, and `installed` status in RST,
+The same manifest drives `remuda mod list`. It reports each built-in or
+installed package's name, version, source, and `installed` status in RST,
 Markdown, or JSON; the command does not maintain a second package catalog.
 
 ## A process's output arrives as events, never as something Lua waits on

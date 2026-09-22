@@ -27,8 +27,8 @@ optional Matrix bridge are described in [Butler](butler.md).
 The [generated RST reference](lua-reference.rst) is included in the Lua page
 and can also be consumed directly by documentation tooling.
 
-The same [Lua extensions page](lua.md) documents the live embedded-extension
-inventory exposed by `remuda extension list`.
+The same [Lua extensions page](lua.md) documents the live mod inventory
+exposed by `remuda mod list`.
 
 The same herd is reachable over MCP — `new`, `ls`, `send`, `capture` — so an
 agent can drive other agents.
