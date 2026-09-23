@@ -1938,5 +1938,5 @@ fn kill(path: &Path, name: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-#[path = "../tests/tui_unit.rs"]
+#[path = "../tests/tui_support/tui_unit.rs"]
 mod tui_unit;

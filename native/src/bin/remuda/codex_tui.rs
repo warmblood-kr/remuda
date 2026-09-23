@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
@@ -40,6 +41,7 @@ pub fn run(args: &[&str]) -> ExitCode {
     }
 }
 
+#[cfg(unix)]
 fn wait_for_socket(socket: &std::path::Path) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
@@ -51,6 +53,15 @@ fn wait_for_socket(socket: &std::path::Path) -> bool {
     false
 }
 
+/// Codex integration needs a Unix domain socket; there's no Windows
+/// equivalent wired up here, so `run` fails fast via this always-false
+/// stub instead of hanging.
+#[cfg(not(unix))]
+fn wait_for_socket(_socket: &std::path::Path) -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn monitor(socket: &std::path::Path, status: &str) {
     let Ok(stream) = UnixStream::connect(socket) else {
         return;
@@ -77,6 +88,9 @@ fn monitor(socket: &std::path::Path, status: &str) {
         update_status(&event, &mut model, status);
     }
 }
+
+#[cfg(not(unix))]
+fn monitor(_socket: &std::path::Path, _status: &str) {}
 
 /// Publish a complete record as soon as Codex announces its thread.  Context
 /// capacity is intentionally unknown until its first token-usage event: the
