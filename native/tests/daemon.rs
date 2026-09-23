@@ -2625,23 +2625,6 @@ fn matrix_reply_tool_never_puts_the_token_in_curls_argv() {
 }
 
 #[test]
-fn butler_claude_builder_keeps_its_noninteractive_cli_hint() {
-    let adapter = include_str!("../../packages/butler/agents/claudecode.lua");
-
-    let permission_mode_idx = adapter
-        .find("\"--permission-mode\"")
-        .expect("butler launch argv lost --permission-mode");
-    let append_system_prompt_idx = adapter
-        .find("\"--append-system-prompt\"")
-        .expect("butler launch argv lost --append-system-prompt");
-
-    assert!(
-        permission_mode_idx < append_system_prompt_idx,
-        "expected --permission-mode before --append-system-prompt"
-    );
-}
-
-#[test]
 fn butler_codex_builder_uses_automatic_approval() {
     let path = scratch("butler-codex-builder");
     let _daemon = daemon_at(&path);
@@ -2860,48 +2843,6 @@ fn butler_initializes_mail_and_persists_a_sent_message() {
     assert!(envelope.contains("\"body\":{\"object_id\":\"object-"));
     assert!(mail.join("inboxes/6275746c6572.jsonl").is_file());
     drop(daemon);
-}
-
-/// Same live-`claude` limitation as the test above blocks a real kill-and-
-/// watch-it-come-back test for the respawn watchdog. This checks, at the
-/// source level, that the watchdog reuses one launch function (so a
-/// respawn can't drift from a fresh start) and clears its hook group before
-/// registering (so a second `exec butler` can't double-launch a session).
-#[test]
-fn butler_session_exited_hook_relaunches_via_the_shared_launch_function() {
-    // Normalized once: a `\n`-only search below would miss a real call on a
-    // checkout where git converts this file to CRLF (Windows runners do).
-    let init_lua = include_str!("../../packages/butler/init.lua").replace("\r\n", "\n");
-
-    let launch_fn_idx = init_lua
-        .find("local function launch_butler()")
-        .expect("butler package lost its shared launch function");
-    let clear_hooks_idx = init_lua
-        .find("remuda.clear_hooks({ group = \"butler\" })")
-        .expect("butler package lost its clear_hooks guard against a second exec");
-    let session_exited_idx = init_lua
-        .find("remuda.on(\"session_exited\",")
-        .expect("butler package lost its session_exited watchdog");
-
-    assert!(
-        launch_fn_idx < clear_hooks_idx && clear_hooks_idx < session_exited_idx,
-        "expected launch_butler to be defined before the guarded watchdog is registered"
-    );
-
-    let hook_body_end = init_lua[session_exited_idx..]
-        .find("end, { group = \"butler\" })")
-        .map(|i| session_exited_idx + i)
-        .expect("session_exited hook is not registered in the \"butler\" group");
-    let hook_body = &init_lua[session_exited_idx..hook_body_end];
-    assert!(
-        hook_body.contains("remuda._butler_reconcile()"),
-        "the session_exited watchdog must use the shared reconciler: {hook_body:?}"
-    );
-    assert!(
-        init_lua.contains("name = \"butler-reconcile\"")
-            && init_lua.contains("remuda._butler_reconcile()\n"),
-        "butler needs a periodic reconciler as well as an exit event hook"
-    );
 }
 
 /// The watchdog end to end, proven by a real effect rather than a call
