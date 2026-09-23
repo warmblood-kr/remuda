@@ -1,4 +1,4 @@
-# Lua extensions
+# Lua mods
 
 Remuda keeps one Lua image for the lifetime of its daemon. Rust exposes the
 small host surface, while Lua defines the extension vocabulary on top of it.
@@ -19,6 +19,7 @@ remuda mod install OWNER/REPO --reload
 remuda mod test path/to/remuda-mod
 remuda mod update butler --reload
 remuda mod update --all
+remuda mod remove butler
 ```
 
 The default output is reStructuredText, and the JSON form is intended for
@@ -30,18 +31,30 @@ shows one manifest. Both use the same RST/Markdown/JSON format selector.
 
 `remuda mod install OWNER/REPO` accepts a GitHub shorthand or HTTPS URL,
 validates the repository's `extension.toml`, and atomically stores its Lua
-package under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/extensions`. Add
-`--ref REF` to select a branch, tag, or commit. Installation does not change a
+package under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/mods`. Add
+`--ref REF` to select a branch, tag, or commit. Installation never changes a
 live Lua image by default. Add `--reload` to ask the running daemon to replace
-the installed mod in its existing Lua image. `remuda mod update NAME --reload`
-does the same after updating one mod; `--all --reload` updates and reloads each
-mod in order. A failed in-process reload leaves that mod's previous code,
-initialized state, hooks, and tools active, while the validated update remains
-installed on disk for inspection or a later retry.
+the installed lifecycle-managed mod in its existing Lua image. `remuda mod
+update NAME --reload` does the same after updating one mod. Batch update with
+`--all --reload` is intentionally refused before any files change; update and
+reload mods individually so each mod's lifecycle support and reload result are
+clear. A failed in-process reload leaves that mod's previous code, initialized
+state, hooks, and tools active, while the validated update remains installed on
+disk for inspection or a later retry.
+When a manifest declares `command = "NAME"`, `remuda NAME` loads that
+mod explicitly and opens the regular Remuda screen when attached to a terminal.
+Use `remuda NAME --headless` to load it without opening the screen. Further
+words (`remuda NAME ...`) are dispatched to the already-loaded mod's Lua
+command handler; the core does not embed a mod-specific parser.
+
 `remuda mod update NAME` and `remuda mod update --all` reuse each installed
 mod's recorded GitHub source and ref, validate the new checkout, and replace
-the old copy only after validation succeeds. Without `--reload`, update the mod
-on disk and restart the daemon when convenient.
+the old copy only after validation succeeds.
+Without `--reload`, update the mod on disk and restart the daemon when
+convenient.
+`remuda mod remove NAME` removes an installed mod directory. It does not
+restart a daemon or stop sessions; already-loaded Lua definitions remain live
+until the next daemon restart.
 
 An extension repository declares `api = "remuda-lua-v1"` in its
 `extension.toml`. `remuda mod test PATH` is the deterministic local check: it

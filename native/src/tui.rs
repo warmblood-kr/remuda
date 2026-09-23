@@ -1165,7 +1165,9 @@ pub fn render_styled(
     let selected = cells_with_selection(ui, cells);
     let (lines, cut) = crop_styled(&selected, preview_w, body, ui.pan);
     let caret = locate_cursor(cells, cursor, ui.pan, preview_w, body, list_w);
-    let mut out = String::from("\x1b[?2026h\x1b[H");
+    // Hide before moving the terminal cursor around the frame. The final
+    // caret state below is the only place that makes it visible again.
+    let mut out = String::from("\x1b[?2026h\x1b[?25l\x1b[H");
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
         if ui.list_visible {
@@ -1464,6 +1466,10 @@ fn refresh(
                 .map_or(frame.as_str(), |(content, _)| content);
             if previous_content == current_content {
                 let cursor = frame.rsplit_once("\x1b[J").map_or("", |(_, cursor)| cursor);
+                // A cursor-only update still moves a visible terminal caret.
+                // Hide it for that move, then let the frame's suffix restore
+                // the child-requested visibility state.
+                stdout.write_all(b"\x1b[?25l")?;
                 stdout.write_all(cursor.as_bytes())?;
             } else {
                 stdout.write_all(frame.as_bytes())?;
@@ -1932,5 +1938,5 @@ fn kill(path: &Path, name: &str) -> Result<(), String> {
 }
 
 #[cfg(test)]
-#[path = "../tests/tui_unit.rs"]
+#[path = "../tests/tui_support/tui_unit.rs"]
 mod tui_unit;

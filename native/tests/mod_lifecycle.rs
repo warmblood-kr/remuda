@@ -28,7 +28,7 @@ impl DataHome {
 
     fn entry(&self) -> PathBuf {
         self.root
-            .join("remuda/extensions/sample/packages/sample/init.lua")
+            .join("remuda/mods/sample/packages/sample/init.lua")
     }
 }
 
@@ -55,7 +55,7 @@ fn read_value(image: &Image, code: &str) -> String {
 #[test]
 fn installed_mod_reloads_in_the_same_image_without_losing_state_or_old_code_on_failure() {
     let home = DataHome::new();
-    let manifest = home.root.join("remuda/extensions/sample/extension.toml");
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
     fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
     fs::write(
         &manifest,

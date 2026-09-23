@@ -131,7 +131,7 @@ request the old code could not read. Either way the cure is one verb, and it tak
 the herd with it:
 
 ```sh
-remuda restart        # names any live session and asks first; -f skips the ask
+remuda stop           # names any live session and asks first; -f skips the ask
 ```
 
 [`steps/013`](steps/013-a-daemon-that-says-which-build-it-is.md) has the incident,

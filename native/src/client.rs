@@ -62,9 +62,9 @@ fn interpret(line: &str) -> Response {
 fn skew(detail: &str) -> String {
     // One line, cure first. The TUI footer is one row of `cols` and crops the
     // tail: measured at 80 columns, a message that led with the diagnosis lost
-    // `remuda restart` off the right edge — the only actionable half of it.
+    // `remuda stop` off the right edge — the only actionable half of it.
     format!(
-        "the daemon is not this build — run `remuda restart`, then this again. \
+        "the daemon is not this build — run `remuda stop`, then this again. \
          This command is {}; the daemon: {detail}",
         crate::dist::BUILD_VERSION,
     )
@@ -335,7 +335,7 @@ mod tests {
         };
         let footer: String = format!("remuda: {said}").chars().take(80).collect();
         assert!(
-            footer.contains("remuda restart"),
+            footer.contains("remuda stop"),
             "cropped away the cure:\n{footer}"
         );
     }

@@ -23,8 +23,6 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 
-#[path = "remuda/butler_cli.rs"]
-mod butler_cli;
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
 
@@ -57,10 +55,7 @@ fn main() -> ExitCode {
             })
         }
 
-        [] | ["help"] | ["-h"] | ["--help"] => {
-            eprint!("{}", USAGE);
-            ExitCode::SUCCESS
-        }
+        [] | ["help"] | ["-h"] | ["--help"] => help_command(),
 
         ["--version"] | ["-V"] | ["version"] => {
             println!("remuda {}", dist::BUILD_VERSION);
@@ -81,7 +76,7 @@ fn main() -> ExitCode {
         // Deliberately NOT behind `with_daemon`: the daemon this stops is often
         // exactly the one that cannot be talked to, and starting one to stop it
         // is not a thing to do.
-        ["restart", rest @ ..] => restart(server, &path, rest),
+        ["stop", rest @ ..] => stop(server, &path, rest),
 
         ["ls"] => with_daemon(server, &path, list_sessions),
 
@@ -112,7 +107,7 @@ fn main() -> ExitCode {
         ["exec", name] => with_daemon(server, &path, |path| exec_command(path, name)),
 
         [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
-            butler_cli::extension_command(server, &path, command, rest)
+            extension_command(server, &path, command, rest)
         }
 
         // `emacsclient -e` for this runtime: the code runs in the daemon's
@@ -124,6 +119,7 @@ fn main() -> ExitCode {
         ["mod", "info", rest @ ..] => mod_info_command(rest),
         ["mod", "test", rest @ ..] => mod_test_command(rest),
         ["mod", "update", rest @ ..] => mod_update_command(server, &path, rest),
+        ["mod", "remove", rest @ ..] => mod_remove_command(rest),
 
         ["doc", rest @ ..] => with_daemon(server, &path, |path| doc_command(path, rest)),
 
@@ -133,9 +129,9 @@ fn main() -> ExitCode {
         // can reach the manager. Not meant to be typed by hand — a client
         // spawns it and owns both pipes.
         ["mcp"] => with_daemon(server, &path, |path| {
-            // Butler puts an unforgeable per-session capability in this child
-            // process's environment. MCP JSON never supplies caller identity.
-            let capability = std::env::var("REMUDA_BUTLER_SESSION_TOKEN")
+            // An extension may put an unforgeable per-session capability in
+            // this child process's environment. MCP JSON never supplies caller identity.
+            let capability = std::env::var("REMUDA_SESSION_CAPABILITY")
                 .ok()
                 .filter(|token| !token.is_empty());
             match remuda_native::mcp::serve_with_capability(path, capability.as_deref()) {
@@ -156,7 +152,8 @@ fn main() -> ExitCode {
     }
 }
 
-const USAGE: &str = "\
+#[allow(dead_code)]
+const DETAILED_USAGE: &str = "\
 remuda — a pty manager you can attach to
 
   remuda                        open the herd (a terminal is required)
@@ -179,13 +176,14 @@ remuda — a pty manager you can attach to
   remuda mod info NAME            show a mod manifest
   remuda mod test PATH            validate a local mod checkout
   remuda mod update NAME [--reload] update one installed mod
-  remuda mod update --all [--reload] update all installed mods
+  remuda mod update --all         update all installed mods
+  remuda mod remove NAME          remove one installed mod
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
   remuda upgrade [--channel C]  re-run the installer on stable or nightly
-  remuda restart [-f]           stop the daemon; the next command starts a fresh
+  remuda stop [-f]              stop the daemon; the next command starts a fresh
                                   one. Its sessions and Lua image die with it,
                                   so a live herd is named and confirmed first.
   remuda --version              the version this binary was built with
@@ -229,6 +227,46 @@ In a script they live on one table, and a refusal is raised, not returned:
 `mcp` is for a program running inside a session to reach the manager holding
 it — a client spawns it and owns both pipes, so there is nothing to type here.
 ";
+
+const USAGE: &str = "\
+remuda — terminal orchestration for coding agents
+
+  remuda                         open the session screen
+  remuda run [-n NAME] COMMAND   start and enter a session
+  remuda attach NAME             enter a session; Ctrl-\\ detaches
+  remuda ls | send NAME TEXT     inspect or message sessions
+  remuda stop [-f]               stop the daemon (sessions are lost)
+
+  remuda mod install OWNER/REPO  install a mod from GitHub
+  remuda mod list | info NAME    inspect installed mods
+  remuda mod update NAME|--all   update a mod
+  remuda mod remove NAME         remove a mod
+
+  remuda doc | repl | -e CODE    use the persistent Lua runtime
+  remuda --version
+
+Run `remuda mod list` for installed mods and `remuda doc` for the live Lua API.
+";
+
+fn help_command() -> ExitCode {
+    eprint!("{USAGE}");
+    match remuda_native::packages::manifests() {
+        Ok(mods) => {
+            let commands: Vec<_> = mods
+                .into_iter()
+                .filter_map(|mod_spec| mod_spec.command)
+                .collect();
+            if !commands.is_empty() {
+                eprintln!("Installed mod commands:");
+                for command in commands {
+                    eprintln!("  remuda {command} [--agent AGENT] [--headless]");
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error),
+    }
+}
 
 /// `run [-n name] <argv…>`: create a session and ride it, in one act. argv
 /// comes first, so no leading positional can eat the program name — which is
@@ -298,14 +336,14 @@ fn fate(path: &Path, name: &str) -> String {
     }
 }
 
-/// `restart [-f]`: stop this server's daemon so the next command starts a fresh
-/// one. `remuda upgrade` replaces the binary and cannot touch a daemon already
-/// running — this is the verb that closes that gap.
-fn restart(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+/// `stop [-f]`: stop this server's daemon. `remuda upgrade` replaces the
+/// binary but cannot touch a daemon already running — this is the verb that
+/// closes that gap.
+fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     let force = match args {
         [] => false,
         ["-f"] | ["--force"] => true,
-        _ => return fail("usage: remuda restart [-f]"),
+        _ => return fail("usage: remuda stop [-f]"),
     };
     if remuda_native::ipc::connect(path).is_err() {
         eprintln!("remuda: no daemon running for {server:?} — the next command starts one");
@@ -352,7 +390,7 @@ fn confirm_losses(path: &Path) -> Result<(), String> {
     );
     eprintln!("remuda: their processes, their last screens and the Lua image are all lost.");
     if !std::io::stdin().is_terminal() {
-        return Err("nothing to ask on — `remuda restart -f` if that is what you want".into());
+        return Err("nothing to ask on — `remuda stop -f` if that is what you want".into());
     }
     eprint!("remuda: type y to go ahead: ");
     let mut answer = String::new();
@@ -399,7 +437,7 @@ fn stop_daemon(path: &Path) -> Result<(), String> {
 /// most skews are harmless, and stranding someone mid-work behind a version
 /// string is its own incident. `None` when nothing is listening — it will be us.
 fn version_skew(argv: &[&str], path: &Path) -> Option<String> {
-    if matches!(argv, ["daemon"] | ["mcp"] | ["restart", ..]) {
+    if matches!(argv, ["daemon"] | ["mcp"] | ["stop", ..]) {
         return None;
     }
     remuda_native::ipc::connect(path).ok()?;
@@ -417,7 +455,7 @@ fn skew_notice(response: std::io::Result<Response>) -> Option<String> {
         // footer that crops the tail at the terminal's width.
         Err(_) => {
             return Some(format!(
-                "the daemon could not confirm its version — `remuda restart` \
+                "the daemon could not confirm its version — `remuda stop` \
                  replaces it if something still seems off. The check itself \
                  failed partway through; this command is {}",
                 dist::BUILD_VERSION
@@ -429,7 +467,7 @@ fn skew_notice(response: std::io::Result<Response>) -> Option<String> {
     // Cure first, and no "remuda:" prefix — the caller adds one, and this also
     // goes to a TUI footer that crops the tail at the terminal's width.
     Some(format!(
-        "the daemon is not this build — `remuda restart` replaces it, and its \
+        "the daemon is not this build — `remuda stop` replaces it, and its \
          sessions and Lua image go with it. It is {theirs}; this command is {}",
         dist::BUILD_VERSION
     ))
@@ -510,6 +548,61 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
             }
         }
     }
+}
+
+/// Dispatch a manifest-declared mod command. The launch form may select an
+/// agent and/or skip the screen; other arguments belong to the Lua mod.
+fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) -> ExitCode {
+    let package = match remuda_native::packages::subcommand(command) {
+        Ok(Some(package)) => package,
+        Ok(None) => return fail(format!("no installed mod provides command {command}")),
+        Err(error) => return fail(error),
+    };
+    let launch = match args {
+        [] => Some((false, None)),
+        ["--headless"] => Some((true, None)),
+        ["--agent", agent] => Some((false, Some(*agent))),
+        ["--agent", agent, "--headless"] | ["--headless", "--agent", agent] => {
+            Some((true, Some(*agent)))
+        }
+        _ => None,
+    };
+    if let Some((headless, agent)) = launch {
+        return with_daemon(server, path, |path| {
+            if let Some(agent) = agent {
+                let code = format!(
+                    "remuda._mod_launch_options = remuda._mod_launch_options or {{}}; remuda._mod_launch_options[{}] = {{agent = {}}}",
+                    serde_json::to_string(command).expect("command serializes"),
+                    serde_json::to_string(agent).expect("agent serializes")
+                );
+                if eval_once(path, &code) != ExitCode::SUCCESS {
+                    return ExitCode::FAILURE;
+                }
+            }
+            let started = exec_command(path, &package);
+            if started != ExitCode::SUCCESS
+                || headless
+                || !std::io::stdin().is_terminal()
+                || !std::io::stdout().is_terminal()
+            {
+                return started;
+            }
+            match remuda_native::tui::run(path, server, None) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(format!("tui: {error}")),
+            }
+        });
+    }
+    let arguments = args
+        .iter()
+        .map(|argument| serde_json::to_string(argument).expect("argument serializes"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let code = format!(
+        "return remuda._dispatch_extension_command({}, {{{arguments}}})",
+        serde_json::to_string(command).expect("command serializes")
+    );
+    with_daemon(server, path, |path| eval_once(path, &code))
 }
 
 /// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
@@ -732,7 +825,7 @@ fn mod_list_command(args: &[&str]) -> ExitCode {
     };
     match format {
         "json" => {
-            let extensions: Vec<_> = manifests
+            let mods: Vec<_> = manifests
                 .iter()
                 .map(|entry| {
                     serde_json::json!({
@@ -747,7 +840,7 @@ fn mod_list_command(args: &[&str]) -> ExitCode {
                     })
                 })
                 .collect();
-            println!("{}", serde_json::json!({ "mods": extensions }));
+            println!("{}", serde_json::json!({ "mods": mods }));
         }
         "markdown" => {
             println!("# Remuda mods\n");
@@ -835,40 +928,173 @@ fn mod_update_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         ["--all", "--reload"] => (true, None, true),
         [name] => (false, Some(*name), false),
         [name, "--reload"] => (false, Some(*name), true),
-        _ => return fail("usage: remuda mod update NAME|--all [--reload]"),
+        _ => return fail("usage: remuda mod update NAME [--reload]|--all"),
     };
-    let reports = if all {
-        remuda_native::packages::update_all()
-    } else {
-        remuda_native::packages::update(name.expect("single mod name")).map(|report| vec![report])
-    };
-    match reports {
-        Ok(reports) => {
-            for report in &reports {
-                println!(
-                    "updated mod {} {} from {} at {}",
-                    report.manifest.name, report.manifest.version, report.repository, report.commit
-                );
-            }
-            if reload {
-                for report in &reports {
-                    if let Err(error) = reload_mod_in_daemon(server, path, &report.manifest.name) {
-                        return fail(format!(
-                            "updated mod {}, but its running copy was not replaced: {error}",
-                            report.manifest.name
-                        ));
-                    }
+    if all && reload {
+        let manifests = match remuda_native::packages::manifests() {
+            Ok(manifests) => manifests,
+            Err(error) => return fail(error),
+        };
+        let not_attempted = all_reload_not_attempted_names(&manifests);
+        println!(
+            "batch reload preflight: updated none; reloaded none; failed none; not attempted [{}]",
+            display_names(&not_attempted)
+        );
+        return fail(
+            "`remuda mod update --all --reload` is disabled; update and reload mods individually",
+        );
+    }
+    if all {
+        return match remuda_native::packages::update_all() {
+            Ok(batch) => {
+                for report in &batch.updated {
                     println!(
-                        "reloaded mod {} in the running daemon",
-                        report.manifest.name
+                        "updated mod {} {} from {} at {}",
+                        report.manifest.name,
+                        report.manifest.version,
+                        report.repository,
+                        report.commit
                     );
                 }
-            } else {
-                println!("use `remuda mod update NAME --reload` to reload in-process, or restart the daemon");
+                if let Some(failed) = batch.failed {
+                    println!(
+                        "update outcomes: updated [{}]; reloaded none; failed {}: {}; not attempted [{}]",
+                        display_names(
+                            &batch.updated.iter().map(|report| report.manifest.name.clone()).collect::<Vec<_>>()
+                        ),
+                        failed.name,
+                        failed.error,
+                        display_names(&batch.not_attempted)
+                    );
+                    fail(format!("update stopped after {} failed", failed.name))
+                } else {
+                    println!("update outcomes: updated [{}]; reloaded none; failed none; not attempted none", display_names(&batch.updated.iter().map(|report| report.manifest.name.clone()).collect::<Vec<_>>()));
+                    println!("use `remuda mod update NAME --reload` to reload in-process, or restart the daemon");
+                    ExitCode::SUCCESS
+                }
             }
+            Err(error) => fail(error),
+        };
+    }
+    let name = name.expect("single mod name");
+    let result = if reload {
+        match remuda_native::packages::manifest(name) {
+            Ok(Some(manifest)) if manifest.lifecycle.is_some() => {
+                remuda_native::packages::update_lifecycle(name)
+            }
+            Ok(Some(_)) => {
+                return fail(format!(
+                    "update outcomes: updated none; reloaded none; failed none; not attempted [{}]: legacy mods cannot be reloaded in-process",
+                    name
+                ));
+            }
+            Ok(None) => return fail(format!("mod {name} is not installed")),
+            Err(error) => return fail(error),
+        }
+    } else {
+        remuda_native::packages::update(name)
+    };
+    match result {
+        Ok(report) => {
+            println!(
+                "updated mod {} {} from {} at {}",
+                report.manifest.name, report.manifest.version, report.repository, report.commit
+            );
+            if reload {
+                match reload_mod_in_daemon(server, path, &report.manifest.name) {
+                    Ok(()) => {
+                        println!("update outcomes: updated [{}]; reloaded [{}]; failed none; not attempted none", report.manifest.name, report.manifest.name);
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => fail(format!(
+                        "update outcomes: updated [{}]; reloaded none; failed {}: {}; not attempted none",
+                        report.manifest.name, report.manifest.name, error
+                    )),
+                }
+            } else {
+                println!(
+                    "update outcomes: updated [{}]; reloaded none; failed none; not attempted none",
+                    report.manifest.name
+                );
+                println!("use `remuda mod update NAME --reload` to reload in-process, or restart the daemon");
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) if reload => fail(format!(
+            "update outcomes: updated none; reloaded none; failed {name}: {error}; not attempted none"
+        )),
+        Err(error) => fail(error),
+    }
+}
+
+fn all_reload_not_attempted_names(manifests: &[remuda_native::packages::Manifest]) -> Vec<String> {
+    manifests
+        .iter()
+        .map(|manifest| manifest.name.clone())
+        .collect()
+}
+
+fn display_names(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".into()
+    } else {
+        names.join(", ")
+    }
+}
+
+fn mod_remove_command(args: &[&str]) -> ExitCode {
+    let [name] = args else {
+        return fail("usage: remuda mod remove NAME");
+    };
+    match remuda_native::packages::remove(name) {
+        Ok(report) => {
+            println!(
+                "removed mod {} from {}",
+                report.manifest.name,
+                report.path.display()
+            );
+            println!(
+                "a running daemon keeps its loaded Lua definitions until restart; no session was stopped"
+            );
             ExitCode::SUCCESS
         }
         Err(error) => fail(error),
+    }
+}
+
+#[cfg(test)]
+mod mod_update_tests {
+    use super::all_reload_not_attempted_names;
+    use remuda_native::packages::Manifest;
+
+    #[test]
+    fn batch_reload_policy_leaves_mixed_lifecycle_and_legacy_mods_unattempted() {
+        let manifests = vec![
+            Manifest {
+                name: "managed".into(),
+                version: "1".into(),
+                api: "remuda-lua-v1".into(),
+                entry: "init.lua".into(),
+                command: None,
+                lifecycle: Some("remuda-module-v1".into()),
+                source: "disk".into(),
+                status: "installed".into(),
+            },
+            Manifest {
+                name: "legacy".into(),
+                version: "1".into(),
+                api: "remuda-lua-v1".into(),
+                entry: "init.lua".into(),
+                command: None,
+                lifecycle: None,
+                source: "disk".into(),
+                status: "installed".into(),
+            },
+        ];
+        assert_eq!(
+            all_reload_not_attempted_names(&manifests),
+            vec!["managed", "legacy"]
+        );
     }
 }
 
@@ -1015,19 +1241,6 @@ mod tests {
             "a transport failure on the version check must say something, \
              not silently read as a confirmed match"
         );
-        assert!(notice.unwrap().contains("remuda restart"));
-    }
-
-    #[test]
-    fn butler_message_is_one_lua_string_not_extra_lua() {
-        let message = "hello\" ); remuda.close('butler') --\nnext";
-        let code = format!(
-            "return remuda._butler_send(\"a\", \"b\", {})",
-            butler_cli::lua_string(message)
-        );
-        assert_eq!(
-            code,
-            "return remuda._butler_send(\"a\", \"b\", \"hello\\\" ); remuda.close('butler') --\\nnext\")"
-        );
+        assert!(notice.unwrap().contains("remuda stop"));
     }
 }

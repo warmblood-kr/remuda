@@ -15,6 +15,23 @@
 
 remuda.tools = {}
 
+-- Installed mods may claim a manifest-declared shell command. The core
+-- forwards its remaining words here after the mod has been explicitly
+-- loaded; it never imports an extension's command parser.
+remuda._extension_commands = {}
+function remuda.extension_command(name, handler)
+  if type(name) ~= "string" or name == "" then error("a mod command needs a name", 2) end
+  if type(handler) ~= "function" then error("a mod command needs a handler", 2) end
+  remuda._extension_commands[name] = handler
+end
+function remuda._dispatch_extension_command(name, args)
+  local handler = remuda._extension_commands[name]
+  if not handler then
+    error("mod command " .. tostring(name) .. " is not loaded; run `remuda " .. tostring(name) .. "` first", 2)
+  end
+  return handler(args or {})
+end
+
 -- One row per word, Rust's own bindings included (`script.rs`'s `WORDS`
 -- populates this table before this file loads) — `remuda doc` reads it.
 local function register(name, about, signature)
@@ -127,7 +144,7 @@ Schedule.__index = Schedule
 -- native code provides the fixed tick while this table owns the interval and
 -- callback behavior. Schedules do not survive a daemon restart.
 --
--- NAME is an optional label, never an identity — two extensions (or one,
+-- NAME is an optional label, never an identity — two mods (or one,
 -- twice) may register under the same name without one silently replacing
 -- the other, the gap measured on 09-13. Ownership is the returned handle;
 -- only `remuda.cancel(handle)` removes it.
@@ -488,7 +505,7 @@ Buffer.__index = Buffer
 remuda.buffer = {}
 register("buffer", "Namespace for creating and listing named text buffers.", "table")
 
--- Create-if-absent, return-if-present — so two extensions naming the same
+-- Create-if-absent, return-if-present — so two mods naming the same
 -- buffer share it rather than racing to overwrite it.
 function remuda.buffer.new(name)
   if type(name) ~= "string" or name == "" then
@@ -731,28 +748,15 @@ register(
 function remuda._refresh_sessions_buffer(width, selected)
   local sessions = remuda.ls()
   local lines = {}
-  local function context_k(tokens)
-    if tokens == "?" then return "?" end
-    return string.format("%.0fk", tonumber(tokens) / 1000)
-  end
-  local function butler_detail(session)
-    local bus = remuda._butler_bus
-    local agent = bus and bus.agents and bus.agents[session.name]
-    if not agent then return nil end
-    local telemetry = remuda._butler_telemetry_for(agent)
-    local model = telemetry.model
-    local used = telemetry.context_used
-    local window = telemetry.context_window
-    local percent = telemetry.context_percent
-    local context = "CTX " .. context_k(used) .. "/" .. context_k(window)
-    if percent ~= "?" then context = context .. " " .. percent .. "%" end
-    return (agent.kind or "agent") .. " · " .. model .. " · " .. context
+  local function session_detail(session)
+    if type(remuda.session_detail) ~= "function" then return nil end
+    return remuda.session_detail(session)
   end
   if #sessions == 0 then
     lines = { "the herd is empty.", "press n to start a session." }
   else
     for i, s in ipairs(sessions) do
-      local detail = butler_detail(s)
+      local detail = session_detail(s)
       local state_color = s.alive and "\27[32m" or "\27[31m"
       local reset = "\27[0m"
       local flag = s.attached and "  ⚑" or ""
