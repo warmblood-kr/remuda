@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_REPOSITORY_PART: usize = 128;
 pub const LUA_API_VERSION: &str = "remuda-lua-v1";
+pub const MOD_LIFECYCLE_API: &str = "remuda-module-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -22,6 +23,7 @@ pub struct Manifest {
     pub api: String,
     pub entry: String,
     pub command: Option<String>,
+    pub lifecycle: Option<String>,
     pub source: String,
     pub status: String,
 }
@@ -30,6 +32,7 @@ pub struct Manifest {
 pub struct PackageSource {
     pub source: String,
     pub chunk_name: String,
+    pub lifecycle: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +51,7 @@ pub struct ExtensionSpec {
     pub api: String,
     pub entry: String,
     pub command: Option<String>,
+    pub lifecycle: Option<String>,
 }
 
 /// Return the installed mod name that owns a CLI command. Commands are
@@ -79,6 +83,7 @@ pub fn manifests() -> Result<Vec<Manifest>, String> {
             api: spec.api,
             entry: spec.entry,
             command: spec.command,
+            lifecycle: spec.lifecycle,
             source: "disk".into(),
             status: "installed".into(),
         });
@@ -104,6 +109,7 @@ fn manifest_from_spec(spec: ExtensionSpec, source: &str) -> Manifest {
         api: spec.api,
         entry: spec.entry,
         command: spec.command,
+        lifecycle: spec.lifecycle,
         source: source.into(),
         status: "installed".into(),
     }
@@ -386,6 +392,7 @@ pub fn parse_manifest(text: &str) -> Result<ExtensionSpec, String> {
     let mut api = None;
     let mut entry = None;
     let mut command = None;
+    let mut lifecycle = None;
     for (line_number, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -401,6 +408,7 @@ pub fn parse_manifest(text: &str) -> Result<ExtensionSpec, String> {
             "api" => &mut api,
             "entry" => &mut entry,
             "command" => &mut command,
+            "lifecycle" => &mut lifecycle,
             other => return Err(format!("extension.toml has unknown key {other:?}")),
         };
         if slot.replace(value).is_some() {
@@ -413,6 +421,7 @@ pub fn parse_manifest(text: &str) -> Result<ExtensionSpec, String> {
         api: api.ok_or_else(|| "extension.toml is missing api".to_string())?,
         entry: entry.ok_or_else(|| "extension.toml is missing entry".to_string())?,
         command,
+        lifecycle,
     };
     validate_spec(&spec)?;
     Ok(spec)
@@ -424,6 +433,16 @@ fn validate_spec(spec: &ExtensionSpec) -> Result<(), String> {
     }
     if spec.api != LUA_API_VERSION {
         return Err(format!("unsupported mod API {:?}", spec.api));
+    }
+    if spec
+        .lifecycle
+        .as_deref()
+        .is_some_and(|api| api != MOD_LIFECYCLE_API)
+    {
+        return Err(format!(
+            "unsupported mod lifecycle API {:?}",
+            spec.lifecycle.as_deref().unwrap()
+        ));
     }
     let expected = format!("packages/{}/init.lua", spec.name);
     if spec.entry != expected {
@@ -556,6 +575,11 @@ fn installed_source(name: &str) -> Result<Option<PackageSource>, String> {
             spec.name
         ));
     }
+    let lifecycle = if name == extension {
+        spec.lifecycle.clone()
+    } else {
+        None
+    };
     let entry = safe_relative_path(&spec.entry, "entry")?;
     let entry_path = root.join(&entry);
     let package_root = entry_path
@@ -582,6 +606,7 @@ fn installed_source(name: &str) -> Result<Option<PackageSource>, String> {
             format!("cannot read installed package {}: {error}", path.display())
         })?,
         chunk_name,
+        lifecycle,
     }))
 }
 
@@ -722,7 +747,7 @@ fn valid_package_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_manifest, parse_repository, validate_reference};
+    use super::{parse_manifest, parse_repository, validate_reference, MOD_LIFECYCLE_API};
 
     #[test]
     fn parses_the_published_butler_manifest_shape() {
@@ -737,6 +762,28 @@ mod tests {
         .expect("manifest");
         assert_eq!(manifest.name, "butler");
         assert_eq!(manifest.version, "0.1.0");
+        assert_eq!(manifest.lifecycle, None);
+    }
+
+    #[test]
+    fn lifecycle_manifest_is_opt_in_and_versioned() {
+        let manifest = parse_manifest(
+            r#"
+            name = "sample"
+            entry = "packages/sample/init.lua"
+            api = "remuda-lua-v1"
+            lifecycle = "remuda-module-v1"
+            "#,
+        )
+        .expect("lifecycle manifest");
+        assert_eq!(manifest.lifecycle.as_deref(), Some(MOD_LIFECYCLE_API));
+        assert!(parse_manifest(
+            r#"name = "sample"
+entry = "packages/sample/init.lua"
+api = "remuda-lua-v1"
+lifecycle = "remuda-module-v2""#
+        )
+        .is_err());
     }
 
     #[test]

@@ -20,13 +20,16 @@ use crate::client;
 use mlua::{Lua, Table, Value};
 use remuda_core::keys;
 use remuda_core::protocol::{Request, Response, Step};
+use std::cell::Cell;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::Duration;
 
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 49] = [
+pub const BINDINGS: [&str; 51] = [
+    "_activate_module",
     "_call",
     "_descriptors",
     "_event_counts",
@@ -62,6 +65,7 @@ pub const BINDINGS: [&str; 49] = [
     "on",
     "process",
     "processes",
+    "reload",
     "remove_dir_all",
     "request_counts",
     "schedule",
@@ -77,6 +81,16 @@ pub const BINDINGS: [&str; 49] = [
     "window",
     "windows",
 ];
+
+#[cfg(test)]
+mod binding_tests {
+    use super::BINDINGS;
+
+    #[test]
+    fn binding_names_are_sorted_and_unique() {
+        assert!(BINDINGS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+}
 
 /// name, about, signature — one row per Rust-bound word. `tools.lua` adds its
 /// own rows for the words it defines in pure Lua, into the same table.
@@ -135,6 +149,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "exec",
         "Run an installed mod's entry source, by name, in this same image.",
         "exec(name) -> nil",
+    ),
+    (
+        "reload",
+        "Reload a lifecycle-managed mod in this image, preserving state and replacing its registrations.",
+        "reload(name) -> nil",
     ),
     (
         "list_dir",
@@ -442,17 +461,67 @@ fn new_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Resu
 /// safe: a nested `lua.load(...).exec()` on this same `Lua`, not a new
 /// interpreter. Mods must be installed independently of the Remuda binary.
 fn exec_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
-    table.set(
-        "exec",
-        lua.create_function(move |lua, name: String| {
-            let package = crate::packages::resolve(&name)
-                .map_err(mlua::Error::runtime)?
-                .ok_or_else(|| mlua::Error::runtime(format!("no such package: {name}")))?;
-            lua.load(&package.source)
-                .set_name(package.chunk_name)
-                .exec()
-        })?,
-    )
+    table
+        .set(
+            "exec",
+            lua.create_function(|lua, name: String| execute_package(lua, &name, false))?,
+        )
+        .and_then(|()| {
+            table.set(
+                "reload",
+                lua.create_function(|lua, name: String| execute_package(lua, &name, true))?,
+            )
+        })
+}
+
+fn execute_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Result<()> {
+    let package = crate::packages::resolve(name)
+        .map_err(mlua::Error::runtime)?
+        .ok_or_else(|| mlua::Error::runtime(format!("no such package: {name}")))?;
+    if require_lifecycle && package.lifecycle.is_none() {
+        return Err(mlua::Error::runtime(format!(
+            "mod {name} uses the legacy entry format and cannot be reloaded in-process"
+        )));
+    }
+    if package.lifecycle.is_some() {
+        let active = Rc::new(Cell::new(false));
+        let environment = lua.create_table()?;
+        environment.set("_G", environment.clone())?;
+        let environment_meta = lua.create_table()?;
+        environment_meta.set("__index", lua.globals())?;
+        environment.set_metatable(Some(environment_meta))?;
+        let remuda_proxy = lua.create_table()?;
+        let remuda_meta = lua.create_table()?;
+        let active_for_lookup = Rc::clone(&active);
+        remuda_meta.set(
+            "__index",
+            lua.create_function(move |lua, key: String| {
+                if !active_for_lookup.get() {
+                    return Err(mlua::Error::runtime(
+                        "lifecycle declarations and migrations cannot call remuda APIs",
+                    ));
+                }
+                let remuda: Table = lua.globals().get("remuda")?;
+                remuda.get::<Value>(key)
+            })?,
+        )?;
+        remuda_proxy.set_metatable(Some(remuda_meta))?;
+        environment.set("remuda", remuda_proxy)?;
+        let declaration: Value = lua
+            .load(&package.source)
+            .set_name(package.chunk_name)
+            .set_environment(environment)
+            .eval()?;
+        let remuda: Table = lua.globals().get("remuda")?;
+        let activate: mlua::Function = remuda.get("_activate_module")?;
+        activate.call::<bool>((name, declaration))?;
+        active.set(true);
+        Ok(())
+    } else {
+        lua.load(&package.source)
+            .set_name(package.chunk_name)
+            .exec()
+    }
 }
 
 /// Plain filesystem primitives for topic directories, no session involved —

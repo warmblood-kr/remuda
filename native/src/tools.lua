@@ -50,7 +50,10 @@ local speech = {
 -- Define a word and export it as an MCP tool. `args` maps each argument to a
 -- description a model reads; `needs` lists the ones that are not optional.
 -- Redefining an existing word replaces it.
-function remuda.tool(spec)
+local function make_tool(spec)
+  if type(spec) ~= "table" then
+    error("a tool declaration must be a table", 2)
+  end
   local name = spec.name
   if type(name) ~= "string" or name == "" then
     error("a tool needs a name", 2)
@@ -65,8 +68,21 @@ function remuda.tool(spec)
   end
   local args = spec.args or {}
   local needs = spec.needs or {}
+  if type(args) ~= "table" or type(needs) ~= "table" then
+    error("tool args and needs must be tables", 2)
+  end
+  for key, description in pairs(args) do
+    if type(key) ~= "string" or type(description) ~= "string" then
+      error("tool argument names and descriptions must be strings", 2)
+    end
+  end
+  for key in pairs(needs) do
+    if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > #needs then
+      error("tool needs must be a dense array", 2)
+    end
+  end
   for _, key in ipairs(needs) do
-    if args[key] == nil then
+    if type(key) ~= "string" or args[key] == nil then
       error("tool " .. name .. " needs `" .. key .. "` but never describes it", 2)
     end
   end
@@ -77,8 +93,13 @@ function remuda.tool(spec)
     needs = needs,
     run = spec.run,
   }, speech)
-  remuda.tools[name] = word
-  register(name, spec.about, name .. "(" .. arg_list(args, needs) .. ") -> string")
+  return word
+end
+
+function remuda.tool(spec)
+  local word = make_tool(spec)
+  remuda.tools[word.name] = word
+  register(word.name, word.about, word.name .. "(" .. arg_list(word.args, word.needs) .. ") -> string")
   return word
 end
 register("tool", "Define a word and export it as an MCP tool.", "tool(spec) -> word")
@@ -192,6 +213,9 @@ function remuda.on(event, fn, opts)
     error("a hook needs a function", 2)
   end
   opts = opts or {}
+  if type(opts.group) == "string" and opts.group:match("^remuda%-module:") then
+    error("hook groups beginning with `remuda-module:` are reserved", 2)
+  end
   remuda.hooks[event] = remuda.hooks[event] or {}
   table.insert(remuda.hooks[event], { fn = fn, group = opts.group })
 end
@@ -236,6 +260,9 @@ function remuda.clear_hooks(opts)
   if opts.group == nil then
     error("clear_hooks needs a `group` — clearing every hook at once is not offered", 2)
   end
+  if type(opts.group) == "string" and opts.group:match("^remuda%-module:") then
+    error("hook groups beginning with `remuda-module:` are reserved", 2)
+  end
   for event, hooks in pairs(remuda.hooks) do
     local kept = {}
     for _, hook in ipairs(hooks) do
@@ -247,6 +274,173 @@ function remuda.clear_hooks(opts)
   end
 end
 register("clear_hooks", "Remove every hook registered under a group.", "clear_hooks(opts) -> nil")
+
+-- Opt-in lifecycle-managed mods keep their initialized state in the image and
+-- declare registrations as data. Reload stages the declaration and migrations
+-- before replacing the mod's hook group and tools.
+local modules = {}
+local module_tool_owners = {}
+
+local function clone_module_state(value, seen)
+  local kind = type(value)
+  if kind == "nil" or kind == "boolean" or kind == "number" or kind == "string" then
+    return value
+  end
+  if kind ~= "table" then
+    error("module state migrations only support plain tables and scalar values", 0)
+  end
+  if getmetatable(value) ~= nil then
+    error("module state migrations cannot clone tables with metatables", 0)
+  end
+  seen = seen or {}
+  if seen[value] then return seen[value] end
+  local copy = {}
+  seen[value] = copy
+  for key, item in pairs(value) do
+    copy[clone_module_state(key, seen)] = clone_module_state(item, seen)
+  end
+  return copy
+end
+
+local function array_length(value, label)
+  if type(value) ~= "table" then
+    error(label .. " must be an array", 0)
+  end
+  local length = #value
+  for key in pairs(value) do
+    if type(key) ~= "number" or key % 1 ~= 0 or key < 1 or key > length then
+      error(label .. " must be a dense array", 0)
+    end
+  end
+  return length
+end
+
+function remuda._activate_module(name, candidate)
+  if type(name) ~= "string" or name == "" then
+    error("module name must be a non-empty string", 0)
+  end
+  if type(candidate) ~= "table" or candidate.api ~= "remuda-module-v1" then
+    error("mod entry must return a remuda-module-v1 declaration", 0)
+  end
+  local version = candidate.state_version
+  if type(version) ~= "number" or version % 1 ~= 0 or version < 1 then
+    error("module state_version must be a positive integer", 0)
+  end
+  if type(candidate.initialize) ~= "function" then
+    error("module declaration needs an initialize function", 0)
+  end
+
+  local hooks = candidate.hooks or {}
+  local hook_count = array_length(hooks, "module hooks")
+  for index = 1, hook_count do
+    local hook = hooks[index]
+    if type(hook) ~= "table" or type(hook.event) ~= "string" or hook.event == ""
+      or type(hook.run) ~= "function" then
+      error("each module hook needs a non-empty event and run function", 0)
+    end
+  end
+
+  local tools = candidate.tools or {}
+  local tool_count = array_length(tools, "module tools")
+  local prepared_tools, tool_names, seen_tools = {}, {}, {}
+  for index = 1, tool_count do
+    local declared = tools[index]
+    if type(declared) ~= "table" or type(declared.run) ~= "function" then
+      error("each module tool needs a run function", 0)
+    end
+    local spec = {
+      name = declared.name,
+      about = declared.about,
+      args = declared.args,
+      needs = declared.needs,
+      run = declared.run,
+    }
+    local word = make_tool(spec)
+    if seen_tools[word.name] then
+      error("module declares duplicate tool " .. word.name, 0)
+    end
+    seen_tools[word.name] = true
+    local existing_owner = module_tool_owners[word.name]
+    if remuda.tools[word.name] ~= nil and existing_owner ~= name then
+      error("tool " .. word.name .. " is already registered", 0)
+    end
+    prepared_tools[index] = word
+    tool_names[index] = word.name
+  end
+
+  local migrations = candidate.migrations or {}
+  if type(migrations) ~= "table" then
+    error("module migrations must be a table keyed by prior state version", 0)
+  end
+  for from, migrate in pairs(migrations) do
+    if type(from) ~= "number" or from % 1 ~= 0 or from < 1 or from >= version
+      or type(migrate) ~= "function" then
+      error("module migrations must map prior versions to functions", 0)
+    end
+  end
+
+  local previous = modules[name]
+  local state
+  if previous == nil then
+    state = candidate.initialize()
+    if type(state) ~= "table" then
+      error("module initialize must return a state table", 0)
+    end
+  else
+    if version < previous.version then
+      error("module state_version cannot move backwards", 0)
+    end
+    state = previous.state
+    for from = previous.version, version - 1 do
+      local migrate = migrations[from]
+      if type(migrate) ~= "function" then
+        error("module is missing migration from state version " .. from, 0)
+      end
+      local migrated = migrate(clone_module_state(state))
+      if type(migrated) ~= "table" then
+        error("module migration must return a state table", 0)
+      end
+      state = migrated
+    end
+  end
+
+  local group = "remuda-module:" .. name
+  for event, registered in pairs(remuda.hooks) do
+    local kept = {}
+    for _, hook in ipairs(registered) do
+      if hook.group ~= group then
+        kept[#kept + 1] = hook
+      end
+    end
+    remuda.hooks[event] = kept
+  end
+  for _, old_name in ipairs(previous and previous.tools or {}) do
+    if module_tool_owners[old_name] == name then
+      remuda.tools[old_name] = nil
+      remuda._registry[old_name] = nil
+      module_tool_owners[old_name] = nil
+    end
+  end
+  for index = 1, hook_count do
+    local hook = hooks[index]
+    remuda.hooks[hook.event] = remuda.hooks[hook.event] or {}
+    table.insert(remuda.hooks[hook.event], { fn = function(...)
+      return hook.run(state, ...)
+    end, group = group })
+  end
+  for index, word in ipairs(prepared_tools) do
+    local declared = tools[index]
+    word.run = function(arguments, caller)
+      return declared.run(state, arguments, caller)
+    end
+    remuda.tools[word.name] = word
+    module_tool_owners[word.name] = name
+    register(word.name, word.about, word.name .. "(" .. arg_list(word.args, word.needs) .. ") -> string")
+  end
+  modules[name] = { version = version, state = state, tools = tool_names }
+  return true
+end
+register("_activate_module", "Replace one lifecycle-managed mod after validating its declaration and migrations.", "_activate_module(name, declaration) -> boolean")
 
 local escapes = {
   ['"'] = '\\"',
