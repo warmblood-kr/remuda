@@ -83,6 +83,7 @@ fn installed_mod_reloads_in_the_same_image_without_losing_state_or_old_code_on_f
         Arc::new(Registry::new()),
         Arc::new(Counters::default()),
     );
+    read_value(&image, include_str!("api/v3.lua"));
     read_value(&image, "remuda.exec('sample')");
     assert_eq!(
         read_value(&image, "return remuda.tools.sample_status()"),
@@ -107,12 +108,8 @@ fn installed_mod_reloads_in_the_same_image_without_losing_state_or_old_code_on_f
             run = function(state) return tostring(state.count) end }},
         }"#,
     );
-    read_value(&image, "remuda.reload('sample')");
-    read_value(&image, "remuda.emit('probe')");
-    assert_eq!(
-        read_value(&image, "return remuda.tools.sample_status()"),
-        "11"
-    );
+    read_value(&image, "api_v3_phase = 'same_version'");
+    read_value(&image, include_str!("api/v3.lua"));
 
     write_entry(
         &entry,
@@ -120,18 +117,34 @@ fn installed_mod_reloads_in_the_same_image_without_losing_state_or_old_code_on_f
           api = "remuda-module-v1", state_version = 2,
           initialize = function() return {} end,
           migrations = {[1] = function(state)
+            state.count = state.count + 100
+            return state
+          end},
+          hooks = {{ event = "probe", run = function(state)
+            state.count = state.count + 20
+          end }},
+          tools = {{ name = "sample_status",
+            about = "Read the persistent state for this test mod.",
+            run = function(state) return tostring(state.count) end }},
+        }"#,
+    );
+    read_value(&image, "api_v3_phase = 'migration'");
+    read_value(&image, include_str!("api/v3.lua"));
+
+    write_entry(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 3,
+          initialize = function() return {} end,
+          migrations = {[2] = function(state)
             state.count = -1
             error("intentional migration failure")
           end},
           hooks = {}, tools = {},
         }"#,
     );
-    assert!(image.eval("remuda.reload('sample')", None).is_err());
-    read_value(&image, "remuda.emit('probe')");
-    assert_eq!(
-        read_value(&image, "return remuda.tools.sample_status()"),
-        "21"
-    );
+    read_value(&image, "api_v3_phase = 'migration_failure'");
+    read_value(&image, include_str!("api/v3.lua"));
 
     write_entry(
         &entry,
@@ -148,7 +161,7 @@ fn installed_mod_reloads_in_the_same_image_without_losing_state_or_old_code_on_f
     read_value(&image, "remuda.emit('probe')");
     assert_eq!(
         read_value(&image, "return remuda.tools.sample_status()"),
-        "31"
+        "171"
     );
 
     fs::write(
@@ -156,9 +169,6 @@ fn installed_mod_reloads_in_the_same_image_without_losing_state_or_old_code_on_f
         "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\n",
     )
     .unwrap();
-    assert!(image.eval("remuda.reload('sample')", None).is_err());
-    assert_eq!(
-        read_value(&image, "return remuda.tools.sample_status()"),
-        "31"
-    );
+    read_value(&image, "api_v3_phase = 'legacy_refusal'");
+    read_value(&image, include_str!("api/v3.lua"));
 }

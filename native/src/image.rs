@@ -78,6 +78,7 @@ impl Image {
                         .set_name("@remuda/tools.lua")
                         .exec()
                 })
+                .and_then(|()| script::hide_module_activator(&lua))
                 .and_then(|()| capture_print(&lua, Rc::clone(&printed)))
                 .map_err(|e| e.to_string());
 

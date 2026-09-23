@@ -28,11 +28,12 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 51] = [
-    "_activate_module",
+pub const BINDINGS: [&str; 53] = [
     "_call",
     "_descriptors",
+    "_dispatch_extension_command",
     "_event_counts",
+    "_extension_commands",
     "_process_drain",
     "_process_killpg",
     "_process_spawn",
@@ -53,6 +54,7 @@ pub const BINDINGS: [&str; 51] = [
     "emit",
     "event_counts",
     "exec",
+    "extension_command",
     "feed",
     "hooks",
     "insert",
@@ -512,8 +514,8 @@ fn execute_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Resu
             .set_name(package.chunk_name)
             .set_environment(environment)
             .eval()?;
-        let remuda: Table = lua.globals().get("remuda")?;
-        let activate: mlua::Function = remuda.get("_activate_module")?;
+        let activate: mlua::Function =
+            lua.named_registry_value("remuda.lifecycle.activate_module")?;
         activate.call::<bool>((name, declaration))?;
         active.set(true);
         Ok(())
@@ -522,6 +524,15 @@ fn execute_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Resu
             .set_name(package.chunk_name)
             .exec()
     }
+}
+
+/// Keep the Lua lifecycle manager callable by the loader without exposing its
+/// implementation helper on the public `remuda` table.
+pub(crate) fn hide_module_activator(lua: &Lua) -> mlua::Result<()> {
+    let remuda: Table = lua.globals().get("remuda")?;
+    let activate: mlua::Function = remuda.get("_activate_module")?;
+    lua.set_named_registry_value("remuda.lifecycle.activate_module", activate)?;
+    remuda.set("_activate_module", Value::Nil)
 }
 
 /// Plain filesystem primitives for topic directories, no session involved —

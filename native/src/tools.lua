@@ -38,6 +38,9 @@ local function register(name, about, signature)
   remuda._registry[name] = { name = name, about = about, signature = signature }
 end
 register("tools", "The `remuda.tool` registry table, keyed by tool name.", "table")
+register("_extension_commands", "Handlers registered for installed mod commands.", "table")
+register("extension_command", "Register a handler for an installed mod command.", "extension_command(name, handler) -> nil")
+register("_dispatch_extension_command", "Dispatch arguments to a loaded mod command handler.", "_dispatch_extension_command(name, args) -> value")
 
 -- Required names first (a caller's own order, via `needs`), then everything
 -- else marked optional — the same order a hand-written signature would use.
@@ -457,7 +460,6 @@ function remuda._activate_module(name, candidate)
   modules[name] = { version = version, state = state, tools = tool_names }
   return true
 end
-register("_activate_module", "Replace one lifecycle-managed mod after validating its declaration and migrations.", "_activate_module(name, declaration) -> boolean")
 
 local escapes = {
   ['"'] = '\\"',
