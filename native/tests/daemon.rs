@@ -933,23 +933,48 @@ fn the_daemon_names_the_build_it_was_started_from() {
 /// turns any failure below into a hung job instead of a red one.
 struct Daemon(std::process::Child);
 
+/// The one place all four spawn helpers below route through to build their
+/// `Command`. Defaults `HOME` to a path under the test's own scratch `dir`
+/// (created if needed) and removes `XDG_CONFIG_HOME` -- mirroring what only
+/// `spawn_with_home` used to do, but now as the default every helper gets
+/// for free, rather than something each has to opt into. `load_user_config`
+/// (daemon.rs:126) reads and `eval`s `$XDG_CONFIG_HOME`/`$HOME/.config` +
+/// `remuda/init.lua` on every daemon boot; without this, a helper that
+/// forgot to redirect `HOME` would spawn a daemon that reads and executes
+/// the REAL test-runner machine's own `~/.config/remuda/init.lua`, if one
+/// exists. A future fifth helper inherits this safety by construction --
+/// it would have to deliberately override `HOME` to lose it.
+fn base_command(dir: &Path) -> std::process::Command {
+    let home = dir.join("home");
+    let _ = std::fs::create_dir_all(&home);
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["-s", "s", "daemon"])
+        .env("REMUDA_RUNTIME_DIR", dir)
+        .env("HOME", &home)
+        .env_remove("XDG_CONFIG_HOME")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd
+}
+
+/// Spawns `cmd` and blocks until the daemon it starts actually answers on
+/// its socket under `dir` -- the connect-poll every helper below used to
+/// duplicate.
+fn spawn_and_wait(mut cmd: std::process::Command, dir: &Path) -> Daemon {
+    let child = cmd.spawn().expect("spawn daemon");
+    let path = daemon::socket_path_in(dir, "s");
+    let deadline = Instant::now() + PATIENCE;
+    while remuda_native::ipc::connect(&path).is_err() {
+        assert!(Instant::now() < deadline, "daemon never bound {path:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Daemon(child)
+}
+
 impl Daemon {
     fn spawn(dir: &Path) -> Self {
-        let child = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
-            .args(["-s", "s", "daemon"])
-            .env("REMUDA_RUNTIME_DIR", dir)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn daemon");
-        let path = daemon::socket_path_in(dir, "s");
-        let deadline = Instant::now() + PATIENCE;
-        while remuda_native::ipc::connect(&path).is_err() {
-            assert!(Instant::now() < deadline, "daemon never bound {path:?}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        Self(child)
+        spawn_and_wait(base_command(dir), dir)
     }
 
     /// Like `spawn`, but pins the daemon process's own `PWD` -- `None` unsets
@@ -957,26 +982,12 @@ impl Daemon {
     /// have, so a directory-derived name test is not at the mercy of `cargo
     /// test`'s own working directory.
     fn spawn_with_pwd(dir: &Path, pwd: Option<&str>) -> Self {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"));
-        cmd.args(["-s", "s", "daemon"])
-            .env("REMUDA_RUNTIME_DIR", dir);
+        let mut cmd = base_command(dir);
         match pwd {
             Some(p) => cmd.env("PWD", p),
             None => cmd.env_remove("PWD"),
         };
-        let child = cmd
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn daemon");
-        let path = daemon::socket_path_in(dir, "s");
-        let deadline = Instant::now() + PATIENCE;
-        while remuda_native::ipc::connect(&path).is_err() {
-            assert!(Instant::now() < deadline, "daemon never bound {path:?}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        Self(child)
+        spawn_and_wait(cmd, dir)
     }
 
     /// Like `spawn`, but layers extra environment variables onto the daemon
@@ -986,55 +997,27 @@ impl Daemon {
     /// `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG` set here, additive to
     /// `spawn`'s existing behavior.
     fn spawn_with_env(dir: &Path, extra_env: &[(&str, &str)]) -> Self {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"));
-        cmd.args(["-s", "s", "daemon"])
-            .env("REMUDA_RUNTIME_DIR", dir);
+        let mut cmd = base_command(dir);
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
-        let child = cmd
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn daemon");
-        let path = daemon::socket_path_in(dir, "s");
-        let deadline = Instant::now() + PATIENCE;
-        while remuda_native::ipc::connect(&path).is_err() {
-            assert!(Instant::now() < deadline, "daemon never bound {path:?}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        Self(child)
+        spawn_and_wait(cmd, dir)
     }
 
     /// Like `spawn_with_env`, but for the birth-environment-poisoning
-    /// scenario itself: a daemon born with `HOME` pinned to a scratch
-    /// directory and NEITHER `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG`
-    /// nor `XDG_CONFIG_HOME` present at all (`env_remove`, not merely
-    /// unset-by-omission -- `cargo test`'s own process could otherwise leak
-    /// either through, making the test non-deterministic on a machine where
-    /// they happen to be set).
+    /// scenario itself: a daemon born with `HOME` pinned to a caller-chosen
+    /// directory (overriding `base_command`'s default) and NEITHER
+    /// `REMUDA_BUTLER_TOKEN`/`REMUDA_BUTLER_CONFIG` nor `XDG_CONFIG_HOME`
+    /// present at all (`env_remove`, not merely unset-by-omission --
+    /// `cargo test`'s own process could otherwise leak either through,
+    /// making the test non-deterministic on a machine where they happen to
+    /// be set).
     fn spawn_with_home(dir: &Path, home: &Path) -> Self {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"));
-        cmd.args(["-s", "s", "daemon"])
-            .env("REMUDA_RUNTIME_DIR", dir)
-            .env("HOME", home)
-            .env_remove("XDG_CONFIG_HOME")
+        let mut cmd = base_command(dir);
+        cmd.env("HOME", home)
             .env_remove("REMUDA_BUTLER_TOKEN")
             .env_remove("REMUDA_BUTLER_CONFIG");
-        let child = cmd
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn daemon");
-        let path = daemon::socket_path_in(dir, "s");
-        let deadline = Instant::now() + PATIENCE;
-        while remuda_native::ipc::connect(&path).is_err() {
-            assert!(Instant::now() < deadline, "daemon never bound {path:?}");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        Self(child)
+        spawn_and_wait(cmd, dir)
     }
 
     /// Bounded on purpose: an unbounded `wait` on a daemon that did not stop is
@@ -4008,4 +3991,150 @@ fn a_broken_user_config_is_reported_but_never_bricks_the_daemon() {
         "an ordinary session could not be created after a broken user config \
          -- the image is poisoned"
     );
+}
+
+/// Guards `HOME`/`XDG_CONFIG_HOME` mutation below -- `std::env::set_var` is
+/// process-wide, so a second test doing the same thing at the same time
+/// would race this one. No such test exists today, but the next one that
+/// wants to simulate "a real developer's env" gets safety for free by
+/// routing through this instead of calling `set_var` directly.
+static REAL_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII: pins the parent test PROCESS's own `HOME` (and clears
+/// `XDG_CONFIG_HOME`) to simulate "a real developer's env", restoring both on
+/// drop -- including on panic -- so a failing assertion below can't leave the
+/// process env corrupted for whatever test runs next in this binary.
+struct RealHomeGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    old_home: Option<std::ffi::OsString>,
+    old_xdg: Option<std::ffi::OsString>,
+}
+
+impl RealHomeGuard {
+    fn set_to(home: &Path) -> Self {
+        let lock = REAL_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_home = std::env::var_os("HOME");
+        let old_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", home);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        Self {
+            _lock: lock,
+            old_home,
+            old_xdg,
+        }
+    }
+}
+
+impl Drop for RealHomeGuard {
+    fn drop(&mut self) {
+        match &self.old_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match &self.old_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+}
+
+/// (Re)writes the sentinel `init.lua` under `config_dir` so that, if eval'd,
+/// it writes a marker to `marker_path` -- baked directly into the Lua source
+/// as an absolute path, so the marker's presence is unambiguous evidence the
+/// sentinel ran, regardless of what `HOME` the reading process sees.
+fn write_home_sentinel(config_dir: &Path, marker_path: &Path) {
+    std::fs::create_dir_all(config_dir).expect("mkdir sentinel config dir");
+    let lua = format!(
+        "local f = io.open({:?}, 'w') f:write('ran') f:close()",
+        marker_path.display().to_string()
+    );
+    std::fs::write(config_dir.join("init.lua"), lua).expect("write sentinel init.lua");
+}
+
+/// Polls for `marker`'s appearance -- fails fast the moment it shows up,
+/// rather than waiting out the whole bound -- then, if the bound passes
+/// clean, treats that as proof `load_user_config` (daemon.rs:126) never ran
+/// against this sentinel. 1200ms matches
+/// `a_fresh_daemon_with_no_user_config_never_auto_registers_butler`'s own
+/// margin for this identical background thread.
+fn assert_marker_never_appears(marker: &Path, helper: &str) {
+    let deadline = Instant::now() + Duration::from_millis(1200);
+    loop {
+        assert!(
+            !marker.exists(),
+            "{helper} spawned a daemon that read and eval'd a config from \
+             outside its own scratch dir (marker present at {marker:?})"
+        );
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The defect this guards: `load_user_config` (daemon.rs:126) reads and
+/// `eval`s whatever `$XDG_CONFIG_HOME`/`$HOME/.config` + `remuda/init.lua`
+/// resolves to, against a live, IPC-connected `Image` -- on EVERY daemon
+/// boot, unconditionally. A test helper that builds its `Command` without
+/// pinning `HOME`/`XDG_CONFIG_HOME` spawns a daemon that inherits the *real*
+/// test-runner process's env, and will find and eval the *actual developer
+/// machine's* own `~/.config/remuda/init.lua`, if one exists.
+///
+/// `RealHomeGuard` simulates exactly that "real developer env" without ever
+/// touching the actual real `$HOME`: it pins the parent test PROCESS's own
+/// `HOME` to a fake developer home (with a sentinel `init.lua` planted in
+/// it) for the test's duration. Each of the four spawn helpers is then
+/// exercised in turn, each against its own fresh marker path, and none of
+/// them may ever cause that marker to appear.
+#[test]
+#[cfg(unix)]
+fn daemon_spawn_helpers_never_read_the_real_developer_home() {
+    let fake_home = scratch_dir("home-isolation-fake-developer-home");
+    let config_dir = fake_home.join(".config").join("remuda");
+    let marker_dir = scratch_dir("home-isolation-markers");
+    std::fs::create_dir_all(&marker_dir).expect("mkdir marker dir");
+
+    let _env = RealHomeGuard::set_to(&fake_home);
+
+    // spawn(): the plain helper -- inherits ambient HOME/XDG_CONFIG_HOME.
+    let marker = marker_dir.join("spawn.marker");
+    write_home_sentinel(&config_dir, &marker);
+    {
+        let _daemon = Daemon::spawn(&scratch_dir("home-isolation-spawn"));
+        assert_marker_never_appears(&marker, "Daemon::spawn");
+    }
+
+    // spawn_with_pwd(): same ambient env, PWD pinned on top.
+    let marker = marker_dir.join("spawn_with_pwd.marker");
+    write_home_sentinel(&config_dir, &marker);
+    {
+        let _daemon =
+            Daemon::spawn_with_pwd(&scratch_dir("home-isolation-spawn-pwd"), Some("/tmp"));
+        assert_marker_never_appears(&marker, "Daemon::spawn_with_pwd");
+    }
+
+    // spawn_with_env(): same ambient env, extra vars layered on top.
+    let marker = marker_dir.join("spawn_with_env.marker");
+    write_home_sentinel(&config_dir, &marker);
+    {
+        let _daemon = Daemon::spawn_with_env(
+            &scratch_dir("home-isolation-spawn-env"),
+            &[("SOME_EXTRA_VAR", "1")],
+        );
+        assert_marker_never_appears(&marker, "Daemon::spawn_with_env");
+    }
+
+    // spawn_with_home(): existing-good baseline -- an explicit `home` wins
+    // over whatever ambient HOME the parent process has. The fake-home
+    // sentinel is left primed (same one the three helpers above just used)
+    // specifically so this proves the helper ignores it, not merely that
+    // nothing was there to find.
+    let marker = marker_dir.join("spawn_with_home.marker");
+    write_home_sentinel(&config_dir, &marker);
+    let clean_home = scratch_dir("home-isolation-clean-home");
+    {
+        let _daemon =
+            Daemon::spawn_with_home(&scratch_dir("home-isolation-spawn-home"), &clean_home);
+        assert_marker_never_appears(&marker, "Daemon::spawn_with_home");
+    }
 }
