@@ -598,11 +598,27 @@ fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) ->
         .map(|argument| serde_json::to_string(argument).expect("argument serializes"))
         .collect::<Vec<_>>()
         .join(", ");
+    let env = caller_env(std::env::vars());
     let code = format!(
-        "return remuda._dispatch_extension_command({}, {{{arguments}}})",
+        "return remuda._dispatch_extension_command({}, {{{arguments}}}, {{env = {{{env}}}}})",
         serde_json::to_string(command).expect("command serializes")
     );
     with_daemon(server, path, |path| eval_once(path, &code))
+}
+
+/// The caller's `REMUDA_*` variables as Lua table fields. The handler runs in
+/// the daemon, whose own environment is not the caller's (#95).
+fn caller_env(vars: impl Iterator<Item = (String, String)>) -> String {
+    vars.filter(|(name, _)| name.starts_with("REMUDA_"))
+        .map(|(name, value)| {
+            format!(
+                "[{}] = {}",
+                serde_json::to_string(&name).expect("name serializes"),
+                serde_json::to_string(&value).expect("value serializes")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
@@ -1242,5 +1258,18 @@ mod tests {
              not silently read as a confirmed match"
         );
         assert!(notice.unwrap().contains("remuda stop"));
+    }
+
+    #[test]
+    fn caller_env_keeps_only_remuda_vars_as_escaped_lua_fields() {
+        let vars = [
+            ("REMUDA_BUTLER_AGENT_ID", "dev \"lead\""),
+            ("HOME", "/home/x"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string()));
+        assert_eq!(
+            caller_env(vars.into_iter()),
+            r#"["REMUDA_BUTLER_AGENT_ID"] = "dev \"lead\"""#
+        );
     }
 }
