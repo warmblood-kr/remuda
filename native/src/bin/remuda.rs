@@ -114,11 +114,11 @@ fn main() -> ExitCode {
         // long-lived image, so what it defines is still there next time.
         ["-e", code] => with_daemon(server, &path, |path| eval_once(path, code)),
 
-        ["mod", "install", rest @ ..] => mod_install_command(rest),
+        ["mod", "install", rest @ ..] => mod_install_command(server, &path, rest),
         ["mod", "list", rest @ ..] => mod_list_command(rest),
         ["mod", "info", rest @ ..] => mod_info_command(rest),
         ["mod", "test", rest @ ..] => mod_test_command(rest),
-        ["mod", "update", rest @ ..] => mod_update_command(rest),
+        ["mod", "update", rest @ ..] => mod_update_command(server, &path, rest),
         ["mod", "remove", rest @ ..] => mod_remove_command(rest),
 
         ["doc", rest @ ..] => with_daemon(server, &path, |path| doc_command(path, rest)),
@@ -164,12 +164,18 @@ remuda — a pty manager you can attach to
 
   remuda lua <script.lua>       run a Lua script in the daemon's living image
   remuda exec <name>            run an installed Lua mod
-  remuda mod install OWNER/REPO [--ref REF] [--force]
+  remuda butler                 run the installed Butler mod
+  remuda butler help             show Butler coordination commands
+  remuda butler sessions         list Butler-managed agent sessions
+  remuda butler launch KIND [N]  launch a claude or codex session
+  remuda butler send FROM TO MSG queue a message for an agent
+  remuda butler inbox NAME       drain an agent's queued messages
+  remuda mod install OWNER/REPO [--ref REF] [--force] [--reload]
                                   install a Lua mod from GitHub
   remuda mod list [--format F]    list installed mods
   remuda mod info NAME            show a mod manifest
   remuda mod test PATH            validate a local mod checkout
-  remuda mod update NAME          update one installed mod
+  remuda mod update NAME [--reload] update one installed mod
   remuda mod update --all         update all installed mods
   remuda mod remove NAME          remove one installed mod
   remuda doc [--format F]        print live Lua documentation (rst by default)
@@ -716,21 +722,56 @@ fn doc_command(path: &Path, args: &[&str]) -> ExitCode {
     }
 }
 
-fn mod_install_command(args: &[&str]) -> ExitCode {
+fn reload_mod_in_daemon(server: &str, path: &Path, name: &str) -> Result<(), String> {
+    match remuda_native::ipc::connect(path) {
+        Ok(_) => {}
+        Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => {
+            start_daemon(server, path)?;
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot connect to remuda daemon at {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    let encoded_name = serde_json::to_string(name).expect("a mod name is a JSON string");
+    match remuda_native::client::request(
+        path,
+        &Request::Eval {
+            code: format!("return remuda.reload({encoded_name})"),
+            name: None,
+        },
+    )
+    .map_err(|error| error.to_string())?
+    {
+        Response::Value(_) => Ok(()),
+        Response::Error(error) => Err(error),
+        other => Err(format!("unexpected reload response: {other:?}")),
+    }
+}
+
+fn mod_install_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     let Some(repository) = args.first() else {
-        return fail("usage: remuda mod install OWNER/REPO [--ref REF] [--force]");
+        return fail("usage: remuda mod install OWNER/REPO [--ref REF] [--force] [--reload]");
     };
     let mut reference = None;
     let mut force = false;
+    let mut reload = false;
     let mut index = 1;
     while index < args.len() {
         match args[index] {
             "--force" if !force => force = true,
+            "--reload" if !reload => reload = true,
             "--ref" if reference.is_none() && index + 1 < args.len() => {
                 index += 1;
                 reference = Some(args[index]);
             }
-            _ => return fail("usage: remuda mod install OWNER/REPO [--ref REF] [--force]"),
+            _ => {
+                return fail(
+                    "usage: remuda mod install OWNER/REPO [--ref REF] [--force] [--reload]",
+                )
+            }
         }
         index += 1;
     }
@@ -740,9 +781,32 @@ fn mod_install_command(args: &[&str]) -> ExitCode {
                 "installed mod {} {} from {} at {}",
                 report.manifest.name, report.manifest.version, report.repository, report.commit
             );
-            println!(
-                "the running daemon keeps its current Lua image; use `remuda stop` before its next start to load this update"
-            );
+            if reload {
+                match reload_mod_in_daemon(server, path, &report.manifest.name) {
+                    Ok(()) => println!(
+                        "reloaded mod {} in the running daemon",
+                        report.manifest.name
+                    ),
+                    Err(error) => {
+                        return fail(format!(
+                            "installed mod {}, but its running copy was not replaced: {error}",
+                            report.manifest.name
+                        ))
+                    }
+                }
+            } else {
+                if report.manifest.lifecycle.is_some() {
+                    println!(
+                        "use `remuda -e \"remuda.reload('{}')\"` to reload in-process, or restart the daemon",
+                        report.manifest.name
+                    );
+                } else {
+                    println!(
+                        "legacy mod {} is installed; run it once with `remuda exec {}` or restart the daemon to load updated files",
+                        report.manifest.name, report.manifest.name
+                    );
+                }
+            }
             ExitCode::SUCCESS
         }
         Err(error) => fail(error),
@@ -770,6 +834,7 @@ fn mod_list_command(args: &[&str]) -> ExitCode {
                         "api": entry.api,
                         "entry": entry.entry,
                         "command": entry.command,
+                        "lifecycle": entry.lifecycle,
                         "source": entry.source,
                         "status": entry.status,
                     })
@@ -781,8 +846,9 @@ fn mod_list_command(args: &[&str]) -> ExitCode {
             println!("# Remuda mods\n");
             for entry in manifests {
                 println!(
-                    "## `{}`\n\n- version: `{}`\n- api: `{}`\n- entry: `{}`\n- source: `{}`\n- status: `{}`\n",
-                    entry.name, entry.version, entry.api, entry.entry, entry.source, entry.status
+                    "## `{}`\n\n- version: `{}`\n- api: `{}`\n- entry: `{}`\n- lifecycle: `{}`\n- source: `{}`\n- status: `{}`\n",
+                    entry.name, entry.version, entry.api, entry.entry,
+                    entry.lifecycle.as_deref().unwrap_or("legacy"), entry.source, entry.status
                 );
             }
         }
@@ -790,12 +856,13 @@ fn mod_list_command(args: &[&str]) -> ExitCode {
             println!("Remuda mods\n===========\n");
             for entry in manifests {
                 println!(
-                    "{}\n{}\n\n* version: ``{}``\n* api: ``{}``\n* entry: ``{}``\n* source: ``{}``\n* status: ``{}``\n",
+                    "{}\n{}\n\n* version: ``{}``\n* api: ``{}``\n* entry: ``{}``\n* lifecycle: ``{}``\n* source: ``{}``\n* status: ``{}``\n",
                     entry.name,
                     "-".repeat(entry.name.len()),
                     entry.version,
                     entry.api,
                     entry.entry,
+                    entry.lifecycle.as_deref().unwrap_or("legacy"),
                     entry.source,
                     entry.status
                 );
@@ -829,21 +896,24 @@ fn mod_info_command(args: &[&str]) -> ExitCode {
                 "api": manifest.api,
                 "entry": manifest.entry,
                 "command": manifest.command,
+                "lifecycle": manifest.lifecycle,
                 "source": manifest.source,
                 "status": manifest.status,
             })
         ),
         "markdown" => println!(
-            "# `{}`\n\n- version: `{}`\n- api: `{}`\n- entry: `{}`\n- source: `{}`\n- status: `{}`",
-            manifest.name, manifest.version, manifest.api, manifest.entry, manifest.source, manifest.status
+            "# `{}`\n\n- version: `{}`\n- api: `{}`\n- entry: `{}`\n- lifecycle: `{}`\n- source: `{}`\n- status: `{}`",
+            manifest.name, manifest.version, manifest.api, manifest.entry,
+            manifest.lifecycle.as_deref().unwrap_or("legacy"), manifest.source, manifest.status
         ),
         "rst" => println!(
-            "{}\n{}\n\n* version: ``{}``\n* api: ``{}``\n* entry: ``{}``\n* source: ``{}``\n* status: ``{}``",
+            "{}\n{}\n\n* version: ``{}``\n* api: ``{}``\n* entry: ``{}``\n* lifecycle: ``{}``\n* source: ``{}``\n* status: ``{}``",
             manifest.name,
             "-".repeat(manifest.name.len()),
             manifest.version,
             manifest.api,
             manifest.entry,
+            manifest.lifecycle.as_deref().unwrap_or("legacy"),
             manifest.source,
             manifest.status
         ),
@@ -852,24 +922,123 @@ fn mod_info_command(args: &[&str]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn mod_update_command(args: &[&str]) -> ExitCode {
-    let reports = match args {
-        ["--all"] => remuda_native::packages::update_all(),
-        [name] => remuda_native::packages::update(name).map(|report| vec![report]),
-        _ => return fail("usage: remuda mod update NAME|--all"),
+fn mod_update_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let (all, name, reload) = match args {
+        ["--all"] => (true, None, false),
+        ["--all", "--reload"] => (true, None, true),
+        [name] => (false, Some(*name), false),
+        [name, "--reload"] => (false, Some(*name), true),
+        _ => return fail("usage: remuda mod update NAME [--reload]|--all"),
     };
-    match reports {
-        Ok(reports) => {
-            for report in reports {
-                println!(
-                    "updated mod {} {} from {} at {}",
-                    report.manifest.name, report.manifest.version, report.repository, report.commit
-                );
+    if all && reload {
+        let manifests = match remuda_native::packages::manifests() {
+            Ok(manifests) => manifests,
+            Err(error) => return fail(error),
+        };
+        let not_attempted = all_reload_not_attempted_names(&manifests);
+        println!(
+            "batch reload preflight: updated none; reloaded none; failed none; not attempted [{}]",
+            display_names(&not_attempted)
+        );
+        return fail(
+            "`remuda mod update --all --reload` is disabled; update and reload mods individually",
+        );
+    }
+    if all {
+        return match remuda_native::packages::update_all() {
+            Ok(batch) => {
+                for report in &batch.updated {
+                    println!(
+                        "updated mod {} {} from {} at {}",
+                        report.manifest.name,
+                        report.manifest.version,
+                        report.repository,
+                        report.commit
+                    );
+                }
+                if let Some(failed) = batch.failed {
+                    println!(
+                        "update outcomes: updated [{}]; reloaded none; failed {}: {}; not attempted [{}]",
+                        display_names(
+                            &batch.updated.iter().map(|report| report.manifest.name.clone()).collect::<Vec<_>>()
+                        ),
+                        failed.name,
+                        failed.error,
+                        display_names(&batch.not_attempted)
+                    );
+                    fail(format!("update stopped after {} failed", failed.name))
+                } else {
+                    println!("update outcomes: updated [{}]; reloaded none; failed none; not attempted none", display_names(&batch.updated.iter().map(|report| report.manifest.name.clone()).collect::<Vec<_>>()));
+                    println!("use `remuda mod update NAME --reload` to reload in-process, or restart the daemon");
+                    ExitCode::SUCCESS
+                }
             }
-            println!("the running daemon keeps its current Lua image; use `remuda stop` before its next start to load updates");
-            ExitCode::SUCCESS
+            Err(error) => fail(error),
+        };
+    }
+    let name = name.expect("single mod name");
+    let result = if reload {
+        match remuda_native::packages::manifest(name) {
+            Ok(Some(manifest)) if manifest.lifecycle.is_some() => {
+                remuda_native::packages::update_lifecycle(name)
+            }
+            Ok(Some(_)) => {
+                return fail(format!(
+                    "update outcomes: updated none; reloaded none; failed none; not attempted [{}]: legacy mods cannot be reloaded in-process",
+                    name
+                ));
+            }
+            Ok(None) => return fail(format!("mod {name} is not installed")),
+            Err(error) => return fail(error),
         }
+    } else {
+        remuda_native::packages::update(name)
+    };
+    match result {
+        Ok(report) => {
+            println!(
+                "updated mod {} {} from {} at {}",
+                report.manifest.name, report.manifest.version, report.repository, report.commit
+            );
+            if reload {
+                match reload_mod_in_daemon(server, path, &report.manifest.name) {
+                    Ok(()) => {
+                        println!("update outcomes: updated [{}]; reloaded [{}]; failed none; not attempted none", report.manifest.name, report.manifest.name);
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => fail(format!(
+                        "update outcomes: updated [{}]; reloaded none; failed {}: {}; not attempted none",
+                        report.manifest.name, report.manifest.name, error
+                    )),
+                }
+            } else {
+                println!(
+                    "update outcomes: updated [{}]; reloaded none; failed none; not attempted none",
+                    report.manifest.name
+                );
+                println!("use `remuda mod update NAME --reload` to reload in-process, or restart the daemon");
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) if reload => fail(format!(
+            "update outcomes: updated none; reloaded none; failed {name}: {error}; not attempted none"
+        )),
         Err(error) => fail(error),
+    }
+}
+
+fn all_reload_not_attempted_names(manifests: &[remuda_native::packages::Manifest]) -> Vec<String> {
+    manifests
+        .iter()
+        .map(|manifest| manifest.name.clone())
+        .collect()
+}
+
+fn display_names(names: &[String]) -> String {
+    if names.is_empty() {
+        "none".into()
+    } else {
+        names.join(", ")
     }
 }
 
@@ -890,6 +1059,42 @@ fn mod_remove_command(args: &[&str]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => fail(error),
+    }
+}
+
+#[cfg(test)]
+mod mod_update_tests {
+    use super::all_reload_not_attempted_names;
+    use remuda_native::packages::Manifest;
+
+    #[test]
+    fn batch_reload_policy_leaves_mixed_lifecycle_and_legacy_mods_unattempted() {
+        let manifests = vec![
+            Manifest {
+                name: "managed".into(),
+                version: "1".into(),
+                api: "remuda-lua-v1".into(),
+                entry: "init.lua".into(),
+                command: None,
+                lifecycle: Some("remuda-module-v1".into()),
+                source: "disk".into(),
+                status: "installed".into(),
+            },
+            Manifest {
+                name: "legacy".into(),
+                version: "1".into(),
+                api: "remuda-lua-v1".into(),
+                entry: "init.lua".into(),
+                command: None,
+                lifecycle: None,
+                source: "disk".into(),
+                status: "installed".into(),
+            },
+        ];
+        assert_eq!(
+            all_reload_not_attempted_names(&manifests),
+            vec!["managed", "legacy"]
+        );
     }
 }
 

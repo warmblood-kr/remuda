@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_REPOSITORY_PART: usize = 128;
 pub const LUA_API_VERSION: &str = "remuda-lua-v1";
+pub const MOD_LIFECYCLE_API: &str = "remuda-module-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
@@ -22,6 +23,7 @@ pub struct Manifest {
     pub api: String,
     pub entry: String,
     pub command: Option<String>,
+    pub lifecycle: Option<String>,
     pub source: String,
     pub status: String,
 }
@@ -30,6 +32,7 @@ pub struct Manifest {
 pub struct PackageSource {
     pub source: String,
     pub chunk_name: String,
+    pub lifecycle: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +42,21 @@ pub struct InstallReport {
     pub repository: String,
     pub reference: Option<String>,
     pub commit: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateFailure {
+    pub name: String,
+    pub error: String,
+}
+
+/// Per-mod results from a batch update. The first failed update stops the
+/// batch; later names are reported as not attempted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateAllReport {
+    pub updated: Vec<InstallReport>,
+    pub failed: Option<UpdateFailure>,
+    pub not_attempted: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +72,7 @@ pub struct ModSpec {
     pub api: String,
     pub entry: String,
     pub command: Option<String>,
+    pub lifecycle: Option<String>,
 }
 
 /// Return the installed mod name that owns a CLI command. Commands are
@@ -85,6 +104,7 @@ pub fn manifests() -> Result<Vec<Manifest>, String> {
             api: spec.api,
             entry: spec.entry,
             command: spec.command,
+            lifecycle: spec.lifecycle,
             source: "disk".into(),
             status: "installed".into(),
         });
@@ -110,6 +130,7 @@ fn manifest_from_spec(spec: ModSpec, source: &str) -> Manifest {
         api: spec.api,
         entry: spec.entry,
         command: spec.command,
+        lifecycle: spec.lifecycle,
         source: source.into(),
         status: "installed".into(),
     }
@@ -136,6 +157,7 @@ pub fn install(
         reference.map(str::to_string),
         force,
         None,
+        false,
     );
     let _ = fs::remove_dir_all(&checkout);
     result
@@ -145,6 +167,17 @@ pub fn install(
 /// install time. The clone is fully validated before the existing directory
 /// is moved aside, so a failed fetch or validation leaves the old mod intact.
 pub fn update(name: &str) -> Result<InstallReport, String> {
+    update_inner(name, false)
+}
+
+/// Update a mod only when the fetched candidate still opts into the in-process
+/// lifecycle. Candidate validation happens before the installed directory is
+/// changed.
+pub fn update_lifecycle(name: &str) -> Result<InstallReport, String> {
+    update_inner(name, true)
+}
+
+fn update_inner(name: &str, require_lifecycle: bool) -> Result<InstallReport, String> {
     if !valid_component(name) {
         return Err(format!("invalid installed mod name {name:?}"));
     }
@@ -164,19 +197,56 @@ pub fn update(name: &str) -> Result<InstallReport, String> {
     let (repository, reference) = read_source_metadata(&root.join("source"))?;
     let (owner, repo, url) = github_repository(&repository)?;
     let checkout = temporary_path("update")?;
-    let result = install_from_checkout(&checkout, &owner, &repo, &url, reference, true, Some(name));
+    let result = install_from_checkout(
+        &checkout,
+        &owner,
+        &repo,
+        &url,
+        reference,
+        true,
+        Some(name),
+        require_lifecycle,
+    );
     let _ = fs::remove_dir_all(&checkout);
     result
 }
 
-/// Update every installed root mod, preserving each mod's recorded source.
-pub fn update_all() -> Result<Vec<InstallReport>, String> {
+/// Update every installed mod, preserving each mod's recorded source and
+/// retaining outcomes if an update fails partway through.
+pub fn update_all() -> Result<UpdateAllReport, String> {
     let mut names: Vec<_> = installed_specs()?
         .into_iter()
         .map(|spec| spec.name)
         .collect();
     names.sort();
-    names.into_iter().map(|name| update(&name)).collect()
+    Ok(update_all_with(names, update))
+}
+
+fn update_all_with<F>(names: Vec<String>, mut update_one: F) -> UpdateAllReport
+where
+    F: FnMut(&str) -> Result<InstallReport, String>,
+{
+    let mut updated = Vec::new();
+    for (index, name) in names.iter().enumerate() {
+        match update_one(name) {
+            Ok(report) => updated.push(report),
+            Err(error) => {
+                return UpdateAllReport {
+                    updated,
+                    failed: Some(UpdateFailure {
+                        name: name.clone(),
+                        error,
+                    }),
+                    not_attempted: names[index + 1..].to_vec(),
+                };
+            }
+        }
+    }
+    UpdateAllReport {
+        updated,
+        failed: None,
+        not_attempted: Vec::new(),
+    }
 }
 
 /// Remove one explicitly installed mod. The manifest is checked before the
@@ -239,6 +309,7 @@ fn install_from_checkout(
     reference: Option<String>,
     force: bool,
     expected_name: Option<&str>,
+    require_lifecycle: bool,
 ) -> Result<InstallReport, String> {
     let mut command = Command::new("git");
     command.args(["clone", "--depth", "1", "--no-tags"]);
@@ -264,6 +335,12 @@ fn install_from_checkout(
                 spec.name, expected_name
             ));
         }
+    }
+    if require_lifecycle && spec.lifecycle.is_none() {
+        return Err(format!(
+            "mod {} does not declare lifecycle {}; installed files were not changed",
+            spec.name, MOD_LIFECYCLE_API
+        ));
     }
     let entry = safe_relative_path(&spec.entry, "entry")?;
     let entry_path = checkout.join(&entry);
@@ -420,6 +497,7 @@ pub fn parse_manifest(text: &str) -> Result<ModSpec, String> {
     let mut api = None;
     let mut entry = None;
     let mut command = None;
+    let mut lifecycle = None;
     for (line_number, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -435,6 +513,7 @@ pub fn parse_manifest(text: &str) -> Result<ModSpec, String> {
             "api" => &mut api,
             "entry" => &mut entry,
             "command" => &mut command,
+            "lifecycle" => &mut lifecycle,
             other => return Err(format!("extension.toml has unknown key {other:?}")),
         };
         if slot.replace(value).is_some() {
@@ -447,6 +526,7 @@ pub fn parse_manifest(text: &str) -> Result<ModSpec, String> {
         api: api.ok_or_else(|| "extension.toml is missing api".to_string())?,
         entry: entry.ok_or_else(|| "extension.toml is missing entry".to_string())?,
         command,
+        lifecycle,
     };
     validate_spec(&spec)?;
     Ok(spec)
@@ -458,6 +538,16 @@ fn validate_spec(spec: &ModSpec) -> Result<(), String> {
     }
     if spec.api != LUA_API_VERSION {
         return Err(format!("unsupported mod API {:?}", spec.api));
+    }
+    if spec
+        .lifecycle
+        .as_deref()
+        .is_some_and(|api| api != MOD_LIFECYCLE_API)
+    {
+        return Err(format!(
+            "unsupported mod lifecycle API {:?}",
+            spec.lifecycle.as_deref().unwrap()
+        ));
     }
     let expected = format!("packages/{}/init.lua", spec.name);
     if spec.entry != expected {
@@ -590,6 +680,11 @@ fn installed_source(name: &str) -> Result<Option<PackageSource>, String> {
             spec.name
         ));
     }
+    let lifecycle = if name == extension {
+        spec.lifecycle.clone()
+    } else {
+        None
+    };
     let entry = safe_relative_path(&spec.entry, "entry")?;
     let entry_path = root.join(&entry);
     let package_root = entry_path
@@ -616,6 +711,7 @@ fn installed_source(name: &str) -> Result<Option<PackageSource>, String> {
             format!("cannot read installed package {}: {error}", path.display())
         })?,
         chunk_name,
+        lifecycle,
     }))
 }
 
@@ -768,7 +864,44 @@ fn valid_package_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_manifest, parse_repository, validate_reference};
+    use super::{
+        parse_manifest, parse_repository, update_all_with, validate_reference, InstallReport,
+        Manifest, MOD_LIFECYCLE_API,
+    };
+
+    fn report(name: &str) -> InstallReport {
+        InstallReport {
+            manifest: Manifest {
+                name: name.into(),
+                version: "1".into(),
+                api: "remuda-lua-v1".into(),
+                entry: "init.lua".into(),
+                command: None,
+                lifecycle: None,
+                source: "disk".into(),
+                status: "installed".into(),
+            },
+            path: std::path::PathBuf::from(name),
+            repository: "owner/repo".into(),
+            reference: None,
+            commit: "abc".into(),
+        }
+    }
+
+    #[test]
+    fn batch_update_keeps_success_before_failure_and_remaining_names() {
+        let result = update_all_with(
+            vec!["alpha".into(), "bravo".into(), "charlie".into()],
+            |name| match name {
+                "alpha" => Ok(report(name)),
+                "bravo" => Err("fetch failed".into()),
+                _ => panic!("charlie must not be attempted"),
+            },
+        );
+        assert_eq!(result.updated, vec![report("alpha")]);
+        assert_eq!(result.failed.unwrap().name, "bravo");
+        assert_eq!(result.not_attempted, vec!["charlie"]);
+    }
 
     #[test]
     fn parses_a_manifest_with_a_declared_command() {
@@ -783,6 +916,28 @@ mod tests {
         .expect("manifest");
         assert_eq!(manifest.name, "example");
         assert_eq!(manifest.version, "0.1.0");
+        assert_eq!(manifest.lifecycle, None);
+    }
+
+    #[test]
+    fn lifecycle_manifest_is_opt_in_and_versioned() {
+        let manifest = parse_manifest(
+            r#"
+            name = "sample"
+            entry = "packages/sample/init.lua"
+            api = "remuda-lua-v1"
+            lifecycle = "remuda-module-v1"
+            "#,
+        )
+        .expect("lifecycle manifest");
+        assert_eq!(manifest.lifecycle.as_deref(), Some(MOD_LIFECYCLE_API));
+        assert!(parse_manifest(
+            r#"name = "sample"
+entry = "packages/sample/init.lua"
+api = "remuda-lua-v1"
+lifecycle = "remuda-module-v2""#
+        )
+        .is_err());
     }
 
     #[test]

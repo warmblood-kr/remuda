@@ -78,6 +78,7 @@ impl Image {
                         .set_name("@remuda/tools.lua")
                         .exec()
                 })
+                .and_then(|()| script::hide_module_activator(&lua))
                 .and_then(|()| capture_print(&lua, Rc::clone(&printed)))
                 .map_err(|e| e.to_string());
 
@@ -293,6 +294,17 @@ mod tests {
     use super::render;
     use mlua::Lua;
 
+    fn lifecycle_lua() -> Lua {
+        let lua = Lua::new();
+        let remuda = lua.create_table().unwrap();
+        remuda
+            .set("_registry", lua.create_table().unwrap())
+            .unwrap();
+        lua.globals().set("remuda", remuda).unwrap();
+        lua.load(include_str!("tools.lua")).exec().unwrap();
+        lua
+    }
+
     /// What `remuda -e <code>` would print, without a daemon in the way.
     fn shown(code: &str) -> String {
         let lua = Lua::new();
@@ -335,6 +347,91 @@ mod tests {
     #[test]
     fn the_array_part_comes_first_in_index_order() {
         assert_eq!(shown("{10, 20, name = 'x'}"), r#"{10, 20, name = "x"}"#);
+    }
+
+    #[test]
+    fn module_reload_replaces_owned_hooks_and_tools_but_keeps_initialized_state() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            local initialized = 0
+            local function declaration(step, tool_name)
+              return {
+                api = "remuda-module-v1",
+                state_version = 1,
+                initialize = function()
+                  initialized = initialized + 1
+                  return { count = 0 }
+                end,
+                hooks = {{ event = "probe", run = function(state)
+                  state.count = state.count + step
+                end }},
+                tools = {{
+                  name = tool_name,
+                  about = "A sufficiently long description for this test tool.",
+                  run = function(state) return tostring(state.count) end,
+                }},
+              }
+            end
+            assert(remuda._activate_module("sample", declaration(1, "sample_old")))
+            remuda.emit("probe")
+            assert(remuda.tools.sample_old() == "1")
+            assert(remuda._activate_module("sample", declaration(10, "sample_new")))
+            remuda.emit("probe")
+            assert(initialized == 1)
+            assert(remuda.tools.sample_old == nil)
+            assert(remuda.tools.sample_new() == "11")
+            assert(#remuda.hooks.probe == 1)
+            "#,
+        )
+        .exec()
+        .expect("reload should keep one hook and the original state");
+    }
+
+    #[test]
+    fn failed_state_migration_keeps_the_previous_state_and_registrations() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            local v1 = {
+              api = "remuda-module-v1", state_version = 1,
+              initialize = function() return { nested = { count = 4 } } end,
+              hooks = {{ event = "probe", run = function(state)
+                state.nested.count = state.nested.count + 1
+              end }},
+            }
+            assert(remuda._activate_module("sample", v1))
+            local v2 = {
+              api = "remuda-module-v1", state_version = 2,
+              initialize = function() error("must not initialize on reload") end,
+              migrations = {[1] = function(state)
+                state.nested.count = state.nested.count + 10
+                return { total = state.nested.count }
+              end},
+              hooks = {{ event = "probe", run = function(state)
+                state.total = state.total + 1
+                remuda._observed_total = state.total
+              end }},
+            }
+            assert(remuda._activate_module("sample", v2))
+            local broken = {
+              api = "remuda-module-v1", state_version = 3,
+              initialize = function() return {} end,
+              migrations = {[2] = function(state)
+                state.total = -1
+                error("migration failed")
+              end},
+              hooks = {},
+            }
+            local ok = pcall(remuda._activate_module, "sample", broken)
+            assert(not ok)
+            remuda.emit("probe")
+            assert(remuda._observed_total == 15)
+            assert(#remuda.hooks.probe == 1)
+            "#,
+        )
+        .exec()
+        .expect("failed migration must leave the prior module active");
     }
 
     #[test]
