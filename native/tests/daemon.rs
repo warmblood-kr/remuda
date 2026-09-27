@@ -588,6 +588,50 @@ fn a_session_exited_hook_fires_when_a_real_session_dies() {
 }
 
 #[test]
+fn a_session_exited_hook_fires_once_when_a_session_is_closed() {
+    // `close` removes the entry itself, so the reaper never sees it die: the
+    // close path must fire the event, and the reaper must not fire it again.
+    let path = scratch("session-exited-close");
+    let _daemon = daemon_at(&path);
+
+    eval(
+        &path,
+        r#"
+            remuda._session_exited_names = {}
+            remuda.on("session_exited", function(name)
+                table.insert(remuda._session_exited_names, name)
+            end)
+        "#,
+    );
+    new_session(&path, "closed");
+    let response = client::request(
+        &path,
+        &Request::Close {
+            name: "closed".into(),
+        },
+    )
+    .expect("close");
+    assert_eq!(response, Response::Ok);
+
+    let count = "local n = 0 for _, v in ipairs(remuda._session_exited_names) do if v == 'closed' then n = n + 1 end end return n";
+    let deadline = Instant::now() + PATIENCE;
+    while read_count(&path, count) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "session_exited never fired for a closed session"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Two more ticks: a late reap must not fire a duplicate.
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(
+        read_count(&path, count),
+        1,
+        "a closed session must fire exactly once"
+    );
+}
+
+#[test]
 fn a_session_exited_hook_still_fires_once_when_ls_reaps_before_the_tick() {
     // `Registry::reap()` removes what it finds and hands it only to whoever
     // calls first. A `List` that reaps well inside TICK_PERIOD must not make

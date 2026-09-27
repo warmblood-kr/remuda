@@ -199,15 +199,29 @@ const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String> {
     let dead = registry.reap();
     for name in &dead {
-        let _ = image.submit(
-            &format!(
-                "remuda.emit('session_exited', {})",
-                crate::mcp::lua_string(name)
-            ),
-            None,
-        );
+        notify_exited(image, name);
     }
     dead
+}
+
+fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<()>> {
+    let closed = registry.close(name)?;
+    if let Ok(true) = closed {
+        notify_exited(image, name);
+    }
+    Some(closed.map(drop))
+}
+
+/// `close` stops tracking a session itself, so the reaper never sees it die:
+/// whichever of the two removes the entry fires the one `session_exited`.
+fn notify_exited(image: &Image, name: &str) {
+    let _ = image.submit(
+        &format!(
+            "remuda.emit('session_exited', {})",
+            crate::mcp::lua_string(name)
+        ),
+        None,
+    );
 }
 
 /// Wake the image once a period with `remuda._run_due_schedules(now)`, and
@@ -405,9 +419,9 @@ fn handle(
 
         Request::Attach { name } => attach(stream, reader, registry, &name),
 
-        Request::Close { name } => {
-            respond(&stream, &name, registry.close(&name), |()| Response::Ok)
-        }
+        Request::Close { name } => respond(&stream, &name, close(registry, image, &name), |()| {
+            Response::Ok
+        }),
 
         Request::ListDir { path: dir } => reply(&stream, &list_dir(&dir)),
         Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
