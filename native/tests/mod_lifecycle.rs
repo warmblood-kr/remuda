@@ -119,7 +119,7 @@ fn installed_mod_reloads_in_the_same_image_without_losing_state_or_old_code_on_f
         &entry,
         r#"return {
           api = "remuda-module-v1", state_version = 2,
-          initialize = function() return {} end,
+          initialize = function() return { called = false } end,
           migrations = {[1] = function(state)
             state.count = state.count + 100
             return state
@@ -175,6 +175,44 @@ fn installed_mod_reloads_in_the_same_image_without_losing_state_or_old_code_on_f
     .unwrap();
     read_value(&image, "api_v3_phase = 'legacy_refusal'");
     read_value(&image, include_str!("api/v3.lua"));
+}
+
+#[test]
+fn activated_lifecycle_hook_can_call_remuda_and_hook_errors_are_visible() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          hooks = {
+            { event = "probe", run = function() remuda.emit("nested") end },
+            { event = "probe", run = function() error("visible lifecycle hook error") end },
+            { event = "probe", run = function(state) state.called = true end },
+          },
+          tools = {{ name = "sample_called",
+            about = "Read whether the last lifecycle hook ran.",
+            run = function(state) return tostring(state.called) end }},
+        }"#,
+    );
+
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-hook-error.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "remuda.exec('sample')");
+    let output = image.eval("remuda.emit('probe')", None).expect("emit runs hooks");
+    assert!(output.contains("visible lifecycle hook error"), "{output}");
+    assert_eq!(read_value(&image, "return remuda.tools.sample_called()"), "true");
 }
 
 #[test]

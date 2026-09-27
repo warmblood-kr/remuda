@@ -257,7 +257,10 @@ function remuda.emit(event, ...)
     snapshot[i] = hook
   end
   for _, hook in ipairs(snapshot) do
-    hook.fn(...)
+    local ok, err = pcall(hook.fn, ...)
+    if not ok then
+      print("remuda hook error for " .. event .. ": " .. tostring(err))
+    end
   end
 end
 register("emit", "Fire an event, running every hook registered for it.", "emit(event, ...) -> nil")
