@@ -932,7 +932,9 @@ fn the_daemon_names_the_build_it_was_started_from() {
     }
 }
 
+// Unix only: the regression is SIGPIPE, and `true` is not a Windows command.
 #[test]
+#[cfg(unix)]
 fn auto_started_daemon_survives_a_fast_process_exit() {
     let dir = scratch_dir("autostart-fast-process");
 
