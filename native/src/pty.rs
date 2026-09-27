@@ -127,7 +127,7 @@ fn spawn_reader(
             let at = match screen.lock() {
                 Ok(mut parser) => {
                     parser.process(&buf[..n]);
-                    let (row, col) = parser.screen().cursor_position();
+                    let (row, col) = display_cursor(parser.screen());
                     (row + 1, col + 1)
                 }
                 // Poisoned: the grid can no longer be trusted.
@@ -161,7 +161,16 @@ fn answer_cursor_query(writer: &SharedWriter, (row, col): (u16, u16)) {
     }
 }
 
-fn styled_cells(screen: &vt100::Screen, size: Size) -> Vec<Vec<StyledCell>> {
+/// The emulator's cursor as a terminal shows and reports it. vt100 leaves
+/// it one past the last column in DECAWM pending wrap (a row typed exactly
+/// full); xterm/iTerm/tmux draw it on the last column and answer DSR 6n with
+/// that column, so clamp to `cols - 1`.
+pub(crate) fn display_cursor(screen: &vt100::Screen) -> (u16, u16) {
+    let (row, col) = screen.cursor_position();
+    (row, col.min(screen.size().1.saturating_sub(1)))
+}
+
+pub(crate) fn styled_cells(screen: &vt100::Screen, size: Size) -> Vec<Vec<StyledCell>> {
     (0..size.rows())
         .map(|row| {
             (0..size.cols())
@@ -247,7 +256,7 @@ impl AgentProcess for PtyAgent {
     fn cursor(&mut self) -> Result<Cursor> {
         let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
         let screen = parser.screen();
-        let (row, col) = screen.cursor_position();
+        let (row, col) = display_cursor(screen);
         Ok(Cursor {
             row,
             col,
