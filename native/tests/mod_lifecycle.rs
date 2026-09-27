@@ -5,13 +5,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// XDG_DATA_HOME is process-global; tests that set it must not overlap.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct DataHome {
     root: PathBuf,
     old_data: Option<std::ffi::OsString>,
+    _env: std::sync::MutexGuard<'static, ()>,
 }
 
 impl DataHome {
     fn new() -> Self {
+        let env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -23,7 +28,11 @@ impl DataHome {
         fs::create_dir_all(&root).expect("private data home");
         let old_data = std::env::var_os("XDG_DATA_HOME");
         std::env::set_var("XDG_DATA_HOME", &root);
-        Self { root, old_data }
+        Self {
+            root,
+            old_data,
+            _env: env,
+        }
     }
 
     fn entry(&self) -> PathBuf {
