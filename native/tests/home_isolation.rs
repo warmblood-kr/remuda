@@ -64,7 +64,7 @@ impl Drop for RealHomeGuard {
 /// rather than waiting out the whole bound -- then, if the bound passes
 /// clean, treats that as proof `load_user_config` (daemon.rs:126) never ran
 /// against this sentinel. 1200ms matches
-/// `a_fresh_daemon_with_no_user_config_never_auto_registers_butler`'s own
+/// `a_fresh_daemon_with_no_user_config_never_auto_starts_a_session`'s own
 /// margin for this identical background thread.
 fn assert_marker_never_appears(marker: &Path, helper: &str) {
     let deadline = Instant::now() + Duration::from_millis(1200);
