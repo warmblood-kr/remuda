@@ -1014,10 +1014,10 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
     assert_eq!(
         lines,
         vec![
-            "\x1b[1;36malpha\x1b[0m \x1b[32m●\x1b[0m".to_string(),
+            "\x1b[1;36malpha\x1b[0m \x1b[32m∙\x1b[0m".to_string(),
             String::new(),
             String::new(),
-            "\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m".to_string(),
+            "\x1b[1mbravo\x1b[0m \x1b[32m∙\x1b[0m".to_string(),
             "⚑".to_string(),
             String::new(),
         ],
@@ -1032,10 +1032,10 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
-             \x1b[2;1H\x1b[K▸ \x1b[1;36malpha\x1b[0m \x1b[32m●\x1b[0m       │xxxxxxxxxx                                                     \
+             \x1b[2;1H\x1b[K▸ \x1b[1;36malpha\x1b[0m \x1b[32m∙\x1b[0m       │xxxxxxxxxx                                                     \
              \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K  \x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m       │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K  \x1b[1mbravo\x1b[0m \x1b[32m∙\x1b[0m       │xxxxxxxxxx                                                     \
              \x1b[6;1H\x1b[K  ⚑             │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1145,14 +1145,14 @@ fn every_row_of_a_nested_entry_shares_one_offset() {
     let block = |i: usize| &lines[i * 3..i * 3 + 3];
 
     // Depth 0 is the local layout itself, byte-identical to the flat list.
-    assert_eq!(block(0), ["\x1b[1malpha\x1b[0m \x1b[32m●\x1b[0m", "", ""]);
+    assert_eq!(block(0), ["\x1b[1malpha\x1b[0m \x1b[32m∙\x1b[0m", "", ""]);
     // Every row of a deeper entry, blank spacer included, is that same
     // block shifted right by 2 * depth.
     for (i, depth) in [(1, 1), (2, 2)] {
         let pad = " ".repeat(2 * depth);
         let name = ["alpha", "bravo", "charlie"][i];
         let expected = [
-            format!("{pad}\x1b[1m{name}\x1b[0m \x1b[32m●\x1b[0m"),
+            format!("{pad}\x1b[1m{name}\x1b[0m \x1b[32m∙\x1b[0m"),
             pad.clone(),
             pad.clone(),
         ];
@@ -1217,18 +1217,18 @@ fn a_status_dot_follows_the_name_and_the_state_row_keeps_only_detail() {
     let entry = |i: usize| (lines[i * 3].as_str(), lines[i * 3 + 1].as_str());
     assert_eq!(
         entry(0),
-        ("\x1b[1;36mplain\x1b[0m \x1b[32m●\x1b[0m", ""),
+        ("\x1b[1;36mplain\x1b[0m \x1b[32m∙\x1b[0m", ""),
         "selected, live"
     );
     assert_eq!(
         entry(1),
-        ("\x1b[1mbusy\x1b[0m \x1b[32m●\x1b[0m", "⚑"),
+        ("\x1b[1mbusy\x1b[0m \x1b[32m∙\x1b[0m", "⚑"),
         "unselected, live, attached"
     );
     assert_eq!(
         entry(2),
         (
-            "\x1b[1magent\x1b[0m \x1b[32m●\x1b[0m",
+            "\x1b[1magent\x1b[0m \x1b[32m∙\x1b[0m",
             "\x1b[2mclaude · opus · 12K\x1b[0m"
         ),
         "live detail is dim, like any other telemetry"
@@ -1236,11 +1236,56 @@ fn a_status_dot_follows_the_name_and_the_state_row_keeps_only_detail() {
     assert_eq!(
         entry(3),
         (
-            "\x1b[1mgone\x1b[0m \x1b[31m●\x1b[0m",
+            "\x1b[1mgone\x1b[0m \x1b[31m∙\x1b[0m",
             "\x1b[2mclaude · opus · 12K\x1b[0m"
         ),
         "dead is a red dot, not a word"
     );
+}
+
+#[test]
+fn a_name_row_has_the_same_width_in_every_terminal() {
+    // Ambiguous-width characters (East Asian Width "A") render one cell or
+    // two depending on the terminal, e.g. a Korean setup draws them wide.
+    // The renderer's own width must hold either way, so a name row may
+    // contain none: narrow and wide measures agree with visible_width.
+    use unicode_width::UnicodeWidthStr;
+    let path = scratch_socket("status-dot-width");
+    daemon_at(&path);
+    eval(
+        &path,
+        r#"remuda.ls = function() return {
+          { name = "alpha", alive = true, attached = false },
+          { name = "bravo", alive = false, attached = true },
+        } end"#,
+    );
+    let (rows, lines, _) =
+        sessions_buffer_lines(&path, 40, 0, None).expect("refresh sessions buffer");
+    for name_row in lines.iter().step_by(rows) {
+        let plain: String = strip_ansi(name_row);
+        assert_eq!(
+            (visible_width(name_row), plain.width(), plain.width_cjk()),
+            (plain.width(), plain.width(), plain.width()),
+            "no ambiguous-width character on {name_row:?}"
+        );
+    }
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for skip in chars.by_ref() {
+                if skip == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Empty-herd counterpart, fed by a real (empty) daemon registry.
