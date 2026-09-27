@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --all-targets --no-fail-fast
 
   test-windows:
     # The port's only evidence. Nobody here has a Windows machine, so this
@@ -31,9 +31,11 @@ jobs:
     # `pull_request`, which a fork can trigger — so the office's self-hosted
     # macOS runner belongs in release.yml and must never appear here.
     runs-on: windows-latest
+    # A hung test otherwise holds the runner for the 6h default.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - run: cargo test --workspace --all-targets
+      - run: cargo test --workspace --all-targets --no-fail-fast
 
   butler-contract:
     # remuda-butler depends on this core's mod boot/reload contract, and a core
