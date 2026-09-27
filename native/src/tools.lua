@@ -259,7 +259,7 @@ function remuda.emit(event, ...)
   for _, hook in ipairs(snapshot) do
     local ok, err = pcall(hook.fn, ...)
     if not ok then
-      print("remuda hook error for " .. event .. ": " .. tostring(err))
+      io.stderr:write("remuda hook error for " .. event .. ": " .. tostring(err) .. "\n")
     end
   end
 end
