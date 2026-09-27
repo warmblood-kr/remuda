@@ -506,7 +506,8 @@ fn execute_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Resu
             .eval()?;
         let activate: mlua::Function =
             lua.named_registry_value("remuda.lifecycle.activate_module")?;
-        let (_, state, start): (bool, Value, Value) = activate.call((name, declaration))?;
+        let (_, state, start): (bool, Value, Value) =
+            activate.call((name, declaration, require_lifecycle))?;
         active.set(true);
         if let Value::Function(start) = start {
             start.call::<()>(state)?;

@@ -317,3 +317,48 @@ fn mod_command_handler_receives_caller_env() {
         "table"
     );
 }
+
+// #116: a reload must leave the image in the shape of one activation, and
+// `exec` on an already-active mod (a no-args mod command) must not restart it.
+#[test]
+fn reloads_own_declared_schedules_and_exec_does_not_restart_an_active_mod() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return { starts = 0, ticks = 0 } end,
+          start = function(state) state.starts = state.starts + 1 end,
+          schedules = {{ name = "sample_tick", every = 1, run = function(state)
+            state.ticks = state.ticks + 1
+          end }},
+          tools = {{ name = "sample_counts",
+            about = "Read this module's start and tick counts.",
+            run = function(state) return state.starts .. ":" .. state.ticks end }},
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-schedules.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    let schedules = "local n = 0 for _ in pairs(remuda.schedules) do n = n + 1 end return tostring(n)";
+
+    read_value(&image, "remuda.exec('sample')");
+    read_value(&image, "for _ = 1, 10 do remuda.reload('sample') end");
+    assert_eq!(read_value(&image, schedules), "1");
+    read_value(&image, "remuda._run_due_schedules(1e9)");
+    assert_eq!(read_value(&image, "return remuda.tools.sample_counts()"), "11:1");
+
+    read_value(&image, "remuda.exec('sample')");
+    assert_eq!(read_value(&image, "return remuda.tools.sample_counts()"), "11:1");
+    assert_eq!(read_value(&image, schedules), "1");
+}

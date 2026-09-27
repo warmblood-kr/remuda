@@ -130,6 +130,24 @@ returned table; do not register them at file scope or from `initialize`.
 Reload replaces only that mod's owned hooks and tools, so removed handlers do
 not linger and other mods remain registered.
 
+Periodic work belongs in the declaration too. Each `schedules` entry is
+registered like `remuda.schedule`, but its `run` receives the state, and reload
+cancels the previous activation's schedules before registering the new ones:
+
+```lua
+schedules = {
+  { name = "sample_poll", every = 5, run = function(state) state.polls = (state.polls or 0) + 1 end },
+},
+```
+
+An optional `start(state)` runs after each activation: the first
+`remuda.exec(NAME)` and every `remuda.reload(NAME)`. `remuda.exec` (and a
+mod's own no-argument command) on an already-active mod does nothing, so
+opening a mod's screen does not restart it. The mod owns only its declared
+hooks, tools and schedules. Anything `start` or a handler registers
+imperatively (`remuda.schedule`, `remuda.process`, `remuda.new`, and so on)
+survives reload; the mod must find and reuse or cancel it itself.
+
 The runtime registry also covers words added with `remuda.tool`, so an
 extension can document itself when it registers its function:
 

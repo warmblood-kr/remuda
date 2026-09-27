@@ -350,9 +350,15 @@ local function array_length(value, label)
   return length
 end
 
-function remuda._activate_module(name, candidate)
+-- REACTIVATE false is `exec`: ensure the mod is active, but leave an active
+-- one (and its `start` effects) alone — only `reload` re-runs `start` (#116).
+-- A `start` that failed does not count, so the next `exec` retries it.
+function remuda._activate_module(name, candidate, reactivate)
   if type(name) ~= "string" or name == "" then
     error("module name must be a non-empty string", 0)
+  end
+  if reactivate == false and modules[name] ~= nil and modules[name].started then
+    return false
   end
   if type(candidate) ~= "table" or candidate.api ~= "remuda-module-v1" then
     error("mod entry must return a remuda-module-v1 declaration", 0)
@@ -404,6 +410,17 @@ function remuda._activate_module(name, candidate)
     end
     prepared_tools[index] = word
     tool_names[index] = word.name
+  end
+
+  local schedules = candidate.schedules or {}
+  local schedule_count = array_length(schedules, "module schedules")
+  for index = 1, schedule_count do
+    local schedule = schedules[index]
+    if type(schedule) ~= "table" or type(schedule.every) ~= "number" or schedule.every <= 0
+      or type(schedule.run) ~= "function"
+      or (schedule.name ~= nil and (type(schedule.name) ~= "string" or schedule.name == "")) then
+      error("each module schedule needs a positive every, a run function, and an optional non-empty name", 0)
+    end
   end
 
   local migrations = candidate.migrations or {}
@@ -475,8 +492,24 @@ function remuda._activate_module(name, candidate)
     module_tool_owners[word.name] = name
     register(word.name, word.about, word.name .. "(" .. arg_list(word.args, word.needs) .. ") -> string")
   end
-  modules[name] = { version = version, state = state, tools = tool_names }
-  return true, state, candidate.start
+  for _, handle in ipairs(previous and previous.schedules or {}) do
+    remuda.cancel(handle)
+  end
+  local schedule_handles = {}
+  for index = 1, schedule_count do
+    local declared = schedules[index]
+    schedule_handles[index] = remuda.schedule({
+      name = declared.name,
+      every = declared.every,
+      run = function() return declared.run(state) end,
+    })
+  end
+  local entry = { version = version, state = state, tools = tool_names, schedules = schedule_handles }
+  modules[name] = entry
+  return true, state, function(started_state)
+    if candidate.start then candidate.start(started_state) end
+    entry.started = true
+  end
 end
 
 local escapes = {
