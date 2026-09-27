@@ -657,6 +657,24 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot create daemon log {}: {e}", stderr_path.display()))?;
     #[cfg(windows)]
     let _log_cleanup = StartupLogCleanup(stderr_path.clone());
+    // std spawns with bInheritHandles=TRUE, so the daemon would inherit every
+    // inheritable handle we hold — including our own stdout/stderr pipe ends,
+    // keeping a caller that captures our output waiting on the daemon's life
+    // instead of ours. Our std handles don't need to be inheritable: std's
+    // Stdio::inherit passes an inheritable duplicate, not the handle itself.
+    // Best effort, so errors (e.g. no std handle) are ignored. Issue #111.
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        use windows_sys::Win32::System::Console::{
+            GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            // SAFETY: both calls take plain values; an invalid handle only
+            // makes SetHandleInformation fail.
+            unsafe { SetHandleInformation(GetStdHandle(id), HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
     let mut command = std::process::Command::new(exe);
     command
         .args(["-s", server, "daemon"])
