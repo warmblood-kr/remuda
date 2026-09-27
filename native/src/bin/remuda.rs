@@ -534,10 +534,8 @@ fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> Exit
     f(path)
 }
 
-/// Delegates to the lib crate's installed package resolver — the
-/// `remuda.exec()` Lua binding (script.rs) resolves through the same resolver,
-/// so there is exactly one list, not two.
-/// Run an installed mod's entry file in the daemon's image.
+/// Run an installed mod's entry file in the daemon's image. Resolves through
+/// the same resolver as the `remuda.exec()` Lua binding, so there is one list.
 fn exec_command(path: &Path, name: &str) -> ExitCode {
     match remuda_native::packages::resolve(name) {
         Err(error) => fail(error),
@@ -953,6 +951,45 @@ fn mod_info_command(args: &[&str]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn mod_update_all() -> ExitCode {
+    match remuda_native::packages::update_all() {
+        Ok(batch) => {
+            for report in &batch.updated {
+                println!(
+                    "updated mod {} {} from {} at {}",
+                    report.manifest.name, report.manifest.version, report.repository, report.commit
+                );
+            }
+            if let Some(failed) = batch.failed {
+                println!(
+                    "update outcomes: updated [{}]; reloaded none; failed {}: {}; not attempted [{}]",
+                    display_names(
+                        &batch.updated.iter().map(|report| report.manifest.name.clone()).collect::<Vec<_>>()
+                    ),
+                    failed.name,
+                    failed.error,
+                    display_names(&batch.not_attempted)
+                );
+                fail(format!("update stopped after {} failed", failed.name))
+            } else {
+                println!(
+                    "update outcomes: updated [{}]; reloaded none; failed none; not attempted none",
+                    display_names(
+                        &batch
+                            .updated
+                            .iter()
+                            .map(|report| report.manifest.name.clone())
+                            .collect::<Vec<_>>()
+                    )
+                );
+                println!("use `remuda mod update NAME --reload` to reload in-process, or restart the daemon");
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => fail(error),
+    }
+}
+
 fn mod_update_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     let (all, name, reload) = match args {
         ["--all"] => (true, None, false),
@@ -976,36 +1013,7 @@ fn mod_update_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         );
     }
     if all {
-        return match remuda_native::packages::update_all() {
-            Ok(batch) => {
-                for report in &batch.updated {
-                    println!(
-                        "updated mod {} {} from {} at {}",
-                        report.manifest.name,
-                        report.manifest.version,
-                        report.repository,
-                        report.commit
-                    );
-                }
-                if let Some(failed) = batch.failed {
-                    println!(
-                        "update outcomes: updated [{}]; reloaded none; failed {}: {}; not attempted [{}]",
-                        display_names(
-                            &batch.updated.iter().map(|report| report.manifest.name.clone()).collect::<Vec<_>>()
-                        ),
-                        failed.name,
-                        failed.error,
-                        display_names(&batch.not_attempted)
-                    );
-                    fail(format!("update stopped after {} failed", failed.name))
-                } else {
-                    println!("update outcomes: updated [{}]; reloaded none; failed none; not attempted none", display_names(&batch.updated.iter().map(|report| report.manifest.name.clone()).collect::<Vec<_>>()));
-                    println!("use `remuda mod update NAME --reload` to reload in-process, or restart the daemon");
-                    ExitCode::SUCCESS
-                }
-            }
-            Err(error) => fail(error),
-        };
+        return mod_update_all();
     }
     let name = name.expect("single mod name");
     let result = if reload {

@@ -76,6 +76,10 @@ impl Registry {
     /// Take ownership of a session and hand back a shared handle. Caution: a
     /// name already in use is refused, and the session comes back in `Err`
     /// **unregistered** — replacing would strand a live pty.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the refused session is handed back whole"
+    )]
     pub fn register(&self, session: Session) -> core::result::Result<Arc<Session>, Session> {
         let mut sessions = self.lock();
         if sessions.contains_key(session.name()) {

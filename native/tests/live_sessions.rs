@@ -205,17 +205,20 @@ fn detaching_leaves_the_agent_untouched_and_the_core_back_in_charge() {
         .expect("keystrokes");
     wait_for(&session, "25-typed");
 
-    // While held, the core is refused — and the refusal must not have leaked
-    // any bytes into the pty.
-    assert!(session.send_line("echo LEAKED").is_err());
+    // While held, managed input is still accepted and reaches the process;
+    // only terminate is refused, and it leaves the process running.
+    session
+        .send_line("echo $((7*7))-managed")
+        .expect("a viewer does not block managed input");
+    wait_for(&session, "49-managed");
+    assert!(
+        session.terminate().is_err(),
+        "terminate is refused while attached"
+    );
 
     drop(held);
     session
         .send_line("echo $((9*9))-after")
-        .expect("the core resumes on detach");
-    let screen = wait_for(&session, "81-after");
-    assert!(
-        !screen.contains("LEAKED"),
-        "a refused instruction must never reach the process. screen:\n{screen}"
-    );
+        .expect("the core stays in charge after detach");
+    wait_for(&session, "81-after");
 }

@@ -191,9 +191,6 @@ pub trait AgentProcess: Send {
         Ok(())
     }
 
-    /// Move through retained terminal history. Positive values move toward
-    /// older output; negative values return toward the live screen.
-
     /// The current terminal size.
     fn size(&self) -> Size;
 }

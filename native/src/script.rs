@@ -84,16 +84,6 @@ pub const BINDINGS: [&str; 53] = [
     "windows",
 ];
 
-#[cfg(test)]
-mod binding_tests {
-    use super::BINDINGS;
-
-    #[test]
-    fn binding_names_are_sorted_and_unique() {
-        assert!(BINDINGS.windows(2).all(|pair| pair[0] < pair[1]));
-    }
-}
-
 /// name, about, signature — one row per Rust-bound word. `tools.lua` adds its
 /// own rows for the words it defines in pure Lua, into the same table.
 const WORDS: &[(&str, &str, &str)] = &[
@@ -742,5 +732,15 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::StyledScreen { .. } => Err(mlua::Error::runtime(
             "styled capture is not exposed to scripts",
         )),
+    }
+}
+
+#[cfg(test)]
+mod binding_tests {
+    use super::BINDINGS;
+
+    #[test]
+    fn binding_names_are_sorted_and_unique() {
+        assert!(BINDINGS.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }

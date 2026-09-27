@@ -211,7 +211,7 @@ impl Session {
         }
     }
 
-    /// End the child. Refused while attached, as `send` is, and idempotent on an
+    /// End the child. Refused while attached, and idempotent on an
     /// already-dead agent. Does not remove the session from a registry — the
     /// last screen survives; [`crate::Registry::close`] does both.
     pub fn terminate(&self) -> Result<()> {

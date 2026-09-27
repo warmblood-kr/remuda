@@ -886,7 +886,7 @@ fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buff
     let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
     assert_eq!(
             out,
-            "\x1b[?2026h\x1b[H\
+            "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
              \x1b[2;1H\x1b[K▸ alpha         │xxxxxxxxxx                                                     \
              \x1b[3;1H\x1b[Klive            │xxxxxxxxxx                                                     \
@@ -934,7 +934,7 @@ fn render_styled_of_the_empty_session_list_is_byte_identical_before_and_after_th
     let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
     assert_eq!(
             out,
-            "\x1b[?2026h\x1b[H\
+            "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default                        │                                       \
              \x1b[2;1H\x1b[K                                        │                                       \
              \x1b[3;1H\x1b[K  the herd is empty.                    │                                       \
@@ -989,8 +989,7 @@ fn new_session(path: &std::path::Path, name: &str) {
 /// The e2e counterpart to the two literal oracles above: same expected
 /// bytes, but fed from a real daemon instead of hand-built fixtures.
 // Proves the half of the migration the hand-fed oracle can't: that
-// Lua's flag glyph and 22-column threshold actually produce " " / "⚑"
-// for this scenario. Measured ~13ms: one daemon thread, two `sh`
+// tools.lua's real three-row, styled output renders as expected. Measured ~13ms: one daemon thread, two `sh`
 // children, one held Attach connection, one Eval round trip.
 #[test]
 fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon() {
@@ -1007,27 +1006,37 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
     };
     let mut ui = Ui::new(sessions, "/bin/sh", None);
     let (list_w, _) = layout(80, widest(&ui));
-    let lines = sessions_buffer_lines(&path, list_w, 0, None)
-        .expect("refresh sessions buffer")
-        .1;
+    let (rows, lines, _) =
+        sessions_buffer_lines(&path, list_w, 0, None).expect("refresh sessions buffer");
+    // tools.lua's three-row contract: bold name (cyan when selected), coloured
+    // state word, the attach flag, then a blank spacer row.
+    assert_eq!(rows, 3);
     assert_eq!(
         lines,
-        vec![" ".to_string(), "⚑".to_string()],
-        "real Lua output for this scenario must match the hand-fed oracle's input"
+        vec![
+            "\x1b[1;36malpha\x1b[0m".to_string(),
+            "  \x1b[32mlive\x1b[0m".to_string(),
+            String::new(),
+            "\x1b[1mbravo\x1b[0m".to_string(),
+            "  \x1b[32mlive\x1b[0m  ⚑".to_string(),
+            String::new(),
+        ],
+        "real Lua output for this scenario"
     );
+    ui.session_rows = rows;
     ui.sessions_text = lines;
 
     let cells = vec![text_row(10); 23];
     let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
     assert_eq!(
             out,
-            "\x1b[?2026h\x1b[H\
+            "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
-             \x1b[2;1H\x1b[K▸ alpha         │xxxxxxxxxx                                                     \
-             \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[4;1H\x1b[K  bravo         │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K  ⚑             │xxxxxxxxxx                                                     \
-             \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[2;1H\x1b[K▸ \x1b[1;36malpha\x1b[0m         │xxxxxxxxxx                                                     \
+             \x1b[3;1H\x1b[K  \x1b[32mlive\x1b[0m          │xxxxxxxxxx                                                     \
+             \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K  \x1b[1mbravo\x1b[0m         │xxxxxxxxxx                                                     \
+             \x1b[6;1H\x1b[K  \x1b[32mlive\x1b[0m  ⚑       │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1045,7 +1054,7 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
              \x1b[21;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[22;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[23;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[24;1H\x1b[K↑↓ select   ⏎ enter   n new   x kill   q quit                                   \
+             \x1b[24;1H\x1b[K↑↓/jk select   ⏎ enter   n new   x kill   l list   q quit                       \
              \x1b[J\x1b[?25l\x1b[?2026l",
             "byte-identical oracle for the non-empty session list, fed for real"
         );
@@ -1145,7 +1154,7 @@ fn render_styled_of_the_empty_session_list_is_byte_identical_when_fed_by_a_real_
     let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
     assert_eq!(
             out,
-            "\x1b[?2026h\x1b[H\
+            "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default                        │                                       \
              \x1b[2;1H\x1b[K                                        │                                       \
              \x1b[3;1H\x1b[K  the herd is empty.                    │                                       \
@@ -1175,13 +1184,12 @@ fn render_styled_of_the_empty_session_list_is_byte_identical_when_fed_by_a_real_
         );
 }
 
-/// Pins the live/dead word's 22-column threshold against real Lua, not
-/// just the flag glyph the two oracles above already exercise.
-// `alpha` unattached, `bravo` attached, both alive. Measured ~13ms: one
-// daemon thread, two `sh` children, one held Attach, two Eval round
-// trips (one per width).
+/// Pins the live/dead word against real Lua at widths either side of the
+/// old 22-column threshold. Since 2f8ce82 the state word is its own row, so
+/// it survives any list width (the renderer's `fit` truncates, not Lua).
+// `alpha` unattached, `bravo` attached, both alive. Two Eval round trips.
 #[test]
-fn the_live_dead_word_is_pinned_against_real_lua_at_the_22_column_threshold() {
+fn the_live_dead_word_is_pinned_against_real_lua_at_every_width() {
     let path = scratch_socket("e2e-live-dead-threshold");
     daemon_at(&path);
 
@@ -1189,23 +1197,22 @@ fn the_live_dead_word_is_pinned_against_real_lua_at_the_22_column_threshold() {
     new_session(&path, "bravo");
     let _held = client::hold(&path, "bravo").expect("attach bravo for real");
 
-    let wide = sessions_buffer_lines(&path, 22, 0, None)
-        .expect("refresh at width 22")
-        .1;
-    assert_eq!(
-        wide,
-        vec!["live  ".to_string(), "live ⚑".to_string()],
-        "at width >= 22, tools.lua shows the live/dead word before the flag"
-    );
-
-    let narrow = sessions_buffer_lines(&path, 21, 0, None)
-        .expect("refresh at width 21")
-        .1;
-    assert_eq!(
-        narrow,
-        vec![" ".to_string(), "⚑".to_string()],
-        "below width 22, tools.lua drops the word and shows only the flag"
-    );
+    for width in [22, 21] {
+        let lines = sessions_buffer_lines(&path, width, 0, None)
+            .expect("refresh sessions buffer")
+            .1;
+        let states: Vec<&str> = lines
+            .iter()
+            .skip(1)
+            .step_by(3)
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            states,
+            vec!["  \x1b[32mlive\x1b[0m", "  \x1b[32mlive\x1b[0m  ⚑"],
+            "at width {width}, tools.lua shows the live/dead word before the flag"
+        );
+    }
 }
 
 fn hidden_cursor() -> Cursor {
@@ -1646,15 +1653,16 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
     let (cells, _, cursor) =
         capture_styled(&path, &name, 0).expect("capture through the window's target");
 
-    let mut ui = Ui::new(vec![row("alpha", true, false)], "/bin/sh", None);
-    ui.sessions_text = vec![" ".into()];
+    // No sessions buffer yet: `list_row` falls back to the bare name, which
+    // keeps this oracle about the right pane rather than Lua's list styling.
+    let ui = Ui::new(vec![row("alpha", true, false)], "/bin/sh", None);
     // rows=25, not 24: the pty is a real 24-row screen (`Size::MIN_ROWS`
     // floors it there), and `body = rows - 1` is what the bottom-anchored
     // crop keeps — 24 would drop row 0, exactly where "hello" printed.
     let out = render_styled(&ui, &cells, cursor, "default", 80, 25);
     assert_eq!(
             out,
-            "\x1b[?2026h\x1b[H\
+            "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│hello                                                         →\
              \x1b[2;1H\x1b[K▸ alpha         │                                                              →\
              \x1b[3;1H\x1b[K                │                                                              →\
@@ -1679,7 +1687,7 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
              \x1b[22;1H\x1b[K                │                                                              →\
              \x1b[23;1H\x1b[K                │                                                              →\
              \x1b[24;1H\x1b[K                │                                                              →\
-             \x1b[25;1H\x1b[K↑↓ select   ⏎ enter   n new   x kill   showing 63 cols — h/l pans   q quit      \
+             \x1b[25;1H\x1b[K↑↓/jk select   ⏎ enter   n new   x kill   l list   showing 63 cols   q quit     \
              \x1b[J\x1b[1;23H\x1b[?25h\x1b[?2026l",
             "byte-identical oracle for the right pane, fed through a real window"
         );

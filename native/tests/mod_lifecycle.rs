@@ -53,6 +53,10 @@ fn read_value(image: &Image, code: &str) -> String {
 }
 
 #[test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scenario; PR #104 reshapes this file"
+)]
 fn installed_mod_reloads_in_the_same_image_without_losing_state_or_old_code_on_failure() {
     let home = DataHome::new();
     let manifest = home.root.join("remuda/mods/sample/extension.toml");
