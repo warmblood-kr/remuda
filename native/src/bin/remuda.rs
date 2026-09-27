@@ -620,6 +620,17 @@ fn caller_env(vars: impl Iterator<Item = (String, String)>) -> String {
         .join(", ")
 }
 
+/// Removes the Windows temp startup log once `start_daemon` returns.
+#[cfg(windows)]
+struct StartupLogCleanup(std::path::PathBuf);
+
+#[cfg(windows)]
+impl Drop for StartupLogCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
 /// successful *connect*, not on the file existing, and pass `-s <server>`
 /// through — a bare `remuda daemon` re-derives `"default"` and never matches.
@@ -644,6 +655,8 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     }
     let stderr_file = File::create(&stderr_path)
         .map_err(|e| format!("cannot create daemon log {}: {e}", stderr_path.display()))?;
+    #[cfg(windows)]
+    let _log_cleanup = StartupLogCleanup(stderr_path.clone());
     let mut child = std::process::Command::new(exe)
         .args(["-s", server, "daemon"])
         .stdin(std::process::Stdio::null())
@@ -1281,6 +1294,12 @@ mod tests {
                 .as_nanos()
         ));
         let path = daemon::socket_path_in(&dir, "s");
+        #[cfg(unix)]
+        let log = path.with_extension("log");
+        #[cfg(unix)]
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        fs::write(&log, "stale output from a previous run\n").unwrap();
 
         // `current_exe()` is this test harness. It exits immediately with a
         // useful stderr diagnostic when asked to run as a daemon.
@@ -1290,6 +1309,14 @@ mod tests {
             !error.contains("it printed nothing"),
             "the child diagnostic must survive startup failure: {error}"
         );
+        #[cfg(unix)]
+        assert!(
+            !fs::read_to_string(&log)
+                .unwrap()
+                .contains("stale output from a previous run"),
+            "a new daemon run must truncate its prior log"
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     /// [MEASURED] A request failure must not read as a confirmed match —
