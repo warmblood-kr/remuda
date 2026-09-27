@@ -350,15 +350,22 @@ fn reloads_own_declared_schedules_and_exec_does_not_restart_an_active_mod() {
         Arc::new(Counters::default()),
     );
     read_value(&image, include_str!("api/v3.lua"));
-    let schedules = "local n = 0 for _ in pairs(remuda.schedules) do n = n + 1 end return tostring(n)";
+    let schedules =
+        "local n = 0 for _ in pairs(remuda.schedules) do n = n + 1 end return tostring(n)";
 
     read_value(&image, "remuda.exec('sample')");
     read_value(&image, "for _ = 1, 10 do remuda.reload('sample') end");
     assert_eq!(read_value(&image, schedules), "1");
     read_value(&image, "remuda._run_due_schedules(1e9)");
-    assert_eq!(read_value(&image, "return remuda.tools.sample_counts()"), "11:1");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_counts()"),
+        "11:1"
+    );
 
     read_value(&image, "remuda.exec('sample')");
-    assert_eq!(read_value(&image, "return remuda.tools.sample_counts()"), "11:1");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_counts()"),
+        "11:1"
+    );
     assert_eq!(read_value(&image, schedules), "1");
 }
