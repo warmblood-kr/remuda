@@ -265,13 +265,9 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
     }
 }
 
-/// SIGTERM/SIGINT stop the daemon the way `Request::Shutdown` does, but say
-/// so on stderr (the `<server>.log`) and remove the socket; before this a
-/// signal killed the fleet with no trace. SIGHUP is logged and ignored, as
-/// tmux's server does, when the daemon leads its own session (#106) — a HUP
-/// is then a stray explicit one; otherwise it stops like SIGTERM. Caught, never SIG_IGN — a caught disposition resets on
-/// exec, an ignored one would reach every pty child. The handler only writes
-/// the signal number to a socketpair; a thread does the rest.
+/// SIGTERM/SIGINT: log, reap like `Shutdown`, remove the socket, exit 0. SIGHUP: ignored
+/// when detached (#106), else the same. Caught, never SIG_IGN (pty children would inherit
+/// it); the handler only writes the signal number to a socketpair.
 #[cfg(unix)]
 fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::os::fd::AsRawFd;
