@@ -146,6 +146,11 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
             path.display()
         )));
     }
+    // Before the bind: once a client can see the socket, a signal must find
+    // the handler, not the default action. Signals queue in the pair until
+    // `stop_on_signals` below starts reading.
+    #[cfg(unix)]
+    let signals = catch_signals()?;
     let listener: Listener = ipc::listen(path)?;
 
     let registry = Arc::new(Registry::new());
@@ -176,6 +181,8 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
         std::thread::spawn(move || load_user_config(&image));
     }
     spawn_ticker(image.clone(), Arc::clone(&counters), Arc::clone(&registry));
+    #[cfg(unix)]
+    stop_on_signals(signals, image.clone(), path.to_path_buf());
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let registry = Arc::clone(&registry);
@@ -256,6 +263,79 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
         Request::CaptureStyled { .. } => counters.counter("request_capture_styled").record_hit(),
         _ => {}
     }
+}
+
+/// SIGTERM/SIGINT: log, reap like `Shutdown`, remove the socket, exit 0. SIGHUP: ignored
+/// when detached (#106), else the same. Caught, never SIG_IGN (pty children would inherit
+/// it); the handler only writes the signal number to a socketpair.
+#[cfg(unix)]
+fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+    extern "C" fn on_signal(signal: libc::c_int) {
+        let byte = signal as u8;
+        // SAFETY: write(2) is async-signal-safe; the fd outlives the process.
+        unsafe {
+            libc::write(
+                WRITE_FD.load(Ordering::Relaxed),
+                (&raw const byte).cast(),
+                1,
+            )
+        };
+    }
+    let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
+    WRITE_FD.store(writer.as_raw_fd(), Ordering::Relaxed);
+    std::mem::forget(writer);
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: installs a handler that only calls write(2).
+        unsafe {
+            libc::signal(
+                signal,
+                on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            )
+        };
+    }
+    Ok(reader)
+}
+
+/// The other half of `catch_signals`: act on what the handler wrote.
+#[cfg(unix)]
+fn stop_on_signals(
+    mut reader: std::os::unix::net::UnixStream,
+    image: Image,
+    socket: std::path::PathBuf,
+) {
+    use std::io::Read;
+    // Auto-started (#107), the daemon leads its own session and a HUP is a
+    // stray one. Run by hand in a terminal it does not, and a HUP means that
+    // terminal really hung up — stop in order rather than write to a dead tty.
+    // SAFETY: getsid/getpid only read this process's ids.
+    let detached = unsafe { libc::getsid(0) == libc::getpid() };
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let mut byte = [0u8];
+        while reader.read_exact(&mut byte).is_ok() {
+            // `writeln!`, not `eprintln!`: stderr may be a dead tty (EIO), and
+            // a panic here would leave every later signal unhandled.
+            let name = match libc::c_int::from(byte[0]) {
+                libc::SIGTERM => "SIGTERM",
+                libc::SIGINT => "SIGINT",
+                _ if detached => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "remuda daemon: SIGHUP ignored — use `remuda stop` to stop it"
+                    );
+                    continue;
+                }
+                _ => "SIGHUP",
+            };
+            let _ = writeln!(std::io::stderr(), "remuda daemon: {name}, shutting down");
+            reap_processes_before_exit(&image);
+            let _ = std::fs::remove_file(&socket);
+            std::process::exit(0);
+        }
+    });
 }
 
 /// Best-effort group-wide reap before a clean `Request::Shutdown` exits —
