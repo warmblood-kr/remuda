@@ -430,30 +430,30 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     held.write_raw(&[client::DETACH]).expect("Ctrl-\\");
     drop(held);
 
+    let resumed = client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "echo $((9*9))-after".into(),
+        },
+    );
+    assert!(matches!(resumed, Ok(Response::Ok)), "{resumed:?}");
+    wait_for(&path, "target", "81-after");
+
+    // The server drops the hold asynchronously after Ctrl-\, so poll: close
+    // must succeed once the release lands, and never before the deadline.
     let deadline = Instant::now() + PATIENCE;
     loop {
-        let resumed = client::request(
-            &path,
-            &Request::SendLine {
-                name: "target".into(),
-                text: "echo $((9*9))-after".into(),
-            },
-        );
-        if matches!(resumed, Ok(Response::Ok)) {
+        let closed = close();
+        if matches!(closed, Ok(Response::Ok)) {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the core never regained the session after detach: {resumed:?}"
+            "after detach the hold must be released, so close succeeds: {closed:?}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-
-    wait_for(&path, "target", "81-after");
-    assert!(
-        matches!(close(), Ok(Response::Ok)),
-        "after detach the hold must be released, so close succeeds"
-    );
 }
 
 #[test]
