@@ -257,7 +257,10 @@ function remuda.emit(event, ...)
     snapshot[i] = hook
   end
   for _, hook in ipairs(snapshot) do
-    hook.fn(...)
+    local ok, err = pcall(hook.fn, ...)
+    if not ok then
+      io.stderr:write("remuda hook error for " .. event .. ": " .. tostring(err) .. "\n")
+    end
   end
 end
 register("emit", "Fire an event, running every hook registered for it.", "emit(event, ...) -> nil")
@@ -350,6 +353,9 @@ function remuda._activate_module(name, candidate)
   end
   if type(candidate.initialize) ~= "function" then
     error("module declaration needs an initialize function", 0)
+  end
+  if candidate.start ~= nil and type(candidate.start) ~= "function" then
+    error("module start must be a function", 0)
   end
 
   local hooks = candidate.hooks or {}
@@ -460,7 +466,7 @@ function remuda._activate_module(name, candidate)
     register(word.name, word.about, word.name .. "(" .. arg_list(word.args, word.needs) .. ") -> string")
   end
   modules[name] = { version = version, state = state, tools = tool_names }
-  return true
+  return true, state, candidate.start
 end
 
 local escapes = {

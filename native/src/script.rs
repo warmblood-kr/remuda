@@ -487,7 +487,7 @@ fn execute_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Resu
         let active_for_lookup = Rc::clone(&active);
         remuda_meta.set(
             "__index",
-            lua.create_function(move |lua, key: String| {
+            lua.create_function(move |lua, (_table, key): (Table, String)| {
                 if !active_for_lookup.get() {
                     return Err(mlua::Error::runtime(
                         "lifecycle declarations and migrations cannot call remuda APIs",
@@ -506,8 +506,11 @@ fn execute_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Resu
             .eval()?;
         let activate: mlua::Function =
             lua.named_registry_value("remuda.lifecycle.activate_module")?;
-        activate.call::<bool>((name, declaration))?;
+        let (_, state, start): (bool, Value, Value) = activate.call((name, declaration))?;
         active.set(true);
+        if let Value::Function(start) = start {
+            start.call::<()>(state)?;
+        }
         Ok(())
     } else {
         lua.load(&package.source)

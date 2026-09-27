@@ -5,13 +5,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// XDG_DATA_HOME is process-global; tests that set it must not overlap.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct DataHome {
     root: PathBuf,
     old_data: Option<std::ffi::OsString>,
+    _env: std::sync::MutexGuard<'static, ()>,
 }
 
 impl DataHome {
     fn new() -> Self {
+        let env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
@@ -23,7 +28,11 @@ impl DataHome {
         fs::create_dir_all(&root).expect("private data home");
         let old_data = std::env::var_os("XDG_DATA_HOME");
         std::env::set_var("XDG_DATA_HOME", &root);
-        Self { root, old_data }
+        Self {
+            root,
+            old_data,
+            _env: env,
+        }
     }
 
     fn entry(&self) -> PathBuf {
@@ -119,7 +128,7 @@ fn installed_mod_reloads_in_the_same_image_without_losing_state_or_old_code_on_f
         &entry,
         r#"return {
           api = "remuda-module-v1", state_version = 2,
-          initialize = function() return {} end,
+          initialize = function() return { called = false } end,
           migrations = {[1] = function(state)
             state.count = state.count + 100
             return state
@@ -175,6 +184,105 @@ fn installed_mod_reloads_in_the_same_image_without_losing_state_or_old_code_on_f
     .unwrap();
     read_value(&image, "api_v3_phase = 'legacy_refusal'");
     read_value(&image, include_str!("api/v3.lua"));
+}
+
+#[test]
+fn activated_lifecycle_hook_can_call_remuda_and_hook_errors_are_visible() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          hooks = {
+            { event = "probe", run = function() remuda.emit("nested") end },
+            { event = "probe", run = function() error("visible lifecycle hook error") end },
+            { event = "probe", run = function(state) state.called = true end },
+          },
+          tools = {{ name = "sample_called",
+            about = "Read whether the last lifecycle hook ran.",
+            run = function(state) return tostring(state.called) end }},
+        }"#,
+    );
+
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-hook-error.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "remuda.exec('sample')");
+    image
+        .eval("remuda.emit('probe')", None)
+        .expect("emit runs hooks");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_called()"),
+        "true"
+    );
+}
+
+#[test]
+fn lifecycle_start_runs_once_after_activation_and_surfaces_errors() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let entry = home.entry();
+    write_entry(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return { starts = 0, hooks = 0 } end,
+          start = function(state)
+            state.starts = state.starts + 1
+            remuda.emit("start_probe")
+          end,
+          hooks = {{ event = "start_probe", run = function(state)
+            state.hooks = state.hooks + 1
+          end }},
+          tools = {{ name = "sample_start_count",
+            about = "Read how often this module started.",
+            run = function(state) return state.starts .. ":" .. state.hooks end }},
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-start.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "remuda.exec('sample')");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_start_count()"),
+        "1:1"
+    );
+    read_value(&image, "remuda.reload('sample')");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_start_count()"),
+        "2:2"
+    );
+
+    write_entry(
+        &entry,
+        r#"return {
+      api = "remuda-module-v1", state_version = 1,
+      initialize = function() return {} end,
+      start = function() error("visible lifecycle start error") end,
+    }"#,
+    );
+    let error = image.eval("remuda.reload('sample')", None).unwrap_err();
+    assert!(error.contains("visible lifecycle start error"), "{error}");
 }
 
 #[test]
