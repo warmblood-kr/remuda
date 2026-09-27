@@ -104,7 +104,10 @@ pub struct Ui {
     scrollback: HashMap<String, usize>,
     pub mode: Mode,
     pub focus: Focus,
+    /// Visual mode (tmux copy-mode-vi): `visual_cursor` moves; the selection
+    /// (`text_selection`) exists only once `v`/Space anchors it there.
     visual: bool,
+    visual_cursor: TextPoint,
     preview_cursor: Cursor,
     /// What `n` prefills the prompt with. Held rather than read at the prompt,
     /// so the pure state machine still needs no environment.
@@ -140,6 +143,7 @@ impl Ui {
             mode: Mode::Browse,
             focus: Focus::List,
             visual: false,
+            visual_cursor: TextPoint { row: 0, col: 0 },
             preview_cursor: Cursor {
                 row: 0,
                 col: 0,
@@ -409,17 +413,20 @@ impl Ui {
     fn browse_key(&mut self, key: KeyEvent) -> Action {
         if self.visual {
             match key.code {
-                KeyCode::Esc => {
-                    self.visual = false;
-                    self.selecting_text = false;
-                    self.text_selection = None;
-                    return Action::Nothing;
-                }
+                KeyCode::Esc | KeyCode::Char('q') => self.leave_visual(),
+                // Yank and leave in one key; with no anchor there is nothing
+                // to copy, so it only leaves (tmux's copy-selection-and-cancel).
                 KeyCode::Char('y') => {
+                    let anchored = self.anchored();
                     self.visual = false;
                     self.selecting_text = false;
-                    return self.copy_action();
+                    if anchored {
+                        return self.copy_action();
+                    }
+                    self.text_selection = None;
                 }
+                KeyCode::Char('v') if self.anchored() => self.text_selection = None,
+                KeyCode::Char('v') | KeyCode::Char(' ') => self.anchor_visual(),
                 KeyCode::Char('h') | KeyCode::Left => self.move_visual(-1, 0),
                 KeyCode::Char('j') | KeyCode::Down => self.move_visual(0, 1),
                 KeyCode::Char('k') | KeyCode::Up => self.move_visual(0, -1),
@@ -462,26 +469,14 @@ impl Ui {
             KeyCode::Char('v') => {
                 self.visual = true;
                 self.selecting_text = false;
-                if let Some(name) = self.selected().map(|s| s.name.clone()) {
-                    let point = TextPoint {
-                        row: self.preview_cursor.row as usize,
-                        col: self.preview_cursor.col as usize,
-                    };
-                    self.text_selection = Some(TextSelection {
-                        session: name,
-                        start: point,
-                        end: point,
-                    });
-                }
+                self.text_selection = None;
+                self.visual_cursor = TextPoint {
+                    row: self.preview_cursor.row as usize,
+                    col: self.preview_cursor.col as usize,
+                };
                 Action::Nothing
             }
             KeyCode::Char('p') => Action::Paste,
-            KeyCode::Esc if self.visual => {
-                self.visual = false;
-                self.selecting_text = false;
-                self.text_selection = None;
-                Action::Nothing
-            }
             KeyCode::Enter | KeyCode::Char('i') => self.focus_session(),
             _ => Action::Nothing,
         }
@@ -502,30 +497,45 @@ impl Ui {
         }
     }
 
-    fn move_visual(&mut self, dc: i32, dr: i32) {
-        let dimensions = self
-            .text_selection
+    fn leave_visual(&mut self) {
+        self.visual = false;
+        self.selecting_text = false;
+        self.text_selection = None;
+    }
+
+    /// A selection on the shown session exists (anchored by `v`/Space or a drag).
+    fn anchored(&self) -> bool {
+        let shown = self.selected().map(|s| s.name.as_str());
+        self.text_selection
             .as_ref()
-            .and_then(|selection| self.sessions.iter().find(|s| s.name == selection.session))
-            .map(|session| (session.size.rows() as usize, session.size.cols() as usize));
-        let Some(selection) = &mut self.text_selection else {
+            .is_some_and(|selection| Some(selection.session.as_str()) == shown)
+    }
+
+    /// Anchor at the cursor — again from the cursor if already anchored, as
+    /// tmux's begin-selection does on Space.
+    fn anchor_visual(&mut self) {
+        if let Some(name) = self.selected().map(|s| s.name.clone()) {
+            self.text_selection = Some(TextSelection {
+                session: name,
+                start: self.visual_cursor,
+                end: self.visual_cursor,
+            });
+        }
+    }
+
+    fn move_visual(&mut self, dc: i32, dr: i32) {
+        let Some(size) = self.selected().map(|s| s.size) else {
             return;
         };
-        let Some((rows, cols)) = dimensions else {
-            return;
-        };
-        let max_row = rows.saturating_sub(1);
-        let max_col = cols.saturating_sub(1);
-        selection.end.row = selection
-            .end
-            .row
-            .saturating_add_signed(dr as isize)
-            .min(max_row);
-        selection.end.col = selection
-            .end
-            .col
-            .saturating_add_signed(dc as isize)
-            .min(max_col);
+        let max_row = (size.rows() as usize).saturating_sub(1);
+        let max_col = (size.cols() as usize).saturating_sub(1);
+        let cursor = &mut self.visual_cursor;
+        cursor.row = cursor.row.saturating_add_signed(dr as isize).min(max_row);
+        cursor.col = cursor.col.saturating_add_signed(dc as isize).min(max_col);
+        let cursor = self.visual_cursor;
+        if let Some(selection) = &mut self.text_selection {
+            selection.end = cursor;
+        }
     }
 
     /// Refuse before focus moves, not after: an occupied or dead session cannot
@@ -799,6 +809,122 @@ impl Viewport {
             return None;
         }
         Some((panel_row as u16, panel_col as u16))
+    }
+}
+
+#[cfg(test)]
+mod visual_mode_tests {
+    //! Visual mode on the tmux copy-mode-vi model: `v` gives a movable
+    //! cursor and no selection; `v`/Space anchors; motions extend; `y` yanks
+    //! and leaves; Esc/`q` cancel; `v` while anchored clears the anchor.
+    use super::{selected_screen_text, Action, Ui};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use remuda_core::agent::{Cursor, StyledCell};
+    use remuda_core::{SessionSummary, Size};
+    use std::time::Duration;
+
+    fn ui() -> Ui {
+        let mut ui = Ui::new(
+            vec![SessionSummary {
+                name: "agent".into(),
+                alive: true,
+                idle: Duration::ZERO,
+                size: Size::new(80, 24),
+                attached: false,
+            }],
+            "sh",
+            None,
+        );
+        ui.preview_cursor = Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        };
+        ui
+    }
+
+    fn press(ui: &mut Ui, keys: &str) -> Action {
+        let mut last = Action::Nothing;
+        for ch in keys.chars() {
+            let code = match ch {
+                '\u{1b}' => KeyCode::Esc,
+                c => KeyCode::Char(c),
+            };
+            last = ui.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+        }
+        last
+    }
+
+    fn copied(ui: &Ui) -> String {
+        let cells: Vec<Vec<StyledCell>> = ["hello world"]
+            .iter()
+            .map(|line| {
+                line.chars()
+                    .map(|c| StyledCell {
+                        text: c.to_string(),
+                        ..StyledCell::default()
+                    })
+                    .collect()
+            })
+            .collect();
+        let selection = ui.text_selection.as_ref().expect("an anchored selection");
+        selected_screen_text(&cells, &[false], selection)
+    }
+
+    #[test]
+    fn v_moves_then_v_anchors_then_y_yanks_and_leaves() {
+        let mut ui = ui();
+        assert_eq!(press(&mut ui, "vll"), Action::Nothing);
+        assert!(ui.text_selection.is_none(), "v must not select yet");
+        press(&mut ui, "vllll");
+        assert_eq!(copied(&ui), "llo w");
+        assert_eq!(press(&mut ui, "y"), Action::CopySelection("agent".into()));
+        assert!(!ui.visual, "y must leave visual mode");
+    }
+
+    #[test]
+    fn space_anchors_like_v() {
+        let mut ui = ui();
+        press(&mut ui, "vl ll");
+        assert_eq!(copied(&ui), "ell");
+    }
+
+    #[test]
+    fn y_without_an_anchor_leaves_and_copies_nothing() {
+        let mut ui = ui();
+        assert_eq!(press(&mut ui, "vy"), Action::Nothing);
+        assert!(!ui.visual);
+    }
+
+    #[test]
+    fn esc_and_q_cancel_without_copying() {
+        for cancel in ["\u{1b}", "q"] {
+            let mut ui = ui();
+            assert_eq!(
+                press(&mut ui, &format!("vvl{cancel}")),
+                Action::Nothing,
+                "{cancel:?}"
+            );
+            assert!(!ui.visual, "{cancel:?}");
+            assert!(ui.text_selection.is_none(), "{cancel:?}");
+        }
+    }
+
+    #[test]
+    fn v_while_anchored_clears_the_anchor_but_stays() {
+        let mut ui = ui();
+        press(&mut ui, "vvlv");
+        assert!(ui.visual);
+        assert!(ui.text_selection.is_none());
+    }
+
+    #[test]
+    fn the_footer_names_the_visual_state() {
+        let mut ui = ui();
+        press(&mut ui, "v");
+        assert!(super::render(&ui, "hello world", "s", 120, 30).contains("visual: move"));
+        press(&mut ui, "v");
+        assert!(super::render(&ui, "hello world", "s", 120, 30).contains("visual: selecting"));
     }
 }
 
@@ -1206,7 +1332,13 @@ pub fn render_styled(
 
 fn cells_with_selection(ui: &Ui, cells: &[Vec<StyledCell>]) -> Vec<Vec<StyledCell>> {
     let mut selected = cells.to_vec();
-    let Some(selection) = ui.text_selection.as_ref() else {
+    // Visual mode before an anchor: the movable cursor, drawn as one cell.
+    let cursor_only = (ui.visual && !ui.anchored()).then(|| TextSelection {
+        session: ui.selected().map_or_else(String::new, |s| s.name.clone()),
+        start: ui.visual_cursor,
+        end: ui.visual_cursor,
+    });
+    let Some(selection) = cursor_only.as_ref().or(ui.text_selection.as_ref()) else {
         return selected;
     };
     let Some(session) = ui.selected() else {
@@ -1326,6 +1458,13 @@ fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
             ui.selected().map_or("", |s| s.name.as_str()),
             if cut { format!("   showing {preview_w} cols") } else { String::new() },
         ),
+        Mode::Browse if ui.visual => {
+            if ui.anchored() {
+                "visual: selecting — hjkl extend   y yank   v clear   esc/q cancel".into()
+            } else {
+                "visual: move — hjkl move   v/space anchor   y/esc/q leave".into()
+            }
+        }
         Mode::Browse => match &ui.notice {
             Some(notice) => format!("remuda: {notice}"),
             None if ui.sessions.is_empty() => "n new   q quit".into(),
@@ -1647,9 +1786,10 @@ fn copy_selection(path: &Path, ui: &mut Ui, name: &str) {
     let offset = *ui.scrollback.get(name).unwrap_or(&0);
     match capture_styled(path, name, offset) {
         Ok((cells, wrapped, _)) => {
-            ui.yank = ui.text_selection.as_ref().map_or_else(
+            // Copy-and-cancel, as tmux: the selection has done its job.
+            ui.yank = ui.text_selection.take().map_or_else(
                 || all_screen_text(&cells, &wrapped),
-                |selection| selected_screen_text(&cells, &wrapped, selection),
+                |selection| selected_screen_text(&cells, &wrapped, &selection),
             );
             ui.notice = Some(format!(
                 "copied {} bytes; p pastes into the selected session",
