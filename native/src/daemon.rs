@@ -263,8 +263,8 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
 /// SIGTERM/SIGINT stop the daemon the way `Request::Shutdown` does, but say
 /// so on stderr (the `<server>.log`) and remove the socket; before this a
 /// signal killed the fleet with no trace. SIGHUP is logged and ignored, as
-/// tmux's server does: the daemon leads its own session (#106), so a HUP is a
-/// stray explicit one. Caught, never SIG_IGN — a caught disposition resets on
+/// tmux's server does, when the daemon leads its own session (#106) — a HUP
+/// is then a stray explicit one; otherwise it stops like SIGTERM. Caught, never SIG_IGN — a caught disposition resets on
 /// exec, an ignored one would reach every pty child. The handler only writes
 /// the signal number to a socketpair; a thread does the rest.
 #[cfg(unix)]
@@ -296,18 +296,30 @@ fn stop_on_signals(image: Image, socket: std::path::PathBuf) -> std::io::Result<
             )
         };
     }
+    // Auto-started (#107), the daemon leads its own session and a HUP is a
+    // stray one. Run by hand in a terminal it does not, and a HUP means that
+    // terminal really hung up — stop in order rather than write to a dead tty.
+    // SAFETY: getsid/getpid only read this process's ids.
+    let detached = unsafe { libc::getsid(0) == libc::getpid() };
     std::thread::spawn(move || {
+        use std::io::Write;
         let mut byte = [0u8];
         while reader.read_exact(&mut byte).is_ok() {
+            // `writeln!`, not `eprintln!`: stderr may be a dead tty (EIO), and
+            // a panic here would leave every later signal unhandled.
             let name = match libc::c_int::from(byte[0]) {
                 libc::SIGTERM => "SIGTERM",
                 libc::SIGINT => "SIGINT",
-                _ => {
-                    eprintln!("remuda daemon: SIGHUP ignored — use `remuda stop` to stop it");
+                _ if detached => {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "remuda daemon: SIGHUP ignored — use `remuda stop` to stop it"
+                    );
                     continue;
                 }
+                _ => "SIGHUP",
             };
-            eprintln!("remuda daemon: {name}, shutting down");
+            let _ = writeln!(std::io::stderr(), "remuda daemon: {name}, shutting down");
             reap_processes_before_exit(&image);
             let _ = std::fs::remove_file(&socket);
             std::process::exit(0);

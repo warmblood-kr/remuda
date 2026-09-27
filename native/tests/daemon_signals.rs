@@ -1,8 +1,9 @@
 //! A daemon asked to stop by a signal says so and goes in order, like the
 //! `Shutdown` request: SIGTERM/SIGINT log a line to its stderr (the
 //! `<server>.log`), reap, remove the socket and exit 0. SIGHUP is ignored, as
-//! tmux's server does — the daemon is detached (#106), so a HUP can only be
-//! a stray explicit one. SFDPOT Charter 2 HIGH-1.
+//! tmux's server does, when the daemon leads its own session (auto-started,
+//! #106/#107); a hand-run `remuda daemon` whose terminal hangs up stops in
+//! order instead. SFDPOT Charter 2 HIGH-1.
 #![cfg(unix)]
 
 use remuda_native::daemon;
@@ -18,11 +19,27 @@ struct Daemon {
 
 impl Daemon {
     fn spawn(tag: &str) -> Self {
+        Self::spawn_with(tag, false)
+    }
+
+    /// `leader`: its own session, as `start_daemon` spawns it (#107).
+    fn spawn_with(tag: &str, leader: bool) -> Self {
+        use std::os::unix::process::CommandExt;
         let dir = std::env::temp_dir().join(format!("rds-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("daemon.log");
-        let child = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+        if leader {
+            // SAFETY: setsid is async-signal-safe.
+            unsafe {
+                command.pre_exec(|| {
+                    libc::setsid();
+                    Ok(())
+                })
+            };
+        }
+        let child = command
             .args(["-s", "s", "daemon"])
             .env("REMUDA_RUNTIME_DIR", &dir)
             .env("HOME", &dir)
@@ -98,8 +115,13 @@ fn sigint_stops_the_daemon_in_order() {
 }
 
 #[test]
-fn sighup_is_logged_and_ignored() {
-    let mut daemon = Daemon::spawn("SIGHUP");
+fn sighup_stops_a_daemon_run_from_a_terminal() {
+    stops_in_order(libc::SIGHUP, "SIGHUP");
+}
+
+#[test]
+fn sighup_is_logged_and_ignored_by_a_detached_daemon() {
+    let mut daemon = Daemon::spawn_with("SIGHUP-detached", true);
     daemon.signal(libc::SIGHUP);
     std::thread::sleep(Duration::from_millis(300));
     assert!(
