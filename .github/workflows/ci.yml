@@ -35,6 +35,23 @@ jobs:
       - uses: actions/checkout@v4
       - run: cargo test --workspace --all-targets
 
+  butler-contract:
+    # remuda-butler depends on this core's mod boot/reload contract, and a core
+    # change once broke it with nothing here noticing. This runs Butler's own
+    # tests/live_reload.sh (explicit daemon and AUTOSTART=1) against the core
+    # built from this checkout, on a private -s server with scratch dirs.
+    # A deliberately doubled start hook turns it red (boots=2 vs 1).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: warmblood-kr/remuda-butler
+          path: remuda-butler
+          fetch-depth: 0
+      - run: BUTLER_REPO="$GITHUB_WORKSPACE/remuda-butler" scripts/check-butler-contract.sh
+
   principles-are-documented:
     # PRINCIPLES.md §2: a gate nobody has watched go red is a claim, not a
     # control. This applies to the principles document about itself — every
