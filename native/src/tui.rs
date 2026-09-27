@@ -792,7 +792,12 @@ impl Viewport {
         // continuation cell, putting the caret one column too far right for
         // CJK input. The row crop still uses `Cell::width` because it emits
         // the lead cell and omits zero-width continuation cells.
-        let target = col.min(source_row.len()) as u32;
+        // The clamp, though, is by the row's display width, not its cell
+        // count: the wire drops each wide cell's continuation, so a row of k
+        // wide glyphs arrives k cells short and a cell-count clamp pinned the
+        // caret left of typed Hangul.
+        let row_width: usize = source_row.iter().map(|c| usize::from(c.width())).sum();
+        let target = col.min(row_width) as u32;
         let offset = u32::from(self.col_offset);
         let panel_col = target.checked_sub(offset)?;
         if panel_col >= u32::from(self.width) {
@@ -820,6 +825,61 @@ mod cursor_width_tests {
             .map_cursor(&[row.to_vec()], 0, col)
             .expect("cursor is visible")
             .1
+    }
+
+    /// Bytes -> vt100 -> the wire -> caret, a session pane's real path. The wire
+    /// drops wide continuation cells (k Hangul arrive k cells short); the caret
+    /// must still land where the text ends, as in iTerm or tmux.
+    fn caret_after_typing(typed: &str) -> (u16, u16) {
+        use remuda_core::protocol::{collapse_runs, expand_runs};
+        let size = remuda_core::Size::new(80, 24);
+        let mut parser = vt100::Parser::new(size.rows(), size.cols(), 0);
+        // A claude/codex-style input box: a right border, then "│ > " + input.
+        parser.process(format!("\x1b[1;80H│\x1b[1;1H│ > {typed}").as_bytes());
+        let (_, col) = crate::pty::display_cursor(parser.screen());
+        let wire: Vec<Vec<StyledCell>> = crate::pty::styled_cells(parser.screen(), size)
+            .iter()
+            .map(|row| expand_runs(&collapse_runs(row)))
+            .collect();
+        let caret = Viewport::bottom_anchored(wire.len(), 0, 80, 24)
+            .map_cursor(&wire, 0, col as usize)
+            .expect("cursor is visible")
+            .1;
+        (caret, col)
+    }
+
+    /// DECAWM pending wrap: after exactly filling a row the emulator's
+    /// cursor sits one past the last column; a terminal draws (and reports)
+    /// it ON the last column. Clamped, the caret stays visible at the edge.
+    #[test]
+    fn caret_stays_on_the_last_column_in_pending_wrap() {
+        for typed in ["a".repeat(80), "한".repeat(40)] {
+            let size = remuda_core::Size::new(80, 24);
+            let mut parser = vt100::Parser::new(size.rows(), size.cols(), 0);
+            parser.process(typed.as_bytes());
+            let (row, col) = crate::pty::display_cursor(parser.screen());
+            assert_eq!((row, col), (0, 79), "{typed:?}");
+            let cells = crate::pty::styled_cells(parser.screen(), size);
+            let caret = Viewport::bottom_anchored(cells.len(), 0, 80, 24).map_cursor(
+                &cells,
+                0,
+                col as usize,
+            );
+            assert_eq!(caret.map(|c| c.1), Some(79), "caret hidden at the edge");
+        }
+    }
+
+    #[test]
+    fn caret_follows_ascii_typed_across_a_bordered_row() {
+        let (caret, col) = caret_after_typing(&"a".repeat(60));
+        assert_eq!((caret, col), (64, 64));
+    }
+
+    #[test]
+    fn caret_follows_hangul_typed_across_a_bordered_row() {
+        let (caret, col) = caret_after_typing(&"한".repeat(30));
+        assert_eq!(col, 64, "the emulator's own cursor");
+        assert_eq!(caret, col, "the caret lags left of the typed text");
     }
 
     #[test]
