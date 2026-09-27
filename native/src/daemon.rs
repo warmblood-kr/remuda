@@ -146,6 +146,11 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
             path.display()
         )));
     }
+    // Before the bind: once a client can see the socket, a signal must find
+    // the handler, not the default action. Signals queue in the pair until
+    // `stop_on_signals` below starts reading.
+    #[cfg(unix)]
+    let signals = catch_signals()?;
     let listener: Listener = ipc::listen(path)?;
 
     let registry = Arc::new(Registry::new());
@@ -177,7 +182,7 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     }
     spawn_ticker(image.clone(), Arc::clone(&counters), Arc::clone(&registry));
     #[cfg(unix)]
-    stop_on_signals(image.clone(), path.to_path_buf())?;
+    stop_on_signals(signals, image.clone(), path.to_path_buf());
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let registry = Arc::clone(&registry);
@@ -268,8 +273,7 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
 /// exec, an ignored one would reach every pty child. The handler only writes
 /// the signal number to a socketpair; a thread does the rest.
 #[cfg(unix)]
-fn stop_on_signals(image: Image, socket: std::path::PathBuf) -> std::io::Result<()> {
-    use std::io::Read;
+fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicI32, Ordering};
     static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
@@ -284,7 +288,7 @@ fn stop_on_signals(image: Image, socket: std::path::PathBuf) -> std::io::Result<
             )
         };
     }
-    let (mut reader, writer) = std::os::unix::net::UnixStream::pair()?;
+    let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
     WRITE_FD.store(writer.as_raw_fd(), Ordering::Relaxed);
     std::mem::forget(writer);
     for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
@@ -296,6 +300,17 @@ fn stop_on_signals(image: Image, socket: std::path::PathBuf) -> std::io::Result<
             )
         };
     }
+    Ok(reader)
+}
+
+/// The other half of `catch_signals`: act on what the handler wrote.
+#[cfg(unix)]
+fn stop_on_signals(
+    mut reader: std::os::unix::net::UnixStream,
+    image: Image,
+    socket: std::path::PathBuf,
+) {
+    use std::io::Read;
     // Auto-started (#107), the daemon leads its own session and a HUP is a
     // stray one. Run by hand in a terminal it does not, and a HUP means that
     // terminal really hung up — stop in order rather than write to a dead tty.
@@ -325,7 +340,6 @@ fn stop_on_signals(image: Image, socket: std::path::PathBuf) -> std::io::Result<
             std::process::exit(0);
         }
     });
-    Ok(())
 }
 
 /// Best-effort group-wide reap before a clean `Request::Shutdown` exits —
