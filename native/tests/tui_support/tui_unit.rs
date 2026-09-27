@@ -783,6 +783,21 @@ fn render_styled_row_only_emits_sgr_on_a_style_change() {
     assert_eq!(out, "xy", "no style used, no SGR at all");
 }
 
+#[test]
+fn indexed_256_colors_use_the_extended_sgr_form() {
+    let mut foreground = String::new();
+    push_color(&mut foreground, Color::Idx(208), true);
+    assert_eq!(foreground, "\x1b[38;5;208m");
+
+    let mut background = String::new();
+    push_color(&mut background, Color::Idx(208), false);
+    assert_eq!(background, "\x1b[48;5;208m");
+
+    let mut bright = String::new();
+    push_color(&mut bright, Color::Idx(9), true);
+    assert_eq!(bright, "\x1b[91m");
+}
+
 /// The flicker steps/026 fixes: a full erase repaints every cell on every
 /// frame, which is what a real terminal shows as flashing. Row-local
 /// clears (`\x1b[K`) replace it; nothing here erases the whole screen.

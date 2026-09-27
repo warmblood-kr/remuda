@@ -1007,7 +1007,10 @@ fn push_color(out: &mut String, color: Color, fg: bool) {
     match color {
         Color::Default => {}
         Color::Idx(n) if n < 8 => out.push_str(&format!("\x1b[{}{n}m", if fg { 3 } else { 4 })),
-        Color::Idx(n) => out.push_str(&format!("\x1b[{}{}m", if fg { 9 } else { 10 }, n - 8)),
+        Color::Idx(n) if n < 16 => {
+            out.push_str(&format!("\x1b[{}{}m", if fg { 9 } else { 10 }, n - 8))
+        }
+        Color::Idx(n) => out.push_str(&format!("\x1b[{};5;{n}m", if fg { 38 } else { 48 })),
         Color::Rgb(r, g, b) => {
             out.push_str(&format!("\x1b[{};2;{r};{g};{b}m", if fg { 38 } else { 48 }))
         }
