@@ -10,9 +10,6 @@
 #   BUTLER_REPO=~/src/remuda-butler scripts/check-butler-contract.sh
 #
 # Needs: cargo, git, bash, tar, pgrep/pkill, python3 (Butler's relay helper).
-# Do not run it alongside another live_reload.sh on the same machine until
-# remuda-butler scopes its stand-in pids per run: they would count each
-# other's processes.
 # BUTLER_REPO must have full history: OLD_REF is archived from it.
 set -euo pipefail
 
@@ -42,10 +39,9 @@ unset REMUDA_SERVER
 echo "core $(git -C "$CORE" rev-parse --short HEAD), butler $(git -C "$BUTLER_REPO" rev-parse --short HEAD), OLD_REF $OLD_REF"
 echo "remuda: $(command -v remuda)"
 
-# live_reload.sh counts its stand-in agents with a machine-wide pgrep, and a
-# leaked one outlives its run (that leak is what this gate catches), so each
-# run's leftovers are killed before the next or they poison its baseline.
-stand_ins() { pgrep -fx 'sleep (10000[12]|1[0-9]{6})' | sort || true; }
+# A leaked stand-in agent can outlive its run (that leak is what this gate
+# catches); kill each run's new ones so none lingers into the next.
+stand_ins() { pgrep -fx 'sleep [1-9][0-9]{4}[12]' | sort || true; }
 run() {
   local before
   before=$(stand_ins)
