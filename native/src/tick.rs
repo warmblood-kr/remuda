@@ -115,7 +115,11 @@ impl Ticker {
         let ready = match in_flight.as_ref() {
             None => true,
             Some(rx) => match rx.try_recv() {
-                Ok(_answer) => true,
+                Ok(Ok(_)) => true,
+                Ok(Err(e)) => {
+                    eprintln!("remuda: schedule tick failed: {e}");
+                    true
+                }
                 Err(TryRecvError::Empty) => false,
                 // The image is gone, or the job's sender was dropped without
                 // answering — either way nothing is still running, so the
