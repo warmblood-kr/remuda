@@ -192,7 +192,10 @@ function remuda._run_due_schedules(now)
       if schedule.name then
         remuda._schedule_fire_counts[schedule.name] = (remuda._schedule_fire_counts[schedule.name] or 0) + 1
       end
-      schedule.run()
+      local ok, err = pcall(schedule.run)
+      if not ok then
+        io.stderr:write("remuda schedule error for " .. (schedule.name or "unnamed") .. ": " .. tostring(err) .. "\n")
+      end
     end
   end
 end
