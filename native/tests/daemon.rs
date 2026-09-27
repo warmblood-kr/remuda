@@ -821,7 +821,10 @@ fn one_throwing_schedule_does_not_starve_the_others() {
     );
 
     assert_eq!(
-        eval(&path, "return tostring(pcall(remuda._run_due_schedules, 2e9))"),
+        eval(
+            &path,
+            "return tostring(pcall(remuda._run_due_schedules, 2e9))"
+        ),
         "true",
         "a throwing schedule must not abort the tick"
     );
