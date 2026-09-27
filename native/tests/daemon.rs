@@ -399,21 +399,21 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     held.write_raw(b"echo $((6*7))-typed\r").expect("type");
     wait_for(&path, "target", "42-typed");
 
-    // 3. Ctrl-\ detaches. The proof is on the far side: the core is refused
+    // 3. Ctrl-\ detaches. The proof is on the far side: close is refused
     //    while attached and accepted afterwards, so this cannot pass by the
-    //    client merely exiting for some other reason.
+    //    client merely exiting for some other reason. Managed input is
+    //    accepted either way (95fbe7e).
+    let close = || {
+        client::request(
+            &path,
+            &Request::Close {
+                name: "target".into(),
+            },
+        )
+    };
     assert!(
-        matches!(
-            client::request(
-                &path,
-                &Request::SendLine {
-                    name: "target".into(),
-                    text: "echo LEAKED".into()
-                }
-            ),
-            Ok(Response::Error(_))
-        ),
-        "while a human holds it, the core must be refused"
+        matches!(close(), Ok(Response::Error(_))),
+        "while a human holds it, close must be refused"
     );
 
     held.write_raw(&[client::DETACH]).expect("Ctrl-\\");
@@ -438,10 +438,10 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
         std::thread::sleep(Duration::from_millis(20));
     }
 
-    let screen = wait_for(&path, "target", "81-after");
+    wait_for(&path, "target", "81-after");
     assert!(
-        !screen.contains("LEAKED"),
-        "a refused instruction reached the process anyway:\n{screen}"
+        matches!(close(), Ok(Response::Ok)),
+        "after detach the hold must be released, so close succeeds"
     );
 }
 
