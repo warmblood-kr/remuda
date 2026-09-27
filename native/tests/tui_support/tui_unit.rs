@@ -1163,6 +1163,38 @@ fn every_row_of_a_nested_entry_shares_one_offset() {
     }
 }
 
+#[test]
+fn a_nested_entry_never_overflows_a_narrow_list() {
+    let path = scratch_socket("session-order-narrow");
+    daemon_at(&path);
+    new_session(&path, "root");
+    new_session(&path, "a-deeply-nested-child-with-a-long-name");
+    eval(
+        &path,
+        "remuda.session_order = function() return {{name = 'root', depth = 0}, \
+         {name = 'a-deeply-nested-child-with-a-long-name', depth = 3}} end",
+    );
+    let width = 16;
+    let (rows, lines, order) =
+        sessions_buffer_lines(&path, width, 0, None).expect("refresh sessions buffer");
+    let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+    ui.sessions = vec![
+        row("root", true, false),
+        row("a-deeply-nested-child-with-a-long-name", true, true),
+    ];
+    apply_session_order(&mut ui, None, &order);
+    ui.session_rows = rows;
+    ui.sessions_text = lines;
+    for r in 0..ui.sessions.len() * rows {
+        let shown = list_row(&ui, r, width);
+        assert_eq!(
+            visible_width(&shown),
+            width as usize,
+            "row {r} must fill the list exactly, never spill past it: {shown:?}"
+        );
+    }
+}
+
 /// Empty-herd counterpart, fed by a real (empty) daemon registry.
 // No sessions created at all, so `remuda.ls()` itself sees a real empty
 // herd rather than an empty `Vec` constructed by hand. Measured ~13ms:
