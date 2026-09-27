@@ -10,10 +10,19 @@ pub fn run(args: &[&str]) -> ExitCode {
         eprintln!("remuda: Codex TUI needs --status PATH");
         return ExitCode::FAILURE;
     };
+    let model = match args.get(2..) {
+        Some(["--model", model]) => Some(*model),
+        Some([]) | None => None,
+        _ => {
+            eprintln!("remuda: Codex TUI takes --status PATH [--model M]");
+            return ExitCode::FAILURE;
+        }
+    };
     let socket = std::env::temp_dir().join(format!("remuda-codex-{}.sock", std::process::id()));
     let address = format!("unix://{}", socket.display());
+    let (server_args, client_args) = codex_args(&address, model);
     let mut server = match Command::new("codex")
-        .args(["app-server", "--listen", &address])
+        .args(&server_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -30,7 +39,7 @@ pub fn run(args: &[&str]) -> ExitCode {
     let monitor_status = status.to_string();
     std::thread::spawn(move || monitor(&monitor_socket, &monitor_status));
     let result = Command::new("codex")
-        .args(["--remote", &address, "--approve-for-me"])
+        .args(&client_args)
         .status();
     let _ = server.kill();
     let _ = std::fs::remove_file(socket);
@@ -39,6 +48,18 @@ pub fn run(args: &[&str]) -> ExitCode {
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(error) => fail(error),
     }
+}
+
+/// Argv for the app-server and the TUI client.  A chosen model goes to both:
+/// the server's config default and the client's thread override.
+fn codex_args(address: &str, model: Option<&str>) -> (Vec<String>, Vec<String>) {
+    let mut server = vec!["app-server".into(), "--listen".into(), address.into()];
+    let mut client = vec!["--remote".into(), address.into(), "--approve-for-me".into()];
+    if let Some(model) = model {
+        server.extend(["-c".into(), format!("model={model:?}")]);
+        client.extend(["-m".into(), model.into()]);
+    }
+    (server, client)
 }
 
 #[cfg(unix)]
@@ -144,6 +165,20 @@ mod tests {
 
     fn status_path(test: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("remuda-codex-{test}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn model_reaches_both_the_app_server_and_the_client() {
+        assert_eq!(
+            codex_args("unix://s", None),
+            (
+                vec!["app-server".into(), "--listen".into(), "unix://s".into()],
+                vec!["--remote".into(), "unix://s".into(), "--approve-for-me".into()],
+            )
+        );
+        let (server, client) = codex_args("unix://s", Some("gpt-5.5"));
+        assert_eq!(server[3..], ["-c", "model=\"gpt-5.5\""]);
+        assert_eq!(client[3..], ["-m", "gpt-5.5"]);
     }
 
     #[test]
