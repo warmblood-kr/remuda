@@ -1014,10 +1014,10 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
     assert_eq!(
         lines,
         vec![
-            "\x1b[1;36malpha\x1b[0m".to_string(),
+            "\x1b[1;36malpha\x1b[0m \x1b[32m●\x1b[0m".to_string(),
             String::new(),
             String::new(),
-            "\x1b[1mbravo\x1b[0m".to_string(),
+            "\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m".to_string(),
             "⚑".to_string(),
             String::new(),
         ],
@@ -1032,10 +1032,10 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
-             \x1b[2;1H\x1b[K▸ \x1b[1;36malpha\x1b[0m         │xxxxxxxxxx                                                     \
+             \x1b[2;1H\x1b[K▸ \x1b[1;36malpha\x1b[0m \x1b[32m●\x1b[0m       │xxxxxxxxxx                                                     \
              \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K  \x1b[1mbravo\x1b[0m         │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K  \x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m       │xxxxxxxxxx                                                     \
              \x1b[6;1H\x1b[K  ⚑             │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1145,14 +1145,14 @@ fn every_row_of_a_nested_entry_shares_one_offset() {
     let block = |i: usize| &lines[i * 3..i * 3 + 3];
 
     // Depth 0 is the local layout itself, byte-identical to the flat list.
-    assert_eq!(block(0), ["\x1b[1malpha\x1b[0m", "", ""]);
+    assert_eq!(block(0), ["\x1b[1malpha\x1b[0m \x1b[32m●\x1b[0m", "", ""]);
     // Every row of a deeper entry, blank spacer included, is that same
     // block shifted right by 2 * depth.
     for (i, depth) in [(1, 1), (2, 2)] {
         let pad = " ".repeat(2 * depth);
         let name = ["alpha", "bravo", "charlie"][i];
         let expected = [
-            format!("{pad}\x1b[1m{name}\x1b[0m"),
+            format!("{pad}\x1b[1m{name}\x1b[0m \x1b[32m●\x1b[0m"),
             pad.clone(),
             pad.clone(),
         ];
@@ -1193,10 +1193,11 @@ fn a_nested_entry_never_overflows_a_narrow_list() {
 }
 
 #[test]
-fn the_state_row_drops_live_but_keeps_dead() {
-    // Colour says live, so the word goes; dead stays spelled out. Stubbed
-    // registry so every combination is deterministic.
-    let path = scratch_socket("state-row-policy");
+fn a_status_dot_follows_the_name_and_the_state_row_keeps_only_detail() {
+    // The dot carries live/dead, so row 2 spells neither. Each style is reset
+    // before the next begins: the selection style must not reach the dot,
+    // and the dot colour must not reach anything after it.
+    let path = scratch_socket("status-dot");
     daemon_at(&path);
     eval(
         &path,
@@ -1212,22 +1213,33 @@ fn the_state_row_drops_live_but_keeps_dead() {
             end
         "#,
     );
-    let (_, lines, _) =
-        sessions_buffer_lines(&path, 40, 99, None).expect("refresh sessions buffer");
-    let state_rows: Vec<&str> = lines
-        .iter()
-        .skip(1)
-        .step_by(3)
-        .map(String::as_str)
-        .collect();
+    let (_, lines, _) = sessions_buffer_lines(&path, 40, 0, None).expect("refresh sessions buffer");
+    let entry = |i: usize| (lines[i * 3].as_str(), lines[i * 3 + 1].as_str());
     assert_eq!(
-        state_rows,
-        [
-            "",
-            "⚑",
-            "\x1b[32mclaude · opus · 12K\x1b[0m",
-            "\x1b[31mdead\x1b[0m  \x1b[2mclaude · opus · 12K\x1b[0m",
-        ]
+        entry(0),
+        ("\x1b[1;36mplain\x1b[0m \x1b[32m●\x1b[0m", ""),
+        "selected, live"
+    );
+    assert_eq!(
+        entry(1),
+        ("\x1b[1mbusy\x1b[0m \x1b[32m●\x1b[0m", "⚑"),
+        "unselected, live, attached"
+    );
+    assert_eq!(
+        entry(2),
+        (
+            "\x1b[1magent\x1b[0m \x1b[32m●\x1b[0m",
+            "\x1b[2mclaude · opus · 12K\x1b[0m"
+        ),
+        "live detail is dim, like any other telemetry"
+    );
+    assert_eq!(
+        entry(3),
+        (
+            "\x1b[1mgone\x1b[0m \x1b[31m●\x1b[0m",
+            "\x1b[2mclaude · opus · 12K\x1b[0m"
+        ),
+        "dead is a red dot, not a word"
     );
 }
 
