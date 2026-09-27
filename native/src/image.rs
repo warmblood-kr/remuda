@@ -137,13 +137,14 @@ fn eval(lua: &Lua, code: &str, name: Option<&str>) -> Result<String, String> {
     // `(eval)` is what it should be called instead of a quoted copy of itself.
     let chunk = name.map_or_else(|| "=(eval)".to_string(), |n| format!("@{n}"));
 
-    let as_expression = lua
+    // Only a compile failure means "not an expression" — a runtime error in
+    // an expression must not run the code a second time as statements (#128).
+    let function = match lua
         .load(format!("return {code}"))
         .set_name(&chunk)
-        .eval::<mlua::MultiValue>();
-
-    let values = match as_expression {
-        Ok(values) => values,
+        .into_function()
+    {
+        Ok(function) => function,
         // Not an expression. Run it as statements, and report *that* error if
         // it fails — reporting the expression-parse error instead would name a
         // `return` the user never wrote, which is the single most confusing
@@ -151,9 +152,12 @@ fn eval(lua: &Lua, code: &str, name: Option<&str>) -> Result<String, String> {
         Err(_) => lua
             .load(code)
             .set_name(&chunk)
-            .eval::<mlua::MultiValue>()
+            .into_function()
             .map_err(|e| e.to_string())?,
     };
+    let values = function
+        .call::<mlua::MultiValue>(())
+        .map_err(|e| e.to_string())?;
 
     let rendered: Vec<String> = values.iter().map(render).collect();
     Ok(rendered.join("\t"))
@@ -466,5 +470,19 @@ mod tests {
     #[test]
     fn an_empty_table_is_empty() {
         assert_eq!(shown("{}"), "{}");
+    }
+
+    // #128: only a `return CODE` that fails to compile falls back to running
+    // CODE as statements; an expression that errors at run time ran twice.
+    #[test]
+    fn an_expression_that_errors_at_run_time_runs_once() {
+        let lua = Lua::new();
+        lua.load("calls = 0; function boom() calls = calls + 1; error('boom') end")
+            .exec()
+            .unwrap();
+        let error = super::eval(&lua, "boom()", None).unwrap_err();
+        assert!(error.contains("boom"), "{error}");
+        assert_eq!(lua.globals().get::<i64>("calls").unwrap(), 1);
+        assert_eq!(super::eval(&lua, "x = 1", None).unwrap(), "");
     }
 }
