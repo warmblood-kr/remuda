@@ -202,11 +202,8 @@ impl Registry {
         self.get(name).map(|s| s.cursor())
     }
 
-    /// End a session, live or already dead, and stop tracking it. Caution:
-    /// terminate-then-remove in that order — an attached session refuses and
-    /// keeps its entry, so a close cannot disconnect a human mid-drive.
-    /// `Ok(true)` means this call stopped tracking it; `Ok(false)` means a
-    /// concurrent `reap` got there first and owns the exit notice.
+    /// End and stop tracking a session; an attached one refuses and stays.
+    /// `Ok(false)`: a concurrent `reap` removed it first and owns the notice.
     pub fn close(&self, name: &str) -> Option<Result<bool>> {
         let session = self.get(name)?;
         Some(session.terminate().map(|()| self.remove(name).is_some()))
