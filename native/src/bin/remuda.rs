@@ -540,8 +540,14 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
     match remuda_native::packages::resolve(name) {
         Err(error) => fail(error),
         Ok(None) => fail(format!("no such package: {name}")),
+        // Through the image's loader, not the entry as a plain chunk: that
+        // discarded a lifecycle mod's declaration, so it never activated (#98).
         Ok(Some(package)) => {
-            match remuda_native::script::run_source(path, &package.chunk_name, &package.source) {
+            let code = format!(
+                "remuda.exec({})",
+                serde_json::to_string(name).expect("name serializes")
+            );
+            match remuda_native::script::run_source(path, &package.chunk_name, &code) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(e),
             }
