@@ -1296,24 +1296,15 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
     // A failed or not-yet-completed Lua refresh must not turn a real session
     // into a blank selectable row. The buffer supplies the styled version in
     // normal operation; this fallback keeps the name readable until then.
-    let content = ui.sessions_text.get(row).map_or_else(
-        || {
-            if row.is_multiple_of(ui.session_rows) {
-                session.name.as_str()
-            } else {
-                ""
-            }
-        },
-        String::as_str,
-    );
-    // The cursor gutter spans the whole entry, so Lua lays out every row of
-    // it in the same local coordinates.
-    let cursor = if session_index == ui.selected && row.is_multiple_of(ui.session_rows) {
-        "▸"
-    } else {
-        " "
+    // No caret column: selection is Lua's zero-width reverse-video name, and
+    // this fallback marks it the same way.
+    let content = match ui.sessions_text.get(row) {
+        Some(text) => text.clone(),
+        None if !row.is_multiple_of(ui.session_rows) => String::new(),
+        None if session_index == ui.selected => format!("\x1b[7m{}\x1b[0m", session.name),
+        None => session.name.clone(),
     };
-    format!("{cursor} {}", fit(content, width.saturating_sub(2)))
+    fit(&content, width)
 }
 
 /// The crop notice moved here when the preview lost its title band: a crop that

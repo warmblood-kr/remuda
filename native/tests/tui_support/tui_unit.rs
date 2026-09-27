@@ -106,7 +106,7 @@ fn selected_session_stays_visible_when_the_list_exceeds_a_short_terminal() {
 
     let frame = render(&ui, "", "test", 80, 24);
     assert!(
-        frame.contains("\x1b[20;1H▸ session-11"),
+        frame.contains("\x1b[20;1H\x1b[7msession-11\x1b[0m"),
         "the selected final session must be rendered in the 24-row viewport: {frame:?}"
     );
     assert!(
@@ -694,12 +694,12 @@ fn list_row_with_a_wide_session_name_still_fits_its_column_budget() {
 fn a_session_uses_spaced_name_and_state_rows() {
     let mut ui = make_ui(vec![row("monocle", true, false)]);
     ui.sessions_text = vec![
-        "\x1b[1;36mmonocle\x1b[0m".into(),
+        "\x1b[1;7;36mmonocle\x1b[0m".into(),
         "\x1b[32mlive\x1b[0m  \x1b[2mclaude · opus · CTX 12k/200k 6%\x1b[0m".into(),
         String::new(),
     ];
     assert!(list_row(&ui, 0, 40).contains("monocle"));
-    assert!(list_row(&ui, 0, 40).contains("\x1b[1;36mmonocle\x1b[0m"));
+    assert!(list_row(&ui, 0, 40).contains("\x1b[1;7;36mmonocle\x1b[0m"));
     assert!(list_row(&ui, 1, 40).contains("CTX 12k/200k 6%"));
     assert!(list_row(&ui, 1, 40).contains("\x1b[32mlive\x1b[0m"));
     assert_eq!(list_row(&ui, 2, 40).trim(), "");
@@ -888,11 +888,11 @@ fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buff
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
-             \x1b[2;1H\x1b[K▸ alpha         │xxxxxxxxxx                                                     \
-             \x1b[3;1H\x1b[K  live          │xxxxxxxxxx                                                     \
+             \x1b[2;1H\x1b[Kalpha           │xxxxxxxxxx                                                     \
+             \x1b[3;1H\x1b[Klive            │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K  bravo         │xxxxxxxxxx                                                     \
-             \x1b[6;1H\x1b[K  live  ⚑       │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[Kbravo           │xxxxxxxxxx                                                     \
+             \x1b[6;1H\x1b[Klive  ⚑         │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1014,7 +1014,7 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
     assert_eq!(
         lines,
         vec![
-            "\x1b[1;36malpha\x1b[0m \x1b[32m●\x1b[0m".to_string(),
+            "\x1b[1;7;36malpha\x1b[0m \x1b[32m●\x1b[0m".to_string(),
             String::new(),
             String::new(),
             "\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m".to_string(),
@@ -1032,11 +1032,11 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
-             \x1b[2;1H\x1b[K▸ \x1b[1;36malpha\x1b[0m \x1b[32m●\x1b[0m       │xxxxxxxxxx                                                     \
+             \x1b[2;1H\x1b[K\x1b[1;7;36malpha\x1b[0m \x1b[32m●\x1b[0m         │xxxxxxxxxx                                                     \
              \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K  \x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m       │xxxxxxxxxx                                                     \
-             \x1b[6;1H\x1b[K  ⚑             │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m         │xxxxxxxxxx                                                     \
+             \x1b[6;1H\x1b[K⚑               │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1217,7 +1217,7 @@ fn a_status_dot_follows_the_name_and_the_state_row_keeps_only_detail() {
     let entry = |i: usize| (lines[i * 3].as_str(), lines[i * 3 + 1].as_str());
     assert_eq!(
         entry(0),
-        ("\x1b[1;36mplain\x1b[0m \x1b[32m●\x1b[0m", ""),
+        ("\x1b[1;7;36mplain\x1b[0m \x1b[32m●\x1b[0m", ""),
         "selected, live"
     );
     assert_eq!(
@@ -1258,8 +1258,86 @@ fn the_status_dot_counts_as_one_column() {
         } end"#,
     );
     let (_, lines, _) = sessions_buffer_lines(&path, 40, 0, None).expect("refresh sessions buffer");
-    assert_eq!(lines[0], "\x1b[1;36malpha\x1b[0m \x1b[32m●\x1b[0m");
+    assert_eq!(lines[0], "\x1b[1;7;36malpha\x1b[0m \x1b[32m●\x1b[0m");
     assert_eq!(visible_width(&lines[0]), "alpha ●".chars().count());
+}
+
+#[test]
+fn the_list_has_no_caret_column_at_any_depth() {
+    // Each row is exactly Lua's block row fitted to the list: no gutter, so
+    // every row is two columns narrower than with the old caret column.
+    let path = scratch_socket("no-caret");
+    daemon_at(&path);
+    for name in ["alpha", "bravo", "charlie"] {
+        new_session(&path, name);
+    }
+    eval(
+        &path,
+        "remuda.session_order = function() return {{name = 'alpha', depth = 0}, \
+         {name = 'bravo', depth = 1}, {name = 'charlie', depth = 2}} end",
+    );
+    let width = 30;
+    let (rows, lines, order) =
+        sessions_buffer_lines(&path, width, 0, None).expect("refresh sessions buffer");
+    let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+    ui.sessions = ["alpha", "bravo", "charlie"]
+        .iter()
+        .map(|name| row(name, true, false))
+        .collect();
+    apply_session_order(&mut ui, None, &order);
+    ui.session_rows = rows;
+    ui.sessions_text = lines.clone();
+    for (r, text) in lines.iter().enumerate() {
+        assert_eq!(list_row(&ui, r, width), fit(text, width), "row {r}");
+    }
+}
+
+#[test]
+fn the_selected_entry_stands_out_without_a_caret() {
+    // A zero-width cue: reverse video on the selected name, focused or not,
+    // live or dead, and on the fallback row before Lua has answered.
+    let path = scratch_socket("selection-cue");
+    daemon_at(&path);
+    eval(
+        &path,
+        r#"remuda.ls = function() return {
+          { name = "live", alive = true, attached = false },
+          { name = "gone", alive = false, attached = false },
+        } end"#,
+    );
+    for selected in [0, 1] {
+        let (rows, lines, _) =
+            sessions_buffer_lines(&path, 30, selected, None).expect("refresh sessions buffer");
+        let mut ui = Ui::new(
+            vec![row("live", true, false), row("gone", false, false)],
+            "/bin/sh",
+            None,
+        );
+        ui.selected = selected;
+        ui.session_rows = rows;
+        ui.sessions_text = lines;
+        for focus in [Focus::List, Focus::Session] {
+            ui.focus = focus;
+            for entry in [0, 1] {
+                let name_row = list_row(&ui, entry * rows, 30);
+                assert_eq!(
+                    name_row.contains("\x1b[1;7;36m"),
+                    entry == selected,
+                    "entry {entry}, selected {selected}: {name_row:?}"
+                );
+            }
+        }
+    }
+
+    let mut ui = Ui::new(
+        vec![row("live", true, false), row("gone", false, false)],
+        "/bin/sh",
+        None,
+    );
+    ui.session_rows = 3;
+    ui.selected = 1;
+    assert!(list_row(&ui, 3, 30).starts_with("\x1b[7mgone\x1b[0m"));
+    assert!(list_row(&ui, 0, 30).starts_with("live"));
 }
 
 /// Empty-herd counterpart, fed by a real (empty) daemon registry.
@@ -1483,7 +1561,7 @@ fn the_frame_says_what_it_is_showing() {
     let mut ui = make_ui(vec![row("claude", true, false), row("busy", true, true)]);
     ui.notice = None;
     ui.sessions_text = vec![
-        "claude".into(),
+        "\x1b[1;7;36mclaude\x1b[0m".into(),
         "live".into(),
         String::new(),
         "busy".into(),
@@ -1492,7 +1570,10 @@ fn the_frame_says_what_it_is_showing() {
     ];
     let frame = render(&ui, "hello", "default", 120, 10);
     assert!(frame.contains("remuda · default"));
-    assert!(frame.contains("▸ claude"), "the cursor is on the first row");
+    assert!(
+        frame.contains("\x1b[1;7;36mclaude"),
+        "the selected first row is reverse video"
+    );
     assert!(frame.contains('⚑'), "and the busy one is flagged");
     assert!(frame.contains("⏎ enter"), "the footer teaches the keys");
     assert!(frame.contains('│'), "and the border is the quiet one");
@@ -1799,7 +1880,7 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│hello                                                         →\
-             \x1b[2;1H\x1b[K▸ alpha         │                                                              →\
+             \x1b[2;1H\x1b[K\x1b[7malpha\x1b[0m           │                                                              →\
              \x1b[3;1H\x1b[K                │                                                              →\
              \x1b[4;1H\x1b[K                │                                                              →\
              \x1b[5;1H\x1b[K                │                                                              →\

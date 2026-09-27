@@ -816,7 +816,8 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
       -- second competing visual treatment.
       local is_selected = selected_name and s.name == selected_name
         or (not selected_name and i - 1 == selected)
-      local name_style = is_selected and "\27[1;36m" or "\27[1m"
+      -- Reverse video marks the selection without a caret column.
+      local name_style = is_selected and "\27[1;7;36m" or "\27[1m"
       -- The dot carries live/dead, so row 2 is only telemetry and the flag.
       -- Each style resets before the next starts, so none bleeds into another.
       -- U+25CF BLACK CIRCLE. Ambiguous width; tui.rs's char_width counts it
