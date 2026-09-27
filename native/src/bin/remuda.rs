@@ -19,6 +19,7 @@
 use remuda_core::protocol::{Request, Response};
 use remuda_native::client::Left;
 use remuda_native::{daemon, dist, terminal_size};
+use std::fs::{self, File};
 use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
@@ -610,15 +611,30 @@ fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) ->
 /// through — a bare `remuda daemon` re-derives `"default"` and never matches.
 fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
-    // The daemon outlives this client, so do not pipe stderr: after a successful
-    // connect this function returns and drops the pipe reader. A later daemon
-    // diagnostic would then write to a broken pipe and can kill the daemon.
-    // Inheriting stderr has the same risk when the caller's stderr is short-lived.
+    // Keep stderr in a file beside the socket. The daemon outlives this client,
+    // so a pipe reader would be dropped on successful startup and a later
+    // diagnostic could kill the daemon with SIGPIPE. The file also preserves
+    // startup errors for the failure message below.
+    #[cfg(unix)]
+    let stderr_path = path.with_extension("log");
+    #[cfg(windows)]
+    let stderr_path =
+        std::env::temp_dir().join(format!("remuda-daemon-startup-{}.log", std::process::id()));
+    if let Some(parent) = stderr_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            format!(
+                "cannot create daemon log directory {}: {e}",
+                parent.display()
+            )
+        })?;
+    }
+    let stderr_file = File::create(&stderr_path)
+        .map_err(|e| format!("cannot create daemon log {}: {e}", stderr_path.display()))?;
     let mut child = std::process::Command::new(exe)
         .args(["-s", server, "daemon"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .map_err(|e| format!("cannot start daemon: {e}"))?;
 
@@ -639,10 +655,10 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     }
 
     let _ = child.kill();
-    let said = child
-        .wait_with_output()
+    let _ = child.wait();
+    let said = fs::read_to_string(&stderr_path)
         .ok()
-        .map(|o| String::from_utf8_lossy(&o.stderr).trim().to_string())
+        .map(|text| text.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "it printed nothing".into());
     Err(format!(
@@ -1229,6 +1245,28 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_daemon_start_includes_its_stderr() {
+        let dir = std::env::temp_dir().join(format!(
+            "remuda-startup-stderr-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let path = daemon::socket_path_in(&dir, "s");
+
+        // `current_exe()` is this test harness. It exits immediately with a
+        // useful stderr diagnostic when asked to run as a daemon.
+        let error = start_daemon("s", &path).expect_err("the test harness is not a daemon");
+        assert!(error.contains("daemon did not come up"), "{error}");
+        assert!(
+            !error.contains("it printed nothing"),
+            "the child diagnostic must survive startup failure: {error}"
+        );
+    }
 
     /// [MEASURED] A request failure must not read as a confirmed match —
     /// that silently uses a possibly-mismatched daemon. See steps/024.
