@@ -161,10 +161,9 @@ fn answer_cursor_query(writer: &SharedWriter, (row, col): (u16, u16)) {
     }
 }
 
-/// The emulator's cursor as a terminal shows and reports it. vt100 leaves
-/// it one past the last column in DECAWM pending wrap (a row typed exactly
-/// full); xterm/iTerm/tmux draw it on the last column and answer DSR 6n with
-/// that column, so clamp to `cols - 1`.
+/// The cursor as a terminal shows and reports it: vt100 leaves it one past the
+/// last column in DECAWM pending wrap, where xterm/iTerm/tmux draw and report
+/// (DSR 6n) the last column, so clamp to `cols - 1`.
 pub(crate) fn display_cursor(screen: &vt100::Screen) -> (u16, u16) {
     let (row, col) = screen.cursor_position();
     (row, col.min(screen.size().1.saturating_sub(1)))

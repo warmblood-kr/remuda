@@ -827,11 +827,9 @@ mod cursor_width_tests {
             .1
     }
 
-    /// Bytes -> vt100 grid -> the wire -> caret, the path a session pane
-    /// really takes. The wire (collapse/expand_runs) drops a wide cell's empty
-    /// continuation, so a row of k Hangul arrives k cells short of its column
-    /// width. The caret must still land where the text ends — as in iTerm or
-    /// tmux — not be clamped to that shorter cell count.
+    /// Bytes -> vt100 -> the wire -> caret, a session pane's real path. The wire
+    /// drops wide continuation cells (k Hangul arrive k cells short); the caret
+    /// must still land where the text ends, as in iTerm or tmux.
     fn caret_after_typing(typed: &str) -> (u16, u16) {
         use remuda_core::protocol::{collapse_runs, expand_runs};
         let size = remuda_core::Size::new(80, 24);
