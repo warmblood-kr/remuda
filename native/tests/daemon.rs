@@ -113,7 +113,14 @@ fn a_second_listener_cannot_unlink_a_live_daemons_socket() {
     let _first = ipc::listen(&path).expect("first listener binds");
 
     let second = ipc::listen(&path).expect_err("a live listener must keep its address");
-    assert_eq!(second.kind(), std::io::ErrorKind::AddrInUse);
+    // Windows refuses a second FILE_FLAG_FIRST_PIPE_INSTANCE pipe with
+    // ERROR_ACCESS_DENIED, which std reports as PermissionDenied.
+    let expected = if cfg!(windows) {
+        std::io::ErrorKind::PermissionDenied
+    } else {
+        std::io::ErrorKind::AddrInUse
+    };
+    assert_eq!(second.kind(), expected);
     assert!(
         ipc::connect(&path).is_ok(),
         "the first daemon remains reachable"
