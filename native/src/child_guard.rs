@@ -20,6 +20,9 @@ pub enum Guard {
     // Reaps the DIRECT child on any daemon death via a kernel signal alone.
     // Never reaches a grandchild forked before that signal — see `killpg`.
     LinuxPdeathsig,
+    // Own process group only, so a clean shutdown's `killpg` reaps it. No
+    // PDEATHSIG here: an unexpected daemon death still orphans the child.
+    UnixProcessGroup(&'static str),
     // Not implemented for this platform: the child orphans if this daemon
     // dies unexpectedly. `reason` names the gap, so it's loud, not silent.
     Unimplemented(&'static str),
@@ -60,15 +63,26 @@ pub fn harden(command: &mut Command) -> Guard {
     Guard::LinuxPdeathsig
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
+pub fn harden(command: &mut Command) -> Guard {
+    use std::os::unix::process::CommandExt;
+    // Same group as Linux, so `killpg` on a clean shutdown reaches the child
+    // and anything it forked. Only the death-signal half is missing.
+    command.process_group(0);
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    let reason = "no PDEATHSIG-equivalent on this platform -- a child spawned \
+        here is reaped on a clean stop, but orphans if this daemon dies \
+        unexpectedly (macOS needs a kqueue EVFILT_PROC supervisor)";
+    WARNED.call_once(|| eprintln!("remuda: WARNING: {reason}"));
+    Guard::UnixProcessGroup(reason)
+}
+
+#[cfg(not(unix))]
 pub fn harden(_command: &mut Command) -> Guard {
     static WARNED: std::sync::Once = std::sync::Once::new();
-    let reason = "no PDEATHSIG-equivalent wired for this platform yet -- a \
-        child spawned here will orphan if this daemon dies unexpectedly \
-        (built and measured on Linux only; macOS needs a kqueue \
-        EVFILT_PROC supervisor or a pipe-EOF trick, Windows needs a Job \
-        Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE — neither exists \
-        here yet)";
+    let reason = "no child guard wired for this platform yet -- a child \
+        spawned here will orphan if this daemon dies or stops (Windows \
+        needs a Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE)";
     WARNED.call_once(|| eprintln!("remuda: WARNING: {reason}"));
     Guard::Unimplemented(reason)
 }

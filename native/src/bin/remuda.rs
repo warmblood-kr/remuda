@@ -542,9 +542,10 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
         Ok(None) => fail(format!("no such package: {name}")),
         // Through the image's loader, not the entry as a plain chunk: that
         // discarded a lifecycle mod's declaration, so it never activated (#98).
-        Ok(Some(package)) => {
+        // The wrapper gets its own chunk name; the mod's frames keep theirs.
+        Ok(Some(_)) => {
             let code = format!("remuda.exec({})", remuda_native::mcp::lua_string(name));
-            match remuda_native::script::run_source(path, &package.chunk_name, &code) {
+            match remuda_native::script::run_source(path, "=remuda exec", &code) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => fail(e),
             }
@@ -817,11 +818,13 @@ fn reload_mod_in_daemon(server: &str, path: &Path, name: &str) -> Result<(), Str
             ));
         }
     }
-    let encoded_name = serde_json::to_string(name).expect("a mod name is a JSON string");
     match remuda_native::client::request(
         path,
         &Request::Eval {
-            code: format!("return remuda.reload({encoded_name})"),
+            code: format!(
+                "return remuda.reload({})",
+                remuda_native::mcp::lua_string(name)
+            ),
             name: None,
         },
     )
