@@ -951,6 +951,45 @@ fn mod_info_command(args: &[&str]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn mod_update_all() -> ExitCode {
+    match remuda_native::packages::update_all() {
+        Ok(batch) => {
+            for report in &batch.updated {
+                println!(
+                    "updated mod {} {} from {} at {}",
+                    report.manifest.name, report.manifest.version, report.repository, report.commit
+                );
+            }
+            if let Some(failed) = batch.failed {
+                println!(
+                    "update outcomes: updated [{}]; reloaded none; failed {}: {}; not attempted [{}]",
+                    display_names(
+                        &batch.updated.iter().map(|report| report.manifest.name.clone()).collect::<Vec<_>>()
+                    ),
+                    failed.name,
+                    failed.error,
+                    display_names(&batch.not_attempted)
+                );
+                fail(format!("update stopped after {} failed", failed.name))
+            } else {
+                println!(
+                    "update outcomes: updated [{}]; reloaded none; failed none; not attempted none",
+                    display_names(
+                        &batch
+                            .updated
+                            .iter()
+                            .map(|report| report.manifest.name.clone())
+                            .collect::<Vec<_>>()
+                    )
+                );
+                println!("use `remuda mod update NAME --reload` to reload in-process, or restart the daemon");
+                ExitCode::SUCCESS
+            }
+        }
+        Err(error) => fail(error),
+    }
+}
+
 fn mod_update_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     let (all, name, reload) = match args {
         ["--all"] => (true, None, false),
@@ -974,36 +1013,7 @@ fn mod_update_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         );
     }
     if all {
-        return match remuda_native::packages::update_all() {
-            Ok(batch) => {
-                for report in &batch.updated {
-                    println!(
-                        "updated mod {} {} from {} at {}",
-                        report.manifest.name,
-                        report.manifest.version,
-                        report.repository,
-                        report.commit
-                    );
-                }
-                if let Some(failed) = batch.failed {
-                    println!(
-                        "update outcomes: updated [{}]; reloaded none; failed {}: {}; not attempted [{}]",
-                        display_names(
-                            &batch.updated.iter().map(|report| report.manifest.name.clone()).collect::<Vec<_>>()
-                        ),
-                        failed.name,
-                        failed.error,
-                        display_names(&batch.not_attempted)
-                    );
-                    fail(format!("update stopped after {} failed", failed.name))
-                } else {
-                    println!("update outcomes: updated [{}]; reloaded none; failed none; not attempted none", display_names(&batch.updated.iter().map(|report| report.manifest.name.clone()).collect::<Vec<_>>()));
-                    println!("use `remuda mod update NAME --reload` to reload in-process, or restart the daemon");
-                    ExitCode::SUCCESS
-                }
-            }
-            Err(error) => fail(error),
-        };
+        return mod_update_all();
     }
     let name = name.expect("single mod name");
     let result = if reload {

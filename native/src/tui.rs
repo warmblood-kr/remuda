@@ -250,9 +250,8 @@ impl Ui {
         // `col == list_w + 1` is the divider itself — between the two panes,
         // part of neither. Anything past it is the session pane.
         if self.list_visible && col == list_w + 1 {
-            match event.kind {
-                MouseEventKind::Down(MouseButton::Left) => self.dragging_divider = true,
-                _ => {}
+            if let MouseEventKind::Down(MouseButton::Left) = event.kind {
+                self.dragging_divider = true;
             }
             return Action::Nothing;
         }
@@ -1294,7 +1293,7 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
     // normal operation; this fallback keeps the name readable until then.
     let content = ui.sessions_text.get(row).map_or_else(
         || {
-            if row % ui.session_rows == 0 {
+            if row.is_multiple_of(ui.session_rows) {
                 session.name.as_str()
             } else {
                 ""
@@ -1302,7 +1301,7 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
         },
         String::as_str,
     );
-    if row % ui.session_rows != 0 {
+    if !row.is_multiple_of(ui.session_rows) {
         return fit(content, width);
     }
     let cursor = if session_index == ui.selected {
@@ -1620,58 +1619,66 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                     };
                 }
             }
-            Action::Copy(name) => match capture_styled(path, &name, 0) {
-                Ok((cells, wrapped, _)) => {
-                    ui.yank = all_screen_text(&cells, &wrapped);
-                    ui.notice = Some(format!(
-                        "copied {} bytes; p pastes into the selected session",
-                        ui.yank.len()
-                    ));
-                }
-                Err(e) => ui.notice = Some(format!("{name}: {e}")),
-            },
-            Action::CopySelection(name) => {
-                let offset = *ui.scrollback.get(&name).unwrap_or(&0);
-                match capture_styled(path, &name, offset) {
-                    Ok((cells, wrapped, _)) => {
-                        ui.yank = ui.text_selection.as_ref().map_or_else(
-                            || all_screen_text(&cells, &wrapped),
-                            |selection| selected_screen_text(&cells, &wrapped, selection),
-                        );
-                        ui.notice = Some(format!(
-                            "copied {} bytes; p pastes into the selected session",
-                            ui.yank.len()
-                        ));
-                    }
-                    Err(e) => ui.notice = Some(format!("{name}: {e}")),
-                }
-            }
-            Action::Paste => {
-                if ui.yank.is_empty() {
-                    ui.notice = Some("kill ring is empty".into());
-                } else if let Some((name, hold)) = &held {
-                    if let Err(e) = hold.keys(ui.yank.as_bytes()) {
-                        ui.notice = Some(format!("{name}: {e}"));
-                    }
-                } else if let Some(name) = ui.selected().map(|session| session.name.clone()) {
-                    match client::request(
-                        path,
-                        &Request::Send {
-                            name: name.clone(),
-                            bytes: ui.yank.as_bytes().to_vec(),
-                        },
-                    ) {
-                        Ok(Response::Ok) => {}
-                        Ok(Response::Error(reason)) => ui.notice = Some(reason),
-                        other => ui.notice = Some(format!("{other:?}")),
-                    }
-                }
-            }
+            Action::Copy(name) => copy_screen(path, &mut ui, &name),
+            Action::CopySelection(name) => copy_selection(path, &mut ui, &name),
+            Action::Paste => paste(path, &mut ui, &held),
         }
         // Not `painted.clear()`: the frame-vs-`painted` compare in `refresh`
         // already skips the write when a key changed nothing visible — see
         // steps/026. Only the immediate re-check is forced here.
         force_refresh = true;
+    }
+}
+
+fn copy_screen(path: &Path, ui: &mut Ui, name: &str) {
+    match capture_styled(path, name, 0) {
+        Ok((cells, wrapped, _)) => {
+            ui.yank = all_screen_text(&cells, &wrapped);
+            ui.notice = Some(format!(
+                "copied {} bytes; p pastes into the selected session",
+                ui.yank.len()
+            ));
+        }
+        Err(e) => ui.notice = Some(format!("{name}: {e}")),
+    }
+}
+
+fn copy_selection(path: &Path, ui: &mut Ui, name: &str) {
+    let offset = *ui.scrollback.get(name).unwrap_or(&0);
+    match capture_styled(path, name, offset) {
+        Ok((cells, wrapped, _)) => {
+            ui.yank = ui.text_selection.as_ref().map_or_else(
+                || all_screen_text(&cells, &wrapped),
+                |selection| selected_screen_text(&cells, &wrapped, selection),
+            );
+            ui.notice = Some(format!(
+                "copied {} bytes; p pastes into the selected session",
+                ui.yank.len()
+            ));
+        }
+        Err(e) => ui.notice = Some(format!("{name}: {e}")),
+    }
+}
+
+fn paste(path: &Path, ui: &mut Ui, held: &Option<(String, Hold)>) {
+    if ui.yank.is_empty() {
+        ui.notice = Some("kill ring is empty".into());
+    } else if let Some((name, hold)) = &held {
+        if let Err(e) = hold.keys(ui.yank.as_bytes()) {
+            ui.notice = Some(format!("{name}: {e}"));
+        }
+    } else if let Some(name) = ui.selected().map(|session| session.name.clone()) {
+        match client::request(
+            path,
+            &Request::Send {
+                name: name.clone(),
+                bytes: ui.yank.as_bytes().to_vec(),
+            },
+        ) {
+            Ok(Response::Ok) => {}
+            Ok(Response::Error(reason)) => ui.notice = Some(reason),
+            other => ui.notice = Some(format!("{other:?}")),
+        }
     }
 }
 
@@ -1815,14 +1822,13 @@ fn parse_shown_target(text: &str) -> Option<ShownTarget> {
         })
 }
 
+/// Rows of cells, each row's soft-wrap flag, and the cursor.
+type StyledCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor);
+
 /// Styled counterpart of the (now unused) plain `capture` — see steps/020,
 /// 021. The wire carries runs, expanded back to cells here — see steps/022.
 /// The cursor rides the same round trip — see steps/027.
-fn capture_styled(
-    path: &Path,
-    name: &str,
-    scrollback: usize,
-) -> Result<(Vec<Vec<StyledCell>>, Vec<bool>, Cursor), String> {
+fn capture_styled(path: &Path, name: &str, scrollback: usize) -> Result<StyledCapture, String> {
     match client::request(
         path,
         &Request::CaptureStyled {

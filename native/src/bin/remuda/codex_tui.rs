@@ -120,15 +120,14 @@ fn monitor_with_key(socket: &std::path::Path, status: &str, key: Option<&str>) {
         let Ok(event) = serde_json::from_str::<Value>(&message) else {
             continue;
         };
-        if event.get("id").and_then(Value::as_u64) == Some(1) {
-            if websocket_send_text(
+        if event.get("id").and_then(Value::as_u64) == Some(1)
+            && websocket_send_text(
                 &mut stream,
                 &json!({"method":"initialized","params":{}}).to_string(),
             )
             .is_err()
-            {
-                return;
-            }
+        {
+            return;
         }
         if let Some(id) = event.get("id").and_then(Value::as_u64) {
             if let Some(thread_id) = resume_requests.remove(&id) {
