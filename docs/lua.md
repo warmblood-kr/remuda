@@ -122,10 +122,11 @@ migrations = {
 
 Migration copies support nested plain tables, scalar values, and table cycles.
 They reject metatables, functions, and userdata so a failed migration cannot
-partially mutate the live state. If any declaration or migration fails, the
-current version stays active. The entry is evaluated in a private declaration
-environment; a declaration cannot call remuda APIs or write daemon globals
-while it is being staged. Lifecycle mods declare hooks and tools in the
+partially mutate the live state. If any declaration, migration or `start`
+fails, the current version's hooks, tools and schedules stay active; changes a
+failing `start` already made to the state are not undone. The entry is
+evaluated in a private declaration environment; a declaration cannot call
+remuda APIs or write daemon globals while it is being staged. Lifecycle mods declare hooks and tools in the
 returned table; do not register them at file scope or from `initialize`.
 Reload replaces only that mod's owned hooks and tools, so removed handlers do
 not linger and other mods remain registered.

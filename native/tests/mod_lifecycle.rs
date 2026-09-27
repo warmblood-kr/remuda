@@ -369,3 +369,67 @@ fn reloads_own_declared_schedules_and_exec_does_not_restart_an_active_mod() {
     );
     assert_eq!(read_value(&image, schedules), "1");
 }
+
+// #129: a reload whose start() fails must leave the previous activation's
+// hooks, tools and schedules in place, as a failed declaration already does.
+#[test]
+fn reload_into_a_failing_start_keeps_the_previous_registrations() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let entry = home.entry();
+    write_entry(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return { hooks = 0 } end,
+          hooks = {{ event = "probe", run = function(state) state.hooks = state.hooks + 1 end }},
+          schedules = {{ name = "sample_tick", every = 1, run = function() end }},
+          tools = {
+            { name = "sample_old", about = "Report the old activation hook count.", run = function(state) return "old:" .. state.hooks end },
+            { name = "sample_kept", about = "Report which activation owns this tool.", run = function() return "old" end },
+          },
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-rollback.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "remuda.exec('sample')");
+
+    write_entry(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function() error("failing reload start") end,
+          tools = {{ name = "sample_kept", about = "Report which activation owns this tool.", run = function() return "new" end }},
+        }"#,
+    );
+    let error = image.eval("remuda.reload('sample')", None).unwrap_err();
+    assert!(error.contains("failing reload start"), "{error}");
+
+    read_value(&image, "remuda.emit('probe')");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_old()"),
+        "old:1"
+    );
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_kept()"),
+        "old"
+    );
+    assert_eq!(
+        read_value(
+            &image,
+            "local n = 0 for _ in pairs(remuda.schedules) do n = n + 1 end return tostring(n)"
+        ),
+        "1"
+    );
+}
