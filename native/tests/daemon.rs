@@ -1222,7 +1222,7 @@ fn a_silent_process_yields_only_the_exit_event() {
 /// A pid this daemon spawned is gone: `kill(pid, 0)` — no signal delivered,
 /// only whether one *could* be — is ESRCH once the pid is reaped. Anything
 /// else (success, or a permission error) means it is still around.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn pid_alive(pid: i32) -> bool {
     let rc = unsafe { libc::kill(pid, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
@@ -1231,11 +1231,12 @@ fn pid_alive(pid: i32) -> bool {
 /// Find a pid's own child, by exact pid, one time — never a glob/grep
 /// pattern (this investigation's own history: zsh's globber has produced a
 /// false "no matches" from `ps -ef | grep [r]emuda` more than once).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn child_pid_of(parent: i32, deadline: Instant) -> Option<i32> {
     loop {
-        let out = std::process::Command::new("ps")
-            .args(["-o", "pid=", "--ppid", &parent.to_string()])
+        // `pgrep -P`, not `ps --ppid`: the latter is GNU-only.
+        let out = std::process::Command::new("pgrep")
+            .args(["-P", &parent.to_string()])
             .output()
             .expect("ps");
         let text = String::from_utf8_lossy(&out.stdout);
@@ -1349,13 +1350,13 @@ fn a_sigkilled_daemon_reaps_its_direct_process_child_but_not_an_already_forked_g
     }
 }
 
-/// [MEASURED, Linux] The one path that DOES reach a grandchild: a clean
+/// [MEASURED, unix] The one path that DOES reach a grandchild: a clean
 /// `remuda stop` sends `Request::Shutdown`, which runs
 /// `reap_processes_before_exit` (daemon.rs) before the process exits —
 /// `remuda.processes()` + `remuda._process_killpg(id)`, which `killpg`s the
 /// whole process group `child_guard::harden` put the direct child in. Both
 /// the direct child and the grandchild it already forked are gone.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn a_clean_shutdown_reaps_a_processs_whole_group_including_a_grandchild() {
     let dir = scratch_dir("orphan-reap-clean");
