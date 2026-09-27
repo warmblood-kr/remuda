@@ -928,6 +928,39 @@ fn the_daemon_names_the_build_it_was_started_from() {
     }
 }
 
+#[test]
+fn auto_started_daemon_survives_a_fast_process_exit() {
+    let dir = scratch_dir("autostart-fast-process");
+
+    let start = remuda_timed(
+        &dir,
+        &[
+            "-s",
+            "s",
+            "-e",
+            "remuda.process{argv = {'true'}, on_exit = 'fast-exit'}",
+        ],
+    );
+    assert!(
+        start.status.success(),
+        "auto-started process call failed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    // Give the daemon time to deliver the exit event before asking the same
+    // auto-started instance a second question.
+    std::thread::sleep(Duration::from_millis(100));
+    let answer = remuda_timed(&dir, &["-s", "s", "-e", "return 1"]);
+    assert!(
+        answer.status.success(),
+        "the daemon died after its fast child exited: {}",
+        String::from_utf8_lossy(&answer.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&answer.stdout).trim(), "1");
+
+    let _ = remuda(&dir, &["-s", "s", "stop", "-f"]);
+}
+
 /// A daemon as its own PROCESS, with its streams pointed at nothing. Inheriting
 /// the harness's stdout would let a leaked daemon hold cargo's pipe open, which
 /// turns any failure below into a hung job instead of a red one.

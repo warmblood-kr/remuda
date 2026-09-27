@@ -610,16 +610,15 @@ fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) ->
 /// through — a bare `remuda daemon` re-derives `"default"` and never matches.
 fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
-    // stderr is captured rather than discarded. The first version discarded it,
-    // and when the daemon failed for a perfectly nameable reason ("path must be
-    // shorter than SUN_LEN") the client reported a timeout instead — a wall
-    // claim that named the wrong wall, and the single most expensive kind of
-    // wrong message to debug.
+    // The daemon outlives this client, so do not pipe stderr: after a successful
+    // connect this function returns and drops the pipe reader. A later daemon
+    // diagnostic would then write to a broken pipe and can kill the daemon.
+    // Inheriting stderr has the same risk when the caller's stderr is short-lived.
     let mut child = std::process::Command::new(exe)
         .args(["-s", server, "daemon"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("cannot start daemon: {e}"))?;
 
