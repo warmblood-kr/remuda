@@ -812,9 +812,10 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
       local is_selected = selected_name and s.name == selected_name
         or (not selected_name and i - 1 == selected)
       local name_style = is_selected and "\27[1;36m" or "\27[1m"
-      lines[base + 1] = name_style .. string.rep(" ", 2 * depth) .. s.name .. reset
+      local indent = string.rep(" ", 2 * depth)
+      lines[base + 1] = name_style .. indent .. s.name .. reset
       local detail_text = detail and ("  \27[2m" .. detail .. reset) or ""
-      lines[base + 2] = "  " .. state_color .. state .. reset .. detail_text .. flag
+      lines[base + 2] = indent .. "  " .. state_color .. state .. reset .. detail_text .. flag
       lines[base + 3] = ""
     end
   end

@@ -1127,6 +1127,40 @@ fn session_order_hook_indents_rows_and_an_error_keeps_the_legacy_buffer_bytes() 
     );
 }
 
+#[test]
+fn a_nested_entry_indents_its_state_row_with_its_name_row() {
+    let path = scratch_socket("session-order-indent");
+    daemon_at(&path);
+    new_session(&path, "alpha");
+    new_session(&path, "bravo");
+    eval(
+        &path,
+        "remuda.session_order = function() return {{name = 'alpha', depth = 0}, {name = 'bravo', depth = 2}} end",
+    );
+    let buffer = eval(
+        &path,
+        "remuda._refresh_sessions_buffer(80, 0, 'none'); return remuda.buffer.new('*sessions*'):get()",
+    );
+    let lines: Vec<&str> = buffer.lines().collect();
+    let row = |name: &str| {
+        lines
+            .iter()
+            // Skip the private \x1e/\x1f header lines, which list names too.
+            .position(|line| !line.starts_with(['\x1e', '\x1f']) && line.contains(name))
+            .unwrap_or_else(|| panic!("{name} row missing: {lines:?}"))
+    };
+
+    // Depth 0 stays byte-identical to the unordered list.
+    let alpha = row("alpha");
+    assert_eq!(lines[alpha], "\x1b[1malpha\x1b[0m");
+    assert_eq!(lines[alpha + 1], "  \x1b[32mlive\x1b[0m");
+
+    // Depth 2: both rows carry the same four extra spaces.
+    let bravo = row("bravo");
+    assert_eq!(lines[bravo], "\x1b[1m    bravo\x1b[0m");
+    assert_eq!(lines[bravo + 1], "      \x1b[32mlive\x1b[0m");
+}
+
 /// Empty-herd counterpart, fed by a real (empty) daemon registry.
 // No sessions created at all, so `remuda.ls()` itself sees a real empty
 // herd rather than an empty `Vec` constructed by hand. Measured ~13ms:
