@@ -144,16 +144,14 @@ pub fn install(
     reference: Option<&str>,
     force: bool,
 ) -> Result<InstallReport, String> {
-    let (owner, repo, url) = github_repository(repository)?;
+    let github = github_repository(repository)?;
     if let Some(reference) = reference {
         validate_reference(reference)?;
     }
     let checkout = temporary_path("checkout")?;
     let result = install_from_checkout(
         &checkout,
-        &owner,
-        &repo,
-        &url,
+        &github,
         reference.map(str::to_string),
         force,
         None,
@@ -195,13 +193,11 @@ fn update_inner(name: &str, require_lifecycle: bool) -> Result<InstallReport, St
         ));
     }
     let (repository, reference) = read_source_metadata(&root.join("source"))?;
-    let (owner, repo, url) = github_repository(&repository)?;
+    let github = github_repository(&repository)?;
     let checkout = temporary_path("update")?;
     let result = install_from_checkout(
         &checkout,
-        &owner,
-        &repo,
-        &url,
+        &github,
         reference,
         true,
         Some(name),
@@ -277,10 +273,9 @@ pub fn remove(name: &str) -> Result<RemoveReport, String> {
     })
 }
 
-/// Validate a local mod checkout without installing or mutating a daemon.
-/// This is the deterministic half of the extension development harness:
-/// manifest, paths, symlinks, Lua syntax, and the host API version are checked
-/// before an integration test installs the mod into an isolated data home.
+/// Validate a local mod checkout without installing or mutating a daemon:
+/// manifest, paths, symlinks, Lua syntax, and host API version. The
+/// deterministic half of the extension harness, run before an install test.
 pub fn test_path(path: &Path) -> Result<ModSpec, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot inspect mod checkout {}: {error}", path.display()))?;
@@ -303,9 +298,7 @@ pub fn test_path(path: &Path) -> Result<ModSpec, String> {
 
 fn install_from_checkout(
     checkout: &Path,
-    owner: &str,
-    repo: &str,
-    url: &str,
+    (owner, repo, url): &(String, String, String),
     reference: Option<String>,
     force: bool,
     expected_name: Option<&str>,

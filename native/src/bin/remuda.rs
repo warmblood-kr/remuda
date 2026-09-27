@@ -534,10 +534,8 @@ fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> Exit
     f(path)
 }
 
-/// Delegates to the lib crate's installed package resolver — the
-/// `remuda.exec()` Lua binding (script.rs) resolves through the same resolver,
-/// so there is exactly one list, not two.
-/// Run an installed mod's entry file in the daemon's image.
+/// Run an installed mod's entry file in the daemon's image. Resolves through
+/// the same resolver as the `remuda.exec()` Lua binding, so there is one list.
 fn exec_command(path: &Path, name: &str) -> ExitCode {
     match remuda_native::packages::resolve(name) {
         Err(error) => fail(error),
