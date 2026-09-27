@@ -822,7 +822,7 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
       local detail_text = detail and ("  \27[2m" .. detail .. reset) or ""
       local block = place({
         name_style .. s.name .. reset,
-        "  " .. state_color .. state .. reset .. detail_text .. flag,
+        state_color .. state .. reset .. detail_text .. flag,
         "",
       }, 2 * depth)
       for r, row in ipairs(block) do lines[base + r] = row end

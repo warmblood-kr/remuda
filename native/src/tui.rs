@@ -1301,10 +1301,9 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
         },
         String::as_str,
     );
-    if !row.is_multiple_of(ui.session_rows) {
-        return fit(content, width);
-    }
-    let cursor = if session_index == ui.selected {
+    // The cursor gutter spans the whole entry, so Lua lays out every row of
+    // it in the same local coordinates.
+    let cursor = if session_index == ui.selected && row.is_multiple_of(ui.session_rows) {
         "▸"
     } else {
         " "

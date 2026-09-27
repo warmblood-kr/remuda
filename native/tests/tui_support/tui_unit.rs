@@ -695,7 +695,7 @@ fn a_session_uses_spaced_name_and_state_rows() {
     let mut ui = make_ui(vec![row("monocle", true, false)]);
     ui.sessions_text = vec![
         "\x1b[1;36mmonocle\x1b[0m".into(),
-        "  \x1b[32mlive\x1b[0m  \x1b[2mclaude · opus · CTX 12k/200k 6%\x1b[0m".into(),
+        "\x1b[32mlive\x1b[0m  \x1b[2mclaude · opus · CTX 12k/200k 6%\x1b[0m".into(),
         String::new(),
     ];
     assert!(list_row(&ui, 0, 40).contains("monocle"));
@@ -889,10 +889,10 @@ fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buff
             "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
              \x1b[2;1H\x1b[K▸ alpha         │xxxxxxxxxx                                                     \
-             \x1b[3;1H\x1b[Klive            │xxxxxxxxxx                                                     \
+             \x1b[3;1H\x1b[K  live          │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[5;1H\x1b[K  bravo         │xxxxxxxxxx                                                     \
-             \x1b[6;1H\x1b[Klive  ⚑         │xxxxxxxxxx                                                     \
+             \x1b[6;1H\x1b[K  live  ⚑       │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1015,10 +1015,10 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
         lines,
         vec![
             "\x1b[1;36malpha\x1b[0m".to_string(),
-            "  \x1b[32mlive\x1b[0m".to_string(),
+            "\x1b[32mlive\x1b[0m".to_string(),
             String::new(),
             "\x1b[1mbravo\x1b[0m".to_string(),
-            "  \x1b[32mlive\x1b[0m  ⚑".to_string(),
+            "\x1b[32mlive\x1b[0m  ⚑".to_string(),
             String::new(),
         ],
         "real Lua output for this scenario"
@@ -1145,10 +1145,7 @@ fn every_row_of_a_nested_entry_shares_one_offset() {
     let block = |i: usize| &lines[i * 3..i * 3 + 3];
 
     // Depth 0 is the local layout itself, byte-identical to the flat list.
-    assert_eq!(
-        block(0),
-        ["\x1b[1malpha\x1b[0m", "  \x1b[32mlive\x1b[0m", ""]
-    );
+    assert_eq!(block(0), ["\x1b[1malpha\x1b[0m", "\x1b[32mlive\x1b[0m", ""]);
     // Every row of a deeper entry, blank spacer included, is that same
     // block shifted right by 2 * depth.
     for (i, depth) in [(1, 1), (2, 2)] {
@@ -1156,7 +1153,7 @@ fn every_row_of_a_nested_entry_shares_one_offset() {
         let name = ["alpha", "bravo", "charlie"][i];
         let expected = [
             format!("{pad}\x1b[1m{name}\x1b[0m"),
-            format!("{pad}  \x1b[32mlive\x1b[0m"),
+            format!("{pad}\x1b[32mlive\x1b[0m"),
             pad.clone(),
         ];
         assert_eq!(block(i), expected, "depth {depth}");
@@ -1277,7 +1274,7 @@ fn the_live_dead_word_is_pinned_against_real_lua_at_every_width() {
             .collect();
         assert_eq!(
             states,
-            vec!["  \x1b[32mlive\x1b[0m", "  \x1b[32mlive\x1b[0m  ⚑"],
+            vec!["\x1b[32mlive\x1b[0m", "\x1b[32mlive\x1b[0m  ⚑"],
             "at width {width}, tools.lua shows the live/dead word before the flag"
         );
     }
