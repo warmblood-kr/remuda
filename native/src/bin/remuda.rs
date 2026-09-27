@@ -620,9 +620,7 @@ fn caller_env(vars: impl Iterator<Item = (String, String)>) -> String {
         .join(", ")
 }
 
-/// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
-/// successful *connect*, not on the file existing, and pass `-s <server>`
-/// through — a bare `remuda daemon` re-derives `"default"` and never matches.
+/// Removes the Windows temp startup log once `start_daemon` returns.
 #[cfg(windows)]
 struct StartupLogCleanup(std::path::PathBuf);
 
@@ -633,6 +631,9 @@ impl Drop for StartupLogCleanup {
     }
 }
 
+/// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
+/// successful *connect*, not on the file existing, and pass `-s <server>`
+/// through — a bare `remuda daemon` re-derives `"default"` and never matches.
 fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
     // Keep stderr in a file beside the socket. The daemon outlives this client,
