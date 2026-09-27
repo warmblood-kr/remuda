@@ -352,12 +352,12 @@ end
 
 -- REACTIVATE false is `exec`: ensure the mod is active, but leave an active
 -- one (and its `start` effects) alone — only `reload` re-runs `start` (#116).
--- A `start` that failed does not count, so the next `exec` retries it.
+-- A `start` that failed rolls back (#129), so the next `exec` retries it.
 function remuda._activate_module(name, candidate, reactivate)
   if type(name) ~= "string" or name == "" then
     error("module name must be a non-empty string", 0)
   end
-  if reactivate == false and modules[name] ~= nil and modules[name].started then
+  if reactivate == false and modules[name] ~= nil then
     return false
   end
   if type(candidate) ~= "table" or candidate.api ~= "remuda-module-v1" then
@@ -459,6 +459,22 @@ function remuda._activate_module(name, candidate, reactivate)
     end
   end
 
+  -- Snapshot what this activation replaces, so a failing `start` can put the
+  -- previous activation back (#129). State mutated by that `start` stays.
+  local saved_hooks, saved_tools, saved_schedules = {}, {}, {}
+  for event, registered in pairs(remuda.hooks) do
+    saved_hooks[event] = { table.unpack(registered) }
+  end
+  for _, tool_name in ipairs(tool_names) do
+    saved_tools[tool_name] = { remuda.tools[tool_name], remuda._registry[tool_name], module_tool_owners[tool_name] }
+  end
+  for _, tool_name in ipairs(previous and previous.tools or {}) do
+    saved_tools[tool_name] = { remuda.tools[tool_name], remuda._registry[tool_name], module_tool_owners[tool_name] }
+  end
+  for _, handle in ipairs(previous and previous.schedules or {}) do
+    saved_schedules[handle] = remuda.schedules[handle]
+  end
+
   local group = "remuda-module:" .. name
   for event, registered in pairs(remuda.hooks) do
     local kept = {}
@@ -504,12 +520,33 @@ function remuda._activate_module(name, candidate, reactivate)
       run = function() return declared.run(state) end,
     })
   end
-  local entry = { version = version, state = state, tools = tool_names, schedules = schedule_handles }
-  modules[name] = entry
-  return true, state, function(started_state)
-    if candidate.start then candidate.start(started_state) end
-    entry.started = true
+  modules[name] = { version = version, state = state, tools = tool_names, schedules = schedule_handles }
+
+  local function rollback()
+    for event, registered in pairs(remuda.hooks) do
+      local restored = saved_hooks[event] or {}
+      local known = {}
+      for _, hook in ipairs(restored) do known[hook] = true end
+      for _, hook in ipairs(registered) do
+        if hook.group ~= group and not known[hook] then
+          restored[#restored + 1] = hook
+        end
+      end
+      remuda.hooks[event] = restored
+    end
+    for tool_name, saved in pairs(saved_tools) do
+      remuda.tools[tool_name], remuda._registry[tool_name], module_tool_owners[tool_name] =
+        saved[1], saved[2], saved[3]
+    end
+    for _, handle in ipairs(schedule_handles) do
+      remuda.cancel(handle)
+    end
+    for handle, schedule in pairs(saved_schedules) do
+      remuda.schedules[handle] = schedule
+    end
+    modules[name] = previous
   end
+  return true, state, candidate.start, rollback
 end
 
 local escapes = {
