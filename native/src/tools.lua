@@ -800,6 +800,13 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
     end
   end
   local lines = {}
+  -- One entry is a block of rows laid out at x = 0; nesting moves the whole
+  -- block, so no row can keep a position of its own.
+  local function place(block, dx)
+    local pad = string.rep(" ", dx)
+    for i, row in ipairs(block) do block[i] = pad .. row end
+    return block
+  end
   local function session_detail(session)
     if type(remuda.session_detail) ~= "function" then return nil end
     return remuda.session_detail(session)
@@ -813,19 +820,28 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
       local detail = session_detail(s)
       local state_color = s.alive and "\27[32m" or "\27[31m"
       local reset = "\27[0m"
-      local flag = s.attached and "  ⚑" or ""
-      local state = s.alive and "live" or "dead"
       local base = (i - 1) * 3
       -- Names remain neutral and readable; state carries the color. Keeping
       -- an actually blank third row gives entries whitespace rather than a
       -- second competing visual treatment.
       local is_selected = selected_name and s.name == selected_name
         or (not selected_name and i - 1 == selected)
-      local name_style = is_selected and "\27[1;36m" or "\27[1m"
-      lines[base + 1] = name_style .. string.rep(" ", 2 * depth) .. s.name .. reset
-      local detail_text = detail and ("  \27[2m" .. detail .. reset) or ""
-      lines[base + 2] = "  " .. state_color .. state .. reset .. detail_text .. flag
-      lines[base + 3] = ""
+      -- Reverse video marks the selection without a caret column.
+      local name_style = is_selected and "\27[1;7;36m" or "\27[1m"
+      -- The dot carries live/dead, so row 2 is only telemetry and the flag.
+      -- Each style resets before the next starts, so none bleeds into another.
+      -- U+25CF BLACK CIRCLE. Ambiguous width; tui.rs's char_width counts it
+      -- as one cell by owner choice.
+      local dot = "●"
+      local parts = {}
+      if detail then parts[#parts + 1] = "\27[2m" .. detail .. reset end
+      if s.attached then parts[#parts + 1] = "⚑" end
+      local block = place({
+        name_style .. s.name .. reset .. " " .. state_color .. dot .. reset,
+        table.concat(parts, "  "),
+        "",
+      }, 2 * depth)
+      for r, row in ipairs(block) do lines[base + r] = row end
     end
   end
   -- The private first line is the native bridge contract: Lua selects the
