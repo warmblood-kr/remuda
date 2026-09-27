@@ -836,6 +836,44 @@ fn one_throwing_schedule_does_not_starve_the_others() {
 }
 
 #[test]
+fn a_schedule_registered_during_a_tick_first_fires_on_the_next_tick() {
+    // Adding keys to a table mid-`pairs` is undefined in Lua: new entries may
+    // or may not be visited, or `next` may raise. A snapshot makes it exact.
+    let path = scratch("schedule-mutate");
+    let _daemon = daemon_at(&path);
+
+    eval(
+        &path,
+        r#"
+            remuda.late_fired = 0
+            remuda.schedule({ every = 1e9, run = function()
+              for _ = 1, 50 do
+                remuda.schedule({
+                  every = 1e9,
+                  run = function() remuda.late_fired = remuda.late_fired + 1 end,
+                })
+              end
+            end })
+        "#,
+    );
+
+    assert_eq!(
+        eval(
+            &path,
+            "return tostring(pcall(remuda._run_due_schedules, 2e9))"
+        ),
+        "true"
+    );
+    assert_eq!(
+        read_count(&path, "return remuda.late_fired"),
+        0,
+        "schedules added during a tick must wait for the next one"
+    );
+    eval(&path, "remuda._run_due_schedules(4e9)");
+    assert_eq!(read_count(&path, "return remuda.late_fired"), 50);
+}
+
+#[test]
 fn event_counts_reads_zero_before_any_emit_and_n_after_real_fires() {
     // `remuda.event_counts()` does not exist yet — this must fail red with a
     // Lua "attempt to call a nil value" error, not a compile error.

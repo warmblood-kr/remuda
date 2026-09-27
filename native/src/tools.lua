@@ -186,8 +186,15 @@ register("cancel", "Cancel a schedule by the handle `schedule()` returned.", "ca
 -- clock). Fires every schedule whose own interval has elapsed since ITS OWN
 -- last run — native never sees or compares an individual interval itself.
 function remuda._run_due_schedules(now)
-  for _, schedule in pairs(remuda.schedules) do
-    if now - schedule.last_run >= schedule.every then
+  -- Snapshot the handles, as `emit` does: a run() that schedules must not add
+  -- keys mid-`pairs` (undefined in Lua). A cancel mid-tick still takes effect.
+  local handles = {}
+  for handle in pairs(remuda.schedules) do
+    handles[#handles + 1] = handle
+  end
+  for _, handle in ipairs(handles) do
+    local schedule = remuda.schedules[handle]
+    if schedule and now - schedule.last_run >= schedule.every then
       schedule.last_run = now
       if schedule.name then
         remuda._schedule_fire_counts[schedule.name] = (remuda._schedule_fire_counts[schedule.name] or 0) + 1
