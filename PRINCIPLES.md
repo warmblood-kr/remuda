@@ -120,11 +120,13 @@ not because a viewer joined from a smaller terminal.
 human at an attached terminal types Enter themselves, so attaching needs the very
 raw write invariant 1 refuses to expose. The two are reconciled by *exclusivity*
 rather than by a rule: `attach` hands out an `Attached` guard, at most one at a
-time, and `write_raw` lives **only on that guard**. While it is held, `send_line`
-returns `AgentError::Attached` instead of queueing. Refusing is the point —
-orchestrated input landing in a session a person is driving is the exact fleet
-incident this design exists to prevent. "The core is busy" is information the
-caller can act on; a silently interleaved keystroke is not.
+time, and `write_raw` lives **only on that guard**. Managed input (`send_line`,
+`send`, `feed`) is still accepted while a viewer is attached: attaching is
+routine, and a watcher must not stall the orchestrator. What still holds is
+invariant 1 — each managed act is delivered whole under `input_lock`, never
+interleaved with another managed act. A human's `write_raw` takes only the
+agent lock, so a keystroke can land in a pause between one act's bursts, but
+never inside a burst. Only `terminate` is refused while attached.
 
 ### Widening an atom does not repeal invariant 1
 
@@ -154,16 +156,10 @@ act, pause included, is a second lock, `input_lock` — the thing a second
 sender cannot land inside at any point in the sequence. That is `feed`
 widening the same **divisibility** property a second time, not repealing it.
 
-Attachment is re-checked on *every* burst, not once at the act's start — and
-not just the live flag. A human can `attach` **and detach again**, both
-fully inside one `Pause`, so `attached` reads false again by the time the
-next burst runs; a generation counter bumped on every successful `attach`
-is what a burst actually compares against, refusing if it has changed since
-the act started even though nothing is held *now*. `attach` itself takes
-neither lock, so an act sitting in a pause cannot make it wait — it simply
-wins the race, and the act's remaining bursts lose theirs. The failure this
-buys is a safe one: a refused act leaves its body typed but not submitted,
-never silently corrupted or misdelivered to whoever attached.
+`attach` takes neither lock, so an act sitting in a pause cannot make it wait,
+and an attach — or an attach-then-detach — inside a pause does not stop the
+act's remaining bursts. There is no attach check per burst and no generation
+counter; both were removed in 95fbe7e along with the refusal.
 
 A `feed` act's own pauses are what a caller sits inside of too — `Session::
 feed` runs on the daemon's connection thread, and a script's call blocks
@@ -180,9 +176,9 @@ test `feed_bursts_and_pauses_are_one_indivisible_act` and its negative control
 `control_separate_calls_with_a_gap_do_interleave` · a screen read never
 waiting on a pause, by test `capture_does_not_wait_out_a_feed_pause` · the
 attach race, by test
-`attaching_during_a_feed_pause_refuses_the_remaining_bursts` and the
+`attaching_during_a_feed_pause_does_not_block_the_remaining_bursts` and the
 attach-then-detach-inside-one-pause case, by test
-`attaching_and_detaching_inside_a_pause_still_refuses_the_next_burst` · the
+`attaching_and_detaching_inside_a_pause_does_not_block_the_next_burst` · the
 pause cap, by test `feed_refuses_a_total_pause_over_the_cap`
 
 ## 7. Time is injected, never read
