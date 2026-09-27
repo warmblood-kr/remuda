@@ -657,11 +657,30 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot create daemon log {}: {e}", stderr_path.display()))?;
     #[cfg(windows)]
     let _log_cleanup = StartupLogCleanup(stderr_path.clone());
-    let mut child = std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .args(["-s", server, "daemon"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::from(stderr_file))
+        .stderr(std::process::Stdio::from(stderr_file));
+    // Its own session, as tmux's daemon(3) does: otherwise the daemon stays in
+    // this CLI's process group and terminal session, and a hangup (an SSH
+    // disconnect) SIGHUPs it along with the shell. See issue #106.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid() is async-signal-safe; the child is a fresh fork, so
+        // it is never already a process-group leader and cannot fail.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start daemon: {e}"))?;
 
