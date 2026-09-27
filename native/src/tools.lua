@@ -819,10 +819,9 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
       local name_style = is_selected and "\27[1;36m" or "\27[1m"
       -- The dot carries live/dead, so row 2 is only telemetry and the flag.
       -- Each style resets before the next starts, so none bleeds into another.
-      -- U+2219 BULLET OPERATOR: East Asian Width N (EastAsianWidth-18.0.0.txt
-      -- "2216..2219 ; N"), so one cell in every terminal, unlike an A-width
-      -- "●"; Menlo and SF Mono both carry it.
-      local dot = "\u{2219}"
+      -- U+25CF BLACK CIRCLE. Ambiguous width; tui.rs's char_width counts it
+      -- as one cell by owner choice.
+      local dot = "●"
       local parts = {}
       if detail then parts[#parts + 1] = "\27[2m" .. detail .. reset end
       if s.attached then parts[#parts + 1] = "⚑" end

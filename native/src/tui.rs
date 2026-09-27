@@ -879,7 +879,6 @@ pub fn crop(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool)
 /// last cell. Counts real display width via `visible_width`, not `char`s —
 /// a wide (CJK) name used to overflow this budget. See steps/025.
 fn fit(text: &str, width: u16) -> String {
-    use unicode_width::UnicodeWidthChar;
     let width = width as usize;
     if visible_width(text) > width {
         let mut out = String::new();
@@ -898,7 +897,7 @@ fn fit(text: &str, width: u16) -> String {
                 }
                 continue;
             }
-            let w = c.width().unwrap_or(1);
+            let w = char_width(c);
             if used + w > width.saturating_sub(1) {
                 break;
             }
@@ -1082,11 +1081,17 @@ fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Ve
     (out, cut)
 }
 
+/// The one text-width rule the list renderer uses. Ambiguous-width
+/// characters (East Asian Width A, e.g. the status dot) count as narrow.
+fn char_width(c: char) -> usize {
+    // Ambiguous-width is treated as narrow by owner choice.
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(1)
+}
+
 /// A styled row's display width, ignoring the SGR bytes riding along with
 /// it, and counting a wide (CJK) character as the 2 columns it actually
 /// draws — `fit`'s plain char count would under-count it by 1. See steps/023.
 fn visible_width(s: &str) -> usize {
-    use unicode_width::UnicodeWidthChar;
     let mut width = 0;
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -1097,7 +1102,7 @@ fn visible_width(s: &str) -> usize {
                 }
             }
         } else {
-            width += c.width().unwrap_or(1);
+            width += char_width(c);
         }
     }
     width
