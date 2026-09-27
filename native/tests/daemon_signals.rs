@@ -135,3 +135,56 @@ fn sighup_is_logged_and_ignored_by_a_detached_daemon() {
     let log = daemon.log();
     assert!(log.contains("remuda daemon: SIGHUP ignored"), "{log:?}");
 }
+
+/// The handlers are caught, never SIG_IGN: a caught disposition resets to
+/// SIG_DFL on exec, an ignored one is inherited — and a pty child ignoring
+/// SIGHUP would outlive its daemon (the master-close hangup is what reaps it).
+/// Both kinds of child report their own SIGHUP disposition: 0 = SIG_DFL.
+/// Measured with SIG_IGN swapped in: the `remuda.process` child reports 1 and
+/// fails this; the pty child still reports 0 (portable-pty's spawn appears to
+/// reset dispositions itself), so its assertion pins that, not this change.
+#[test]
+fn children_of_a_detached_daemon_keep_the_default_sighup() {
+    let daemon = Daemon::spawn_with("children", true);
+    let dir = daemon.socket.parent().unwrap().to_path_buf();
+    let probe = |file: &Path| {
+        format!(
+            "{{'python3', '-c', 'import signal, sys, time; open(sys.argv[1], \"w\").write(str(int(signal.getsignal(signal.SIGHUP)))); time.sleep(30)', '{}'}}",
+            file.display()
+        )
+    };
+    let (pty_file, process_file) = (dir.join("pty.disp"), dir.join("process.disp"));
+    let code = format!(
+        "remuda.new('probe', {}); remuda.process{{argv = {}}}",
+        probe(&pty_file),
+        probe(&process_file)
+    );
+    let answer = remuda_native::client::request(
+        &daemon.socket,
+        &remuda_core::protocol::Request::Eval { code, name: None },
+    )
+    .expect("eval");
+    assert!(
+        matches!(answer, remuda_core::protocol::Response::Value(_)),
+        "{answer:?}"
+    );
+
+    let read = |file: &Path| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(file) {
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+            assert!(Instant::now() < deadline, "probe never reported {file:?}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert_eq!(read(&pty_file), "0", "pty child's SIGHUP is not SIG_DFL");
+    assert_eq!(
+        read(&process_file),
+        "0",
+        "process child's SIGHUP is not SIG_DFL"
+    );
+}
