@@ -19,8 +19,8 @@
 use remuda_core::protocol::{Request, Response};
 use remuda_native::client::Left;
 use remuda_native::{daemon, dist, terminal_size};
-use std::fs::{self, File};
-use std::io::IsTerminal;
+use std::fs;
+use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -656,8 +656,25 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
             )
         })?;
     }
-    let stderr_file = File::create(&stderr_path)
+    // Append, so the previous daemon's post-mortem survives this start; rotate
+    // once past 1 MiB so it cannot grow forever.
+    #[cfg(unix)]
+    let stderr_file = {
+        if fs::metadata(&stderr_path).is_ok_and(|m| m.len() > 1_048_576) {
+            let _ = fs::rename(&stderr_path, stderr_path.with_extension("log.1"));
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stderr_path)
+    };
+    #[cfg(windows)]
+    let stderr_file = fs::File::create(&stderr_path);
+    let stderr_file = stderr_file
         .map_err(|e| format!("cannot create daemon log {}: {e}", stderr_path.display()))?;
+    // Where this run's output starts, for the failure message below.
+    let offset = stderr_file.metadata().map_or(0, |m| m.len());
+    let mut separator = stderr_file.try_clone().ok();
     #[cfg(windows)]
     let _log_cleanup = StartupLogCleanup(stderr_path.clone());
     // std spawns with bInheritHandles=TRUE, so the daemon would inherit every
@@ -704,6 +721,18 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start daemon: {e}"))?;
+    // Written after spawn so it names the daemon's pid; the failure read below
+    // drops it, since it may land after the daemon's own first lines.
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let separator_line = format!(
+        "--- remuda daemon start pid {} at unix time {since_epoch} (UTC) ---",
+        child.id()
+    );
+    if let Some(log) = separator.as_mut() {
+        let _ = writeln!(log, "{separator_line}");
+    }
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
@@ -723,8 +752,10 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
 
     let _ = child.kill();
     let _ = child.wait();
-    let said = fs::read_to_string(&stderr_path)
+    let said = fs::read(&stderr_path)
         .ok()
+        .and_then(|bytes| bytes.get(offset as usize..).map(<[u8]>::to_vec))
+        .map(|bytes| String::from_utf8_lossy(&bytes).replace(&separator_line, ""))
         .map(|text| text.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "it printed nothing".into());
@@ -1349,12 +1380,16 @@ mod tests {
             !error.contains("it printed nothing"),
             "the child diagnostic must survive startup failure: {error}"
         );
+        assert!(
+            !error.contains("stale output from a previous run"),
+            "the failure must quote only this run's output: {error}"
+        );
         #[cfg(unix)]
         assert!(
-            !fs::read_to_string(&log)
+            fs::read_to_string(&log)
                 .unwrap()
                 .contains("stale output from a previous run"),
-            "a new daemon run must truncate its prior log"
+            "a new daemon run must keep its prior log"
         );
         let _ = fs::remove_dir_all(dir);
     }

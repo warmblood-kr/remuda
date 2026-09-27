@@ -1018,6 +1018,54 @@ fn auto_started_daemon_survives_a_fast_process_exit() {
     let _ = remuda(&dir, &["-s", "s", "stop", "-f"]);
 }
 
+/// A daemon's log is post-mortem evidence: the next auto-start must append to
+/// it, not wipe it. Unix only: CLI auto-start with piped output hangs on Windows.
+#[test]
+#[cfg(unix)]
+fn an_auto_start_appends_to_the_previous_daemons_log() {
+    let dir = scratch_dir("log-append");
+    let log = daemon::socket_path_in(&dir, "s").with_extension("log");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, "panic trace from the last daemon\n").unwrap();
+
+    let out = remuda_timed(&dir, &["-s", "s", "-e", "return 1"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = remuda(&dir, &["-s", "s", "stop", "-f"]);
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("panic trace from the last daemon"), "{text}");
+    assert!(text.contains("--- remuda daemon start pid "), "{text}");
+}
+
+/// Appending must not grow forever: past ~1 MiB the old log moves to `.log.1`.
+#[test]
+#[cfg(unix)]
+fn an_oversized_daemon_log_is_rotated_on_auto_start() {
+    let dir = scratch_dir("log-rotate");
+    let log = daemon::socket_path_in(&dir, "s").with_extension("log");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    let big = format!("old marker\n{}", "x".repeat(1_100_000));
+    std::fs::write(&log, big).unwrap();
+
+    let out = remuda_timed(&dir, &["-s", "s", "-e", "return 1"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = remuda(&dir, &["-s", "s", "stop", "-f"]);
+
+    let rotated = std::fs::read_to_string(log.with_extension("log.1")).unwrap();
+    assert!(rotated.starts_with("old marker"));
+    let fresh = std::fs::read_to_string(&log).unwrap();
+    assert!(fresh.len() < 10_000, "{} bytes", fresh.len());
+    assert!(fresh.contains("--- remuda daemon start pid "), "{fresh}");
+}
+
 /// What a person types, with its own pipes and no terminal — so `restart`
 /// reaches the "nothing to ask on" branch rather than blocking on a prompt.
 fn remuda(dir: &Path, args: &[&str]) -> std::process::Output {
@@ -1036,6 +1084,8 @@ fn remuda_timed(dir: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .env("REMUDA_RUNTIME_DIR", dir)
         .env("REMUDA_NO_UPDATE_CHECK", "1")
+        // An auto-started daemon boots the user config; keep it off the real one.
+        .env("HOME", dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
