@@ -18,6 +18,11 @@ pub fn run(args: &[&str]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The selected model is useful status even before the first prompt. The
+    // app-server does not announce a thread (or its model) until a thread is
+    // started, so waiting for `thread/started` leaves the caller showing its
+    // previous/default model while the new TUI is idle.
+    seed_status(status, model);
     let socket = std::env::temp_dir().join(format!("remuda-codex-{}.sock", std::process::id()));
     let address = format!("unix://{}", socket.display());
     let (server_args, client_args) = codex_args(&address, model);
@@ -38,15 +43,19 @@ pub fn run(args: &[&str]) -> ExitCode {
     let monitor_socket = socket.clone();
     let monitor_status = status.to_string();
     std::thread::spawn(move || monitor(&monitor_socket, &monitor_status));
-    let result = Command::new("codex")
-        .args(&client_args)
-        .status();
+    let result = Command::new("codex").args(&client_args).status();
     let _ = server.kill();
     let _ = std::fs::remove_file(socket);
     match result {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(error) => fail(error),
+    }
+}
+
+fn seed_status(status: &str, model: Option<&str>) {
+    if let Some(model) = model {
+        write_status(status, model, "?", "?");
     }
 }
 
@@ -173,7 +182,11 @@ mod tests {
             codex_args("unix://s", None),
             (
                 vec!["app-server".into(), "--listen".into(), "unix://s".into()],
-                vec!["--remote".into(), "unix://s".into(), "--approve-for-me".into()],
+                vec![
+                    "--remote".into(),
+                    "unix://s".into(),
+                    "--approve-for-me".into()
+                ],
             )
         );
         let (server, client) = codex_args("unix://s", Some("gpt-5.5"));
@@ -214,6 +227,20 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "MODEL:gpt-5.4 CTX:15000 CTXWIN:200000 CTXPCT:7\n"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn selected_model_is_published_before_any_thread_starts() {
+        let path = status_path("selected-model-before-thread");
+        let _ = std::fs::remove_file(&path);
+
+        seed_status(&path.to_string_lossy(), Some("gpt-5.6-sol"));
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "MODEL:gpt-5.6-sol CTX:? CTXWIN:? CTXPCT:?\n"
         );
         let _ = std::fs::remove_file(path);
     }
