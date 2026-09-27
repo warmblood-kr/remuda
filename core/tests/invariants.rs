@@ -435,7 +435,7 @@ fn close_terminates_a_live_session_and_stops_tracking_it() {
         ))
         .expect("registration");
 
-    assert!(matches!(registry.close("worker"), Some(Ok(()))));
+    assert!(matches!(registry.close("worker"), Some(Ok(true))));
     assert!(
         !alive.load(Ordering::SeqCst),
         "the process must actually end"
@@ -459,7 +459,7 @@ fn close_on_an_already_dead_session_is_not_an_error() {
         ))
         .expect("registration");
 
-    assert!(matches!(registry.close("worker"), Some(Ok(()))));
+    assert!(matches!(registry.close("worker"), Some(Ok(true))));
     assert!(registry.get("worker").is_none());
 }
 
@@ -498,7 +498,7 @@ fn close_is_refused_while_attached_and_the_session_survives() {
 
     drop(held);
     assert!(
-        matches!(registry.close("worker"), Some(Ok(()))),
+        matches!(registry.close("worker"), Some(Ok(true))),
         "detaching lets close through, exactly as it does for send"
     );
 }
