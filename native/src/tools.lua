@@ -24,12 +24,14 @@ function remuda.extension_command(name, handler)
   if type(handler) ~= "function" then error("a mod command needs a handler", 2) end
   remuda._extension_commands[name] = handler
 end
-function remuda._dispatch_extension_command(name, args)
+-- `caller` is what the CLI knows and the daemon does not: `caller.env` holds
+-- the caller's `REMUDA_*` variables (`os.getenv` here reads the daemon's).
+function remuda._dispatch_extension_command(name, args, caller)
   local handler = remuda._extension_commands[name]
   if not handler then
     error("mod command " .. tostring(name) .. " is not loaded; run `remuda " .. tostring(name) .. "` first", 2)
   end
-  return handler(args or {})
+  return handler(args or {}, caller or {})
 end
 
 -- One row per word, Rust's own bindings included (`script.rs`'s `WORDS`
@@ -39,8 +41,8 @@ local function register(name, about, signature)
 end
 register("tools", "The `remuda.tool` registry table, keyed by tool name.", "table")
 register("_extension_commands", "Handlers registered for installed mod commands.", "table")
-register("extension_command", "Register a handler for an installed mod command.", "extension_command(name, handler) -> nil")
-register("_dispatch_extension_command", "Dispatch arguments to a loaded mod command handler.", "_dispatch_extension_command(name, args) -> value")
+register("extension_command", "Register a handler for an installed mod command.", "extension_command(name, handler(args, caller)) -> nil")
+register("_dispatch_extension_command", "Dispatch arguments and caller context to a loaded mod command handler.", "_dispatch_extension_command(name, args, caller) -> value")
 
 -- Required names first (a caller's own order, via `needs`), then everything
 -- else marked optional — the same order a hand-written signature would use.

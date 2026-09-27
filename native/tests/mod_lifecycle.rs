@@ -172,3 +172,36 @@ fn installed_mod_reloads_in_the_same_image_without_losing_state_or_old_code_on_f
     read_value(&image, "api_v3_phase = 'legacy_refusal'");
     read_value(&image, include_str!("api/v3.lua"));
 }
+
+#[test]
+fn mod_command_handler_receives_caller_env() {
+    // #95: the handler runs in the daemon, so `os.getenv` is the daemon's; the
+    // caller's `REMUDA_*` variables arrive as the second handler argument.
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-caller-unused.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(
+        &image,
+        "remuda.extension_command('probe', function(args, caller) \
+           return args[1] .. ':' .. caller.env.REMUDA_BUTLER_AGENT_ID end)",
+    );
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('probe', {'inbox'}, \
+             {env = {REMUDA_BUTLER_AGENT_ID = 'dev-lead'}})"
+        ),
+        "inbox:dev-lead"
+    );
+    // An older CLI sends no caller table; handlers still get one.
+    assert_eq!(
+        read_value(
+            &image,
+            "remuda.extension_command('bare', function(_, caller) return type(caller) end); \
+             return remuda._dispatch_extension_command('bare', {})"
+        ),
+        "table"
+    );
+}
