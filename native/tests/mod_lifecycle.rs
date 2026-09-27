@@ -220,6 +220,63 @@ fn activated_lifecycle_hook_can_call_remuda_and_hook_errors_are_visible() {
 }
 
 #[test]
+fn lifecycle_start_runs_once_after_activation_and_surfaces_errors() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let entry = home.entry();
+    write_entry(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return { starts = 0, hooks = 0 } end,
+          start = function(state)
+            state.starts = state.starts + 1
+            remuda.emit("start_probe")
+          end,
+          hooks = {{ event = "start_probe", run = function(state)
+            state.hooks = state.hooks + 1
+          end }},
+          tools = {{ name = "sample_start_count",
+            about = "Read how often this module started.",
+            run = function(state) return state.starts .. ":" .. state.hooks end }},
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-start.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "remuda.exec('sample')");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_start_count()"),
+        "1:1"
+    );
+    read_value(&image, "remuda.reload('sample')");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_start_count()"),
+        "2:2"
+    );
+
+    write_entry(
+        &entry,
+        r#"return {
+      api = "remuda-module-v1", state_version = 1,
+      initialize = function() return {} end,
+      start = function() error("visible lifecycle start error") end,
+    }"#,
+    );
+    let error = image.eval("remuda.reload('sample')", None).unwrap_err();
+    assert!(error.contains("visible lifecycle start error"), "{error}");
+}
+
+#[test]
 fn mod_command_handler_receives_caller_env() {
     // #95: the handler runs in the daemon, so `os.getenv` is the daemon's; the
     // caller's `REMUDA_*` variables arrive as the second handler argument.
