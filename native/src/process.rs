@@ -175,7 +175,7 @@ impl Processes {
         }
     }
 
-    /// Reap a tracked child's WHOLE process group (Linux, via
+    /// Reap a tracked child's WHOLE process group (unix, via
     /// `child_guard::harden`) — covers a grandchild it forked before this
     /// runs. Best-effort: an already-gone child is nothing to signal.
     pub fn killpg(&self, id: u64) -> Result<(), String> {
@@ -186,7 +186,7 @@ impl Processes {
         let Some(c) = child.as_ref() else {
             return Ok(());
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         {
             let pid = c.id() as libc::pid_t;
             // SAFETY: killpg with a plain pid, no memory involved.
@@ -197,7 +197,7 @@ impl Processes {
                 }
             }
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         {
             let _ = c;
         }

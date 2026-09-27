@@ -106,7 +106,7 @@ fn selected_session_stays_visible_when_the_list_exceeds_a_short_terminal() {
 
     let frame = render(&ui, "", "test", 80, 24);
     assert!(
-        frame.contains("\x1b[20;1H▸ session-11"),
+        frame.contains("\x1b[20;1H\x1b[7msession-11\x1b[0m"),
         "the selected final session must be rendered in the 24-row viewport: {frame:?}"
     );
     assert!(
@@ -694,12 +694,12 @@ fn list_row_with_a_wide_session_name_still_fits_its_column_budget() {
 fn a_session_uses_spaced_name_and_state_rows() {
     let mut ui = make_ui(vec![row("monocle", true, false)]);
     ui.sessions_text = vec![
-        "\x1b[1;36mmonocle\x1b[0m".into(),
-        "  \x1b[32mlive\x1b[0m  \x1b[2mclaude · opus · CTX 12k/200k 6%\x1b[0m".into(),
+        "\x1b[1;7;36mmonocle\x1b[0m".into(),
+        "\x1b[32mlive\x1b[0m  \x1b[2mclaude · opus · CTX 12k/200k 6%\x1b[0m".into(),
         String::new(),
     ];
     assert!(list_row(&ui, 0, 40).contains("monocle"));
-    assert!(list_row(&ui, 0, 40).contains("\x1b[1;36mmonocle\x1b[0m"));
+    assert!(list_row(&ui, 0, 40).contains("\x1b[1;7;36mmonocle\x1b[0m"));
     assert!(list_row(&ui, 1, 40).contains("CTX 12k/200k 6%"));
     assert!(list_row(&ui, 1, 40).contains("\x1b[32mlive\x1b[0m"));
     assert_eq!(list_row(&ui, 2, 40).trim(), "");
@@ -888,10 +888,10 @@ fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buff
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
-             \x1b[2;1H\x1b[K▸ alpha         │xxxxxxxxxx                                                     \
+             \x1b[2;1H\x1b[Kalpha           │xxxxxxxxxx                                                     \
              \x1b[3;1H\x1b[Klive            │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K  bravo         │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[Kbravo           │xxxxxxxxxx                                                     \
              \x1b[6;1H\x1b[Klive  ⚑         │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1014,11 +1014,11 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
     assert_eq!(
         lines,
         vec![
-            "\x1b[1;36malpha\x1b[0m".to_string(),
-            "  \x1b[32mlive\x1b[0m".to_string(),
+            "\x1b[1;7;36malpha\x1b[0m \x1b[32m●\x1b[0m".to_string(),
             String::new(),
-            "\x1b[1mbravo\x1b[0m".to_string(),
-            "  \x1b[32mlive\x1b[0m  ⚑".to_string(),
+            String::new(),
+            "\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m".to_string(),
+            "⚑".to_string(),
             String::new(),
         ],
         "real Lua output for this scenario"
@@ -1032,11 +1032,11 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
-             \x1b[2;1H\x1b[K▸ \x1b[1;36malpha\x1b[0m         │xxxxxxxxxx                                                     \
-             \x1b[3;1H\x1b[K  \x1b[32mlive\x1b[0m          │xxxxxxxxxx                                                     \
+             \x1b[2;1H\x1b[K\x1b[1;7;36malpha\x1b[0m \x1b[32m●\x1b[0m         │xxxxxxxxxx                                                     \
+             \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K  \x1b[1mbravo\x1b[0m         │xxxxxxxxxx                                                     \
-             \x1b[6;1H\x1b[K  \x1b[32mlive\x1b[0m  ⚑       │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m         │xxxxxxxxxx                                                     \
+             \x1b[6;1H\x1b[K⚑               │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1083,7 +1083,7 @@ fn session_order_hook_indents_rows_and_an_error_keeps_the_legacy_buffer_bytes() 
     let (_, _, names) = parse_sessions_buffer(&ordered).expect("ordered private header");
     assert_eq!(names, vec!["bravo", "alpha", "charlie"]);
     assert!(
-        ordered.contains("\x1b[1m  bravo\x1b[0m"),
+        ordered.contains("  \x1b[1mbravo\x1b[0m"),
         "a depth of one indents the name row by two spaces: {ordered:?}"
     );
 
@@ -1125,6 +1125,219 @@ fn session_order_hook_indents_rows_and_an_error_keeps_the_legacy_buffer_bytes() 
         legacy,
         "a hook error must fall back to the exact no-hook buffer"
     );
+}
+
+#[test]
+fn every_row_of_a_nested_entry_shares_one_offset() {
+    let path = scratch_socket("session-order-indent");
+    daemon_at(&path);
+    for name in ["alpha", "bravo", "charlie"] {
+        new_session(&path, name);
+    }
+    eval(
+        &path,
+        "remuda.session_order = function() return {{name = 'alpha', depth = 0}, \
+         {name = 'bravo', depth = 1}, {name = 'charlie', depth = 2}} end",
+    );
+    let (rows, lines, _) =
+        sessions_buffer_lines(&path, 40, 99, None).expect("refresh sessions buffer");
+    assert_eq!(rows, 3);
+    let block = |i: usize| &lines[i * 3..i * 3 + 3];
+
+    // Depth 0 is the local layout itself, byte-identical to the flat list.
+    assert_eq!(block(0), ["\x1b[1malpha\x1b[0m \x1b[32m●\x1b[0m", "", ""]);
+    // Every row of a deeper entry, blank spacer included, is that same
+    // block shifted right by 2 * depth.
+    for (i, depth) in [(1, 1), (2, 2)] {
+        let pad = " ".repeat(2 * depth);
+        let name = ["alpha", "bravo", "charlie"][i];
+        let expected = [
+            format!("{pad}\x1b[1m{name}\x1b[0m \x1b[32m●\x1b[0m"),
+            pad.clone(),
+            pad.clone(),
+        ];
+        assert_eq!(block(i), expected, "depth {depth}");
+    }
+}
+
+#[test]
+fn a_nested_entry_never_overflows_a_narrow_list() {
+    let path = scratch_socket("session-order-narrow");
+    daemon_at(&path);
+    new_session(&path, "root");
+    new_session(&path, "a-deeply-nested-child-with-a-long-name");
+    eval(
+        &path,
+        "remuda.session_order = function() return {{name = 'root', depth = 0}, \
+         {name = 'a-deeply-nested-child-with-a-long-name', depth = 3}} end",
+    );
+    let width = 16;
+    let (rows, lines, order) =
+        sessions_buffer_lines(&path, width, 0, None).expect("refresh sessions buffer");
+    let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+    ui.sessions = vec![
+        row("root", true, false),
+        row("a-deeply-nested-child-with-a-long-name", true, true),
+    ];
+    apply_session_order(&mut ui, None, &order);
+    ui.session_rows = rows;
+    ui.sessions_text = lines;
+    for r in 0..ui.sessions.len() * rows {
+        let shown = list_row(&ui, r, width);
+        assert_eq!(
+            visible_width(&shown),
+            width as usize,
+            "row {r} must fill the list exactly, never spill past it: {shown:?}"
+        );
+    }
+}
+
+#[test]
+fn a_status_dot_follows_the_name_and_the_state_row_keeps_only_detail() {
+    // The dot carries live/dead, so row 2 spells neither. Each style is reset
+    // before the next begins: the selection style must not reach the dot,
+    // and the dot colour must not reach anything after it.
+    let path = scratch_socket("status-dot");
+    daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda.ls = function() return {
+              { name = "plain", alive = true, attached = false },
+              { name = "busy", alive = true, attached = true },
+              { name = "agent", alive = true, attached = false },
+              { name = "gone", alive = false, attached = false },
+            } end
+            remuda.session_detail = function(s)
+              if s.name == "agent" or s.name == "gone" then return "claude · opus · 12K" end
+            end
+        "#,
+    );
+    let (_, lines, _) = sessions_buffer_lines(&path, 40, 0, None).expect("refresh sessions buffer");
+    let entry = |i: usize| (lines[i * 3].as_str(), lines[i * 3 + 1].as_str());
+    assert_eq!(
+        entry(0),
+        ("\x1b[1;7;36mplain\x1b[0m \x1b[32m●\x1b[0m", ""),
+        "selected, live"
+    );
+    assert_eq!(
+        entry(1),
+        ("\x1b[1mbusy\x1b[0m \x1b[32m●\x1b[0m", "⚑"),
+        "unselected, live, attached"
+    );
+    assert_eq!(
+        entry(2),
+        (
+            "\x1b[1magent\x1b[0m \x1b[32m●\x1b[0m",
+            "\x1b[2mclaude · opus · 12K\x1b[0m"
+        ),
+        "live detail is dim, like any other telemetry"
+    );
+    assert_eq!(
+        entry(3),
+        (
+            "\x1b[1mgone\x1b[0m \x1b[31m●\x1b[0m",
+            "\x1b[2mclaude · opus · 12K\x1b[0m"
+        ),
+        "dead is a red dot, not a word"
+    );
+}
+
+#[test]
+fn the_status_dot_counts_as_one_column() {
+    // Owner choice: ambiguous-width characters (East Asian Width A) such as
+    // "●" count as narrow. Pinned so a change to that rule fails loudly
+    // here instead of silently shifting the list divider.
+    assert_eq!(char_width('●'), 1);
+    let path = scratch_socket("status-dot-width");
+    daemon_at(&path);
+    eval(
+        &path,
+        r#"remuda.ls = function() return {
+          { name = "alpha", alive = true, attached = false },
+        } end"#,
+    );
+    let (_, lines, _) = sessions_buffer_lines(&path, 40, 0, None).expect("refresh sessions buffer");
+    assert_eq!(lines[0], "\x1b[1;7;36malpha\x1b[0m \x1b[32m●\x1b[0m");
+    assert_eq!(visible_width(&lines[0]), "alpha ●".chars().count());
+}
+
+#[test]
+fn the_list_has_no_caret_column_at_any_depth() {
+    // Each row is exactly Lua's block row fitted to the list: no gutter, so
+    // every row is two columns narrower than with the old caret column.
+    let path = scratch_socket("no-caret");
+    daemon_at(&path);
+    for name in ["alpha", "bravo", "charlie"] {
+        new_session(&path, name);
+    }
+    eval(
+        &path,
+        "remuda.session_order = function() return {{name = 'alpha', depth = 0}, \
+         {name = 'bravo', depth = 1}, {name = 'charlie', depth = 2}} end",
+    );
+    let width = 30;
+    let (rows, lines, order) =
+        sessions_buffer_lines(&path, width, 0, None).expect("refresh sessions buffer");
+    let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+    ui.sessions = ["alpha", "bravo", "charlie"]
+        .iter()
+        .map(|name| row(name, true, false))
+        .collect();
+    apply_session_order(&mut ui, None, &order);
+    ui.session_rows = rows;
+    ui.sessions_text = lines.clone();
+    for (r, text) in lines.iter().enumerate() {
+        assert_eq!(list_row(&ui, r, width), fit(text, width), "row {r}");
+    }
+}
+
+#[test]
+fn the_selected_entry_stands_out_without_a_caret() {
+    // A zero-width cue: reverse video on the selected name, focused or not,
+    // live or dead, and on the fallback row before Lua has answered.
+    let path = scratch_socket("selection-cue");
+    daemon_at(&path);
+    eval(
+        &path,
+        r#"remuda.ls = function() return {
+          { name = "live", alive = true, attached = false },
+          { name = "gone", alive = false, attached = false },
+        } end"#,
+    );
+    for selected in [0, 1] {
+        let (rows, lines, _) =
+            sessions_buffer_lines(&path, 30, selected, None).expect("refresh sessions buffer");
+        let mut ui = Ui::new(
+            vec![row("live", true, false), row("gone", false, false)],
+            "/bin/sh",
+            None,
+        );
+        ui.selected = selected;
+        ui.session_rows = rows;
+        ui.sessions_text = lines;
+        for focus in [Focus::List, Focus::Session] {
+            ui.focus = focus;
+            for entry in [0, 1] {
+                let name_row = list_row(&ui, entry * rows, 30);
+                assert_eq!(
+                    name_row.contains("\x1b[1;7;36m"),
+                    entry == selected,
+                    "entry {entry}, selected {selected}: {name_row:?}"
+                );
+            }
+        }
+    }
+
+    let mut ui = Ui::new(
+        vec![row("live", true, false), row("gone", false, false)],
+        "/bin/sh",
+        None,
+    );
+    ui.session_rows = 3;
+    ui.selected = 1;
+    assert!(list_row(&ui, 3, 30).starts_with("\x1b[7mgone\x1b[0m"));
+    assert!(list_row(&ui, 0, 30).starts_with("live"));
 }
 
 /// Empty-herd counterpart, fed by a real (empty) daemon registry.
@@ -1209,7 +1422,7 @@ fn the_live_dead_word_is_pinned_against_real_lua_at_every_width() {
             .collect();
         assert_eq!(
             states,
-            vec!["  \x1b[32mlive\x1b[0m", "  \x1b[32mlive\x1b[0m  ⚑"],
+            vec!["", "⚑"],
             "at width {width}, tools.lua shows the live/dead word before the flag"
         );
     }
@@ -1348,7 +1561,7 @@ fn the_frame_says_what_it_is_showing() {
     let mut ui = make_ui(vec![row("claude", true, false), row("busy", true, true)]);
     ui.notice = None;
     ui.sessions_text = vec![
-        "claude".into(),
+        "\x1b[1;7;36mclaude\x1b[0m".into(),
         "live".into(),
         String::new(),
         "busy".into(),
@@ -1357,7 +1570,10 @@ fn the_frame_says_what_it_is_showing() {
     ];
     let frame = render(&ui, "hello", "default", 120, 10);
     assert!(frame.contains("remuda · default"));
-    assert!(frame.contains("▸ claude"), "the cursor is on the first row");
+    assert!(
+        frame.contains("\x1b[1;7;36mclaude"),
+        "the selected first row is reverse video"
+    );
     assert!(frame.contains('⚑'), "and the busy one is flagged");
     assert!(frame.contains("⏎ enter"), "the footer teaches the keys");
     assert!(frame.contains('│'), "and the border is the quiet one");
@@ -1664,7 +1880,7 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│hello                                                         →\
-             \x1b[2;1H\x1b[K▸ alpha         │                                                              →\
+             \x1b[2;1H\x1b[K\x1b[7malpha\x1b[0m           │                                                              →\
              \x1b[3;1H\x1b[K                │                                                              →\
              \x1b[4;1H\x1b[K                │                                                              →\
              \x1b[5;1H\x1b[K                │                                                              →\
