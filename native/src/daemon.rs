@@ -176,6 +176,8 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
         std::thread::spawn(move || load_user_config(&image));
     }
     spawn_ticker(image.clone(), Arc::clone(&counters), Arc::clone(&registry));
+    #[cfg(unix)]
+    stop_on_signals(image.clone(), path.to_path_buf())?;
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let registry = Arc::clone(&registry);
@@ -256,6 +258,62 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
         Request::CaptureStyled { .. } => counters.counter("request_capture_styled").record_hit(),
         _ => {}
     }
+}
+
+/// SIGTERM/SIGINT stop the daemon the way `Request::Shutdown` does, but say
+/// so on stderr (the `<server>.log`) and remove the socket; before this a
+/// signal killed the fleet with no trace. SIGHUP is logged and ignored, as
+/// tmux's server does: the daemon leads its own session (#106), so a HUP is a
+/// stray explicit one. Caught, never SIG_IGN — a caught disposition resets on
+/// exec, an ignored one would reach every pty child. The handler only writes
+/// the signal number to a socketpair; a thread does the rest.
+#[cfg(unix)]
+fn stop_on_signals(image: Image, socket: std::path::PathBuf) -> std::io::Result<()> {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    static WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+    extern "C" fn on_signal(signal: libc::c_int) {
+        let byte = signal as u8;
+        // SAFETY: write(2) is async-signal-safe; the fd outlives the process.
+        unsafe {
+            libc::write(
+                WRITE_FD.load(Ordering::Relaxed),
+                (&raw const byte).cast(),
+                1,
+            )
+        };
+    }
+    let (mut reader, writer) = std::os::unix::net::UnixStream::pair()?;
+    WRITE_FD.store(writer.as_raw_fd(), Ordering::Relaxed);
+    std::mem::forget(writer);
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: installs a handler that only calls write(2).
+        unsafe {
+            libc::signal(
+                signal,
+                on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+            )
+        };
+    }
+    std::thread::spawn(move || {
+        let mut byte = [0u8];
+        while reader.read_exact(&mut byte).is_ok() {
+            let name = match libc::c_int::from(byte[0]) {
+                libc::SIGTERM => "SIGTERM",
+                libc::SIGINT => "SIGINT",
+                _ => {
+                    eprintln!("remuda daemon: SIGHUP ignored — use `remuda stop` to stop it");
+                    continue;
+                }
+            };
+            eprintln!("remuda daemon: {name}, shutting down");
+            reap_processes_before_exit(&image);
+            let _ = std::fs::remove_file(&socket);
+            std::process::exit(0);
+        }
+    });
+    Ok(())
 }
 
 /// Best-effort group-wide reap before a clean `Request::Shutdown` exits —

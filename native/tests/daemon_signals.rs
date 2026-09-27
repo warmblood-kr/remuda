@@ -1,0 +1,115 @@
+//! A daemon asked to stop by a signal says so and goes in order, like the
+//! `Shutdown` request: SIGTERM/SIGINT log a line to its stderr (the
+//! `<server>.log`), reap, remove the socket and exit 0. SIGHUP is ignored, as
+//! tmux's server does — the daemon is detached (#106), so a HUP can only be
+//! a stray explicit one. SFDPOT Charter 2 HIGH-1.
+#![cfg(unix)]
+
+use remuda_native::daemon;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+struct Daemon {
+    child: Child,
+    socket: PathBuf,
+    log: PathBuf,
+}
+
+impl Daemon {
+    fn spawn(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("rds-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("daemon.log");
+        let child = Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(["-s", "s", "daemon"])
+            .env("REMUDA_RUNTIME_DIR", &dir)
+            .env("HOME", &dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .expect("spawn daemon");
+        let socket = daemon::socket_path_in(&dir, "s");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while remuda_native::ipc::connect(&socket).is_err() {
+            assert!(Instant::now() < deadline, "daemon never bound {socket:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Self { child, socket, log }
+    }
+
+    fn signal(&self, signal: libc::c_int) {
+        // SAFETY: kill only sends a signal to our own child's pid.
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as libc::pid_t, signal) },
+            0
+        );
+    }
+
+    fn wait(&mut self) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return Some(status);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn stops_in_order(signal: libc::c_int, name: &str) {
+    let mut daemon = Daemon::spawn(name);
+    daemon.signal(signal);
+    let status = daemon.wait().expect("daemon did not exit");
+    let log = daemon.log();
+    assert!(status.success(), "{name}: {status:?}, log: {log}");
+    assert!(
+        log.contains(&format!("remuda daemon: {name}, shutting down")),
+        "{name}: nothing said why it went: {log:?}"
+    );
+    assert!(
+        !Path::new(&daemon.socket).exists(),
+        "{name}: stale socket left"
+    );
+}
+
+#[test]
+fn sigterm_stops_the_daemon_in_order() {
+    stops_in_order(libc::SIGTERM, "SIGTERM");
+}
+
+#[test]
+fn sigint_stops_the_daemon_in_order() {
+    stops_in_order(libc::SIGINT, "SIGINT");
+}
+
+#[test]
+fn sighup_is_logged_and_ignored() {
+    let mut daemon = Daemon::spawn("SIGHUP");
+    daemon.signal(libc::SIGHUP);
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        daemon.child.try_wait().unwrap().is_none(),
+        "SIGHUP killed the daemon"
+    );
+    assert!(
+        remuda_native::ipc::connect(&daemon.socket).is_ok(),
+        "stopped answering"
+    );
+    let log = daemon.log();
+    assert!(log.contains("remuda daemon: SIGHUP ignored"), "{log:?}");
+}
