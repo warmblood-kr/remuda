@@ -1015,10 +1015,10 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
         lines,
         vec![
             "\x1b[1;36malpha\x1b[0m".to_string(),
-            "\x1b[32mlive\x1b[0m".to_string(),
+            String::new(),
             String::new(),
             "\x1b[1mbravo\x1b[0m".to_string(),
-            "\x1b[32mlive\x1b[0m  ⚑".to_string(),
+            "⚑".to_string(),
             String::new(),
         ],
         "real Lua output for this scenario"
@@ -1033,10 +1033,10 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
             "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
              \x1b[2;1H\x1b[K▸ \x1b[1;36malpha\x1b[0m         │xxxxxxxxxx                                                     \
-             \x1b[3;1H\x1b[K  \x1b[32mlive\x1b[0m          │xxxxxxxxxx                                                     \
+             \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[5;1H\x1b[K  \x1b[1mbravo\x1b[0m         │xxxxxxxxxx                                                     \
-             \x1b[6;1H\x1b[K  \x1b[32mlive\x1b[0m  ⚑       │xxxxxxxxxx                                                     \
+             \x1b[6;1H\x1b[K  ⚑             │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1145,7 +1145,7 @@ fn every_row_of_a_nested_entry_shares_one_offset() {
     let block = |i: usize| &lines[i * 3..i * 3 + 3];
 
     // Depth 0 is the local layout itself, byte-identical to the flat list.
-    assert_eq!(block(0), ["\x1b[1malpha\x1b[0m", "\x1b[32mlive\x1b[0m", ""]);
+    assert_eq!(block(0), ["\x1b[1malpha\x1b[0m", "", ""]);
     // Every row of a deeper entry, blank spacer included, is that same
     // block shifted right by 2 * depth.
     for (i, depth) in [(1, 1), (2, 2)] {
@@ -1153,7 +1153,7 @@ fn every_row_of_a_nested_entry_shares_one_offset() {
         let name = ["alpha", "bravo", "charlie"][i];
         let expected = [
             format!("{pad}\x1b[1m{name}\x1b[0m"),
-            format!("{pad}\x1b[32mlive\x1b[0m"),
+            pad.clone(),
             pad.clone(),
         ];
         assert_eq!(block(i), expected, "depth {depth}");
@@ -1190,6 +1190,45 @@ fn a_nested_entry_never_overflows_a_narrow_list() {
             "row {r} must fill the list exactly, never spill past it: {shown:?}"
         );
     }
+}
+
+#[test]
+fn the_state_row_drops_live_but_keeps_dead() {
+    // Colour says live, so the word goes; dead stays spelled out. Stubbed
+    // registry so every combination is deterministic.
+    let path = scratch_socket("state-row-policy");
+    daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda.ls = function() return {
+              { name = "plain", alive = true, attached = false },
+              { name = "busy", alive = true, attached = true },
+              { name = "agent", alive = true, attached = false },
+              { name = "gone", alive = false, attached = false },
+            } end
+            remuda.session_detail = function(s)
+              if s.name == "agent" or s.name == "gone" then return "claude · opus · 12K" end
+            end
+        "#,
+    );
+    let (_, lines, _) =
+        sessions_buffer_lines(&path, 40, 99, None).expect("refresh sessions buffer");
+    let state_rows: Vec<&str> = lines
+        .iter()
+        .skip(1)
+        .step_by(3)
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        state_rows,
+        [
+            "",
+            "⚑",
+            "\x1b[32mclaude · opus · 12K\x1b[0m",
+            "\x1b[31mdead\x1b[0m  \x1b[2mclaude · opus · 12K\x1b[0m",
+        ]
+    );
 }
 
 /// Empty-herd counterpart, fed by a real (empty) daemon registry.
@@ -1274,7 +1313,7 @@ fn the_live_dead_word_is_pinned_against_real_lua_at_every_width() {
             .collect();
         assert_eq!(
             states,
-            vec!["\x1b[32mlive\x1b[0m", "\x1b[32mlive\x1b[0m  ⚑"],
+            vec!["", "⚑"],
             "at width {width}, tools.lua shows the live/dead word before the flag"
         );
     }

@@ -810,8 +810,6 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
       local detail = session_detail(s)
       local state_color = s.alive and "\27[32m" or "\27[31m"
       local reset = "\27[0m"
-      local flag = s.attached and "  ⚑" or ""
-      local state = s.alive and "live" or "dead"
       local base = (i - 1) * 3
       -- Names remain neutral and readable; state carries the color. Keeping
       -- an actually blank third row gives entries whitespace rather than a
@@ -819,10 +817,17 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
       local is_selected = selected_name and s.name == selected_name
         or (not selected_name and i - 1 == selected)
       local name_style = is_selected and "\27[1;36m" or "\27[1m"
-      local detail_text = detail and ("  \27[2m" .. detail .. reset) or ""
+      -- Colour says live, so only dead is spelled out; a live session's
+      -- detail carries the green instead of the dim style.
+      local parts = {}
+      if not s.alive then parts[#parts + 1] = state_color .. "dead" .. reset end
+      if detail then
+        parts[#parts + 1] = (s.alive and state_color or "\27[2m") .. detail .. reset
+      end
+      if s.attached then parts[#parts + 1] = "⚑" end
       local block = place({
         name_style .. s.name .. reset,
-        state_color .. state .. reset .. detail_text .. flag,
+        table.concat(parts, "  "),
         "",
       }, 2 * depth)
       for r, row in ipairs(block) do lines[base + r] = row end
