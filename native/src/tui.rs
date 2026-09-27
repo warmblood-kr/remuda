@@ -1363,6 +1363,10 @@ fn refresh(
 ) -> std::io::Result<(u16, u16)> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     if !skip_list {
+        // The buffer is allowed to reorder the herd. Keep the identity, not
+        // the old numeric position, so a refresh cannot move a cursor (or an
+        // attached pane) onto its new neighbour.
+        let selected_name = ui.selected().map(|session| session.name.clone());
         match list(path) {
             Ok(sessions) => ui.sessions = sessions,
             // Keep the last known herd rather than blanking it: a transport
@@ -1374,10 +1378,11 @@ fn refresh(
         // paying for it there would be the exact per-keystroke IPC cost
         // steps/017/022 exist to avoid.
         let (list_w, _) = ui_layout(ui, cols);
-        match sessions_buffer_lines(path, list_w, ui.selected) {
-            Ok((session_rows, lines)) => {
+        match sessions_buffer_lines(path, list_w, ui.selected, selected_name.as_deref()) {
+            Ok((session_rows, lines, order)) => {
                 ui.session_rows = session_rows;
                 ui.sessions_text = lines;
+                apply_session_order(ui, selected_name.as_deref(), &order);
             }
             // Same fallback as the relist: keep whatever was last drawn
             // rather than blanking the tail column on a transport hiccup.
@@ -1717,9 +1722,11 @@ fn sessions_buffer_lines(
     path: &Path,
     width: u16,
     selected: usize,
-) -> Result<(usize, Vec<String>), String> {
+    selected_name: Option<&str>,
+) -> Result<(usize, Vec<String>, Vec<String>), String> {
+    let selected_name = selected_name.map_or_else(|| "nil".to_string(), mcp::lua_string);
     let code = format!(
-        "remuda._refresh_sessions_buffer({width}, {selected}); return remuda.buffer.new('*sessions*'):get()"
+        "remuda._refresh_sessions_buffer({width}, {selected}, {selected_name}); return remuda.buffer.new('*sessions*'):get()"
     );
     match client::request(path, &Request::Eval { code, name: None }) {
         Ok(Response::Value(text)) => parse_sessions_buffer(&text),
@@ -1730,7 +1737,7 @@ fn sessions_buffer_lines(
 
 /// Decode Lua's private sessions-buffer header. The body stays ordinary
 /// newline-separated styled text; only the row grouping crosses the boundary.
-fn parse_sessions_buffer(text: &str) -> Result<(usize, Vec<String>), String> {
+fn parse_sessions_buffer(text: &str) -> Result<(usize, Vec<String>, Vec<String>), String> {
     let mut lines = text.split('\n');
     let rows = lines
         .next()
@@ -1738,7 +1745,38 @@ fn parse_sessions_buffer(text: &str) -> Result<(usize, Vec<String>), String> {
         .and_then(|rows| rows.parse::<usize>().ok())
         .filter(|rows| *rows > 0)
         .ok_or_else(|| "invalid sessions-buffer layout contract".to_string())?;
-    Ok((rows, lines.map(str::to_string).collect()))
+    let body: Vec<_> = lines.collect();
+    let (order, body) = match body.first().and_then(|line| line.strip_prefix('\x1f')) {
+        Some(names) => (names.split('\t').map(str::to_string).collect(), &body[1..]),
+        None => (Vec::new(), body.as_slice()),
+    };
+    Ok((
+        rows,
+        body.iter().map(|line| (*line).to_string()).collect(),
+        order,
+    ))
+}
+
+/// Apply Lua's optional ordering header while retaining every live session
+/// exactly once. Names absent from the header deliberately keep their daemon
+/// order at the end, which makes a partial hook safe.
+fn apply_session_order(ui: &mut Ui, selected_name: Option<&str>, order: &[String]) {
+    if order.is_empty() {
+        return;
+    }
+    let mut sessions = std::mem::take(&mut ui.sessions);
+    let mut ordered = Vec::with_capacity(sessions.len());
+    for name in order {
+        if let Some(index) = sessions.iter().position(|session| session.name == *name) {
+            ordered.push(sessions.remove(index));
+        }
+    }
+    ordered.append(&mut sessions);
+    ui.sessions = ordered;
+    ui.selected = selected_name
+        .and_then(|name| ui.sessions.iter().position(|session| session.name == name))
+        .unwrap_or(ui.selected);
+    ui.clamp();
 }
 
 /// What the window shows — a real session, a script's own buffer, or

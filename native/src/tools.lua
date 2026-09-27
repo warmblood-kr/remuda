@@ -749,8 +749,40 @@ register(
 -- WIDTH is passed in rather than read from anywhere, because whether the
 -- tail shows `live`/`dead` or just the flag depends on the caller's own
 -- column budget — a fact only the renderer asking for a refresh has.
-function remuda._refresh_sessions_buffer(width, selected)
+function remuda._refresh_sessions_buffer(width, selected, selected_name)
   local sessions = remuda.ls()
+  local ordered = sessions
+  local has_order = false
+  -- The private order line is tab-delimited. A daemon normally receives names
+  -- from a shell/CLI, but its protocol permits arbitrary strings, so verify
+  -- the framing assumption before opting into a reordered render.
+  local names_are_frameable = true
+  for _, session in ipairs(sessions) do
+    if session.name:find("[\t\r\n]") then names_are_frameable = false break end
+  end
+  if names_are_frameable and type(remuda.session_order) == "function" then
+    local ok, requested = pcall(remuda.session_order, sessions)
+    if ok and type(requested) == "table" then
+      local live, seen, reordered = {}, {}, {}
+      for _, session in ipairs(sessions) do live[session.name] = session end
+      for _, entry in ipairs(requested) do
+        local name = type(entry) == "table" and entry.name
+        local session = type(name) == "string" and live[name]
+        if session and not seen[name] then
+          local depth = tonumber(entry.depth) or 0
+          depth = math.max(0, math.floor(depth))
+          reordered[#reordered + 1] = { session = session, depth = depth }
+          seen[name] = true
+        end
+      end
+      for _, session in ipairs(sessions) do
+        if not seen[session.name] then
+          reordered[#reordered + 1] = { session = session, depth = 0 }
+        end
+      end
+      ordered, has_order = reordered, true
+    end
+  end
   local lines = {}
   local function session_detail(session)
     if type(remuda.session_detail) ~= "function" then return nil end
@@ -759,7 +791,9 @@ function remuda._refresh_sessions_buffer(width, selected)
   if #sessions == 0 then
     lines = { "the herd is empty.", "press n to start a session." }
   else
-    for i, s in ipairs(sessions) do
+    for i, item in ipairs(ordered) do
+      local s = item.session or item
+      local depth = item.depth or 0
       local detail = session_detail(s)
       local state_color = s.alive and "\27[32m" or "\27[31m"
       local reset = "\27[0m"
@@ -769,8 +803,10 @@ function remuda._refresh_sessions_buffer(width, selected)
       -- Names remain neutral and readable; state carries the color. Keeping
       -- an actually blank third row gives entries whitespace rather than a
       -- second competing visual treatment.
-      local name_style = (i - 1 == selected) and "\27[1;36m" or "\27[1m"
-      lines[base + 1] = name_style .. s.name .. reset
+      local is_selected = selected_name and s.name == selected_name
+        or (not selected_name and i - 1 == selected)
+      local name_style = is_selected and "\27[1;36m" or "\27[1m"
+      lines[base + 1] = name_style .. string.rep(" ", 2 * depth) .. s.name .. reset
       local detail_text = detail and ("  \27[2m" .. detail .. reset) or ""
       lines[base + 2] = "  " .. state_color .. state .. reset .. detail_text .. flag
       lines[base + 3] = ""
@@ -780,6 +816,15 @@ function remuda._refresh_sessions_buffer(width, selected)
   -- number of rows and all visual treatment, while Rust only maps input and
   -- viewport positions onto those rows.
   table.insert(lines, 1, "\30" .. tostring(3))
+  -- A successful ordering hook adds a second private line for Rust.
+  if has_order then
+    local names = {}
+    for _, item in ipairs(ordered) do
+      local name = (item.session or item).name
+      names[#names + 1] = name
+    end
+    table.insert(lines, 2, "\31" .. table.concat(names, "\t"))
+  end
   remuda.buffer.new("*sessions*"):set(table.concat(lines, "\n"))
 end
 register(

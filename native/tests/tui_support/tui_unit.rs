@@ -711,10 +711,45 @@ fn a_session_uses_spaced_name_and_state_rows() {
 
 #[test]
 fn sessions_buffer_contract_leaves_entry_height_to_lua() {
-    let (rows, lines) = parse_sessions_buffer("\x1e3\nname\nstate\n\nnext\nstate\n").unwrap();
+    let (rows, lines, order) =
+        parse_sessions_buffer("\x1e3\nname\nstate\n\nnext\nstate\n").unwrap();
     assert_eq!(rows, 3);
     assert_eq!(lines, vec!["name", "state", "", "next", "state", ""]);
+    assert!(order.is_empty());
+    let (_, lines, order) = parse_sessions_buffer("\x1e3\n\x1fnext\tname\nnext\nstate\n").unwrap();
+    assert_eq!(order, vec!["next", "name"]);
+    assert_eq!(lines, vec!["next", "state", ""]);
     assert!(parse_sessions_buffer("name\nstate").is_err());
+}
+
+#[test]
+fn session_order_header_makes_selection_follow_the_rendered_session() {
+    let mut ui = make_ui(vec![
+        row("alpha", true, false),
+        row("bravo", true, false),
+        row("charlie", true, false),
+    ]);
+    ui.selected = 1;
+
+    apply_session_order(&mut ui, Some("bravo"), &["charlie".into(), "alpha".into()]);
+
+    assert_eq!(
+        ui.sessions
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["charlie", "alpha", "bravo"],
+        "the native list must have the same order as Lua's rendered rows"
+    );
+    assert_eq!(
+        ui.selected().map(|session| session.name.as_str()),
+        Some("bravo")
+    );
+    ui.selected = 1;
+    assert_eq!(
+        ui.on_key(press(KeyCode::Enter)),
+        Action::Focus("alpha".into())
+    );
 }
 
 /// Two style groups must emit exactly two style-change points, not one
@@ -972,7 +1007,7 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
     };
     let mut ui = Ui::new(sessions, "/bin/sh", None);
     let (list_w, _) = layout(80, widest(&ui));
-    let lines = sessions_buffer_lines(&path, list_w, 0)
+    let lines = sessions_buffer_lines(&path, list_w, 0, None)
         .expect("refresh sessions buffer")
         .1;
     assert_eq!(
@@ -1016,6 +1051,73 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
         );
 }
 
+#[test]
+fn session_order_hook_indents_rows_and_an_error_keeps_the_legacy_buffer_bytes() {
+    let path = scratch_socket("session-order-hook");
+    daemon_at(&path);
+    new_session(&path, "alpha");
+    new_session(&path, "bravo");
+    new_session(&path, "charlie");
+
+    let refresh_buffer = "remuda._refresh_sessions_buffer(80, 0, 'alpha'); return remuda.buffer.new('*sessions*'):get()";
+    let legacy = eval(&path, refresh_buffer);
+    assert!(
+        !legacy.contains('\x1f'),
+        "without a hook the old one-line private header is byte-identical"
+    );
+
+    eval(
+        &path,
+        "remuda.session_order = function() return {{name = 'bravo', depth = 1}, {name = 'alpha', depth = 0}} end",
+    );
+    let ordered = eval(&path, refresh_buffer);
+    let (_, _, names) = parse_sessions_buffer(&ordered).expect("ordered private header");
+    assert_eq!(names, vec!["bravo", "alpha", "charlie"]);
+    assert!(
+        ordered.contains("\x1b[1m  bravo\x1b[0m"),
+        "a depth of one indents the name row by two spaces: {ordered:?}"
+    );
+
+    let mut ui = Ui::new(Vec::new(), "/bin/sh", None);
+    let mut held = None;
+    let mut painted = String::new();
+    let mut shown = None;
+    refresh(
+        &path,
+        "default",
+        &mut ui,
+        &mut held,
+        &mut painted,
+        &mut shown,
+        false,
+        false,
+    )
+    .expect("refresh ordered session list");
+    assert_eq!(
+        ui.sessions
+            .iter()
+            .map(|session| session.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["bravo", "alpha", "charlie"]
+    );
+    ui.selected = 1;
+    assert_eq!(
+        ui.on_key(press(KeyCode::Enter)),
+        Action::Focus("alpha".into()),
+        "selecting rendered row one must attach alpha, not its daemon-list neighbour"
+    );
+
+    eval(
+        &path,
+        "remuda.session_order = function() error('broken ordering mod') end",
+    );
+    assert_eq!(
+        eval(&path, refresh_buffer),
+        legacy,
+        "a hook error must fall back to the exact no-hook buffer"
+    );
+}
+
 /// Empty-herd counterpart, fed by a real (empty) daemon registry.
 // No sessions created at all, so `remuda.ls()` itself sees a real empty
 // herd rather than an empty `Vec` constructed by hand. Measured ~13ms:
@@ -1025,7 +1127,7 @@ fn render_styled_of_the_empty_session_list_is_byte_identical_when_fed_by_a_real_
     let path = scratch_socket("e2e-empty-oracle");
     daemon_at(&path);
 
-    let lines = sessions_buffer_lines(&path, 16, 0)
+    let lines = sessions_buffer_lines(&path, 16, 0, None)
         .expect("refresh sessions buffer")
         .1;
     assert_eq!(
@@ -1087,7 +1189,7 @@ fn the_live_dead_word_is_pinned_against_real_lua_at_the_22_column_threshold() {
     new_session(&path, "bravo");
     let _held = client::hold(&path, "bravo").expect("attach bravo for real");
 
-    let wide = sessions_buffer_lines(&path, 22, 0)
+    let wide = sessions_buffer_lines(&path, 22, 0, None)
         .expect("refresh at width 22")
         .1;
     assert_eq!(
@@ -1096,7 +1198,7 @@ fn the_live_dead_word_is_pinned_against_real_lua_at_the_22_column_threshold() {
         "at width >= 22, tools.lua shows the live/dead word before the flag"
     );
 
-    let narrow = sessions_buffer_lines(&path, 21, 0)
+    let narrow = sessions_buffer_lines(&path, 21, 0, None)
         .expect("refresh at width 21")
         .1;
     assert_eq!(
