@@ -1083,7 +1083,7 @@ fn session_order_hook_indents_rows_and_an_error_keeps_the_legacy_buffer_bytes() 
     let (_, _, names) = parse_sessions_buffer(&ordered).expect("ordered private header");
     assert_eq!(names, vec!["bravo", "alpha", "charlie"]);
     assert!(
-        ordered.contains("\x1b[1m  bravo\x1b[0m"),
+        ordered.contains("  \x1b[1mbravo\x1b[0m"),
         "a depth of one indents the name row by two spaces: {ordered:?}"
     );
 
@@ -1128,37 +1128,39 @@ fn session_order_hook_indents_rows_and_an_error_keeps_the_legacy_buffer_bytes() 
 }
 
 #[test]
-fn a_nested_entry_indents_its_state_row_with_its_name_row() {
+fn every_row_of_a_nested_entry_shares_one_offset() {
     let path = scratch_socket("session-order-indent");
     daemon_at(&path);
-    new_session(&path, "alpha");
-    new_session(&path, "bravo");
+    for name in ["alpha", "bravo", "charlie"] {
+        new_session(&path, name);
+    }
     eval(
         &path,
-        "remuda.session_order = function() return {{name = 'alpha', depth = 0}, {name = 'bravo', depth = 2}} end",
+        "remuda.session_order = function() return {{name = 'alpha', depth = 0}, \
+         {name = 'bravo', depth = 1}, {name = 'charlie', depth = 2}} end",
     );
-    let buffer = eval(
-        &path,
-        "remuda._refresh_sessions_buffer(80, 0, 'none'); return remuda.buffer.new('*sessions*'):get()",
+    let (rows, lines, _) =
+        sessions_buffer_lines(&path, 40, 99, None).expect("refresh sessions buffer");
+    assert_eq!(rows, 3);
+    let block = |i: usize| &lines[i * 3..i * 3 + 3];
+
+    // Depth 0 is the local layout itself, byte-identical to the flat list.
+    assert_eq!(
+        block(0),
+        ["\x1b[1malpha\x1b[0m", "  \x1b[32mlive\x1b[0m", ""]
     );
-    let lines: Vec<&str> = buffer.lines().collect();
-    let row = |name: &str| {
-        lines
-            .iter()
-            // Skip the private \x1e/\x1f header lines, which list names too.
-            .position(|line| !line.starts_with(['\x1e', '\x1f']) && line.contains(name))
-            .unwrap_or_else(|| panic!("{name} row missing: {lines:?}"))
-    };
-
-    // Depth 0 stays byte-identical to the unordered list.
-    let alpha = row("alpha");
-    assert_eq!(lines[alpha], "\x1b[1malpha\x1b[0m");
-    assert_eq!(lines[alpha + 1], "  \x1b[32mlive\x1b[0m");
-
-    // Depth 2: both rows carry the same four extra spaces.
-    let bravo = row("bravo");
-    assert_eq!(lines[bravo], "\x1b[1m    bravo\x1b[0m");
-    assert_eq!(lines[bravo + 1], "      \x1b[32mlive\x1b[0m");
+    // Every row of a deeper entry, blank spacer included, is that same
+    // block shifted right by 2 * depth.
+    for (i, depth) in [(1, 1), (2, 2)] {
+        let pad = " ".repeat(2 * depth);
+        let name = ["alpha", "bravo", "charlie"][i];
+        let expected = [
+            format!("{pad}\x1b[1m{name}\x1b[0m"),
+            format!("{pad}  \x1b[32mlive\x1b[0m"),
+            pad.clone(),
+        ];
+        assert_eq!(block(i), expected, "depth {depth}");
+    }
 }
 
 /// Empty-herd counterpart, fed by a real (empty) daemon registry.
