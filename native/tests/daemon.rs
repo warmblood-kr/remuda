@@ -430,30 +430,30 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     held.write_raw(&[client::DETACH]).expect("Ctrl-\\");
     drop(held);
 
+    let resumed = client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "echo $((9*9))-after".into(),
+        },
+    );
+    assert!(matches!(resumed, Ok(Response::Ok)), "{resumed:?}");
+    wait_for(&path, "target", "81-after");
+
+    // The server drops the hold asynchronously after Ctrl-\, so poll: close
+    // must succeed once the release lands, and never before the deadline.
     let deadline = Instant::now() + PATIENCE;
     loop {
-        let resumed = client::request(
-            &path,
-            &Request::SendLine {
-                name: "target".into(),
-                text: "echo $((9*9))-after".into(),
-            },
-        );
-        if matches!(resumed, Ok(Response::Ok)) {
+        let closed = close();
+        if matches!(closed, Ok(Response::Ok)) {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the core never regained the session after detach: {resumed:?}"
+            "after detach the hold must be released, so close succeeds: {closed:?}"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-
-    wait_for(&path, "target", "81-after");
-    assert!(
-        matches!(close(), Ok(Response::Ok)),
-        "after detach the hold must be released, so close succeeds"
-    );
 }
 
 #[test]
@@ -798,6 +798,82 @@ fn cancelling_one_same_label_schedule_leaves_the_other_firing() {
 }
 
 #[test]
+fn one_throwing_schedule_does_not_starve_the_others() {
+    // Handles are table keys, so iteration order is unknown: a throw that
+    // escapes the loop skips whichever schedules happen to come after it.
+    // `every` is far beyond the real ticker's clock, so only the ticks this
+    // test drives by hand can fire anything.
+    let path = scratch("schedule-throw");
+    let _daemon = daemon_at(&path);
+
+    eval(
+        &path,
+        r#"
+            remuda.healthy_fired = 0
+            remuda.schedule({ every = 1e9, run = function() error("boom") end })
+            for _ = 1, 20 do
+              remuda.schedule({
+                every = 1e9,
+                run = function() remuda.healthy_fired = remuda.healthy_fired + 1 end,
+              })
+            end
+        "#,
+    );
+
+    assert_eq!(
+        eval(
+            &path,
+            "return tostring(pcall(remuda._run_due_schedules, 2e9))"
+        ),
+        "true",
+        "a throwing schedule must not abort the tick"
+    );
+    assert_eq!(
+        read_count(&path, "return remuda.healthy_fired"),
+        20,
+        "every healthy schedule must fire despite the throwing one"
+    );
+}
+
+#[test]
+fn a_schedule_registered_during_a_tick_first_fires_on_the_next_tick() {
+    // Adding keys to a table mid-`pairs` is undefined in Lua: new entries may
+    // or may not be visited, or `next` may raise. A snapshot makes it exact.
+    let path = scratch("schedule-mutate");
+    let _daemon = daemon_at(&path);
+
+    eval(
+        &path,
+        r#"
+            remuda.late_fired = 0
+            remuda.schedule({ every = 1e9, run = function()
+              for _ = 1, 50 do
+                remuda.schedule({
+                  every = 1e9,
+                  run = function() remuda.late_fired = remuda.late_fired + 1 end,
+                })
+              end
+            end })
+        "#,
+    );
+
+    assert_eq!(
+        eval(
+            &path,
+            "return tostring(pcall(remuda._run_due_schedules, 2e9))"
+        ),
+        "true"
+    );
+    assert_eq!(
+        read_count(&path, "return remuda.late_fired"),
+        0,
+        "schedules added during a tick must wait for the next one"
+    );
+    eval(&path, "remuda._run_due_schedules(4e9)");
+    assert_eq!(read_count(&path, "return remuda.late_fired"), 50);
+}
+
+#[test]
 fn event_counts_reads_zero_before_any_emit_and_n_after_real_fires() {
     // `remuda.event_counts()` does not exist yet — this must fail red with a
     // Lua "attempt to call a nil value" error, not a compile error.
@@ -1018,6 +1094,54 @@ fn auto_started_daemon_survives_a_fast_process_exit() {
     let _ = remuda(&dir, &["-s", "s", "stop", "-f"]);
 }
 
+/// A daemon's log is post-mortem evidence: the next auto-start must append to
+/// it, not wipe it. Unix only: CLI auto-start with piped output hangs on Windows.
+#[test]
+#[cfg(unix)]
+fn an_auto_start_appends_to_the_previous_daemons_log() {
+    let dir = scratch_dir("log-append");
+    let log = daemon::socket_path_in(&dir, "s").with_extension("log");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    std::fs::write(&log, "panic trace from the last daemon\n").unwrap();
+
+    let out = remuda_timed(&dir, &["-s", "s", "-e", "return 1"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = remuda(&dir, &["-s", "s", "stop", "-f"]);
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("panic trace from the last daemon"), "{text}");
+    assert!(text.contains("--- remuda daemon start pid "), "{text}");
+}
+
+/// Appending must not grow forever: past ~1 MiB the old log moves to `.log.1`.
+#[test]
+#[cfg(unix)]
+fn an_oversized_daemon_log_is_rotated_on_auto_start() {
+    let dir = scratch_dir("log-rotate");
+    let log = daemon::socket_path_in(&dir, "s").with_extension("log");
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    let big = format!("old marker\n{}", "x".repeat(1_100_000));
+    std::fs::write(&log, big).unwrap();
+
+    let out = remuda_timed(&dir, &["-s", "s", "-e", "return 1"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = remuda(&dir, &["-s", "s", "stop", "-f"]);
+
+    let rotated = std::fs::read_to_string(log.with_extension("log.1")).unwrap();
+    assert!(rotated.starts_with("old marker"));
+    let fresh = std::fs::read_to_string(&log).unwrap();
+    assert!(fresh.len() < 10_000, "{} bytes", fresh.len());
+    assert!(fresh.contains("--- remuda daemon start pid "), "{fresh}");
+}
+
 /// What a person types, with its own pipes and no terminal — so `restart`
 /// reaches the "nothing to ask on" branch rather than blocking on a prompt.
 fn remuda(dir: &Path, args: &[&str]) -> std::process::Output {
@@ -1036,6 +1160,8 @@ fn remuda_timed(dir: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .env("REMUDA_RUNTIME_DIR", dir)
         .env("REMUDA_NO_UPDATE_CHECK", "1")
+        // An auto-started daemon boots the user config; keep it off the real one.
+        .env("HOME", dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1222,7 +1348,7 @@ fn a_silent_process_yields_only_the_exit_event() {
 /// A pid this daemon spawned is gone: `kill(pid, 0)` — no signal delivered,
 /// only whether one *could* be — is ESRCH once the pid is reaped. Anything
 /// else (success, or a permission error) means it is still around.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn pid_alive(pid: i32) -> bool {
     let rc = unsafe { libc::kill(pid, 0) };
     rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
@@ -1231,11 +1357,12 @@ fn pid_alive(pid: i32) -> bool {
 /// Find a pid's own child, by exact pid, one time — never a glob/grep
 /// pattern (this investigation's own history: zsh's globber has produced a
 /// false "no matches" from `ps -ef | grep [r]emuda` more than once).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn child_pid_of(parent: i32, deadline: Instant) -> Option<i32> {
     loop {
-        let out = std::process::Command::new("ps")
-            .args(["-o", "pid=", "--ppid", &parent.to_string()])
+        // `pgrep -P`, not `ps --ppid`: the latter is GNU-only.
+        let out = std::process::Command::new("pgrep")
+            .args(["-P", &parent.to_string()])
             .output()
             .expect("ps");
         let text = String::from_utf8_lossy(&out.stdout);
@@ -1349,13 +1476,13 @@ fn a_sigkilled_daemon_reaps_its_direct_process_child_but_not_an_already_forked_g
     }
 }
 
-/// [MEASURED, Linux] The one path that DOES reach a grandchild: a clean
+/// [MEASURED, unix] The one path that DOES reach a grandchild: a clean
 /// `remuda stop` sends `Request::Shutdown`, which runs
 /// `reap_processes_before_exit` (daemon.rs) before the process exits —
 /// `remuda.processes()` + `remuda._process_killpg(id)`, which `killpg`s the
 /// whole process group `child_guard::harden` put the direct child in. Both
 /// the direct child and the grandchild it already forked are gone.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn a_clean_shutdown_reaps_a_processs_whole_group_including_a_grandchild() {
     let dir = scratch_dir("orphan-reap-clean");

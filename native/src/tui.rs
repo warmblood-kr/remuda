@@ -802,7 +802,12 @@ impl Viewport {
         // continuation cell, putting the caret one column too far right for
         // CJK input. The row crop still uses `Cell::width` because it emits
         // the lead cell and omits zero-width continuation cells.
-        let target = col.min(source_row.len()) as u32;
+        // The clamp, though, is by the row's display width, not its cell
+        // count: the wire drops each wide cell's continuation, so a row of k
+        // wide glyphs arrives k cells short and a cell-count clamp pinned the
+        // caret left of typed Hangul.
+        let row_width: usize = source_row.iter().map(|c| usize::from(c.width())).sum();
+        let target = col.min(row_width) as u32;
         let offset = u32::from(self.col_offset);
         let panel_col = target.checked_sub(offset)?;
         if panel_col >= u32::from(self.width) {
@@ -948,6 +953,61 @@ mod cursor_width_tests {
             .1
     }
 
+    /// Bytes -> vt100 -> the wire -> caret, a session pane's real path. The wire
+    /// drops wide continuation cells (k Hangul arrive k cells short); the caret
+    /// must still land where the text ends, as in iTerm or tmux.
+    fn caret_after_typing(typed: &str) -> (u16, u16) {
+        use remuda_core::protocol::{collapse_runs, expand_runs};
+        let size = remuda_core::Size::new(80, 24);
+        let mut parser = vt100::Parser::new(size.rows(), size.cols(), 0);
+        // A claude/codex-style input box: a right border, then "│ > " + input.
+        parser.process(format!("\x1b[1;80H│\x1b[1;1H│ > {typed}").as_bytes());
+        let (_, col) = crate::pty::display_cursor(parser.screen());
+        let wire: Vec<Vec<StyledCell>> = crate::pty::styled_cells(parser.screen(), size)
+            .iter()
+            .map(|row| expand_runs(&collapse_runs(row)))
+            .collect();
+        let caret = Viewport::bottom_anchored(wire.len(), 0, 80, 24)
+            .map_cursor(&wire, 0, col as usize)
+            .expect("cursor is visible")
+            .1;
+        (caret, col)
+    }
+
+    /// DECAWM pending wrap: after exactly filling a row the emulator's
+    /// cursor sits one past the last column; a terminal draws (and reports)
+    /// it ON the last column. Clamped, the caret stays visible at the edge.
+    #[test]
+    fn caret_stays_on_the_last_column_in_pending_wrap() {
+        for typed in ["a".repeat(80), "한".repeat(40)] {
+            let size = remuda_core::Size::new(80, 24);
+            let mut parser = vt100::Parser::new(size.rows(), size.cols(), 0);
+            parser.process(typed.as_bytes());
+            let (row, col) = crate::pty::display_cursor(parser.screen());
+            assert_eq!((row, col), (0, 79), "{typed:?}");
+            let cells = crate::pty::styled_cells(parser.screen(), size);
+            let caret = Viewport::bottom_anchored(cells.len(), 0, 80, 24).map_cursor(
+                &cells,
+                0,
+                col as usize,
+            );
+            assert_eq!(caret.map(|c| c.1), Some(79), "caret hidden at the edge");
+        }
+    }
+
+    #[test]
+    fn caret_follows_ascii_typed_across_a_bordered_row() {
+        let (caret, col) = caret_after_typing(&"a".repeat(60));
+        assert_eq!((caret, col), (64, 64));
+    }
+
+    #[test]
+    fn caret_follows_hangul_typed_across_a_bordered_row() {
+        let (caret, col) = caret_after_typing(&"한".repeat(30));
+        assert_eq!(col, 64, "the emulator's own cursor");
+        assert_eq!(caret, col, "the caret lags left of the typed text");
+    }
+
     #[test]
     fn latin_cursor_uses_terminal_column() {
         assert_eq!(cursor_col(&[cell("a", false), cell("b", false)], 2), 2);
@@ -1005,7 +1065,6 @@ pub fn crop(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool)
 /// last cell. Counts real display width via `visible_width`, not `char`s —
 /// a wide (CJK) name used to overflow this budget. See steps/025.
 fn fit(text: &str, width: u16) -> String {
-    use unicode_width::UnicodeWidthChar;
     let width = width as usize;
     if visible_width(text) > width {
         let mut out = String::new();
@@ -1024,7 +1083,7 @@ fn fit(text: &str, width: u16) -> String {
                 }
                 continue;
             }
-            let w = c.width().unwrap_or(1);
+            let w = char_width(c);
             if used + w > width.saturating_sub(1) {
                 break;
             }
@@ -1208,11 +1267,17 @@ fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Ve
     (out, cut)
 }
 
+/// The one text-width rule the list renderer uses. Ambiguous-width
+/// characters (East Asian Width A, e.g. the status dot) count as narrow.
+fn char_width(c: char) -> usize {
+    // Ambiguous-width is treated as narrow by owner choice.
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(1)
+}
+
 /// A styled row's display width, ignoring the SGR bytes riding along with
 /// it, and counting a wide (CJK) character as the 2 columns it actually
 /// draws — `fit`'s plain char count would under-count it by 1. See steps/023.
 fn visible_width(s: &str) -> usize {
-    use unicode_width::UnicodeWidthChar;
     let mut width = 0;
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -1223,7 +1288,7 @@ fn visible_width(s: &str) -> usize {
                 }
             }
         } else {
-            width += c.width().unwrap_or(1);
+            width += char_width(c);
         }
     }
     width
@@ -1423,25 +1488,15 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
     // A failed or not-yet-completed Lua refresh must not turn a real session
     // into a blank selectable row. The buffer supplies the styled version in
     // normal operation; this fallback keeps the name readable until then.
-    let content = ui.sessions_text.get(row).map_or_else(
-        || {
-            if row.is_multiple_of(ui.session_rows) {
-                session.name.as_str()
-            } else {
-                ""
-            }
-        },
-        String::as_str,
-    );
-    if !row.is_multiple_of(ui.session_rows) {
-        return fit(content, width);
-    }
-    let cursor = if session_index == ui.selected {
-        "▸"
-    } else {
-        " "
+    // No caret column: selection is Lua's zero-width reverse-video name, and
+    // this fallback marks it the same way.
+    let content = match ui.sessions_text.get(row) {
+        Some(text) => text.clone(),
+        None if !row.is_multiple_of(ui.session_rows) => String::new(),
+        None if session_index == ui.selected => format!("\x1b[7m{}\x1b[0m", session.name),
+        None => session.name.clone(),
     };
-    format!("{cursor} {}", fit(content, width.saturating_sub(2)))
+    fit(&content, width)
 }
 
 /// The crop notice moved here when the preview lost its title band: a crop that
