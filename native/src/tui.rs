@@ -1165,7 +1165,7 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
     }
 
     out.push_str(&format!("\x1b[{};1H", rows));
-    out.push_str(&fit(&footer(ui, server, cut, preview_w), cols));
+    out.push_str(&footer(ui, server, cut, preview_w, cols));
     out
 }
 
@@ -1398,7 +1398,7 @@ pub fn render_styled(
     }
 
     out.push_str(&format!("\x1b[{};1H\x1b[K", rows));
-    out.push_str(&fit(&footer(ui, server, cut, preview_w), cols));
+    out.push_str(&footer(ui, server, cut, preview_w, cols));
     // Erase anything a previous, taller frame left below this one — a resize
     // to fewer rows is the only way stale content can survive past here. Must
     // happen BEFORE the caret move below, or `\x1b[J` erases from the caret's
@@ -1545,7 +1545,7 @@ fn fit_session_row(content: &str, width: u16) -> String {
 /// The crop notice moved here when the preview lost its title band: a crop that
 /// reads as absence is the failure this repo keeps re-discovering, and the
 /// footer is the only band left that is not the session's own screen.
-fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16) -> String {
+fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16, cols: u16) -> String {
     let status = match &ui.mode {
         Mode::Prompt(buffer) => format!("start: {buffer}▏   ⏎ run · esc cancel"),
         Mode::Confirm(name) => format!("kill {name}? it is running — y / n"),
@@ -1574,7 +1574,18 @@ fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16) -> String {
             None => "↑↓/jk select   ⏎ enter   n new   x kill   l list   q quit".into(),
         },
     };
-    format!("remuda · {server} 🏇   {status}")
+    let brand = format!("remuda · {server} 🏇");
+    let status_width = visible_width(&status);
+    let brand_width = visible_width(&brand);
+    if status_width + 3 + brand_width <= cols as usize {
+        format!(
+            "{status}{}{}",
+            " ".repeat(cols as usize - status_width - brand_width),
+            brand
+        )
+    } else {
+        fit(&status, cols)
+    }
 }
 
 /// Whether to relist, recapture and rebuild the frame: forced right after a

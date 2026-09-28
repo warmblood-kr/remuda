@@ -1009,8 +1009,8 @@ fn render_styled_of_the_session_list_moves_the_brand_to_the_footer() {
         "the server brand is no longer in the pane header"
     );
     assert!(
-        out.contains("\x1b[24;1H\x1b[Kremuda · default 🏇"),
-        "the server brand and horse appear in the footer"
+        out.contains("remuda · default 🏇\x1b[J"),
+        "the server brand and horse end the footer"
     );
 }
 
@@ -1032,8 +1032,8 @@ fn render_styled_of_the_empty_session_list_moves_the_brand_to_the_footer() {
         "the server brand is no longer in the pane header"
     );
     assert!(
-        out.contains("\x1b[24;1H\x1b[Kremuda · default 🏇"),
-        "the server brand and horse appear in the footer"
+        out.contains("remuda · default 🏇\x1b[J"),
+        "the server brand and horse end the footer"
     );
 }
 
@@ -1118,8 +1118,8 @@ fn render_styled_of_the_session_list_moves_the_real_brand_to_the_footer() {
         "the server brand is no longer in the pane header"
     );
     assert!(
-        out.contains("\x1b[24;1H\x1b[Kremuda · default 🏇"),
-        "the server brand and horse appear in the footer"
+        out.contains("remuda · default 🏇\x1b[J"),
+        "the server brand and horse end the footer"
     );
 }
 
@@ -1456,8 +1456,8 @@ fn render_styled_of_the_empty_session_list_moves_the_real_brand_to_the_footer() 
         "the server brand is no longer in the pane header"
     );
     assert!(
-        out.contains("\x1b[24;1H\x1b[Kremuda · default 🏇"),
-        "the server brand and horse appear in the footer"
+        out.contains("remuda · default 🏇\x1b[J"),
+        "the server brand and horse end the footer"
     );
 }
 
@@ -1857,6 +1857,50 @@ fn which_pane_has_the_keyboard_is_on_screen_either_way() {
     assert!(session.contains("ctrl-\\ back to the list"));
 }
 
+#[test]
+fn narrow_footers_keep_mode_status_before_the_optional_server_brand() {
+    let modes = [
+        (Mode::Browse, Focus::List, "↑↓/jk", true),
+        (Mode::Browse, Focus::Session, "▶ sh", false),
+        (Mode::Prompt("/bin/sh".into()), Focus::List, "start:", true),
+        (Mode::Confirm("sh".into()), Focus::List, "kill sh?", true),
+    ];
+
+    for (mode, focus, status_prefix, brand_fits_at_80) in modes {
+        let mut ui = make_ui(vec![row("sh", true, false)]);
+        ui.mode = mode;
+        ui.focus = focus;
+        for width in [17, 20, 30] {
+            let line = footer(&ui, "srv5", false, 0, width);
+            assert_eq!(visible_width(&line), width as usize);
+            assert!(
+                line.starts_with(status_prefix),
+                "mode status comes first at {width} columns: {line:?}"
+            );
+            assert!(
+                !line.contains("remuda · srv5 🏇"),
+                "brand is omitted when status and brand cannot fit at {width}: {line:?}"
+            );
+        }
+
+        let wide = footer(&ui, "srv5", false, 0, 80);
+        assert!(wide.starts_with(status_prefix));
+        assert_eq!(
+            wide.ends_with("remuda · srv5 🏇"),
+            brand_fits_at_80,
+            "brand visibility follows available space for {status_prefix:?}: {wide:?}"
+        );
+    }
+
+    let ui = make_ui(vec![row("sh", true, false)]);
+    let wide = footer(&ui, "srv5", false, 0, 80);
+    assert_eq!(visible_width(&wide), 80);
+    assert!(
+        wide.ends_with("remuda · srv5 🏇"),
+        "brand is right-aligned: {wide:?}"
+    );
+}
+
 fn scratch_socket(tag: &str) -> std::path::PathBuf {
     let root = if cfg!(unix) {
         std::path::PathBuf::from("/tmp")
@@ -2096,7 +2140,7 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
              \x1b[22;1H\x1b[K                │                                                              →\
              \x1b[23;1H\x1b[K                │                                                              →\
              \x1b[24;1H\x1b[K                │                                                              →\
-             \x1b[25;1H\x1b[Kremuda · default 🏇   ↑↓/jk ⏎ enter n new l list q quit · showing 63            \
+             \x1b[25;1H\x1b[K↑↓/jk ⏎ enter n new l list q quit · showing 63               remuda · default 🏇\
              \x1b[J\x1b[1;23H\x1b[?25h\x1b[?2026l",
             "byte-identical oracle for the right pane, fed through a real window"
         );

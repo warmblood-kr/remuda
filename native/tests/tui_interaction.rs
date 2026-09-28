@@ -100,7 +100,7 @@ fn the_server_brand_and_horse_live_in_the_footer_not_the_pane_header() {
         "preview content also starts on the first row: {first_line:?}"
     );
     let footer = frame.split("\x1b[5;1H").nth(1).expect("footer row");
-    assert!(footer.starts_with("remuda · default 🏇"));
+    assert!(footer.ends_with("remuda · default 🏇"));
 }
 
 #[test]
