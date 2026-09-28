@@ -121,6 +121,16 @@ close
 
 ``close(name) -> nil`` — End a session, live or already self-exited.
 
+contribute
+----------
+
+``contribute(point, id, entry) -> nil`` — Fill an extension point: the same point and id replaces. `entry.order` sorts (default 0).
+
+contributions
+-------------
+
+``contributions(point) -> {{id, owner, entry}...}`` — A point's entries as {id, owner, entry} rows, entry a shallow copy, by entry.order then id.
+
 emit
 ----
 

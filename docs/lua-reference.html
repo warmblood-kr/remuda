@@ -47,6 +47,10 @@
 <p><code>click(name, col, row, button?) -&gt; nil</code> — Send a mouse click at a terminal cell.</p>
 <h2 id="close">close</h2>
 <p><code>close(name) -&gt; nil</code> — End a session, live or already self-exited.</p>
+<h2 id="contribute">contribute</h2>
+<p><code>contribute(point, id, entry) -&gt; nil</code> — Fill an extension point: the same point and id replaces. <span class="title-ref">entry.order</span> sorts (default 0).</p>
+<h2 id="contributions">contributions</h2>
+<p><code>contributions(point) -&gt; {{id, owner, entry}...}</code> — A point's entries as {id, owner, entry} rows, entry a shallow copy, by entry.order then id.</p>
 <h2 id="emit">emit</h2>
 <p><code>emit(event, ...) -&gt; nil</code> — Fire an event, running every hook registered for it.</p>
 <h2 id="emit_filter">emit_filter</h2>
