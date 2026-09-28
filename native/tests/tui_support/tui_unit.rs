@@ -1942,6 +1942,84 @@ fn list_reports_a_transport_failure_instead_of_an_empty_herd() {
     );
 }
 
+#[test]
+fn daemon_gone_requires_three_transport_failures_unless_the_endpoint_is_definitively_dead() {
+    assert!(!daemon_failure_marks_gone(1, false));
+    assert!(!daemon_failure_marks_gone(2, false));
+    assert!(daemon_failure_marks_gone(3, false));
+    assert!(daemon_failure_marks_gone(1, true));
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_socket_is_definitive_only_when_its_lifetime_lock_is_free() {
+    use std::os::fd::AsRawFd;
+
+    let dir = std::env::temp_dir().join(format!("remuda-tui-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make private lock probe directory");
+    let socket = dir.join("s.sock");
+    std::fs::write(&socket, b"stale endpoint").expect("make endpoint exist");
+    let lock_path = dir.join("s.sock.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lock file");
+    let refused = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert!(
+        !daemon_is_definitively_gone(&socket, &refused),
+        "a held daemon lock means a refused connection is not proof"
+    );
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    assert!(daemon_is_definitively_gone(&socket, &refused));
+    std::fs::remove_dir_all(dir).expect("remove private lock probe directory");
+}
+
+#[test]
+fn a_missing_daemon_marks_the_cached_list_stale_and_offers_restart_or_quit() {
+    let path = std::path::PathBuf::from(format!("/tmp/remuda-dead-{}.sock", std::process::id()));
+    let mut ui = make_ui(vec![row("remembered", true, false)]);
+    ui.mode = Mode::Prompt("sh".into());
+    let mut held = None;
+    let mut painted = String::new();
+    let mut shown = None;
+
+    refresh(
+        &path,
+        "test",
+        &mut ui,
+        &mut held,
+        &mut painted,
+        &mut shown,
+        false,
+        false,
+    )
+    .expect("draw stale list");
+
+    assert_eq!(ui.sessions.len(), 1, "keep the last known sessions");
+    assert_eq!(ui.mode, Mode::Browse, "leave prompts when daemon dies");
+    let frame = render(&ui, "", "test", 80, 24);
+    assert!(
+        frame.contains(&format!("daemon gone (stale): {}", path.display())),
+        "identify the missing daemon and stale list: {frame:?}"
+    );
+    assert!(
+        frame.contains("r restart"),
+        "offer an explicit restart: {frame:?}"
+    );
+    assert!(frame.contains("q quit"), "offer quit: {frame:?}");
+    assert_eq!(ui.on_key(press(KeyCode::Char('r'))), Action::Restart);
+    assert_eq!(ui.on_key(press(KeyCode::Char('q'))), Action::Quit);
+}
+
 /// [MEASURED] `capture_styled` (the pane's own function) against a real
 /// daemon's real "no such session" error — must surface it, not swallow
 /// it into an empty grid. See steps/021.
