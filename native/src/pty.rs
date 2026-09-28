@@ -20,13 +20,14 @@
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use remuda_core::agent::{
-    AgentError, AgentProcess, Color, Cursor, MouseEncoding, MouseMode, MouseState, Result,
-    ScreenSnapshot, Size, StyledCell, VersionedSnapshot,
+    AgentError, AgentProcess, AgentWriter, Color, Cursor, MouseEncoding, MouseMode, MouseState,
+    Result, ScreenSnapshot, Size, StyledCell, VersionedSnapshot,
 };
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// Live viewers of one pty's output. Shared with the reader thread, which is
 /// the only producer; every consumer holds the other end of a channel.
@@ -35,6 +36,88 @@ type Watchers = Arc<Mutex<Vec<Sender<Vec<u8>>>>>;
 /// The pty's input end. Shared, because the reader thread must answer the
 /// terminal's own questions — see [`DSR_CURSOR`].
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+
+pub const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+
+struct WriteTask {
+    bytes: Vec<u8>,
+    result: Sender<Result<()>>,
+}
+
+/// One bounded worker owns blocking PTY writes. It accepts only one task at a
+/// time and never holds the process or screen lock while its write blocks.
+struct PtyInputWriter {
+    sender: SyncSender<WriteTask>,
+    busy: Arc<AtomicBool>,
+    timeout: Duration,
+}
+
+impl PtyInputWriter {
+    fn spawn(writer: SharedWriter, timeout: Duration) -> std::io::Result<Self> {
+        let (sender, receiver) = sync_channel::<WriteTask>(1);
+        let busy = Arc::new(AtomicBool::new(false));
+        let worker_busy = Arc::clone(&busy);
+        std::thread::Builder::new()
+            .name("remuda-pty-writer".into())
+            .spawn(move || run_writer(receiver, writer, worker_busy))?;
+        Ok(Self {
+            sender,
+            busy,
+            timeout,
+        })
+    }
+}
+
+fn run_writer(receiver: Receiver<WriteTask>, writer: SharedWriter, busy: Arc<AtomicBool>) {
+    while let Ok(task) = receiver.recv() {
+        let result = match writer.lock() {
+            Ok(mut writer) => writer
+                .write_all(&task.bytes)
+                .and_then(|()| writer.flush())
+                .map_err(io),
+            Err(_) => Err(io("pty writer lock poisoned")),
+        };
+        busy.store(false, Ordering::Release);
+        let _ = task.result.send(result);
+    }
+}
+
+impl AgentWriter for PtyInputWriter {
+    fn write_bounded(&self, bytes: &[u8]) -> Result<()> {
+        self.busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| AgentError::Busy)?;
+        let (result, receiver) = channel();
+        let task = WriteTask {
+            bytes: bytes.to_vec(),
+            result,
+        };
+        match self.sender.try_send(task) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                self.busy.store(false, Ordering::Release);
+                return Err(AgentError::Busy);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.busy.store(false, Ordering::Release);
+                return Err(AgentError::Io("pty writer worker stopped".into()));
+            }
+        }
+        match receiver.recv_timeout(self.timeout) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(AgentError::WriteTimeout {
+                timeout: self.timeout,
+            }),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(AgentError::Io("pty writer worker stopped".into()))
+            }
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
+    }
+}
 
 /// "Where is the cursor?" — a query the terminal must answer. ⚠ ConPTY asks it
 /// BEFORE emitting anything and waits: unanswered, the child is alive and the
@@ -85,7 +168,7 @@ fn color(c: vt100::Color) -> Color {
 pub struct PtyAgent {
     size: Size,
     screen: Arc<Mutex<vt100::Parser>>,
-    writer: SharedWriter,
+    input_writer: Arc<PtyInputWriter>,
     child: Box<dyn Child + Send + Sync>,
     watchers: Watchers,
     scrollback_total: Arc<AtomicUsize>,
@@ -114,6 +197,8 @@ impl PtyAgent {
         drop(pair.slave); // Or the master never sees EOF when the child exits.
 
         let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer().map_err(io)?));
+        let input_writer =
+            Arc::new(PtyInputWriter::spawn(Arc::clone(&writer), PTY_WRITE_TIMEOUT).map_err(io)?);
         let reader = pair.master.try_clone_reader().map_err(io)?;
         let screen = Arc::new(Mutex::new(vt100::Parser::new(
             size.rows(),
@@ -135,7 +220,7 @@ impl PtyAgent {
         Ok(Self {
             size,
             screen,
-            writer,
+            input_writer,
             child,
             watchers,
             scrollback_total,
@@ -279,9 +364,11 @@ impl AgentProcess for PtyAgent {
         if !self.is_alive() {
             return Err(AgentError::Exited);
         }
-        let mut writer = self.writer.lock().map_err(|_| io("writer lock poisoned"))?;
-        writer.write_all(bytes).map_err(io)?;
-        writer.flush().map_err(io)
+        self.input_writer.write_bounded(bytes)
+    }
+
+    fn input_writer(&mut self) -> Option<Arc<dyn AgentWriter>> {
+        Some(Arc::clone(&self.input_writer) as Arc<dyn AgentWriter>)
     }
 
     fn screen_text(&mut self) -> Result<String> {
@@ -443,6 +530,78 @@ impl AgentProcess for PtyAgent {
 
     fn process_id(&self) -> Option<u32> {
         self.child.process_id()
+    }
+}
+
+#[cfg(test)]
+mod input_writer_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    struct StalledWrite {
+        started: Mutex<Option<Sender<()>>>,
+        release: Mutex<Receiver<()>>,
+        finished: Sender<()>,
+        first: AtomicBool,
+    }
+
+    impl Write for StalledWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.first.swap(true, Ordering::AcqRel) {
+                self.started
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                self.finished.send(()).unwrap();
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn timed_out_worker_keeps_one_busy_write_then_recovers() {
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let (finished_tx, finished_rx) = channel();
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(StalledWrite {
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(release_rx),
+            finished: finished_tx,
+            first: AtomicBool::new(false),
+        })));
+        let writer = Arc::new(PtyInputWriter::spawn(writer, Duration::from_millis(100)).unwrap());
+        let first_writer = Arc::clone(&writer);
+        let first = std::thread::spawn(move || first_writer.write_bounded(b"first"));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let started_at = std::time::Instant::now();
+        assert!(matches!(
+            writer.write_bounded(b"second"),
+            Err(AgentError::Busy)
+        ));
+        assert!(started_at.elapsed() < Duration::from_millis(80));
+        assert!(matches!(
+            first.join().unwrap(),
+            Err(AgentError::WriteTimeout { .. })
+        ));
+        assert!(writer.is_busy());
+
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while writer.is_busy() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!writer.is_busy());
+        writer.write_bounded(b"recovered").unwrap();
     }
 }
 

@@ -886,6 +886,8 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::Uncertain => Err(mlua::Error::runtime("input outcome is uncertain")),
         Response::WrongInstance => Err(mlua::Error::runtime("session instance changed")),
         Response::RateLimited => Err(mlua::Error::runtime("session input rate limit exceeded")),
+        Response::Busy => Err(mlua::Error::runtime("session input is busy")),
+        Response::WriteTimeout => Err(mlua::Error::runtime("session PTY write timed out")),
         Response::AttachStarted { .. } | Response::AttachStatus { .. } => Err(
             mlua::Error::runtime("attach responses are not exposed to scripts"),
         ),

@@ -799,6 +799,7 @@ fn input(
         Some(Err(remuda_core::input::InputError::RateLimited)) => {
             reply(stream, &Response::RateLimited)
         }
+        Some(Err(remuda_core::input::InputError::Busy)) => reply(stream, &Response::Busy),
         Some(Err(error)) => reply(stream, &Response::error(error.to_string())),
         Some(Ok(remuda_core::input::InputOutcome::Ack { duplicate })) => {
             reply(stream, &Response::Ack { duplicate })
@@ -835,6 +836,10 @@ fn respond<T>(
 ) -> std::io::Result<()> {
     match result {
         None => reply(stream, &Response::error(format!("no such session: {name}"))),
+        Some(Err(remuda_core::AgentError::Busy)) => reply(stream, &Response::Busy),
+        Some(Err(remuda_core::AgentError::WriteTimeout { .. })) => {
+            reply(stream, &Response::WriteTimeout)
+        }
         Some(Err(e)) => reply(stream, &Response::error(e)),
         Some(Ok(v)) => reply(stream, &ok(v)),
     }

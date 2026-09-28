@@ -15,6 +15,7 @@ pub enum InputError {
     InvalidSequence,
     InvalidLength,
     RateLimited,
+    Busy,
     Unavailable,
 }
 
@@ -24,6 +25,7 @@ impl fmt::Display for InputError {
             Self::InvalidSequence => "input sequence must start at 1",
             Self::InvalidLength => "input must contain 1 to 65536 bytes",
             Self::RateLimited => "session input rate limit exceeded",
+            Self::Busy => "a session input write is already in flight",
             Self::Unavailable => "session input rate check unavailable",
         };
         formatter.write_str(message)
@@ -95,66 +97,98 @@ impl InputDeduplicator {
     where
         F: FnOnce() -> Result<(), AgentError>,
     {
+        if let Some(outcome) = self.lookup(client_id, seq) {
+            return outcome;
+        }
+        if !self.reserve(client_id, seq) {
+            return self
+                .lookup(client_id, seq)
+                .unwrap_or(InputOutcome::Uncertain);
+        }
+        let applied = write().is_ok();
+        self.complete(client_id, seq, applied);
+        if applied {
+            InputOutcome::Ack { duplicate: false }
+        } else {
+            InputOutcome::Uncertain
+        }
+    }
+
+    /// Return a remembered result and touch the client's LRU position.
+    pub(crate) fn lookup(&mut self, client_id: [u8; 16], seq: u64) -> Option<InputOutcome> {
+        let index = self
+            .clients
+            .iter()
+            .position(|client| client.id == client_id)?;
+        let client = self.clients.remove(index).expect("located client exists");
+        let outcome = client
+            .entries
+            .iter()
+            .find(|entry| entry.seq == seq)
+            .map(|entry| {
+                if entry.applied {
+                    InputOutcome::Ack { duplicate: true }
+                } else {
+                    InputOutcome::Uncertain
+                }
+            })
+            .or_else(|| (seq <= client.evicted_watermark).then_some(InputOutcome::Uncertain));
+        self.clients.push_back(client);
+        outcome
+    }
+
+    /// Reserve an attempt as unapplied before its write begins. A retry while
+    /// that write is still running can then return `Uncertain` immediately.
+    pub(crate) fn reserve(&mut self, client_id: [u8; 16], seq: u64) -> bool {
         if let Some(index) = self
             .clients
             .iter()
             .position(|client| client.id == client_id)
         {
             let mut client = self.clients.remove(index).expect("located client exists");
-            let outcome = apply_known(&mut client, seq, write);
+            let eligible = seq > client.evicted_watermark
+                && !client.entries.iter().any(|entry| entry.seq == seq);
+            if eligible {
+                remember(&mut client, seq, false);
+            }
             self.clients.push_back(client);
-            return outcome;
+            return eligible;
         }
         if seq != 1 {
-            return InputOutcome::Uncertain;
+            return false;
         }
         let mut client = ClientHistory {
             id: client_id,
             entries: VecDeque::new(),
             evicted_watermark: 0,
         };
-        let outcome = write_and_remember(&mut client, seq, write);
+        remember(&mut client, seq, false);
         if self.clients.len() == MAX_INPUT_CLIENTS {
             self.clients.pop_front();
         }
         self.clients.push_back(client);
-        outcome
+        true
+    }
+
+    pub(crate) fn complete(&mut self, client_id: [u8; 16], seq: u64, applied: bool) {
+        if let Some(entry) = self
+            .clients
+            .iter_mut()
+            .find(|client| client.id == client_id)
+            .and_then(|client| client.entries.iter_mut().find(|entry| entry.seq == seq))
+        {
+            entry.applied = applied;
+        }
     }
 }
 
-fn apply_known<F>(client: &mut ClientHistory, seq: u64, write: F) -> InputOutcome
-where
-    F: FnOnce() -> Result<(), AgentError>,
-{
-    if let Some(entry) = client.entries.iter().find(|entry| entry.seq == seq) {
-        return if entry.applied {
-            InputOutcome::Ack { duplicate: true }
-        } else {
-            InputOutcome::Uncertain
-        };
-    }
-    if seq <= client.evicted_watermark {
-        return InputOutcome::Uncertain;
-    }
-    write_and_remember(client, seq, write)
-}
-
-fn write_and_remember<F>(client: &mut ClientHistory, seq: u64, write: F) -> InputOutcome
-where
-    F: FnOnce() -> Result<(), AgentError>,
-{
-    let applied = write().is_ok();
+fn remember(client: &mut ClientHistory, seq: u64, applied: bool) {
     if client.entries.len() == INPUT_RING_CAPACITY {
         if let Some(evicted) = client.entries.pop_front() {
             client.evicted_watermark = client.evicted_watermark.max(evicted.seq);
         }
     }
     client.entries.push_back(SequenceResult { seq, applied });
-    if applied {
-        InputOutcome::Ack { duplicate: false }
-    } else {
-        InputOutcome::Uncertain
-    }
 }
 
 pub fn validate_batch(client_id: &str, seq: u64, bytes: &[u8]) -> Result<[u8; 16], String> {

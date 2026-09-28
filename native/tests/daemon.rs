@@ -333,6 +333,139 @@ fn input_batches_acknowledge_duplicates_and_check_instance_before_deduplication(
     assert!(running.left_on_its_own(), "daemon should stop cleanly");
 }
 
+#[cfg(unix)]
+#[test]
+fn stalled_pty_write_times_out_without_blocking_reads_and_recovers() {
+    let runtime = scratch_dir("pty-write-timeout");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    let reader_marker = start_reader_waiting_session(&socket, &runtime);
+
+    let bytes = vec![b'\n'; 1024 * 1024];
+    let send_socket = socket.clone();
+    let (sent, result) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    let sender = std::thread::spawn(move || {
+        let result = client::request(
+            &send_socket,
+            &Request::Send {
+                name: "versioned".into(),
+                bytes,
+            },
+        );
+        let _ = sent.send(result);
+    });
+
+    // Wait until the first writer has had time to fill the PTY, then prove an
+    // independent request can make progress and a second input is not queued.
+    let busy_deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        match client::request(
+            &socket,
+            &Request::Send {
+                name: "versioned".into(),
+                bytes: b"later\n".to_vec(),
+            },
+        )
+        .expect("second send")
+        {
+            Response::Busy => break,
+            Response::Ok => {
+                assert!(
+                    Instant::now() < busy_deadline,
+                    "the large write never occupied the session writer"
+                );
+                if let Ok(result) = result.try_recv() {
+                    panic!("large write finished before a second write was refused: {result:?}");
+                }
+            }
+            other => panic!("unexpected second send response: {other:?}"),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let read_started = Instant::now();
+    let _ = listed_session(&socket);
+    let _ = capture_version(&socket);
+    assert!(
+        read_started.elapsed() < Duration::from_millis(500),
+        "list and capture should stay responsive during the blocked write"
+    );
+
+    assert_eq!(
+        result
+            .recv_timeout(Duration::from_secs(4))
+            .expect("bounded send response")
+            .expect("send request"),
+        Response::WriteTimeout
+    );
+    sender.join().expect("send client thread");
+    assert!(started.elapsed() < Duration::from_secs(6));
+    std::fs::write(&reader_marker, b"read now").expect("allow child to read input");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match client::request(
+            &socket,
+            &Request::Send {
+                name: "versioned".into(),
+                bytes: b"after recovery\n".to_vec(),
+            },
+        )
+        .expect("retry after child begins reading")
+        {
+            Response::Ok => break,
+            Response::Busy => {
+                assert!(Instant::now() < deadline, "PTY writer did not recover");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => panic!("unexpected recovery response: {other:?}"),
+        }
+    }
+
+    let _ = client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    assert!(
+        running.left_on_its_own(),
+        "daemon exits after shutdown request"
+    );
+}
+
+#[cfg(unix)]
+fn start_reader_waiting_session(socket: &Path, runtime: &Path) -> PathBuf {
+    // Keep the master unread until the test signals it, then drain input so
+    // recovery is deterministic regardless of parallel test scheduling.
+    let marker = runtime.join("start-reader");
+    let mut env = std::collections::HashMap::new();
+    env.insert("READER_MARKER".into(), marker.display().to_string());
+    assert!(matches!(
+        client::request(
+            socket,
+            &Request::New {
+                name: Some("versioned".into()),
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "stty -echo; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat >/dev/null".into(),
+                ],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: Some(env),
+            },
+        )
+        .expect("start non-reading child"),
+        Response::Value(_)
+    ));
+    marker
+}
+
 fn start_shell_session(socket: &Path, script: &str) {
     let response = client::request(
         socket,

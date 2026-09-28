@@ -12,6 +12,7 @@
 use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 
 /// Terminal dimensions, clamped to the smallest usable interactive terminal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -126,6 +127,12 @@ pub enum AgentError {
     /// Someone is attached and driving this session by hand. Orchestrated
     /// input is refused rather than queued — see [`crate::session::Session`].
     Attached,
+    /// A previous PTY write is still active; no second write was queued.
+    Busy,
+    /// The bounded write deadline elapsed; bytes may still finish later.
+    WriteTimeout {
+        timeout: core::time::Duration,
+    },
     /// A `feed` act's `Pause`s summed past the caller's cap — refused before
     /// anything is written, not clamped, so a seconds/millis mixup errors
     /// instead of silently running a shorter pause than asked for.
@@ -141,6 +148,10 @@ impl fmt::Display for AgentError {
         match self {
             AgentError::Exited => write!(f, "agent process has exited"),
             AgentError::Attached => write!(f, "a human is attached to this session"),
+            AgentError::Busy => write!(f, "a session input write is already in flight"),
+            AgentError::WriteTimeout { timeout } => {
+                write!(f, "PTY write exceeded {timeout:?}; delivery is uncertain")
+            }
             AgentError::PauseTooLong { total, cap } => {
                 write!(f, "feed's pauses total {total:?}, over the {cap:?} cap")
             }
@@ -150,6 +161,12 @@ impl fmt::Display for AgentError {
 }
 
 pub type Result<T> = core::result::Result<T, AgentError>;
+
+/// A backend writer that can wait independently of the locked process object.
+pub trait AgentWriter: Send + Sync {
+    fn write_bounded(&self, bytes: &[u8]) -> Result<()>;
+    fn is_busy(&self) -> bool;
+}
 
 /// A styled screen and its scrollback measurements from one parser snapshot.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -176,6 +193,12 @@ pub trait AgentProcess: Send {
     /// Type raw bytes. Not public API on [`Session`] — see
     /// [`crate::session::Session::send_line`] for why callers never get this.
     fn write(&mut self, bytes: &[u8]) -> Result<()>;
+
+    /// An optional writer handle that can outlive the process lock while it
+    /// waits for a bounded PTY write. Simpler agents keep using `write`.
+    fn input_writer(&mut self) -> Option<Arc<dyn AgentWriter>> {
+        None
+    }
 
     /// The visible screen, rendered as text, newline-separated.
     fn screen_text(&mut self) -> Result<String>;
