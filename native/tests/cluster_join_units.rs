@@ -1,0 +1,210 @@
+use remuda_core::ManualWallClock;
+use remuda_native::cluster::join_line::JoinLine;
+use remuda_native::cluster::join_token::JoinTokenStore;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+fn private_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "remuda-join-units-{}-{}",
+        std::process::id(),
+        NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    dir
+}
+
+fn remove_dir(dir: &Path) {
+    let _ = fs::remove_dir_all(dir);
+}
+
+fn fingerprint(public_key: &[u8]) -> String {
+    use snow::resolvers::CryptoResolver;
+    let params: snow::params::NoiseParams = "Noise_NN_25519_ChaChaPoly_SHA256".parse().unwrap();
+    let resolver = snow::resolvers::DefaultResolver;
+    let mut hash = resolver.resolve_hash(&params.hash).unwrap();
+    hash.input(public_key);
+    let mut digest = vec![0; hash.hash_len()];
+    hash.result(&mut digest);
+    format!(
+        "SHA256:{}",
+        remuda_native::cluster::encoding::encode_base64(&digest).trim_end_matches('=')
+    )
+}
+
+#[test]
+fn join_token_mint_stores_only_hash_with_private_owned_state() {
+    let dir = private_dir();
+    let clock = Arc::new(ManualWallClock::new(1_700_000_000));
+    let store = JoinTokenStore::open_at(&dir, clock).unwrap();
+    let minted = store.mint().unwrap();
+    assert_eq!(minted.expires_at_unix_seconds, 1_700_000_600);
+    let state = fs::read_to_string(dir.join("join_tokens.json")).unwrap();
+    assert!(!state.contains(&minted.token));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            fs::metadata(dir.join("join_tokens.json")).unwrap().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(dir.join("join_tokens.json")).unwrap().uid(),
+            unsafe { libc::geteuid() }
+        );
+    }
+    assert_eq!(minted.token.len(), 44);
+    remove_dir(&dir);
+}
+
+#[test]
+fn join_token_consumes_once_across_store_reload() {
+    let dir = private_dir();
+    let clock = Arc::new(ManualWallClock::new(1_700_000_000));
+    let minted = JoinTokenStore::open_at(&dir, clock.clone())
+        .unwrap()
+        .mint()
+        .unwrap();
+    JoinTokenStore::open_at(&dir, clock.clone())
+        .unwrap()
+        .verify_and_consume(&minted.token)
+        .unwrap();
+    assert!(JoinTokenStore::open_at(&dir, clock)
+        .unwrap()
+        .verify_and_consume(&minted.token)
+        .is_err());
+    remove_dir(&dir);
+}
+
+#[test]
+fn join_token_rejects_expired_and_unknown_values() {
+    let dir = private_dir();
+    let clock = Arc::new(ManualWallClock::new(1_700_000_000));
+    let store = JoinTokenStore::open_at(&dir, clock.clone()).unwrap();
+    let minted = store.mint().unwrap();
+    assert!(store.verify_and_consume("unknown").is_err());
+    clock.advance(Duration::from_secs(600));
+    assert!(store.verify_and_consume(&minted.token).is_err());
+    remove_dir(&dir);
+}
+
+#[test]
+fn join_token_rollback_expires_existing_tokens_but_allows_minting() {
+    let dir = private_dir();
+    let clock = Arc::new(ManualWallClock::new(1_700_000_000));
+    let old = JoinTokenStore::open_at(&dir, clock.clone())
+        .unwrap()
+        .mint()
+        .unwrap();
+    clock.set_unix_seconds(1_699_000_000);
+    let store = JoinTokenStore::open_at(&dir, clock.clone()).unwrap();
+    assert!(store.verify_and_consume(&old.token).is_err());
+    let fresh = store.mint().unwrap();
+    assert_eq!(fresh.expires_at_unix_seconds, 1_699_000_600);
+    assert!(store.verify_and_consume(&fresh.token).is_ok());
+    remove_dir(&dir);
+}
+
+#[test]
+fn join_token_state_refuses_loose_file_permissions() {
+    let dir = private_dir();
+    let clock = Arc::new(ManualWallClock::new(1_700_000_000));
+    let token = JoinTokenStore::open_at(&dir, clock.clone())
+        .unwrap()
+        .mint()
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(
+            dir.join("join_tokens.json"),
+            fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert_eq!(
+            JoinTokenStore::open_at(&dir, clock)
+                .unwrap()
+                .verify_and_consume(&token.token)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+    remove_dir(&dir);
+}
+
+#[test]
+fn join_token_store_caps_outstanding_tokens_at_sixteen() {
+    let dir = private_dir();
+    let clock = Arc::new(ManualWallClock::new(1_700_000_000));
+    let store = JoinTokenStore::open_at(&dir, clock).unwrap();
+    for _ in 0..16 {
+        store.mint().unwrap();
+    }
+    let error = store.mint().err().unwrap();
+    assert!(error.to_string().contains("16 outstanding"));
+    remove_dir(&dir);
+}
+
+#[test]
+fn join_line_round_trips_ipv4_and_ipv6() {
+    let line = JoinLine {
+        issuer_addr: "[fd00::1]:443".parse().unwrap(),
+        issuer_static_pubkey: [7; 32],
+        token: remuda_native::cluster::encoding::encode_base64(&[9; 32]),
+    };
+    assert_eq!(JoinLine::decode(&line.encode().unwrap()).unwrap(), line);
+    assert!(!format!("{line:?}").contains(&line.token));
+    let ipv4 = JoinLine {
+        issuer_addr: "10.0.0.1:443".parse().unwrap(),
+        issuer_static_pubkey: [7; 32],
+        token: remuda_native::cluster::encoding::encode_base64(&[9; 32]),
+    };
+    assert_eq!(JoinLine::decode(&ipv4.encode().unwrap()).unwrap(), ipv4);
+}
+
+#[test]
+fn join_line_rejects_bad_fields_and_noncanonical_keys() {
+    let valid = format!(
+        "remuda-join-v1 10.0.0.1:443 {} {}",
+        remuda_native::cluster::encoding::encode_base64(&[7; 32]),
+        remuda_native::cluster::encoding::encode_base64(&[9; 32])
+    );
+    for invalid in [
+        "remuda-join-v1 10.0.0.1:443",
+        "remuda-join-v1 10.0.0.1:443 key token extra",
+        "remuda-join-v1  10.0.0.1:443 key token",
+        "remuda-join-v1 10.0.0.1:443 key token\n",
+        "remuda-join-v2 10.0.0.1:443 key token",
+        &"x".repeat(257),
+    ] {
+        assert!(JoinLine::decode(invalid).is_err(), "accepted {invalid:?}");
+    }
+    let noncanonical = valid.replace("= ", " ");
+    assert!(JoinLine::decode(&noncanonical).is_err());
+}
+
+#[test]
+fn join_line_pin_check_matches_and_rejects_mismatch() {
+    let keypair = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+        .generate_keypair()
+        .unwrap();
+    let expected_fp = fingerprint(&keypair.public);
+    let line = JoinLine {
+        issuer_addr: "10.0.0.1:443".parse().unwrap(),
+        issuer_static_pubkey: keypair.public.as_slice().try_into().unwrap(),
+        token: remuda_native::cluster::encoding::encode_base64(&[9; 32]),
+    };
+    assert!(line.verify_pin(&expected_fp).is_ok());
+    assert!(line.verify_pin("SHA256:wrong").is_err());
+}

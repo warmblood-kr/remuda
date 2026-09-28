@@ -2,6 +2,8 @@
 
 pub mod encoding;
 pub mod identity;
+pub mod join_line;
+pub mod join_token;
 pub mod registry;
 #[cfg(not(windows))]
 mod storage;
