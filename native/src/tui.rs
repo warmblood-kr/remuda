@@ -1342,8 +1342,8 @@ fn locate_cursor(
     let viewport = Viewport::bottom_anchored(cells.len(), pan, preview_w, body);
     let (panel_row, panel_col) =
         viewport.map_cursor(cells, cursor.row as usize, cursor.col as usize)?;
-    // +1 for the header row above row 0 of the pane; list_w + divider + 1 for
-    // the preview pane's own left edge; both again for 1-based addressing.
+    // Convert pane-local coordinates to 1-based terminal coordinates, adding
+    // the list and divider widths when the preview shares the screen.
     Some((
         panel_row + 1,
         if list_w == 0 {
