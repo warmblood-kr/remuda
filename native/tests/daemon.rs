@@ -638,6 +638,15 @@ fn target_row(path: &Path, expr: &str) -> String {
     }
 }
 
+fn target_is_attached(path: &Path) -> bool {
+    match client::request(path, &Request::List) {
+        Ok(Response::Sessions(sessions)) => sessions
+            .iter()
+            .any(|session| session.name == "target" && session.attached),
+        other => panic!("session list: {other:?}"),
+    }
+}
+
 #[test]
 fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     // The binary derives its socket as $REMUDA_RUNTIME_DIR/remuda/default.sock,
@@ -948,19 +957,31 @@ fn a_tracked_client_exits_on_takeover_without_waiting_for_another_key() {
     command.args(["-s", "s", "attach", "target"]);
     command.env("REMUDA_RUNTIME_DIR", &dir);
     let mut child = pty.slave.spawn_command(command).expect("spawn client A");
+    // The test only uses the master side after spawning the child. Keeping the
+    // parent's slave handle open can prevent some PTY implementations from
+    // reporting EOF after the child exits.
+    drop(pty.slave);
     #[cfg(unix)]
     let mut reader = pty.master.try_clone_reader().expect("clone pty reader");
     #[cfg(unix)]
     let (output_tx, output_rx) = std::sync::mpsc::channel();
     #[cfg(unix)]
     std::thread::spawn(move || {
-        let mut output = Vec::new();
-        let _ = reader.read_to_end(&mut output);
-        let _ = output_tx.send(output);
+        let mut buf = [0u8; 1024];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if output_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
     });
 
     let deadline = Instant::now() + PATIENCE;
-    while target_row(&path, "r.attached") != "true" {
+    while !target_is_attached(&path) {
         assert!(Instant::now() < deadline, "client A never attached");
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -980,11 +1001,10 @@ fn a_tracked_client_exits_on_takeover_without_waiting_for_another_key() {
     assert_eq!(status.exit_code(), 2);
     #[cfg(unix)]
     {
-        // Allow slow CI machines the full integration-test patience window
-        // for the PTY reader to observe EOF after the client has exited.
-        let output = output_rx
-            .recv_timeout(PATIENCE)
-            .expect("client output closed");
+        // Do not wait for PTY EOF here. Some platforms keep a reader open
+        // after the child exits; the notice and mode resets are the evidence
+        // this test needs, and arrive before EOF.
+        let output = collect_until_bytes(&output_rx, b"\x1b[?1000l");
         assert!(
             output
                 .windows(b"attached elsewhere, detached".len())
