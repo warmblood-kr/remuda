@@ -309,6 +309,9 @@ local function call_hook(event, hook, ...)
   hook.errors, hook.last_error = (hook.errors or 0) + 1, tostring(result[2])
   local who = (hook.group or hook.id) and (" [" .. tostring(hook.group) .. "/" .. tostring(hook.id) .. "]") or ""
   io.stderr:write("remuda hook error for " .. event .. who .. ": " .. hook.last_error .. "\n")
+  if remuda._lifecycle_start_active then
+    error(hook.last_error, 0)
+  end
   return false
 end
 
