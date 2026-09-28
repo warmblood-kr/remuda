@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 pub fn run(args: &[&str]) -> ExitCode {
@@ -31,31 +31,115 @@ pub fn run(args: &[&str]) -> ExitCode {
     let socket = std::env::temp_dir().join(format!("remuda-codex-{}.sock", std::process::id()));
     let address = format!("unix://{}", socket.display());
     let (server_args, client_args) = codex_args(&address, model);
-    let mut server = match Command::new("codex")
+    let mut server_command = Command::new("codex");
+    server_command
         .args(&server_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-    {
+        .stderr(Stdio::inherit());
+    // Keep the app-server and any descendants in a group the session CLI can
+    // reap together. Linux also gets the kernel parent-death signal; on other
+    // Unix hosts the watcher below notices when this CLI is orphaned.
+    remuda_native::child_guard::harden(&mut server_command);
+    let mut server = match server_command.spawn() {
         Ok(child) => child,
         Err(error) => return fail(error),
     };
+    #[cfg(unix)]
+    let mut parent_watch = match start_parent_watch(server.id()) {
+        Ok(watch) => Some(watch),
+        Err(error) => {
+            finish_app_server(&mut server, None);
+            return fail(error);
+        }
+    };
+    #[cfg(not(unix))]
+    let mut parent_watch: Option<Child> = None;
+
     if !wait_for_socket(&socket) {
-        let _ = server.kill();
+        finish_app_server(&mut server, parent_watch.take());
         return fail("Codex app-server did not bind its local socket");
     }
     let monitor_socket = socket.clone();
     let monitor_status = status.to_string();
     std::thread::spawn(move || monitor(&monitor_socket, &monitor_status));
     let result = Command::new("codex").args(&client_args).status();
-    let _ = server.kill();
+    finish_app_server(&mut server, parent_watch.take());
     let _ = std::fs::remove_file(socket);
     match result {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(error) => fail(error),
     }
+}
+
+#[cfg(unix)]
+fn start_parent_watch(server_pid: u32) -> std::io::Result<Child> {
+    use std::os::unix::process::CommandExt;
+    let executable = std::env::current_exe()?;
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "_codex_watch".to_string(),
+            std::process::id().to_string(),
+            server_pid.to_string(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // The watcher must survive the PTY hangup that kills its parent.
+        .process_group(0);
+    command.spawn()
+}
+
+#[cfg(unix)]
+fn finish_app_server(server: &mut Child, mut parent_watch: Option<Child>) {
+    let process_group = -(server.id() as libc::pid_t);
+    // SAFETY: the app-server was placed in a process group with its pid as pgid.
+    unsafe {
+        libc::kill(process_group, libc::SIGKILL);
+    }
+    if let Some(watch) = parent_watch.as_mut() {
+        let _ = watch.kill();
+        let _ = watch.wait();
+    }
+    let _ = server.wait();
+}
+
+#[cfg(not(unix))]
+fn finish_app_server(server: &mut Child, _parent_watch: Option<Child>) {
+    let _ = server.kill();
+    let _ = server.wait();
+}
+
+/// Internal child mode. It lives in its own process group so PTY teardown
+/// cannot kill the watcher before it reaps the app-server group.
+#[cfg(unix)]
+pub fn watch_parent(parent_pid: i32, process_group: i32) -> ExitCode {
+    if parent_pid <= 1 || process_group <= 1 {
+        return fail("invalid Codex app-server parent watch target");
+    }
+    loop {
+        // SAFETY: these calls only inspect the current process and signal the
+        // process group created for the app-server.
+        unsafe {
+            if libc::getppid() != parent_pid {
+                libc::kill(-process_group, libc::SIGKILL);
+                return ExitCode::SUCCESS;
+            }
+            if libc::kill(-process_group, 0) == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return ExitCode::SUCCESS;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(not(unix))]
+pub fn watch_parent(_parent_pid: i32, _process_group: i32) -> ExitCode {
+    fail("Codex app-server parent watch requires Unix")
 }
 
 fn seed_status(status: &str, model: Option<&str>) {

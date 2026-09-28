@@ -165,6 +165,13 @@ recreate keeps its advice. Other imperative effects
 (`remuda.schedule`, `remuda.process`, `remuda.new`, and so on) are not owned
 and survive reload; the mod must find and reuse or cancel them itself.
 
+An optional `stop(state)` runs for the old activation before a reload starts
+its replacement, while the old activation still owns its registrations. It
+also runs for each active lifecycle mod during a clean daemon shutdown.
+Failures are logged and cleanup continues; shutdown waits at most two seconds
+for the whole stop pass. A forced daemon termination cannot run Lua stop
+callbacks.
+
 The runtime registry also covers words added with `remuda.tool`, so an
 extension can document itself when it registers its function:
 
