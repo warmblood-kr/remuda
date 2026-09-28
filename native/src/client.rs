@@ -418,20 +418,25 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     let mut stdout = std::io::stdout();
     let mut buf = [0u8; 8192];
     let mut reader = reader_stream.as_ref();
-    while !output_stop.load(std::sync::atomic::Ordering::SeqCst) {
-        let Ok(n) = reader.read(&mut buf) else {
-            break;
-        };
-        if n == 0 {
-            break;
+    let output_end = loop {
+        if output_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            break "stopped".to_string();
         }
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break "EOF".to_string(),
+            Ok(n) => n,
+            Err(error) => break format!("read error: {error}"),
+        };
         let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
         if scrollback.load(std::sync::atomic::Ordering::SeqCst) != 0 {
             continue;
         }
         if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
-            break;
+            break "stdout write failed".to_string();
         }
+    };
+    if trace_attach_exit {
+        eprintln!("attach input trace: session output reader ended: {output_end}");
     }
 
     let taken_over = was_taken_over(path, name, generation);

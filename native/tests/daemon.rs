@@ -843,11 +843,21 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
     let dir = scratch_dir("attach-exit-any-key");
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
+    #[cfg(unix)]
+    let target_command = vec!["sh".into(), "-c".into(), "sleep 3".into()];
+    #[cfg(windows)]
+    let target_command = vec![
+        "powershell.exe".into(),
+        "-NoLogo".into(),
+        "-NoProfile".into(),
+        "-Command".into(),
+        "Start-Sleep -Seconds 3".into(),
+    ];
     let created = client::request(
         &path,
         &Request::New {
             name: Some("target".into()),
-            command: vec!["sh".into(), "-c".into(), "sleep 3".into()],
+            command: target_command,
             size: Size::new(80, 24),
             cwd: None,
             env: None,
