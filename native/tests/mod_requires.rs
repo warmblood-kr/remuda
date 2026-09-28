@@ -235,5 +235,9 @@ fn a_nightly_host_version_satisfies_and_a_non_numeric_one_is_named() {
     home.installed("strict", "1.0.0", r#"requires = { odd = ">=1" }"#);
     let out = home.remuda(&["exec", "strict"]);
     assert!(!out.status.success());
-    assert!(stderr(&out).contains("odd") && stderr(&out).contains("banana"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("odd") && stderr(&out).contains("banana"),
+        "{}",
+        stderr(&out)
+    );
 }

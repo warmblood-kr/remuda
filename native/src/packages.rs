@@ -614,18 +614,22 @@ fn parse_version(text: &str) -> Result<[u64; 3], String> {
     Ok(version)
 }
 
-/// Whether an installed `version` meets a `requires` constraint.
+/// `*` accepts any version unparsed; otherwise the numeric core decides, so
+/// `0.1.0-nightly.X` or `1.2.3+build` compare as `0.1.0` and `1.2.3`.
 pub fn satisfies(version: &str, constraint: &str) -> Result<bool, String> {
-    let installed = parse_version(version)?;
-    Ok(parse_constraint(constraint)?
-        .iter()
-        .all(|(op, wanted)| match *op {
-            ">=" => installed >= *wanted,
-            "<=" => installed <= *wanted,
-            ">" => installed > *wanted,
-            "<" => installed < *wanted,
-            _ => installed == *wanted,
-        }))
+    let comparators = parse_constraint(constraint)?;
+    if comparators.is_empty() {
+        return Ok(true);
+    }
+    let core = version.split(['-', '+']).next().unwrap_or(version);
+    let installed = parse_version(core)?;
+    Ok(comparators.iter().all(|(op, wanted)| match *op {
+        ">=" => installed >= *wanted,
+        "<=" => installed <= *wanted,
+        ">" => installed > *wanted,
+        "<" => installed < *wanted,
+        _ => installed == *wanted,
+    }))
 }
 
 fn validate_spec(spec: &ModSpec) -> Result<(), String> {
@@ -856,7 +860,9 @@ fn check_requirement(owner: &str, dependency: &str, constraint: &str) -> Result<
         ));
     }
     let spec = read_manifest(&path)?;
-    if !satisfies(&spec.version, constraint)? {
+    let met = satisfies(&spec.version, constraint)
+        .map_err(|error| format!("mod {owner} requires {dependency} {constraint}, but installed {dependency} {} is unreadable: {error}", spec.version))?;
+    if !met {
         return Err(format!(
             "mod {owner} requires {dependency} {constraint}, but {dependency} {} is installed",
             spec.version
@@ -1079,9 +1085,16 @@ mod tests {
             ("1.2.3+build.5", "=1.2.3", true),
             ("nightly", "*", true),
         ] {
-            assert_eq!(satisfies(version, constraint), Ok(expected), "{version} {constraint}");
+            assert_eq!(
+                satisfies(version, constraint),
+                Ok(expected),
+                "{version} {constraint}"
+            );
         }
-        assert!(satisfies("nightly", ">=1").is_err(), "a non-numeric core under a real constraint");
+        assert!(
+            satisfies("nightly", ">=1").is_err(),
+            "a non-numeric core under a real constraint"
+        );
     }
 
     #[test]
