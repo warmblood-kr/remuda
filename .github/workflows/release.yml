@@ -168,7 +168,7 @@ jobs:
 
       - name: set up QEMU for Termux smoke
         if: matrix.target == 'aarch64-linux-android'
-        uses: docker/setup-qemu-action@c7d53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
         with:
           platforms: arm64
 
