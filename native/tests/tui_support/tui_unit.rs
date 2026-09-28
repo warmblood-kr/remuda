@@ -110,6 +110,7 @@ fn refresh_waits_for_the_slow_tick_when_nothing_forced_it() {
 
 fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
     SessionSummary {
+        id: String::new(),
         name: name.into(),
         instance_id: Some("test-session".into()),
         output_version: Some(0),
@@ -129,6 +130,94 @@ fn make_ui(rows: Vec<SessionSummary>) -> Ui {
     ui.session_rows = 3;
     ui.preview_rows = 23;
     ui
+}
+
+#[test]
+fn short_terminal_preview_keeps_a_top_line_visible_at_all_supported_heights() {
+    let mut ui = make_ui(vec![row("shell", true, false)]);
+    ui.list_visible = false;
+    let mut cells = vec![vec![remuda_core::agent::StyledCell::default(); 80]; 24];
+    for (col, ch) in "one-line".chars().enumerate() {
+        cells[0][col] = remuda_core::agent::StyledCell {
+            text: ch.to_string(),
+            ..remuda_core::agent::StyledCell::default()
+        };
+    }
+    let cursor = remuda_core::agent::Cursor {
+        row: 0,
+        col: 8,
+        visible: true,
+    };
+
+    for terminal_rows in [10, 12, 16, 20, 24] {
+        let frame = render_styled(&ui, &cells, cursor, "test", 80, terminal_rows);
+        assert!(
+            frame.contains("one-line"),
+            "top-line session content disappeared at terminal height {terminal_rows}"
+        );
+    }
+}
+
+#[test]
+fn a_visible_cursor_stays_in_a_short_crop_even_with_a_footer_below_it() {
+    fn cell(text: &str) -> remuda_core::agent::StyledCell {
+        remuda_core::agent::StyledCell {
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+    let mut cells = vec![vec![cell(" "); 80]; 24];
+    cells[0][0] = cell("cursor");
+    cells[23][0] = cell("footer");
+    let cursor = Cursor {
+        row: 0,
+        col: 0,
+        visible: true,
+    };
+
+    let mut ui = make_ui(vec![row("shell", true, false)]);
+    ui.list_visible = false;
+    for body in [2, 3] {
+        let frame = render_styled(&ui, &cells, cursor, "test", 80, body + 1);
+        let (lines, _) = crop_styled(&cells, 80, body, 0, cursor.row as usize);
+        assert!(lines.iter().any(|line| line.contains("cursor")));
+        assert!(
+            frame.contains("cursor"),
+            "cursor row was cropped: {frame:?}"
+        );
+        assert!(frame.contains("\x1b[1;1H"), "caret was cropped: {frame:?}");
+    }
+}
+
+#[test]
+fn hidden_cursor_keeps_the_bottom_crop_stable_as_historical_output_grows() {
+    fn cell(text: &str) -> remuda_core::agent::StyledCell {
+        remuda_core::agent::StyledCell {
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+    let mut before = vec![vec![cell(" "); 80]; 24];
+    before[20][0] = cell("older");
+    let mut after = before.clone();
+    after[21][0] = cell("new output");
+    let hidden = hidden_cursor();
+
+    let mut ui = make_ui(vec![row("shell", true, false)]);
+    ui.list_visible = false;
+    ui.scrollback.entry("shell".into()).or_default().offset = 5;
+    let before_offset = preview_row_offset(&before, hidden, 2, true);
+    let after_offset = preview_row_offset(&after, hidden, 2, true);
+    assert_eq!(
+        before_offset, after_offset,
+        "historical view must not follow new last text row"
+    );
+    let before_frame = render_styled(&ui, &before, hidden, "test", 80, 3);
+    let after_frame = render_styled(&ui, &after, hidden, "test", 80, 3);
+    assert_eq!(
+        before_frame, after_frame,
+        "new output must not move the short historical crop"
+    );
 }
 
 #[cfg(windows)]
@@ -211,6 +300,15 @@ fn a_click_on_a_list_row_selects_and_enters_it_like_arrow_plus_enter() {
     assert_eq!(ui.on_mouse(click(5, 4), 80, 24), Action::Focus("b".into()));
     assert_eq!(ui.selected, 1, "clicked the second row");
     assert_eq!(ui.focus, Focus::Session, "a click enters, same as Enter");
+}
+
+#[test]
+fn mouse_actions_are_ignored_after_daemon_is_gone() {
+    let mut ui = make_ui(vec![row("a", true, false), row("b", true, false)]);
+    ui.daemon_gone = Some("/tmp/dead.sock".into());
+    assert_eq!(ui.on_mouse(click(5, 4), 80, 24), Action::Nothing);
+    assert_eq!(ui.focus, Focus::List);
+    assert_eq!(ui.selected, 0);
 }
 
 #[test]
@@ -1159,7 +1257,8 @@ fn the_styled_crop_matches_plain_crop_when_every_cell_is_default() {
             for pan in 0..=max_len + 2 {
                 for rows in 0..=max_rows + 2 {
                     let want = crop(screen, cols, rows, pan);
-                    let (got_lines, got_cut) = crop_styled(&cells, cols, rows, pan);
+                    let (got_lines, got_cut) =
+                        crop_styled(&cells, cols, rows, pan, cells.len().saturating_sub(1));
                     // Defensive: a default-only row should never actually
                     // carry a trailing reset, but strip one if present
                     // rather than assume it.
@@ -1223,7 +1322,7 @@ fn a_cut_after_a_wide_cell_never_overflows_the_pane_width() {
     let row = vec![plain("a"), plain("b"), wide, continuation, plain("x")];
     let cols = 4;
 
-    let (lines, cut) = crop_styled(&[row], cols, 1, 0);
+    let (lines, cut) = crop_styled(&[row], cols, 1, 0, 0);
     assert!(
         cut,
         "there is more content than fits — this must be marked cut"
@@ -2066,14 +2165,13 @@ fn a_hidden_cursor_never_gets_a_show_sequence() {
     );
 }
 
-/// A cursor scrolled above the bottom-anchored viewport (more session
-/// rows than the pane has height for) must not paint a caret at some
-/// clamped, wrong row — steps/027's axis 3.
+/// A visible cursor stays in the preview even when the outer terminal is
+/// shorter than the session screen; it must not be clamped to a wrong row.
 #[test]
-fn a_cursor_scrolled_out_of_the_viewport_is_hidden_not_clamped() {
+fn a_visible_cursor_stays_in_the_preview_when_the_outer_terminal_is_short() {
     let ui = make_ui(vec![row("claude", true, false)]);
-    // 20 session rows into a 9-row body (rows=10): row_offset = 11, so
-    // session row 0 is 11 rows above the visible window.
+    // 20 session rows into a 9-row body (rows=10): the content-aware
+    // viewport must move up to include the still-visible cursor at row 0.
     let cells = vec![text_row(10); 20];
     let cursor = Cursor {
         row: 0,
@@ -2082,8 +2180,8 @@ fn a_cursor_scrolled_out_of_the_viewport_is_hidden_not_clamped() {
     };
     let out = render_styled(&ui, &cells, cursor, "default", 80, 10);
     assert!(
-        out.ends_with("\x1b[?25l\x1b[?2026l"),
-        "row 0 is scrolled off above the visible window: {out:?}"
+        out.contains("\x1b[1;18H\x1b[?25h"),
+        "cursor row remains visible: {out:?}"
     );
 }
 
@@ -2396,6 +2494,155 @@ fn list_reports_a_transport_failure_instead_of_an_empty_herd() {
         "no daemon answered — an empty Ok(vec![]) would read as \
              'no sessions exist', which is not what happened: {result:?}"
     );
+}
+
+#[test]
+fn daemon_gone_requires_three_transport_failures_unless_the_endpoint_is_definitively_dead() {
+    assert!(!daemon_failure_marks_gone(1, false));
+    assert!(!daemon_failure_marks_gone(2, false));
+    assert!(daemon_failure_marks_gone(3, false));
+    assert!(daemon_failure_marks_gone(1, true));
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_socket_is_definitive_only_when_its_lifetime_lock_is_free() {
+    use std::os::fd::AsRawFd;
+
+    let dir = std::env::temp_dir().join(format!("remuda-tui-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make private lock probe directory");
+    let socket = dir.join("s.sock");
+    std::fs::write(&socket, b"stale endpoint").expect("make endpoint exist");
+    let lock_path = dir.join("s.sock.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lock file");
+    let refused = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert!(
+        !daemon_is_definitively_gone(&socket, &refused),
+        "a held daemon lock means a refused connection is not proof"
+    );
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    assert!(daemon_is_definitively_gone(&socket, &refused));
+    std::fs::remove_dir_all(dir).expect("remove private lock probe directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+
+    let dir = std::env::temp_dir().join(format!("remuda-tui-busy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make private busy daemon directory");
+    let socket = dir.join("s.sock");
+    drop(UnixListener::bind(&socket).expect("bind private endpoint"));
+    let lock_path = dir.join("s.sock.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .expect("open private lifetime lock");
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let connect_error = crate::ipc::connect(&socket).expect_err("placeholder is not a socket");
+    assert_eq!(
+        connect_error.kind(),
+        std::io::ErrorKind::ConnectionRefused,
+        "{connect_error:?}"
+    );
+    assert!(!daemon_is_definitively_gone(&socket, &connect_error));
+
+    let mut ui = make_ui(vec![row("remembered", true, false)]);
+    ui.consecutive_transport_failures = 2;
+    let mut held = None;
+    let mut painted = String::new();
+    let mut shown = None;
+    refresh(
+        &socket,
+        "test",
+        &mut ui,
+        &mut held,
+        &mut painted,
+        &mut shown,
+        false,
+        false,
+    )
+    .expect("refresh handles refused private endpoint");
+    assert!(
+        ui.daemon_gone.is_none(),
+        "held lifetime lock means the daemon may be busy"
+    );
+    assert_eq!(
+        ui.consecutive_transport_failures, 0,
+        "busy refusal must not count"
+    );
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    drop(lock);
+    std::fs::remove_dir_all(dir).expect("remove private busy daemon directory");
+}
+
+#[test]
+fn a_missing_daemon_marks_the_cached_list_stale_and_offers_restart_or_quit() {
+    // Use the daemon's platform-specific address shape. On Windows the IPC
+    // endpoint is a named pipe, and arbitrary filesystem paths are rejected
+    // before connection (so they cannot prove that a daemon is gone).
+    let dir = if cfg!(unix) {
+        std::path::PathBuf::from(format!("/tmp/rm-{}", std::process::id()))
+    } else {
+        std::env::temp_dir().join(format!("remuda-tui-missing-{}", std::process::id()))
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make private missing-daemon fixture");
+    let path = crate::daemon::socket_path_in(&dir, "s");
+    let mut ui = make_ui(vec![row("remembered", true, false)]);
+    ui.mode = Mode::Prompt("sh".into());
+    let mut held = None;
+    let mut painted = String::new();
+    let mut shown = None;
+
+    refresh(
+        &path,
+        "test",
+        &mut ui,
+        &mut held,
+        &mut painted,
+        &mut shown,
+        false,
+        false,
+    )
+    .expect("draw stale list");
+
+    assert_eq!(ui.sessions.len(), 1, "keep the last known sessions");
+    assert_eq!(ui.mode, Mode::Browse, "leave prompts when daemon dies");
+    let frame = render(&ui, "", "test", 80, 24);
+    assert!(
+        frame.contains(&format!("daemon gone (stale): {}", path.display())),
+        "identify the missing daemon and stale list: {frame:?}"
+    );
+    assert!(
+        frame.contains("r restart"),
+        "offer an explicit restart: {frame:?}"
+    );
+    assert!(frame.contains("q quit"), "offer quit: {frame:?}");
+    assert_eq!(ui.on_key(press(KeyCode::Char('r'))), Action::Restart);
+    assert_eq!(ui.on_key(press(KeyCode::Char('q'))), Action::Quit);
+    std::fs::remove_dir_all(dir).expect("remove private missing-daemon fixture");
 }
 
 /// [MEASURED] `capture_styled` (the pane's own function) against a real

@@ -6,6 +6,7 @@ use std::time::Duration;
 fn ui_with_mouse_tracking(mouse_tracking: bool) -> Ui {
     Ui::new(
         vec![SessionSummary {
+            id: String::new(),
             name: "agent".into(),
             instance_id: Some("test-agent".into()),
             output_version: Some(0),

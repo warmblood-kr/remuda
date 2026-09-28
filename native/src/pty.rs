@@ -440,6 +440,10 @@ impl AgentProcess for PtyAgent {
     fn size(&self) -> Size {
         self.size
     }
+
+    fn process_id(&self) -> Option<u32> {
+        self.child.process_id()
+    }
 }
 
 fn capture_snapshot(

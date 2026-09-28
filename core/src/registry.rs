@@ -31,6 +31,9 @@ use std::sync::{Arc, Mutex};
 /// registry — the caller may be a viewer on another machine.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SessionSummary {
+    /// Stable identity for this daemon lifetime; unlike `name`, it is never reused.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     /// Unique to this particular start, even when a later process reuses its name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,6 +131,23 @@ impl Registry {
         self.lock().get(name).map(Arc::clone)
     }
 
+    /// Look up a tracked session identity without reaping exited sessions.
+    pub fn name_for_id(&self, id: &str) -> Option<String> {
+        self.lock()
+            .values()
+            .find(|session| session.id() == id)
+            .map(|session| session.name().to_string())
+    }
+
+    /// Process IDs for the live session children. Exited sessions remain
+    /// listed, but cannot be parents of an active shutdown requester.
+    pub fn live_process_ids(&self) -> Vec<u32> {
+        self.lock()
+            .values()
+            .filter_map(|session| session.process_id_if_alive())
+            .collect()
+    }
+
     /// A snapshot of every session, sorted by name so callers can diff two
     /// listings without sorting first.
     pub fn list(&self) -> Vec<SessionSummary> {
@@ -135,6 +155,7 @@ impl Registry {
             .lock()
             .values()
             .map(|s| SessionSummary {
+                id: s.id().to_string(),
                 name: s.name().to_string(),
                 instance_id: Some(s.instance_id().to_string()),
                 output_version: s.output_version(),

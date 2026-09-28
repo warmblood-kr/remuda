@@ -103,7 +103,16 @@ fn daemon_lock_file_is_private() {
     let metadata = std::fs::metadata(&lock).expect("daemon lock file exists");
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     assert_eq!(
-        client::request(&socket, &Request::Shutdown).expect("request shutdown"),
+        client::request(
+            &socket,
+            &Request::Shutdown {
+                requester_daemon_id: None,
+                requester_session_id: None,
+                requester_session_name: None,
+                override_hosted: false,
+            },
+        )
+        .expect("request shutdown"),
         Response::Ok
     );
     assert!(
@@ -176,7 +185,16 @@ fn concurrent_daemon_starts_serialize_stale_socket_replacement() {
     }
 
     assert_eq!(
-        client::request(&socket, &Request::Shutdown).expect("stop winning daemon"),
+        client::request(
+            &socket,
+            &Request::Shutdown {
+                requester_daemon_id: None,
+                requester_session_id: None,
+                requester_session_name: None,
+                override_hosted: false,
+            },
+        )
+        .expect("stop winning daemon"),
         Response::Ok
     );
     let first_exited = first.left_on_its_own();
@@ -2422,7 +2440,7 @@ fn stop_refuses_to_kill_a_live_session_without_being_told_twice() {
         "the daemon died despite refusing"
     );
 
-    // -f is the way past it, and the same daemon now goes.
+    // Outside a hosted session, -f remains the no-prompt path for a live herd.
     let forced = remuda(&dir, &["-s", "s", "stop", "-f"]);
     assert!(
         forced.status.success(),
@@ -2430,6 +2448,295 @@ fn stop_refuses_to_kill_a_live_session_without_being_told_twice() {
         String::from_utf8_lossy(&forced.stderr)
     );
     assert!(daemon.left_on_its_own(), "-f did not stop it");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_session_cannot_force_stop_its_own_daemon_without_an_explicit_override() {
+    let dir = scratch_dir("stop-inside");
+    let path = daemon::socket_path_in(&dir, "s");
+    let mut daemon = Daemon::spawn(&dir);
+    let binary = env!("CARGO_BIN_EXE_remuda");
+    let alias = dir.join("runtime-alias");
+    std::os::unix::fs::symlink(&dir, &alias).expect("runtime symlink");
+    let env = std::collections::HashMap::from([(
+        "REMUDA_RUNTIME_DIR".to_string(),
+        alias.to_string_lossy().into_owned(),
+    )]);
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("inside".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("'{binary}' -s s stop -f --yes; sleep 30"),
+            ],
+            size: Size::new(100, 30),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("create managed session");
+    assert!(matches!(response, Response::Value(_)));
+
+    assert_session_shutdown_identity_is_refused(&path, daemon.0.id());
+
+    let deadline = Instant::now() + PATIENCE;
+    let screen = loop {
+        let screen = capture(&path, "inside");
+        if screen.contains("cannot stop this daemon") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stop command did not report its refusal: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        screen.contains("--i-am-inside"),
+        "missing explicit override guidance: {screen}"
+    );
+    assert!(
+        remuda_native::ipc::connect(&path).is_ok(),
+        "the daemon died"
+    );
+    let stopped = client::request(
+        &path,
+        &Request::New {
+            name: Some("override".into()),
+            command: vec![
+                binary.into(),
+                "-s".into(),
+                "s".into(),
+                "stop".into(),
+                "-f".into(),
+                "--yes".into(),
+                "--i-am-inside".into(),
+            ],
+            size: Size::new(100, 30),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("request override session");
+    assert!(matches!(stopped, Response::Value(_)));
+    assert!(
+        daemon.left_on_its_own(),
+        "daemon did not exit after override"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+fn assert_session_shutdown_identity_is_refused(path: &Path, daemon_id: u32) {
+    let sessions = match client::request(path, &Request::List).expect("list sessions") {
+        Response::Sessions(sessions) => sessions,
+        response => panic!("unexpected list response: {response:?}"),
+    };
+    let session_id = sessions
+        .iter()
+        .find(|session| session.name == "inside")
+        .expect("inside session")
+        .id
+        .clone();
+    let raw_shutdown = client::request(
+        path,
+        &Request::Shutdown {
+            requester_daemon_id: Some(daemon_id.to_string()),
+            requester_session_id: Some(session_id),
+            requester_session_name: Some("inside".into()),
+            override_hosted: false,
+        },
+    )
+    .expect("raw shutdown response");
+    assert!(
+        matches!(&raw_shutdown, Response::Error(reason) if reason.contains("one of its own sessions")),
+        "raw shutdown was not refused: {raw_shutdown:?}"
+    );
+    let stale_identity = client::request(
+        path,
+        &Request::Shutdown {
+            requester_daemon_id: Some(daemon_id.to_string()),
+            requester_session_id: Some("stale-session-id".into()),
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("stale identity response");
+    assert!(
+        matches!(&stale_identity, Response::Error(reason) if reason.contains("one of its own sessions")),
+        "unknown identity from this daemon was not refused: {stale_identity:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn shutdown_uses_peer_ancestry_when_session_environment_is_stripped() {
+    let dir = scratch_dir("stop-ancestry-red");
+    let path = daemon::socket_path_in(&dir, "s");
+    let mut daemon = Daemon::spawn(&dir);
+    let runtime = dir.to_string_lossy();
+    let path_text = path.to_string_lossy();
+    let path_value = std::env::var("PATH").unwrap_or_default();
+    let binary = env!("CARGO_BIN_EXE_remuda");
+    let test_binary = std::env::current_exe().expect("integration test binary path");
+    let cli = format!(
+        "/usr/bin/env -i PATH='{}' REMUDA_RUNTIME_DIR='{}' '{}' -s s stop -f --yes; sleep 30",
+        path_value, runtime, binary
+    );
+    let raw = format!(
+        "/usr/bin/env -i PATH='{}' REMUDA_RUNTIME_DIR='{}' REMUDA_TEST_RAW_SHUTDOWN_SOCKET='{}' '{}' --exact raw_shutdown_descendant_helper --nocapture; sleep 30",
+        path_value,
+        runtime,
+        path_text,
+        test_binary.display()
+    );
+    for (name, command) in [("env-stop", cli), ("raw-stop", raw)] {
+        let response = client::request(
+            &path,
+            &Request::New {
+                name: Some(name.into()),
+                command: vec!["sh".into(), "-c".into(), command],
+                size: Size::new(100, 30),
+                cwd: None,
+                env: Some(std::collections::HashMap::from([(
+                    "REMUDA_RUNTIME_DIR".into(),
+                    runtime.to_string(),
+                )])),
+            },
+        )
+        .expect("start descendant requester");
+        assert!(matches!(response, Response::Value(_)));
+    }
+
+    let deadline = Instant::now() + PATIENCE;
+    let cli_screen = loop {
+        let screen = capture(&path, "env-stop");
+        if screen.contains("cannot stop this daemon") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "env -i requester was not refused: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(cli_screen.contains("--i-am-inside"), "{cli_screen}");
+
+    let deadline = Instant::now() + PATIENCE;
+    let raw_screen = loop {
+        let screen = capture(&path, "raw-stop");
+        if screen.contains("raw_shutdown_descendant_helper") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "raw Shutdown helper did not run: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(raw_screen.contains("ok"), "raw helper failed: {raw_screen}");
+    assert!(
+        remuda_native::ipc::connect(&path).is_ok(),
+        "daemon was stopped"
+    );
+
+    let stopped = client::request(
+        &path,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("outside shutdown");
+    assert_eq!(stopped, Response::Ok);
+    assert!(
+        daemon.left_on_its_own(),
+        "outside caller did not stop daemon"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_shutdown_descendant_helper() {
+    let Ok(path) = std::env::var("REMUDA_TEST_RAW_SHUTDOWN_SOCKET") else {
+        return;
+    };
+    let response = client::request(
+        Path::new(&path),
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("raw descendant shutdown response");
+    assert!(
+        matches!(&response, Response::Error(reason) if reason.contains("one of its own sessions")),
+        "raw descendant Shutdown was not refused: {response:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_session_can_stop_a_different_private_daemon() {
+    let dir_a = scratch_dir("stop-foreign-a");
+    let dir_b = scratch_dir("stop-foreign-b");
+    let path_a = daemon::socket_path_in(&dir_a, "s");
+    let mut daemon_a = Daemon::spawn(&dir_a);
+    let mut daemon_b = Daemon::spawn(&dir_b);
+    let env = std::collections::HashMap::from([(
+        "REMUDA_RUNTIME_DIR".to_string(),
+        dir_b.to_string_lossy().into_owned(),
+    )]);
+    let response = client::request(
+        &path_a,
+        &Request::New {
+            name: Some("foreign-stop".into()),
+            command: vec![
+                env!("CARGO_BIN_EXE_remuda").into(),
+                "-s".into(),
+                "s".into(),
+                "stop".into(),
+                "-f".into(),
+                "--yes".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start foreign stop command");
+    assert!(matches!(response, Response::Value(_)));
+    assert!(
+        daemon_b.left_on_its_own(),
+        "different daemon was not stopped"
+    );
+    assert!(
+        remuda_native::ipc::connect(&path_a).is_ok(),
+        "the session's own daemon was stopped"
+    );
+    let stopped_a = client::request(
+        &path_a,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("stop session daemon");
+    assert_eq!(stopped_a, Response::Ok);
+    assert!(daemon_a.left_on_its_own(), "session daemon did not stop");
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
 }
 
 /// A name with no matching arm is a plain error naming the package, not a
@@ -2655,6 +2962,91 @@ fn a_sigkilled_daemon_reaps_its_direct_process_child_but_not_an_already_forked_g
     unsafe {
         libc::kill(grandchild_pid, libc::SIGKILL);
     }
+}
+
+/// The Codex app-server is detached into its own process group, so daemon PTY
+/// teardown cannot HUP it. Its parent-death guard must still reap it when the
+/// daemon dies and the session's remuda CLI disappears.
+#[cfg(unix)]
+#[test]
+fn a_sigkilled_daemon_reaps_a_codex_app_server_in_its_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("codex-parent-death");
+    let mut daemon = Daemon::spawn(&dir);
+    let path = daemon::socket_path_in(&dir, "s");
+    let stub_dir = dir.join("bin");
+    std::fs::create_dir_all(&stub_dir).unwrap();
+    let pid_file = dir.join("app-server.pid");
+    let stub = stub_dir.join("codex");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nif [ \"$1\" = app-server ]; then\n  trap '' HUP\n  echo $$ > \"$STUB_PIDFILE\"\nfi\nexec /bin/sleep 60\n",
+    )
+    .unwrap();
+    let mut mode = std::fs::metadata(&stub).unwrap().permissions();
+    mode.set_mode(0o755);
+    std::fs::set_permissions(&stub, mode).unwrap();
+    let env = std::collections::HashMap::from([
+        ("PATH".to_string(), stub_dir.to_string_lossy().into_owned()),
+        (
+            "STUB_PIDFILE".to_string(),
+            pid_file.to_string_lossy().into_owned(),
+        ),
+    ]);
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("codex".into()),
+            command: vec![
+                env!("CARGO_BIN_EXE_remuda").into(),
+                "_codex_tui".into(),
+                "--status".into(),
+                dir.join("status").to_string_lossy().into_owned(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start Codex TUI session");
+    assert!(matches!(response, Response::Value(_)));
+
+    let deadline = Instant::now() + PATIENCE;
+    let app_server_pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            break pid.trim().parse::<i32>().unwrap();
+        }
+        assert!(Instant::now() < deadline, "stub app-server never started");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        pid_alive(app_server_pid),
+        "app-server exited before daemon death"
+    );
+
+    assert_eq!(
+        unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGKILL) },
+        0,
+        "kill private daemon"
+    );
+    let _ = daemon.0.wait();
+    let deadline = Instant::now() + PATIENCE;
+    while pid_alive(app_server_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let app_server_reaped = !pid_alive(app_server_pid);
+    if !app_server_reaped {
+        // Keep a regression failure from leaving the stub process behind.
+        unsafe {
+            libc::kill(app_server_pid, libc::SIGKILL);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        app_server_reaped,
+        "Codex app-server ({app_server_pid}) outlived the killed daemon"
+    );
 }
 
 /// [MEASURED, unix] The one path that DOES reach a grandchild: a clean

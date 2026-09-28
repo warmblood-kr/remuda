@@ -168,7 +168,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         | Request::Mkdir { .. }
         | Request::RemoveDirAll { .. }
         | Request::Version
-        | Request::Shutdown
+        | Request::Shutdown { .. }
         | Request::Eval { .. } => Err(format!("remote front refuses {request:?}")),
     }
 }
@@ -239,7 +239,12 @@ mod tests {
             Request::Mkdir { path: "/".into() },
             Request::RemoveDirAll { path: "/".into() },
             Request::Version,
-            Request::Shutdown,
+            Request::Shutdown {
+                requester_daemon_id: None,
+                requester_session_id: None,
+                requester_session_name: None,
+                override_hosted: false,
+            },
         ];
         for request in dangerous {
             let encoded = serde_json::to_vec(&request).unwrap();
