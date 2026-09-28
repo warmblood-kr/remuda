@@ -1955,6 +1955,38 @@ fn confirmed_close_refuses_a_mismatched_instance_and_keeps_the_session() {
 }
 
 #[test]
+fn confirmed_close_requires_true_confirmation_and_keeps_the_session() {
+    let path = scratch("close-unconfirmed-instance");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    let instance_id = match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "target")
+            .and_then(|session| session.instance_id)
+            .expect("session instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+
+    for confirm in [Some(false), None] {
+        let response = client::request(
+            &path,
+            &Request::Close {
+                name: "target".into(),
+                instance_id: Some(instance_id.clone()),
+                confirm,
+            },
+        )
+        .expect("close response");
+        assert!(matches!(response, Response::Error(_)), "{response:?}");
+        assert!(matches!(
+            client::request(&path, &Request::List),
+            Ok(Response::Sessions(sessions)) if sessions.iter().any(|session| session.name == "target")
+        ));
+    }
+}
+
+#[test]
 fn confirmed_close_ends_the_matching_instance() {
     let path = scratch("close-confirmed-instance");
     let _daemon = daemon_at(&path);
