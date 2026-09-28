@@ -397,10 +397,10 @@ fn read_stdin_timeout(
     timeout: std::time::Duration,
 ) -> std::io::Result<Option<usize>> {
     use windows_sys::Win32::{
-        Foundation::HANDLE,
+        Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
         System::{
             Console::{GetStdHandle, STD_INPUT_HANDLE},
-            Threading::{WaitForSingleObject, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            Threading::WaitForSingleObject,
         },
     };
     let handle: HANDLE = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
