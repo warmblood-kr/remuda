@@ -926,9 +926,85 @@ impl Drop for RawMode {
 mod tests {
     #[cfg(unix)]
     use super::trace_input_read;
-    use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
-    use remuda_core::protocol::Response;
-    use std::time::{Duration, UNIX_EPOCH};
+    use super::{
+        interpret, request_with_timeout, reset_input_modes, write_input_trace, RESET_INPUT_MODES,
+    };
+    use crate::ipc;
+    use interprocess::local_socket::traits::ListenerExt;
+    use remuda_core::protocol::{Request, Response};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant, UNIX_EPOCH};
+
+    fn assert_request_timeout(request: Request) {
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+        const TIMEOUT: Duration = Duration::from_millis(300);
+        const TEST_DEADLINE: Duration = Duration::from_secs(2);
+        let path = std::env::temp_dir().join(format!(
+            "remuda-timeout-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = ipc::listen(&path).expect("bind raw local listener");
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let stream = listener
+                .incoming()
+                .next()
+                .expect("incoming connection")
+                .expect("accept");
+            accepted_tx.send(()).expect("notify accepted");
+            release_rx.recv().expect("release silent peer");
+            drop(stream);
+        });
+
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let client_path = path.clone();
+        let client = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = request_with_timeout(&client_path, &request, TIMEOUT);
+            result_tx
+                .send((result, started.elapsed()))
+                .expect("report timed request");
+        });
+        accepted_rx
+            .recv_timeout(TEST_DEADLINE)
+            .expect("client did not connect to raw listener");
+
+        let result = result_rx.recv_timeout(TEST_DEADLINE);
+        // Release the peer even on failure: this lets a broken implementation
+        // that forgot to wake its blocked read finish before the assertion.
+        release_tx.send(()).expect("release silent peer");
+        server.join().expect("silent listener thread");
+        client.join().expect("timed request thread");
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&path);
+
+        let (result, elapsed) = result.expect("request_with_timeout exceeded test deadline");
+        let error = result.expect_err("silent listener unexpectedly produced a reply");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed >= TIMEOUT && elapsed < TEST_DEADLINE,
+            "timeout returned outside the expected window: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn request_timeout_wakes_a_peer_that_never_replies() {
+        assert_request_timeout(Request::Version);
+    }
+
+    #[test]
+    fn request_timeout_bounds_a_large_input_to_a_peer_that_never_reads() {
+        assert_request_timeout(Request::Input {
+            name: "target".into(),
+            instance_id: "instance".into(),
+            client_id: "client".into(),
+            seq: 1,
+            bytes: vec![b'x'; 64 * 1024],
+        });
+    }
 
     #[test]
     fn detach_resets_mouse_and_bracketed_paste_modes() {
