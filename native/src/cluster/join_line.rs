@@ -114,7 +114,7 @@ fn validate_static_key(public_key: &[u8; 32]) -> io::Result<()> {
             "issuer static public key cannot be all zero",
         ));
     }
-    Ok(())
+    crate::net::frame::validate_static_public_key(public_key)
 }
 
 fn decode_canonical_key(value: &str, description: &str) -> io::Result<Vec<u8>> {

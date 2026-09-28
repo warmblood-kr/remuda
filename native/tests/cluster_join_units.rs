@@ -343,6 +343,19 @@ fn join_line_rejects_all_zero_static_key() {
 }
 
 #[test]
+fn join_line_rejects_known_low_order_static_key() {
+    let mut low_order = [0u8; 32];
+    low_order[0] = 1;
+    let invalid = format!(
+        "remuda-join-v1 10.0.0.1:443 {} {} {}",
+        fingerprint(&low_order),
+        remuda_native::cluster::encoding::encode_base64(&low_order),
+        remuda_native::cluster::encoding::encode_base64(&[9; 32])
+    );
+    assert!(JoinLine::decode(&invalid).is_err());
+}
+
+#[test]
 fn join_line_pin_check_matches_and_rejects_mismatch() {
     let keypair = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
         .generate_keypair()

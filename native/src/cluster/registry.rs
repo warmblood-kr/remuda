@@ -146,6 +146,12 @@ fn validate_entry(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
             "registry fingerprint does not match public key",
         ));
     }
+    crate::net::frame::validate_static_public_key(&public_key).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "registry static public key is a low-order X25519 point",
+        )
+    })?;
     if !valid_fingerprint(&entry.by) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -990,6 +996,25 @@ mod tests {
     fn registry_rejects_invalid_endpoint_hints() {
         let mut invalid = entry("bad-endpoint", NodeState::Admitted, 1, "node");
         invalid.endpoint = Some("0.0.0.0:9443".into());
+        assert!(Registry {
+            authorized_nodes: vec![invalid]
+        }
+        .digest()
+        .is_err());
+    }
+
+    #[test]
+    fn registry_rejects_known_low_order_x25519_points() {
+        let mut low_order = [0u8; 32];
+        low_order[0] = 1;
+        let invalid = AuthorizedNode {
+            node_fp: encoding::fingerprint(&low_order),
+            static_pubkey: encoding::encode_base64(&low_order),
+            endpoint: None,
+            state: NodeState::Admitted,
+            version: 1,
+            by: origin("node"),
+        };
         assert!(Registry {
             authorized_nodes: vec![invalid]
         }
