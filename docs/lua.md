@@ -6,6 +6,16 @@ Every installed mod and registered tool writes metadata to the same runtime
 registry; the reference output is generated from that registry at request
 time.
 
+The session API is available under `remuda.session`. Calling
+`remuda.session(name)` returns a handle onto the named session; the namespace
+also provides `list`, `new`, `close`, and `attach`. `remuda.session.list()`
+reaps exited sessions unless `REMUDA_KEEP_EXITED=1` is set in the daemon's
+environment. The older top-level `remuda.new`, `remuda.close`, `remuda.ls`,
+and `remuda.attach` names are deprecated aliases. To suppress their deprecation
+notices, set `REMUDA_SUPPRESS_DEPRECATIONS=1` in the daemon's environment when
+the daemon starts; setting it only on a CLI process cannot change the
+environment of a running daemon.
+
 ## Generate the reference
 
 ```sh

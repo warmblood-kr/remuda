@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 71] = [
+pub const BINDINGS: [&str; 74] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -36,6 +36,8 @@ pub const BINDINGS: [&str; 71] = [
     "_event_counts",
     "_extension_commands",
     "_function_source",
+    "_pending_create",
+    "_pending_events",
     "_process_drain",
     "_process_killpg",
     "_process_spawn",
@@ -82,6 +84,7 @@ pub const BINDINGS: [&str; 71] = [
     "mkdir",
     "new",
     "on",
+    "pending",
     "process",
     "processes",
     "reload",
@@ -105,6 +108,16 @@ pub const BINDINGS: [&str; 71] = [
 /// name, about, signature — one row per Rust-bound word. `tools.lua` adds its
 /// own rows for the words it defines in pure Lua, into the same table.
 const WORDS: &[(&str, &str, &str)] = &[
+    (
+        "_pending_create",
+        "Create a private bounded reply handle for remuda.pending.",
+        "_pending_create(timeout?) -> id, handle",
+    ),
+    (
+        "_pending_events",
+        "Drain deferred-reply completion and cancellation notifications for the Lua tick.",
+        "_pending_events() -> {{id, reason?}...}",
+    ),
     (
         "http",
         "Start an asynchronous bounded HTTP request; completion is delivered on the Lua image queue.",
@@ -353,6 +366,7 @@ pub fn bindings(
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
     fail_binding(lua, &table, image.clone())?;
+    pending_bindings(lua, &table, image.pending_replies())?;
 
     // In-process, not a loopback: the image always runs inside the same
     // daemon this `Registry` belongs to (image.rs), so asking over the wire
@@ -486,19 +500,62 @@ pub fn bindings(
     // the REPL, `-e`, any other script — for the full duration. Not a wait or
     // a timer primitive; remuda has no periodic-execution mechanism yet, and
     // faking one with a sleep-and-poll loop holds the Image hostage the same way.
+    sleep_binding(lua, &table)?;
+
+    Ok(table)
+}
+
+fn sleep_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
     table.set(
         "sleep",
         lua.create_function(|_, seconds: f64| {
-            // A negative or NaN duration would panic in `from_secs_f64`; a
-            // script asking to sleep backwards gets nothing rather than a crash.
+            // Negative or NaN durations do nothing instead of panicking in
+            // `Duration::from_secs_f64`.
             if seconds.is_finite() && seconds > 0.0 {
                 std::thread::sleep(Duration::from_secs_f64(seconds));
             }
             Ok(())
         })?,
-    )?;
+    )
+}
 
-    Ok(table)
+fn pending_bindings(
+    lua: &Lua,
+    table: &Table,
+    pending: crate::pending::PendingReplies,
+) -> mlua::Result<()> {
+    let create = pending.clone();
+    table.set(
+        "_pending_create",
+        lua.create_function(move |lua, timeout: Option<f64>| {
+            let seconds = timeout.unwrap_or(30.0);
+            if !seconds.is_finite() || seconds <= 0.0 || seconds > 300.0 {
+                return Err(mlua::Error::runtime(
+                    "pending timeout must be a positive number no greater than 300 seconds",
+                ));
+            }
+            let duration = Duration::from_secs_f64(seconds.max(0.000_000_001));
+            let (id, handle) = create.create(duration).map_err(|message| {
+                mlua::Error::external(crate::image::TypedFailure { message, code: 1 })
+            })?;
+            Ok((id, lua.create_userdata(handle)?))
+        })?,
+    )?;
+    table.set(
+        "_pending_events",
+        lua.create_function(move |lua, ()| {
+            let events = pending.drain_events();
+            let rows = lua.create_table_with_capacity(events.len(), 0)?;
+            for (index, event) in events.into_iter().enumerate() {
+                let row = lua.create_table()?;
+                row.set("id", event.id)?;
+                row.set("reason", event.reason)?;
+                rows.set(index + 1, row)?;
+            }
+            Ok(rows)
+        })?,
+    )?;
+    Ok(())
 }
 
 /// `remuda.new(name, argv, cwd, env)` — split out of `bindings` to stay under
@@ -927,6 +984,9 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         // adding one later is a compile error to think about, not a silent
         // fall-through that returns the wrong shape.
         Response::Value(text) => Ok(Value::String(lua.create_string(&text)?)),
+        Response::CommandResult { .. } => Err(mlua::Error::runtime(
+            "deferred command replies cannot be consumed as a Lua value",
+        )),
         Response::Sessions(list) => {
             let rows = lua.create_table()?;
             for (index, session) in list.into_iter().enumerate() {
