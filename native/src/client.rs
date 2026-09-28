@@ -147,6 +147,15 @@ fn skew(detail: &str) -> String {
 pub enum Left {
     Detached,
     Exited,
+    TakenOver,
+}
+
+const TAKEN_OVER_NOTICE: &[u8] = b"\r\n[remuda] attached elsewhere, detached\r\n";
+
+fn takeover_notice_position(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(TAKEN_OVER_NOTICE.len())
+        .position(|window| window == TAKEN_OVER_NOTICE)
 }
 
 /// Give this terminal to a session until the user presses [`DETACH`] or the
@@ -183,6 +192,7 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
     // Only the key thread can tell the two exits apart: the reader below just
     // sees the stream end, which is true of a detach and of a death alike.
     let detached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let taken_over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let output_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let output_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let trace_input = std::env::var_os("REMUDA_TRACE_INPUT").map(PathBuf::from);
@@ -230,6 +240,7 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
 
     let mut stdout = std::io::stdout();
     let mut buf = [0u8; 8192];
+    let mut observed = Vec::new();
     let mut reader = reader_stream.as_ref();
     while !output_stop.load(std::sync::atomic::Ordering::SeqCst) {
         let Ok(n) = reader.read(&mut buf) else {
@@ -238,8 +249,18 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
         if n == 0 {
             break;
         }
+        observed.extend_from_slice(&buf[..n]);
+        let found = takeover_notice_position(&observed).is_some();
         if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
             break;
+        }
+        if found {
+            taken_over.store(true, std::sync::atomic::Ordering::SeqCst);
+            break;
+        }
+        let keep = TAKEN_OVER_NOTICE.len().saturating_sub(1);
+        if observed.len() > keep {
+            observed.drain(..observed.len() - keep);
         }
     }
 
@@ -247,7 +268,9 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
     ipc::stop_reader(&reader_stream, &output_stop, || {
         output_done.load(std::sync::atomic::Ordering::SeqCst)
     });
-    let left = if detached.load(std::sync::atomic::Ordering::SeqCst) {
+    let left = if taken_over.load(std::sync::atomic::Ordering::SeqCst) {
+        Left::TakenOver
+    } else if detached.load(std::sync::atomic::Ordering::SeqCst) {
         Left::Detached
     } else {
         // The session ended while the key thread sits in a tty read, and a tty
@@ -393,7 +416,8 @@ impl Drop for RawMode {
 #[cfg(test)]
 mod tests {
     use super::{
-        interpret, reset_input_modes, trace_input_read, write_input_trace, RESET_INPUT_MODES,
+        interpret, reset_input_modes, takeover_notice_position, trace_input_read,
+        write_input_trace, RESET_INPUT_MODES, TAKEN_OVER_NOTICE,
     };
     use remuda_core::protocol::Response;
     use std::time::{Duration, UNIX_EPOCH};
@@ -403,6 +427,15 @@ mod tests {
         let mut output = Vec::new();
         reset_input_modes(&mut output).unwrap();
         assert_eq!(output, RESET_INPUT_MODES);
+    }
+
+    #[test]
+    fn takeover_notice_is_recognized_across_raw_output_chunks() {
+        let split = TAKEN_OVER_NOTICE.len() / 2;
+        let mut output = TAKEN_OVER_NOTICE[..split].to_vec();
+        assert_eq!(takeover_notice_position(&output), None);
+        output.extend_from_slice(&TAKEN_OVER_NOTICE[split..]);
+        assert_eq!(takeover_notice_position(&output), Some(0));
     }
 
     #[test]

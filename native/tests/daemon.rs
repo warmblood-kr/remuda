@@ -14,6 +14,7 @@
 use remuda_core::protocol::{Request, Response};
 use remuda_core::{Session, Size};
 use remuda_native::{client, daemon, ipc, CommandBuilder, PtyAgent, SystemClock};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
@@ -44,7 +45,9 @@ fn scratch(tag: &str) -> PathBuf {
 fn daemon_at(path: &Path) -> impl Drop {
     let serving = path.to_path_buf();
     std::thread::spawn(move || {
-        let _ = daemon::serve(&serving);
+        if let Err(error) = daemon::serve(&serving) {
+            eprintln!("test daemon failed at {serving:?}: {error}");
+        }
     });
 
     let deadline = Instant::now() + PATIENCE;
@@ -79,6 +82,32 @@ fn new_session(path: &Path, name: &str) {
         Response::Value(name.to_string()),
         "New answers with the name it gave the session"
     );
+}
+
+/// Connect using the original attach wire shape and leave the connection in
+/// raw mode. Reading the acknowledgement one byte at a time keeps any initial
+/// screen bytes in the socket for the caller.
+fn raw_attach(path: &Path, name: &str) -> ipc::Stream {
+    let mut stream = ipc::connect(path).expect("connect attach client");
+    let mut request = serde_json::to_vec(&Request::Attach {
+        name: name.to_string(),
+    })
+    .expect("serialize Attach");
+    request.push(b'\n');
+    stream.write_all(&request).expect("send Attach");
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read(&mut byte).expect("read Attach response") == 1 {
+        response.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    assert_eq!(
+        serde_json::from_slice::<Response>(&response).expect("parse Attach response"),
+        Response::Ok
+    );
+    stream
 }
 
 fn capture(path: &Path, name: &str) -> String {
@@ -504,7 +533,7 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach().expect("drive the viewer");
+    let held = viewer.attach();
     let viewer_output = held.subscribe().expect("capture raw terminal output");
 
     // 1. Repaint: what was already there arrives without the program redrawing.
@@ -589,6 +618,44 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
             Instant::now() < deadline,
             "after detach the hold must be released, so close succeeds: {closed:?}"
         );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn a_new_attach_takes_over_and_old_raw_clients_get_a_plain_notice() {
+    let path = scratch("takeover");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+
+    // This connection models a pre-upgrade client: it knows only the existing
+    // Attach request followed by a raw byte stream, and treats EOF as ordinary.
+    let mut old = raw_attach(&path, "target");
+    let mut current = raw_attach(&path, "target");
+    let mut old_output = Vec::new();
+    old.read_to_end(&mut old_output)
+        .expect("displaced connection closes cleanly");
+    assert!(
+        old_output
+            .windows(b"[remuda] attached elsewhere, detached".len())
+            .any(|window| window == b"[remuda] attached elsewhere, detached"),
+        "older clients receive a printable explanation before EOF: {old_output:?}"
+    );
+
+    current
+        .write_all(b"echo takeover-input\r")
+        .expect("current client input");
+    wait_for(&path, "target", "takeover-input");
+    assert_eq!(target_row(&path, "r.attached"), "true");
+
+    // A third attach is accepted immediately, even while the second daemon
+    // handler is still unwinding its raw connection.
+    let third = raw_attach(&path, "target");
+    drop(current);
+    drop(third);
+    let deadline = Instant::now() + PATIENCE;
+    while target_row(&path, "r.attached") == "true" {
+        assert!(Instant::now() < deadline, "all attaches should release");
         std::thread::sleep(Duration::from_millis(20));
     }
 }

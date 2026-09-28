@@ -603,9 +603,8 @@ fn spawn(
     ))
 }
 
-/// Hand this connection over to a human. Exclusivity is enforced by
-/// `Session::attach` returning `None`, not here, so a second viewer is refused
-/// even when it arrives over some later transport.
+/// Hand this connection over to a human. A later attach displaces this one;
+/// the old connection receives a printable notice before it is closed.
 fn attach(
     stream: Stream,
     mut reader: BufReader<Stream>,
@@ -618,12 +617,7 @@ fn attach(
             &Response::error(format!("no such session: {name}")),
         );
     };
-    let Some(held) = session.attach() else {
-        return reply(
-            &stream,
-            &Response::error("already attached by someone else"),
-        );
-    };
+    let held = session.attach();
     reply(&stream, &Response::Ok)?;
 
     // Paint what is already on screen before streaming anything new, or the
@@ -676,6 +670,13 @@ fn attach(
 
         if let Some(rx) = held.subscribe() {
             while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                if held.is_displaced() {
+                    // Keep this plain text so older clients display a useful
+                    // reason before observing the ordinary EOF.
+                    let _ = out.write_all(b"\r\n[remuda] attached elsewhere, detached\r\n");
+                    let _ = out.flush();
+                    break;
+                }
                 match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                     Ok(chunk) => {
                         if out.write_all(&chunk).is_err() || out.flush().is_err() {
@@ -684,7 +685,9 @@ fn attach(
                     }
                     // Timeout: nothing was printed, which is the normal state of
                     // an idle agent. Loop back and re-check whether we are done.
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        continue;
+                    }
                     // The sender is gone: the process exited.
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }

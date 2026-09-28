@@ -167,7 +167,7 @@ remuda — a pty manager you can attach to
 
   remuda                        open the herd (a terminal is required)
   remuda run [-n name] <argv…>  start a program and ride it, in one act
-  remuda attach <name>          hand this terminal over; Ctrl-\\ detaches
+  remuda attach <name>          hand this terminal over; Ctrl-\\ detaches (2 = attached elsewhere)
   remuda ls                     list sessions
   remuda send <name> <text>     deliver one instruction (body + Enter)
 
@@ -242,7 +242,7 @@ remuda — terminal orchestration for coding agents
 
   remuda                         open the session screen
   remuda run [-n NAME] COMMAND   start and enter a session
-  remuda attach NAME             enter a session; Ctrl-\\ detaches
+  remuda attach NAME             enter a session; Ctrl-\\ detaches (exit 2 if attached elsewhere)
   remuda ls | send NAME TEXT     inspect or message sessions
   remuda stop [-f]               stop the daemon (sessions are lost)
 
@@ -328,6 +328,11 @@ fn ride(path: &Path, name: &str) -> ExitCode {
             eprintln!("remuda: {name} exited — {}", fate(path, name));
             eprintln!("remuda: you are back in your own shell");
             ExitCode::SUCCESS
+        }
+        Ok(Left::TakenOver) => {
+            // The daemon's printable notice names this outcome in the terminal.
+            // 2 is reserved for a live attachment displaced by another client.
+            ExitCode::from(2)
         }
         Err(e) => fail(format!("attach: {e}")),
     }
