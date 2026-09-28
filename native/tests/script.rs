@@ -446,3 +446,44 @@ fn clearing_one_group_leaves_the_others_hooks_firing() {
 
     script::run(&path, &write(&dir, "hooks.lua", source)).expect("hook groups");
 }
+
+/// #137: a script can tell dim text (a TUI's ghost suggestion) from typed text,
+/// and see where the cursor is.
+#[test]
+fn capture_styled_marks_dim_spans_and_reports_the_cursor() {
+    let dir = scratch("styled");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+    let code = r#"
+        remuda.new("styled", {"sh"})
+        remuda.send("styled", "printf '\\033[2mgh%sst\\033[0m-plain\\n' o")
+        local deadline = 500
+        while deadline > 0 and not remuda.capture("styled"):find("ghost%-plain") do
+          remuda.sleep(0.02)
+          deadline = deadline - 1
+        end
+        local screen, dim = remuda.capture_styled("styled"), {}
+        for _, row in ipairs(screen.rows) do
+          if row[1] and row[1].text:find("^ghost") then -- the output, not the echo
+            for _, span in ipairs(row) do
+              if span.text:find("%S") then
+                dim[#dim + 1] = span.text:match("%S+") .. "=" .. tostring(span.dim)
+              end
+            end
+          end
+        end
+        local c = screen.cursor
+        return table.concat(dim, " ") .. " cursor=" .. type(c.row) .. "," .. type(c.col) .. "," .. type(c.visible)
+    "#;
+    let got = match client::request(
+        &path,
+        &Request::Eval {
+            code: code.into(),
+            name: None,
+        },
+    ) {
+        Ok(Response::Value(value)) => value,
+        other => panic!("eval: {other:?}"),
+    };
+    assert_eq!(got, "ghost=true -plain=false cursor=number,number,boolean");
+}
