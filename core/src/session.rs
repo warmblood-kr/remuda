@@ -438,8 +438,9 @@ impl Session {
             }
             locked = self
                 .input_ready
-                .wait(locked)
-                .map_err(|_| AgentError::Io("session input lock poisoned".into()))?;
+                .wait_timeout(locked, Duration::from_millis(10))
+                .map_err(|_| AgentError::Io("session input lock poisoned".into()))?
+                .0;
         }
     }
 
