@@ -124,7 +124,7 @@ contribute
 contributions
 -------------
 
-``contributions(point) -> {{id, owner, entry}...}`` — A point's entries as copies of {id, owner, entry}, by entry.order then id.
+``contributions(point) -> {{id, owner, entry}...}`` — A point's entries as {id, owner, entry} rows, entry a shallow copy, by entry.order then id.
 
 emit
 ----

@@ -383,6 +383,14 @@ register("clear_hooks", "Remove every hook registered under a group.", "clear_ho
 -- extensions fill it. A mod's declared entries are replaced on reload.
 local contributions = {}
 
+-- Shallow: nested tables stay shared, but no caller can rewrite a field or
+-- `order` of a stored entry, including another mod's owned one.
+local function shallow_copy(entry)
+  local copy = {}
+  for key, value in pairs(entry) do copy[key] = value end
+  return copy
+end
+
 local function contribution_problem(point, id, entry)
   if type(point) ~= "string" or point == "" then return "a contribution needs a point name" end
   if type(id) ~= "string" or id == "" then return "a contribution needs an id" end
@@ -394,14 +402,14 @@ function remuda.contribute(point, id, entry)
   local problem = contribution_problem(point, id, entry)
   if problem then error(problem, 2) end
   contributions[point] = contributions[point] or {}
-  contributions[point][id] = { entry = entry }
+  contributions[point][id] = { entry = shallow_copy(entry) }
 end
 register("contribute", "Fill an extension point: the same point and id replaces. `entry.order` sorts (default 0).", "contribute(point, id, entry) -> nil")
 
 function remuda.contributions(point)
   local rows = {}
   for id, item in pairs(contributions[point] or {}) do
-    rows[#rows + 1] = { id = id, owner = item.owner, entry = item.entry }
+    rows[#rows + 1] = { id = id, owner = item.owner, entry = shallow_copy(item.entry) }
   end
   table.sort(rows, function(a, b)
     local left, right = a.entry.order or 0, b.entry.order or 0
@@ -410,7 +418,7 @@ function remuda.contributions(point)
   end)
   return rows
 end
-register("contributions", "A point's entries as copies of {id, owner, entry}, by entry.order then id.", "contributions(point) -> {{id, owner, entry}...}")
+register("contributions", "A point's entries as {id, owner, entry} rows, entry a shallow copy, by entry.order then id.", "contributions(point) -> {{id, owner, entry}...}")
 
 -- Opt-in lifecycle-managed mods keep their initialized state in the image and
 -- declare registrations as data. Reload stages the declaration and migrations

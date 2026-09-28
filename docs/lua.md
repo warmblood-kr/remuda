@@ -188,7 +188,7 @@ local text = remuda.emit_filter("before_send", "hi  ")  -- "hi"
 
 `remuda.contribute(point, id, entry)` fills an extension point that a host defines (like VS Code `contributes`). The same point and id replaces the earlier entry.
 
-`remuda.contributions(point)` returns copies of `{id, owner, entry}`, sorted by `entry.order` (default 0) and then by id.
+`remuda.contributions(point)` returns `{id, owner, entry}` rows, sorted by `entry.order` (default 0) and then by id. Each `entry` is a shallow copy: changing its fields never reaches the registry, but nested tables are shared. `contribute` stores a shallow copy too.
 
 A lifecycle mod can declare its contributions: `contributes = { [point] = { {id = ..., ...} } }`.
 - Declared entries are owned by the mod, and their function fields receive `state` first, like hooks.
