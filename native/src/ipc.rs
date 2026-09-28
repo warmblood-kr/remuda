@@ -117,6 +117,32 @@ pub fn wake(stream: &Stream) {
     }
 }
 
+/// Check whether the connected Windows named-pipe peer has closed without
+/// changing the stream's read mode; `set_nonblocking` is unsupported there.
+#[cfg(windows)]
+pub fn peer_disconnected(stream: &Stream) -> io::Result<bool> {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let Stream::NamedPipe(pipe) = stream;
+    let mut available = 0u32;
+    let result = unsafe {
+        PeekNamedPipe(
+            pipe.as_handle().as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if result != 0 {
+        Ok(false)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Stop a reader thread and wait for it to exit: `stop` (checked before
 /// every read) covers "not reading yet"; retrying `wake` until `is_finished`
 /// covers "reading, but the cancel arrived too early". See steps/029.
