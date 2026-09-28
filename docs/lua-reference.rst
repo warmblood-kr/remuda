@@ -174,7 +174,7 @@ feed
 hook_list
 ---------
 
-``hook_list(event?) -> {{event, group, id, depth, src, errors, last_error}...}`` — Copies of the registered hooks, for one event or all, in run order.
+``hook_list(event?) -> {{event, group, id, depth, owner, src, errors, last_error}...}`` — Copies of the registered hooks, for one event or all, in run order.
 
 hooks
 -----
