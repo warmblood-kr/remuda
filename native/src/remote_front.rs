@@ -217,11 +217,8 @@ fn write_response(stream: &mut crate::ipc::Stream, reply: Vec<u8>) -> std::io::R
     stream.flush()
 }
 
-/// Validate the deliberately small request surface. The explicit deny arms
-/// make the compiler require a policy decision for every new Request variant.
-/// Exhaustive on purpose: no wildcard arm, a new Request variant must be classified here.
-/// Threat model: Sync is read-only and bounded to one capped wait per request,
-/// with an overall daemon concurrency limit; it does not expose Eval or writes.
+/// Explicit request allowlist; new variants need a policy decision.
+/// Threat model: Sync is read-only and bounded; Eval and writes stay refused.
 pub fn authorize(request: &Request) -> Result<(), String> {
     match request {
         Request::List | Request::CaptureStyled { .. } | Request::Sync { .. } => Ok(()),

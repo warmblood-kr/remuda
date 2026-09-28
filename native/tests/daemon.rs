@@ -412,8 +412,8 @@ fn sync_waits_for_output_and_returns_the_new_snapshot() {
     let runtime = scratch_dir("sync-output");
     let socket = daemon::socket_path_in(&runtime, "s");
     let mut running = spawn::Daemon::spawn(&runtime);
-    start_shell_session(&socket, "sleep 0.2; printf after-sync; sleep 30");
-    let since = capture_version(&socket);
+    start_shell_session(&socket, "sleep 1.5; printf after-sync; sleep 30");
+    let since = wait_for_quiet_output_version(&socket);
     let request_socket = socket.clone();
     let started = Instant::now();
     let request = std::thread::spawn(move || {
@@ -439,7 +439,7 @@ fn sync_waits_for_output_and_returns_the_new_snapshot() {
         if output_version > since && snapshot.rows.iter().flatten().any(|run| run.text.contains("after-sync")))
     );
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_millis(2_500),
         "output notification should wake Sync well before its 5s timeout"
     );
     stop_daemon(&runtime, &socket, &mut running);
@@ -451,7 +451,7 @@ fn sync_waiter_wakes_when_session_is_resized() {
     let socket = daemon::socket_path_in(&runtime, "s");
     let mut running = spawn::Daemon::spawn(&runtime);
     start_shell_session(&socket, "sleep 30");
-    let since = capture_version(&socket);
+    let since = wait_for_quiet_output_version(&socket);
     let request_socket = socket.clone();
     let started = Instant::now();
     let request = std::thread::spawn(move || {
@@ -492,7 +492,7 @@ fn sync_times_out_with_the_current_unchanged_frame() {
     let socket = daemon::socket_path_in(&runtime, "s");
     let mut running = spawn::Daemon::spawn(&runtime);
     start_shell_session(&socket, "sleep 30");
-    let current = capture_version(&socket);
+    let current = wait_for_quiet_output_version(&socket);
     let started = Instant::now();
     let response = client::request(
         &socket,
@@ -516,7 +516,7 @@ fn sync_waiter_wakes_when_child_exits() {
     let socket = daemon::socket_path_in(&runtime, "s");
     let mut running = spawn::Daemon::spawn(&runtime);
     start_shell_session(&socket, "sleep 30");
-    let since = capture_version(&socket);
+    let since = wait_for_quiet_output_version(&socket);
     let request_socket = socket.clone();
     let started = Instant::now();
     let request = std::thread::spawn(move || {
@@ -560,7 +560,7 @@ fn sync_rechecks_instance_after_close_and_relaunch_during_wait() {
     let mut running = spawn::Daemon::spawn(&runtime);
     start_shell_session(&socket, "sleep 30");
     let old_instance = listed_session(&socket).instance_id.expect("instance id");
-    let since = capture_version(&socket);
+    let since = wait_for_quiet_output_version(&socket);
     let request_socket = socket.clone();
     let started = Instant::now();
     let request = std::thread::spawn(move || {
@@ -648,14 +648,19 @@ fn wait_for_output_version(socket: &Path, original: u64) {
 
 fn wait_for_quiet_output_version(socket: &Path) -> u64 {
     let deadline = Instant::now() + PATIENCE;
+    let mut version = capture_version(socket);
+    let mut quiet_since = Instant::now();
     loop {
-        let version = capture_version(socket);
         assert!(
             Instant::now() < deadline,
             "output version did not become quiet"
         );
-        std::thread::sleep(Duration::from_millis(100));
-        if capture_version(socket) == version {
+        std::thread::sleep(Duration::from_millis(200));
+        let next = capture_version(socket);
+        if next != version {
+            version = next;
+            quiet_since = Instant::now();
+        } else if quiet_since.elapsed() >= Duration::from_millis(400) {
             return version;
         }
     }
