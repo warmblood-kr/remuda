@@ -177,6 +177,27 @@ fn assert_bytes_in_order(output: &[u8], needles: &[&[u8]]) {
     }
 }
 
+fn assert_detach_restore(receiver: &Receiver<Vec<u8>>) {
+    #[cfg(unix)]
+    let _received_restore = collect_until_bytes(
+        receiver,
+        b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
+    );
+    #[cfg(windows)]
+    {
+        let received = collect_until_bytes(receiver, b"remuda: detached from target");
+        assert_bytes_in_order(
+            &received,
+            &[
+                b"echo $((6*7))-typed",
+                b"\x1b[?2004l",
+                b"42-typed",
+                b"remuda: detached from target",
+            ],
+        );
+    }
+}
+
 fn traced_input(path: &Path) -> Vec<u8> {
     std::fs::read_to_string(path)
         .expect("input trace file")
@@ -534,24 +555,7 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     held.write_raw(&[client::DETACH]).expect("Ctrl-\\");
     drop(held);
 
-    #[cfg(unix)]
-    let _received_restore = collect_until_bytes(
-        &viewer_output,
-        b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
-    );
-    #[cfg(windows)]
-    {
-        let received = collect_until_bytes(&viewer_output, b"remuda: detached from target");
-        assert_bytes_in_order(
-            &received,
-            &[
-                b"echo $((6*7))-typed",
-                b"\x1b[?2004l",
-                b"42-typed",
-                b"remuda: detached from target",
-            ],
-        );
-    }
+    assert_detach_restore(&viewer_output);
     let traced = traced_input(&trace_path);
     assert!(
         traced
