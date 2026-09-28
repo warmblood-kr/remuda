@@ -78,9 +78,12 @@ if not windows then
   -- and stderr. The entire call, including pipe draining, must obey timeout.
   local started = os.time()
   local held_pipes = remuda.process.run({
-    argv = { "/bin/sh", "-c", "sleep 6 & echo child-started" }, timeout = 0.2,
+    argv = { "/bin/sh", "-c", "sleep 30 & echo $!" }, timeout = 0.2,
   })
+  local held_pid = held_pipes.stdout:match("(%d+)")
+  if held_pid then os.execute("/bin/kill -KILL " .. held_pid) end
   assert(held_pipes.timed_out, "process.run must time out when a descendant holds its pipes")
+  assert(held_pid, "the pipe-holding descendant pid should be captured")
   assert(os.time() - started < 4, "process.run must return by its deadline when a descendant holds pipes")
 
   -- A descendant can escape the process group with setsid and keep both
@@ -92,23 +95,24 @@ if not windows then
   end)
   if setsid_probe then
     local escaped_pids = {}
-    for _ = 1, 8 do
-      local escaped = remuda.process.run({
-        argv = { "/bin/sh", "-c", "setsid /bin/sh -c 'echo $$; exec /bin/sleep 30' &" },
-        timeout = 0.1,
-      })
-      assert(escaped.timed_out, "setsid descendant should leave output pipes open")
-      local pid = escaped.stdout:match("(%d+)")
-      assert(pid, "setsid descendant pid should be captured")
-      escaped_pids[#escaped_pids + 1] = pid
-    end
-    local capped, cap_error = pcall(function()
-      remuda.process.run({ argv = echo_argv, timeout = 1 })
+    local exercised_cap, cap_error = pcall(function()
+      for _ = 1, 8 do
+        local escaped = remuda.process.run({
+          argv = { "/bin/sh", "-c", "setsid /bin/sh -c 'echo $$; exec /bin/sleep 30' &" },
+          timeout = 0.1,
+        })
+        assert(escaped.timed_out, "setsid descendant should leave output pipes open")
+        local pid = escaped.stdout:match("(%d+)")
+        assert(pid, "setsid descendant pid should be captured")
+        escaped_pids[#escaped_pids + 1] = pid
+      end
+      local capped, refusal = pcall(function()
+        remuda.process.run({ argv = echo_argv, timeout = 1 })
+      end)
+      assert(not capped, "process.run must refuse calls after reaching the detached reader cap")
+      assert(tostring(refusal):find("limit of 16 output-reader workers", 1, true),
+        "reader cap should explain why the call was refused")
     end)
-    assert(not capped, "process.run must refuse calls after reaching the detached reader cap")
-    assert(tostring(cap_error):find("limit of 16 output-reader workers", 1, true),
-      "reader cap should explain why the call was refused")
-
     for _, pid in ipairs(escaped_pids) do os.execute("/bin/kill -KILL " .. pid) end
     local recovered = false
     for _ = 1, 40 do
@@ -116,6 +120,7 @@ if not windows then
       local ok = pcall(function() remuda.process.run({ argv = echo_argv, timeout = 1 }) end)
       if ok then recovered = true; break end
     end
+    assert(exercised_cap, tostring(cap_error))
     assert(recovered, "reader permits should be released after escaped descendants exit")
   end
 end
