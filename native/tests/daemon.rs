@@ -246,6 +246,23 @@ fn capture(path: &Path, name: &str) -> String {
     }
 }
 
+fn capture_styled(path: &Path, name: &str, scrollback: usize) -> String {
+    match client::request(
+        path,
+        &Request::CaptureStyled {
+            name: name.to_string(),
+            scrollback,
+        },
+    ) {
+        Ok(Response::StyledScreen { rows, .. }) => rows
+            .into_iter()
+            .flat_map(|row| row.into_iter().map(|run| run.text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => panic!("styled capture failed: {other:?}"),
+    }
+}
+
 fn wait_for(path: &Path, name: &str, needle: &str) -> String {
     let deadline = Instant::now() + PATIENCE;
     loop {
@@ -746,6 +763,103 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     }
 }
 
+// Unix-only until #185: on Windows the key injected through ConPTY after the
+// attached session exits never reaches the client (CI trace, run 36424446857).
+#[cfg(unix)]
+#[test]
+fn any_key_after_attached_session_exit_restores_the_terminal() {
+    let dir = scratch_dir("attach-exit-any-key");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec!["sh".into(), "-c".into(), "sleep 1".into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start short-lived target");
+    assert_eq!(created, Response::Value("target".into()));
+
+    let exit_status = dir.join("attach-exit-status");
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args([
+            "-c",
+            "\"$REMUDA_BIN\" attach target; printf '%s' \"$?\" > \"$REMUDA_EXIT_STATUS\"",
+        ]);
+        cmd.env("REMUDA_BIN", env!("CARGO_BIN_EXE_remuda"));
+        cmd.env("REMUDA_EXIT_STATUS", &exit_status);
+        cmd
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = CommandBuilder::new("powershell.exe");
+        cmd.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            "& $env:REMUDA_BIN attach target; $code = $LASTEXITCODE; Set-Content -NoNewline -Path $env:REMUDA_EXIT_STATUS -Value $code",
+        ]);
+        cmd.env("REMUDA_BIN", env!("CARGO_BIN_EXE_remuda"));
+        cmd.env("REMUDA_EXIT_STATUS", &exit_status);
+        cmd
+    };
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let _output = held.subscribe().expect("capture viewer output");
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let response = client::request(&path, &Request::List).expect("list after target exit");
+        let target_present = match response {
+            Response::Sessions(sessions) => sessions.iter().any(|s| s.name == "target"),
+            other => panic!("list: {other:?}"),
+        };
+        if !target_present {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "short-lived target was not reaped"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // Unix captures can assert the text and reset bytes directly. ConPTY can
+    // discard both, so Windows checks the process and its recorded exit code.
+    #[cfg(unix)]
+    wait_for_session_screen(&viewer, "[remuda] target");
+
+    held.write_raw(b"k").expect("release attach with any key");
+    let deadline = Instant::now() + PATIENCE;
+    while viewer.is_alive() {
+        assert!(
+            Instant::now() < deadline,
+            "attach client did not exit after one key"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&exit_status)
+            .expect("wrapper records attach client exit status")
+            .trim(),
+        "0"
+    );
+    #[cfg(unix)]
+    let _restored = collect_until_bytes(
+        &_output,
+        b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
+    );
+}
+
 #[test]
 fn a_new_attach_takes_over_and_old_raw_clients_get_a_plain_notice() {
     let path = scratch("takeover");
@@ -834,8 +948,11 @@ fn a_tracked_client_exits_on_takeover_without_waiting_for_another_key() {
     command.args(["-s", "s", "attach", "target"]);
     command.env("REMUDA_RUNTIME_DIR", &dir);
     let mut child = pty.slave.spawn_command(command).expect("spawn client A");
+    #[cfg(unix)]
     let mut reader = pty.master.try_clone_reader().expect("clone pty reader");
+    #[cfg(unix)]
     let (output_tx, output_rx) = std::sync::mpsc::channel();
+    #[cfg(unix)]
     std::thread::spawn(move || {
         let mut output = Vec::new();
         let _ = reader.read_to_end(&mut output);
@@ -849,7 +966,7 @@ fn a_tracked_client_exits_on_takeover_without_waiting_for_another_key() {
     }
     let _current = raw_attach(&path, "target");
 
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + PATIENCE;
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll client A") {
             break status;
@@ -861,24 +978,31 @@ fn a_tracked_client_exits_on_takeover_without_waiting_for_another_key() {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert_eq!(status.exit_code(), 2);
-    let output = output_rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("client output closed");
-    assert!(
-        output
-            .windows(b"attached elsewhere, detached".len())
-            .any(|window| window == b"attached elsewhere, detached"),
-        "takeover reason was not displayed: {output:?}"
-    );
-    assert!(
-        output
-            .windows(b"\x1b[?1000l".len())
-            .any(|w| w == b"\x1b[?1000l")
-            && output
-                .windows(b"\x1b[?2004l".len())
-                .any(|w| w == b"\x1b[?2004l"),
-        "the input modes were not reset before exit: {output:?}"
-    );
+    #[cfg(unix)]
+    {
+        // Allow slow CI machines the full integration-test patience window
+        // for the PTY reader to observe EOF after the client has exited.
+        let output = output_rx
+            .recv_timeout(PATIENCE)
+            .expect("client output closed");
+        assert!(
+            output
+                .windows(b"attached elsewhere, detached".len())
+                .any(|window| window == b"attached elsewhere, detached"),
+            "takeover reason was not displayed: {output:?}"
+        );
+        assert!(
+            output
+                .windows(b"\x1b[?1000l".len())
+                .any(|w| w == b"\x1b[?1000l")
+                && output
+                    .windows(b"\x1b[?2004l".len())
+                    .any(|w| w == b"\x1b[?2004l"),
+            "the input modes were not reset before exit: {output:?}"
+        );
+    }
+    // ConPTY does not provide stable screen bytes for assertions. On Windows,
+    // the process exit and takeover exit code above prove client A detached.
 }
 
 #[test]
@@ -906,6 +1030,223 @@ fn session_listing_reports_the_child_mouse_tracking_mode() {
     .expect("enable mouse tracking");
     wait_for(&path, "target", "ready-mode");
     assert!(listed().mouse_tracking);
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_mouse_scrolls_the_full_history_and_returns_to_live_output() {
+    let dir = scratch_dir("attach-mouse-scroll");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "i=0; while [ $i -lt 10000 ]; do printf 'history-%05d\\n' \"$i\"; i=$((i+1)); done; printf 'history-end\\n'".into(),
+        },
+    )
+    .expect("write retained history");
+    // `history-end` appears in the echoed shell command before execution; wait
+    // for a generated row that is not present in the command text.
+    wait_for(&path, "target", "history-09999");
+    wait_for(&path, "target", "history-end");
+    let oldest = capture_styled(&path, "target", 10_000);
+    assert!(
+        oldest.contains("history-00014"),
+        "the 10,000-row capture should reach old output; capture tail: {}",
+        &oldest[oldest.len().saturating_sub(500)..]
+    );
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "history-end");
+
+    held.write_raw(b"\x1b[<64;10;10M").expect("wheel up");
+    let near_history = collect_until_bytes(&output, b"[scrollback: 3 rows");
+    assert!(near_history
+        .windows(b"history-end".len())
+        .any(|w| w == b"history-end"));
+
+    held.write_raw(b"\x1b[<65;10;10M")
+        .expect("wheel down to live");
+    collect_until_bytes(&output, b"history-end");
+
+    held.write_raw(b"\x1b[5~")
+        .expect("PageUp enters scrollback");
+    collect_until_bytes(&output, b"[scrollback: 24 rows");
+    held.write_raw(b"\x1b[6~")
+        .expect("PageDown returns to live");
+    collect_until_bytes(&output, b"history-end");
+
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "printf 'resume-%s\\n' $((17*23))".into(),
+        },
+    )
+    .expect("write after scroll mode");
+    wait_for(&path, "target", "resume-391");
+    let resumed = collect_until_bytes(&output, b"resume-391");
+    assert!(
+        resumed
+            .windows(b"resume-391".len())
+            .filter(|w| *w == b"resume-391")
+            .count()
+            == 1,
+        "live output should resume exactly once after the historical repaint"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
+    use remuda_core::agent::{MouseEncoding, MouseMode, MouseState};
+
+    let dir = scratch_dir("attach-mouse-forward");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006h'; dd bs=1 count=12 2>/dev/null | od -An -tx1; printf '\\nmouse-forwarded\\n'";
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec!["sh".into(), "-c".into(), script.into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start mouse-reporting child");
+    assert_eq!(created, Response::Value("target".into()));
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match client::request(
+            &path,
+            &Request::MouseState {
+                name: "target".into(),
+            },
+        ) {
+            Ok(Response::MouseState(MouseState {
+                mode: MouseMode::PressRelease,
+                encoding: MouseEncoding::Sgr,
+            })) => break,
+            other => {
+                assert!(
+                    Instant::now() < deadline,
+                    "child mouse mode not observed: {other:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    held.write_raw(b"\x1b[<64;10;10M")
+        .expect("deliver host wheel report");
+    wait_for(&path, "target", "mouse-forwarded");
+    let screen = capture(&path, "target").replace([' ', '\n'], "");
+    assert!(
+        screen.contains("1b5b3c36343b31303b31304d"),
+        "child did not receive the SGR mouse report: {screen}"
+    );
+
+    held.write_raw(&[client::DETACH]).expect("detach");
+    drop(held);
+    let _ = collect_until_bytes(
+        &output,
+        b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mouse_off_knob_and_toggle_pass_reports_to_the_child_and_restore_host_modes() {
+    let dir = scratch_dir("attach-mouse-toggle");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let script = "stty raw -echo; printf 'child-ready\\n'; cat";
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec!["sh".into(), "-c".into(), script.into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start raw child");
+    assert_eq!(created, Response::Value("target".into()));
+    wait_for(&path, "target", "child-ready");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target", "--mouse=false"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    let initial = collect_until_bytes(&output, b"\x1b[?25");
+    assert!(!initial
+        .windows(b"\x1b[?1000h".len())
+        .any(|w| w == b"\x1b[?1000h"));
+    assert!(!initial
+        .windows(b"\x1b[?1006h".len())
+        .any(|w| w == b"\x1b[?1006h"));
+
+    let wheel = b"\x1b[<64;10;10M";
+    held.write_raw(wheel)
+        .expect("wheel reaches child while disabled");
+    let received = collect_until_bytes(&output, wheel);
+    assert!(received.windows(wheel.len()).any(|w| w == wheel));
+
+    held.write_raw(&[0x1d])
+        .expect("Ctrl-] reaches child when disabled");
+    let received_toggle = collect_until_bytes(&output, &[0x1d]);
+    assert!(
+        received_toggle.contains(&0x1d),
+        "disabled toggle key must reach the child"
+    );
+    assert!(!received_toggle
+        .windows(b"\x1b[?1000h".len())
+        .any(|w| w == b"\x1b[?1000h"));
+
+    held.write_raw(&[client::DETACH]).expect("detach");
+    drop(held);
+    let restored = collect_until_bytes(
+        &output,
+        b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
+    );
+    assert!(restored
+        .windows(b"\x1b[?1000l".len())
+        .any(|w| w == b"\x1b[?1000l"));
+    assert!(restored
+        .windows(b"\x1b[?1006l".len())
+        .any(|w| w == b"\x1b[?1006l"));
 }
 
 #[test]

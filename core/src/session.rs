@@ -3,7 +3,7 @@
 //! Input acts stay indivisible, sessions do not resize, and one viewer owns an
 //! attachment at a time.
 
-use crate::agent::{AgentError, AgentProcess, Cursor, Result, Size, StyledCell};
+use crate::agent::{AgentError, AgentProcess, Cursor, MouseState, Result, Size, StyledCell};
 use crate::clock::Clock;
 use crate::protocol::Step;
 use core::time::Duration;
@@ -201,6 +201,13 @@ impl Session {
             .lock()
             .map(|mut agent| agent.mouse_tracking())
             .unwrap_or(false)
+    }
+
+    pub fn mouse_state(&self) -> MouseState {
+        self.agent
+            .lock()
+            .map(|mut agent| agent.mouse_state())
+            .unwrap_or_default()
     }
 
     pub fn cursor(&self) -> Result<Cursor> {

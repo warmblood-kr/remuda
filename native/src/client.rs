@@ -126,61 +126,6 @@ fn read_protocol_line(stream: &mut impl Read) -> std::io::Result<String> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-/// Read terminal input with a timeout so the output pump can release this
-/// thread after a tracked attachment is displaced.
-#[cfg(unix)]
-fn read_stdin_timeout(
-    stdin: &mut impl Read,
-    buf: &mut [u8],
-    timeout: std::time::Duration,
-) -> std::io::Result<Option<usize>> {
-    use std::os::fd::AsRawFd;
-    let fd = std::io::stdin().as_raw_fd();
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
-        let mut poll = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ready = unsafe { libc::poll(&mut poll, 1, millis) };
-        if ready > 0 {
-            return stdin.read(buf).map(Some);
-        }
-        if ready == 0 {
-            return Ok(None);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
-#[cfg(windows)]
-fn read_stdin_timeout(
-    stdin: &mut impl Read,
-    buf: &mut [u8],
-    timeout: std::time::Duration,
-) -> std::io::Result<Option<usize>> {
-    use windows_sys::Win32::{
-        Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
-        System::{
-            Console::{GetStdHandle, STD_INPUT_HANDLE},
-            Threading::WaitForSingleObject,
-        },
-    };
-    let handle: HANDLE = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
-    match unsafe { WaitForSingleObject(handle, millis) } {
-        WAIT_OBJECT_0 => stdin.read(buf).map(Some),
-        WAIT_TIMEOUT => Ok(None),
-        _ => Err(std::io::Error::last_os_error()),
-    }
-}
-
 /// Every daemon deployed before any handshake existed can never announce its own
 /// version, so the client's reaction to the failure is the only diagnosis that
 /// reaches those users. See [`tests::the_cure_survives_an_eighty_column_crop`].
@@ -203,6 +148,13 @@ pub enum Left {
     Detached,
     Exited,
     TakenOver,
+}
+
+/// Give this terminal to a session until the user presses [`DETACH`] or the
+/// session ends. Leaving does not disturb the session: the process keeps
+/// running and this direct attach never changes its size.
+pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
+    attach_with_mouse(path, name, true)
 }
 
 enum AttachAck {
@@ -231,16 +183,9 @@ fn begin_attach(path: &Path, name: &str) -> std::io::Result<(Stream, Option<u64>
         AttachAck::Tracked(generation) => Ok((stream, Some(generation))),
         AttachAck::Legacy => Ok((stream, None)),
         AttachAck::Unsupported => {
-            // Older daemons do not know AttachTracked. Reconnect with the
-            // original request and preserve their existing attach behavior.
             drop(stream);
             let mut stream = ipc::connect(path)?;
-            send(
-                &stream,
-                &Request::Attach {
-                    name: name.to_string(),
-                },
-            )?;
+            send(&stream, &Request::Attach { name: name.into() })?;
             match interpret(&read_protocol_line(&mut stream)?) {
                 Response::Ok => Ok((stream, None)),
                 Response::Error(reason) => Err(std::io::Error::other(reason)),
@@ -257,8 +202,8 @@ fn was_taken_over(path: &Path, name: &str, generation: Option<u64>) -> bool {
             request(
                 path,
                 &Request::AttachStatus {
-                    name: name.to_string(),
-                    generation,
+                    name: name.into(),
+                    generation
                 }
             ),
             Ok(Response::AttachStatus { taken_over: true })
@@ -266,62 +211,35 @@ fn was_taken_over(path: &Path, name: &str, generation: Option<u64>) -> bool {
     })
 }
 
-fn finish_output_pump(
-    stream: &Stream,
-    stop: &std::sync::atomic::AtomicBool,
-    done: &std::sync::atomic::AtomicBool,
-    taken_over: &std::sync::atomic::AtomicBool,
-    was_taken_over: bool,
-) {
-    taken_over.store(was_taken_over, std::sync::atomic::Ordering::SeqCst);
-    done.store(true, std::sync::atomic::Ordering::SeqCst);
-    ipc::stop_reader(stream, stop, || {
-        done.load(std::sync::atomic::Ordering::SeqCst)
-    });
-}
-
-fn attach_left(name: &str, stdout: &mut impl Write, taken_over: bool, detached: bool) -> Left {
-    if taken_over {
-        Left::TakenOver
-    } else if detached {
-        Left::Detached
-    } else {
-        let _ = write!(stdout, "\r\n[remuda] {name} ended — press any key\r\n");
-        let _ = stdout.flush();
-        Left::Exited
-    }
-}
-
-fn pump_output(stream: &Stream, stop: &std::sync::atomic::AtomicBool) {
-    let mut stdout = std::io::stdout();
-    let mut buf = [0u8; 8192];
-    let mut reader = stream;
-    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        let Ok(n) = reader.read(&mut buf) else {
-            break;
-        };
-        if n == 0 || stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
-            break;
-        }
-    }
-}
-
-/// Give this terminal to a session until the user presses [`DETACH`] or the
-/// session ends. Leaving does not disturb the session: the process keeps
-/// running and this direct attach never changes its size.
-pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
+// This lifecycle is intentionally linear: attach, start the input reader,
+// drain output, wake the reader and restore the terminal in one scope.
+#[allow(clippy::too_many_lines)]
+pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Result<Left> {
     let (stream, generation) = begin_attach(path, name)?;
 
     let _raw = RawMode::enable()?;
+    if mouse {
+        let mut stdout = std::io::stdout();
+        stdout.write_all(b"\x1b[?1000h\x1b[?1006h")?;
+        stdout.flush()?;
+    }
 
-    // Both pumps share this handle so the Windows wake cancels the pending read.
+    // The Windows wake must cancel the same HANDLE that owns the blocked read;
+    // cloning a named-pipe stream creates a different HANDLE. Share this one
+    // between the output pump and the key thread that may need to wake it.
     let reader_stream = std::sync::Arc::new(stream);
 
+    // Only the key thread can tell the two exits apart: the reader below just
+    // sees the stream end, which is true of a detach and of a death alike.
     let detached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let output_taken_over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let output_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let output_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let trace_input = std::env::var_os("REMUDA_TRACE_INPUT").map(PathBuf::from);
+    let scrollback = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let output_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let attach_path = path.to_path_buf();
+    let attach_name = name.to_string();
 
     // Keystrokes out, on their own thread; the screen pump runs here.
     let keys = std::thread::spawn({
@@ -329,42 +247,64 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
         let reader_stream = std::sync::Arc::clone(&reader_stream);
         let detached = std::sync::Arc::clone(&detached);
         let output_taken_over = std::sync::Arc::clone(&output_taken_over);
-        let output_done = std::sync::Arc::clone(&output_done);
         let output_stop = std::sync::Arc::clone(&output_stop);
+        let output_done = std::sync::Arc::clone(&output_done);
+        let scrollback = std::sync::Arc::clone(&scrollback);
+        let output_lock = std::sync::Arc::clone(&output_lock);
+        let path = attach_path.clone();
+        let name = attach_name.clone();
         move || {
             let mut stdin = std::io::stdin().lock();
             let mut buf = [0u8; 1024];
+            let mut parser = crate::mouse::SgrParser::default();
+            let mut mouse_on = mouse;
             loop {
                 if output_done.load(std::sync::atomic::Ordering::SeqCst) {
                     if output_taken_over.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
                     }
-                    // Preserve the existing "press any key" behavior after a
-                    // natural session exit; takeover returns without input.
-                    if matches!(
-                        read_stdin_timeout(
-                            &mut stdin,
-                            &mut buf,
-                            std::time::Duration::from_secs(86_400)
-                        ),
-                        Ok(Some(_)) | Err(_)
-                    ) {
+                    // Keep the advertised "press any key" behavior after the
+                    // child exits, but let that key release the attach and
+                    // restore terminal modes instead of routing it to nowhere.
+                    #[cfg(unix)]
+                    let Ok(Some(_)) = read_stdin_timeout(
+                        &mut stdin,
+                        &mut buf,
+                        std::time::Duration::from_secs(86_400),
+                    ) else {
+                        continue;
+                    };
+                    #[cfg(windows)]
+                    {
+                        // ConPTY input does not signal the console HANDLE for
+                        // WaitForSingleObject. A blocking raw stdin read does
+                        // receive the key and lets the attach return here.
+                        let _ = stdin.read(&mut buf);
                         break;
                     }
-                    continue;
+                    break;
                 }
-                let n = match read_stdin_timeout(
-                    &mut stdin,
-                    &mut buf,
-                    std::time::Duration::from_millis(25),
-                ) {
+                let wait = parser
+                    .timeout_remaining()
+                    .unwrap_or(std::time::Duration::from_millis(25))
+                    .min(std::time::Duration::from_millis(25));
+                let n = match read_stdin_timeout(&mut stdin, &mut buf, wait) {
                     Ok(Some(n)) => n,
-                    Ok(None) => continue,
+                    Ok(None) => {
+                        route_tokens(
+                            &path,
+                            &name,
+                            &mut stream,
+                            parser.flush_expired(),
+                            &mut mouse_on,
+                            &scrollback,
+                            &output_lock,
+                        );
+                        continue;
+                    }
                     Err(_) => break,
                 };
-                if output_done.load(std::sync::atomic::Ordering::SeqCst)
-                    && output_taken_over.load(std::sync::atomic::Ordering::SeqCst)
-                {
+                if output_done.load(std::sync::atomic::Ordering::SeqCst) {
                     break;
                 }
                 if n == 0 {
@@ -372,44 +312,353 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
                 }
                 trace_input_read(trace_input.as_deref(), &buf[..n]);
                 match buf[..n].iter().position(|&b| b == DETACH) {
-                    // Preserve bytes typed before the detach key.
+                    // Forward what was typed before the detach key, then stop.
+                    // Dropping those bytes would silently swallow input the
+                    // user believes they sent.
                     Some(at) => {
-                        let _ = stream.write_all(&buf[..at]);
-                        let _ = stream.flush();
+                        if mouse {
+                            route_tokens(
+                                &path,
+                                &name,
+                                &mut stream,
+                                parser.feed(&buf[..at]),
+                                &mut mouse_on,
+                                &scrollback,
+                                &output_lock,
+                            );
+                        } else if at > 0 {
+                            let _ = stream.write_all(&buf[..at]);
+                            let _ = stream.flush();
+                        }
+                        route_tokens(
+                            &path,
+                            &name,
+                            &mut stream,
+                            parser.finish(),
+                            &mut mouse_on,
+                            &scrollback,
+                            &output_lock,
+                        );
                         detached.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
                     None => {
-                        if stream.write_all(&buf[..n]).is_err() || stream.flush().is_err() {
-                            break;
+                        if mouse {
+                            route_tokens(
+                                &path,
+                                &name,
+                                &mut stream,
+                                parser.feed(&buf[..n]),
+                                &mut mouse_on,
+                                &scrollback,
+                                &output_lock,
+                            );
+                        } else {
+                            let _ = stream.write_all(&buf[..n]);
+                            let _ = stream.flush();
                         }
                     }
                 }
             }
+            // Ends the screen pump below, which then returns from `attach` and
+            // drops every handle on this connection — that hang-up is what the
+            // daemon reads as "the human left".
             ipc::stop_reader(&reader_stream, &output_stop, || {
                 output_done.load(std::sync::atomic::Ordering::SeqCst)
             });
         }
     });
 
-    pump_output(reader_stream.as_ref(), &output_stop);
+    let mut stdout = std::io::stdout();
+    let mut buf = [0u8; 8192];
+    let mut reader = reader_stream.as_ref();
+    while !output_stop.load(std::sync::atomic::Ordering::SeqCst) {
+        let Ok(n) = reader.read(&mut buf) else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if scrollback.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            continue;
+        }
+        if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
+            break;
+        }
+    }
 
-    let was_taken_over = was_taken_over(path, name, generation);
-    finish_output_pump(
-        &reader_stream,
-        &output_stop,
-        &output_done,
-        &output_taken_over,
-        was_taken_over,
-    );
-    let left = attach_left(
-        name,
-        &mut std::io::stdout(),
-        was_taken_over,
-        detached.load(std::sync::atomic::Ordering::SeqCst),
-    );
+    let taken_over = was_taken_over(path, name, generation);
+    output_taken_over.store(taken_over, std::sync::atomic::Ordering::SeqCst);
+    output_done.store(true, std::sync::atomic::Ordering::SeqCst);
+    ipc::stop_reader(&reader_stream, &output_stop, || {
+        output_done.load(std::sync::atomic::Ordering::SeqCst)
+    });
+    let left = if taken_over {
+        Left::TakenOver
+    } else if detached.load(std::sync::atomic::Ordering::SeqCst) {
+        Left::Detached
+    } else {
+        // The key thread remains alive until one key releases the user's
+        // terminal after the session exits.
+        let _ = write!(stdout, "\r\n[remuda] {name} ended — press any key\r\n");
+        let _ = stdout.flush();
+        Left::Exited
+    };
     let _ = keys.join();
     Ok(left)
+}
+
+#[cfg(unix)]
+fn read_stdin_timeout(
+    _stdin: &mut impl Read,
+    buf: &mut [u8],
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<usize>> {
+    use std::os::fd::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pfd, 1, millis) };
+        if ready > 0 {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            return if n < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(Some(n as usize))
+            };
+        }
+        if ready == 0 {
+            return Ok(None);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn read_stdin_timeout(
+    stdin: &mut impl Read,
+    buf: &mut [u8],
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<usize>> {
+    use windows_sys::Win32::{
+        Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::{
+            Console::{GetStdHandle, STD_INPUT_HANDLE},
+            Threading::WaitForSingleObject,
+        },
+    };
+    let handle: HANDLE = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
+    match unsafe { WaitForSingleObject(handle, millis) } {
+        WAIT_OBJECT_0 => stdin.read(buf).map(Some),
+        WAIT_TIMEOUT => Ok(None),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+fn route_tokens(
+    path: &Path,
+    name: &str,
+    stream: &mut Stream,
+    tokens: Vec<crate::mouse::InputToken>,
+    mouse_on: &mut bool,
+    scrollback: &std::sync::atomic::AtomicUsize,
+    output_lock: &std::sync::Mutex<()>,
+) {
+    use crate::mouse::{route_mouse_event, InputToken, MouseAction};
+    use remuda_core::agent::MouseState;
+    use std::sync::atomic::Ordering;
+
+    for token in tokens {
+        match token {
+            InputToken::Mouse(event) => {
+                let state = if *mouse_on {
+                    match request(path, &Request::MouseState { name: name.into() }) {
+                        Ok(Response::MouseState(state)) => state,
+                        _ => MouseState::default(),
+                    }
+                } else {
+                    MouseState::default()
+                };
+                match route_mouse_event(event, state, *mouse_on, scrollback.load(Ordering::SeqCst))
+                {
+                    MouseAction::Forward(bytes) => {
+                        let _ = stream.write_all(&bytes);
+                        let _ = stream.flush();
+                    }
+                    MouseAction::Scroll(next) => {
+                        let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        scrollback.store(next, Ordering::SeqCst);
+                        paint_history(path, name, next);
+                    }
+                    MouseAction::Ignore => {}
+                }
+            }
+            InputToken::Bytes(bytes) => {
+                if *mouse_on && (bytes == b"\x1b[5~" || bytes == b"\x1b[6~") {
+                    let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let old = scrollback.load(Ordering::SeqCst);
+                    let next = if bytes == b"\x1b[5~" {
+                        (old + 24).min(10_000)
+                    } else {
+                        old.saturating_sub(24)
+                    };
+                    if next != 0 || old != 0 {
+                        scrollback.store(next, Ordering::SeqCst);
+                        paint_history(path, name, next);
+                        continue;
+                    }
+                }
+                let mut start = 0;
+                for (at, &byte) in bytes.iter().enumerate() {
+                    if byte == 0x1d {
+                        if start < at {
+                            exit_history_if_needed(
+                                path,
+                                name,
+                                stream,
+                                &bytes[start..at],
+                                scrollback,
+                                output_lock,
+                            );
+                        }
+                        *mouse_on = !*mouse_on;
+                        let mut stdout = std::io::stdout();
+                        let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        let report = if *mouse_on {
+                            b"\x1b[?1000h\x1b[?1006h"
+                        } else {
+                            b"\x1b[?1000l\x1b[?1006l"
+                        };
+                        let _ = stdout.write_all(report);
+                        let _ = stdout.flush();
+                        start = at + 1;
+                    }
+                }
+                if start < bytes.len() {
+                    exit_history_if_needed(
+                        path,
+                        name,
+                        stream,
+                        &bytes[start..],
+                        scrollback,
+                        output_lock,
+                    );
+                }
+            }
+            InputToken::Paste(bytes) => {
+                let _ = stream.write_all(&bytes);
+                let _ = stream.flush();
+            }
+        }
+    }
+}
+
+fn exit_history_if_needed(
+    path: &Path,
+    name: &str,
+    stream: &mut Stream,
+    bytes: &[u8],
+    scrollback: &std::sync::atomic::AtomicUsize,
+    output_lock: &std::sync::Mutex<()>,
+) {
+    use std::sync::atomic::Ordering;
+    let old = scrollback.load(Ordering::SeqCst);
+    if old != 0 {
+        let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if bytes == b"q" || bytes == b"\x1b" || bytes == b"\x1bq" {
+            scrollback.store(0, Ordering::SeqCst);
+            paint_history(path, name, 0);
+            return;
+        }
+        scrollback.store(0, Ordering::SeqCst);
+        paint_history(path, name, 0);
+    }
+    let _ = stream.write_all(bytes);
+    let _ = stream.flush();
+}
+
+/// Paint one captured frame while the caller holds the output lock.
+fn paint_history(path: &Path, name: &str, offset: usize) {
+    use remuda_core::agent::Color;
+    let Ok(Response::StyledScreen { rows, cursor, .. }) = request(
+        path,
+        &Request::CaptureStyled {
+            name: name.into(),
+            scrollback: offset,
+        },
+    ) else {
+        return;
+    };
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(b"\x1b[H\x1b[2J");
+    for (index, row) in rows.iter().enumerate() {
+        for run in row {
+            let mut codes = vec![
+                if run.bold { "1" } else { "22" }.to_string(),
+                if run.dim { "2" } else { "22" }.to_string(),
+                if run.italic { "3" } else { "23" }.to_string(),
+                if run.underline { "4" } else { "24" }.to_string(),
+                if run.inverse { "7" } else { "27" }.to_string(),
+            ];
+            let color_codes = |color: Color, foreground: bool| match color {
+                Color::Default => vec![if foreground { "39" } else { "49" }.to_string()],
+                Color::Idx(index) => vec![
+                    if foreground { "38" } else { "48" }.to_string(),
+                    "5".into(),
+                    index.to_string(),
+                ],
+                Color::Rgb(r, g, b) => vec![
+                    if foreground { "38" } else { "48" }.to_string(),
+                    "2".into(),
+                    r.to_string(),
+                    g.to_string(),
+                    b.to_string(),
+                ],
+            };
+            codes.extend(color_codes(run.fg, true));
+            codes.extend(color_codes(run.bg, false));
+            let _ = write!(stdout, "\x1b[{}m", codes.join(";"));
+            let _ = stdout.write_all(run.text.as_bytes());
+            let _ = stdout.write_all(b"\x1b[0m");
+        }
+        if index + 1 < rows.len() {
+            let _ = stdout.write_all(b"\r\n");
+        }
+    }
+    if offset != 0 {
+        let _ = write!(
+            stdout,
+            "\x1b[{};1H\x1b[2K[scrollback: {offset} rows — PgUp/PgDn, q/Esc returns]",
+            rows.len().max(1)
+        );
+    }
+    if offset == 0 {
+        let _ = if cursor.visible {
+            write!(
+                stdout,
+                "\x1b[{};{}H\x1b[?25h",
+                cursor.row + 1,
+                cursor.col + 1
+            )
+        } else {
+            stdout.write_all(b"\x1b[?25l")
+        };
+    } else {
+        let _ = stdout.write_all(b"\x1b[?25l");
+    }
+    let _ = stdout.flush();
 }
 
 /// A session held for a human typing into a pane rather than into the whole
@@ -543,8 +792,7 @@ impl Drop for RawMode {
 #[cfg(test)]
 mod tests {
     use super::{
-        attach_ack, interpret, reset_input_modes, trace_input_read, write_input_trace, AttachAck,
-        RESET_INPUT_MODES,
+        interpret, reset_input_modes, trace_input_read, write_input_trace, RESET_INPUT_MODES,
     };
     use remuda_core::protocol::Response;
     use std::time::{Duration, UNIX_EPOCH};
@@ -554,22 +802,6 @@ mod tests {
         let mut output = Vec::new();
         reset_input_modes(&mut output).unwrap();
         assert_eq!(output, RESET_INPUT_MODES);
-    }
-
-    #[test]
-    fn tracked_attach_ack_is_used_when_the_daemon_supports_it() {
-        assert!(matches!(
-            attach_ack(r#"{"AttachStarted":{"generation":7}}"#),
-            AttachAck::Tracked(7)
-        ));
-    }
-
-    #[test]
-    fn tracked_attach_falls_back_for_an_older_daemon() {
-        assert!(matches!(
-            attach_ack(r#"{"Error":"bad request: unknown variant `AttachTracked`"}"#),
-            AttachAck::Unsupported
-        ));
     }
 
     #[test]

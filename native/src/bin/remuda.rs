@@ -95,6 +95,18 @@ fn main() -> ExitCode {
         }
 
         ["attach", name] => with_daemon(server, &path, |path| ride(path, name)),
+        ["attach", name, "--mouse=false"] => {
+            with_daemon(server, &path, |path| ride_with_mouse(path, name, false))
+        }
+        ["attach", name, "--mouse=true"] => {
+            with_daemon(server, &path, |path| ride_with_mouse(path, name, true))
+        }
+        ["attach", "--mouse=false", name] => {
+            with_daemon(server, &path, |path| ride_with_mouse(path, name, false))
+        }
+        ["attach", "--mouse=true", name] => {
+            with_daemon(server, &path, |path| ride_with_mouse(path, name, true))
+        }
 
         ["lua", script] => with_daemon(server, &path, |path| {
             match remuda_native::script::run(path, Path::new(script)) {
@@ -167,7 +179,7 @@ remuda — a pty manager you can attach to
 
   remuda                        open the herd (a terminal is required)
   remuda run [-n name] <argv…>  start a program and ride it, in one act
-  remuda attach <name>          hand this terminal over; Ctrl-\\ detaches (2 = attached elsewhere)
+  remuda attach <name> [--mouse=false] hand this terminal over; Ctrl-\\ detaches (2 = attached elsewhere)
   remuda ls                     list sessions
   remuda send <name> <text>     deliver one instruction (body + Enter)
 
@@ -243,6 +255,8 @@ remuda — terminal orchestration for coding agents
   remuda                         open the session screen
   remuda run [-n NAME] COMMAND   start and enter a session
   remuda attach NAME             enter a session; Ctrl-\\ detaches (exit 2 if attached elsewhere)
+                                 Ctrl-] toggles mouse; wheel scrolls history
+                                 --mouse=false disables mouse handling (before or after NAME)
   remuda ls | send NAME TEXT     inspect or message sessions
   remuda stop [-f]               stop the daemon (sessions are lost)
 
@@ -317,7 +331,11 @@ fn lua_script_refusal(argv: &[&str]) -> Option<String> {
 /// be silent and identical, and a second `exit` then went to the real login
 /// shell — the incident this whole change is named after.
 fn ride(path: &Path, name: &str) -> ExitCode {
-    match remuda_native::client::attach(path, name) {
+    ride_with_mouse(path, name, true)
+}
+
+fn ride_with_mouse(path: &Path, name: &str, mouse: bool) -> ExitCode {
+    match remuda_native::client::attach_with_mouse(path, name, mouse) {
         Ok(Left::Detached) => {
             eprintln!(
                 "remuda: detached from {name} — still running, `remuda attach {name}` to go back"
@@ -329,11 +347,7 @@ fn ride(path: &Path, name: &str) -> ExitCode {
             eprintln!("remuda: you are back in your own shell");
             ExitCode::SUCCESS
         }
-        Ok(Left::TakenOver) => {
-            // The daemon's printable notice names this outcome in the terminal.
-            // 2 is reserved for a live attachment displaced by another client.
-            ExitCode::from(2)
-        }
+        Ok(Left::TakenOver) => ExitCode::from(2),
         Err(e) => fail(format!("attach: {e}")),
     }
 }

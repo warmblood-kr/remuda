@@ -16,7 +16,7 @@
 //! and becomes a raw byte pipe in both directions, which is why attaching has
 //! no response type beyond the acknowledgement.
 
-use crate::agent::{Color, Cursor, Size, StyledCell};
+use crate::agent::{Color, Cursor, MouseState, Size, StyledCell};
 use crate::registry::SessionSummary;
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +62,8 @@ pub enum Request {
         #[serde(default)]
         scrollback: usize,
     },
+    /// Read the child's current mouse mode and encoding.
+    MouseState { name: String },
     /// Take the session over for a human at a terminal. On `Ok`, this
     /// connection becomes a byte pipe.
     Attach { name: String },
@@ -124,6 +126,8 @@ pub enum Response {
         wrapped: Vec<bool>,
         cursor: Cursor,
     },
+    /// Current mouse tracking mode and encoding, read from the live parser.
+    MouseState(MouseState),
     /// What an [`Request::Eval`] returned, already rendered to text. Kept
     /// distinct from `Screen` so a client can tell "the session printed
     /// nothing" from "the expression returned nothing".

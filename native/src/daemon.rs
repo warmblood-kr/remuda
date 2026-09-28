@@ -608,6 +608,8 @@ fn handle(
             capture_styled(&stream, registry, &name, scrollback)
         }
 
+        Request::MouseState { name } => mouse_state(&stream, registry, &name),
+
         Request::Attach { name } => attach(stream, reader, registry, &name, false),
         Request::AttachTracked { name } => attach(stream, reader, registry, &name, true),
         Request::AttachStatus { name, generation } => {
@@ -635,6 +637,15 @@ fn handle(
             Err(e) => reply(&stream, &Response::error(e)),
         },
     }
+}
+
+fn mouse_state(stream: &Stream, registry: &Registry, name: &str) -> std::io::Result<()> {
+    respond(
+        stream,
+        name,
+        registry.get(name).map(|session| Ok(session.mouse_state())),
+        Response::MouseState,
+    )
 }
 
 /// The `None`/`Some(Err)`/`Some(Ok)` shape several `Request` arms share: no
