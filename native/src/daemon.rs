@@ -671,10 +671,6 @@ fn attach(
         if let Some(rx) = held.subscribe() {
             while !done.load(std::sync::atomic::Ordering::SeqCst) {
                 if held.is_displaced() {
-                    // Keep this plain text so older clients display a useful
-                    // reason before observing the ordinary EOF.
-                    let _ = out.write_all(b"\r\n[remuda] attached elsewhere, detached\r\n");
-                    let _ = out.flush();
                     break;
                 }
                 match rx.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -692,6 +688,12 @@ fn attach(
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
+        }
+        if held.is_displaced() {
+            // Keep this plain text so older clients display a useful reason
+            // before observing the ordinary EOF, even if input ended the pump.
+            let _ = out.write_all(b"\r\n[remuda] attached elsewhere, detached\r\n");
+            let _ = out.flush();
         }
         done.store(true, std::sync::atomic::Ordering::SeqCst);
         // Unblocks the key thread's read so the scope can close.
