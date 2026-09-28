@@ -169,9 +169,9 @@ pub trait AgentProcess: Send {
         Ok(Vec::new())
     }
 
-    /// Subscribe to output as it arrives, for a viewer that must not poll.
-    /// `None` means this backend cannot stream; that caller falls back to
-    /// `screen_bytes`.
+    /// Subscribe to output as it arrives. Sessions track output activity and
+    /// viewers can consume it without screen polling. `None` means this backend
+    /// cannot stream, so viewers fall back to `screen_bytes`.
     fn subscribe(&mut self) -> Option<Receiver<Vec<u8>>> {
         None
     }

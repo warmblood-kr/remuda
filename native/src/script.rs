@@ -844,6 +844,10 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
                 row.set("name", session.name)?;
                 row.set("alive", session.alive)?;
                 row.set("idle", session.idle.as_secs_f64())?;
+                row.set(
+                    "output_idle",
+                    session.output_idle.unwrap_or(session.idle).as_secs_f64(),
+                )?;
                 row.set("cols", session.size.cols())?;
                 row.set("rows", session.size.rows())?;
                 // Additive: `tests/api/v1.lua` asserts specific fields exist,

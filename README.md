@@ -169,6 +169,10 @@ for _, s in ipairs(remuda.ls()) do
 end
 ```
 
+`idle` is time since the last accepted input; `output_idle` is time since the
+agent last produced output. Use the latter for a working/quiet heuristic, and
+the former when measuring how long a session has been left without input.
+
 The same herd is reachable over MCP — `new`, `ls`, `send`, `capture`,
 `run_script` — so an agent can drive other agents. `attach` is deliberately
 absent there: handing a real terminal to something that has none can only fail.

@@ -6,6 +6,7 @@
 use remuda_core::agent::{AgentError, AgentProcess, Cursor, Result, Size};
 use remuda_core::protocol::Step;
 use remuda_core::{Clock, ManualClock, ScriptedAgent, Session};
+use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,6 +32,38 @@ impl AgentProcess for RecordingAgent {
     }
     fn screen_text(&mut self) -> Result<String> {
         Ok(String::new())
+    }
+    fn cursor(&mut self) -> Result<Cursor> {
+        Ok(Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        })
+    }
+    fn is_alive(&mut self) -> bool {
+        true
+    }
+    fn terminate(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn size(&self) -> Size {
+        Size::default()
+    }
+}
+
+struct StreamingAgent {
+    output: Option<Receiver<Vec<u8>>>,
+}
+
+impl AgentProcess for StreamingAgent {
+    fn write(&mut self, _bytes: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn screen_text(&mut self) -> Result<String> {
+        Ok(String::new())
+    }
+    fn subscribe(&mut self) -> Option<Receiver<Vec<u8>>> {
+        self.output.take()
     }
     fn cursor(&mut self) -> Result<Cursor> {
         Ok(Cursor {
@@ -214,6 +247,54 @@ fn idle_time_is_driven_by_the_injected_clock() {
     // Input resets it, without any real time having passed.
     session.send_line("more work").unwrap();
     assert_eq!(session.idle_for(), Duration::ZERO);
+}
+
+#[test]
+fn output_idle_tracks_streaming_without_input_then_ages_when_quiet() {
+    let clock = Arc::new(ManualClock::new());
+    let (output, receiver) = mpsc::channel();
+    let session = Session::new(
+        "streaming",
+        Box::new(StreamingAgent {
+            output: Some(receiver),
+        }),
+        clock.clone(),
+    );
+
+    // No input is ever sent. After an old input-idle value, streamed output
+    // must refresh the separate output-idle clock.
+    clock.advance(Duration::from_secs(3));
+    for _ in 0..4 {
+        output.send(vec![b'x']).expect("stream output");
+        // Let the receiver thread record the chunk without advancing the
+        // injected clock; output_idle must then reset to exactly zero.
+        for _ in 0..100_000 {
+            if session.output_idle_for() == Duration::ZERO {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            session.output_idle_for() < Duration::from_secs(2),
+            "streaming output did not refresh output_idle"
+        );
+        clock.advance(Duration::from_secs(1));
+        assert!(
+            session.output_idle_for() < Duration::from_secs(2),
+            "a streaming session without input must remain busy"
+        );
+    }
+
+    drop(output);
+    clock.advance(Duration::from_secs(2));
+    assert!(
+        session.output_idle_for() >= Duration::from_secs(2),
+        "a session must become idle after output stops"
+    );
+    assert!(
+        session.idle_for() > Duration::from_secs(5),
+        "output must not change ls().idle's since-input meaning"
+    );
 }
 
 /// #136: only an attached human's keystrokes set `human_idle_for`; a script's

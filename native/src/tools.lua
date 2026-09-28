@@ -1105,11 +1105,9 @@ Session.__index = function(self, key)
   elseif key == "is_busy" then
     for _, row in ipairs(remuda.ls()) do
       if row.name == self.name then
-        -- A session that just produced output is doing work; one that has
-        -- sat quiet a couple of seconds is waiting on something else. No
-        -- real "is this session working" signal exists — this is a heuristic
-        -- ceiling on top of the idle time `ls()` already tracks, not a fact.
-        return row.idle < 2.0
+        -- No output for a couple of seconds is a useful working/idle heuristic.
+        -- `row.idle` remains since-input for callers that use that measure.
+        return row.output_idle < 2.0
       end
     end
     return nil

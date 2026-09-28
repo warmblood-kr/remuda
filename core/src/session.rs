@@ -20,6 +20,10 @@ pub struct Session {
     /// Reading of [`Clock::now`] taken at the last successful `send_line`.
     /// Meaningful only as a difference against a later reading.
     last_input_at: Mutex<Duration>,
+    /// Reading of [`Clock::now`] when the agent last produced output. A
+    /// dedicated receiver keeps this current even when no caller polls the
+    /// screen; `idle_for` remains the distinct since-input measure.
+    last_output_at: Arc<Mutex<Duration>>,
     /// [`Clock::now`] at the last keystroke through an [`Attached`] guard —
     /// a human's, never a script's. `None` until one arrives (#136).
     last_human_input_at: Mutex<Option<Duration>>,
@@ -46,17 +50,30 @@ impl core::fmt::Debug for Session {
 impl Session {
     pub fn new(
         name: impl Into<String>,
-        agent: Box<dyn AgentProcess>,
+        mut agent: Box<dyn AgentProcess>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         let size = agent.size();
         let started = clock.now();
+        let last_output_at = Arc::new(Mutex::new(started));
+        if let Some(output) = agent.subscribe() {
+            let last_output_at = Arc::clone(&last_output_at);
+            let clock = Arc::clone(&clock);
+            std::thread::spawn(move || {
+                while output.recv().is_ok() {
+                    if let Ok(mut at) = last_output_at.lock() {
+                        *at = clock.now();
+                    }
+                }
+            });
+        }
         Self {
             name: name.into(),
             agent: Mutex::new(agent),
             size: Mutex::new(size),
             clock,
             last_input_at: Mutex::new(started),
+            last_output_at,
             last_human_input_at: Mutex::new(None),
             attached: AtomicBool::new(false),
             input_lock: Mutex::new(()),
@@ -247,6 +264,12 @@ impl Session {
     /// signal, read off the injected clock so a test can drive it.
     pub fn idle_for(&self) -> Duration {
         let last = self.last_input_at.lock().map(|d| *d).unwrap_or_default();
+        self.clock.now().saturating_sub(last)
+    }
+
+    /// How long since the agent last produced output.
+    pub fn output_idle_for(&self) -> Duration {
+        let last = self.last_output_at.lock().map(|at| *at).unwrap_or_default();
         self.clock.now().saturating_sub(last)
     }
 

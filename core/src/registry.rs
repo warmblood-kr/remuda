@@ -33,7 +33,11 @@ use std::sync::{Arc, Mutex};
 pub struct SessionSummary {
     pub name: String,
     pub alive: bool,
+    /// Time since the last accepted input; unchanged by agent output.
     pub idle: Duration,
+    /// Time since the agent last produced output. `None` from older daemons.
+    #[serde(default)]
+    pub output_idle: Option<Duration>,
     pub size: Size,
     /// Whether a human holds it right now. A fact about the terminal, not about
     /// the session's job — see the scope line in `steps/012`.
@@ -124,6 +128,7 @@ impl Registry {
                 name: s.name().to_string(),
                 alive: s.is_alive(),
                 idle: s.idle_for(),
+                output_idle: Some(s.output_idle_for()),
                 size: s.size(),
                 attached: s.is_attached(),
                 human_idle: s.human_idle_for(),
