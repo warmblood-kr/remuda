@@ -69,7 +69,11 @@ struct Job {
 }
 
 enum JobKind {
-    Eval { code: String, name: Option<String> },
+    Eval {
+        code: String,
+        name: Option<String>,
+        allow_pending: bool,
+    },
     StopModules,
 }
 
@@ -130,7 +134,11 @@ impl Image {
                 let answer = match &ready {
                     Err(why) => Err(format!("image failed to start: {why}")),
                     Ok(()) => match &job.kind {
-                        JobKind::Eval { code, name } => {
+                        JobKind::Eval {
+                            code,
+                            name,
+                            allow_pending,
+                        } => {
                             handle.pending.begin_eval();
                             let answer = eval(&lua, code, name.as_deref()).map(|value| {
                                 if handle.pending.pending_id(&value).is_some() {
@@ -143,8 +151,14 @@ impl Image {
                                 .as_ref()
                                 .ok()
                                 .and_then(|value| handle.pending.pending_id(value));
-                            handle.pending.finish_eval(pending_id);
-                            answer
+                            if pending_id.is_some() && !*allow_pending {
+                                handle.pending.finish_eval(None);
+                                Err("pending replies may only be returned from a daemon request"
+                                    .into())
+                            } else {
+                                handle.pending.finish_eval(pending_id);
+                                answer
+                            }
                         }
                         JobKind::StopModules => script::stop_modules(&lua)
                             .map(|()| String::new())
@@ -174,6 +188,7 @@ impl Image {
                 kind: JobKind::Eval {
                     code: code.to_string(),
                     name: name.map(str::to_string),
+                    allow_pending: false,
                 },
                 reply,
             })
@@ -200,6 +215,23 @@ impl Image {
     /// interpreter, and a variable set by any of them outlives the call.
     pub fn eval(&self, code: &str, name: Option<&str>) -> Result<String, String> {
         self.submit(code, name)?
+            .recv()
+            .map_err(|_| "the image stopped without answering".to_string())?
+    }
+
+    pub fn eval_request(&self, code: &str, name: Option<&str>) -> Result<String, String> {
+        let (reply, answer) = channel();
+        self.jobs
+            .send(Job {
+                kind: JobKind::Eval {
+                    code: code.to_string(),
+                    name: name.map(str::to_string),
+                    allow_pending: true,
+                },
+                reply,
+            })
+            .map_err(|_| "the image is not running".to_string())?;
+        answer
             .recv()
             .map_err(|_| "the image stopped without answering".to_string())?
     }

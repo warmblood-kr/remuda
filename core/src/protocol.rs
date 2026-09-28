@@ -158,8 +158,8 @@ pub enum Response {
     /// A command result completed through a bounded pending reply handle.
     CommandResult {
         exit_code: u8,
-        stdout: Vec<u8>,
-        stderr: Vec<u8>,
+        stdout_base64: String,
+        stderr_base64: String,
     },
     Ok,
     /// A tracked attachment was accepted and its generation is returned.

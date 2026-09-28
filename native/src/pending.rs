@@ -235,16 +235,44 @@ impl PendingReplies {
                 Err(TryRecvError::Empty) => {}
             }
             if let Ok(Signal::Shutdown(ack)) = signal_rx.try_recv() {
-                cancel_entry(&entry, "shutdown");
+                if cancel_entry(&entry, "shutdown") {
+                    break (Err("daemon stopping".into()), Some(ack));
+                }
+                if entry.state.status.load(Ordering::SeqCst) == 1 {
+                    let completion = result_rx
+                        .recv()
+                        .map_err(|_| "deferred reply was abandoned".to_string());
+                    break (completion, Some(ack));
+                }
                 break (Err("daemon stopping".into()), Some(ack));
             }
             if client_disconnected() {
-                cancel_entry(&entry, "client_disconnected");
+                if cancel_entry(&entry, "client_disconnected") {
+                    break (Err("client disconnected".into()), None);
+                }
+                if entry.state.status.load(Ordering::SeqCst) == 1 {
+                    break (
+                        result_rx
+                            .recv()
+                            .map_err(|_| "deferred reply was abandoned".to_string()),
+                        None,
+                    );
+                }
                 break (Err("client disconnected".into()), None);
             }
             let now = Instant::now();
             if now >= deadline {
-                cancel_entry(&entry, "timeout");
+                if cancel_entry(&entry, "timeout") {
+                    break (Err("deferred command timed out".into()), None);
+                }
+                if entry.state.status.load(Ordering::SeqCst) == 1 {
+                    break (
+                        result_rx
+                            .recv()
+                            .map_err(|_| "deferred reply was abandoned".to_string()),
+                        None,
+                    );
+                }
                 break (Err("deferred command timed out".into()), None);
             }
             let wait = (deadline - now).min(CLIENT_POLL);
@@ -284,14 +312,13 @@ impl PendingReplies {
         let (ack_tx, ack_rx) = mpsc::channel();
         let mut expected = 0;
         for entry in entries.values() {
-            if cancel_entry(entry, "shutdown") {
-                if entry
+            if cancel_entry(entry, "shutdown")
+                && entry
                     .signal_tx
                     .send(Signal::Shutdown(ack_tx.clone()))
                     .is_ok()
-                {
-                    expected += 1;
-                }
+            {
+                expected += 1;
             }
         }
         drop(ack_tx);
@@ -301,6 +328,23 @@ impl PendingReplies {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() || ack_rx.recv_timeout(remaining).is_err() {
                 break;
+            }
+        }
+    }
+
+    pub fn abandon(&self, id: u64) {
+        if let Some(entry) = self
+            .0
+            .entries
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id)
+        {
+            if entry.state.cancel("client_disconnected") {
+                let _ = entry.event_tx.send(PendingEvent {
+                    id,
+                    reason: Some("client_disconnected".into()),
+                });
             }
         }
     }
@@ -376,14 +420,18 @@ impl UserData for PendingHandle {
                         "pending exit code must be an integer from 0 through 255",
                     ));
                 }
-                let stdout = stdout.as_bytes().to_vec();
-                let stderr = stderr.as_bytes().to_vec();
-                let output_size = stdout.len().saturating_add(stderr.len());
+                let stdout_bytes = stdout.as_bytes();
+                let stderr_bytes = stderr.as_bytes();
+                let output_size = stdout_bytes.len().saturating_add(stderr_bytes.len());
                 if output_size > MAX_DEFERRED_OUTPUT_BYTES {
-                    return this.complete(Completion::Failure(format!(
+                    let message = format!(
                         "deferred command reply exceeds the 16 MiB output limit ({output_size} bytes)"
-                    )));
+                    );
+                    this.complete(Completion::Failure(message.clone()))?;
+                    return Err(mlua::Error::runtime(message));
                 }
+                let stdout = stdout_bytes.to_vec();
+                let stderr = stderr_bytes.to_vec();
                 this.complete(Completion::Result(CommandResult {
                     exit_code: code as u8,
                     stdout,
@@ -402,5 +450,38 @@ impl UserData for PendingHandle {
             };
             this.complete(Completion::Failure(failure))
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn waiter_does_not_report_timeout_after_completion_claim() {
+        let pending = PendingReplies::default();
+        let (id, handle) = pending.create(Duration::from_millis(20)).unwrap();
+        let entry = pending.0.entries.lock().unwrap().get(&id).unwrap().clone();
+        // This is the state immediately after complete() wins its CAS and
+        // before it publishes the completion into the result channel.
+        entry.state.status.store(1, Ordering::SeqCst);
+        let waiter = pending.clone();
+        let (done_tx, done_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let result = waiter.wait(id, || false).unwrap();
+            done_tx.send(result.completion).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(matches!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        handle
+            .result_tx
+            .send(Completion::Failure("claimed completion".into()))
+            .unwrap();
+        assert!(matches!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Ok(Completion::Failure(message)) if message == "claimed completion"
+        ));
+        thread.join().unwrap();
     }
 }

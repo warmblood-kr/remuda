@@ -90,6 +90,14 @@ remuda.extension_command("deferred", function(args)
       reply:resolve(0, string.rep("x", 16 * 1024 * 1024 + 1), "")
     end }
     return reply
+  elseif args[1] == "max_output" then
+    local reply = remuda.pending { timeout = 5 }
+    local schedule
+    schedule = remuda.schedule { every = 0.1, run = function()
+      remuda.cancel(schedule)
+      reply:resolve(0, string.rep("x", 16 * 1024 * 1024), "")
+    end }
+    return reply
   elseif args[1] == "shutdown_wait" then
     local path = args[2]
     return remuda.pending { timeout = 30, on_cancel = function(reason)
@@ -253,6 +261,27 @@ fn deferred_output_over_limit_is_an_error_without_truncation() {
         String::from_utf8_lossy(&output.stderr).contains("16 MiB output limit"),
         "{output:?}"
     );
+}
+
+#[test]
+fn maximum_deferred_output_round_trips_with_base64_wire_encoding() {
+    let (dir, remuda) = fixture("max_output");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+    let started = std::time::Instant::now();
+    let output = remuda(&["deferred", "max_output"]);
+    let elapsed = started.elapsed();
+    let _ = remuda(&["stop", "-f"]);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(output.stdout.len(), 16 * 1024 * 1024);
+    assert!(output.stderr.is_empty(), "{output:?}");
+    eprintln!("16 MiB deferred reply round trip: {elapsed:.2?}");
 }
 
 #[test]

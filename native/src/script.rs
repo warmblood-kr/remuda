@@ -462,19 +462,23 @@ pub fn bindings(
     // the REPL, `-e`, any other script — for the full duration. Not a wait or
     // a timer primitive; remuda has no periodic-execution mechanism yet, and
     // faking one with a sleep-and-poll loop holds the Image hostage the same way.
+    sleep_binding(lua, &table)?;
+
+    Ok(table)
+}
+
+fn sleep_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
     table.set(
         "sleep",
         lua.create_function(|_, seconds: f64| {
-            // A negative or NaN duration would panic in `from_secs_f64`; a
-            // script asking to sleep backwards gets nothing rather than a crash.
+            // Negative or NaN durations do nothing instead of panicking in
+            // `Duration::from_secs_f64`.
             if seconds.is_finite() && seconds > 0.0 {
                 std::thread::sleep(Duration::from_secs_f64(seconds));
             }
             Ok(())
         })?,
-    )?;
-
-    Ok(table)
+    )
 }
 
 fn pending_bindings(
@@ -493,7 +497,9 @@ fn pending_bindings(
                 ));
             }
             let duration = Duration::from_secs_f64(seconds.max(0.000_000_001));
-            let (id, handle) = create.create(duration).map_err(mlua::Error::runtime)?;
+            let (id, handle) = create.create(duration).map_err(|message| {
+                mlua::Error::external(crate::image::TypedFailure { message, code: 1 })
+            })?;
             Ok((id, lua.create_userdata(handle)?))
         })?,
     )?;

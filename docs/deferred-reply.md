@@ -23,6 +23,8 @@ code. In particular, `--json` output belongs on stdout and errors belong on
 stderr with a non-zero code. `reject(error)` takes a descriptive string and
 surfaces a command failure through the ordinary CLI error path. Returning an
 ordinary value remains a shorthand for today's synchronous success behavior.
+The daemon encodes stdout and stderr as Base64 strings in its JSON protocol;
+the CLI decodes them and writes the original bytes.
 
 `timeout` is in seconds, must be positive, and is optional. Its default is 30
 seconds and the maximum is 300 seconds, which allows a 60 second upload to
@@ -44,9 +46,10 @@ sent to a connected client when timeout causes cancellation.
   cancelled because its client went away. A second `resolve` or `reject` is a
   programming error and returns an error without changing the first outcome.
 - A deferred result's combined stdout and stderr must be at most
-  `MAX_DEFERRED_OUTPUT_BYTES` (16 MiB). Oversized results complete with a clear
-  size-limit error; they are not silently cut off. This bound applies only to
-  deferred results; today's synchronous return path is unchanged.
+  `MAX_DEFERRED_OUTPUT_BYTES` (16 MiB). Oversized `resolve` calls raise a clear
+  size-limit error to Lua and fail the deferred request; they are not silently
+  cut off. This bound applies only to deferred results; today's synchronous
+  return path is unchanged.
 - An invalid timeout (non-number, non-positive, or above 300 seconds), an
   invalid exit code or output type, a missing result field, or completion after
   another terminal outcome is reported as a Lua API error. Command rejection,

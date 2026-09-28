@@ -597,7 +597,7 @@ fn handle(
         Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
         Request::RemoveDirAll { path: dir } => reply(&stream, &remove_dir_all(&dir)),
 
-        Request::Eval { code, name } => match image.eval(&code, name.as_deref()) {
+        Request::Eval { code, name } => match image.eval_request(&code, name.as_deref()) {
             Ok(value) => match image.pending_replies().pending_id(&value) {
                 Some(id) => deferred_reply(stream, reader, image, id),
                 None => reply(&stream, &Response::Value(value)),
@@ -615,7 +615,10 @@ fn deferred_reply(
     image: &Image,
     id: u64,
 ) -> std::io::Result<()> {
-    stream.set_nonblocking(true)?;
+    if let Err(error) = stream.set_nonblocking(true) {
+        image.pending_replies().abandon(id);
+        return Err(error);
+    }
     let result = image.pending_replies().wait(id, || {
         let mut extra = [0u8; 1];
         match reader.read(&mut extra) {
@@ -632,8 +635,8 @@ fn deferred_reply(
             let response = match result.completion {
                 Ok(crate::pending::Completion::Result(result)) => Some(Response::CommandResult {
                     exit_code: result.exit_code,
-                    stdout: result.stdout,
-                    stderr: result.stderr,
+                    stdout_base64: crate::cluster::encoding::encode_base64(&result.stdout),
+                    stderr_base64: crate::cluster::encoding::encode_base64(&result.stderr),
                 }),
                 Ok(crate::pending::Completion::Failure(error)) => Some(Response::error(error)),
                 Err(error) if error == "client disconnected" => None,
