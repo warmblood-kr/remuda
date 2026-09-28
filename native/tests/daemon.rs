@@ -127,19 +127,35 @@ fn collect_until_bytes(receiver: &Receiver<Vec<u8>>, needle: &[u8]) {
     let deadline = Instant::now() + PATIENCE;
     let mut output = Vec::new();
     while !output.windows(needle.len()).any(|window| window == needle) {
-        assert!(
-            Instant::now() < deadline,
-            "terminal output omitted {needle:?}"
-        );
+        if Instant::now() >= deadline {
+            panic!(
+                "terminal output omitted {needle:?}; received {} bytes, tail: {}",
+                output.len(),
+                escaped_tail(&output)
+            );
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         match receiver.recv_timeout(remaining.min(Duration::from_millis(500))) {
             Ok(chunk) => output.extend_from_slice(&chunk),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
-                panic!("attach client exited before writing {needle:?}")
+                panic!(
+                    "attach client exited before writing {needle:?}; received {} bytes, tail: {}",
+                    output.len(),
+                    escaped_tail(&output)
+                )
             }
         }
     }
+}
+
+fn escaped_tail(output: &[u8]) -> String {
+    let start = output.len().saturating_sub(400);
+    output[start..]
+        .iter()
+        .flat_map(|byte| std::ascii::escape_default(*byte))
+        .map(char::from)
+        .collect()
 }
 
 fn traced_input(path: &Path) -> Vec<u8> {
