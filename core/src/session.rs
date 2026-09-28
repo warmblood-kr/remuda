@@ -5,6 +5,7 @@
 
 use crate::agent::{
     AgentError, AgentProcess, Cursor, MouseState, Result, ScreenSnapshot, Size, StyledCell,
+    VersionedSnapshot,
 };
 use crate::clock::Clock;
 use crate::protocol::Step;
@@ -29,6 +30,7 @@ pub struct Session {
     /// dedicated receiver keeps this current even when no caller polls the
     /// screen; `idle_for` remains the distinct since-input measure.
     last_output_at: Arc<Mutex<Duration>>,
+    instance_id: String,
     /// [`Clock::now`] at the last keystroke through an [`Attached`] guard —
     /// a human's, never a script's. `None` until one arrives (#136).
     last_human_input_at: Mutex<Option<Duration>>,
@@ -42,6 +44,12 @@ pub struct Session {
     /// `Pause` between them — so a second sender cannot land a write during a
     /// pause, when the `agent` lock is briefly free. See [`Self::feed`].
     input_lock: Mutex<()>,
+}
+
+/// Generate a unique session-start identity from host entropy and a process counter.
+pub fn generate_instance_id(seed: u128) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("{seed:032x}-{:016x}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Identity and size only. Deliberately takes no lock: a `Debug` that locks
@@ -82,6 +90,7 @@ impl Session {
         mut agent: Box<dyn AgentProcess>,
         clock: Arc<dyn Clock>,
     ) -> Self {
+        let instance_id = generate_instance_id(clock.instance_id_seed());
         let size = agent.size();
         let started = clock.now();
         let last_output_at = Arc::new(Mutex::new(started));
@@ -104,6 +113,7 @@ impl Session {
             clock,
             last_input_at: Mutex::new(started),
             last_output_at,
+            instance_id,
             last_human_input_at: Mutex::new(None),
             attached: AtomicBool::new(false),
             attach_slot: Mutex::new(None),
@@ -118,6 +128,17 @@ impl Session {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn instance_id(&self) -> &str {
+        &self.instance_id
+    }
+
+    pub fn output_version(&self) -> Option<u64> {
+        self.agent
+            .lock()
+            .ok()
+            .and_then(|mut agent| agent.output_version())
     }
 
     /// The current terminal size.
@@ -286,12 +307,19 @@ impl Session {
         agent.row_wrapped_at(scrollback)
     }
 
+    /// A screen and its output generation from one session-lock interval.
     pub fn screen_snapshot_at(&self, scrollback: usize) -> Result<ScreenSnapshot> {
+        Ok(self.screen_snapshot_version_at(scrollback)?.snapshot)
+    }
+
+    pub fn screen_snapshot_version_at(&self, scrollback: usize) -> Result<VersionedSnapshot> {
         let mut agent = self
             .agent
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-        agent.screen_snapshot_at(scrollback)
+        let mut snapshot = agent.screen_snapshot_at(scrollback)?;
+        snapshot.instance_id = Some(self.instance_id.clone());
+        Ok(snapshot)
     }
 
     pub fn is_alive(&self) -> bool {
