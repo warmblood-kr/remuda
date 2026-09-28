@@ -25,6 +25,9 @@ const PATIENCE: Duration = Duration::from_secs(10);
 #[path = "daemon_support/spawn.rs"]
 mod spawn;
 use spawn::Daemon;
+#[cfg(windows)]
+#[path = "daemon_support/conpty.rs"]
+mod conpty;
 
 /// A runtime directory of our own. Short enough for `sun_path` (~108 bytes) —
 /// a long path fails at bind with a message no caller would guess from a
@@ -993,6 +996,8 @@ fn a_tracked_client_exits_on_takeover_without_waiting_for_another_key() {
     // parent's slave handle open can prevent some PTY implementations from
     // reporting EOF after the child exits.
     drop(pty.slave);
+    #[cfg(windows)]
+    let mut input_writer = pty.master.take_writer().expect("take client PTY writer");
     let mut reader = pty.master.try_clone_reader().expect("clone pty reader");
     let captured_output = Arc::new(Mutex::new(Vec::new()));
     let thread_output = Arc::clone(&captured_output);
@@ -1000,10 +1005,18 @@ fn a_tracked_client_exits_on_takeover_without_waiting_for_another_key() {
     let (output_tx, output_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
+        #[cfg(windows)]
+        let mut pending = Vec::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    #[cfg(windows)]
+                    conpty::answer_conpty_cursor_queries(
+                        &mut input_writer,
+                        &mut pending,
+                        &buf[..n],
+                    );
                     thread_output
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
