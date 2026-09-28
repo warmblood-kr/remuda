@@ -635,9 +635,7 @@ fn handle_connection_with(
         Err(_) => return ignore_response_error(write_http_response(stream, 400, b"bad frame")),
     };
     let peer_fp = cluster::encoding::fingerprint(&opened.peer_static);
-    if authorize(&opened.peer_static).is_err() {
-        return ignore_response_error(write_http_response(stream, 403, b"not admitted"));
-    }
+    let admitted = authorize(&opened.peer_static).is_ok();
     let now = crate::SystemWallClock::new().unix_seconds() as i64;
     let replay = state
         .replay
@@ -646,6 +644,35 @@ fn handle_connection_with(
         .check_and_insert(&peer_fp, opened.ephemeral, opened.timestamp_seconds, now);
     if replay.is_err() {
         return ignore_response_error(write_http_response(stream, 409, b"replayed or stale frame"));
+    }
+    if !admitted {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct JoinRequest {
+            join: JoinToken,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct JoinToken {
+            token: String,
+        }
+        let request: JoinRequest = match serde_json::from_slice(&opened.payload) {
+            Ok(request) => request,
+            Err(_) => {
+                return ignore_response_error(write_http_response(stream, 403, b"not admitted"))
+            }
+        };
+        let result = state
+            .join_tokens
+            .verify_consume_with(&request.join.token, || {
+                cluster::admit_join_locked(&opened.peer_static)
+            });
+        let response = if result.is_ok() {
+            b"{\"joined\":true}".as_slice()
+        } else {
+            b"{\"joined\":false}".as_slice()
+        };
+        return send_encrypted_response(stream, opened, response);
     }
     let Some(peer_permit) = state.limiter.acquire_peer(&peer_fp) else {
         return ignore_response_error(write_http_response(

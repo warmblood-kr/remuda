@@ -123,9 +123,19 @@ impl JoinTokenStore {
 
     /// Verify and durably consume a token; all later uses are refused.
     pub fn verify_and_consume(&self, token: &str) -> io::Result<()> {
+        self.verify_consume_with(token, || Ok(()))
+    }
+
+    /// Validate a token and perform admission while holding the same state lock.
+    /// The token remains valid if the admission callback refuses the request.
+    pub fn verify_consume_with<T>(
+        &self,
+        token: &str,
+        admit: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
         #[cfg(windows)]
         {
-            let _ = token;
+            let _ = (token, admit);
             Err(unsupported_storage())
         }
         #[cfg(not(windows))]
@@ -139,9 +149,10 @@ impl JoinTokenStore {
                 record.expires_at_unix_seconds > now && hashes_equal(&record.hash, &hash)
             });
             if let Some(position) = position {
+                let result = admit()?;
                 state.tokens.remove(position);
                 save_state(&self.directory, &state)?;
-                Ok(())
+                Ok(result)
             } else {
                 save_state(&self.directory, &state)?;
                 Err(refused_token())

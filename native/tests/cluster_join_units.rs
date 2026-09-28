@@ -105,6 +105,25 @@ fn join_token_consumes_once_across_store_reload() {
 
 #[test]
 #[cfg(not(windows))]
+fn refused_join_admission_does_not_consume_token() {
+    let dir = private_dir();
+    let clock = Arc::new(ManualWallClock::new(1_700_000_000));
+    let store = JoinTokenStore::open_at(&dir, clock).unwrap();
+    let minted = store.mint().unwrap();
+    let refused = store.verify_consume_with(&minted.token, || {
+        Err::<(), _>(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "registry full",
+        ))
+    });
+    assert!(refused.is_err());
+    assert!(store.verify_and_consume(&minted.token).is_ok());
+    assert!(store.verify_and_consume(&minted.token).is_err());
+    remove_dir(&dir);
+}
+
+#[test]
+#[cfg(not(windows))]
 fn join_token_rejects_expired_and_unknown_values() {
     let dir = private_dir();
     let clock = Arc::new(ManualWallClock::new(1_700_000_000));
@@ -256,6 +275,7 @@ fn join_token_purges_expired_entries_before_applying_the_limit() {
 fn join_line_round_trips_ipv4_and_ipv6() {
     let line = JoinLine {
         issuer_addr: "[fd00::1]:443".parse().unwrap(),
+        issuer_fingerprint: fingerprint(&[7; 32]),
         issuer_static_pubkey: [7; 32],
         token: Zeroizing::new(remuda_native::cluster::encoding::encode_base64(&[9; 32])),
     };
@@ -263,6 +283,7 @@ fn join_line_round_trips_ipv4_and_ipv6() {
     assert!(!format!("{line:?}").contains(line.token.as_str()));
     let ipv4 = JoinLine {
         issuer_addr: "10.0.0.1:443".parse().unwrap(),
+        issuer_fingerprint: fingerprint(&[7; 32]),
         issuer_static_pubkey: [7; 32],
         token: Zeroizing::new(remuda_native::cluster::encoding::encode_base64(&[9; 32])),
     };
@@ -272,7 +293,8 @@ fn join_line_round_trips_ipv4_and_ipv6() {
 #[test]
 fn join_line_rejects_bad_fields_and_noncanonical_keys() {
     let valid = format!(
-        "remuda-join-v1 10.0.0.1:443 {} {}",
+        "remuda-join-v1 10.0.0.1:443 {} {} {}",
+        fingerprint(&[7; 32]),
         remuda_native::cluster::encoding::encode_base64(&[7; 32]),
         remuda_native::cluster::encoding::encode_base64(&[9; 32])
     );
@@ -301,7 +323,10 @@ fn join_line_rejects_noncanonical_or_nonunicast_endpoints() {
         "[ff02::1]:443",
         "[fe80::1%1]:443",
     ] {
-        let line = format!("remuda-join-v1 {address} {key} {token}");
+        let line = format!(
+            "remuda-join-v1 {address} {} {key} {token}",
+            fingerprint(&[7; 32])
+        );
         assert!(JoinLine::decode(&line).is_err(), "accepted {address}");
     }
 }
@@ -309,7 +334,8 @@ fn join_line_rejects_noncanonical_or_nonunicast_endpoints() {
 #[test]
 fn join_line_rejects_all_zero_static_key() {
     let invalid = format!(
-        "remuda-join-v1 10.0.0.1:443 {} {}",
+        "remuda-join-v1 10.0.0.1:443 {} {} {}",
+        fingerprint(&[0; 32]),
         remuda_native::cluster::encoding::encode_base64(&[0; 32]),
         remuda_native::cluster::encoding::encode_base64(&[9; 32])
     );
@@ -324,6 +350,7 @@ fn join_line_pin_check_matches_and_rejects_mismatch() {
     let expected_fp = fingerprint(&keypair.public);
     let line = JoinLine {
         issuer_addr: "10.0.0.1:443".parse().unwrap(),
+        issuer_fingerprint: expected_fp.clone(),
         issuer_static_pubkey: keypair.public.as_slice().try_into().unwrap(),
         token: Zeroizing::new(remuda_native::cluster::encoding::encode_base64(&[9; 32])),
     };

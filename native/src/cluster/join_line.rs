@@ -13,6 +13,7 @@ const MAX_JOIN_LINE_SIZE: usize = 256;
 #[derive(PartialEq, Eq)]
 pub struct JoinLine {
     pub issuer_addr: SocketAddr,
+    pub issuer_fingerprint: String,
     pub issuer_static_pubkey: [u8; 32],
     pub token: Zeroizing<String>,
 }
@@ -35,20 +36,21 @@ impl JoinLine {
         validate_token(&self.token)?;
         validate_static_key(&self.issuer_static_pubkey)?;
         Ok(format!(
-            "{JOIN_LINE_VERSION} {} {} {}",
+            "{JOIN_LINE_VERSION} {} {} {} {}",
             self.issuer_addr,
+            self.issuer_fingerprint,
             encoding::encode_base64(&self.issuer_static_pubkey),
             self.token.as_str()
         ))
     }
 
-    /// Parse an invitation with exactly four canonical fields on one line.
+    /// Parse an invitation with exactly five canonical fields on one line.
     pub fn decode(line: &str) -> io::Result<Self> {
         if line.len() > MAX_JOIN_LINE_SIZE || line.contains(['\r', '\n', '\t']) {
             return Err(invalid_join_line());
         }
         let fields: Vec<&str> = line.split(' ').collect();
-        if fields.len() != 4 || fields.iter().any(|field| field.is_empty()) {
+        if fields.len() != 5 || fields.iter().any(|field| field.is_empty()) {
             return Err(invalid_join_line());
         }
         if fields[0] != JOIN_LINE_VERSION {
@@ -59,20 +61,29 @@ impl JoinLine {
             return Err(invalid_join_line());
         }
         validate_endpoint(issuer_addr)?;
-        let public_key = decode_canonical_key(fields[2], "issuer public key")?;
+        let public_key = decode_canonical_key(fields[3], "issuer public key")?;
         let issuer_static_pubkey = public_key.try_into().map_err(|_| invalid_join_line())?;
         validate_static_key(&issuer_static_pubkey)?;
-        validate_token(fields[3])?;
+        if encoding::fingerprint(&issuer_static_pubkey) != fields[2] {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "issuer key does not match pinned fingerprint",
+            ));
+        }
+        validate_token(fields[4])?;
         Ok(Self {
             issuer_addr,
+            issuer_fingerprint: fields[2].to_owned(),
             issuer_static_pubkey,
-            token: Zeroizing::new(fields[3].to_owned()),
+            token: Zeroizing::new(fields[4].to_owned()),
         })
     }
 
     /// Verify the shown fingerprint before any handshake is attempted.
     pub fn verify_pin(&self, shown_fingerprint: &str) -> io::Result<()> {
-        if encoding::fingerprint(&self.issuer_static_pubkey) != shown_fingerprint {
+        if self.issuer_fingerprint != shown_fingerprint
+            || encoding::fingerprint(&self.issuer_static_pubkey) != shown_fingerprint
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "issuer static key does not match the shown fingerprint",

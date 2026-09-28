@@ -323,6 +323,13 @@ fn help_command() -> ExitCode {
 enum ClusterCommand {
     Status,
     Init,
+    Invite {
+        bind_addr: std::net::SocketAddr,
+    },
+    Join {
+        fingerprint: String,
+        invitation: remuda_native::cluster::join_line::JoinLine,
+    },
     Nodes,
     Revoke {
         target: String,
@@ -340,6 +347,16 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
     match args {
         [] => ClusterCommand::Status,
         ["init"] => ClusterCommand::Init,
+        ["invite", "--bind", address] => address
+            .parse()
+            .map(|bind_addr| ClusterCommand::Invite { bind_addr })
+            .unwrap_or(ClusterCommand::Invalid),
+        ["join", fingerprint, line] => remuda_native::cluster::join_line::JoinLine::decode(line)
+            .map(|invitation| ClusterCommand::Join {
+                fingerprint: (*fingerprint).to_owned(),
+                invitation,
+            })
+            .unwrap_or(ClusterCommand::Invalid),
         ["nodes"] => ClusterCommand::Nodes,
         ["revoke", target] => ClusterCommand::Revoke {
             target: (*target).to_string(),
@@ -402,6 +419,17 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             }
             Err(error) => fail(format!("cluster init: {error}")),
         },
+        ClusterCommand::Invite { bind_addr } => match remuda_native::cluster::mint_join_line(bind_addr) {
+            Ok(line) => match line.encode() {
+                Ok(line) => { println!("Join line (expires in 10 minutes):\n{line}"); ExitCode::SUCCESS }
+                Err(error) => fail(format!("cluster invite: {error}")),
+            },
+            Err(error) => fail(format!("cluster invite: {error}")),
+        },
+        ClusterCommand::Join { fingerprint, invitation } => match cluster_join(&fingerprint, &invitation) {
+            Ok(()) => { println!("Joined cluster."); ExitCode::SUCCESS }
+            Err(error) => fail(format!("cluster join: {error}")),
+        },
         ClusterCommand::Nodes => match remuda_native::cluster::nodes() {
             Ok(Some((identity, registry))) => {
                 let mut stdout = std::io::stdout().lock();
@@ -442,7 +470,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                 Err(error) => fail(format!("cluster listener: {error}")),
             }
         }),
-        ClusterCommand::Invalid => fail("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | remote [node/session] | listen --bind ADDR [--allow-public]]"),
+        ClusterCommand::Invalid => fail("usage: remuda cluster [init | invite --bind ADDR | join <fingerprint> <join-line> | nodes | revoke <node|fingerprint> [--yes] | remote [node/session] | listen --bind ADDR [--allow-public]]"),
     }
 }
 
@@ -497,6 +525,19 @@ fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
         }
         Err(error) => fail(format!("cluster revoke: {error}")),
     }
+}
+
+fn cluster_join(
+    shown_fingerprint: &str,
+    invitation: &remuda_native::cluster::join_line::JoinLine,
+) -> std::io::Result<()> {
+    invitation.verify_pin(shown_fingerprint)?;
+    let private = remuda_native::cluster::identity::load_static_private_key()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_secs() as i64;
+    remuda_native::net::join::join(invitation, &private, now)
 }
 
 fn revoke_confirmation(yes: bool, stdin_tty: bool, stderr_tty: bool) -> Result<bool, &'static str> {
@@ -559,6 +600,12 @@ mod cluster_cli_tests {
         assert_eq!(parse_cluster_command(&[]), ClusterCommand::Status);
         assert_eq!(parse_cluster_command(&["init"]), ClusterCommand::Init);
         assert_eq!(parse_cluster_command(&["join"]), ClusterCommand::Invalid);
+        assert_eq!(
+            parse_cluster_command(&["invite", "--bind", "192.0.2.4:9443"]),
+            ClusterCommand::Invite {
+                bind_addr: "192.0.2.4:9443".parse().unwrap()
+            }
+        );
     }
 
     #[test]
