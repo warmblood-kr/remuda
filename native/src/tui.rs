@@ -39,6 +39,8 @@ const TICK: Duration = Duration::from_millis(250);
 /// than `TICK` so a keypress is never left waiting to be noticed. Used to
 /// also be the redraw cadence; see steps/017 for why that was the bug.
 const TICK_TYPING: Duration = Duration::from_millis(40);
+const SCROLL_DOWN_SETTLE: Duration = Duration::from_millis(1500);
+const MAX_ANCHOR_CAPTURES: usize = 3;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -110,7 +112,7 @@ pub struct Ui {
     /// Remuda's own kill ring. It deliberately does not require or alter the
     /// host OS clipboard.
     yank: String,
-    scrollback: HashMap<String, usize>,
+    scrollback: HashMap<String, ScrollState>,
     pub mode: Mode,
     pub focus: Focus,
     /// Visual mode (tmux copy-mode-vi): `visual_cursor` moves; the selection
@@ -134,6 +136,21 @@ pub struct Ui {
     sessions_text: Vec<String>,
     /// Rows per session, supplied by the Lua sessions-buffer contract.
     session_rows: usize,
+    /// Visible preview rows, refreshed from the terminal dimensions each frame.
+    preview_rows: u16,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ScrollState {
+    offset: usize,
+    history_rows: usize,
+    history_total: usize,
+    /// Total corresponding to `offset`; can lag `history_total` when output
+    /// keeps arriving through the bounded capture retries.
+    anchor_total: usize,
+    last_scroll_down: Option<Instant>,
+    scroll_direction: i8,
+    recent_up_output: usize,
 }
 
 impl Ui {
@@ -170,6 +187,7 @@ impl Ui {
             notice,
             sessions_text: Vec::new(),
             session_rows: 1,
+            preview_rows: 1,
         }
     }
 
@@ -422,7 +440,13 @@ impl Ui {
             self.notice = None;
             return Action::Nothing;
         }
-        to_bytes(key).map_or(Action::Nothing, Action::Type)
+        let bytes = to_bytes(key);
+        if bytes.is_some() {
+            if let Some(name) = self.selected().map(|session| session.name.clone()) {
+                self.scrollback.entry(name).or_default().offset = 0;
+            }
+        }
+        bytes.map_or(Action::Nothing, Action::Type)
     }
 
     /// Follow the session the keyboard is talking to by NAME, and hand the
@@ -497,6 +521,9 @@ impl Ui {
                 self.pan = 0;
                 Action::Nothing
             }
+            KeyCode::PageUp => Action::Scroll(self.preview_page_delta()),
+            KeyCode::PageDown => Action::Scroll(-self.preview_page_delta()),
+            KeyCode::End => Action::Scroll(i16::MIN),
             KeyCode::Char('h') => {
                 self.list_width = None;
                 Action::Nothing
@@ -546,6 +573,13 @@ impl Ui {
         } else {
             Action::Copy(name)
         }
+    }
+
+    fn preview_page_delta(&self) -> i16 {
+        self.preview_rows
+            .saturating_sub(1)
+            .max(1)
+            .min(i16::MAX as u16) as i16
     }
 
     fn leave_visual(&mut self) {
@@ -1439,7 +1473,7 @@ mod visual_mode_tests {
         ));
         let capture_deadline = Instant::now() + Duration::from_secs(5);
         let (cells, wrapped) = loop {
-            let (cells, wrapped, _) = capture_styled(&path, name, 0).expect("real capture");
+            let (cells, wrapped, _, _, _) = capture_styled(&path, name, 0).expect("real capture");
             let captured: String = cells[0].iter().map(|cell| cell.text.as_str()).collect();
             if captured.starts_with(text) {
                 break (cells, wrapped);
@@ -2213,6 +2247,7 @@ fn refresh(
     selection_moved: bool,
 ) -> std::io::Result<(u16, u16)> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    ui.preview_rows = rows.saturating_sub(1).max(1);
     ui.preview_width = ui_layout(ui, cols).1;
     if !skip_list {
         // The buffer is allowed to reorder the herd. Keep the identity, not
@@ -2288,15 +2323,13 @@ fn refresh(
         ui.last_resized = None;
     }
     let (cells, wrapped, cursor) = match shown.as_ref() {
-        Some(ShownTarget::Session(name)) => {
-            match capture_styled(path, name, *ui.scrollback.get(name).unwrap_or(&0)) {
-                Ok(result) => result,
-                Err(e) => {
-                    ui.notice = Some(format!("{name}: {e}"));
-                    (Vec::new(), Vec::new(), hidden)
-                }
+        Some(ShownTarget::Session(name)) => match capture_preview(path, ui, name) {
+            Ok(result) => result,
+            Err(e) => {
+                ui.notice = Some(format!("{name}: {e}"));
+                (Vec::new(), Vec::new(), hidden)
             }
-        }
+        },
         Some(ShownTarget::Buffer(name)) => match capture_buffer(path, name) {
             Ok((cells, cursor)) => (cells, Vec::new(), cursor),
             Err(e) => {
@@ -2465,14 +2498,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             Action::Kill(name) => ui.notice = kill(path, &name).err(),
             Action::Focus(name) => reconcile_hold(path, &mut ui, &mut held, &name),
             Action::Scroll(delta) => {
-                if let Some(session) = ui.selected() {
-                    let offset = ui.scrollback.entry(session.name.clone()).or_default();
-                    *offset = if delta >= 0 {
-                        offset.saturating_add(delta as usize)
-                    } else {
-                        offset.saturating_sub((-delta) as usize)
-                    };
-                }
+                scroll_selected(&mut ui, delta);
             }
             Action::Copy(name) => copy_screen(path, &mut ui, &name),
             Action::CopySelection(name) => copy_selection(path, &mut ui, &name),
@@ -2487,7 +2513,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
 
 fn copy_screen(path: &Path, ui: &mut Ui, name: &str) {
     match capture_styled(path, name, 0) {
-        Ok((cells, wrapped, _)) => {
+        Ok((cells, wrapped, _, _, _)) => {
             ui.yank = all_screen_text(&cells, &wrapped);
             ui.notice = Some(format!(
                 "copied {} bytes; p pastes into the selected session",
@@ -2499,9 +2525,9 @@ fn copy_screen(path: &Path, ui: &mut Ui, name: &str) {
 }
 
 fn copy_selection(path: &Path, ui: &mut Ui, name: &str) {
-    let offset = *ui.scrollback.get(name).unwrap_or(&0);
+    let offset = ui.scrollback.get(name).map_or(0, |state| state.offset);
     match capture_styled(path, name, offset) {
-        Ok((cells, wrapped, _)) => {
+        Ok((cells, wrapped, _, _, _)) => {
             // Copy-and-cancel, as tmux: the selection has done its job.
             ui.yank = ui.text_selection.take().map_or_else(
                 || all_screen_text(&cells, &wrapped),
@@ -2514,6 +2540,107 @@ fn copy_selection(path: &Path, ui: &mut Ui, name: &str) {
         }
         Err(e) => ui.notice = Some(format!("{name}: {e}")),
     }
+}
+
+fn scroll_state(state: &mut ScrollState, delta: i16) {
+    if delta > 0 {
+        if state.scroll_direction != 1 {
+            state.recent_up_output = 0;
+        }
+        state.scroll_direction = 1;
+        state.offset = state
+            .offset
+            .saturating_add(delta as usize)
+            .min(state.history_rows);
+    } else if delta < 0 {
+        if state.scroll_direction != -1 {
+            state.offset = state.offset.saturating_sub(state.recent_up_output);
+            state.recent_up_output = 0;
+        }
+        state.scroll_direction = -1;
+        state.last_scroll_down = Some(Instant::now());
+        state.offset = state.offset.saturating_sub(delta.unsigned_abs() as usize);
+    }
+}
+
+fn scroll_selected(ui: &mut Ui, delta: i16) {
+    if let Some(name) = ui.selected().map(|session| session.name.clone()) {
+        scroll_state(ui.scrollback.entry(name).or_default(), delta);
+    }
+}
+
+fn anchor_offset_to_new_history(
+    offset: usize,
+    previous_total: usize,
+    current_total: usize,
+    current_rows: usize,
+) -> usize {
+    if offset == 0 {
+        0
+    } else {
+        offset
+            .saturating_add(current_total.saturating_sub(previous_total))
+            .min(current_rows)
+    }
+}
+
+/// Capture at the offset computed from the history total in that capture.
+/// Output can arrive between a probe and its corrective capture; retry until
+/// the offset and the captured total describe the same screen state.
+fn capture_anchored<T>(
+    base_offset: usize,
+    previous_total: usize,
+    mut capture: impl FnMut(usize) -> Result<(T, usize, usize), String>,
+) -> Result<(T, usize, usize, usize, usize), String> {
+    let mut requested = base_offset;
+    for attempt in 0..MAX_ANCHOR_CAPTURES {
+        let (value, rows, total) = capture(requested)?;
+        let anchored = anchor_offset_to_new_history(base_offset, previous_total, total, rows);
+        if anchored == requested {
+            return Ok((value, rows, total, anchored, total));
+        }
+        if attempt + 1 == MAX_ANCHOR_CAPTURES {
+            // The captured cells use `requested`, while `total` may already
+            // include output that arrived after that offset was chosen. Store
+            // the total that corresponds to the captured offset so the next
+            // frame accounts for that missed drift exactly once.
+            let anchor_total = total.saturating_sub(requested.saturating_sub(base_offset));
+            return Ok((value, rows, total, requested, anchor_total));
+        }
+        requested = anchored;
+    }
+    unreachable!("the bounded anchor loop always returns a capture")
+}
+
+/// Keep a scrolled preview on the same history rows as output pushes new rows.
+fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCapture, String> {
+    let state = ui.scrollback.entry(name.to_string()).or_default();
+    let scrolling_down = state
+        .last_scroll_down
+        .is_some_and(|last| last.elapsed() < SCROLL_DOWN_SETTLE);
+    let (cells, wrapped, cursor, history_rows, history_total, anchored, anchor_total) =
+        if scrolling_down {
+            let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, state.offset)?;
+            (cells, wrapped, cursor, rows, total, state.offset, total)
+        } else {
+            let (capture, rows, total, anchored, anchor_total) =
+                capture_anchored(state.offset, state.anchor_total, |offset| {
+                    let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, offset)?;
+                    Ok(((cells, wrapped, cursor), rows, total))
+                })?;
+            let (cells, wrapped, cursor) = capture;
+            (cells, wrapped, cursor, rows, total, anchored, anchor_total)
+        };
+    state.offset = anchored;
+    if state.scroll_direction == 1 {
+        state.recent_up_output = state
+            .recent_up_output
+            .saturating_add(history_total.saturating_sub(state.history_total));
+    }
+    state.history_rows = history_rows;
+    state.history_total = history_total;
+    state.anchor_total = anchor_total;
+    Ok((cells, wrapped, cursor))
 }
 
 fn paste(path: &Path, ui: &mut Ui, held: &Option<(String, Hold)>) {
@@ -2679,7 +2806,8 @@ fn parse_shown_target(text: &str) -> Option<ShownTarget> {
 }
 
 /// Rows of cells, each row's soft-wrap flag, and the cursor.
-type StyledCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor);
+type StyledCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor, usize, usize);
+type PreviewCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor);
 
 /// Styled counterpart of the (now unused) plain `capture` — see steps/020,
 /// 021. The wire carries runs, expanded back to cells here — see steps/022.
@@ -2696,10 +2824,14 @@ fn capture_styled(path: &Path, name: &str, scrollback: usize) -> Result<StyledCa
             rows,
             wrapped,
             cursor,
+            scrollback_len,
+            scrollback_total,
         }) => Ok((
             rows.iter().map(|row| expand_runs(row)).collect(),
             wrapped,
             cursor,
+            scrollback_len,
+            scrollback_total,
         )),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),

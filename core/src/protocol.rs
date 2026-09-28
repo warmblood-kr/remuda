@@ -124,6 +124,10 @@ pub enum Response {
         rows: Vec<Vec<StyledRun>>,
         #[serde(default)]
         wrapped: Vec<bool>,
+        #[serde(default)]
+        scrollback_len: usize,
+        #[serde(default)]
+        scrollback_total: usize,
         cursor: Cursor,
     },
     /// Current mouse tracking mode and encoding, read from the live parser.
