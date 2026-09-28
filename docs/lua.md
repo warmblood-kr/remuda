@@ -56,6 +56,12 @@ convenient.
 restart a daemon or stop sessions; already-loaded Lua definitions remain live
 until the next daemon restart.
 
+A manifest can declare the mods it needs: `requires = { butler = ">=0.4, <0.5" }`.
+- **Constraints:** each is a comma-separated list of `>=`, `>`, `<=`, `<` and `=`, all of which must hold. `*` means any version.
+- **Install:** `mod install` refuses a mod whose requirement is missing or too old, and names it.
+- **Activation:** `exec` and `reload` check the whole chain first. They then activate the lifecycle mods it needs, hosts before guests with ties broken by name, and leave an already active host alone. A requires cycle is refused, with its path, before anything activates.
+- **Remove:** `mod remove NAME` refuses while an installed mod requires NAME, and lists those mods.
+
 An extension repository declares `api = "remuda-lua-v1"` in its
 `extension.toml`. `remuda mod test PATH` is the deterministic local check: it
 validates the manifest, package paths, symlinks, Lua-only contents, and Lua

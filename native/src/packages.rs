@@ -268,6 +268,13 @@ pub fn remove(name: &str) -> Result<RemoveReport, String> {
             spec.name
         ));
     }
+    let dependents = dependents(name)?;
+    if !dependents.is_empty() {
+        let list = dependents.join(", ");
+        return Err(format!(
+            "mod {name} is required by {list}; remove {list} first"
+        ));
+    }
     fs::remove_dir_all(&root).map_err(|error| format!("cannot remove mod {name}: {error}"))?;
     Ok(RemoveReport {
         manifest: manifest_from_spec(spec, "removed"),
@@ -323,6 +330,9 @@ fn install_from_checkout(
     }
     let manifest_path = checkout.join("extension.toml");
     let spec = read_manifest(&manifest_path)?;
+    for (dependency, constraint) in &spec.requires {
+        check_requirement(&spec.name, dependency, constraint)?;
+    }
     if let Some(expected_name) = expected_name {
         if spec.name != expected_name {
             return Err(format!(
@@ -558,7 +568,10 @@ fn parse_requires(value: &str) -> Result<Vec<(String, String)>, String> {
         let quoted = after.trim_start().strip_prefix('"').ok_or(shape)?;
         let (constraint, after) = quoted.split_once('"').ok_or(shape)?;
         parse_constraint(constraint)?;
-        if requires.insert(name.to_string(), constraint.to_string()).is_some() {
+        if requires
+            .insert(name.to_string(), constraint.to_string())
+            .is_some()
+        {
             return Err(format!("requires names {name} twice"));
         }
         rest = after.trim_start();
@@ -594,7 +607,9 @@ fn parse_version(text: &str) -> Result<[u64; 3], String> {
         return Err(format!("version {text:?} has more than three parts"));
     }
     for (slot, part) in version.iter_mut().zip(parts) {
-        *slot = part.parse().map_err(|_| format!("version {text:?} is not numeric"))?;
+        *slot = part
+            .parse()
+            .map_err(|_| format!("version {text:?} is not numeric"))?;
     }
     Ok(version)
 }
@@ -602,13 +617,15 @@ fn parse_version(text: &str) -> Result<[u64; 3], String> {
 /// Whether an installed `version` meets a `requires` constraint.
 pub fn satisfies(version: &str, constraint: &str) -> Result<bool, String> {
     let installed = parse_version(version)?;
-    Ok(parse_constraint(constraint)?.iter().all(|(op, wanted)| match *op {
-        ">=" => installed >= *wanted,
-        "<=" => installed <= *wanted,
-        ">" => installed > *wanted,
-        "<" => installed < *wanted,
-        _ => installed == *wanted,
-    }))
+    Ok(parse_constraint(constraint)?
+        .iter()
+        .all(|(op, wanted)| match *op {
+            ">=" => installed >= *wanted,
+            "<=" => installed <= *wanted,
+            ">" => installed > *wanted,
+            "<" => installed < *wanted,
+            _ => installed == *wanted,
+        }))
 }
 
 fn validate_spec(spec: &ModSpec) -> Result<(), String> {
@@ -814,6 +831,76 @@ fn installed_specs() -> Result<Vec<ModSpec>, String> {
     Ok(specs)
 }
 
+/// Installed mods whose `requires` names `name`. A manifest that no longer
+/// parses cannot hold a dependency, so it is skipped rather than fatal.
+fn dependents(name: &str) -> Result<Vec<String>, String> {
+    let Ok(entries) = fs::read_dir(mods_dir()?) else {
+        return Ok(Vec::new());
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| read_manifest(&entry.path().join("extension.toml")).ok())
+        .filter(|spec| spec.requires.iter().any(|(required, _)| required == name))
+        .map(|spec| spec.name)
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// `owner` needs `dependency` installed at a version meeting `constraint`.
+fn check_requirement(owner: &str, dependency: &str, constraint: &str) -> Result<ModSpec, String> {
+    let path = mods_dir()?.join(dependency).join("extension.toml");
+    if !path.is_file() {
+        return Err(format!(
+            "mod {owner} requires {dependency}, which is not installed"
+        ));
+    }
+    let spec = read_manifest(&path)?;
+    if !satisfies(&spec.version, constraint)? {
+        return Err(format!(
+            "mod {owner} requires {dependency} {constraint}, but {dependency} {} is installed",
+            spec.version
+        ));
+    }
+    Ok(spec)
+}
+
+/// Every mod `name` needs, transitively and checked, hosts first (ties by
+/// name); `name` itself is not included. A cycle is refused with its path.
+pub fn requirement_order(name: &str) -> Result<Vec<String>, String> {
+    fn visit(
+        name: &str,
+        requires: &[(String, String)],
+        path: &mut Vec<String>,
+        done: &mut Vec<String>,
+    ) -> Result<(), String> {
+        path.push(name.to_string());
+        for (dependency, constraint) in requires {
+            if done.contains(dependency) {
+                continue;
+            }
+            if let Some(at) = path.iter().position(|seen| seen == dependency) {
+                let mut cycle = path[at..].to_vec();
+                cycle.push(dependency.clone());
+                return Err(format!("mod requires form a cycle: {}", cycle.join(" -> ")));
+            }
+            let spec = check_requirement(name, dependency, constraint)?;
+            visit(dependency, &spec.requires, path, done)?;
+        }
+        path.pop();
+        done.push(name.to_string());
+        Ok(())
+    }
+    let root = mods_dir()?.join(name).join("extension.toml");
+    let Ok(spec) = read_manifest(&root) else {
+        return Ok(Vec::new());
+    };
+    let mut done = Vec::new();
+    visit(name, &spec.requires, &mut Vec::new(), &mut done)?;
+    done.pop();
+    Ok(done)
+}
+
 fn mods_dir() -> Result<PathBuf, String> {
     let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
     let base = std::env::var_os("XDG_DATA_HOME")
@@ -956,13 +1043,20 @@ mod tests {
 
     #[test]
     fn requires_is_an_inline_table_of_name_to_constraint_sorted_by_name() {
-        let spec = with_requires(r#"requires = { zeta = "*", butler = ">=0.4, <0.5" }"#).expect("spec");
+        let spec =
+            with_requires(r#"requires = { zeta = "*", butler = ">=0.4, <0.5" }"#).expect("spec");
         assert_eq!(
             spec.requires,
-            vec![("butler".to_string(), ">=0.4, <0.5".to_string()), ("zeta".into(), "*".into())]
+            vec![
+                ("butler".to_string(), ">=0.4, <0.5".to_string()),
+                ("zeta".into(), "*".into())
+            ]
         );
         assert!(with_requires("").expect("no requires").requires.is_empty());
-        assert!(with_requires("requires = {}").expect("empty").requires.is_empty());
+        assert!(with_requires("requires = {}")
+            .expect("empty")
+            .requires
+            .is_empty());
         for bad in [
             r#"requires = "butler""#,
             r#"requires = { butler = ">=x" }"#,
@@ -988,9 +1082,16 @@ mod tests {
             ("0.1.0", "*", true),
             ("0.1.0", "", true),
         ] {
-            assert_eq!(satisfies(version, constraint), Ok(expected), "{version} {constraint}");
+            assert_eq!(
+                satisfies(version, constraint),
+                Ok(expected),
+                "{version} {constraint}"
+            );
         }
-        assert!(satisfies("x.1", ">=0.1").is_err(), "a non-numeric installed version is an error");
+        assert!(
+            satisfies("x.1", ">=0.1").is_err(),
+            "a non-numeric installed version is an error"
+        );
     }
 
     fn report(name: &str) -> InstallReport {
