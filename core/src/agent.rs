@@ -189,6 +189,12 @@ pub trait AgentProcess: Send {
         MouseState::default()
     }
 
+    /// The operating-system process ID for a process-backed agent.
+    /// Non-process implementations return `None`.
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+
     /// The visible screen as styled cells, for a croppable colour pane.
     /// Default: every cell plain, from the same text `screen_text` gives —
     /// a backend that hasn't implemented styling degrades to colourless.

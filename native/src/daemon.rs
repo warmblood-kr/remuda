@@ -14,6 +14,7 @@
 
 use crate::image::Image;
 use crate::ipc::{self, Listener, Stream, TryClone};
+use crate::process_ancestry;
 use crate::pty::PtyAgent;
 use interprocess::local_socket::traits::ListenerExt;
 use remuda_core::agent::Result as AgentResult;
@@ -626,17 +627,46 @@ fn handle_shutdown(
             .or(requester_session_name)
             .or(requester_session_id)
             .unwrap_or_else(|| "unknown".into());
-        return reply(
-            &stream,
-            &Response::error(format!(
-                "cannot stop this daemon from one of its own sessions ({identity}); pass --i-am-inside to override"
+        return refuse_hosted_shutdown(&stream, &identity);
+    }
+    if !override_hosted {
+        let is_hosted = process_ancestry::peer_pid(&stream).and_then(|peer_pid| match peer_pid {
+            Some(peer_pid) => {
+                process_ancestry::is_self_or_descendant(peer_pid, &registry.live_process_ids())
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "local socket did not provide a peer process ID",
             )),
-        );
+        });
+        match is_hosted {
+            Ok(true) => return refuse_hosted_shutdown(&stream, "session process ancestry"),
+            Ok(false) => {}
+            // Unknown peer identity or an incomplete parent chain fails closed.
+            // A caller can explicitly opt in with --i-am-inside.
+            Err(error) => {
+                return reply(
+                    &stream,
+                    &Response::error(
+                        format!("cannot verify the shutdown caller process identity ({error}); pass --i-am-inside to override"),
+                    ),
+                );
+            }
+        }
     }
     reply(&stream, &Response::Ok)?;
     reap_processes_before_exit(image);
     socket_owner.cleanup();
     std::process::exit(0);
+}
+
+fn refuse_hosted_shutdown(stream: &Stream, identity: &str) -> std::io::Result<()> {
+    reply(
+        stream,
+        &Response::error(format!(
+            "cannot stop this daemon from one of its own sessions ({identity}); pass --i-am-inside to override"
+        )),
+    )
 }
 
 fn handle_new(
