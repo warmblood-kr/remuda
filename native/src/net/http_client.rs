@@ -12,7 +12,7 @@ use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use url::Url;
+use url::{Host, Url};
 
 #[derive(Clone, Default)]
 pub struct HttpClient {
@@ -75,7 +75,7 @@ pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HEADER_LINE: usize = 8 * 1024;
 const SOCKET_POLL: Duration = Duration::from_millis(50);
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpRequest {
     pub method: String,
     pub url: String,
@@ -87,6 +87,37 @@ pub struct HttpRequest {
     pub ca_file: Option<String>,
     /// `sha256/<base64 SPKI SHA-256>`.
     pub pin: Option<String>,
+}
+
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let safe_url = Url::parse(&self.url)
+            .map(|mut url| {
+                let _ = url.set_username("");
+                let _ = url.set_password(None);
+                url.set_query(None);
+                url.set_fragment(None);
+                url.to_string()
+            })
+            .unwrap_or_else(|_| "<invalid URL>".into());
+        let header_names: Vec<&str> = self
+            .headers
+            .iter()
+            .map(|(name, _)| name)
+            .map(String::as_str)
+            .collect();
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("url", &safe_url)
+            .field("header_names", &header_names)
+            .field("body", &format_args!("<{} bytes>", self.body.len()))
+            .field("timeout", &self.timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("max_bytes", &self.max_bytes)
+            .field("ca_file", &self.ca_file)
+            .field("pin", &self.pin)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -113,23 +144,27 @@ fn perform_with_dns_limit(
     let deadline = Instant::now() + req.timeout;
     let url = Url::parse(&req.url).map_err(|_| "invalid HTTP URL".to_string())?;
     let host = url
-        .host_str()
+        .host()
         .ok_or_else(|| "HTTP URL has no host".to_string())?;
     let port = url
         .port_or_known_default()
         .ok_or_else(|| "HTTP URL has no port".to_string())?;
     let tls = if url.scheme() == "https" {
         let config = tls_config(&req)?;
-        let server_name = ServerName::try_from(host.to_owned())
-            .map_err(|_| "invalid TLS server name".to_string())?;
+        let server_name = match host {
+            Host::Domain(domain) => ServerName::try_from(domain.to_owned())
+                .map_err(|_| "invalid TLS server name".to_string())?,
+            Host::Ipv4(address) => ServerName::IpAddress(address.into()),
+            Host::Ipv6(address) => ServerName::IpAddress(address.into()),
+        };
         Some((config, server_name))
     } else {
         None
     };
-    let address = if host.parse::<std::net::Ipv6Addr>().is_ok() {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
+    let address = match host {
+        Host::Domain(domain) => format!("{domain}:{port}"),
+        Host::Ipv4(address) => format!("{address}:{port}"),
+        Host::Ipv6(address) => format!("[{address}]:{port}"),
     };
     if dns_active
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
@@ -229,15 +264,33 @@ fn connect(
     deadline: Instant,
     cancelled: Option<&AtomicBool>,
 ) -> Result<TcpStream, String> {
+    connect_with(
+        addresses.collect(),
+        deadline,
+        cancelled,
+        TcpStream::connect_timeout,
+    )
+}
+
+fn connect_with(
+    addresses: Vec<SocketAddr>,
+    deadline: Instant,
+    cancelled: Option<&AtomicBool>,
+    mut connect_one: impl FnMut(&SocketAddr, Duration) -> std::io::Result<TcpStream>,
+) -> Result<TcpStream, String> {
     let mut last = None;
+    let mut addresses_left = addresses.len();
     for address in addresses {
         check(deadline, cancelled)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
-        let attempt = remaining.min(Duration::from_millis(250));
-        match TcpStream::connect_timeout(&address, attempt) {
+        let attempt = (remaining / addresses_left as u32)
+            .max(Duration::from_millis(250))
+            .min(remaining);
+        addresses_left -= 1;
+        match connect_one(&address, attempt) {
             Ok(stream) => return Ok(stream),
             Err(error) => last = Some(error),
         }
@@ -254,7 +307,12 @@ fn execute_http<S: Read + Write>(
     req: &HttpRequest,
     url: &Url,
 ) -> Result<HttpResponse, String> {
-    let host = url.host_str().unwrap_or_default();
+    let host = match url.host() {
+        Some(Host::Domain(domain)) => domain.to_owned(),
+        Some(Host::Ipv4(address)) => address.to_string(),
+        Some(Host::Ipv6(address)) => format!("[{address}]"),
+        None => String::new(),
+    };
     let host_header = if let Some(port) = url.port() {
         format!("{host}:{port}")
     } else {
@@ -581,15 +639,36 @@ fn io_error(error: std::io::Error) -> String {
     if is_timeout(&error) {
         "request timeout".into()
     } else {
-        format!("HTTP transport error: {}", error)
+        let message = error.to_string();
+        let lower = message.to_ascii_lowercase();
+        if message.contains("SPKI pin mismatch") {
+            "TLS request failed: SPKI pin mismatch".into()
+        } else if error.kind() == std::io::ErrorKind::InvalidData
+            || lower.contains("osstatus")
+            || lower.contains("certificate")
+            || lower.contains("trust")
+            || lower.contains("tls")
+        {
+            "TLS request failed: certificate or protocol validation failed".into()
+        } else {
+            format!("HTTP transport error: {error}")
+        }
     }
 }
 fn tls_error(error: TlsError) -> String {
-    format!("TLS request failed: {error}")
+    match error {
+        TlsError::InvalidCertificate(_) => {
+            "TLS request failed: certificate validation failed".into()
+        }
+        TlsError::NoCertificatesPresented => {
+            "TLS request failed: server presented no certificate".into()
+        }
+        _ => format!("TLS request failed: {error}"),
+    }
 }
 
 fn tls_config(req: &HttpRequest) -> Result<Arc<ClientConfig>, String> {
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier: Arc<dyn ServerCertVerifier> = if let Some(path) = &req.ca_file {
         let pem = read_ca_file(path)?;
         let certs = parse_pem_certs(&pem)?;
@@ -597,12 +676,19 @@ fn tls_config(req: &HttpRequest) -> Result<Arc<ClientConfig>, String> {
             return Err("custom CA file contains no certificates".into());
         }
         let mut roots = rustls::RootCertStore::empty();
-        for cert in certs {
-            roots.add(cert).map_err(tls_error)?;
+        for cert in &certs {
+            roots.add(cert.clone()).map_err(tls_error)?;
         }
-        WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+        let inner = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
             .build()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        Arc::new(CaFileVerifier {
+            inner,
+            trusted_end_entities: certs
+                .into_iter()
+                .map(|cert| cert.as_ref().to_vec())
+                .collect(),
+        })
     } else {
         Arc::new(rustls_platform_verifier::Verifier::new(provider.clone()).map_err(tls_error)?)
     };
@@ -621,6 +707,165 @@ fn tls_config(req: &HttpRequest) -> Result<Arc<ClientConfig>, String> {
         .with_no_client_auth()
         .pipe(Arc::new)
         .pipe(Ok)
+}
+
+#[derive(Debug)]
+struct CaFileVerifier {
+    inner: Arc<WebPkiServerVerifier>,
+    trusted_end_entities: Vec<Vec<u8>>,
+}
+
+impl ServerCertVerifier for CaFileVerifier {
+    fn verify_server_cert(
+        &self,
+        cert: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        name: &ServerName<'_>,
+        ocsp: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        match self
+            .inner
+            .verify_server_cert(cert, intermediates, name, ocsp, now)
+        {
+            Ok(verified) => Ok(verified),
+            Err(_error)
+                if self
+                    .trusted_end_entities
+                    .iter()
+                    .any(|trusted| trusted == cert.as_ref()) =>
+            {
+                verify_trusted_end_entity(cert, name, now)?;
+                Ok(ServerCertVerified::assertion())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+fn verify_trusted_end_entity(
+    cert: &CertificateDer<'_>,
+    name: &ServerName<'_>,
+    now: UnixTime,
+) -> Result<(), TlsError> {
+    let parsed = rustls::server::ParsedCertificate::try_from(cert)?;
+    rustls::client::verify_server_name(&parsed, name)?;
+    let (_, outer, _) = der_value(cert.as_ref(), 0)
+        .map_err(|_| TlsError::General("malformed trusted server certificate".into()))?;
+    let (tag, tbs, _) = der_value(outer, 0)
+        .map_err(|_| TlsError::General("malformed trusted server certificate".into()))?;
+    if tag != 0x30 {
+        return Err(TlsError::General(
+            "malformed trusted server certificate".into(),
+        ));
+    }
+    let mut at = 0;
+    if tbs.get(at) == Some(&0xa0) {
+        at = der_value(tbs, at)
+            .map_err(|_| TlsError::General("malformed trusted server certificate".into()))?
+            .2;
+    }
+    for _ in 0..3 {
+        at = der_value(tbs, at)
+            .map_err(|_| TlsError::General("malformed trusted server certificate".into()))?
+            .2;
+    }
+    let (tag, validity, _) = der_value(tbs, at)
+        .map_err(|_| TlsError::General("malformed trusted server certificate".into()))?;
+    if tag != 0x30 {
+        return Err(TlsError::General(
+            "malformed trusted server certificate".into(),
+        ));
+    }
+    let (before_tag, before, next) = der_value(validity, 0)
+        .map_err(|_| TlsError::General("malformed certificate validity".into()))?;
+    let (after_tag, after, _) = der_value(validity, next)
+        .map_err(|_| TlsError::General("malformed certificate validity".into()))?;
+    let before = asn1_time(before_tag, before)
+        .ok_or_else(|| TlsError::General("unsupported certificate validity time".into()))?;
+    let after = asn1_time(after_tag, after)
+        .ok_or_else(|| TlsError::General("unsupported certificate validity time".into()))?;
+    let now = now.as_secs() as i64;
+    if now < before {
+        return Err(TlsError::General(
+            "server certificate is not yet valid".into(),
+        ));
+    }
+    if now > after {
+        return Err(TlsError::General("server certificate has expired".into()));
+    }
+    Ok(())
+}
+
+fn asn1_time(tag: u8, bytes: &[u8]) -> Option<i64> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let (year, rest) = match tag {
+        0x17 if text.ends_with('Z') && text.len() == 13 => {
+            let short = text[0..2].parse::<i64>().ok()?;
+            (
+                if short >= 50 {
+                    1900 + short
+                } else {
+                    2000 + short
+                },
+                &text[2..12],
+            )
+        }
+        0x18 if text.ends_with('Z') && text.len() == 15 => {
+            (text[0..4].parse::<i64>().ok()?, &text[4..14])
+        }
+        _ => return None,
+    };
+    let month = rest[0..2].parse::<i64>().ok()?;
+    let day = rest[2..4].parse::<i64>().ok()?;
+    let hour = rest[4..6].parse::<i64>().ok()?;
+    let minute = rest[6..8].parse::<i64>().ok()?;
+    let second = rest[8..10].parse::<i64>().ok()?;
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if !(1..=max_day).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146097 + day_of_era - 719468;
+    Some(days * 86400 + hour * 3600 + minute * 60 + second)
 }
 
 const MAX_CA_FILE_BYTES: u64 = 1024 * 1024;
@@ -860,9 +1105,10 @@ fn duration_option(
 mod tests {
     use super::{perform, HttpRequest};
     use base64::Engine as _;
+    use rustls::pki_types::ServerName;
     use sha2::{Digest, Sha256};
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
     use std::time::Duration;
 
@@ -893,6 +1139,62 @@ mod tests {
             ca_file: None,
             pin: None,
         }
+    }
+
+    #[test]
+    fn request_debug_redacts_credentials_query_header_values_and_body() {
+        let mut req = request("https://user:pass@example.test/path?token=secret".into());
+        req.headers
+            .push(("Authorization".into(), b"Bearer secret".to_vec()));
+        req.body = b"private body".to_vec();
+        let debug = format!("{req:?}");
+        assert!(debug.contains("https://example.test/path"));
+        assert!(debug.contains("Authorization"));
+        assert!(debug.contains("<12 bytes>"));
+        for secret in [
+            "user",
+            "pass",
+            "token=secret",
+            "Bearer secret",
+            "private body",
+        ] {
+            assert!(!debug.contains(secret), "Debug leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn platform_certificate_errors_use_tls_class_without_raw_os_status() {
+        let error = super::io_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "OSStatus -67843",
+        ));
+        assert!(error.starts_with("TLS request failed:"));
+        assert!(!error.contains("-67843"));
+    }
+
+    #[test]
+    fn connection_attempts_share_the_budget_and_allow_a_slow_first_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut first_budget = Duration::ZERO;
+        let stream =
+            super::connect_with(vec![address, address], deadline, None, |address, budget| {
+                if first_budget.is_zero() {
+                    first_budget = budget;
+                    thread::sleep(Duration::from_millis(300));
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "delayed address",
+                    ))
+                } else {
+                    TcpStream::connect_timeout(address, budget)
+                }
+            })
+            .unwrap();
+        assert!(first_budget >= Duration::from_millis(900));
+        drop(stream);
+        drop(listener);
     }
 
     #[test]
@@ -1002,13 +1304,34 @@ mod tests {
     }
 
     fn tls_stub() -> (String, std::sync::mpsc::Receiver<bool>) {
+        tls_stub_with(
+            include_str!("testdata/test-leaf.pem"),
+            include_str!("testdata/test-leaf-key.pem"),
+            false,
+            "localhost",
+        )
+    }
+
+    fn tls_stub_with(
+        cert_pem: &'static str,
+        key_pem: &'static str,
+        ipv6: bool,
+        host: &str,
+    ) -> (String, std::sync::mpsc::Receiver<bool>) {
         use rustls::pki_types::PrivateKeyDer;
         use std::sync::mpsc;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = if ipv6 {
+            TcpListener::bind("[::1]:0").unwrap()
+        } else {
+            TcpListener::bind("127.0.0.1:0").unwrap()
+        };
         let address = listener.local_addr().unwrap();
-        let certs = super::parse_pem_certs(include_str!("testdata/test-leaf.pem")).unwrap();
-        let key = pem_key(include_str!("testdata/test-leaf-key.pem"));
-        let config = rustls::ServerConfig::builder()
+        let certs = super::parse_pem_certs(cert_pem).unwrap();
+        let key = pem_key(key_pem);
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
             .with_no_client_auth()
             .with_single_cert(certs, PrivateKeyDer::try_from(key).unwrap())
             .unwrap();
@@ -1027,10 +1350,12 @@ mod tests {
                 let _ = tls.flush();
             }
         });
-        (
-            format!("https://localhost:{}/test", address.port()),
-            seen_rx,
-        )
+        let authority = if ipv6 {
+            format!("[{host}]:{}", address.port())
+        } else {
+            format!("{host}:{}", address.port())
+        };
+        (format!("https://{authority}/test"), seen_rx)
     }
 
     fn pem_key(pem: &str) -> Vec<u8> {
@@ -1101,6 +1426,81 @@ mod tests {
     }
 
     #[test]
+    fn self_signed_ca_true_certificate_can_be_the_exact_server_certificate() {
+        let cert = include_str!("testdata/selfsigned-ca.pem");
+        let key = include_str!("testdata/selfsigned-ca-key.pem");
+        let ca_file = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/net/testdata/selfsigned-ca.pem"
+        );
+
+        let (url, seen) = tls_stub_with(cert, key, false, "localhost");
+        let mut req = request(url);
+        req.ca_file = Some(ca_file.into());
+        assert_eq!(perform(req, None).unwrap().status, 200);
+        assert!(seen.recv_timeout(Duration::from_secs(1)).unwrap());
+
+        let (url, seen) = tls_stub_with(cert, key, false, "localhost");
+        let mut req = request(url.replace("localhost", "127.0.0.1"));
+        req.ca_file = Some(ca_file.into());
+        assert!(perform(req, None)
+            .unwrap_err()
+            .contains("TLS request failed"));
+        assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+
+        let (url, seen) = tls_stub_with(cert, key, false, "localhost");
+        let mut req = request(url);
+        req.ca_file = Some(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/net/testdata/selfsigned-other.pem"
+            )
+            .into(),
+        );
+        assert!(perform(req, None)
+            .unwrap_err()
+            .contains("TLS request failed"));
+        assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn exact_ca_certificate_still_obeys_validity_dates() {
+        let cert = super::parse_pem_certs(include_str!("testdata/selfsigned-ca.pem")).unwrap();
+        let name = ServerName::try_from("localhost".to_owned()).unwrap();
+        let too_early = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1));
+        assert!(super::verify_trusted_end_entity(&cert[0], &name, too_early)
+            .unwrap_err()
+            .to_string()
+            .contains("not yet valid"));
+        let too_late =
+            rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(4_102_444_800));
+        assert!(super::verify_trusted_end_entity(&cert[0], &name, too_late)
+            .unwrap_err()
+            .to_string()
+            .contains("expired"));
+    }
+
+    #[test]
+    fn https_ipv6_literal_is_verified_as_an_ip_address() {
+        let (url, seen) = tls_stub_with(
+            include_str!("testdata/selfsigned-ca.pem"),
+            include_str!("testdata/selfsigned-ca-key.pem"),
+            true,
+            "::1",
+        );
+        let mut req = request(url);
+        req.ca_file = Some(
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/net/testdata/selfsigned-ca.pem"
+            )
+            .into(),
+        );
+        assert_eq!(perform(req, None).unwrap().status, 200);
+        assert!(seen.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
     fn cancellation_and_concurrency_limit_complete_asynchronously() {
         use std::sync::mpsc;
         let url = stub(
@@ -1161,6 +1561,29 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_after_completion_keeps_the_completed_result_once() {
+        use std::sync::mpsc;
+        let url = stub(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            Duration::ZERO,
+        );
+        let (tx, rx) = mpsc::channel();
+        let task = super::HttpClient::default().start(request(url), move |_, result| {
+            let _ = tx.send(result);
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap()
+                .status,
+            200
+        );
+        task.cancel();
+        thread::sleep(Duration::from_millis(60));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn slow_request_does_not_block_the_lua_image() {
         let url = stub(
             b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -1189,6 +1612,40 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+        image.stop_for_test();
+    }
+
+    #[test]
+    fn callback_error_is_logged_and_does_not_stop_the_lua_image() {
+        let url = stub(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            Duration::ZERO,
+        );
+        let socket =
+            std::env::temp_dir().join(format!("unused-http-error-image-{}", std::process::id()));
+        let image = crate::image::Image::spawn(
+            &socket,
+            std::sync::Arc::new(remuda_core::Registry::new()),
+            std::sync::Arc::new(crate::tick::Counters::default()),
+        );
+        let code = format!("remuda.http.request{{method='GET', url='{url}', timeout=2, callback=function() remuda._callback_started=true; error('callback exploded') end}}; return 'started'");
+        assert_eq!(image.eval(&code, None).unwrap(), "started");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if image
+                .eval("return remuda._callback_started or false", None)
+                .unwrap()
+                == "true"
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "HTTP callback did not run"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(image.eval("return 7", None).unwrap(), "7");
         image.stop_for_test();
     }
 

@@ -145,9 +145,10 @@ impl Image {
                             .map(|()| String::new())
                             .map_err(|error| error.to_string()),
                         JobKind::HttpComplete { id, result } => {
-                            deliver_http(&lua, *id, result.clone())
-                                .map(|()| String::new())
-                                .map_err(|error| error.to_string())
+                            if let Err(error) = deliver_http(&lua, *id, result.clone()) {
+                                eprintln!("remuda: HTTP callback delivery failed: {error}");
+                            }
+                            Ok(String::new())
                         }
                         #[cfg(test)]
                         JobKind::StopImage => Ok(String::new()),
