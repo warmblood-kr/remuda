@@ -314,6 +314,7 @@ fn paging_moves_by_one_preview_page_and_end_returns_to_follow() {
         ScrollState {
             offset: 0,
             history_rows: 100,
+            ..ScrollState::default()
         },
     );
 
@@ -362,6 +363,7 @@ fn preview_wheel_down_returns_to_follow_and_clamps_past_bottom() {
         ScrollState {
             offset: 3,
             history_rows: 30,
+            ..ScrollState::default()
         },
     );
 
@@ -390,9 +392,15 @@ fn preview_wheel_down_returns_to_follow_and_clamps_past_bottom() {
 
 #[test]
 fn scrolled_preview_offset_stays_with_its_content_as_history_grows() {
-    assert_eq!(anchor_offset_to_new_history(6, 40, 43), 9);
-    assert_eq!(anchor_offset_to_new_history(0, 40, 43), 0);
-    assert_eq!(anchor_offset_to_new_history(6, 43, 43), 6);
+    assert_eq!(anchor_offset_to_new_history(6, 40, 43, 100), 9);
+    assert_eq!(anchor_offset_to_new_history(0, 40, 43, 100), 0);
+    assert_eq!(anchor_offset_to_new_history(6, 43, 43, 100), 6);
+}
+
+#[test]
+fn monotonic_history_keeps_anchor_moving_after_the_retained_buffer_is_full() {
+    assert_eq!(anchor_offset_to_new_history(6, 20_000, 20_003, 10_000), 9);
+    assert_eq!(anchor_offset_to_new_history(0, 20_000, 20_003, 10_000), 0);
 }
 
 #[test]
@@ -404,6 +412,7 @@ fn session_input_returns_to_live_view_without_swallowing_the_key() {
         ScrollState {
             offset: 5,
             history_rows: 20,
+            ..ScrollState::default()
         },
     );
 
@@ -418,7 +427,7 @@ fn session_input_returns_to_live_view_without_swallowing_the_key() {
 fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     let path = scratch_socket("preview-follow-after-wheel");
     daemon_at(&path);
-    let command = "i=0; while [ $i -lt 60 ]; do printf 'newest-%02d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 3";
+    let command = "i=0; while [ $i -lt 200 ]; do printf 'newest-%03d\\n' $i; i=$((i + 1)); sleep 0.02; done; sleep 3";
     let response = client::request(
         &path,
         &Request::New {
@@ -436,7 +445,7 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     let history_deadline = Instant::now() + Duration::from_secs(6);
     loop {
         capture_preview(&path, &mut ui, "stream").expect("initial live preview");
-        if ui.scrollback["stream"].history_rows >= 3 {
+        if ui.scrollback["stream"].history_rows >= 40 {
             break;
         }
         assert!(
@@ -451,13 +460,29 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
         row: 4,
         modifiers: KeyModifiers::NONE,
     };
-    let up = ui.on_mouse(wheel(MouseEventKind::ScrollUp), 80, 24);
-    assert_eq!(up, Action::Scroll(3));
-    scroll_selected(&mut ui, 3);
-    assert_eq!(ui.scrollback["stream"].offset, 3);
-    let down = ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24);
-    assert_eq!(down, Action::Scroll(-3));
-    scroll_selected(&mut ui, -3);
+    for _ in 0..10 {
+        assert_eq!(
+            ui.on_mouse(wheel(MouseEventKind::ScrollUp), 80, 24),
+            Action::Scroll(3)
+        );
+        scroll_selected(&mut ui, 3);
+        capture_preview(&path, &mut ui, "stream").expect("capture scrolling output");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(ui.scrollback["stream"].offset >= 30);
+
+    for _ in 0..30 {
+        assert_eq!(
+            ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
+            Action::Scroll(-3)
+        );
+        scroll_selected(&mut ui, -3);
+        capture_preview(&path, &mut ui, "stream").expect("capture while returning live");
+        if ui.scrollback["stream"].offset == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(ui.scrollback["stream"].offset, 0);
 
     let deadline = Instant::now() + Duration::from_secs(6);
@@ -465,7 +490,7 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
         let (cells, _, cursor) =
             capture_preview(&path, &mut ui, "stream").expect("capture the streaming preview");
         let frame = render_styled(&ui, &cells, cursor, "default", 80, 25);
-        if frame.contains("newest-59") {
+        if frame.contains("newest-199") {
             break;
         }
         assert!(
@@ -549,6 +574,74 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
             "history did not grow while scrolled"
         );
         std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = client::request(
+        &path,
+        &Request::Close {
+            name: "stream".into(),
+        },
+    );
+}
+
+#[test]
+fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {
+    let path = scratch_socket("preview-content-anchor-at-cap");
+    daemon_at(&path);
+    let command = "i=0; while [ $i -lt 10100 ]; do printf 'row-%05d\\n' $i; i=$((i + 1)); done; j=0; while [ $j -lt 30 ]; do printf 'tail-%02d\\n' $j; j=$((j + 1)); sleep 0.1; done; sleep 3";
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("stream".into()),
+            command: vec!["sh".into(), "-c".into(), command.into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new long-running session");
+    assert_eq!(response, Response::Value("stream".into()));
+
+    let mut ui = make_ui(vec![row("stream", true, false)]);
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        capture_preview(&path, &mut ui, "stream").expect("capture history");
+        let state = ui.scrollback["stream"];
+        if state.history_rows == 10_000 && state.history_total > 10_000 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "history did not reach the 10k cap"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(ui.on_key(press(KeyCode::PageUp)), Action::Scroll(22));
+    scroll_selected(&mut ui, 22);
+    let (anchor_cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("scroll up");
+    let anchor_text = terminal_rows_text(&anchor_cells);
+    let anchor_total = ui.scrollback["stream"].history_total;
+    let initial_offset = ui.scrollback["stream"].offset;
+
+    loop {
+        let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture tail");
+        let state = ui.scrollback["stream"];
+        if state.history_total >= anchor_total + 4 {
+            assert_eq!(
+                state.history_rows, 10_000,
+                "retained history remains capped"
+            );
+            assert_eq!(
+                state.offset,
+                initial_offset + state.history_total - anchor_total
+            );
+            assert_eq!(terminal_rows_text(&cells), anchor_text);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "new rows did not arrive beyond the cap"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     }
     let _ = client::request(
         &path,
@@ -2245,14 +2338,14 @@ fn capture_styled_10k_history_measurement() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok((live, _, _, _)) = capture_styled(&path, "history", 0) {
+        if let Ok((live, _, _, _, _)) = capture_styled(&path, "history", 0) {
             let visible: String = live
                 .iter()
                 .flatten()
                 .map(|cell| cell.text.as_str())
                 .collect();
             if visible.contains("09999") {
-                let (oldest, _, _, _) =
+                let (oldest, _, _, _, _) =
                     capture_styled(&path, "history", 9_999).expect("oldest capture");
                 let first: String = oldest[0].iter().map(|cell| cell.text.as_str()).collect();
                 assert!(first.contains("00000"), "oldest line was {first:?}");
@@ -2337,7 +2430,7 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Ok((cells, _, _, _)) = capture_styled(&path, "alpha", 0) {
+        if let Ok((cells, _, _, _, _)) = capture_styled(&path, "alpha", 0) {
             let first_five: String = cells
                 .first()
                 .map(|row| row.iter().take(5).map(|c| c.text.as_str()).collect())
@@ -2362,7 +2455,7 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
     let ShownTarget::Session(name) = shown.unwrap() else {
         unreachable!("just asserted it above");
     };
-    let (cells, _, cursor, _) =
+    let (cells, _, cursor, _, _) =
         capture_styled(&path, &name, 0).expect("capture through the window's target");
 
     // No sessions buffer yet: `list_row` falls back to the bare name, which

@@ -228,6 +228,13 @@ impl Session {
             .unwrap_or(0)
     }
 
+    pub fn scrollback_total(&self) -> usize {
+        self.agent
+            .lock()
+            .map(|mut agent| agent.scrollback_total())
+            .unwrap_or(0)
+    }
+
     pub fn row_wrapped_at(&self, scrollback: usize) -> Result<Vec<bool>> {
         let mut agent = self
             .agent

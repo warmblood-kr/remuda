@@ -176,6 +176,11 @@ pub trait AgentProcess: Send {
         0
     }
 
+    /// Total rows that have scrolled into history over this process lifetime.
+    fn scrollback_total(&mut self) -> usize {
+        self.scrollback_len()
+    }
+
     fn row_wrapped_at(&mut self, _scrollback: usize) -> Result<Vec<bool>> {
         Ok(Vec::new())
     }

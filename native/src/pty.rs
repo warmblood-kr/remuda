@@ -21,6 +21,7 @@
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use remuda_core::agent::{AgentError, AgentProcess, Color, Cursor, Result, Size, StyledCell};
 use std::io::{Read, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -37,6 +38,7 @@ type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 /// screen is blank forever. Measured on a windows-latest runner; see steps/010.
 const DSR_CURSOR: &[u8] = b"\x1b[6n";
 const SCROLLBACK_ROWS: usize = 10_000;
+const SCROLLBACK_PROBE_CHUNK: usize = 512;
 
 fn io<E: std::fmt::Display>(e: E) -> AgentError {
     AgentError::Io(e.to_string())
@@ -83,6 +85,7 @@ pub struct PtyAgent {
     writer: SharedWriter,
     child: Box<dyn Child + Send + Sync>,
     watchers: Watchers,
+    scrollback_total: Arc<AtomicUsize>,
     _master: Box<dyn MasterPty + Send>,
 }
 
@@ -114,11 +117,13 @@ impl PtyAgent {
             SCROLLBACK_ROWS,
         )));
         let watchers: Watchers = Arc::new(Mutex::new(Vec::new()));
+        let scrollback_total = Arc::new(AtomicUsize::new(0));
         spawn_reader(
             reader,
             Arc::clone(&screen),
             Arc::clone(&watchers),
             Arc::clone(&writer),
+            Arc::clone(&scrollback_total),
         );
 
         Ok(Self {
@@ -127,6 +132,7 @@ impl PtyAgent {
             writer,
             child,
             watchers,
+            scrollback_total,
             _master: pair.master,
         })
     }
@@ -140,6 +146,7 @@ fn spawn_reader(
     screen: Arc<Mutex<vt100::Parser>>,
     watchers: Watchers,
     writer: SharedWriter,
+    scrollback_total: Arc<AtomicUsize>,
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -149,11 +156,7 @@ fn spawn_reader(
             }
             let asked = buf[..n].windows(DSR_CURSOR.len()).any(|w| w == DSR_CURSOR);
             let at = match screen.lock() {
-                Ok(mut parser) => {
-                    parser.process(&buf[..n]);
-                    let (row, col) = display_cursor(parser.screen());
-                    (row + 1, col + 1)
-                }
+                Ok(mut parser) => process_output(&mut parser, &buf[..n], &scrollback_total),
                 // Poisoned: the grid can no longer be trusted.
                 Err(_) => break,
             };
@@ -170,6 +173,42 @@ fn spawn_reader(
             watchers.clear();
         }
     });
+}
+
+/// Process bounded chunks while a temporary nonzero scroll offset counts
+/// every full-screen row pushed into history, even when the retained buffer is full.
+fn process_output(
+    parser: &mut vt100::Parser,
+    bytes: &[u8],
+    scrollback_total: &AtomicUsize,
+) -> (u16, u16) {
+    for chunk in bytes.chunks(SCROLLBACK_PROBE_CHUNK) {
+        let screen = parser.screen_mut();
+        let previous = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        let before_len = screen.scrollback();
+        screen.set_scrollback(1);
+        let probe_start = screen.scrollback();
+
+        parser.process(chunk);
+
+        let screen = parser.screen_mut();
+        let probe_end = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        let after_len = screen.scrollback();
+        screen.set_scrollback(previous);
+
+        let scrolled = if probe_start == 0 {
+            after_len.saturating_sub(before_len)
+        } else {
+            probe_end.saturating_sub(probe_start)
+        };
+        let _ = scrollback_total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |total| {
+            Some(total.saturating_add(scrolled))
+        });
+    }
+    let (row, col) = display_cursor(parser.screen());
+    (row + 1, col + 1)
 }
 
 /// Reply to a cursor-position query. One `write_all` under the same lock every
@@ -280,6 +319,10 @@ impl AgentProcess for PtyAgent {
         length
     }
 
+    fn scrollback_total(&mut self) -> usize {
+        self.scrollback_total.load(Ordering::Relaxed)
+    }
+
     fn row_wrapped_at(&mut self, scrollback: usize) -> Result<Vec<bool>> {
         let mut parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
         Ok(with_scrollback(parser.screen_mut(), scrollback, |screen| {
@@ -361,6 +404,32 @@ mod tests {
 
         assert!(panic.is_err());
         assert_eq!(parser.screen().scrollback(), original);
+    }
+
+    #[test]
+    fn monotonic_scrollback_counter_advances_after_retained_history_is_full() {
+        let mut parser = vt100::Parser::new(24, 80, SCROLLBACK_ROWS);
+        let total = AtomicUsize::new(0);
+        let fill: String = (0..SCROLLBACK_ROWS + 100)
+            .map(|row| format!("row-{row:05}\r\n"))
+            .collect();
+        process_output(&mut parser, fill.as_bytes(), &total);
+        assert_eq!(retained_history_len(&mut parser), SCROLLBACK_ROWS);
+        assert!(total.load(Ordering::Relaxed) >= SCROLLBACK_ROWS);
+
+        let before = total.load(Ordering::Relaxed);
+        process_output(&mut parser, b"tail\r\ntail\r\ntail\r\n", &total);
+        assert_eq!(retained_history_len(&mut parser), SCROLLBACK_ROWS);
+        assert_eq!(total.load(Ordering::Relaxed) - before, 3);
+    }
+
+    fn retained_history_len(parser: &mut vt100::Parser) -> usize {
+        let screen = parser.screen_mut();
+        let previous = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        let len = screen.scrollback();
+        screen.set_scrollback(previous);
+        len
     }
 
     fn wait_for(agent: &mut PtyAgent, needle: &str) {

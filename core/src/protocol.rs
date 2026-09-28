@@ -120,6 +120,8 @@ pub enum Response {
         wrapped: Vec<bool>,
         #[serde(default)]
         scrollback_len: usize,
+        #[serde(default)]
+        scrollback_total: usize,
         cursor: Cursor,
     },
     /// What an [`Request::Eval`] returned, already rendered to text. Kept

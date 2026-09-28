@@ -39,6 +39,7 @@ const TICK: Duration = Duration::from_millis(250);
 /// than `TICK` so a keypress is never left waiting to be noticed. Used to
 /// also be the redraw cadence; see steps/017 for why that was the bug.
 const TICK_TYPING: Duration = Duration::from_millis(40);
+const SCROLL_DOWN_SETTLE: Duration = Duration::from_millis(1500);
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -129,6 +130,10 @@ pub struct Ui {
 struct ScrollState {
     offset: usize,
     history_rows: usize,
+    history_total: usize,
+    last_scroll_down: Option<Instant>,
+    scroll_direction: i8,
+    recent_up_output: usize,
 }
 
 impl Ui {
@@ -1900,7 +1905,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
 
 fn copy_screen(path: &Path, ui: &mut Ui, name: &str) {
     match capture_styled(path, name, 0) {
-        Ok((cells, wrapped, _, _)) => {
+        Ok((cells, wrapped, _, _, _)) => {
             ui.yank = all_screen_text(&cells, &wrapped);
             ui.notice = Some(format!(
                 "copied {} bytes; p pastes into the selected session",
@@ -1914,7 +1919,7 @@ fn copy_screen(path: &Path, ui: &mut Ui, name: &str) {
 fn copy_selection(path: &Path, ui: &mut Ui, name: &str) {
     let offset = ui.scrollback.get(name).map_or(0, |state| state.offset);
     match capture_styled(path, name, offset) {
-        Ok((cells, wrapped, _, _)) => {
+        Ok((cells, wrapped, _, _, _)) => {
             // Copy-and-cancel, as tmux: the selection has done its job.
             ui.yank = ui.text_selection.take().map_or_else(
                 || all_screen_text(&cells, &wrapped),
@@ -1930,14 +1935,24 @@ fn copy_selection(path: &Path, ui: &mut Ui, name: &str) {
 }
 
 fn scroll_state(state: &mut ScrollState, delta: i16) {
-    state.offset = if delta >= 0 {
-        state
+    if delta > 0 {
+        if state.scroll_direction != 1 {
+            state.recent_up_output = 0;
+        }
+        state.scroll_direction = 1;
+        state.offset = state
             .offset
             .saturating_add(delta as usize)
-            .min(state.history_rows)
-    } else {
-        state.offset.saturating_sub(delta.unsigned_abs() as usize)
-    };
+            .min(state.history_rows);
+    } else if delta < 0 {
+        if state.scroll_direction != -1 {
+            state.offset = state.offset.saturating_sub(state.recent_up_output);
+            state.recent_up_output = 0;
+        }
+        state.scroll_direction = -1;
+        state.last_scroll_down = Some(Instant::now());
+        state.offset = state.offset.saturating_sub(delta.unsigned_abs() as usize);
+    }
 }
 
 fn scroll_selected(ui: &mut Ui, delta: i16) {
@@ -1946,12 +1961,17 @@ fn scroll_selected(ui: &mut Ui, delta: i16) {
     }
 }
 
-fn anchor_offset_to_new_history(offset: usize, previous_rows: usize, current_rows: usize) -> usize {
+fn anchor_offset_to_new_history(
+    offset: usize,
+    previous_total: usize,
+    current_total: usize,
+    current_rows: usize,
+) -> usize {
     if offset == 0 {
         0
     } else {
         offset
-            .saturating_add(current_rows.saturating_sub(previous_rows))
+            .saturating_add(current_total.saturating_sub(previous_total))
             .min(current_rows)
     }
 }
@@ -1963,14 +1983,33 @@ fn capture_preview(
     name: &str,
 ) -> Result<(Vec<Vec<StyledCell>>, Vec<bool>, Cursor), String> {
     let state = ui.scrollback.entry(name.to_string()).or_default();
-    let (mut cells, mut wrapped, mut cursor, mut history_rows) =
+    let (mut cells, mut wrapped, mut cursor, mut history_rows, mut history_total) =
         capture_styled(path, name, state.offset)?;
-    let anchored = anchor_offset_to_new_history(state.offset, state.history_rows, history_rows);
+    let scrolling_down = state
+        .last_scroll_down
+        .is_some_and(|last| last.elapsed() < SCROLL_DOWN_SETTLE);
+    let anchored = if scrolling_down {
+        state.offset
+    } else {
+        anchor_offset_to_new_history(
+            state.offset,
+            state.history_total,
+            history_total,
+            history_rows,
+        )
+    };
     if anchored != state.offset {
         state.offset = anchored;
-        (cells, wrapped, cursor, history_rows) = capture_styled(path, name, anchored)?;
+        (cells, wrapped, cursor, history_rows, history_total) =
+            capture_styled(path, name, anchored)?;
+    }
+    if state.scroll_direction == 1 {
+        state.recent_up_output = state
+            .recent_up_output
+            .saturating_add(history_total.saturating_sub(state.history_total));
     }
     state.history_rows = history_rows;
+    state.history_total = history_total;
     Ok((cells, wrapped, cursor))
 }
 
@@ -2137,7 +2176,7 @@ fn parse_shown_target(text: &str) -> Option<ShownTarget> {
 }
 
 /// Rows of cells, each row's soft-wrap flag, and the cursor.
-type StyledCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor, usize);
+type StyledCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor, usize, usize);
 
 /// Styled counterpart of the (now unused) plain `capture` — see steps/020,
 /// 021. The wire carries runs, expanded back to cells here — see steps/022.
@@ -2155,11 +2194,13 @@ fn capture_styled(path: &Path, name: &str, scrollback: usize) -> Result<StyledCa
             wrapped,
             cursor,
             scrollback_len,
+            scrollback_total,
         }) => Ok((
             rows.iter().map(|row| expand_runs(row)).collect(),
             wrapped,
             cursor,
             scrollback_len,
+            scrollback_total,
         )),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
