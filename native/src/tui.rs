@@ -1151,12 +1151,10 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
     let mut out = String::from("\x1b[H\x1b[2J");
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H", row + 1));
-        // The left column has a header; the preview deliberately has none, so
-        // its first row is the session's own first row — the same thing a ride
-        // shows, at the same place on the screen.
+        // The top-left corner stays quiet; the footer names the server.
         if ui.list_visible {
             let left = if row == 0 {
-                format!("remuda · {server}")
+                String::new()
             } else {
                 list_row(
                     ui,
@@ -1172,7 +1170,7 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
     }
 
     out.push_str(&format!("\x1b[{};1H", rows));
-    out.push_str(&fit(&footer(ui, cut, preview_w), cols));
+    out.push_str(&fit(&footer(ui, server, cut, preview_w), cols));
     out
 }
 
@@ -1393,7 +1391,7 @@ pub fn render_styled(
         out.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
         if ui.list_visible {
             let left = if row == 0 {
-                format!("remuda · {server}")
+                String::new()
             } else {
                 list_row(
                     ui,
@@ -1409,7 +1407,7 @@ pub fn render_styled(
     }
 
     out.push_str(&format!("\x1b[{};1H\x1b[K", rows));
-    out.push_str(&fit(&footer(ui, cut, preview_w), cols));
+    out.push_str(&fit(&footer(ui, server, cut, preview_w), cols));
     // Erase anything a previous, taller frame left below this one — a resize
     // to fewer rows is the only way stale content can survive past here. Must
     // happen BEFORE the caret move below, or `\x1b[J` erases from the caret's
@@ -1554,8 +1552,8 @@ fn fit_session_row(content: &str, width: u16) -> String {
 /// The crop notice moved here when the preview lost its title band: a crop that
 /// reads as absence is the failure this repo keeps re-discovering, and the
 /// footer is the only band left that is not the session's own screen.
-fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
-    match &ui.mode {
+fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16) -> String {
+    let status = match &ui.mode {
         Mode::Prompt(buffer) => format!("start: {buffer}▏   ⏎ run · esc cancel"),
         Mode::Confirm(name) => format!("kill {name}? it is running — y / n"),
         // Focus is named in words as well as drawn, because the one thing a
@@ -1563,7 +1561,11 @@ fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
         Mode::Browse if ui.focus == Focus::Session => format!(
             "▶ {} — every key goes to the session{}   ctrl-\\ back to the list",
             ui.selected().map_or("", |s| s.name.as_str()),
-            if cut { format!("   showing {preview_w} cols") } else { String::new() },
+            if cut {
+                format!("   showing {preview_w} cols")
+            } else {
+                String::new()
+            },
         ),
         Mode::Browse if ui.visual => {
             if ui.anchored() {
@@ -1575,12 +1577,11 @@ fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
         Mode::Browse => match &ui.notice {
             Some(notice) => format!("remuda: {notice}"),
             None if ui.sessions.is_empty() => "n new   q quit".into(),
-            None if cut => format!(
-                "↑↓/jk select   ⏎ enter   n new   x kill   l list   showing {preview_w} cols   q quit"
-            ),
+            None if cut => format!("↑↓/jk ⏎ enter n new l list q quit · showing {preview_w}"),
             None => "↑↓/jk select   ⏎ enter   n new   x kill   l list   q quit".into(),
         },
-    }
+    };
+    format!("remuda · {server} 🏇   {status}")
 }
 
 /// Whether to relist, recapture and rebuild the frame: forced right after a

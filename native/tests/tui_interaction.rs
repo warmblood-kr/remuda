@@ -72,12 +72,21 @@ fn l_hides_the_list_and_gives_the_preview_the_full_terminal_width() {
     assert_eq!(ui.on_key(key('l')), Action::Nothing);
     assert_eq!(pane_size(&ui, 120, 30), Size::new(120, 29));
     let hidden = render(&ui, "child screen", "default", 120, 30);
-    assert!(!hidden.contains("remuda · default"));
+    assert!(hidden.contains("remuda · default 🏇"));
     assert!(!hidden.contains('│'));
 
     assert_eq!(ui.on_key(key('l')), Action::Nothing);
     let shown = render(&ui, "child screen", "default", 120, 30);
-    assert!(shown.contains("remuda · default"));
+    assert!(shown.contains("remuda · default 🏇"));
+    assert!(!shown.contains("remuda · default│"));
+}
+
+#[test]
+fn the_server_brand_and_horse_live_in_the_footer_not_the_pane_header() {
+    let frame = render(&ui(), "child screen", "default", 80, 5);
+    assert!(!frame.contains("remuda · default│"));
+    let footer = frame.split("\x1b[5;1H").nth(1).expect("footer row");
+    assert!(footer.starts_with("remuda · default 🏇"));
 }
 
 #[test]
