@@ -1,6 +1,11 @@
 Remuda Lua runtime
 ==================
 
+_advice_reattach
+----------------
+
+``_advice_reattach() -> nil`` — Re-install advice trampolines over redefined functions. Called after each mod load.
+
 _call
 -----
 
@@ -75,6 +80,21 @@ _sync_window_shown
 ------------------
 
 ``_sync_window_shown(name, selection_changed) -> string`` — Reconcile the current window with the session Rust wants to auto-follow.
+
+advice_list
+-----------
+
+``advice_list(path?) -> {{path, id, how, depth, owner}...}`` — Copies of the advice on one path or all, outermost first.
+
+advice_member
+-------------
+
+``advice_member(path, id) -> boolean`` — Whether advice with this id is on a path.
+
+advise
+------
+
+``advise(path, how, fn, opts) -> nil`` — Wrap the function at a `remuda.*` path. `how`: around|before|after|override|filter_args|filter_return|before_while|before_until. `opts`: `id` (required; same id replaces), `depth` (-100 outermost).
 
 attach
 ------
@@ -285,6 +305,11 @@ type_text
 ---------
 
 ``type_text(session, text, settle?) -> nil`` — Type text into a session and submit it with Return.
+
+unadvise
+--------
+
+``unadvise(path, id) -> nil`` — Remove the advice with this id from a path; the last one removed restores the original.
 
 wait_for
 --------

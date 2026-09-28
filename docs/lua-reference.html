@@ -1,4 +1,6 @@
 <h1 id="remuda-lua-runtime">Remuda Lua runtime</h1>
+<h2 id="advice_reattach">_advice_reattach</h2>
+<p><code>_advice_reattach() -&gt; nil</code> — Re-install advice trampolines over redefined functions. Called after each mod load.</p>
 <h2 id="call">_call</h2>
 <p><code>_call(name, arguments, caller) -&gt; string</code> — Dispatch one MCP tools/call by name.</p>
 <h2 id="descriptors">_descriptors</h2>
@@ -29,6 +31,12 @@
 <p><code>table</code> — Internal named-schedule fire counts. Read via <span class="title-ref">schedule_fires()</span>.</p>
 <h2 id="sync_window_shown">_sync_window_shown</h2>
 <p><code>_sync_window_shown(name, selection_changed) -&gt; string</code> — Reconcile the current window with the session Rust wants to auto-follow.</p>
+<h2 id="advice_list">advice_list</h2>
+<p><code>advice_list(path?) -&gt; {{path, id, how, depth, owner}...}</code> — Copies of the advice on one path or all, outermost first.</p>
+<h2 id="advice_member">advice_member</h2>
+<p><code>advice_member(path, id) -&gt; boolean</code> — Whether advice with this id is on a path.</p>
+<h2 id="advise">advise</h2>
+<p><code>advise(path, how, fn, opts) -&gt; nil</code> — Wrap the function at a <span class="title-ref">remuda.*</span> path. `how`: aroundafterfilter_argsbefore_while|before_until. `opts`: <span class="title-ref">id</span> (required; same id replaces), <span class="title-ref">depth</span> (-100 outermost).</p>
 <h2 id="attach">attach</h2>
 <p><code>attach(name) -&gt; nil</code> — Enter raw mode on a session (a no-op inside the daemon's own image).</p>
 <h2 id="buffer">buffer</h2>
@@ -113,6 +121,8 @@
 <p><code>table</code> — The <span class="title-ref">remuda.tool</span> registry table, keyed by tool name.</p>
 <h2 id="type_text">type_text</h2>
 <p><code>type_text(session, text, settle?) -&gt; nil</code> — Type text into a session and submit it with Return.</p>
+<h2 id="unadvise">unadvise</h2>
+<p><code>unadvise(path, id) -&gt; nil</code> — Remove the advice with this id from a path; the last one removed restores the original.</p>
 <h2 id="wait_for">wait_for</h2>
 <p><code>wait_for(session, pattern, seconds?) -&gt; string</code> — Wait until a session's screen matches a Lua pattern, then answer with that screen. Fails when the deadline passes instead of answering with a screen that does not match. Use it after <span class="title-ref">send</span> rather than guessing a sleep.</p>
 <h2 id="window">window</h2>

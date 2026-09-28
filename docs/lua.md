@@ -180,7 +180,7 @@ Four ways to fire an event:
 
 A hook that raises an error is logged with its group and id, and counted on that hook. It never counts as an answer or a veto.
 
-`remuda.hook_list(event?)` returns copies of `{event, group, id, depth, src, errors, last_error}` in run order. Use it to inspect hooks.
+`remuda.hook_list(event?)` returns copies of `{event, group, id, depth, owner, src, errors, last_error}` in run order. Use it to inspect hooks.
 
 `remuda.hooks` is deprecated for reading, and will become read-only once no mod edits it by hand.
 
@@ -188,6 +188,42 @@ A hook that raises an error is logged with its group and id, and counted on that
 remuda.on("before_send", function(text) return text:gsub("%s+$", "") end,
   { group = "tidy", id = "trim", depth = -10 })
 local text = remuda.emit_filter("before_send", "hi  ")  -- "hi"
+```
+
+## Advice
+
+`remuda.advise(path, how, fn, {id, depth})` wraps the function stored at a
+`remuda.*` path, such as `remuda._butler_notify` or `remuda._butler_mail.queue`,
+with Emacs nadvice semantics. Local functions have no path and cannot be advised.
+
+| `how` | Runs |
+|---|---|
+| `around` | `fn(orig, ...)`; call `orig` to continue |
+| `before` / `after` | `fn(...)` before or after the original, keeping its result |
+| `override` | `fn(...)` instead of the original |
+| `filter_args` / `filter_return` | the original on `fn(...)`'s results, or `fn` on the original's |
+| `before_while` / `before_until` | the original only if `fn(...)` is truthy, or falsy (else returns it) |
+
+- `id` is required; advising the same path and `id` again replaces it.
+- `depth` runs from -100 (outermost) to 100 (innermost); the default is 0.
+- `unadvise(path, id)` removes one; removing the last restores the original.
+- `advice_member(path, id)` and `advice_list(path?)` inspect it.
+- An error raised inside the chain gains a line per layer,
+  `<- advice ID (HOW, depth D) on PATH [OWNER]`.
+- Advising a path that holds no function is an error.
+- A mod that redefines an advised function when it loads keeps the advice: the
+  new definition becomes the original.
+
+A lifecycle mod may declare `advice = {{path, how, id, depth, run}}`; `run`
+receives the mod's state first. Declared advice, and advice the mod adds while
+its own code runs, is owned like its hooks, so reload replaces it and a failed
+`start` restores the previous set.
+
+```lua
+remuda.advise("remuda._butler_notify", "around", function(orig, alias, notice)
+  if quiet_hours() then return false end
+  return orig(alias, notice)
+end, { id = "quiet-hours" })
 ```
 
 ## Generated reference

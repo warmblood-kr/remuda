@@ -496,6 +496,36 @@ function remuda.advice_list(path)
 end
 register("advice_list", "Copies of the advice on one path or all, outermost first.", "advice_list(path?) -> {{path, id, how, depth, owner}...}")
 
+-- For the module loader: every advice entry, to restore after a failed
+-- start; and dropping one owner's advice on reload.
+local function snapshot_advice()
+  local saved = {}
+  for path, entry in pairs(advised) do
+    saved[path] = { entry = entry, base = entry.base, list = { table.unpack(entry.list) } }
+  end
+  return saved
+end
+local function restore_advice(saved)
+  for path in pairs(advised) do
+    if not saved[path] then
+      local list = advised[path].list
+      for i = #list, 1, -1 do remuda.unadvise(path, list[i].id) end
+    end
+  end
+  for path, snap in pairs(saved) do
+    snap.entry.base, snap.entry.list = snap.base, snap.list
+    advised[path] = snap.entry
+    pcall(reattach, path, snap.entry)
+  end
+end
+local function drop_owned_advice(owner)
+  for path, entry in pairs(advised) do
+    for i = #entry.list, 1, -1 do
+      if entry.list[i].owner == owner then remuda.unadvise(path, entry.list[i].id) end
+    end
+  end
+end
+
 -- A shallow copy, the same discipline `emit` itself already keeps for its own
 -- hook snapshot above — a caller mutating what it was handed must never
 -- reach back into this table.
@@ -644,6 +674,20 @@ function remuda._activate_module(name, candidate, reactivate)
     end
   end
 
+  local declared_advice = candidate.advice or {}
+  local advice_count = array_length(declared_advice, "module advice")
+  for index = 1, advice_count do
+    local advice = declared_advice[index]
+    if type(advice) ~= "table" or type(advice.run) ~= "function" or not ADVICE_KINDS[advice.how]
+      or type(advice.id) ~= "string" or advice.id == "" then
+      error("each module advice needs a path, a known how, an id and a run function", 0)
+    end
+    local found, parent, key = pcall(advice_slot, advice.path)
+    if not found or type(parent[key]) ~= "function" then
+      error("module advice path " .. tostring(advice.path) .. " holds no function", 0)
+    end
+  end
+
   local migrations = candidate.migrations or {}
   if type(migrations) ~= "table" then
     error("module migrations must be a table keyed by prior state version", 0)
@@ -683,6 +727,7 @@ function remuda._activate_module(name, candidate, reactivate)
   -- Snapshot what this activation replaces, so a failing `start` can put the
   -- previous activation back (#129). State mutated by that `start` stays.
   local saved_hooks, saved_tools, saved_schedules, saved_commands = {}, {}, {}, {}
+  local saved_advice = snapshot_advice()
   for event, registered in pairs(remuda.hooks) do
     saved_hooks[event] = { table.unpack(registered) }
   end
@@ -706,6 +751,13 @@ function remuda._activate_module(name, candidate, reactivate)
   local function owned(hook) return hook.group == group or hook.owner == name end
   for command in pairs(saved_commands) do
     remuda._extension_commands[command], extension_command_owners[command] = nil, nil
+  end
+  drop_owned_advice(name)
+  for index = 1, advice_count do
+    local advice = declared_advice[index]
+    with_owner(name, remuda.advise, advice.path, advice.how, function(...)
+      return with_owner(name, advice.run, state, ...)
+    end, { id = advice.id, depth = advice.depth })
   end
   for event, registered in pairs(remuda.hooks) do
     local kept = {}
@@ -790,6 +842,7 @@ function remuda._activate_module(name, candidate, reactivate)
     for command, handler in pairs(saved_commands) do
       remuda._extension_commands[command], extension_command_owners[command] = handler, name
     end
+    restore_advice(saved_advice)
     modules[name] = previous
   end
   local start = candidate.start and function(started_state)
