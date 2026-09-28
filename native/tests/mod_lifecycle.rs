@@ -433,3 +433,60 @@ fn reload_into_a_failing_start_keeps_the_previous_registrations() {
         "1"
     );
 }
+
+/// A failed `start` rolls back, but a hook it registered imperatively
+/// survives. It must land by depth, not appended after the restored ones.
+#[test]
+fn rollback_keeps_surviving_hooks_in_depth_order() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let entry = home.entry();
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-depth.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(
+        &image,
+        "remuda._ran = {}; remuda.on('order', function() table.insert(remuda._ran, '0') end, { group = 'base', id = 'zero' })",
+    );
+    read_value(&image, "remuda.exec('sample')");
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function()
+            remuda.on("order", function() table.insert(remuda._ran, "-100") end, { group = "late", id = "first", depth = -100 })
+            error("start fails after registering")
+          end }"#,
+    );
+    let error = image.eval("remuda.reload('sample')", None).unwrap_err();
+    assert!(error.contains("start fails after registering"), "{error}");
+
+    assert_eq!(
+        read_value(
+            &image,
+            "remuda.emit('order'); return table.concat(remuda._ran, ',')"
+        ),
+        "-100,0"
+    );
+    assert_eq!(
+        read_value(
+            &image,
+            "local d = {} for i, h in ipairs(remuda.hook_list('order')) do d[i] = h.depth end return table.concat(d, ',')"
+        ),
+        "-100,0"
+    );
+}

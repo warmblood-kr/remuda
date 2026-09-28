@@ -38,6 +38,10 @@ pub struct SessionSummary {
     /// Whether a human holds it right now. A fact about the terminal, not about
     /// the session's job — see the scope line in `steps/012`.
     pub attached: bool,
+    /// Time since an attached human last typed; `None` if none has (#136).
+    /// Defaulted so a listing from an older daemon still parses.
+    #[serde(default)]
+    pub human_idle: Option<Duration>,
 }
 
 /// A session name from a program's argv[0]: basename, lowercased, anything
@@ -122,6 +126,7 @@ impl Registry {
                 idle: s.idle_for(),
                 size: s.size(),
                 attached: s.is_attached(),
+                human_idle: s.human_idle_for(),
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));

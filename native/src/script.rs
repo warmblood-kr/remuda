@@ -28,12 +28,13 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 54] = [
+pub const BINDINGS: [&str; 59] = [
     "_call",
     "_descriptors",
     "_dispatch_extension_command",
     "_event_counts",
     "_extension_commands",
+    "_function_source",
     "_process_drain",
     "_process_killpg",
     "_process_spawn",
@@ -53,10 +54,14 @@ pub const BINDINGS: [&str; 54] = [
     "click",
     "close",
     "emit",
+    "emit_filter",
+    "emit_until_failure",
+    "emit_until_success",
     "event_counts",
     "exec",
     "extension_command",
     "feed",
+    "hook_list",
     "hooks",
     "insert",
     "key",
@@ -202,6 +207,12 @@ const WORDS: &[(&str, &str, &str)] = &[
         "kill",
         "Terminate a process started with `remuda.process`, by id.",
         "kill(id) -> nil",
+    ),
+    (
+        "_function_source",
+        "Where a Lua function was defined, as `source:line`; internal, for \
+         `hook_list`, since scripts get no `debug` library.",
+        "_function_source(fn) -> string",
     ),
     (
         "_process_killpg",
@@ -407,6 +418,7 @@ pub fn bindings(
     )?;
 
     exec_binding(lua, &table)?;
+    function_source_binding(lua, &table)?;
 
     capture_styled_binding(lua, &table, at())?;
     dir_bindings(lua, &table, &at)?;
@@ -453,6 +465,21 @@ fn new_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Resu
                 value(lua, ask(&path, new_request(name, argv, cwd, env))?)
             },
         )?,
+    )
+}
+
+/// `source:line` of a Lua function, for `hook_list`; scripts get no `debug`.
+fn function_source_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
+    table.set(
+        "_function_source",
+        lua.create_function(|_, function: mlua::Function| {
+            let info = function.info();
+            Ok(format!(
+                "{}:{}",
+                info.short_src.unwrap_or_else(|| "?".into()),
+                info.line_defined.unwrap_or(0)
+            ))
+        })?,
     )
 }
 
@@ -771,6 +798,14 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
                 // "*sessions*" buffer, `tools.lua`) can show the same
                 // attached state the list has always drawn.
                 row.set("attached", session.attached)?;
+                // Seconds since an attached human typed; math.huge if never, so
+                // the field is always present and nil means an older core.
+                row.set(
+                    "human_idle",
+                    session
+                        .human_idle
+                        .map_or(f64::INFINITY, |idle| idle.as_secs_f64()),
+                )?;
                 rows.set(index + 1, row)?;
             }
             Ok(Value::Table(rows))
