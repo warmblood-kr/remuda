@@ -629,6 +629,7 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
     assert_eq!(created, Response::Value("target".into()));
 
     let exit_status = dir.join("attach-exit-status");
+    let trace_path = dir.join("attach-windows-input.trace");
     #[cfg(unix)]
     let mut cmd = {
         let mut cmd = CommandBuilder::new("sh");
@@ -654,6 +655,7 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         cmd
     };
     cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    cmd.env("REMUDA_WIN_INPUT_TRACE", &trace_path);
     let viewer = Session::new(
         "viewer",
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
@@ -685,10 +687,11 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
     held.write_raw(b"k").expect("release attach with any key");
     let deadline = Instant::now() + PATIENCE;
     while viewer.is_alive() {
-        assert!(
-            Instant::now() < deadline,
-            "attach client did not exit after one key"
-        );
+        if Instant::now() >= deadline {
+            let trace = std::fs::read_to_string(&trace_path)
+                .unwrap_or_else(|error| format!("trace unavailable: {error}"));
+            panic!("attach client did not exit after one key; input trace:\n{trace}");
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(

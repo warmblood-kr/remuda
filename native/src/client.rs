@@ -219,6 +219,8 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
             let mut buf = [0u8; 1024];
             let mut parser = crate::mouse::SgrParser::default();
             let mut mouse_on = mouse;
+            #[cfg(windows)]
+            let mut logged_pre_exit_wait = false;
             loop {
                 if output_done.load(std::sync::atomic::Ordering::SeqCst) {
                     // Keep the advertised "press any key" behavior after the
@@ -233,10 +235,23 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                         continue;
                     };
                     #[cfg(windows)]
-                    if wait_for_windows_keypress().is_err() {
+                    {
+                        trace_windows_attach_input("output_done observed by input thread");
+                        trace_windows_attach_input("enter post-exit wait");
+                        match wait_for_windows_keypress() {
+                            Ok(()) => trace_windows_attach_input("returning after key event"),
+                            Err(error) => {
+                                trace_windows_attach_input(&format!("returning on error: {error}"))
+                            }
+                        }
                         break;
                     }
                     break;
+                }
+                #[cfg(windows)]
+                if !logged_pre_exit_wait {
+                    trace_windows_attach_input("input thread started; output_done=false");
+                    logged_pre_exit_wait = true;
                 }
                 let wait = parser
                     .timeout_remaining()
@@ -259,6 +274,8 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     Err(_) => break,
                 };
                 if output_done.load(std::sync::atomic::Ordering::SeqCst) {
+                    #[cfg(windows)]
+                    trace_windows_attach_input("output_done observed after normal input wait");
                     break;
                 }
                 if n == 0 {
@@ -371,7 +388,9 @@ fn wait_for_windows_keypress() -> std::io::Result<()> {
 
     let handle: HANDLE = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     loop {
-        if unsafe { WaitForSingleObject(handle, INFINITE) } != WAIT_OBJECT_0 {
+        let wait_result = unsafe { WaitForSingleObject(handle, INFINITE) };
+        trace_windows_attach_input(&format!("WaitForSingleObject result={wait_result}"));
+        if wait_result != WAIT_OBJECT_0 {
             return Err(std::io::Error::last_os_error());
         }
         let mut records = [INPUT_RECORD::default(); 16];
@@ -392,11 +411,37 @@ fn wait_for_windows_keypress() -> std::io::Result<()> {
                 // Console input queues include key-up records as well. Only a
                 // key-down event should release the post-exit wait.
                 let key = unsafe { record.Event.KeyEvent };
+                let character = unsafe { key.uChar.UnicodeChar };
+                trace_windows_attach_input(&format!(
+                    "INPUT_RECORD EventType={} bKeyDown={} char=U+{:04X} vk={}",
+                    record.EventType, key.bKeyDown, character, key.wVirtualKeyCode
+                ));
                 if key.bKeyDown != 0 && key.wVirtualKeyCode != 0 {
+                    trace_windows_attach_input("returning on key-down record");
                     return Ok(());
                 }
+            } else {
+                trace_windows_attach_input(&format!(
+                    "INPUT_RECORD EventType={} non-key",
+                    record.EventType
+                ));
             }
         }
+    }
+}
+
+#[cfg(windows)]
+fn trace_windows_attach_input(message: &str) {
+    let Some(path) = std::env::var_os("REMUDA_WIN_INPUT_TRACE") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = writeln!(file, "{message}");
     }
 }
 
