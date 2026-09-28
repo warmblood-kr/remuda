@@ -1098,7 +1098,7 @@ function remuda._activate_module(name, candidate, reactivate)
 
   -- Snapshot what this activation replaces, so a failing `start` can put the
   -- previous activation back (#129). State mutated by that `start` stays.
-  local saved_hooks, saved_tools, saved_schedules, saved_commands = {}, {}, {}, {}
+  local saved_hooks, saved_tools, saved_schedules, saved_owner_schedules, saved_commands = {}, {}, {}, {}, {}
   local saved_advice = snapshot_advice()
   local saved_fields = {}
   for key, owner in pairs(field_owners) do
@@ -1120,6 +1120,9 @@ function remuda._activate_module(name, candidate, reactivate)
   end
   for _, handle in ipairs(previous and previous.schedules or {}) do
     saved_schedules[handle] = remuda.schedules[handle]
+  end
+  for handle, schedule in pairs(remuda.schedules) do
+    if schedule.owner == name then saved_owner_schedules[handle] = true end
   end
   local saved_contributions = {}
   for point, items in pairs(contributions) do
@@ -1268,6 +1271,15 @@ function remuda._activate_module(name, candidate, reactivate)
     end
     for _, handle in ipairs(schedule_handles) do
       remuda.cancel(handle)
+    end
+    -- A failing start can register schedules imperatively. They have the
+    -- module owner but are absent from the declaration's schedule_handles.
+    -- Preserve schedules that existed before activation; the previous
+    -- activation's restart path will rebuild its own imperative schedules.
+    for handle, schedule in pairs(remuda.schedules) do
+      if schedule.owner == name and not saved_owner_schedules[handle] then
+        remuda.cancel(handle)
+      end
     end
     for handle, schedule in pairs(saved_schedules) do
       remuda.schedules[handle] = schedule
