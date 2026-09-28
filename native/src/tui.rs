@@ -616,7 +616,8 @@ impl Ui {
 
     fn set_list_width(&mut self, width: u16, cols: u16) {
         let usable = cols.saturating_sub(1);
-        self.list_width = Some(width.clamp(16, usable.saturating_sub(16)));
+        let max = usable.saturating_sub(16).max(16).min(usable);
+        self.list_width = Some(width.clamp(16.min(max), max));
     }
 }
 
@@ -679,12 +680,30 @@ fn ui_layout(ui: &Ui, term_cols: u16) -> (u16, u16) {
         return (0, term_cols);
     }
     let usable = term_cols.saturating_sub(1);
-    let automatic = layout(term_cols, widest(ui)).0;
-    let list = ui
-        .list_width
-        .unwrap_or(automatic)
-        .clamp(16, usable.saturating_sub(16));
+    let automatic = content_list_width(ui, usable);
+    let max = usable.saturating_sub(16).max(16).min(usable);
+    let list = ui.list_width.unwrap_or(automatic).clamp(16.min(max), max);
     (list, usable.saturating_sub(list))
+}
+
+/// Fit the automatic list pane to its longest rendered row, leaving a little
+/// room at the right edge. `sessions_text` is the Lua-owned rendered content;
+/// before its first refresh, session names give us a useful estimate instead.
+fn content_list_width(ui: &Ui, usable: u16) -> u16 {
+    let longest = ui
+        .sessions_text
+        .iter()
+        .map(|line| visible_width(line))
+        .max()
+        .unwrap_or_else(|| {
+            ui.sessions
+                .iter()
+                .map(|session| visible_width(&session.name) + 2)
+                .max()
+                .unwrap_or(0)
+        });
+    let wanted = longest.saturating_add(2).min(u16::MAX as usize) as u16;
+    wanted.clamp(16, 40).min(usable)
 }
 
 /// Display columns a unit of session content claims. `char`'s answer of 1
@@ -837,6 +856,7 @@ mod visual_mode_tests {
                 name: "agent".into(),
                 alive: true,
                 idle: Duration::ZERO,
+                output_idle: Some(Duration::ZERO),
                 size: Size::new(80, 24),
                 attached: false,
                 human_idle: None,
@@ -1056,7 +1076,7 @@ pub fn crop(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool)
             let mut visible: String = cells.into_iter().collect();
             // The marker has to go on here rather than in `fit`: by the time
             // the row is padded there is nothing left to tell it was cut.
-            if row_cut {
+            if row_cut && cols > 0 {
                 visible.pop();
                 visible.push('→');
             }
@@ -1071,6 +1091,9 @@ pub fn crop(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool)
 /// a wide (CJK) name used to overflow this budget. See steps/025.
 fn fit(text: &str, width: u16) -> String {
     let width = width as usize;
+    if width == 0 {
+        return String::new();
+    }
     if visible_width(text) > width {
         let mut out = String::new();
         let mut used = 0usize;
@@ -1115,7 +1138,7 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
     let body = rows.saturating_sub(1);
     // The border, and the only thing on screen that is always saying where the
     // keyboard is pointing. A prefix key's state is invisible; this is not.
-    let divider = if ui.list_visible {
+    let divider = if ui.list_visible && list_w < cols {
         match ui.focus {
             Focus::List => "│",
             Focus::Session => "\x1b[7m┃\x1b[0m",
@@ -1250,7 +1273,7 @@ fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Ve
     let out = cropped
         .into_iter()
         .map(|(mut visible, row_cut)| {
-            if row_cut {
+            if row_cut && cols > 0 {
                 // Free at least 1 display column for `→`. A wide cell's
                 // trailing continuation frees 0 on its own, so keep popping
                 // until real width comes back — see steps/023.
@@ -1263,7 +1286,7 @@ fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Ve
                 }
             }
             let mut s = render_styled_row(&visible);
-            if row_cut {
+            if row_cut && cols > 0 {
                 s.push('→');
             }
             s
@@ -1351,7 +1374,7 @@ pub fn render_styled(
 ) -> String {
     let (list_w, preview_w) = ui_layout(ui, cols);
     let body = rows.saturating_sub(1);
-    let divider = if ui.list_visible {
+    let divider = if ui.list_visible && list_w < cols {
         match ui.focus {
             Focus::List => "│",
             Focus::Session => "\x1b[7m┃\x1b[0m",
@@ -1448,6 +1471,7 @@ fn cells_with_selection(ui: &Ui, cells: &[Vec<StyledCell>]) -> Vec<Vec<StyledCel
 /// The widest session in the herd, which is what the preview column claims —
 /// from the herd rather than the cursor, so the divider does not jump. Zero
 /// when there is no herd: nothing to preview, so nothing to reserve.
+#[cfg(test)]
 fn widest(ui: &Ui) -> u16 {
     ui.sessions.iter().map(|s| s.size.cols()).max().unwrap_or(0)
 }
@@ -1501,7 +1525,32 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
         None if session_index == ui.selected => format!("\x1b[7m{}\x1b[0m", session.name),
         None => session.name.clone(),
     };
-    fit(&content, width)
+    fit_session_row(&content, width)
+}
+
+/// Keep the status dot in one shared column on every row. Attached rows use
+/// the horse in the final three cells; other rows reserve the same cells.
+/// Only the styled name is shortened, one Unicode scalar at a time, by `fit`.
+fn fit_session_row(content: &str, width: u16) -> String {
+    const MARKER: &str = " 🏇";
+    const PLAIN_PAD: &str = "   ";
+    for state in [" \x1b[32m●\x1b[0m", " \x1b[31m●\x1b[0m"] {
+        if let Some(name) = content.strip_suffix(state) {
+            let suffix = format!("{state}{PLAIN_PAD}");
+            let name_width = width.saturating_sub(visible_width(&suffix) as u16);
+            return format!("{}{}", fit(name, name_width), suffix);
+        }
+        let attached = format!("{state}{MARKER}");
+        if let Some(name) = content.strip_suffix(&attached) {
+            let name_width = width.saturating_sub(visible_width(&attached) as u16);
+            return format!("{}{}", fit(name, name_width), attached);
+        }
+    }
+    if let Some(name) = content.strip_suffix(MARKER) {
+        let name_width = width.saturating_sub(visible_width(MARKER) as u16);
+        return format!("{}{}", fit(name, name_width), MARKER);
+    }
+    fit(content, width)
 }
 
 /// The crop notice moved here when the preview lost its title band: a crop that

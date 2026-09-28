@@ -67,6 +67,7 @@ fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
         name: name.into(),
         alive,
         idle: Duration::from_secs(4),
+        output_idle: Some(Duration::from_secs(4)),
         size: Size::new(80, 24),
         attached,
         human_idle: None,
@@ -248,7 +249,7 @@ fn dragging_the_divider_sets_a_clamped_list_width() {
     let mut ui = make_ui(vec![row("a", true, false)]);
     let down = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
-        column: 39,
+        column: 16,
         row: 4,
         modifiers: KeyModifiers::NONE,
     };
@@ -495,6 +496,112 @@ fn the_preview_claims_what_the_widest_session_needs() {
 }
 
 #[test]
+fn a_shown_list_fits_its_content_without_overriding_a_manual_width() {
+    let mut ui = make_ui(vec![row("short", true, false)]);
+    ui.sessions_text = vec![
+        "\x1b[1mshort\x1b[0m".into(),
+        "a rendered detail row that is longer".into(),
+        String::new(),
+    ];
+
+    ui.on_key(press(KeyCode::Char('l')));
+    assert_eq!(
+        ui_layout(&ui, 120),
+        (0, 120),
+        "hidden list uses full preview"
+    );
+    ui.on_key(press(KeyCode::Char('l')));
+    assert_eq!(ui_layout(&ui, 120), (38, 81));
+
+    ui.set_list_width(31, 120);
+    assert_eq!(
+        ui_layout(&ui, 120),
+        (31, 88),
+        "dragged width remains preferred"
+    );
+}
+
+#[test]
+fn narrow_terminals_clamp_content_fit_and_manual_widths_without_panicking() {
+    let mut ui = make_ui(vec![row("long-enough-to-fit", true, false)]);
+    for cols in [30u16, 20u16] {
+        let usable = cols.saturating_sub(1);
+        let (list, preview) = ui_layout(&ui, cols);
+        assert!(list + preview <= usable, "content fit at {cols} cols");
+
+        ui.set_list_width(24, 120);
+        let (list, preview) = ui_layout(&ui, cols);
+        assert!(list + preview <= usable, "manual width at {cols} cols");
+
+        ui.list_width = None;
+        ui.set_list_width(24, cols);
+        let (list, preview) = ui_layout(&ui, cols);
+        assert!(list + preview <= usable, "drag at {cols} cols");
+    }
+}
+
+#[test]
+fn a_seventeen_column_frame_never_paints_past_the_terminal_edge() {
+    let ui = make_ui(vec![row("alpha", true, false)]);
+    let cols = 17;
+    let frames = [
+        render(&ui, &"preview".repeat(20), "default", cols, 5),
+        render_styled(
+            &ui,
+            &vec![text_row(80); 4],
+            hidden_cursor(),
+            "default",
+            cols,
+            5,
+        ),
+    ];
+
+    fn painted_lines(frame: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        let mut chars = frame.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\x1b' || chars.next() != Some('[') {
+                if ch != '\x1b' {
+                    line.push(ch);
+                }
+                continue;
+            }
+            let mut end = None;
+            for control in chars.by_ref() {
+                if control.is_ascii_alphabetic() {
+                    end = Some(control);
+                    break;
+                }
+            }
+            if end == Some('H') && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+        lines
+    }
+
+    for (renderer, frame) in ["plain", "styled"].into_iter().zip(frames.iter()) {
+        let lines = painted_lines(frame);
+        assert_eq!(
+            lines.len(),
+            5,
+            "{renderer}: one painted line per terminal row"
+        );
+        for (index, line) in lines.iter().enumerate() {
+            assert!(
+                visible_width(line) <= cols as usize,
+                "{renderer} row {} exceeds {cols} columns: {line:?}",
+                index + 1
+            );
+        }
+    }
+}
+
+#[test]
 fn a_terminal_too_small_to_split_still_produces_a_frame() {
     let (list, preview) = layout(10, 80);
     assert_eq!(list + preview, 9, "the divider, and no underflow");
@@ -518,8 +625,10 @@ fn crop_reference(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>,
                 .collect();
             if chars.len() > (pan as usize) + (cols as usize) {
                 cut = true;
-                visible.pop();
-                visible.push('→');
+                if cols > 0 {
+                    visible.pop();
+                    visible.push('→');
+                }
             }
             visible
         })
@@ -874,16 +983,15 @@ fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buff
     let mut ui = make_ui(vec![row("alpha", true, false), row("bravo", true, true)]);
     // What a real refresh() would have fetched from the "*sessions*"
     // buffer at this scenario's list width (16, per `layout(80, 80)`):
-    // unattached is a bare space, attached is the flag — width 16 is
-    // under the 22-column threshold `tools.lua` uses for the live/dead
-    // word, so neither row shows it. This is `render_styled`'s only
-    // input that no longer comes from `ui.sessions` directly.
+    // unattached has no marker, and the attached horse stays on the name
+    // row. These rows model the live Lua buffer at width 16. This is the
+    // `render_styled` input that no longer comes from `ui.sessions` directly.
     ui.sessions_text = vec![
         "alpha".into(),
-        "live".into(),
         String::new(),
-        "bravo".into(),
-        "live  ⚑".into(),
+        String::new(),
+        "bravo 🏇".into(),
+        String::new(),
         String::new(),
     ];
     let cells = vec![text_row(10); 23];
@@ -893,10 +1001,10 @@ fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buff
             "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
              \x1b[2;1H\x1b[Kalpha           │xxxxxxxxxx                                                     \
-             \x1b[3;1H\x1b[Klive            │xxxxxxxxxx                                                     \
+             \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[Kbravo           │xxxxxxxxxx                                                     \
-             \x1b[6;1H\x1b[Klive  ⚑         │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[Kbravo         🏇│xxxxxxxxxx                                                     \
+             \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -939,29 +1047,29 @@ fn render_styled_of_the_empty_session_list_is_byte_identical_before_and_after_th
     assert_eq!(
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
-             \x1b[1;1H\x1b[Kremuda · default                        │                                       \
-             \x1b[2;1H\x1b[K                                        │                                       \
-             \x1b[3;1H\x1b[K  the herd is empty.                    │                                       \
-             \x1b[4;1H\x1b[K                                        │                                       \
-             \x1b[5;1H\x1b[K  press n to start a session.           │                                       \
-             \x1b[6;1H\x1b[K                                        │                                       \
-             \x1b[7;1H\x1b[K                                        │                                       \
-             \x1b[8;1H\x1b[K                                        │                                       \
-             \x1b[9;1H\x1b[K                                        │                                       \
-             \x1b[10;1H\x1b[K                                        │                                       \
-             \x1b[11;1H\x1b[K                                        │                                       \
-             \x1b[12;1H\x1b[K                                        │                                       \
-             \x1b[13;1H\x1b[K                                        │                                       \
-             \x1b[14;1H\x1b[K                                        │                                       \
-             \x1b[15;1H\x1b[K                                        │                                       \
-             \x1b[16;1H\x1b[K                                        │                                       \
-             \x1b[17;1H\x1b[K                                        │                                       \
-             \x1b[18;1H\x1b[K                                        │                                       \
-             \x1b[19;1H\x1b[K                                        │                                       \
-             \x1b[20;1H\x1b[K                                        │                                       \
-             \x1b[21;1H\x1b[K                                        │                                       \
-             \x1b[22;1H\x1b[K                                        │                                       \
-             \x1b[23;1H\x1b[K                                        │                                       \
+             \x1b[1;1H\x1b[Kremuda · default             │                                                  \
+             \x1b[2;1H\x1b[K                             │                                                  \
+             \x1b[3;1H\x1b[K  the herd is empty.         │                                                  \
+             \x1b[4;1H\x1b[K                             │                                                  \
+             \x1b[5;1H\x1b[K  press n to start a session.│                                                  \
+             \x1b[6;1H\x1b[K                             │                                                  \
+             \x1b[7;1H\x1b[K                             │                                                  \
+             \x1b[8;1H\x1b[K                             │                                                  \
+             \x1b[9;1H\x1b[K                             │                                                  \
+             \x1b[10;1H\x1b[K                             │                                                  \
+             \x1b[11;1H\x1b[K                             │                                                  \
+             \x1b[12;1H\x1b[K                             │                                                  \
+             \x1b[13;1H\x1b[K                             │                                                  \
+             \x1b[14;1H\x1b[K                             │                                                  \
+             \x1b[15;1H\x1b[K                             │                                                  \
+             \x1b[16;1H\x1b[K                             │                                                  \
+             \x1b[17;1H\x1b[K                             │                                                  \
+             \x1b[18;1H\x1b[K                             │                                                  \
+             \x1b[19;1H\x1b[K                             │                                                  \
+             \x1b[20;1H\x1b[K                             │                                                  \
+             \x1b[21;1H\x1b[K                             │                                                  \
+             \x1b[22;1H\x1b[K                             │                                                  \
+             \x1b[23;1H\x1b[K                             │                                                  \
              \x1b[24;1H\x1b[Kn new   q quit                                                                  \
              \x1b[J\x1b[?25l\x1b[?2026l",
             "byte-identical oracle for the empty session list, captured \
@@ -1012,8 +1120,8 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
     let (list_w, _) = layout(80, widest(&ui));
     let (rows, lines, _) =
         sessions_buffer_lines(&path, list_w, 0, None).expect("refresh sessions buffer");
-    // tools.lua's three-row contract: bold name (cyan when selected), coloured
-    // state word, the attach flag, then a blank spacer row.
+    // tools.lua's three-row contract: bold name (cyan when selected) plus the
+    // attached marker, detail on row two, then a blank spacer row.
     assert_eq!(rows, 3);
     assert_eq!(
         lines,
@@ -1021,8 +1129,8 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
             "\x1b[1;7;36malpha\x1b[0m \x1b[32m●\x1b[0m".to_string(),
             String::new(),
             String::new(),
-            "\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m".to_string(),
-            "⚑".to_string(),
+            "\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m 🏇".to_string(),
+            String::new(),
             String::new(),
         ],
         "real Lua output for this scenario"
@@ -1036,11 +1144,11 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
-             \x1b[2;1H\x1b[K\x1b[1;7;36malpha\x1b[0m \x1b[32m●\x1b[0m         │xxxxxxxxxx                                                     \
+             \x1b[2;1H\x1b[K\x1b[1;7;36malpha\x1b[0m       \x1b[32m●\x1b[0m   │xxxxxxxxxx                                                     \
              \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m         │xxxxxxxxxx                                                     \
-             \x1b[6;1H\x1b[K⚑               │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K\x1b[1mbravo\x1b[0m       \x1b[32m●\x1b[0m 🏇│xxxxxxxxxx                                                     \
+             \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1197,7 +1305,7 @@ fn a_nested_entry_never_overflows_a_narrow_list() {
 }
 
 #[test]
-fn a_status_dot_follows_the_name_and_the_state_row_keeps_only_detail() {
+fn attached_horse_marker_joins_the_name_row_with_two_cell_width() {
     // The dot carries live/dead, so row 2 spells neither. Each style is reset
     // before the next begins: the selection style must not reach the dot,
     // and the dot colour must not reach anything after it.
@@ -1226,8 +1334,23 @@ fn a_status_dot_follows_the_name_and_the_state_row_keeps_only_detail() {
     );
     assert_eq!(
         entry(1),
-        ("\x1b[1mbusy\x1b[0m \x1b[32m●\x1b[0m", "⚑"),
+        ("\x1b[1mbusy\x1b[0m \x1b[32m●\x1b[0m 🏇", ""),
         "unselected, live, attached"
+    );
+    assert_eq!(
+        visible_width("🏇"),
+        2,
+        "the marker occupies two terminal cells"
+    );
+    assert_eq!(
+        visible_width(entry(1).0),
+        9,
+        "the ANSI styled row includes both cells"
+    );
+    assert_eq!(
+        visible_width(&fit(entry(1).0, 16)),
+        16,
+        "fitting the row accounts for the horse's two display cells"
     );
     assert_eq!(
         entry(2),
@@ -1268,8 +1391,8 @@ fn the_status_dot_counts_as_one_column() {
 
 #[test]
 fn the_list_has_no_caret_column_at_any_depth() {
-    // Each row is exactly Lua's block row fitted to the list: no gutter, so
-    // every row is two columns narrower than with the old caret column.
+    // The dot column stays fixed while the tree indentation consumes name
+    // space, with no gutter or caret column.
     let path = scratch_socket("no-caret");
     daemon_at(&path);
     for name in ["alpha", "bravo", "charlie"] {
@@ -1291,8 +1414,16 @@ fn the_list_has_no_caret_column_at_any_depth() {
     apply_session_order(&mut ui, None, &order);
     ui.session_rows = rows;
     ui.sessions_text = lines.clone();
+    let mut dot_column = None;
     for (r, text) in lines.iter().enumerate() {
-        assert_eq!(list_row(&ui, r, width), fit(text, width), "row {r}");
+        let rendered = list_row(&ui, r, width);
+        if let Some(dot) = rendered.find('●') {
+            let column = visible_width(&rendered[..dot]);
+            assert_eq!(column, width as usize - 4, "row {r} dot column");
+            assert_eq!(dot_column.get_or_insert(column), &column);
+        } else {
+            assert_eq!(rendered, fit(text, width), "blank row {r}");
+        }
     }
 }
 
@@ -1372,41 +1503,40 @@ fn render_styled_of_the_empty_session_list_is_byte_identical_when_fed_by_a_real_
     assert_eq!(
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
-             \x1b[1;1H\x1b[Kremuda · default                        │                                       \
-             \x1b[2;1H\x1b[K                                        │                                       \
-             \x1b[3;1H\x1b[K  the herd is empty.                    │                                       \
-             \x1b[4;1H\x1b[K                                        │                                       \
-             \x1b[5;1H\x1b[K  press n to start a session.           │                                       \
-             \x1b[6;1H\x1b[K                                        │                                       \
-             \x1b[7;1H\x1b[K                                        │                                       \
-             \x1b[8;1H\x1b[K                                        │                                       \
-             \x1b[9;1H\x1b[K                                        │                                       \
-             \x1b[10;1H\x1b[K                                        │                                       \
-             \x1b[11;1H\x1b[K                                        │                                       \
-             \x1b[12;1H\x1b[K                                        │                                       \
-             \x1b[13;1H\x1b[K                                        │                                       \
-             \x1b[14;1H\x1b[K                                        │                                       \
-             \x1b[15;1H\x1b[K                                        │                                       \
-             \x1b[16;1H\x1b[K                                        │                                       \
-             \x1b[17;1H\x1b[K                                        │                                       \
-             \x1b[18;1H\x1b[K                                        │                                       \
-             \x1b[19;1H\x1b[K                                        │                                       \
-             \x1b[20;1H\x1b[K                                        │                                       \
-             \x1b[21;1H\x1b[K                                        │                                       \
-             \x1b[22;1H\x1b[K                                        │                                       \
-             \x1b[23;1H\x1b[K                                        │                                       \
+             \x1b[1;1H\x1b[Kremuda · default             │                                                  \
+             \x1b[2;1H\x1b[K                             │                                                  \
+             \x1b[3;1H\x1b[K  the herd is empty.         │                                                  \
+             \x1b[4;1H\x1b[K                             │                                                  \
+             \x1b[5;1H\x1b[K  press n to start a session.│                                                  \
+             \x1b[6;1H\x1b[K                             │                                                  \
+             \x1b[7;1H\x1b[K                             │                                                  \
+             \x1b[8;1H\x1b[K                             │                                                  \
+             \x1b[9;1H\x1b[K                             │                                                  \
+             \x1b[10;1H\x1b[K                             │                                                  \
+             \x1b[11;1H\x1b[K                             │                                                  \
+             \x1b[12;1H\x1b[K                             │                                                  \
+             \x1b[13;1H\x1b[K                             │                                                  \
+             \x1b[14;1H\x1b[K                             │                                                  \
+             \x1b[15;1H\x1b[K                             │                                                  \
+             \x1b[16;1H\x1b[K                             │                                                  \
+             \x1b[17;1H\x1b[K                             │                                                  \
+             \x1b[18;1H\x1b[K                             │                                                  \
+             \x1b[19;1H\x1b[K                             │                                                  \
+             \x1b[20;1H\x1b[K                             │                                                  \
+             \x1b[21;1H\x1b[K                             │                                                  \
+             \x1b[22;1H\x1b[K                             │                                                  \
+             \x1b[23;1H\x1b[K                             │                                                  \
              \x1b[24;1H\x1b[Kn new   q quit                                                                  \
              \x1b[J\x1b[?25l\x1b[?2026l",
             "byte-identical oracle for the empty session list, fed for real"
         );
 }
 
-/// Pins the live/dead word against real Lua at widths either side of the
-/// old 22-column threshold. Since 2f8ce82 the state word is its own row, so
-/// it survives any list width (the renderer's `fit` truncates, not Lua).
+/// Pins the attached marker against real Lua at narrow widths. The marker
+/// stays on the name row instead of occupying the detail row.
 // `alpha` unattached, `bravo` attached, both alive. Two Eval round trips.
 #[test]
-fn the_live_dead_word_is_pinned_against_real_lua_at_every_width() {
+fn the_attached_marker_stays_on_the_name_row_at_narrow_widths() {
     let path = scratch_socket("e2e-live-dead-threshold");
     daemon_at(&path);
 
@@ -1426,9 +1556,67 @@ fn the_live_dead_word_is_pinned_against_real_lua_at_every_width() {
             .collect();
         assert_eq!(
             states,
-            vec!["", "⚑"],
-            "at width {width}, tools.lua shows the live/dead word before the flag"
+            vec!["", ""],
+            "at width {width}, attached marker must not occupy the detail row"
         );
+        assert!(
+            lines[3].ends_with(" 🏇"),
+            "first row carries the attached marker: {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn long_names_keep_the_status_dot_aligned_and_attached_horse_visible() {
+    const ATTACHED: &str = "attached-name-abcdefghijklmnopqrstuvwxyz-한글";
+    const PLAIN: &str = "plain-name-abcdefghijklmnopqrstuvwxyz-한글";
+    let path = scratch_socket("attached-marker-long-name");
+    daemon_at(&path);
+    eval(
+        &path,
+        r#"
+          remuda.ls = function() return {
+            { name = "attached-name-abcdefghijklmnopqrstuvwxyz-한글", alive = true, attached = true },
+            { name = "plain-name-abcdefghijklmnopqrstuvwxyz-한글", alive = true, attached = false },
+          } end
+        "#,
+    );
+
+    for width in [16, 40] {
+        let (rows, lines, _) =
+            sessions_buffer_lines(&path, width, 0, None).expect("refresh sessions buffer");
+        let mut ui = make_ui(vec![row(ATTACHED, true, true), row(PLAIN, true, false)]);
+        ui.session_rows = rows;
+        ui.sessions_text = lines.clone();
+
+        let attached = list_row(&ui, 0, width);
+        assert!(
+            attached.ends_with(" 🏇"),
+            "the horse stays at the row end at width {width}: {attached:?}"
+        );
+        assert!(
+            attached.contains('→'),
+            "the long name is ellipsized: {attached:?}"
+        );
+        assert_eq!(visible_width(&attached), width as usize);
+
+        let plain = list_row(&ui, rows, width);
+        assert!(
+            plain.contains('→'),
+            "the long name is ellipsized: {plain:?}"
+        );
+        assert!(
+            plain.ends_with("\x1b[0m   "),
+            "dot column is reserved: {plain:?}"
+        );
+        assert_eq!(visible_width(&plain), width as usize);
+
+        let attached_dot = visible_width(&attached[..attached.find('●').unwrap()]);
+        let plain_dot = visible_width(&plain[..plain.find('●').unwrap()]);
+        assert_eq!(attached_dot, width as usize - 4, "attached dot column");
+        assert_eq!(plain_dot, attached_dot, "both rows align their dots");
+        assert!(attached.is_char_boundary(attached.find('●').unwrap()));
+        assert!(plain.is_char_boundary(plain.find('●').unwrap()));
     }
 }
 
@@ -1568,8 +1756,8 @@ fn the_frame_says_what_it_is_showing() {
         "\x1b[1;7;36mclaude\x1b[0m".into(),
         "live".into(),
         String::new(),
-        "busy".into(),
-        "live  ⚑".into(),
+        "busy 🏇".into(),
+        "live".into(),
         String::new(),
     ];
     let frame = render(&ui, "hello", "default", 120, 10);
@@ -1578,7 +1766,10 @@ fn the_frame_says_what_it_is_showing() {
         frame.contains("\x1b[1;7;36mclaude"),
         "the selected first row is reverse video"
     );
-    assert!(frame.contains('⚑'), "and the busy one is flagged");
+    assert!(
+        frame.contains('🏇'),
+        "and the busy one carries the horse marker"
+    );
     assert!(frame.contains("⏎ enter"), "the footer teaches the keys");
     assert!(frame.contains('│'), "and the border is the quiet one");
 }
@@ -1635,13 +1826,17 @@ fn the_preview_starts_at_the_sessions_own_first_row() {
 fn a_session_started_here_is_sized_to_the_pane_not_the_terminal() {
     let empty = make_ui(vec![]);
     let first = pane_size(&empty, 160, 40);
-    assert_eq!((first.cols(), first.rows()), (119, 39));
+    assert_eq!((first.cols(), first.rows()), (143, 39));
 
-    // And once it exists, the layout it caused fits it exactly.
+    // And once it exists, the content-fit layout preserves that width.
     let mut herd = make_ui(vec![row("sh", true, false)]);
     herd.sessions[0].size = first;
-    let (_, preview_w) = layout(160, widest(&herd));
-    assert_eq!(preview_w, first.cols(), "the second frame must not crop it");
+    let next = pane_size(&herd, 160, 40);
+    assert_eq!(
+        next.cols(),
+        first.cols(),
+        "the second frame must not crop it"
+    );
 }
 
 #[test]
@@ -1652,13 +1847,9 @@ fn a_pane_below_the_floor_is_raised_rather_than_dropping_keystrokes() {
 
 #[test]
 fn a_squeezed_list_drops_fields_rather_than_being_cut() {
-    // 80-wide terminal, 80-wide sessions: the list floors at 16. At that
-    // width `tools.lua`'s own `remuda._refresh_sessions_buffer` omits
-    // the live/dead word (width < 22) — simulated here as the tail it
-    // would have supplied at each width, since deciding that is no
-    // longer list_row's job (see the "*sessions*" buffer migration
-    // above list_row's own doc comment). What list_row still owns is
-    // degrading the NAME rather than ever truncating the tail it's given.
+    // 80-wide terminal, 80-wide sessions: the list floors at 16. What
+    // list_row owns is degrading the NAME rather than ever truncating the
+    // rest of the Lua-provided row.
     let mut ui = make_ui(vec![row("claude", true, false)]);
     let (list_w, _) = layout(80, 80);
     assert_eq!(list_w, 16);

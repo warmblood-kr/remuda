@@ -202,15 +202,14 @@ fn assert_detach_restore(receiver: &Receiver<Vec<u8>>) {
     );
     #[cfg(windows)]
     {
-        let received = collect_until_bytes(receiver, b"remuda: detached from target");
+        let received = collect_until_bytes(receiver, b"remuda: detached");
         assert_bytes_in_order(
             &received,
-            &[
-                b"echo $((6*7))-typed",
-                b"\x1b[?2004l",
-                b"42-typed",
-                b"remuda: detached from target",
-            ],
+            // ConPTY strips the mouse resets, reorders the shell's own ?2004l
+            // and repaints (even truncates) lines, so only the typed round
+            // trip and the detach prefix are stable; the release poll below
+            // proves the detach itself.
+            &[b"42-typed", b"remuda: detached"],
         );
     }
 }
