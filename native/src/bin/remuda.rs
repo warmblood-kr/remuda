@@ -438,7 +438,19 @@ fn stop_daemon(path: &Path) -> Result<(), String> {
 /// most skews are harmless, and stranding someone mid-work behind a version
 /// string is its own incident. `None` when nothing is listening — it will be us.
 fn version_skew(argv: &[&str], path: &Path) -> Option<String> {
-    if matches!(argv, ["daemon"] | ["mcp"] | ["stop", ..]) {
+    // Help, version and upgrade must answer with no daemon at all (#115).
+    if matches!(
+        argv,
+        ["daemon"]
+            | ["mcp"]
+            | ["stop", ..]
+            | [
+                "help" | "-h" | "--help" | "version" | "-V" | "--version" | "upgrade",
+                ..
+            ]
+    ) || (argv.is_empty()
+        && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()))
+    {
         return None;
     }
     remuda_native::ipc::connect(path).ok()?;
@@ -523,6 +535,10 @@ fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> Exit
             if let Err(e) = start_daemon(server, path) {
                 return fail(e);
             }
+        }
+        // A path the transport cannot even name proves nothing about a daemon.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            return fail(format!("cannot use {}: {error}", path.display()));
         }
         Err(error) => {
             return fail(format!(
