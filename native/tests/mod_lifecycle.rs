@@ -585,6 +585,62 @@ fn failed_start_drops_its_imperative_contributions() {
     );
 }
 
+#[test]
+fn failed_start_cannot_take_over_another_mods_imperative_contribution() {
+    let home = DataHome::new();
+    let owner_manifest = home.root.join("remuda/mods/owner/extension.toml");
+    fs::create_dir_all(owner_manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &owner_manifest,
+        "name = \"owner\"\nentry = \"packages/owner/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let owner_entry = home.root.join("remuda/mods/owner/packages/owner/init.lua");
+    write_entry(
+        &owner_entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function() remuda.contribute("probe", "shared", { label = "owner" }) end }"#,
+    );
+
+    let intruder_manifest = home.root.join("remuda/mods/intruder/extension.toml");
+    fs::create_dir_all(intruder_manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &intruder_manifest,
+        "name = \"intruder\"\nentry = \"packages/intruder/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let intruder_entry = home
+        .root
+        .join("remuda/mods/intruder/packages/intruder/init.lua");
+    write_entry(
+        &intruder_entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function()
+            remuda.contribute("probe", "shared", { label = "intruder" })
+            error("intruder start fails")
+          end }"#,
+    );
+
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-contribution-conflict.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "remuda.exec('owner')");
+    let error = image.eval("remuda.exec('intruder')", None).unwrap_err();
+    assert!(error.contains("owner"), "{error}");
+    assert_eq!(
+        read_value(
+            &image,
+            "local rows = remuda.contributions('probe'); return rows[1].owner .. ':' .. rows[1].entry.label"
+        ),
+        "owner:owner"
+    );
+}
+
 /// Hook-design (b): what a mod registers imperatively while its own code runs
 /// (`start`, a declared hook) is owned by it, so reload replaces it instead of
 /// piling up, and a failed reload's `start` leaves the previous set intact.
