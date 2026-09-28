@@ -263,7 +263,7 @@ impl Registry {
         &self,
         name: &str,
         scrollback: usize,
-    ) -> Option<Result<crate::session::VersionedSnapshot>> {
+    ) -> Option<Result<crate::agent::VersionedSnapshot>> {
         self.get(name)
             .map(|session| session.screen_snapshot_version_at(scrollback))
     }

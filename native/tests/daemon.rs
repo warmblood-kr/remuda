@@ -260,7 +260,16 @@ fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_vers
     assert_eq!(capture_version(&socket), first_version);
     wait_for_output_version(&socket, first_version);
 
-    client::request(&socket, &Request::Shutdown).expect("stop first daemon");
+    client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("stop first daemon");
     assert!(
         first_daemon.left_on_its_own(),
         "first daemon should stop cleanly"
@@ -270,7 +279,15 @@ fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_vers
     start_shell_session(&socket, "printf second; sleep 30");
     let second_summary = listed_session(&socket);
     assert_ne!(first_summary.instance_id, second_summary.instance_id);
-    let _ = client::request(&socket, &Request::Shutdown);
+    let _ = client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
     assert!(
         second_daemon.left_on_its_own(),
         "second daemon should stop cleanly"
@@ -335,6 +352,7 @@ fn wait_for_output_version(socket: &Path, original: u64) {
 #[test]
 fn old_json_shapes_parse_with_defaults_for_additive_session_fields() {
     let summary = remuda_core::SessionSummary {
+        id: "".into(),
         name: "old-client".into(),
         instance_id: Some("new-field".into()),
         output_version: Some(7),
@@ -348,6 +366,7 @@ fn old_json_shapes_parse_with_defaults_for_additive_session_fields() {
     };
     let mut old_summary = serde_json::to_value(summary).expect("serialize summary");
     let fields = old_summary.as_object_mut().expect("summary object");
+    fields.remove("id");
     fields.remove("instance_id");
     fields.remove("output_version");
     let decoded: remuda_core::SessionSummary =
@@ -404,7 +423,16 @@ fn resizing_without_child_output_advances_the_output_version() {
     .expect("resize session");
     assert_eq!(response, Response::Ok);
     assert!(capture_version(&socket) > before);
-    client::request(&socket, &Request::Shutdown).expect("stop daemon");
+    client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("stop daemon");
     assert!(daemon.left_on_its_own(), "daemon should stop cleanly");
 }
 

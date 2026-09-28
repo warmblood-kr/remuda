@@ -21,7 +21,7 @@
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use remuda_core::agent::{
     AgentError, AgentProcess, Color, Cursor, MouseEncoding, MouseMode, MouseState, Result,
-    ScreenSnapshot, Size, StyledCell,
+    ScreenSnapshot, Size, StyledCell, VersionedSnapshot,
 };
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -367,7 +367,7 @@ impl AgentProcess for PtyAgent {
         }))
     }
 
-    fn screen_snapshot_at(&mut self, scrollback: usize) -> Result<ScreenSnapshot> {
+    fn screen_snapshot_at(&mut self, scrollback: usize) -> Result<VersionedSnapshot> {
         capture_snapshot(
             &self.screen,
             self.size,
@@ -452,7 +452,7 @@ fn capture_snapshot(
     scrollback_total: &AtomicUsize,
     output_version: &AtomicU64,
     scrollback: usize,
-) -> Result<ScreenSnapshot> {
+) -> Result<VersionedSnapshot> {
     let mut parser = screen.lock().map_err(|_| io("screen lock poisoned"))?;
     let screen = parser.screen_mut();
     let previous = screen.scrollback();
@@ -483,13 +483,16 @@ fn capture_snapshot(
         )
     });
     let version = output_version.load(Ordering::SeqCst);
-    Ok(ScreenSnapshot {
-        cells,
-        wrapped,
-        cursor,
-        scrollback_len,
-        scrollback_total: scrollback_total.load(Ordering::Relaxed),
+    Ok(VersionedSnapshot {
+        snapshot: ScreenSnapshot {
+            cells,
+            wrapped,
+            cursor,
+            scrollback_len,
+            scrollback_total: scrollback_total.load(Ordering::Relaxed),
+        },
         output_version: Some(version),
+        instance_id: None,
     })
 }
 

@@ -159,8 +159,14 @@ pub struct ScreenSnapshot {
     pub cursor: Cursor,
     pub scrollback_len: usize,
     pub scrollback_total: usize,
-    /// Generation captured under the backend screen lock, when supported.
+}
+
+/// A captured screen with the session identity and generation captured with it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct VersionedSnapshot {
+    pub snapshot: ScreenSnapshot,
     pub output_version: Option<u64>,
+    pub instance_id: Option<String>,
 }
 
 /// A live agent process: a screen we can read, a keyboard we can type on.
@@ -233,10 +239,15 @@ pub trait AgentProcess: Send {
         Ok(Vec::new())
     }
 
+    /// A backend generation, if it can synchronize it with screen capture.
+    fn output_version(&mut self) -> Option<u64> {
+        None
+    }
+
     /// Capture the screen and its scrollback counters together when the
     /// backend can provide an atomic snapshot. The default preserves support
     /// for simpler agents that expose these values through separate calls.
-    fn screen_snapshot_at(&mut self, scrollback: usize) -> Result<ScreenSnapshot> {
+    fn screen_snapshot_at(&mut self, scrollback: usize) -> Result<VersionedSnapshot> {
         let cells = self.screen_cells_at(scrollback)?;
         let wrapped = self.row_wrapped_at(scrollback)?;
         let scrollback_len = self.scrollback_len();
@@ -250,19 +261,17 @@ pub trait AgentProcess: Send {
                 visible: false,
             }
         };
-        Ok(ScreenSnapshot {
-            cells,
-            wrapped,
-            cursor,
-            scrollback_len,
-            scrollback_total,
-            output_version: None,
+        Ok(VersionedSnapshot {
+            snapshot: ScreenSnapshot {
+                cells,
+                wrapped,
+                cursor,
+                scrollback_len,
+                scrollback_total,
+            },
+            output_version: self.output_version(),
+            instance_id: None,
         })
-    }
-
-    /// A backend generation, if it can synchronize it with screen capture.
-    fn output_version(&mut self) -> Option<u64> {
-        None
     }
 
     /// Subscribe to output as it arrives. Sessions track output activity and

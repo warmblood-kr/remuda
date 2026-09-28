@@ -5,6 +5,7 @@
 
 use crate::agent::{
     AgentError, AgentProcess, Cursor, MouseState, Result, ScreenSnapshot, Size, StyledCell,
+    VersionedSnapshot,
 };
 use crate::clock::Clock;
 use crate::protocol::Step;
@@ -43,14 +44,6 @@ pub struct Session {
     /// `Pause` between them — so a second sender cannot land a write during a
     /// pause, when the `agent` lock is briefly free. See [`Self::feed`].
     input_lock: Mutex<()>,
-}
-
-/// A terminal frame with the identity and output generation captured with it.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct VersionedSnapshot {
-    pub snapshot: ScreenSnapshot,
-    pub output_version: Option<u64>,
-    pub instance_id: Option<String>,
 }
 
 /// Generate a unique session-start identity from host entropy and a process counter.
@@ -324,12 +317,9 @@ impl Session {
             .agent
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-        let snapshot = agent.screen_snapshot_at(scrollback)?;
-        Ok(VersionedSnapshot {
-            output_version: snapshot.output_version,
-            instance_id: Some(self.instance_id.clone()),
-            snapshot,
-        })
+        let mut snapshot = agent.screen_snapshot_at(scrollback)?;
+        snapshot.instance_id = Some(self.instance_id.clone());
+        Ok(snapshot)
     }
 
     pub fn is_alive(&self) -> bool {
