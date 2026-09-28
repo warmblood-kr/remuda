@@ -165,7 +165,8 @@ impl Image {
     /// callback must not hold shutdown indefinitely.
     pub fn stop_modules_bounded(&self) {
         const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-        if let Ok(answer) = self.submit("remuda._stop_modules()", Some("@remuda/shutdown-modules")) {
+        if let Ok(answer) = self.submit("remuda._stop_modules()", Some("@remuda/shutdown-modules"))
+        {
             let _ = answer.recv_timeout(STOP_TIMEOUT);
         }
     }
