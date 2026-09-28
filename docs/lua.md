@@ -213,6 +213,11 @@ with Emacs nadvice semantics. Local functions have no path and cannot be advised
 - Advising a path that holds no function is an error.
 - A mod that redefines an advised function when it loads keeps the advice: the
   new definition becomes the original.
+- Each installed wrapper runs the chain and original it was built from. Code
+  that captured the wrapped function before redefining it
+  (`local orig = remuda.f; function remuda.f(...) return orig(...) end`)
+  therefore calls the older composition, so the advice runs once around the new
+  definition and once more inside `orig`. It never loops back into itself.
 
 A lifecycle mod may declare `advice = {{path, how, id, depth, run}}`; `run`
 receives the mod's state first. Declared advice, and advice the mod adds while

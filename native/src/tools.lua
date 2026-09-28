@@ -419,14 +419,28 @@ local function run_chain(path, entry, index, ...)
   error(err, 0)
 end
 
--- Put the trampoline back in the slot, adopting whatever function replaced
--- it as the new base: a mod that redefines an advised function keeps its
--- advice, as `defalias` respects advice.
+-- Each installed trampoline runs a frozen copy of the chain and base it was
+-- built from (Emacs-like). A caller that captured an older trampoline, such
+-- as the `local orig = remuda.f; function remuda.f(...) return orig(...) end`
+-- idiom, runs that older composition instead of recursing into the new one.
+local trampolines = setmetatable({}, { __mode = "k" })
+local function compose(path, entry)
+  local frozen = { base = entry.base, list = { table.unpack(entry.list) } }
+  local trampoline = function(...) return run_chain(path, frozen, 1, ...) end
+  trampolines[trampoline] = true
+  entry.trampoline = trampoline
+  return trampoline
+end
+
+-- Put a trampoline back in the slot, adopting a function that replaced it as
+-- the new base: a mod that redefines an advised function keeps its advice,
+-- as `defalias` respects advice. One of our own trampolines is never adopted.
 local function reattach(path, entry)
   local parent, key = advice_slot(path)
   local current = parent[key]
-  if current ~= entry.trampoline and type(current) == "function" then entry.base = current end
-  parent[key] = entry.trampoline
+  if current == entry.trampoline then return end
+  if type(current) == "function" and not trampolines[current] then entry.base = current end
+  parent[key] = compose(path, entry)
 end
 function remuda._advice_reattach()
   for path, entry in pairs(advised) do pcall(reattach, path, entry) end
@@ -444,7 +458,7 @@ function remuda.advise(path, how, fn, opts)
   if not entry then
     if type(parent[key]) ~= "function" then error("no function at " .. path .. " to advise", 2) end
     entry = { list = {} }
-    entry.trampoline = function(...) return run_chain(path, entry, 1, ...) end
+    entry.base = parent[key]
     advised[path] = entry
   end
   for i = #entry.list, 1, -1 do
@@ -454,6 +468,7 @@ function remuda.advise(path, how, fn, opts)
   local at = #entry.list + 1
   while at > 1 and entry.list[at - 1].depth > advice.depth do at = at - 1 end
   table.insert(entry.list, at, advice)
+  entry.trampoline = nil -- the chain changed: always compose afresh
   reattach(path, entry)
 end
 register("advise", "Wrap the function at a `remuda.*` path. `how`: around|before|after|override|filter_args|filter_return|before_while|before_until. `opts`: `id` (required; same id replaces), `depth` (-100 outermost).", "advise(path, how, fn, opts) -> nil")
@@ -464,10 +479,12 @@ function remuda.unadvise(path, id)
   for i = #entry.list, 1, -1 do
     if entry.list[i].id == id then table.remove(entry.list, i) end
   end
+  local parent, key = advice_slot(path)
   if #entry.list == 0 then
-    local parent, key = advice_slot(path)
-    if parent[key] == entry.trampoline then parent[key] = entry.base end
+    if trampolines[parent[key]] then parent[key] = entry.base end
     advised[path] = nil
+  elseif trampolines[parent[key]] then
+    parent[key] = compose(path, entry)
   end
 end
 register("unadvise", "Remove the advice with this id from a path; the last one removed restores the original.", "unadvise(path, id) -> nil")
@@ -515,7 +532,10 @@ local function restore_advice(saved)
   for path, snap in pairs(saved) do
     snap.entry.base, snap.entry.list = snap.base, snap.list
     advised[path] = snap.entry
-    pcall(reattach, path, snap.entry)
+    -- Install the restored composition outright: the slot may hold the
+    -- failed start's trampoline, which must not become the base.
+    local found, parent, key = pcall(advice_slot, path)
+    if found then parent[key] = compose(path, snap.entry) end
   end
 end
 local function drop_owned_advice(owner)

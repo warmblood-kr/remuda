@@ -148,3 +148,35 @@ fn advice_survives_a_mod_redefining_the_function() {
     assert_eq!(read(&image, "return remuda._adv_host('x')"), "[v2:x]");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// PR #144 review: the monkey-patch idiom `local orig = remuda.x; function
+/// remuda.x(...) return orig(...) end` over an advised function must
+/// terminate. The captured `orig` is the old trampoline and keeps its old
+/// composition (Emacs-like), so the advice runs twice, around each layer.
+#[test]
+fn a_monkey_patch_over_advice_terminates() {
+    let image = image("monkey");
+    read(
+        &image,
+        "remuda._runs = 0 function remuda._adv_x(v) return v end",
+    );
+    read(&image, "remuda.advise('remuda._adv_x', 'around', function(orig, v) remuda._runs = remuda._runs + 1 return 'a(' .. orig(v) .. ')' end, { id = 'a' })");
+    read(&image, "local orig = remuda._adv_x; function remuda._adv_x(v) return 'm(' .. orig(v) .. ')' end; remuda._advice_reattach()");
+    let got = image.eval(
+        "return remuda._adv_x('x') .. ' runs=' .. remuda._runs",
+        None,
+    );
+    assert_eq!(got.as_deref(), Ok("a(m(a(x))) runs=2"), "{got:?}");
+    // Putting one of our own trampolines back is not a redefinition.
+    read(
+        &image,
+        "remuda._runs = 0; local t = remuda._adv_x; remuda._adv_x = t; remuda._advice_reattach()",
+    );
+    assert_eq!(
+        read(
+            &image,
+            "return remuda._adv_x('y') .. ' runs=' .. remuda._runs"
+        ),
+        "a(m(a(y))) runs=2"
+    );
+}
