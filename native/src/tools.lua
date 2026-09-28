@@ -361,6 +361,141 @@ function remuda.hook_list(event)
 end
 register("hook_list", "Copies of the registered hooks, for one event or all, in run order.", "hook_list(event?) -> {{event, group, id, depth, owner, src, errors, last_error}...}")
 
+-- advice: nadvice semantics on a function stored at a named path under
+-- `remuda` (hook-design §2). The first `advise` keeps the slot's function as
+-- the base and installs a trampoline; the chain runs by depth, -100
+-- outermost. Locals have no address, so they are not advisable.
+local advised = {} -- path -> { base, trampoline, list }
+local ADVICE_KINDS = {
+  around = function(fn, next, ...) return fn(next, ...) end,
+  before = function(fn, next, ...) fn(...) return next(...) end,
+  after = function(fn, next, ...)
+    local result = table.pack(next(...))
+    fn(...)
+    return table.unpack(result, 1, result.n)
+  end,
+  override = function(fn, _, ...) return fn(...) end,
+  filter_args = function(fn, next, ...) return next(fn(...)) end,
+  filter_return = function(fn, next, ...) return fn(next(...)) end,
+  before_while = function(fn, next, ...)
+    local ok = fn(...)
+    if not ok then return ok end
+    return next(...)
+  end,
+  before_until = function(fn, next, ...)
+    local early = fn(...)
+    if early then return early end
+    return next(...)
+  end,
+}
+
+local function advice_slot(path)
+  if type(path) ~= "string" or not path:match("^remuda%.[%w_%.]+$") then
+    error("an advice path names a function under `remuda`, e.g. remuda._butler_notify", 3)
+  end
+  local parent, key = remuda, nil
+  local rest = path:sub(#"remuda." + 1)
+  for part in rest:gmatch("[^.]+") do
+    if key ~= nil then
+      parent = parent[key]
+      if type(parent) ~= "table" then error("no table at " .. path, 3) end
+    end
+    key = part
+  end
+  return parent, key
+end
+
+local function run_chain(path, entry, index, ...)
+  local advice = entry.list[index]
+  if not advice then return entry.base(...) end
+  local next = function(...) return run_chain(path, entry, index + 1, ...) end
+  local result = table.pack(pcall(ADVICE_KINDS[advice.how], advice.fn, next, ...))
+  if result[1] then return table.unpack(result, 2, result.n) end
+  local err = result[2]
+  if type(err) == "string" then
+    err = err .. "\n<- advice " .. advice.id .. " (" .. advice.how .. ", depth " .. advice.depth
+      .. ") on " .. path .. (advice.owner and (" [" .. advice.owner .. "]") or "")
+  end
+  error(err, 0)
+end
+
+-- Put the trampoline back in the slot, adopting whatever function replaced
+-- it as the new base: a mod that redefines an advised function keeps its
+-- advice, as `defalias` respects advice.
+local function reattach(path, entry)
+  local parent, key = advice_slot(path)
+  local current = parent[key]
+  if current ~= entry.trampoline and type(current) == "function" then entry.base = current end
+  parent[key] = entry.trampoline
+end
+function remuda._advice_reattach()
+  for path, entry in pairs(advised) do pcall(reattach, path, entry) end
+end
+register("_advice_reattach", "Re-install advice trampolines over redefined functions. Called after each mod load.", "_advice_reattach() -> nil")
+
+function remuda.advise(path, how, fn, opts)
+  opts = opts or {}
+  local parent, key = advice_slot(path)
+  if not ADVICE_KINDS[how] then error("unknown advice kind " .. tostring(how), 2) end
+  if type(fn) ~= "function" then error("advice needs a function", 2) end
+  if type(opts.id) ~= "string" or opts.id == "" then error("advice needs an id", 2) end
+  if opts.depth ~= nil and type(opts.depth) ~= "number" then error("an advice depth must be a number", 2) end
+  local entry = advised[path]
+  if not entry then
+    if type(parent[key]) ~= "function" then error("no function at " .. path .. " to advise", 2) end
+    entry = { list = {} }
+    entry.trampoline = function(...) return run_chain(path, entry, 1, ...) end
+    advised[path] = entry
+  end
+  for i = #entry.list, 1, -1 do
+    if entry.list[i].id == opts.id then table.remove(entry.list, i) end
+  end
+  local advice = { id = opts.id, how = how, fn = fn, depth = opts.depth or 0, owner = current_owner }
+  local at = #entry.list + 1
+  while at > 1 and entry.list[at - 1].depth > advice.depth do at = at - 1 end
+  table.insert(entry.list, at, advice)
+  reattach(path, entry)
+end
+register("advise", "Wrap the function at a `remuda.*` path. `how`: around|before|after|override|filter_args|filter_return|before_while|before_until. `opts`: `id` (required; same id replaces), `depth` (-100 outermost).", "advise(path, how, fn, opts) -> nil")
+
+function remuda.unadvise(path, id)
+  local entry = advised[path]
+  if not entry then return end
+  for i = #entry.list, 1, -1 do
+    if entry.list[i].id == id then table.remove(entry.list, i) end
+  end
+  if #entry.list == 0 then
+    local parent, key = advice_slot(path)
+    if parent[key] == entry.trampoline then parent[key] = entry.base end
+    advised[path] = nil
+  end
+end
+register("unadvise", "Remove the advice with this id from a path; the last one removed restores the original.", "unadvise(path, id) -> nil")
+
+function remuda.advice_member(path, id)
+  for _, advice in ipairs(advised[path] and advised[path].list or {}) do
+    if advice.id == id then return true end
+  end
+  return false
+end
+register("advice_member", "Whether advice with this id is on a path.", "advice_member(path, id) -> boolean")
+
+function remuda.advice_list(path)
+  local paths = {}
+  for name in pairs(advised) do
+    if path == nil or name == path then paths[#paths + 1] = name end
+  end
+  table.sort(paths)
+  local rows = {}
+  for _, name in ipairs(paths) do
+    for _, advice in ipairs(advised[name].list) do
+      rows[#rows + 1] = { path = name, id = advice.id, how = advice.how, depth = advice.depth, owner = advice.owner }
+    end
+  end
+  return rows
+end
+register("advice_list", "Copies of the advice on one path or all, outermost first.", "advice_list(path?) -> {{path, id, how, depth, owner}...}")
+
 -- A shallow copy, the same discipline `emit` itself already keeps for its own
 -- hook snapshot above — a caller mutating what it was handed must never
 -- reach back into this table.
