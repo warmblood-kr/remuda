@@ -2,13 +2,20 @@
 //! navigation and rendering cannot change the existing session workflow.
 
 use crate::client::{self, RawMode};
+use composer::{ComposerAction, LineComposer};
+use queue::{InputQueue, PendingBatch, QueueEvent, QueueState};
 use remuda_core::agent::StyledCell;
 use remuda_core::clock::Clock;
 use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
+use sender::InputSender;
 use std::io::{self, Write};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+pub mod composer;
+pub mod queue;
+pub mod sender;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AttentionSignals {
@@ -52,10 +59,31 @@ pub struct ClusterUi {
     snapshot_at: Option<Duration>,
     query: Option<String>,
     attention_only: bool,
+    composer: LineComposer,
+    composer_focused: bool,
+    composer_target: Option<(String, String)>,
+    input_sender: InputSender,
+    input_queue: InputQueue,
+    notice: Option<(String, Duration)>,
+    input_hint: Option<(String, Duration)>,
 }
 
 impl ClusterUi {
     pub fn new(node: &str, sessions: Vec<SessionSummary>, synced_at: Duration) -> Self {
+        Self::with_sender(
+            node,
+            sessions,
+            synced_at,
+            InputSender::with_client_id([0; 16]),
+        )
+    }
+
+    fn with_sender(
+        node: &str,
+        sessions: Vec<SessionSummary>,
+        synced_at: Duration,
+        input_sender: InputSender,
+    ) -> Self {
         Self {
             node: node.into(),
             sessions,
@@ -66,6 +94,13 @@ impl ClusterUi {
             snapshot_at: None,
             query: None,
             attention_only: false,
+            composer: LineComposer::default(),
+            composer_focused: false,
+            composer_target: None,
+            input_sender,
+            input_queue: InputQueue::default(),
+            notice: None,
+            input_hint: None,
         }
     }
 
@@ -100,11 +135,14 @@ impl ClusterUi {
                     if index == self.selected { ">" } else { " " },
                     "   ",
                     session.name,
-                    render_badge(if session.alive {
-                        Badge::Live
-                    } else {
-                        Badge::Ended
-                    })
+                    session_status(
+                        render_badge(if session.alive {
+                            Badge::Live
+                        } else {
+                            Badge::Ended
+                        }),
+                        self.pending_count(session),
+                    )
                 ));
             }
             if visible.is_empty() {
@@ -130,9 +168,36 @@ impl ClusterUi {
         let divider = "─".repeat(width);
         frame.push(divider);
         frame.push(pane_header);
-        let screen_rows = height.saturating_sub(frame.len() + 1);
+        let queue_rows: Vec<&PendingBatch> = self.input_queue.items().rev().take(3).collect();
+        let hint = self
+            .input_hint
+            .as_ref()
+            .filter(|(_, at)| now.saturating_sub(*at) < Duration::from_secs(3));
+        let notice = self
+            .notice
+            .as_ref()
+            .filter(|(_, at)| now.saturating_sub(*at) < Duration::from_secs(5));
+        let footer_rows = if self.composer_focused { 2 } else { 1 };
+        let reserved = frame.len()
+            + queue_rows.len()
+            + usize::from(hint.is_some())
+            + usize::from(notice.is_some())
+            + footer_rows;
+        let screen_rows = height.saturating_sub(reserved);
         frame.extend(screen.lines().take(screen_rows).map(str::to_string));
-        frame.push(self.footer());
+        if let Some((hint, _)) = hint {
+            frame.push(hint.clone());
+        }
+        if let Some((notice, _)) = notice {
+            frame.push(notice.clone());
+        }
+        frame.extend(queue_rows.into_iter().rev().map(queue_line));
+        if self.composer_focused {
+            frame.push(self.composer_line());
+            frame.push("Enter send · Ctrl-C clear · Ctrl-\\ list".into());
+        } else {
+            frame.push(self.footer());
+        }
         frame
             .into_iter()
             .map(|line| truncate(&line, width))
@@ -142,13 +207,17 @@ impl ClusterUi {
 
     #[cfg(test)]
     fn key(&mut self, code: crossterm::event::KeyCode) -> bool {
-        self.key_event(crossterm::event::KeyEvent::new(
-            code,
-            crossterm::event::KeyModifiers::NONE,
-        ))
+        self.key_event(
+            crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            Duration::ZERO,
+        )
     }
 
-    fn key_event(&mut self, event: crossterm::event::KeyEvent) -> bool {
+    fn key_event(&mut self, event: crossterm::event::KeyEvent, now: Duration) -> bool {
+        if self.composer_focused {
+            self.handle_composer_event(event, now);
+            return false;
+        }
         use crossterm::event::KeyModifiers;
         if self.query.is_some() && event.modifiers.contains(KeyModifiers::CONTROL) {
             return false;
@@ -189,10 +258,110 @@ impl ClusterUi {
                 self.query = None;
                 self.expanded = true;
                 self.active = self.selected;
+                self.composer_focused = true;
+                self.bind_composer_target();
             }
             _ => {}
         }
         false
+    }
+
+    fn handle_composer_event(&mut self, event: crossterm::event::KeyEvent, now: Duration) {
+        if self.composer_target.is_none() {
+            self.bind_composer_target();
+        }
+        match self.composer.handle_key(event) {
+            ComposerAction::None => {}
+            ComposerAction::Cleared => {
+                self.composer_target = None;
+                self.notice = Some(("draft cleared".into(), now));
+            }
+            ComposerAction::Detach => self.composer_focused = false,
+            ComposerAction::Submit(bytes) => self.enqueue_draft(bytes, now),
+        }
+    }
+
+    fn bind_composer_target(&mut self) {
+        if self.composer.text().is_empty() {
+            self.composer_target = self.sessions.get(self.active).and_then(|session| {
+                session
+                    .instance_id
+                    .as_ref()
+                    .map(|instance_id| (session.name.clone(), instance_id.clone()))
+            });
+        }
+    }
+
+    fn enqueue_draft(&mut self, bytes: Vec<u8>, now: Duration) {
+        let target = self.composer_target.clone();
+        let Some((name, instance_id)) = target else {
+            self.restore_draft(&bytes);
+            self.notice = Some(("input unavailable: session identity is missing".into(), now));
+            return;
+        };
+        let Some(session) = self.sessions.iter().find(|session| session.name == name) else {
+            self.restore_draft(&bytes);
+            self.notice = Some(("input unavailable: session is no longer listed".into(), now));
+            return;
+        };
+        if !session.alive {
+            self.restore_draft(&bytes);
+            self.notice = Some(("input disabled: session ended".into(), now));
+            return;
+        }
+        match self.input_sender.enqueue(
+            &mut self.input_queue,
+            &name,
+            &instance_id,
+            bytes.clone(),
+            Instant::now(),
+        ) {
+            Ok(_) => {
+                self.notice = None;
+                self.composer_target = None;
+            }
+            Err(error) => {
+                self.restore_draft(&bytes);
+                self.notice = Some((format!("input not queued: {error}"), now));
+            }
+        }
+    }
+
+    fn restore_draft(&mut self, bytes: &[u8]) {
+        let draft = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+        if let Ok(text) = std::str::from_utf8(draft) {
+            self.composer.restore_draft(text);
+        }
+    }
+
+    fn start_pending(&mut self, now: Duration) {
+        self.input_sender
+            .begin_due(&mut self.input_queue, Instant::now());
+        if let Some(batch) = self.input_queue.sending_batch() {
+            self.notice = Some((format!("sending input to {}", batch.name), now));
+        }
+    }
+
+    fn send_pending(&mut self, path: &Path, now: Duration) {
+        let event =
+            self.input_sender
+                .send_started(&mut self.input_queue, Instant::now(), |request| {
+                    crate::client::request(path, request)
+                });
+        match event {
+            Some(QueueEvent::Sent { .. }) => {
+                self.input_hint = Some((format!("input from {}", self.node), now));
+            }
+            Some(QueueEvent::Uncertain { reason, .. })
+            | Some(QueueEvent::Dropped { reason, .. })
+            | Some(QueueEvent::Failed { reason, .. }) => {
+                if reason.contains("session restarted") {
+                    self.composer_target = None;
+                }
+                self.notice = Some((reason, now));
+            }
+            Some(QueueEvent::RetryScheduled { .. }) | None => {}
+        }
     }
 
     fn visible_sessions(&self) -> Vec<usize> {
@@ -204,6 +373,7 @@ impl ClusterUi {
             .filter(|(_, session)| {
                 let attention = is_attention(AttentionSignals {
                     ended: !session.alive,
+                    pending_input: self.pending_count(session) > 0,
                     ..AttentionSignals::default()
                 });
                 let name_matches = node_matches || matches_query(query, &session.name);
@@ -236,12 +406,36 @@ impl ClusterUi {
         self.selected = visible[next];
     }
 
+    fn pending_count(&self, session: &SessionSummary) -> usize {
+        self.input_queue
+            .items()
+            .filter(|batch| {
+                batch.name == session.name
+                    && matches!(
+                        batch.state,
+                        QueueState::Waiting | QueueState::Sending | QueueState::Uncertain
+                    )
+            })
+            .count()
+    }
+
     fn footer(&self) -> String {
         let attention = if self.attention_only { "on" } else { "off" };
         match &self.query {
             Some(query) => format!("search: {query} · Esc clear · Enter select"),
             None => format!("↑/↓ move · ←/→ collapse/expand · Enter select · / search · ! attention: {attention} · q detach"),
         }
+    }
+
+    fn composer_line(&self) -> String {
+        let cursor = self.composer.cursor();
+        let before: String = self.composer.text().chars().take(cursor).collect();
+        let after: String = self.composer.text().chars().skip(cursor).collect();
+        let target = self
+            .composer_target
+            .as_ref()
+            .map_or_else(String::new, |(name, _)| format!("{name}> "));
+        format!("$ {target}{before}▏{after}")
     }
 
     fn select_target(&mut self, target: Option<&str>) -> io::Result<()> {
@@ -272,6 +466,20 @@ fn age_seconds(now: Duration, since: Duration) -> u64 {
 
 fn truncate(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
+}
+
+fn queue_line(batch: &PendingBatch) -> String {
+    let bytes = batch.bytes.strip_suffix(b"\r").unwrap_or(&batch.bytes);
+    let text = String::from_utf8_lossy(bytes);
+    format!("Input {} · {text}", batch.status)
+}
+
+fn session_status(status: &str, pending_count: usize) -> String {
+    if pending_count == 0 {
+        status.into()
+    } else {
+        format!("{status} · pending input {pending_count}")
+    }
 }
 
 fn list(path: &Path) -> io::Result<Vec<SessionSummary>> {
@@ -346,7 +554,7 @@ pub fn read_frame(
 }
 
 fn run_loop(path: &Path, node: &str, target: Option<&str>, clock: &dyn Clock) -> io::Result<()> {
-    let mut ui = ClusterUi::new(node, list(path)?, clock.now());
+    let mut ui = ClusterUi::with_sender(node, list(path)?, clock.now(), InputSender::random()?);
     ui.select_target(target)?;
     loop {
         if let Ok(current) = list(path) {
@@ -374,12 +582,14 @@ fn run_loop(path: &Path, node: &str, target: Option<&str>, clock: &dyn Clock) ->
         )?;
         write!(io::stdout(), "{frame}")?;
         io::stdout().flush()?;
+        ui.send_pending(path, clock.now());
+        ui.start_pending(clock.now());
         if crossterm::event::poll(Duration::from_millis(250))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 if key.kind != crossterm::event::KeyEventKind::Press {
                     continue;
                 }
-                if ui.key_event(key) {
+                if ui.key_event(key, clock.now()) {
                     return Ok(());
                 }
             }
@@ -389,6 +599,7 @@ fn run_loop(path: &Path, node: &str, target: Option<&str>, clock: &dyn Clock) ->
 
 #[cfg(test)]
 mod tests {
+    use super::queue::QueueState;
     use super::{is_attention, render_badge, AttentionSignals, Badge, ClusterUi};
     use remuda_core::clock::{Clock, ManualClock};
     use remuda_core::{SessionSummary, Size};
@@ -421,7 +632,7 @@ mod tests {
             attached: false,
             human_idle: None,
             mouse_tracking: false,
-            instance_id: None,
+            instance_id: Some(format!("instance-{name}")),
             output_version: None,
         }
     }
@@ -520,6 +731,13 @@ mod tests {
         assert!(ui
             .render(80, 24, "", &clock)
             .contains("studio / shell · live"));
+        ui.key_event(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('\\'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+            clock.now(),
+        );
         ui.key(crossterm::event::KeyCode::Char('/'));
         ui.key(crossterm::event::KeyCode::Char('d'));
         ui.key(crossterm::event::KeyCode::Backspace);
@@ -600,10 +818,13 @@ mod tests {
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
         assert!(!ui.key(crossterm::event::KeyCode::Char('/')));
         assert!(!ui.key(crossterm::event::KeyCode::Char('q')));
-        ui.key_event(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Char('c'),
-            crossterm::event::KeyModifiers::CONTROL,
-        ));
+        ui.key_event(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+            Duration::ZERO,
+        );
         assert_eq!(ui.query.as_deref(), Some("q"));
         let frame = ui.render(80, 24, "", &clock);
         assert!(frame.contains("search: q"));
@@ -665,5 +886,43 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('!'));
         assert_eq!(ui.selected, 1);
         assert!(ui.render(80, 24, "", &clock).contains(">    shell"));
+    }
+
+    #[test]
+    fn enter_focuses_the_composer_and_submits_to_its_bound_instance() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], clock.now());
+        ui.key(crossterm::event::KeyCode::Enter);
+        assert!(ui.composer_focused);
+        ui.key(crossterm::event::KeyCode::Char('q'));
+        assert_eq!(ui.composer.text(), "q");
+        ui.key_event(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('c'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+            clock.now(),
+        );
+        assert_eq!(ui.composer.text(), "");
+        for character in ['h', 'i'] {
+            ui.key(crossterm::event::KeyCode::Char(character));
+        }
+        ui.key(crossterm::event::KeyCode::Enter);
+        let batch = ui.input_queue.items().next().unwrap();
+        assert_eq!(batch.name, "dev");
+        assert_eq!(batch.instance_id, "instance-dev");
+        assert_eq!(batch.seq, 1);
+        assert_eq!(batch.bytes, b"hi\r");
+        assert_eq!(batch.state, QueueState::Waiting);
+        ui.key_event(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('\\'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+            clock.now(),
+        );
+        ui.key(crossterm::event::KeyCode::Char('!'));
+        let frame = ui.render(80, 24, "", &clock);
+        assert!(frame.contains("dev          live · pending input 1"));
     }
 }
