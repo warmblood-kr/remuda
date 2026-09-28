@@ -642,6 +642,14 @@ fn handle(
         Request::Eval { code, name } => match image.eval_request(&code, name.as_deref()) {
             Ok(value) => match image.pending_replies().pending_id(&value) {
                 Some(id) => deferred_reply(stream, reader, image, id),
+                None if value.len() > crate::reply_limit::MAX_REPLY_BYTES => reply(
+                    &stream,
+                    &Response::error(format!(
+                        "synchronous reply exceeds the {} MiB output limit ({} bytes)",
+                        crate::reply_limit::MAX_REPLY_BYTES / (1024 * 1024),
+                        value.len()
+                    )),
+                ),
                 None => reply(&stream, &Response::Value(value)),
             },
             // Lua's own message, which already carries the line and a
@@ -1081,10 +1089,50 @@ fn attach(
     Ok(())
 }
 
+struct LimitedReplyWriter<'a> {
+    bytes: &'a mut Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for LimitedReplyWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized daemon reply exceeds the wire limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
-    let mut line = serde_json::to_string(response)?;
-    line.push('\n');
-    stream.write_all(line.as_bytes())?;
+    let wire_limit = crate::reply_limit::max_reply_wire_bytes();
+    let mut line = Vec::with_capacity(1024);
+    let serialized = serde_json::to_writer(
+        LimitedReplyWriter {
+            bytes: &mut line,
+            limit: wire_limit - 1,
+        },
+        response,
+    );
+    if serialized.is_err() {
+        line.clear();
+        serde_json::to_writer(
+            LimitedReplyWriter {
+                bytes: &mut line,
+                limit: wire_limit - 1,
+            },
+            &Response::error("daemon reply exceeds the maximum serialized size"),
+        )?;
+    }
+    line.push(b'\n');
+    stream.write_all(&line)?;
     stream.flush()
 }
 
