@@ -287,7 +287,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                                 if trace_attach_exit {
                                     eprintln!("attach input trace: post-exit read error: {error}");
                                 }
-                                continue;
+                                break;
                             }
                         }
                     }

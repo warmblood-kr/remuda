@@ -919,10 +919,33 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Unix captures can assert the text and reset bytes directly. ConPTY can
-    // discard both, so Windows checks the process and its recorded exit code.
+    // Wait until the attach client has painted its post-exit prompt before
+    // sending the release key. The daemon can reap the target before the
+    // client's terminal output reaches this outer ConPTY.
     #[cfg(unix)]
     wait_for_session_screen(&viewer, "[remuda] target");
+    #[cfg(windows)]
+    {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            answer_pending_conpty_queries(
+                &viewer_output,
+                &mut terminal_writer,
+                &mut conpty_pending,
+                &mut terminal_output,
+            );
+            let screen = viewer.screen_text().expect("viewer screen");
+            if screen.contains("press any key") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "attach client never painted its post-exit prompt; terminal bytes:\n{}\nviewer screen:\n{screen}",
+                escaped_tail(&terminal_output),
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     held.write_raw(b"k").expect("release attach with any key");
     let deadline = Instant::now() + PATIENCE;
