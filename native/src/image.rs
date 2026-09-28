@@ -575,6 +575,29 @@ mod tests {
     }
 
     #[test]
+    fn a_returned_entry_is_a_copy_that_cannot_reach_the_registry() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            assert(remuda._activate_module("alpha", { api = "remuda-module-v1", state_version = 1,
+              initialize = function() return {} end,
+              contributes = { p = {{ id = "owned", order = 5, label = "alpha" }} } }))
+            remuda.contribute("p", "free", { order = 10, label = "free" })
+            for _, row in ipairs(remuda.contributions("p")) do
+              row.entry.order, row.entry.label = -999, "hacked"
+            end
+            local list = remuda.contributions("p")
+            assert(list[1].id == "owned" and list[1].entry.order == 5 and list[1].entry.label == "alpha",
+              "an owned entry changed through a returned row")
+            assert(list[2].id == "free" and list[2].entry.order == 10 and list[2].entry.label == "free",
+              "an imperative entry changed through a returned row")
+            "#,
+        )
+        .exec()
+        .expect("returned entries are copies");
+    }
+
+    #[test]
     fn a_cycle_terminates() {
         assert_eq!(
             shown("(function() local t = {} t.self = t return t end)()"),
