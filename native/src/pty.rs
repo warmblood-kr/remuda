@@ -464,10 +464,7 @@ impl AgentProcess for PtyAgent {
 
 impl PtyAgent {
     fn record_exit_status(&mut self, status: portable_pty::ExitStatus) {
-        let signal = status
-            .signal()
-            .and_then(|description| description.rsplit_once(':'))
-            .and_then(|(_, number)| number.trim().parse::<i32>().ok());
+        let signal = status.signal().and_then(signal_number);
         self.exit_info = Some(ExitInfo {
             exit_code: if signal.is_none() {
                 Some(status.exit_code())
@@ -480,24 +477,73 @@ impl PtyAgent {
     }
 }
 
-fn signal_name(signal: i32) -> Option<String> {
+fn signal_number(description: &str) -> Option<i32> {
+    if let Some(number) = description
+        .rsplit_once(':')
+        .and_then(|(_, number)| number.trim().parse().ok())
+    {
+        return Some(number);
+    }
+
     #[cfg(unix)]
+    {
+        let description = description
+            .split_once(':')
+            .map_or(description, |(name, _)| name)
+            .trim()
+            .to_ascii_lowercase();
+        match description.as_str() {
+            "hangup" | "hangup (terminal line hangup)" => Some(libc::SIGHUP),
+            "interrupt" | "interrupt (user)" => Some(libc::SIGINT),
+            "quit" | "quit (core dumped)" => Some(libc::SIGQUIT),
+            "illegal instruction" | "illegal instruction (core dumped)" => Some(libc::SIGILL),
+            "trace/bpt trap" | "trace/breakpoint trap" => Some(libc::SIGTRAP),
+            "abort trap" | "aborted" | "abort trap (core dumped)" => Some(libc::SIGABRT),
+            "bus error" | "bus error (core dumped)" => Some(libc::SIGBUS),
+            "floating point exception" | "arithmetic exception" => Some(libc::SIGFPE),
+            "killed" | "killed (no core)" => Some(libc::SIGKILL),
+            "user defined signal 1" => Some(libc::SIGUSR1),
+            "user defined signal 2" => Some(libc::SIGUSR2),
+            "segmentation fault" | "segmentation fault (core dumped)" => Some(libc::SIGSEGV),
+            "broken pipe" => Some(libc::SIGPIPE),
+            "alarm clock" => Some(libc::SIGALRM),
+            "terminated" | "termination" => Some(libc::SIGTERM),
+            _ => None,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = description;
+        None
+    }
+}
+
+#[cfg(unix)]
+fn signal_name(signal: i32) -> Option<String> {
     let name = match signal {
         libc::SIGHUP => "SIGHUP",
         libc::SIGINT => "SIGINT",
         libc::SIGQUIT => "SIGQUIT",
-        libc::SIGKILL => "SIGKILL",
-        libc::SIGTERM => "SIGTERM",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
         libc::SIGABRT => "SIGABRT",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGUSR2 => "SIGUSR2",
+        libc::SIGTERM => "SIGTERM",
         libc::SIGSEGV => "SIGSEGV",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
         _ => return None,
     };
-    #[cfg(not(unix))]
-    let name = {
-        let _ = signal;
-        return None;
-    };
     Some(name.to_string())
+}
+
+#[cfg(not(unix))]
+fn signal_name(_: i32) -> Option<String> {
+    None
 }
 
 fn capture_snapshot(
@@ -554,6 +600,16 @@ fn capture_snapshot(
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[cfg(unix)]
+    #[test]
+    fn portable_pty_signal_descriptions_map_without_numeric_suffixes() {
+        assert_eq!(signal_number("Terminated"), Some(libc::SIGTERM));
+        assert_eq!(signal_number("Killed"), Some(libc::SIGKILL));
+        assert_eq!(signal_number("Hangup"), Some(libc::SIGHUP));
+        assert_eq!(signal_number("Interrupt"), Some(libc::SIGINT));
+        assert_eq!(signal_number("Terminated: 15"), Some(libc::SIGTERM));
+    }
 
     #[test]
     fn temporary_scrollback_view_restores_after_panic() {
