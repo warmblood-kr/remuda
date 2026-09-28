@@ -8,6 +8,7 @@
 pub mod child_guard;
 pub mod client;
 pub mod cluster;
+pub mod cluster_tui;
 pub mod daemon;
 pub mod dist;
 pub mod image;
@@ -46,12 +47,18 @@ pub fn terminal_size() -> Size {
 /// host facility and the policy layer receives a clock rather than reading one.
 pub struct SystemClock {
     origin: Instant,
+    instance_id_seed: u128,
 }
 
 impl SystemClock {
     pub fn new() -> Self {
         Self {
             origin: Instant::now(),
+            instance_id_seed: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                ^ ((std::process::id() as u128) << 64),
         }
     }
 }
@@ -69,6 +76,10 @@ impl Clock for SystemClock {
 
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
+    }
+
+    fn instance_id_seed(&self) -> u128 {
+        self.instance_id_seed
     }
 }
 

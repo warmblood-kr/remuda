@@ -112,6 +112,8 @@ fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
     SessionSummary {
         id: String::new(),
         name: name.into(),
+        instance_id: Some("test-session".into()),
+        output_version: Some(0),
         alive,
         idle: Duration::from_secs(4),
         output_idle: Some(Duration::from_secs(4)),

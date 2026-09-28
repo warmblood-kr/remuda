@@ -466,14 +466,15 @@ fn capture_styled(
     name: &str,
     scrollback: usize,
 ) -> std::io::Result<()> {
-    match registry.screen_snapshot_at(name, scrollback) {
+    match registry.screen_snapshot_version_at(name, scrollback) {
         None => reply(stream, &Response::error(format!("no such session: {name}"))),
         Some(Err(e)) => reply(stream, &Response::error(e)),
-        Some(Ok(snapshot)) => {
+        Some(Ok(versioned)) => {
             // Runs on the wire, not cells — see steps/022 for the 44x+
             // measured on a real screen. Cells, counters and cursor all come
             // from one parser snapshot, so new output cannot skew the anchor.
-            let rows = snapshot
+            let rows = versioned
+                .snapshot
                 .cells
                 .iter()
                 .map(|row| collapse_runs(row))
@@ -482,10 +483,12 @@ fn capture_styled(
                 stream,
                 &Response::StyledScreen {
                     rows,
-                    wrapped: snapshot.wrapped,
-                    scrollback_len: snapshot.scrollback_len,
-                    scrollback_total: snapshot.scrollback_total,
-                    cursor: snapshot.cursor,
+                    instance_id: versioned.instance_id,
+                    output_version: versioned.output_version,
+                    wrapped: versioned.snapshot.wrapped,
+                    scrollback_len: versioned.snapshot.scrollback_len,
+                    scrollback_total: versioned.snapshot.scrollback_total,
+                    cursor: versioned.snapshot.cursor,
                 },
             )
         }
