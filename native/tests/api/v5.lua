@@ -1,5 +1,11 @@
--- v5 introduces nested session words while retaining the callable constructor.
--- v1-v4 remain frozen; this fixture is the first version for the new vocabulary.
+-- v5 adds the session namespace and deferred replies for extension commands.
+-- v1-v4 remain frozen; v5 remains open until the next tagged release.
+assert(type(remuda.pending) == "function", "remuda.pending is missing")
+assert(remuda._registry.pending ~= nil, "remuda.pending needs a registry entry")
+assert(remuda._pending_replies == nil, "pending manager internals must remain private")
+
+local bad_timeout = pcall(remuda.pending, { timeout = 301 })
+assert(not bad_timeout, "pending timeout must not exceed 300 seconds")
 
 local session = remuda.session
 assert(type(session) == "table", "remuda.session must be a namespace table")

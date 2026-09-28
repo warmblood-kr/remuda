@@ -1205,6 +1205,25 @@ fn eval_once(path: &Path, code: &str) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Ok(Response::CommandResult {
+            exit_code,
+            stdout_base64,
+            stderr_base64,
+        }) => {
+            use std::io::Write;
+            let (Ok(stdout), Ok(stderr)) = (
+                remuda_native::cluster::encoding::decode_base64(&stdout_base64),
+                remuda_native::cluster::encoding::decode_base64(&stderr_base64),
+            ) else {
+                return fail("invalid deferred command output encoding");
+            };
+            let mut out = std::io::stdout().lock();
+            let mut err = std::io::stderr().lock();
+            if out.write_all(&stdout).is_err() || err.write_all(&stderr).is_err() {
+                return fail("could not write deferred command output");
+            }
+            ExitCode::from(exit_code)
+        }
         other => fail(describe(other)),
     }
 }
