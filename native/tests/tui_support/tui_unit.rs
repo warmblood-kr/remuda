@@ -249,7 +249,7 @@ fn dragging_the_divider_sets_a_clamped_list_width() {
     let mut ui = make_ui(vec![row("a", true, false)]);
     let down = MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
-        column: 39,
+        column: 16,
         row: 4,
         modifiers: KeyModifiers::NONE,
     };
@@ -496,6 +496,112 @@ fn the_preview_claims_what_the_widest_session_needs() {
 }
 
 #[test]
+fn a_shown_list_fits_its_content_without_overriding_a_manual_width() {
+    let mut ui = make_ui(vec![row("short", true, false)]);
+    ui.sessions_text = vec![
+        "\x1b[1mshort\x1b[0m".into(),
+        "a rendered detail row that is longer".into(),
+        String::new(),
+    ];
+
+    ui.on_key(press(KeyCode::Char('l')));
+    assert_eq!(
+        ui_layout(&ui, 120),
+        (0, 120),
+        "hidden list uses full preview"
+    );
+    ui.on_key(press(KeyCode::Char('l')));
+    assert_eq!(ui_layout(&ui, 120), (38, 81));
+
+    ui.set_list_width(31, 120);
+    assert_eq!(
+        ui_layout(&ui, 120),
+        (31, 88),
+        "dragged width remains preferred"
+    );
+}
+
+#[test]
+fn narrow_terminals_clamp_content_fit_and_manual_widths_without_panicking() {
+    let mut ui = make_ui(vec![row("long-enough-to-fit", true, false)]);
+    for cols in [30u16, 20u16] {
+        let usable = cols.saturating_sub(1);
+        let (list, preview) = ui_layout(&ui, cols);
+        assert!(list + preview <= usable, "content fit at {cols} cols");
+
+        ui.set_list_width(24, 120);
+        let (list, preview) = ui_layout(&ui, cols);
+        assert!(list + preview <= usable, "manual width at {cols} cols");
+
+        ui.list_width = None;
+        ui.set_list_width(24, cols);
+        let (list, preview) = ui_layout(&ui, cols);
+        assert!(list + preview <= usable, "drag at {cols} cols");
+    }
+}
+
+#[test]
+fn a_seventeen_column_frame_never_paints_past_the_terminal_edge() {
+    let ui = make_ui(vec![row("alpha", true, false)]);
+    let cols = 17;
+    let frames = [
+        render(&ui, &"preview".repeat(20), "default", cols, 5),
+        render_styled(
+            &ui,
+            &vec![text_row(80); 4],
+            hidden_cursor(),
+            "default",
+            cols,
+            5,
+        ),
+    ];
+
+    fn painted_lines(frame: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        let mut chars = frame.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\x1b' || chars.next() != Some('[') {
+                if ch != '\x1b' {
+                    line.push(ch);
+                }
+                continue;
+            }
+            let mut end = None;
+            for control in chars.by_ref() {
+                if control.is_ascii_alphabetic() {
+                    end = Some(control);
+                    break;
+                }
+            }
+            if end == Some('H') && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
+            }
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+        lines
+    }
+
+    for (renderer, frame) in ["plain", "styled"].into_iter().zip(frames.iter()) {
+        let lines = painted_lines(frame);
+        assert_eq!(
+            lines.len(),
+            5,
+            "{renderer}: one painted line per terminal row"
+        );
+        for (index, line) in lines.iter().enumerate() {
+            assert!(
+                visible_width(line) <= cols as usize,
+                "{renderer} row {} exceeds {cols} columns: {line:?}",
+                index + 1
+            );
+        }
+    }
+}
+
+#[test]
 fn a_terminal_too_small_to_split_still_produces_a_frame() {
     let (list, preview) = layout(10, 80);
     assert_eq!(list + preview, 9, "the divider, and no underflow");
@@ -519,8 +625,10 @@ fn crop_reference(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>,
                 .collect();
             if chars.len() > (pan as usize) + (cols as usize) {
                 cut = true;
-                visible.pop();
-                visible.push('→');
+                if cols > 0 {
+                    visible.pop();
+                    visible.push('→');
+                }
             }
             visible
         })
@@ -940,29 +1048,29 @@ fn render_styled_of_the_empty_session_list_is_byte_identical_before_and_after_th
     assert_eq!(
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
-             \x1b[1;1H\x1b[Kremuda · default                        │                                       \
-             \x1b[2;1H\x1b[K                                        │                                       \
-             \x1b[3;1H\x1b[K  the herd is empty.                    │                                       \
-             \x1b[4;1H\x1b[K                                        │                                       \
-             \x1b[5;1H\x1b[K  press n to start a session.           │                                       \
-             \x1b[6;1H\x1b[K                                        │                                       \
-             \x1b[7;1H\x1b[K                                        │                                       \
-             \x1b[8;1H\x1b[K                                        │                                       \
-             \x1b[9;1H\x1b[K                                        │                                       \
-             \x1b[10;1H\x1b[K                                        │                                       \
-             \x1b[11;1H\x1b[K                                        │                                       \
-             \x1b[12;1H\x1b[K                                        │                                       \
-             \x1b[13;1H\x1b[K                                        │                                       \
-             \x1b[14;1H\x1b[K                                        │                                       \
-             \x1b[15;1H\x1b[K                                        │                                       \
-             \x1b[16;1H\x1b[K                                        │                                       \
-             \x1b[17;1H\x1b[K                                        │                                       \
-             \x1b[18;1H\x1b[K                                        │                                       \
-             \x1b[19;1H\x1b[K                                        │                                       \
-             \x1b[20;1H\x1b[K                                        │                                       \
-             \x1b[21;1H\x1b[K                                        │                                       \
-             \x1b[22;1H\x1b[K                                        │                                       \
-             \x1b[23;1H\x1b[K                                        │                                       \
+             \x1b[1;1H\x1b[Kremuda · default             │                                                  \
+             \x1b[2;1H\x1b[K                             │                                                  \
+             \x1b[3;1H\x1b[K  the herd is empty.         │                                                  \
+             \x1b[4;1H\x1b[K                             │                                                  \
+             \x1b[5;1H\x1b[K  press n to start a session.│                                                  \
+             \x1b[6;1H\x1b[K                             │                                                  \
+             \x1b[7;1H\x1b[K                             │                                                  \
+             \x1b[8;1H\x1b[K                             │                                                  \
+             \x1b[9;1H\x1b[K                             │                                                  \
+             \x1b[10;1H\x1b[K                             │                                                  \
+             \x1b[11;1H\x1b[K                             │                                                  \
+             \x1b[12;1H\x1b[K                             │                                                  \
+             \x1b[13;1H\x1b[K                             │                                                  \
+             \x1b[14;1H\x1b[K                             │                                                  \
+             \x1b[15;1H\x1b[K                             │                                                  \
+             \x1b[16;1H\x1b[K                             │                                                  \
+             \x1b[17;1H\x1b[K                             │                                                  \
+             \x1b[18;1H\x1b[K                             │                                                  \
+             \x1b[19;1H\x1b[K                             │                                                  \
+             \x1b[20;1H\x1b[K                             │                                                  \
+             \x1b[21;1H\x1b[K                             │                                                  \
+             \x1b[22;1H\x1b[K                             │                                                  \
+             \x1b[23;1H\x1b[K                             │                                                  \
              \x1b[24;1H\x1b[Kn new   q quit                                                                  \
              \x1b[J\x1b[?25l\x1b[?2026l",
             "byte-identical oracle for the empty session list, captured \
@@ -1373,29 +1481,29 @@ fn render_styled_of_the_empty_session_list_is_byte_identical_when_fed_by_a_real_
     assert_eq!(
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
-             \x1b[1;1H\x1b[Kremuda · default                        │                                       \
-             \x1b[2;1H\x1b[K                                        │                                       \
-             \x1b[3;1H\x1b[K  the herd is empty.                    │                                       \
-             \x1b[4;1H\x1b[K                                        │                                       \
-             \x1b[5;1H\x1b[K  press n to start a session.           │                                       \
-             \x1b[6;1H\x1b[K                                        │                                       \
-             \x1b[7;1H\x1b[K                                        │                                       \
-             \x1b[8;1H\x1b[K                                        │                                       \
-             \x1b[9;1H\x1b[K                                        │                                       \
-             \x1b[10;1H\x1b[K                                        │                                       \
-             \x1b[11;1H\x1b[K                                        │                                       \
-             \x1b[12;1H\x1b[K                                        │                                       \
-             \x1b[13;1H\x1b[K                                        │                                       \
-             \x1b[14;1H\x1b[K                                        │                                       \
-             \x1b[15;1H\x1b[K                                        │                                       \
-             \x1b[16;1H\x1b[K                                        │                                       \
-             \x1b[17;1H\x1b[K                                        │                                       \
-             \x1b[18;1H\x1b[K                                        │                                       \
-             \x1b[19;1H\x1b[K                                        │                                       \
-             \x1b[20;1H\x1b[K                                        │                                       \
-             \x1b[21;1H\x1b[K                                        │                                       \
-             \x1b[22;1H\x1b[K                                        │                                       \
-             \x1b[23;1H\x1b[K                                        │                                       \
+             \x1b[1;1H\x1b[Kremuda · default             │                                                  \
+             \x1b[2;1H\x1b[K                             │                                                  \
+             \x1b[3;1H\x1b[K  the herd is empty.         │                                                  \
+             \x1b[4;1H\x1b[K                             │                                                  \
+             \x1b[5;1H\x1b[K  press n to start a session.│                                                  \
+             \x1b[6;1H\x1b[K                             │                                                  \
+             \x1b[7;1H\x1b[K                             │                                                  \
+             \x1b[8;1H\x1b[K                             │                                                  \
+             \x1b[9;1H\x1b[K                             │                                                  \
+             \x1b[10;1H\x1b[K                             │                                                  \
+             \x1b[11;1H\x1b[K                             │                                                  \
+             \x1b[12;1H\x1b[K                             │                                                  \
+             \x1b[13;1H\x1b[K                             │                                                  \
+             \x1b[14;1H\x1b[K                             │                                                  \
+             \x1b[15;1H\x1b[K                             │                                                  \
+             \x1b[16;1H\x1b[K                             │                                                  \
+             \x1b[17;1H\x1b[K                             │                                                  \
+             \x1b[18;1H\x1b[K                             │                                                  \
+             \x1b[19;1H\x1b[K                             │                                                  \
+             \x1b[20;1H\x1b[K                             │                                                  \
+             \x1b[21;1H\x1b[K                             │                                                  \
+             \x1b[22;1H\x1b[K                             │                                                  \
+             \x1b[23;1H\x1b[K                             │                                                  \
              \x1b[24;1H\x1b[Kn new   q quit                                                                  \
              \x1b[J\x1b[?25l\x1b[?2026l",
             "byte-identical oracle for the empty session list, fed for real"
@@ -1636,13 +1744,17 @@ fn the_preview_starts_at_the_sessions_own_first_row() {
 fn a_session_started_here_is_sized_to_the_pane_not_the_terminal() {
     let empty = make_ui(vec![]);
     let first = pane_size(&empty, 160, 40);
-    assert_eq!((first.cols(), first.rows()), (119, 39));
+    assert_eq!((first.cols(), first.rows()), (143, 39));
 
-    // And once it exists, the layout it caused fits it exactly.
+    // And once it exists, the content-fit layout preserves that width.
     let mut herd = make_ui(vec![row("sh", true, false)]);
     herd.sessions[0].size = first;
-    let (_, preview_w) = layout(160, widest(&herd));
-    assert_eq!(preview_w, first.cols(), "the second frame must not crop it");
+    let next = pane_size(&herd, 160, 40);
+    assert_eq!(
+        next.cols(),
+        first.cols(),
+        "the second frame must not crop it"
+    );
 }
 
 #[test]
