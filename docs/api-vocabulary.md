@@ -4,7 +4,7 @@
 
 Remuda already has the right atoms: protocol `Request` variants, Rust-bound Lua operations, pure Lua tools, and Butler workflows. Their names currently sit together on `remuda`, while reusable mod interfaces are often hidden behind `_`. Make the vocabulary visible in layers: atomic session operations under `remuda.session`, higher-level terminal interactions under `remuda.input` and `remuda.screen`, reusable framework words under `remuda.hook`, `remuda.schedule`, `remuda.process`, `remuda.module`, and `remuda.tool`, and Butler's supported interface under `remuda.butler`. Keep implementation state and dispatch machinery private. For each promotion, add the new name first, retain the old spelling as a deprecated alias with a notice, then remove only in a later breaking API version.
 
-The proposal does not change behavior. The exact boundaries among namespaces, especially session-as-object versus session-as-namespace, are for owner review before implementation.
+The proposal does not change behavior. Owner approval #206 fixes the first implementation scope: the `remuda.session` table remains callable through `__call`, its established nested words join `list/new/close/attach`, and only the named Butler vocabulary in the approved list below becomes public this round.
 
 ## Inventory and classification
 
@@ -27,7 +27,7 @@ The inventory below covers every name in `native/src/script.rs` `BINDINGS` (69 n
 | `expect`, `expect_option` | Composite | Observe a screen, select and perform a matching branch/action; `expect_option` selects from a screen and match set. Promote under `remuda.screen.expect` and `remuda.screen.expect_option`. |
 | `buffer`, `buffers` | Existing namespace + registry | `remuda.buffer` is already a namespace table with `new`, `set`, and `list`; `remuda.buffers` is its registry. Preserve these nested words and use them as the in-repo precedent for the proposed namespace tables. |
 | `window`, `windows` | Existing namespace + registry | `remuda.window` is already a namespace table with `current`; `remuda.windows` is its registry. Preserve these nested words and use them as the in-repo precedent for the proposed namespace tables. |
-| `session` (Lua helper) | Composite | `remuda.session(name)` returns a handle by name, with `buffer` and `is_busy` properties. It does not return Butler session detail; `session_detail` is a separate Butler hook. If `remuda.session` becomes a table, preserve the callable spelling as `remuda.session.open` and `session(...)` alias. |
+| `session` (Lua helper) | Composite | `remuda.session(name)` returns a handle by name, with `buffer` and `is_busy` properties. It does not return Butler session detail; `session_detail` is a separate Butler hook. The approved `remuda.session` namespace is a callable table (`__call` preserves `remuda.session(name)`) with nested `list`, `new`, `close`, `attach`, and the existing session-handle words. |
 | `schedule`, `cancel`, `schedules` | Composite + registry | Register repeating work, cancel a handle, and inspect schedules. Promote to `remuda.schedule.every/cancel/registry`; `schedule` remains an alias during migration. |
 | `tool`, `tools` | Composite + registry | Register an MCP tool word and inspect tool definitions. Promote to `remuda.tool.define/registry`. |
 | `on`, `emit`, `emit_until_success`, `emit_until_failure`, `emit_filter` | Composite | Register event handlers and dispatch/broadcast/filter values. Promote to `remuda.hook.on/emit/emit_until_success/emit_until_failure/emit_filter`. |
@@ -59,13 +59,15 @@ Source: every `.lua` under `remuda-butler/packages/butler/` at detached `main` `
 
 | Current name(s) | Class | What it does / proposal |
 |---|---|---|
-| `butler.project_home`, `butler.template` | Primitive configuration | Set project home and register topic templates. Keep as `remuda.butler.project_home/template`. |
-| `session_order`, `session_detail` | Composite/query | Expose Butler-aware ordering and per-session agent metadata. Promote under `remuda.butler.session_order/detail`. |
-| `command` (passed to `extension_command`), Butler MCP tools | Composite interface | CLI command and MCP tools for status/sessions, delegation, messaging, inbox, replies, forwarding, reports. Provide equivalent supported `remuda.butler.*` Lua words, with CLI/MCP as adapters. |
-| `_butler_compaction_gate`, `_butler_compaction_reset_idle`, `_butler_compaction_submit_matches`, `_butler_register_compaction_schedule`, `_butler_compaction_tick`, `_butler_compaction_submit` | Composite policy/workflow | Compaction decisions and submission workflow. Promote reusable vocabulary as `remuda.butler.ctx_level(name)`, `is_idle(name)`, `compact(name)` then `compaction_policy(name, st)`; the scheduled tick is the composite built on this policy. Match the in-progress design named in the brief. |
-| `_butler_launch`, `_butler_topic_new`, `_butler_topic_delegate` | Composite | Launch members, create topics, delegate a task. Promote to `remuda.butler.agent.launch`, `remuda.butler.topic.new/delegate`. |
-| `_butler_send`, `_butler_inbox`, `_butler_reply`, `_butler_forward`, `_butler_report`, `_butler_sessions` | Composite | Butler messaging and team-session workflows. Promote to `remuda.butler.message.send/inbox/reply/forward/report` and `remuda.butler.sessions`. |
-| `_butler_notify`, `_butler_deliver_notices`, `_butler_notify_policy`, `_butler_prompt_is_empty` | Composite policy | Decide whether/how to deliver notices to an agent prompt. Promote stable caller-facing decisions only if useful beyond Butler internals; otherwise keep private. |
+| `butler.project_home`, `butler.template` | Private setup configuration this round | Set project home and register topic templates. Keep available to Butler setup; do not promote in this round because the owner approved only the compaction units, session/agent metadata, and three messaging words. |
+| `session_order`, `session_detail` | Composite/query | Expose Butler-aware ordering and per-session agent metadata. Promote as `remuda.butler.session_order/detail` in this round. |
+| `command` (passed to `extension_command`), Butler MCP tools | Composite interface | CLI command and MCP tools for status/sessions, delegation, messaging, inbox, replies, forwarding, reports. Promote only approved message operations (`send`, `inbox`, `reply`) in this round; other workflows remain private until they have at least two callers. |
+| `_butler_compaction_gate`, `_butler_compaction_reset_idle`, `_butler_compaction_submit_matches`, `_butler_register_compaction_schedule`, `_butler_compaction_tick`, `_butler_compaction_submit` | Composite policy/workflow | Compaction decisions and submission workflow. Promote exactly `remuda.butler.ctx_level(name)`, `is_idle(name)`, `compact(name)`, and `compaction_policy(name, st)`; the scheduled tick remains private and composes these words. Match the in-progress design named in the brief. |
+| `_butler_launch`, `_butler_topic_new`, `_butler_topic_delegate` | Private composites this round | Launch members, create topics, and delegate tasks. Keep private until these words have at least two callers. |
+| `_butler_send`, `_butler_inbox`, `_butler_reply` | Composite | Butler messaging workflows. Promote as `remuda.butler.message.send/inbox/reply` in this round. |
+| `_butler_forward`, `_butler_report` | Private composites this round | Forward and report workflows remain private until each has at least two callers. |
+| `_butler_sessions` | Composite | Butler-managed sessions listing. Promote as `remuda.butler.sessions`; `session_order/detail` provide approved agent metadata. |
+| `_butler_notify`, `_butler_deliver_notices`, `_butler_notify_policy`, `_butler_prompt_is_empty` | Composite policy | Decide whether/how to deliver notices to an agent prompt. Keep private this round; these are helper policy/workflow words and do not meet the approved API scope. |
 | `_butler_contribute`, `_butler_reconcile`, `_butler_session_exited` | Internal mechanism | Butler extension integration and lifecycle/session reconciliation. Prefer the core `remuda.extension` and lifecycle hooks; keep Butler-specific adapters private. |
 | `_butler_resolve`, `_butler_current_agent`, `_butler_command_run`, `_butler_migrate_legacy_mail`, `_butler_inbox_delivery` | Internal mechanism | Resolve identities/callers, run commands, migrate mail, and adapt delivery events. |
 | `_butler_matrix_line`, `_butler_matrix_submit`, `_butler_matrix_start`, `_butler_matrix_stop`, `_butler_matrix_sync_exit` | Internal mechanism | Matrix relay process callbacks and lifecycle. |
@@ -116,7 +118,7 @@ The protocol is deliberately lower than the Lua word set: Lua `send` uses `SendL
 
 | Namespace | Words | Rationale |
 |---|---|---|
-| `remuda.session` | `list`, `new`, `open`, `close`, `attach` | Session identity and lifecycle, with a session facade as a composite. |
+| `remuda.session` | `list`, `new`, `close`, `attach`; callable table for `session(name)` | Session identity and lifecycle; `__call` preserves the existing handle constructor. |
 | `remuda.input` | `line`, `insert`, `key`, `click`, `feed`, `type_text` | Distinguishes input kinds and composes type-text behavior from atomic input. |
 | `remuda.screen` | `capture`, `styled`, `expect`, `expect_option` | Reading and acting on screen observations. |
 | `remuda.fs` | `list_dir`, `mkdir`, `remove_tree` | Filesystem primitives named by intent. |
@@ -130,11 +132,11 @@ The protocol is deliberately lower than the Lua word set: Lua `send` uses `SendL
 | `remuda.process` | `start`, `list`, `kill` | Managed subprocess lifecycle; no raw process primitive exposed. |
 | `remuda.buffer`, `remuda.window` | `new/list/registry`, `current/registry` | UI objects and registries. |
 | `remuda.diagnostics` | `request_counts`, `event_counts`, `schedule_fires`, `schedule_skips` | Operational observation separated from control. |
-| `remuda.butler` | `ctx_level`, `is_idle`, `compact`, `compaction_policy`, plus supported team, topic, agent, and messaging words | Butler-level composites built on core primitives; promoted only where reusable/stable. |
+| `remuda.butler` | `ctx_level`, `is_idle`, `compact`, `compaction_policy`, `sessions`, `session_order`, `session_detail`, `message.send/inbox/reply` | Exactly the Butler words approved for public use this round, built on core primitives. Other Butler words remain private until each has at least two callers. |
 
-Promote the user-meaningful `_butler_*` compaction decisions specified above, and stable Butler caller operations behind CLI/MCP as `remuda.butler.*`. Keep `_registry`'s writable storage, `_call`, `_descriptors`, counters, ticker callbacks, process internals, lifecycle bookkeeping, module-owned mutable state, test hooks, trace paths, adapter tables, and transport callbacks private. The leading underscore marks implementation mechanism, not merely a stylistic preference.
+Promote only the owner-approved Butler words this round: `ctx_level`, `is_idle`, `compact`, `compaction_policy`, sessions/agent metadata, and message `send`, `inbox`, `reply`. Every other Butler word remains private until it has at least two callers. Keep `_registry`'s writable storage, `_call`, `_descriptors`, counters, ticker callbacks, process internals, lifecycle bookkeeping, module-owned mutable state, test hooks, trace paths, adapter tables, and transport callbacks private. The leading underscore marks implementation mechanism, not merely a stylistic preference.
 
-Nested tables are already established in core: `remuda.buffer.new/set/list` and `remuda.window.current` are registered alongside the top-level table names, and the surface test compares top-level `pairs(remuda)` keys against `BINDINGS`, so table keys are already representable. Use them as precedent. The exact flat-to-nested mapping is an owner decision because nested module tables affect callers and the serialized registry. In particular, `remuda.session` currently names a function; promoting it to a namespace table requires making the old facade available as `open` and preserving `session(...)` as a compatibility alias during migration.
+Nested tables are already established in core: `remuda.buffer.new/set/list` and `remuda.window.current` are registered alongside the top-level table names, and the surface test compares top-level `pairs(remuda)` keys against `BINDINGS`, so table keys are already representable. Use them as precedent. The owner approved this callable-table migration in #206. In particular, `remuda.session` becomes a callable namespace table with `__call`, so existing `remuda.session(...)` behavior stays intact while nested words are added.
 
 ## Layering: composites built from words
 
@@ -168,27 +170,27 @@ Core words
     ├── session capture + telemetry context + prompt parsing
     │   └── ctx_level(name), is_idle(name)
     ├── ctx_level + is_idle + threshold/cooldown state
-    │   └── compact(name) -> compaction_policy(name, state) -> schedule
-    ├── session.new + input.type_text + schedule + process
-    │   └── butler.agent.launch and task delivery/confirmation
-    ├── topic directory + filesystem words + template configuration
-    │   └── butler.topic.new / delegate
+    │   └── compact(name) -> compaction_policy(name, state) -> private schedule
+    ├── session.list + identity metadata
+    │   └── remuda.butler.sessions / session_order / session_detail
     └── mail storage + identity resolution + event delivery
-        └── butler.message.send / inbox / reply / forward / report
+        └── remuda.butler.message.send / inbox / reply
+
+Agent launch, topic workflows, forwarding, reporting, and notification policy remain private this round (further public promotion requires 2+ callers).
 ```
 
 A composite may call other composites; each layer still has a named unit. The schedule's tick, module dispatch, and Butler internals stay mechanisms rather than becoming callable public words simply to complete a diagram.
 
 ## Migration by parallel change
 
-1. **Add names.** Introduce the new nested vocabulary alongside every current spelling. Each deprecated alias forwards to the new word and emits a clear, once-per-process deprecation notice naming the replacement. Keep arguments, results, errors, and timing identical.
-2. **Migrate consumers.** Update core Lua, the Butler mod, examples, and tests to use the new names. Keep aliases live throughout this stage. Confirm `BINDINGS` and live table assertions reflect both surfaces intentionally.
-3. **Freeze each API version.** `native/tests/api/v1.lua` through `v4.lua` are historical compatibility contracts: do not rewrite old assertions to bless a changed meaning. Add a new version fixture for the promoted surface and retain each prior version's expected aliases/behavior. The scripts are executable constraints on the period during which old names remain supported.
+1. **Add names in API v5.** Introduce the new nested vocabulary alongside every current spelling. Each deprecated flat alias emits a clear notice once per process per old spelling, naming its replacement. Notices are suppressed in tests/CI with `REMUDA_SUPPRESS_DEPRECATIONS=1`. Keep arguments, results, errors, and timing identical.
+2. **Migrate consumers.** Update core Lua, the Butler mod, examples, and tests to use the new names. Keep flat aliases live throughout API v5. Confirm `BINDINGS` and live table assertions reflect both surfaces intentionally.
+3. **Freeze each API version.** `native/tests/api/v1.lua` through `v4.lua` are historical compatibility contracts: do not rewrite old assertions to bless a changed meaning. Add `native/tests/api/v5.lua` for the new words; keep v1-v4 green and unchanged. API v5 carries both the new names and deprecated flat aliases.
 4. **Preserve frozen caller indirection.** Frozen fixtures can monkeypatch flat words: `native/tests/api/v4.lua` replaces `remuda.key` and asserts that `expect` key actions call it. Therefore, while the frozen API fixture is loaded, composites must resolve through the old flat slot (or a new nested wrapper must dynamically call that slot), rather than capturing/using a nested implementation that bypasses reassignment. Apply the same rule to advice on flat function paths: calls through a promoted name must remain observable through existing advised/replaced flat names for the compatibility period. Frozen fixtures stay unchanged. Deprecation notices should be emitted once per old spelling per process by default; tests/CI set `REMUDA_SUPPRESS_DEPRECATIONS=1` so frozen API output remains stable and quiet.
 5. **Guard the protocol-derived surface.** `script.rs` surface test compares `pairs(remuda)` top-level keys against `BINDINGS`; new namespace table keys must therefore be included in `BINDINGS`. The existing `buffer` and `window` tables prove this is supported. Nested members are currently unguarded, so add a nested-surface check that asserts each namespace table’s intended keys. Update registry metadata in the same change as each new binding; preserve the no-accidental-word guarantee.
-6. **Remove later.** Only a separately announced breaking API version removes deprecated aliases, after consumers have migrated and frozen old fixtures continue to demonstrate the prior contract.
+6. **Remove in API v6.** Remove deprecated flat aliases only in v6, after v5 has carried both spellings and consumers have migrated. Keep v1-v4 unchanged as historical contracts and v5 as the transition contract.
 
-The first implementation slice should be small: namespace/table introduction and aliases for one vocabulary family, with the bound-surface and relevant API-version contracts adjusted in the same patch. No implementation should precede owner approval of this proposal.
+The implementation is split into small PRs, one namespace family per PR, starting with `remuda.session`. Each slice branches from core `origin/main`; add the v5 fixture and make it RED first, while v1-v4 remain green. No two namespace families are combined in one PR.
 
 ## Prior art and design basis
 
@@ -198,8 +200,9 @@ The first implementation slice should be small: namespace/table introduction and
 - **SICP stratified design:** a system is understood and changed through layers whose words form the vocabulary of the next layer. Naming each level makes it possible to replace a composite without obscuring the primitives beneath it.
 - **Forth:** small words compose into larger definitions; the dictionary is a vocabulary rather than a bag of opaque operations. Remuda's Lua and Rust can preserve this property by naming both the building blocks and the composites they support.
 
-## Review decisions requested
+## Owner decisions recorded (approval #206)
 
-1. Approve the direction and namespace boundaries, especially changing `remuda.session` from a function to a table while preserving `session(...)` as an alias.
-2. Approve which Butler words are stable reusable API. The compaction decomposition (`ctx_level`, `is_idle`, `compact`, then policy and schedule) is the concrete example from the brief.
-3. Choose deprecation notice behavior and the API-version point at which any aliases may be removed.
+1. **Direction and namespaces approved.** `remuda.session` becomes a callable table via `__call`; `remuda.session("x")` remains valid, with nested `list`, `new`, and the other approved session words.
+2. **Butler promotion scope for this round:** `ctx_level`, `is_idle`, `compact`, `compaction_policy`; session listing and agent metadata; messaging `send`, `inbox`, and `reply`. All other Butler words stay private until they have at least two callers.
+3. **Deprecation and versions:** once per process per old spelling, suppressed in tests/CI by `REMUDA_SUPPRESS_DEPRECATIONS=1`; new names arrive in API v5; old flat aliases are removed in API v6.
+4. **Implementation sequence:** one namespace family per PR, starting with `remuda.session`; each slice starts from core `origin/main`, and its v5 test is written RED first while v1-v4 stay green.
