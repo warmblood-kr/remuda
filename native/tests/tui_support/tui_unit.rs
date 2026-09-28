@@ -119,6 +119,32 @@ fn make_ui(rows: Vec<SessionSummary>) -> Ui {
     ui
 }
 
+#[test]
+fn short_terminal_preview_keeps_a_top_line_visible_at_all_supported_heights() {
+    let mut ui = make_ui(vec![row("shell", true, false)]);
+    ui.list_visible = false;
+    let mut cells = vec![vec![remuda_core::agent::StyledCell::default(); 80]; 24];
+    for (col, ch) in "one-line".chars().enumerate() {
+        cells[0][col] = remuda_core::agent::StyledCell {
+            text: ch.to_string(),
+            ..remuda_core::agent::StyledCell::default()
+        };
+    }
+    let cursor = remuda_core::agent::Cursor {
+        row: 0,
+        col: 8,
+        visible: true,
+    };
+
+    for terminal_rows in [10, 12, 16, 20, 24] {
+        let frame = render_styled(&ui, &cells, cursor, "test", 80, terminal_rows);
+        assert!(
+            frame.contains("one-line"),
+            "top-line session content disappeared at terminal height {terminal_rows}"
+        );
+    }
+}
+
 #[cfg(windows)]
 fn streaming_command(_unix_script: &str, windows_script: &str) -> Vec<String> {
     vec![
@@ -1145,7 +1171,8 @@ fn the_styled_crop_matches_plain_crop_when_every_cell_is_default() {
             for pan in 0..=max_len + 2 {
                 for rows in 0..=max_rows + 2 {
                     let want = crop(screen, cols, rows, pan);
-                    let (got_lines, got_cut) = crop_styled(&cells, cols, rows, pan);
+                    let (got_lines, got_cut) =
+                        crop_styled(&cells, cols, rows, pan, cells.len().saturating_sub(1));
                     // Defensive: a default-only row should never actually
                     // carry a trailing reset, but strip one if present
                     // rather than assume it.
@@ -1209,7 +1236,7 @@ fn a_cut_after_a_wide_cell_never_overflows_the_pane_width() {
     let row = vec![plain("a"), plain("b"), wide, continuation, plain("x")];
     let cols = 4;
 
-    let (lines, cut) = crop_styled(&[row], cols, 1, 0);
+    let (lines, cut) = crop_styled(&[row], cols, 1, 0, 0);
     assert!(
         cut,
         "there is more content than fits — this must be marked cut"
