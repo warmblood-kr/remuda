@@ -468,6 +468,11 @@ function remuda._activate_module(name, candidate, reactivate)
       if problem then error("module " .. problem, 0) end
       if seen[entry.id] then error("module declares duplicate contribution " .. point .. "/" .. entry.id, 0) end
       seen[entry.id] = true
+      local existing = contributions[point] and contributions[point][entry.id]
+      if existing and existing.owner ~= nil and existing.owner ~= name then
+        error("contribution " .. point .. "/" .. entry.id .. " is owned by mod " .. existing.owner
+          .. "; mod " .. name .. " cannot replace it", 0)
+      end
     end
   end
 
