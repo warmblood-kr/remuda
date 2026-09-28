@@ -123,7 +123,7 @@ fn wait_for_session_screen(session: &Session, needle: &str) {
     }
 }
 
-fn collect_until_bytes(receiver: &Receiver<Vec<u8>>, needle: &[u8]) {
+fn collect_until_bytes(receiver: &Receiver<Vec<u8>>, needle: &[u8]) -> Vec<u8> {
     let deadline = Instant::now() + PATIENCE;
     let mut output = Vec::new();
     while !output.windows(needle.len()).any(|window| window == needle) {
@@ -147,6 +147,7 @@ fn collect_until_bytes(receiver: &Receiver<Vec<u8>>, needle: &[u8]) {
             }
         }
     }
+    output
 }
 
 fn escaped_tail(output: &[u8]) -> String {
@@ -156,6 +157,24 @@ fn escaped_tail(output: &[u8]) -> String {
         .flat_map(|byte| std::ascii::escape_default(*byte))
         .map(char::from)
         .collect()
+}
+
+#[cfg(windows)]
+fn assert_bytes_in_order(output: &[u8], needles: &[&[u8]]) {
+    let mut cursor = 0;
+    for needle in needles {
+        let Some(offset) = output[cursor..]
+            .windows(needle.len())
+            .position(|window| window == *needle)
+        else {
+            panic!(
+                "terminal output omitted ordered bytes {needle:?}; received {} bytes, tail: {}",
+                output.len(),
+                escaped_tail(output)
+            );
+        };
+        cursor += offset + needle.len();
+    }
 }
 
 fn traced_input(path: &Path) -> Vec<u8> {
@@ -515,10 +534,24 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     held.write_raw(&[client::DETACH]).expect("Ctrl-\\");
     drop(held);
 
-    collect_until_bytes(
+    #[cfg(unix)]
+    let _received_restore = collect_until_bytes(
         &viewer_output,
         b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
     );
+    #[cfg(windows)]
+    {
+        let received = collect_until_bytes(&viewer_output, b"remuda: detached from target");
+        assert_bytes_in_order(
+            &received,
+            &[
+                b"echo $((6*7))-typed",
+                b"\x1b[?2004l",
+                b"42-typed",
+                b"remuda: detached from target",
+            ],
+        );
+    }
     let traced = traced_input(&trace_path);
     assert!(
         traced
