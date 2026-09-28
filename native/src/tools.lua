@@ -1295,9 +1295,8 @@ register(
 -- — status color, detail, and the breathing room between sessions — belongs
 -- here, where a live Lua image can revise it without rebuilding the TUI.
 --
--- WIDTH is passed in rather than read from anywhere, because whether the
--- tail shows `live`/`dead` or just the flag depends on the caller's own
--- column budget — a fact only the renderer asking for a refresh has.
+-- WIDTH travels with the bridge call so any budget-aware row detail can be
+-- chosen here; Rust still fits the resulting rows to the caller's pane.
 function remuda._refresh_sessions_buffer(width, selected, selected_name)
   local sessions = remuda.ls()
   local ordered = sessions
@@ -1361,16 +1360,16 @@ function remuda._refresh_sessions_buffer(width, selected, selected_name)
         or (not selected_name and i - 1 == selected)
       -- Reverse video marks the selection without a caret column.
       local name_style = is_selected and "\27[1;7;36m" or "\27[1m"
-      -- The dot carries live/dead, so row 2 is only telemetry and the flag.
+      -- The dot carries live/dead; row 2 is reserved for telemetry.
       -- Each style resets before the next starts, so none bleeds into another.
       -- U+25CF BLACK CIRCLE. Ambiguous width; tui.rs's char_width counts it
       -- as one cell by owner choice.
       local dot = "●"
+      local marker = s.attached and " 🏇" or ""
       local parts = {}
       if detail then parts[#parts + 1] = "\27[2m" .. detail .. reset end
-      if s.attached then parts[#parts + 1] = "⚑" end
       local block = place({
-        name_style .. s.name .. reset .. " " .. state_color .. dot .. reset,
+        name_style .. s.name .. reset .. " " .. state_color .. dot .. reset .. marker,
         table.concat(parts, "  "),
         "",
       }, 2 * depth)

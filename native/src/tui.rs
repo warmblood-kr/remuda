@@ -1525,7 +1525,30 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
         None if session_index == ui.selected => format!("\x1b[7m{}\x1b[0m", session.name),
         None => session.name.clone(),
     };
-    fit(&content, width)
+    fit_session_row(&content, width)
+}
+
+/// Keep the attached horse and live/dead dot visible when a name is longer
+/// than its row. Both suffixes are fixed-width Lua output; only the styled
+/// name is shortened, one Unicode scalar at a time, by `fit`.
+fn fit_session_row(content: &str, width: u16) -> String {
+    const MARKER: &str = " 🏇";
+    let Some(without_marker) = content.strip_suffix(MARKER) else {
+        return fit(content, width);
+    };
+
+    for state in [" \x1b[32m●\x1b[0m", " \x1b[31m●\x1b[0m"] {
+        if let Some(name) = without_marker.strip_suffix(state) {
+            let reserved = (visible_width(state) + visible_width(MARKER)) as u16;
+            let name_width = width.saturating_sub(reserved);
+            return format!("{}{}{}", fit(name, name_width), state, MARKER);
+        }
+    }
+
+    // Preserve the horse even if an extension replaces the expected state
+    // dot styling; the normal Lua path above also reserves the dot.
+    let name_width = width.saturating_sub(visible_width(MARKER) as u16);
+    format!("{}{}", fit(without_marker, name_width), MARKER)
 }
 
 /// The crop notice moved here when the preview lost its title band: a crop that
