@@ -140,9 +140,21 @@ impl ClusterUi {
             .join("\n")
     }
 
+    #[cfg(test)]
     fn key(&mut self, code: crossterm::event::KeyCode) -> bool {
+        self.key_event(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    fn key_event(&mut self, event: crossterm::event::KeyEvent) -> bool {
+        use crossterm::event::KeyModifiers;
+        if self.query.is_some() && event.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
         use crossterm::event::KeyCode::*;
-        match code {
+        match event.code {
             Char('q') if self.query.is_none() => return true,
             Char('/') if self.query.is_none() => self.query = Some(String::new()),
             Char('!') if self.query.is_none() => {
@@ -170,6 +182,10 @@ impl ClusterUi {
             Left => self.expanded = false,
             Right => self.expanded = true,
             Enter => {
+                let visible = self.visible_sessions();
+                if visible.is_empty() || !visible.contains(&self.selected) {
+                    return false;
+                }
                 self.query = None;
                 self.expanded = true;
                 self.active = self.selected;
@@ -198,8 +214,11 @@ impl ClusterUi {
     }
 
     fn select_first_visible(&mut self) {
-        if let Some(index) = self.visible_sessions().first().copied() {
-            self.selected = index;
+        let visible = self.visible_sessions();
+        if !visible.contains(&self.selected) {
+            if let Some(index) = visible.first().copied() {
+                self.selected = index;
+            }
         }
     }
 
@@ -220,7 +239,7 @@ impl ClusterUi {
     fn footer(&self) -> String {
         let attention = if self.attention_only { "on" } else { "off" };
         match &self.query {
-            Some(query) => format!("search: {query} · Esc clear · Enter select · ! attention: {attention}"),
+            Some(query) => format!("search: {query} · Esc clear · Enter select"),
             None => format!("↑/↓ move · ←/→ collapse/expand · Enter select · / search · ! attention: {attention} · q detach"),
         }
     }
@@ -360,7 +379,7 @@ fn run_loop(path: &Path, node: &str, target: Option<&str>, clock: &dyn Clock) ->
                 if key.kind != crossterm::event::KeyEventKind::Press {
                     continue;
                 }
-                if ui.key(key.code) {
+                if ui.key_event(key) {
                     return Ok(());
                 }
             }
@@ -573,5 +592,78 @@ mod tests {
             ..AttentionSignals::default()
         }));
         assert!(!is_attention(AttentionSignals::default()));
+    }
+
+    #[test]
+    fn search_q_does_not_detach_and_control_keys_are_ignored() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        assert!(!ui.key(crossterm::event::KeyCode::Char('/')));
+        assert!(!ui.key(crossterm::event::KeyCode::Char('q')));
+        ui.key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('c'),
+            crossterm::event::KeyModifiers::CONTROL,
+        ));
+        assert_eq!(ui.query.as_deref(), Some("q"));
+        let frame = ui.render(80, 24, "", &clock);
+        assert!(frame.contains("search: q"));
+        assert!(!frame.contains("attention:"));
+    }
+
+    #[test]
+    fn enter_on_an_empty_search_result_does_nothing() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.key(crossterm::event::KeyCode::Char('/'));
+        ui.key(crossterm::event::KeyCode::Char('z'));
+        ui.key(crossterm::event::KeyCode::Enter);
+        let frame = ui.render(80, 24, "", &clock);
+        assert!(frame.contains("search: z"));
+        assert!(frame.contains("no matching sessions"));
+        assert_eq!(ui.query.as_deref(), Some("z"));
+        assert_eq!(ui.active, 0);
+    }
+
+    #[test]
+    fn enter_with_a_hidden_selection_does_nothing() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new(
+            "studio",
+            vec![session("dev", true), session("shell", true)],
+            clock.now(),
+        );
+        ui.query = Some("dev".into());
+        ui.selected = 1;
+        ui.active = 1;
+        ui.key(crossterm::event::KeyCode::Enter);
+        assert_eq!(ui.query.as_deref(), Some("dev"));
+        assert_eq!(ui.active, 1);
+    }
+
+    #[test]
+    fn enter_on_an_empty_attention_filter_does_nothing() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.key(crossterm::event::KeyCode::Char('!'));
+        ui.key(crossterm::event::KeyCode::Enter);
+        let frame = ui.render(80, 24, "", &clock);
+        assert!(frame.contains("attention: on"));
+        assert!(frame.contains("no sessions need attention"));
+        assert_eq!(ui.active, 0);
+    }
+
+    #[test]
+    fn toggling_attention_preserves_a_selection_when_it_remains_visible() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new(
+            "studio",
+            vec![session("dev", true), session("shell", true)],
+            clock.now(),
+        );
+        ui.key(crossterm::event::KeyCode::Down);
+        ui.key(crossterm::event::KeyCode::Char('!'));
+        ui.key(crossterm::event::KeyCode::Char('!'));
+        assert_eq!(ui.selected, 1);
+        assert!(ui.render(80, 24, "", &clock).contains(">    shell"));
     }
 }
