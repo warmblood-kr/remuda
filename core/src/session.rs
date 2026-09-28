@@ -221,6 +221,13 @@ impl Session {
         agent.screen_cells_at(scrollback)
     }
 
+    pub fn scrollback_len(&self) -> usize {
+        self.agent
+            .lock()
+            .map(|mut agent| agent.scrollback_len())
+            .unwrap_or(0)
+    }
+
     pub fn row_wrapped_at(&self, scrollback: usize) -> Result<Vec<bool>> {
         let mut agent = self
             .agent

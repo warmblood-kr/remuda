@@ -268,6 +268,18 @@ impl AgentProcess for PtyAgent {
         }))
     }
 
+    fn scrollback_len(&mut self) -> usize {
+        let Ok(mut parser) = self.screen.lock() else {
+            return 0;
+        };
+        let screen = parser.screen_mut();
+        let previous = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        let length = screen.scrollback();
+        screen.set_scrollback(previous);
+        length
+    }
+
     fn row_wrapped_at(&mut self, scrollback: usize) -> Result<Vec<bool>> {
         let mut parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
         Ok(with_scrollback(parser.screen_mut(), scrollback, |screen| {

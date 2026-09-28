@@ -101,7 +101,7 @@ pub struct Ui {
     /// Remuda's own kill ring. It deliberately does not require or alter the
     /// host OS clipboard.
     yank: String,
-    scrollback: HashMap<String, usize>,
+    scrollback: HashMap<String, ScrollState>,
     pub mode: Mode,
     pub focus: Focus,
     /// Visual mode (tmux copy-mode-vi): `visual_cursor` moves; the selection
@@ -121,6 +121,12 @@ pub struct Ui {
     sessions_text: Vec<String>,
     /// Rows per session, supplied by the Lua sessions-buffer contract.
     session_rows: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ScrollState {
+    offset: usize,
+    history_rows: usize,
 }
 
 impl Ui {
@@ -397,7 +403,13 @@ impl Ui {
             self.notice = None;
             return Action::Nothing;
         }
-        to_bytes(key).map_or(Action::Nothing, Action::Type)
+        let bytes = to_bytes(key);
+        if bytes.is_some() {
+            if let Some(name) = self.selected().map(|session| session.name.clone()) {
+                self.scrollback.entry(name).or_default().offset = 0;
+            }
+        }
+        bytes.map_or(Action::Nothing, Action::Type)
     }
 
     /// Follow the session the keyboard is talking to by NAME, and hand the
@@ -454,6 +466,8 @@ impl Ui {
                 self.pan = 0;
                 Action::Nothing
             }
+            KeyCode::PageUp => Action::Scroll(i16::MAX),
+            KeyCode::PageDown | KeyCode::End => Action::Scroll(i16::MIN),
             KeyCode::Char('h') => {
                 self.list_width = None;
                 Action::Nothing
@@ -1683,15 +1697,13 @@ fn refresh(
         ui.last_resized = None;
     }
     let (cells, _wrapped, cursor) = match shown.as_ref() {
-        Some(ShownTarget::Session(name)) => {
-            match capture_styled(path, name, *ui.scrollback.get(name).unwrap_or(&0)) {
-                Ok(result) => result,
-                Err(e) => {
-                    ui.notice = Some(format!("{name}: {e}"));
-                    (Vec::new(), Vec::new(), hidden)
-                }
+        Some(ShownTarget::Session(name)) => match capture_preview(path, ui, name) {
+            Ok(result) => result,
+            Err(e) => {
+                ui.notice = Some(format!("{name}: {e}"));
+                (Vec::new(), Vec::new(), hidden)
             }
-        }
+        },
         Some(ShownTarget::Buffer(name)) => match capture_buffer(path, name) {
             Ok((cells, cursor)) => (cells, Vec::new(), cursor),
             Err(e) => {
@@ -1858,14 +1870,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             Action::Kill(name) => ui.notice = kill(path, &name).err(),
             Action::Focus(name) => reconcile_hold(path, &mut ui, &mut held, &name),
             Action::Scroll(delta) => {
-                if let Some(session) = ui.selected() {
-                    let offset = ui.scrollback.entry(session.name.clone()).or_default();
-                    *offset = if delta >= 0 {
-                        offset.saturating_add(delta as usize)
-                    } else {
-                        offset.saturating_sub((-delta) as usize)
-                    };
-                }
+                scroll_selected(&mut ui, delta);
             }
             Action::Copy(name) => copy_screen(path, &mut ui, &name),
             Action::CopySelection(name) => copy_selection(path, &mut ui, &name),
@@ -1880,7 +1885,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
 
 fn copy_screen(path: &Path, ui: &mut Ui, name: &str) {
     match capture_styled(path, name, 0) {
-        Ok((cells, wrapped, _)) => {
+        Ok((cells, wrapped, _, _)) => {
             ui.yank = all_screen_text(&cells, &wrapped);
             ui.notice = Some(format!(
                 "copied {} bytes; p pastes into the selected session",
@@ -1892,9 +1897,9 @@ fn copy_screen(path: &Path, ui: &mut Ui, name: &str) {
 }
 
 fn copy_selection(path: &Path, ui: &mut Ui, name: &str) {
-    let offset = *ui.scrollback.get(name).unwrap_or(&0);
+    let offset = ui.scrollback.get(name).map_or(0, |state| state.offset);
     match capture_styled(path, name, offset) {
-        Ok((cells, wrapped, _)) => {
+        Ok((cells, wrapped, _, _)) => {
             // Copy-and-cancel, as tmux: the selection has done its job.
             ui.yank = ui.text_selection.take().map_or_else(
                 || all_screen_text(&cells, &wrapped),
@@ -1907,6 +1912,51 @@ fn copy_selection(path: &Path, ui: &mut Ui, name: &str) {
         }
         Err(e) => ui.notice = Some(format!("{name}: {e}")),
     }
+}
+
+fn scroll_state(state: &mut ScrollState, delta: i16) {
+    state.offset = if delta >= 0 {
+        state
+            .offset
+            .saturating_add(delta as usize)
+            .min(state.history_rows)
+    } else {
+        state.offset.saturating_sub(delta.unsigned_abs() as usize)
+    };
+}
+
+fn scroll_selected(ui: &mut Ui, delta: i16) {
+    if let Some(name) = ui.selected().map(|session| session.name.clone()) {
+        scroll_state(ui.scrollback.entry(name).or_default(), delta);
+    }
+}
+
+fn anchor_offset_to_new_history(offset: usize, previous_rows: usize, current_rows: usize) -> usize {
+    if offset == 0 {
+        0
+    } else {
+        offset
+            .saturating_add(current_rows.saturating_sub(previous_rows))
+            .min(current_rows)
+    }
+}
+
+/// Keep a scrolled preview on the same history rows as output pushes new rows.
+fn capture_preview(
+    path: &Path,
+    ui: &mut Ui,
+    name: &str,
+) -> Result<(Vec<Vec<StyledCell>>, Vec<bool>, Cursor), String> {
+    let state = ui.scrollback.entry(name.to_string()).or_default();
+    let (mut cells, mut wrapped, mut cursor, mut history_rows) =
+        capture_styled(path, name, state.offset)?;
+    let anchored = anchor_offset_to_new_history(state.offset, state.history_rows, history_rows);
+    if anchored != state.offset {
+        state.offset = anchored;
+        (cells, wrapped, cursor, history_rows) = capture_styled(path, name, anchored)?;
+    }
+    state.history_rows = history_rows;
+    Ok((cells, wrapped, cursor))
 }
 
 fn paste(path: &Path, ui: &mut Ui, held: &Option<(String, Hold)>) {
@@ -2072,7 +2122,7 @@ fn parse_shown_target(text: &str) -> Option<ShownTarget> {
 }
 
 /// Rows of cells, each row's soft-wrap flag, and the cursor.
-type StyledCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor);
+type StyledCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor, usize);
 
 /// Styled counterpart of the (now unused) plain `capture` — see steps/020,
 /// 021. The wire carries runs, expanded back to cells here — see steps/022.
@@ -2089,10 +2139,12 @@ fn capture_styled(path: &Path, name: &str, scrollback: usize) -> Result<StyledCa
             rows,
             wrapped,
             cursor,
+            scrollback_len,
         }) => Ok((
             rows.iter().map(|row| expand_runs(row)).collect(),
             wrapped,
             cursor,
+            scrollback_len,
         )),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),

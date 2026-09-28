@@ -365,6 +365,7 @@ fn capture_styled(
                 .row_wrapped_at(name, scrollback)
                 .and_then(Result::ok)
                 .unwrap_or_default();
+            let scrollback_len = registry.scrollback_len(name).unwrap_or(0);
             // The session existed a line above (`screen_cells` answered),
             // so this only fails on a poisoned lock — hide rather than
             // guess a position. See steps/027.
@@ -390,6 +391,7 @@ fn capture_styled(
                 &Response::StyledScreen {
                     rows,
                     wrapped,
+                    scrollback_len,
                     cursor,
                 },
             )

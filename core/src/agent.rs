@@ -171,6 +171,11 @@ pub trait AgentProcess: Send {
         self.screen_cells()
     }
 
+    /// Number of rows currently retained above the live screen.
+    fn scrollback_len(&mut self) -> usize {
+        0
+    }
+
     fn row_wrapped_at(&mut self, _scrollback: usize) -> Result<Vec<bool>> {
         Ok(Vec::new())
     }

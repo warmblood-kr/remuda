@@ -307,6 +307,254 @@ fn shift_wheel_is_forwarded_to_the_child_tui() {
 }
 
 #[test]
+fn page_down_returns_the_preview_to_follow_mode() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    let wheel_up = MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: 19,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert_eq!(ui.on_mouse(wheel_up, 80, 24), Action::Scroll(3));
+    // The run loop applies the wheel action to this per-session offset.
+    ui.scrollback.insert(
+        "a".into(),
+        ScrollState {
+            offset: 3,
+            history_rows: 30,
+        },
+    );
+
+    assert_eq!(
+        ui.on_key(press(KeyCode::PageDown)),
+        Action::Scroll(i16::MIN),
+        "PageDown should clear preview history offset so following output is visible"
+    );
+    scroll_selected(&mut ui, i16::MIN);
+    assert_eq!(ui.scrollback["a"].offset, 0);
+}
+
+#[test]
+fn preview_wheel_down_returns_to_follow_and_clamps_past_bottom() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    let wheel = |kind| MouseEvent {
+        kind,
+        column: 19,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert_eq!(
+        ui.on_mouse(wheel(MouseEventKind::ScrollUp), 80, 24),
+        Action::Scroll(3)
+    );
+    ui.scrollback.insert(
+        "a".into(),
+        ScrollState {
+            offset: 3,
+            history_rows: 30,
+        },
+    );
+
+    assert_eq!(
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
+        Action::Scroll(-3)
+    );
+    {
+        scroll_state(ui.scrollback.get_mut("a").unwrap(), -3);
+        assert_eq!(
+            ui.scrollback["a"].offset, 0,
+            "wheel-down to the bottom must enable follow"
+        );
+    }
+
+    assert_eq!(
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
+        Action::Scroll(-3)
+    );
+    scroll_state(ui.scrollback.get_mut("a").unwrap(), -3);
+    assert_eq!(
+        ui.scrollback["a"].offset, 0,
+        "scrolling past the bottom stays in follow mode"
+    );
+}
+
+#[test]
+fn scrolled_preview_offset_stays_with_its_content_as_history_grows() {
+    assert_eq!(anchor_offset_to_new_history(6, 40, 43), 9);
+    assert_eq!(anchor_offset_to_new_history(0, 40, 43), 0);
+    assert_eq!(anchor_offset_to_new_history(6, 43, 43), 6);
+}
+
+#[test]
+fn session_input_returns_to_live_view_without_swallowing_the_key() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    ui.on_key(press(KeyCode::Enter));
+    ui.scrollback.insert(
+        "a".into(),
+        ScrollState {
+            offset: 5,
+            history_rows: 20,
+        },
+    );
+
+    assert_eq!(
+        ui.on_key(press(KeyCode::Char('x'))),
+        Action::Type(b"x".to_vec())
+    );
+    assert_eq!(ui.scrollback["a"].offset, 0);
+}
+
+#[test]
+fn real_preview_follows_output_after_wheel_returns_to_bottom() {
+    let path = scratch_socket("preview-follow-after-wheel");
+    daemon_at(&path);
+    let command = "i=0; while [ $i -lt 60 ]; do printf 'newest-%02d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 3";
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("stream".into()),
+            command: vec!["sh".into(), "-c".into(), command.into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new streaming session");
+    assert_eq!(response, Response::Value("stream".into()));
+
+    let mut ui = make_ui(vec![row("stream", true, false)]);
+    let history_deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        capture_preview(&path, &mut ui, "stream").expect("initial live preview");
+        if ui.scrollback["stream"].history_rows >= 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < history_deadline,
+            "output did not reach scrollback"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let wheel = |kind| MouseEvent {
+        kind,
+        column: 19,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    };
+    let up = ui.on_mouse(wheel(MouseEventKind::ScrollUp), 80, 24);
+    assert_eq!(up, Action::Scroll(3));
+    scroll_selected(&mut ui, 3);
+    assert_eq!(ui.scrollback["stream"].offset, 3);
+    let down = ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24);
+    assert_eq!(down, Action::Scroll(-3));
+    scroll_selected(&mut ui, -3);
+    assert_eq!(ui.scrollback["stream"].offset, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let (cells, _, cursor) =
+            capture_preview(&path, &mut ui, "stream").expect("capture the streaming preview");
+        let frame = render_styled(&ui, &cells, cursor, "default", 80, 25);
+        if frame.contains("newest-59") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "latest output never appeared after returning to bottom: {frame:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = client::request(
+        &path,
+        &Request::Close {
+            name: "stream".into(),
+        },
+    );
+}
+
+#[test]
+fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
+    let path = scratch_socket("preview-content-anchor");
+    daemon_at(&path);
+    let command = "i=0; while [ $i -lt 70 ]; do printf 'row-%02d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 3";
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("stream".into()),
+            command: vec!["sh".into(), "-c".into(), command.into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new streaming session");
+    assert_eq!(response, Response::Value("stream".into()));
+
+    let mut ui = make_ui(vec![row("stream", true, false)]);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        capture_preview(&path, &mut ui, "stream").expect("capture preview");
+        if ui.scrollback["stream"].history_rows >= 3 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "output did not reach scrollback");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        ui.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 19,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            80,
+            24,
+        ),
+        Action::Scroll(3)
+    );
+    scroll_selected(&mut ui, 3);
+    let (anchor_cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("scroll up");
+    let anchor_text = terminal_rows_text(&anchor_cells);
+    let anchor_history = ui.scrollback["stream"].history_rows;
+
+    loop {
+        let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture output");
+        let state = ui.scrollback["stream"];
+        if state.history_rows >= anchor_history + 3 {
+            assert_eq!(
+                state.offset,
+                3 + (state.history_rows - anchor_history),
+                "the offset must advance with appended history rows"
+            );
+            assert_eq!(
+                terminal_rows_text(&cells),
+                anchor_text,
+                "new output must not move the scrolled content"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "history did not grow while scrolled"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = client::request(
+        &path,
+        &Request::Close {
+            name: "stream".into(),
+        },
+    );
+}
+
+fn terminal_rows_text(rows: &[Vec<StyledCell>]) -> Vec<String> {
+    rows.iter()
+        .map(|row| row.iter().map(|cell| cell.text.as_str()).collect())
+        .collect()
+}
+
+#[test]
 fn ctrl_backslash_is_the_only_key_that_comes_back() {
     let mut ui = make_ui(vec![row("sh", true, false)]);
     ui.on_key(press(KeyCode::Enter));
@@ -2013,14 +2261,14 @@ fn capture_styled_10k_history_measurement() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok((live, _, _)) = capture_styled(&path, "history", 0) {
+        if let Ok((live, _, _, _)) = capture_styled(&path, "history", 0) {
             let visible: String = live
                 .iter()
                 .flatten()
                 .map(|cell| cell.text.as_str())
                 .collect();
             if visible.contains("09999") {
-                let (oldest, _, _) =
+                let (oldest, _, _, _) =
                     capture_styled(&path, "history", 9_999).expect("oldest capture");
                 let first: String = oldest[0].iter().map(|cell| cell.text.as_str()).collect();
                 assert!(first.contains("00000"), "oldest line was {first:?}");
@@ -2105,7 +2353,7 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Ok((cells, _, _)) = capture_styled(&path, "alpha", 0) {
+        if let Ok((cells, _, _, _)) = capture_styled(&path, "alpha", 0) {
             let first_five: String = cells
                 .first()
                 .map(|row| row.iter().take(5).map(|c| c.text.as_str()).collect())
@@ -2130,7 +2378,7 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
     let ShownTarget::Session(name) = shown.unwrap() else {
         unreachable!("just asserted it above");
     };
-    let (cells, _, cursor) =
+    let (cells, _, cursor, _) =
         capture_styled(&path, &name, 0).expect("capture through the window's target");
 
     // No sessions buffer yet: `list_row` falls back to the bare name, which

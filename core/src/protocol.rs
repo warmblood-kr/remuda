@@ -118,6 +118,8 @@ pub enum Response {
         rows: Vec<Vec<StyledRun>>,
         #[serde(default)]
         wrapped: Vec<bool>,
+        #[serde(default)]
+        scrollback_len: usize,
         cursor: Cursor,
     },
     /// What an [`Request::Eval`] returned, already rendered to text. Kept

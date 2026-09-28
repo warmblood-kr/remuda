@@ -209,6 +209,10 @@ impl Registry {
         self.get(name).map(|s| s.screen_cells_at(scrollback))
     }
 
+    pub fn scrollback_len(&self, name: &str) -> Option<usize> {
+        self.get(name).map(|s| s.scrollback_len())
+    }
+
     pub fn row_wrapped_at(&self, name: &str, scrollback: usize) -> Option<Result<Vec<bool>>> {
         self.get(name).map(|s| s.row_wrapped_at(scrollback))
     }
