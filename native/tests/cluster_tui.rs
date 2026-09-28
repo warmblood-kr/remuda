@@ -8,13 +8,14 @@ use std::time::{Duration, Instant};
 
 struct PrivateDaemon {
     child: Child,
+    root: PathBuf,
     runtime: PathBuf,
 }
 
 impl PrivateDaemon {
     fn start() -> Self {
-        let runtime =
-            PathBuf::from("/private/tmp").join(format!("cluster-tree-{}", std::process::id()));
+        let root = PathBuf::from("/tmp");
+        let runtime = root.join(format!("cluster-tree-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&runtime);
         std::fs::create_dir_all(&runtime).unwrap();
         let home = runtime.join("home");
@@ -31,7 +32,11 @@ impl PrivateDaemon {
             .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
-        Self { child, runtime }
+        Self {
+            child,
+            root,
+            runtime,
+        }
     }
 
     fn path(&self) -> PathBuf {
@@ -53,7 +58,7 @@ impl PrivateDaemon {
 impl Drop for PrivateDaemon {
     fn drop(&mut self) {
         assert!(
-            self.runtime.starts_with("/private/tmp"),
+            self.runtime.starts_with(&self.root),
             "daemon runtime must be scratch"
         );
         let _ = self.child.kill();
