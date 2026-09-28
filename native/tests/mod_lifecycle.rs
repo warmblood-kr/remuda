@@ -370,6 +370,61 @@ fn reloads_own_declared_schedules_and_exec_does_not_restart_an_active_mod() {
     assert_eq!(read_value(&image, schedules), "1");
 }
 
+#[test]
+fn declared_schedule_after_controls_its_first_fire() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return { ticks = 0 } end,
+          schedules = {{ every = 10, after = 5, run = function(state)
+            state.ticks = state.ticks + 1
+          end }},
+          tools = {{ name = "sample_ticks",
+            about = "Read the declared schedule tick count.",
+            run = function(state) return tostring(state.ticks) end }},
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-declared-after.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(
+        &image,
+        "remuda._run_due_schedules(100); remuda.exec('sample')",
+    );
+    read_value(&image, "remuda._run_due_schedules(100)");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_ticks()"),
+        "0"
+    );
+    read_value(&image, "remuda._run_due_schedules(104.9)");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_ticks()"),
+        "0"
+    );
+    read_value(&image, "remuda._run_due_schedules(105)");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_ticks()"),
+        "1"
+    );
+    read_value(&image, "remuda._run_due_schedules(115)");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_ticks()"),
+        "2"
+    );
+}
+
 // #129: a reload whose start() fails must leave the previous activation's
 // hooks, tools and schedules in place, as a failed declaration already does.
 #[test]

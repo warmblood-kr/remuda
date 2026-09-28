@@ -958,8 +958,10 @@ function remuda._activate_module(name, candidate, reactivate)
     local schedule = schedules[index]
     if type(schedule) ~= "table" or type(schedule.every) ~= "number" or schedule.every <= 0
       or type(schedule.run) ~= "function"
+      or (schedule.after ~= nil and (type(schedule.after) ~= "number" or schedule.after < 0
+        or schedule.after ~= schedule.after or schedule.after == math.huge))
       or (schedule.name ~= nil and (type(schedule.name) ~= "string" or schedule.name == "")) then
-      error("each module schedule needs a positive every, a run function, and an optional non-empty name", 0)
+      error("each module schedule needs a positive every, a run function, an optional finite non-negative after, and an optional non-empty name", 0)
     end
   end
 
@@ -1138,6 +1140,7 @@ function remuda._activate_module(name, candidate, reactivate)
     schedule_handles[index] = remuda.schedule({
       name = declared.name,
       every = declared.every,
+      after = declared.after,
       run = function() return with_owner(name, declared.run, state) end,
     })
   end
