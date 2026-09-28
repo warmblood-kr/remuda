@@ -13,6 +13,7 @@ pub mod daemon;
 pub mod dist;
 pub mod image;
 pub mod ipc;
+pub mod json;
 pub mod mcp;
 pub mod mouse;
 #[allow(clippy::disallowed_types)]
