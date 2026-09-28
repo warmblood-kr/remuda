@@ -197,6 +197,9 @@ fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> S
         Ok(Response::Entries(_)) => {
             ok_reply(id, tool_error("directory listing is not exposed over MCP"))
         }
+        Ok(Response::MouseState(_)) => {
+            ok_reply(id, tool_error("mouse state is not exposed over MCP"))
+        }
         // This arm used to say `TOOLS` exposes no eval, deliberately — because
         // MCP was the door for the agent running *inside* a session, and giving
         // it the image would let it rewrite the manager holding it. **The
