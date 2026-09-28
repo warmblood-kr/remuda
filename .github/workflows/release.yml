@@ -28,6 +28,11 @@ on:
 permissions:
   contents: write
 
+# Overlapping nightly runs delete and recreate the same release, leaving it a draft.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   plan:
     runs-on: ubuntu-latest
