@@ -6,10 +6,12 @@ use remuda_core::protocol::Request;
 use std::io::{BufRead, Read, Write};
 use std::path::Path;
 
-/// Maximum single JSON frame accepted by this front (64 KiB).
-pub const MAX_FRAME_BYTES: usize = 64 * 1024;
-/// Maximum number of actions in a future batch input request.
-pub const MAX_BATCH_ITEMS: usize = 64;
+/// Maximum single JSON frame accepted by this front (512 KiB).
+pub const MAX_FRAME_BYTES: usize = 512 * 1024;
+/// Maximum bytes accepted in one atomic input batch (64 KiB).
+pub const MAX_INPUT_BYTES: usize = 64 * 1024;
+/// Maximum simultaneous local front connections.
+pub const MAX_CONNECTIONS: usize = 8;
 /// A connection is closed if one request takes longer than this.
 pub const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -37,18 +39,76 @@ pub fn forward_frame(path: &std::path::Path, frame: &[u8]) -> Result<Vec<u8>, St
 /// Serve one request per connection on a local socket. This listener is not
 /// network facing; a later authenticated transport can call `forward_frame`.
 pub fn serve_local(path: &Path, daemon_path: &Path) -> std::io::Result<()> {
-    let listener = crate::ipc::listen(path)?;
-    for accepted in listener.incoming() {
-        let stream = match accepted {
-            Ok(stream) => stream,
-            Err(_) => continue,
-        };
-        let daemon_path = daemon_path.to_path_buf();
-        std::thread::spawn(move || {
-            let _ = serve_connection(stream, &daemon_path);
-        });
+    let listener = listen_front(path)?;
+    let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    loop {
+        accept_front_connection(&listener, daemon_path, &active)?;
     }
+}
+
+fn listen_front(path: &Path) -> std::io::Result<crate::ipc::Listener> {
+    let listener = crate::ipc::listen(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(listener)
+}
+
+fn accept_front_connection(
+    listener: &crate::ipc::Listener,
+    daemon_path: &Path,
+    active: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> std::io::Result<()> {
+    let stream = listener
+        .incoming()
+        .next()
+        .ok_or_else(|| std::io::Error::other("local front listener closed"))??;
+    dispatch_connection(stream, daemon_path, active)
+}
+
+fn dispatch_connection(
+    mut stream: crate::ipc::Stream,
+    daemon_path: &Path,
+    active: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> std::io::Result<()> {
+    let Some(slot) = ConnectionSlot::acquire(active) else {
+        let mut response = serde_json::to_vec(&remuda_core::protocol::Response::error(
+            "remote front is at connection capacity",
+        ))
+        .expect("response serializes");
+        response.push(b'\n');
+        stream.write_all(&response)?;
+        return stream.flush();
+    };
+    let daemon_path = daemon_path.to_path_buf();
+    std::thread::spawn(move || {
+        let _slot = slot;
+        let _ = serve_connection(stream, &daemon_path);
+    });
     Ok(())
+}
+
+struct ConnectionSlot(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl ConnectionSlot {
+    fn acquire(active: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |count| (count < MAX_CONNECTIONS).then_some(count + 1),
+            )
+            .ok()
+            .map(|_| Self(std::sync::Arc::clone(active)))
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 fn serve_connection(mut stream: crate::ipc::Stream, daemon_path: &Path) -> std::io::Result<()> {
@@ -83,14 +143,15 @@ fn serve_connection(mut stream: crate::ipc::Stream, daemon_path: &Path) -> std::
 
 /// Validate the deliberately small request surface. The explicit deny arms
 /// make the compiler require a policy decision for every new Request variant.
+/// Exhaustive on purpose: no wildcard arm, a new Request variant must be classified here.
 pub fn authorize(request: &Request) -> Result<(), String> {
     match request {
         Request::List | Request::CaptureStyled { .. } => Ok(()),
-        Request::Input { lines, .. } if !lines.is_empty() && lines.len() <= MAX_BATCH_ITEMS => {
+        Request::Input { bytes, .. } if !bytes.is_empty() && bytes.len() <= MAX_INPUT_BYTES => {
             Ok(())
         }
         Request::Input { .. } => Err(format!(
-            "remote input batch must contain 1 to {MAX_BATCH_ITEMS} lines"
+            "remote input must contain 1 to {MAX_INPUT_BYTES} bytes"
         )),
         Request::New { .. }
         | Request::SendLine { .. }
@@ -127,7 +188,7 @@ mod tests {
         .is_ok());
         assert!(authorize(&Request::Input {
             name: "dev".into(),
-            lines: vec!["hello".into()]
+            bytes: b"hello\r".to_vec()
         })
         .is_ok());
         assert!(authorize(&Request::Eval {
@@ -196,10 +257,99 @@ mod tests {
             .contains("exceeds"));
         let oversized = Request::Input {
             name: "dev".into(),
-            lines: vec![String::new(); MAX_BATCH_ITEMS + 1],
+            bytes: vec![0; MAX_INPUT_BYTES + 1],
         };
         assert!(decode_frame(&serde_json::to_vec(&oversized).unwrap())
             .unwrap_err()
-            .contains("batch"));
+            .contains("input"));
+        let empty = Request::Input {
+            name: "dev".into(),
+            bytes: Vec::new(),
+        };
+        assert!(decode_frame(&serde_json::to_vec(&empty).unwrap())
+            .unwrap_err()
+            .contains("input"));
+    }
+
+    fn test_socket_path() -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("remuda-front-{}-{stamp}.sock", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_front_socket_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = test_socket_path();
+        let listener = listen_front(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        drop(listener);
+        let _ = std::fs::remove_file(path);
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn stalled_partial_frame_closes_at_connection_timeout() {
+        use std::io::{Read, Write};
+        let path = test_socket_path();
+        let listener = listen_front(&path).unwrap();
+        let socket = path.clone();
+        let worker = std::thread::spawn(move || {
+            let stream = listener.incoming().next().unwrap().unwrap();
+            let _ = serve_connection(stream, Path::new("unused-daemon-socket"));
+        });
+        let mut client = crate::ipc::connect(&socket).unwrap();
+        client.write_all(b"{\"type\":").unwrap();
+        let start = std::time::Instant::now();
+        let mut byte = [0];
+        let result = client.read(&mut byte);
+        let elapsed = start.elapsed();
+        let _ = worker.join();
+        let _ = std::fs::remove_file(socket);
+        assert!(
+            matches!(result, Err(_) | Ok(0)),
+            "stalled connection stayed open"
+        );
+        assert!(elapsed <= CONNECTION_TIMEOUT + std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn connection_after_the_limit_is_refused_while_slots_are_occupied() {
+        use std::io::{Read, Write};
+        let path = test_socket_path();
+        let listener = listen_front(&path).unwrap();
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker_active = std::sync::Arc::clone(&active);
+        let socket = path.clone();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..=MAX_CONNECTIONS {
+                accept_front_connection(
+                    &listener,
+                    Path::new("unused-daemon-socket"),
+                    &worker_active,
+                )
+                .unwrap();
+            }
+        });
+        let mut clients = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            let mut client = crate::ipc::connect(&socket).unwrap();
+            client.write_all(b"{").unwrap();
+            clients.push(client);
+        }
+        let mut overflow = crate::ipc::connect(&socket).unwrap();
+        let _ = worker.join();
+        let mut reply = Vec::new();
+        overflow.read_to_end(&mut reply).unwrap();
+        let response: remuda_core::protocol::Response = serde_json::from_slice(&reply).unwrap();
+        assert!(matches!(
+            response,
+            remuda_core::protocol::Response::Error(_)
+        ));
+        drop(clients);
+        let _ = std::fs::remove_file(socket);
     }
 }
