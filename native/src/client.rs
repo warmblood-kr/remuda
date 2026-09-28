@@ -1044,6 +1044,31 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn local_daemon_response_wait_has_a_timeout() {
+        let path = std::env::temp_dir().join(format!(
+            "remuda-client-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = crate::ipc::listen(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let _stream = listener.incoming().next().unwrap().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let started = Instant::now();
+        let error =
+            request_with_timeout(&path, &Request::List, Duration::from_millis(40)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn reply_reader_rejects_a_line_over_the_shared_reply_limit() {
         use super::read_response;
         use crate::ipc;
@@ -1081,6 +1106,32 @@ mod tests {
         let mut output = Vec::new();
         reset_input_modes(&mut output).unwrap();
         assert_eq!(output, RESET_INPUT_MODES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_daemon_response_wait_has_a_timeout() {
+        use interprocess::local_socket::traits::ListenerExt as _;
+        let path = std::env::temp_dir().join(format!(
+            "remuda-client-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = crate::ipc::listen(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let _stream = listener.incoming().next().unwrap().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let started = std::time::Instant::now();
+        let error =
+            request_with_timeout(&path, &Request::List, Duration::from_millis(40)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

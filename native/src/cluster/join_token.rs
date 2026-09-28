@@ -148,6 +148,21 @@ impl JoinTokenStore {
             }
         }
     }
+
+    /// Persist a periodic wall-clock observation so serving closes token expiry
+    /// state promptly after a system clock rollback.
+    pub fn observe(&self) -> io::Result<()> {
+        #[cfg(windows)]
+        return Err(unsupported_storage());
+        #[cfg(not(windows))]
+        {
+            let _guard = storage::StateLock::acquire(&self.directory)?;
+            let now = self.clock.unix_seconds();
+            let mut state = load_state(&self.directory, now)?;
+            state.observe(now);
+            save_state(&self.directory, &state)
+        }
+    }
 }
 
 #[cfg(not(windows))]
