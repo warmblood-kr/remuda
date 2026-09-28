@@ -749,6 +749,14 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
                 // "*sessions*" buffer, `tools.lua`) can show the same
                 // attached state the list has always drawn.
                 row.set("attached", session.attached)?;
+                // Seconds since an attached human typed; math.huge if never, so
+                // the field is always present and nil means an older core.
+                row.set(
+                    "human_idle",
+                    session
+                        .human_idle
+                        .map_or(f64::INFINITY, |idle| idle.as_secs_f64()),
+                )?;
                 rows.set(index + 1, row)?;
             }
             Ok(Value::Table(rows))
