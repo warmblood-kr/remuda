@@ -357,6 +357,17 @@ fn a_wire_size_below_the_floor_is_clamped_not_honoured() {
     }
 }
 
+/// EXPR evaluated with `r` bound to session "target"'s Lua `ls()` row.
+fn target_row(path: &Path, expr: &str) -> String {
+    let code = format!(
+        "for _, r in ipairs(remuda.ls()) do if r.name == 'target' then return tostring({expr}) end end"
+    );
+    match client::request(path, &Request::Eval { code, name: None }) {
+        Ok(Response::Value(value)) => value,
+        other => panic!("ls row: {other:?}"),
+    }
+}
+
 #[test]
 fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     // The binary derives its socket as $REMUDA_RUNTIME_DIR/remuda/default.sock,
@@ -414,6 +425,9 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
         other => panic!("list: {other:?}"),
     };
     assert_eq!(human_idle(), None);
+    // In Lua a never-typed session is idle forever, so the field is always
+    // present and its absence can only mean an older core.
+    assert_eq!(target_row(&path, "r.human_idle == math.huge"), "true");
 
     // 2. Keystrokes reach the far session, and its output comes back.
     let held = viewer.attach().expect("drive the viewer");
@@ -425,17 +439,7 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
         human_idle().is_some(),
         "typing through attach sets human_idle"
     );
-    let lua = client::request(
-        &path,
-        &Request::Eval {
-            code: "for _, r in ipairs(remuda.ls()) do if r.name == 'target' then return type(r.human_idle) end end".into(),
-            name: None,
-        },
-    );
-    assert!(
-        matches!(&lua, Ok(Response::Value(v)) if v == "number"),
-        "{lua:?}"
-    );
+    assert_eq!(target_row(&path, "r.human_idle < math.huge"), "true");
 
     // 3. Ctrl-\ detaches. The proof is on the far side: close is refused
     //    while attached and accepted afterwards, so this cannot pass by the
