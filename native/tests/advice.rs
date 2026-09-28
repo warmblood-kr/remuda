@@ -124,3 +124,27 @@ fn advice_errors_name_the_chain_and_bad_calls_are_refused() {
         assert!(image.eval(bad, None).is_err(), "should refuse: {bad}");
     }
 }
+
+/// A mod that redefines an advised function on load keeps its advice: the
+/// new definition becomes the base (Emacs `defalias` respecting advice).
+#[test]
+fn advice_survives_a_mod_redefining_the_function() {
+    let root = std::env::temp_dir().join(format!("remuda-advice-reattach-{}", std::process::id()));
+    let mod_dir = root.join("remuda/mods/host");
+    std::fs::create_dir_all(mod_dir.join("packages/host")).unwrap();
+    std::fs::write(
+        mod_dir.join("extension.toml"),
+        "name = \"host\"\nentry = \"packages/host/init.lua\"\napi = \"remuda-lua-v1\"\n",
+    )
+    .unwrap();
+    let entry = mod_dir.join("packages/host/init.lua");
+    std::env::set_var("XDG_DATA_HOME", &root);
+    let image = image("reattach");
+    std::fs::write(&entry, "function remuda._adv_host(x) return 'v1:' .. x end").unwrap();
+    read(&image, "remuda.exec('host')");
+    read(&image, "remuda.advise('remuda._adv_host', 'around', function(orig, x) return '[' .. orig(x) .. ']' end, { id = 'wrap' })");
+    std::fs::write(&entry, "function remuda._adv_host(x) return 'v2:' .. x end").unwrap();
+    read(&image, "remuda.exec('host')");
+    assert_eq!(read(&image, "return remuda._adv_host('x')"), "[v2:x]");
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -506,6 +506,18 @@ fn exec_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
 }
 
 fn execute_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Result<()> {
+    let loaded = load_package(lua, name, require_lifecycle);
+    // A mod that redefined an advised function keeps its advice: the new
+    // definition becomes the base (hook-design §2). Even after a failed
+    // load, which may have redefined some before it stopped.
+    let remuda: Table = lua.globals().get("remuda")?;
+    if let Ok(reattach) = remuda.get::<mlua::Function>("_advice_reattach") {
+        reattach.call::<()>(())?;
+    }
+    loaded
+}
+
+fn load_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Result<()> {
     let package = crate::packages::resolve(name)
         .map_err(mlua::Error::runtime)?
         .ok_or_else(|| mlua::Error::runtime(format!("no such package: {name}")))?;
