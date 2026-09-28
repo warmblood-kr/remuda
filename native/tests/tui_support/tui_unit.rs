@@ -543,43 +543,60 @@ fn narrow_terminals_clamp_content_fit_and_manual_widths_without_panicking() {
 fn a_seventeen_column_frame_never_paints_past_the_terminal_edge() {
     let ui = make_ui(vec![row("alpha", true, false)]);
     let cols = 17;
-    let frame = render(&ui, "preview", "default", cols, 5);
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    let mut chars = frame.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\x1b' || chars.next() != Some('[') {
-            if ch != '\x1b' {
-                line.push(ch);
+    let frames = [
+        render(&ui, &"preview".repeat(20), "default", cols, 5),
+        render_styled(
+            &ui,
+            &vec![text_row(80); 4],
+            hidden_cursor(),
+            "default",
+            cols,
+            5,
+        ),
+    ];
+
+    fn painted_lines(frame: &str) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        let mut chars = frame.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\x1b' || chars.next() != Some('[') {
+                if ch != '\x1b' {
+                    line.push(ch);
+                }
+                continue;
             }
-            continue;
-        }
-        let mut end = None;
-        for control in chars.by_ref() {
-            if control.is_ascii_alphabetic() {
-                end = Some(control);
-                break;
+            let mut end = None;
+            for control in chars.by_ref() {
+                if control.is_ascii_alphabetic() {
+                    end = Some(control);
+                    break;
+                }
+            }
+            if end == Some('H') && !line.is_empty() {
+                lines.push(std::mem::take(&mut line));
             }
         }
-        if end == Some('H') && !line.is_empty() {
-            lines.push(std::mem::take(&mut line));
+        if !line.is_empty() {
+            lines.push(line);
         }
-    }
-    if !line.is_empty() {
-        lines.push(line);
+        lines
     }
 
-    assert_eq!(
-        lines.len(),
-        5,
-        "one painted line per terminal row: {frame:?}"
-    );
-    for (index, line) in lines.iter().enumerate() {
-        assert!(
-            visible_width(line) <= cols as usize,
-            "painted row {} exceeds {cols} columns: {line:?}",
-            index + 1
+    for (renderer, frame) in ["plain", "styled"].into_iter().zip(frames.iter()) {
+        let lines = painted_lines(frame);
+        assert_eq!(
+            lines.len(),
+            5,
+            "{renderer}: one painted line per terminal row"
         );
+        for (index, line) in lines.iter().enumerate() {
+            assert!(
+                visible_width(line) <= cols as usize,
+                "{renderer} row {} exceeds {cols} columns: {line:?}",
+                index + 1
+            );
+        }
     }
 }
 
@@ -607,8 +624,10 @@ fn crop_reference(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>,
                 .collect();
             if chars.len() > (pan as usize) + (cols as usize) {
                 cut = true;
-                visible.pop();
-                visible.push('→');
+                if cols > 0 {
+                    visible.pop();
+                    visible.push('→');
+                }
             }
             visible
         })

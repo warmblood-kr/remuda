@@ -1075,7 +1075,7 @@ pub fn crop(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool)
             let mut visible: String = cells.into_iter().collect();
             // The marker has to go on here rather than in `fit`: by the time
             // the row is padded there is nothing left to tell it was cut.
-            if row_cut {
+            if row_cut && cols > 0 {
                 visible.pop();
                 visible.push('→');
             }
@@ -1272,7 +1272,7 @@ fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Ve
     let out = cropped
         .into_iter()
         .map(|(mut visible, row_cut)| {
-            if row_cut {
+            if row_cut && cols > 0 {
                 // Free at least 1 display column for `→`. A wide cell's
                 // trailing continuation frees 0 on its own, so keep popping
                 // until real width comes back — see steps/023.
@@ -1285,7 +1285,7 @@ fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Ve
                 }
             }
             let mut s = render_styled_row(&visible);
-            if row_cut {
+            if row_cut && cols > 0 {
                 s.push('→');
             }
             s
