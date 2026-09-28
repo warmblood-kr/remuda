@@ -183,6 +183,8 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
     // Only the key thread can tell the two exits apart: the reader below just
     // sees the stream end, which is true of a detach and of a death alike.
     let detached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let trace_input = std::env::var_os("REMUDA_TRACE_INPUT").map(PathBuf::from);
 
     // Keystrokes out, on their own thread; the screen pump runs here.
@@ -190,6 +192,8 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
         let mut stream = reader_stream.as_ref().try_clone()?;
         let reader_stream = std::sync::Arc::clone(&reader_stream);
         let detached = std::sync::Arc::clone(&detached);
+        let output_stop = std::sync::Arc::clone(&output_stop);
+        let output_done = std::sync::Arc::clone(&output_done);
         move || {
             let mut stdin = std::io::stdin().lock();
             let mut buf = [0u8; 1024];
@@ -218,14 +222,19 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
             // Ends the screen pump below, which then returns from `attach` and
             // drops every handle on this connection — that hang-up is what the
             // daemon reads as "the human left".
-            ipc::wake(&reader_stream);
+            ipc::stop_reader(&reader_stream, &output_stop, || {
+                output_done.load(std::sync::atomic::Ordering::SeqCst)
+            });
         }
     });
 
     let mut stdout = std::io::stdout();
     let mut buf = [0u8; 8192];
     let mut reader = reader_stream.as_ref();
-    while let Ok(n) = reader.read(&mut buf) {
+    while !output_stop.load(std::sync::atomic::Ordering::SeqCst) {
+        let Ok(n) = reader.read(&mut buf) else {
+            break;
+        };
         if n == 0 {
             break;
         }
@@ -234,7 +243,10 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
         }
     }
 
-    ipc::wake(&reader_stream);
+    output_done.store(true, std::sync::atomic::Ordering::SeqCst);
+    ipc::stop_reader(&reader_stream, &output_stop, || {
+        output_done.load(std::sync::atomic::Ordering::SeqCst)
+    });
     let left = if detached.load(std::sync::atomic::Ordering::SeqCst) {
         Left::Detached
     } else {

@@ -48,11 +48,11 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
 /// Whether a failed connection proves no daemon is running: a missing endpoint
 /// or (Unix) a refused stale socket. Any other error must surface, or a second
 /// daemon could split control state from the sessions the first still owns.
-pub fn may_start_daemon(path: &Path, error: &io::Error) -> bool {
+pub fn may_start_daemon(_path: &Path, error: &io::Error) -> bool {
     match error.kind() {
         io::ErrorKind::NotFound => true,
         #[cfg(unix)]
-        io::ErrorKind::ConnectionRefused => path.exists(),
+        io::ErrorKind::ConnectionRefused => _path.exists(),
         _ => false,
     }
 }

@@ -15,7 +15,7 @@ use remuda_core::protocol::{Request, Response};
 use remuda_core::{Session, Size};
 use remuda_native::{client, daemon, ipc, CommandBuilder, PtyAgent, SystemClock};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -131,10 +131,14 @@ fn collect_until_bytes(receiver: &Receiver<Vec<u8>>, needle: &[u8]) {
             Instant::now() < deadline,
             "terminal output omitted {needle:?}"
         );
-        let chunk = receiver
-            .recv_timeout(Duration::from_millis(500))
-            .expect("attach client stays alive through detach cleanup");
-        output.extend_from_slice(&chunk);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(500))) {
+            Ok(chunk) => output.extend_from_slice(&chunk),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!("attach client exited before writing {needle:?}")
+            }
+        }
     }
 }
 
