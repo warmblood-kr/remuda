@@ -540,6 +540,50 @@ fn narrow_terminals_clamp_content_fit_and_manual_widths_without_panicking() {
 }
 
 #[test]
+fn a_seventeen_column_frame_never_paints_past_the_terminal_edge() {
+    let ui = make_ui(vec![row("alpha", true, false)]);
+    let cols = 17;
+    let frame = render(&ui, "preview", "default", cols, 5);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut chars = frame.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' || chars.next() != Some('[') {
+            if ch != '\x1b' {
+                line.push(ch);
+            }
+            continue;
+        }
+        let mut end = None;
+        for control in chars.by_ref() {
+            if control.is_ascii_alphabetic() {
+                end = Some(control);
+                break;
+            }
+        }
+        if end == Some('H') && !line.is_empty() {
+            lines.push(std::mem::take(&mut line));
+        }
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+
+    assert_eq!(
+        lines.len(),
+        5,
+        "one painted line per terminal row: {frame:?}"
+    );
+    for (index, line) in lines.iter().enumerate() {
+        assert!(
+            visible_width(line) <= cols as usize,
+            "painted row {} exceeds {cols} columns: {line:?}",
+            index + 1
+        );
+    }
+}
+
+#[test]
 fn a_terminal_too_small_to_split_still_produces_a_frame() {
     let (list, preview) = layout(10, 80);
     assert_eq!(list + preview, 9, "the divider, and no underflow");

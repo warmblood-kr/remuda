@@ -1090,6 +1090,9 @@ pub fn crop(screen: &str, cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool)
 /// a wide (CJK) name used to overflow this budget. See steps/025.
 fn fit(text: &str, width: u16) -> String {
     let width = width as usize;
+    if width == 0 {
+        return String::new();
+    }
     if visible_width(text) > width {
         let mut out = String::new();
         let mut used = 0usize;
@@ -1134,7 +1137,7 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
     let body = rows.saturating_sub(1);
     // The border, and the only thing on screen that is always saying where the
     // keyboard is pointing. A prefix key's state is invisible; this is not.
-    let divider = if ui.list_visible {
+    let divider = if ui.list_visible && list_w < cols {
         match ui.focus {
             Focus::List => "│",
             Focus::Session => "\x1b[7m┃\x1b[0m",
@@ -1370,7 +1373,7 @@ pub fn render_styled(
 ) -> String {
     let (list_w, preview_w) = ui_layout(ui, cols);
     let body = rows.saturating_sub(1);
-    let divider = if ui.list_visible {
+    let divider = if ui.list_visible && list_w < cols {
         match ui.focus {
             Focus::List => "│",
             Focus::Session => "\x1b[7m┃\x1b[0m",
