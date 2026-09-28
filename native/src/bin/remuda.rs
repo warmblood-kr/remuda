@@ -213,6 +213,8 @@ remuda — a pty manager you can attach to
   remuda mod remove NAME          remove one installed mod
   remuda cluster                  show cluster status
   remuda cluster init             create this node's cluster identity
+  remuda cluster nodes            list local cluster membership
+  remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster remote [node/session] open the read-only cluster tree
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
@@ -283,6 +285,8 @@ remuda — terminal orchestration for coding agents
   remuda mod remove NAME         remove a mod
   remuda cluster                 show cluster status
   remuda cluster init            create this node's cluster identity
+  remuda cluster nodes           list local cluster membership
+  remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster remote [node/session] open the read-only cluster tree
 
   remuda doc | repl | -e CODE    use the persistent Lua runtime
@@ -315,6 +319,8 @@ fn help_command() -> ExitCode {
 enum ClusterCommand {
     Status,
     Init,
+    Nodes,
+    Revoke { target: String, yes: bool },
     Remote(Option<String>),
     Invalid,
 }
@@ -323,6 +329,15 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
     match args {
         [] => ClusterCommand::Status,
         ["init"] => ClusterCommand::Init,
+        ["nodes"] => ClusterCommand::Nodes,
+        ["revoke", target] => ClusterCommand::Revoke {
+            target: (*target).to_string(),
+            yes: false,
+        },
+        ["revoke", target, "--yes"] => ClusterCommand::Revoke {
+            target: (*target).to_string(),
+            yes: true,
+        },
         ["remote"] => ClusterCommand::Remote(None),
         ["remote", target] if target.contains('/') => {
             ClusterCommand::Remote(Some((*target).to_string()))
@@ -355,6 +370,15 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             }
             Err(error) => fail(format!("cluster init: {error}")),
         },
+        ClusterCommand::Nodes => match remuda_native::cluster::nodes() {
+            Ok(Some((identity, registry))) => {
+                print!("{}", remuda_native::cluster::format_nodes_table(&identity, &registry));
+                ExitCode::SUCCESS
+            }
+            Ok(None) => fail("cluster is not initialized; run `remuda cluster init`"),
+            Err(error) => fail(format!("cluster nodes: {error}")),
+        },
+        ClusterCommand::Revoke { target, yes } => cluster_revoke(&target, yes),
         ClusterCommand::Remote(target) => {
             let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into());
             with_daemon(server, path, |path| {
@@ -364,8 +388,73 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                 }
             })
         }
-        ClusterCommand::Invalid => fail("usage: remuda cluster [init | remote [node/session]]"),
+        ClusterCommand::Invalid => fail("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | remote [node/session]]"),
     }
+}
+
+fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
+    let (identity, registry) = match remuda_native::cluster::nodes() {
+        Ok(Some(nodes)) => nodes,
+        Ok(None) => return fail("cluster is not initialized; run `remuda cluster init`"),
+        Err(error) => return fail(format!("cluster nodes: {error}")),
+    };
+    let entry = match remuda_native::cluster::resolve_node(&registry.authorized_nodes, target) {
+        Ok(entry) => entry,
+        Err(error) => return fail(format!("cluster revoke: {error}")),
+    };
+    if entry.node_fp == identity.node_fp {
+        return fail("cluster revoke: cannot revoke self");
+    }
+    let fingerprint = entry.node_fp.clone();
+    let label = remuda_native::cluster::node_label(&entry.node_fp);
+    use std::io::IsTerminal;
+    let prompt = match revoke_confirmation(yes, std::io::stdin().is_terminal()) {
+        Ok(prompt) => prompt,
+        Err(message) => return fail(message),
+    };
+    match confirm_revoke(&label, &fingerprint, prompt) {
+        Ok(false) => {
+            println!("Revocation cancelled.");
+            return ExitCode::SUCCESS;
+        }
+        Ok(true) => {}
+        Err(error) => return fail(format!("cluster revoke: {error}")),
+    }
+    match remuda_native::cluster::revoke(&fingerprint) {
+        Ok(remuda_native::cluster::RevokeOutcome::Revoked) => {
+            println!(
+                "Node {label} revoked locally; propagates when the cluster transport is enabled."
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(remuda_native::cluster::RevokeOutcome::AlreadyRevoked) => {
+            println!("Node {label} is already revoked.");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(format!("cluster revoke: {error}")),
+    }
+}
+
+fn revoke_confirmation(yes: bool, is_tty: bool) -> Result<bool, &'static str> {
+    if yes {
+        Ok(false)
+    } else if is_tty {
+        Ok(true)
+    } else {
+        Err("use --yes to confirm non-interactively")
+    }
+}
+
+fn confirm_revoke(label: &str, fingerprint: &str, prompt: bool) -> std::io::Result<bool> {
+    use std::io::{self, Write};
+    if !prompt {
+        return Ok(true);
+    }
+    print!("Revoke node {label} ({fingerprint})? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(answer.trim(), "y" | "Y"))
 }
 
 fn cluster_init_message(created: bool) -> &'static str {
@@ -378,7 +467,7 @@ fn cluster_init_message(created: bool) -> &'static str {
 
 #[cfg(test)]
 mod cluster_cli_tests {
-    use super::{cluster_init_message, parse_cluster_command, ClusterCommand};
+    use super::{cluster_init_message, parse_cluster_command, revoke_confirmation, ClusterCommand};
 
     #[test]
     fn cluster_status_and_init_are_recognized() {
@@ -402,6 +491,39 @@ mod cluster_cli_tests {
     #[test]
     fn repeated_init_uses_already_initialized_wording() {
         assert_eq!(cluster_init_message(false), "Already initialized");
+    }
+
+    #[test]
+    fn cluster_nodes_is_recognized() {
+        assert_eq!(parse_cluster_command(&["nodes"]), ClusterCommand::Nodes);
+    }
+
+    #[test]
+    fn cluster_revoke_accepts_target_and_yes_flag() {
+        assert_eq!(
+            parse_cluster_command(&["revoke", "node-abcd1234"]),
+            ClusterCommand::Revoke {
+                target: "node-abcd1234".into(),
+                yes: false
+            }
+        );
+        assert_eq!(
+            parse_cluster_command(&["revoke", "SHA256:abc", "--yes"]),
+            ClusterCommand::Revoke {
+                target: "SHA256:abc".into(),
+                yes: true
+            }
+        );
+    }
+
+    #[test]
+    fn revoke_confirmation_requires_yes_for_non_tty() {
+        assert_eq!(
+            revoke_confirmation(false, false),
+            Err("use --yes to confirm non-interactively")
+        );
+        assert_eq!(revoke_confirmation(true, false), Ok(false));
+        assert_eq!(revoke_confirmation(false, true), Ok(true));
     }
 }
 
