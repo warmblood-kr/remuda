@@ -39,6 +39,8 @@
 <p><code>cancel(handle) -&gt; nil</code> — Cancel a schedule by the handle <span class="title-ref">schedule()</span> returned.</p>
 <h2 id="capture">capture</h2>
 <p><code>capture(name) -&gt; string</code> — Read a session's current screen as plain text.</p>
+<h2 id="capture_styled">capture_styled</h2>
+<p><code>capture_styled(name) -&gt; {rows, cursor = {row, col, visible}}</code> — Read a session's screen as rows of {text, dim} spans, plus its cursor.</p>
 <h2 id="clear_hooks">clear_hooks</h2>
 <p><code>clear_hooks(opts) -&gt; nil</code> — Remove every hook registered under a group.</p>
 <h2 id="click">click</h2>
