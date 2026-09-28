@@ -402,7 +402,7 @@ impl Ui {
         let row_offset = if self.visual_screen.is_empty() {
             (session.size.rows() as usize).saturating_sub(body as usize)
         } else {
-            preview_row_offset(&self.visual_screen, self.preview_cursor.row, body)
+            ui_preview_row_offset(self, body)
         };
         let child_row = row_offset + pane_row as usize;
         let child_col = self.pan as usize + pane_col as usize;
@@ -430,7 +430,7 @@ impl Ui {
         let row_offset = if self.visual_screen.is_empty() {
             (session.size.rows() as usize).saturating_sub(body as usize)
         } else {
-            preview_row_offset(&self.visual_screen, self.preview_cursor.row, body)
+            ui_preview_row_offset(self, body)
         };
         let child_row = row_offset + pane_row as usize;
         let child_col = self.pan as usize + pane_col as usize;
@@ -1938,7 +1938,23 @@ fn crop_styled(
     pan: u16,
     bottom_row: usize,
 ) -> (Vec<String>, bool) {
-    let viewport = Viewport::bottom_anchored_at(cells.len(), pan, cols, rows, bottom_row);
+    let row_offset = anchored_row_offset(cells.len(), rows, bottom_row);
+    crop_styled_at_offset(cells, cols, rows, pan, row_offset)
+}
+
+fn crop_styled_at_offset(
+    cells: &[Vec<StyledCell>],
+    cols: u16,
+    rows: u16,
+    pan: u16,
+    row_offset: usize,
+) -> (Vec<String>, bool) {
+    let viewport = Viewport {
+        row_offset: row_offset.min(cells.len().saturating_sub(rows as usize)),
+        col_offset: pan,
+        width: cols,
+        height: rows,
+    };
     let (cropped, cut) = viewport.crop(cells);
     let out = cropped
         .into_iter()
@@ -1976,8 +1992,30 @@ fn preview_anchor_row(cells: &[Vec<StyledCell>], cursor_row: u16) -> usize {
         .min(cells.len().saturating_sub(1))
 }
 
-fn preview_row_offset(cells: &[Vec<StyledCell>], cursor_row: u16, height: u16) -> usize {
-    anchored_row_offset(cells.len(), height, preview_anchor_row(cells, cursor_row))
+fn preview_row_offset(
+    cells: &[Vec<StyledCell>],
+    cursor: Cursor,
+    height: u16,
+    preserve_history: bool,
+) -> usize {
+    if preserve_history || !cursor.visible {
+        return cells.len().saturating_sub(height as usize);
+    }
+    anchored_row_offset(cells.len(), height, preview_anchor_row(cells, cursor.row))
+        .min(cursor.row as usize)
+}
+
+fn ui_preview_row_offset(ui: &Ui, height: u16) -> usize {
+    let preserve_history = ui
+        .selected()
+        .and_then(|session| ui.scrollback.get(&session.name))
+        .is_some_and(|state| state.offset > 0);
+    preview_row_offset(
+        &ui.visual_screen,
+        ui.preview_cursor,
+        height,
+        preserve_history,
+    )
 }
 
 /// The one text-width rule the list renderer uses. Ambiguous-width
@@ -2027,17 +2065,19 @@ fn locate_cursor(
     preview_w: u16,
     body: u16,
     list_w: u16,
+    preserve_history: bool,
 ) -> Option<(u16, u16)> {
     if !cursor.visible {
         return None;
     }
-    let viewport = Viewport::bottom_anchored_at(
+    let mut viewport = Viewport::bottom_anchored_at(
         cells.len(),
         pan,
         preview_w,
         body,
         preview_anchor_row(cells, cursor.row),
     );
+    viewport.row_offset = preview_row_offset(cells, cursor, body, preserve_history);
     let (panel_row, panel_col) =
         viewport.map_cursor(cells, cursor.row as usize, cursor.col as usize)?;
     // Convert pane-local coordinates to 1-based terminal coordinates, adding
@@ -2075,14 +2115,21 @@ pub fn render_styled(
     };
 
     let selected = cells_with_selection(ui, cells);
-    let (lines, cut) = crop_styled(
-        &selected,
+    let preserve_history = ui
+        .selected()
+        .and_then(|session| ui.scrollback.get(&session.name))
+        .is_some_and(|state| state.offset > 0);
+    let row_offset = preview_row_offset(cells, cursor, body, preserve_history);
+    let (lines, cut) = crop_styled_at_offset(&selected, preview_w, body, ui.pan, row_offset);
+    let caret = locate_cursor(
+        cells,
+        cursor,
+        ui.pan,
         preview_w,
         body,
-        ui.pan,
-        preview_anchor_row(&selected, cursor.row),
+        list_w,
+        preserve_history,
     );
-    let caret = locate_cursor(cells, cursor, ui.pan, preview_w, body, list_w);
     // Hide before moving the terminal cursor around the frame. The final
     // caret state below is the only place that makes it visible again.
     let mut out = String::from("\x1b[?2026h\x1b[?25l\x1b[H");
