@@ -1525,7 +1525,32 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
         None if session_index == ui.selected => format!("\x1b[7m{}\x1b[0m", session.name),
         None => session.name.clone(),
     };
-    fit(&content, width)
+    fit_session_row(&content, width)
+}
+
+/// Keep the status dot in one shared column on every row. Attached rows use
+/// the horse in the final three cells; other rows reserve the same cells.
+/// Only the styled name is shortened, one Unicode scalar at a time, by `fit`.
+fn fit_session_row(content: &str, width: u16) -> String {
+    const MARKER: &str = " 🏇";
+    const PLAIN_PAD: &str = "   ";
+    for state in [" \x1b[32m●\x1b[0m", " \x1b[31m●\x1b[0m"] {
+        if let Some(name) = content.strip_suffix(state) {
+            let suffix = format!("{state}{PLAIN_PAD}");
+            let name_width = width.saturating_sub(visible_width(&suffix) as u16);
+            return format!("{}{}", fit(name, name_width), suffix);
+        }
+        let attached = format!("{state}{MARKER}");
+        if let Some(name) = content.strip_suffix(&attached) {
+            let name_width = width.saturating_sub(visible_width(&attached) as u16);
+            return format!("{}{}", fit(name, name_width), attached);
+        }
+    }
+    if let Some(name) = content.strip_suffix(MARKER) {
+        let name_width = width.saturating_sub(visible_width(MARKER) as u16);
+        return format!("{}{}", fit(name, name_width), MARKER);
+    }
+    fit(content, width)
 }
 
 /// The crop notice moved here when the preview lost its title band: a crop that
