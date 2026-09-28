@@ -103,3 +103,48 @@ fn cli_exec_error_names_the_wrapper_not_the_mod_entry() {
     );
     assert!(stderr.contains("remuda exec:1:"), "{stderr}");
 }
+
+/// `start` that errors *indirectly* — by emitting an event whose hook errors —
+/// must fail `exec` the same as a `start` that errors directly. #162.
+#[test]
+fn cli_exec_fails_when_a_start_hook_errors() {
+    let dir = std::env::temp_dir().join(format!("rcz-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let mod_dir = dir.join("data/remuda/mods/hookbroken");
+    fs::create_dir_all(mod_dir.join("packages/hookbroken")).unwrap();
+    fs::write(
+        mod_dir.join("extension.toml"),
+        "name = \"hookbroken\"\nentry = \"packages/hookbroken/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    fs::write(
+        mod_dir.join("packages/hookbroken/init.lua"),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function()
+            remuda.on("some-event", function() error("hook exploded") end)
+            remuda.emit("some-event")
+          end,
+        }"#,
+    )
+    .unwrap();
+    let remuda = |args: &[&str]| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(["-s", "s"])
+            .args(args)
+            .env("REMUDA_RUNTIME_DIR", &dir)
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("HOME", &dir)
+            .output()
+            .expect("run remuda")
+    };
+
+    let exec = remuda(&["exec", "hookbroken"]);
+    remuda(&["stop", "-f"]);
+    let _ = fs::remove_dir_all(&dir);
+
+    let stderr = String::from_utf8_lossy(&exec.stderr);
+    assert!(!exec.status.success(), "{stderr}");
+    assert!(stderr.contains("hook exploded"), "{stderr}");
+}

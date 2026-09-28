@@ -260,6 +260,49 @@ jobs:
               --generate-notes dist/*
           fi
 
+      - name: verify the release did not revert to draft
+        # 2026-09-28 incident: this job's own log confirmed a clean
+        # create→upload→publish of "nightly" for commit abe80a0, but ~40s
+        # later something OUTSIDE this workflow flipped the release back to
+        # draft:true, breaking the public download URL for 10+ minutes
+        # before a human noticed. No other workflow/script/webhook in this
+        # repo touches releases, and the org audit log was not accessible,
+        # so the external cause is still unknown and needs org audit-log
+        # access this workflow's token doesn't have.
+        #
+        # This step is detection, not a root-cause fix: it does NOT prevent
+        # whatever did that — it only turns a silent revert into a failed
+        # run, so it shows up here instead of leaving a broken download URL
+        # for however long until someone notices externally. Checks both
+        # the API's draft flag and the actual public, unauthenticated
+        # download URL (the thing a real colleague's install.sh hits), once
+        # now and once after a short wait, because the observed revert
+        # landed ~40s after a verified-good publish, not immediately.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -eu
+          check_draft() { gh release view "$TAG" --json isDraft --jq .isDraft; }
+          check_download() {
+            curl -s -o /dev/null -w '%{http_code}' -L \
+              "https://github.com/warmblood-kr/remuda/releases/download/$TAG/SHA256SUMS"
+          }
+          verify() {
+            when="$1"
+            draft="$(check_draft)"
+            code="$(check_download)"
+            echo "draft=$draft download-status=$code ($when)"
+            if [ "$draft" = true ] || [ "$code" != 200 ]; then
+              echo "::error::$TAG failed verification $when: draft=$draft, unauthenticated download status=$code (expected draft=false, status=200). External to this workflow (cause unknown) — the download URL may be broken until someone re-publishes $TAG."
+              exit 1
+            fi
+          }
+
+          verify "right after publish"
+          sleep 60
+          verify "60s after publish"
+
       - name: publish the version index
         env:
           CHANNEL: ${{ needs.plan.outputs.channel }}
