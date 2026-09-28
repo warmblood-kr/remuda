@@ -34,9 +34,7 @@ const REPLAY_CAPACITY: usize = 65_536;
 static LISTENER_ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Explicit listener address and opt-in for wildcard binding.
-///
-/// On operating systems with dual-stack IPv6 sockets, an opted-in `[::]` bind
-/// may also accept IPv4 connections.
+/// On dual-stack IPv6 systems, an opted-in `[::]` bind may also accept IPv4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListenerConfig {
     pub bind_addr: SocketAddr,

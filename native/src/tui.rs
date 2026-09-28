@@ -1527,7 +1527,9 @@ mod visual_mode_tests {
             ),
             Ok(Response::Value(_))
         ));
-        let capture_deadline = Instant::now() + Duration::from_secs(5);
+        // ConPTY can take several seconds to launch the shell and flush its
+        // first output on a loaded Windows CI worker.
+        let capture_deadline = Instant::now() + Duration::from_secs(30);
         let (cells, wrapped) = loop {
             let (cells, wrapped, _, _, _) = capture_styled(&path, name, 0).expect("real capture");
             let captured: String = cells[0].iter().map(|cell| cell.text.as_str()).collect();
@@ -1538,7 +1540,7 @@ mod visual_mode_tests {
                 Instant::now() < capture_deadline,
                 "fixture text not captured: {captured:?}"
             );
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(25));
         };
         assert_eq!(cells[0].iter().filter(|cell| cell.wide).count(), 6);
 
