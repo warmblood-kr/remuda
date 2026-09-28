@@ -260,6 +260,8 @@ mod tests {
         vec![SessionSummary {
             id: "session-dev".into(),
             name: "dev".into(),
+            instance_id: None,
+            output_version: None,
             alive: true,
             idle: Duration::ZERO,
             output_idle: Some(Duration::ZERO),
@@ -287,6 +289,8 @@ mod tests {
         sessions.push(SessionSummary {
             id: "session-shell".into(),
             name: "shell".into(),
+            instance_id: None,
+            output_version: None,
             alive: true,
             idle: Duration::ZERO,
             output_idle: Some(Duration::ZERO),
