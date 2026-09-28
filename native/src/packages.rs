@@ -73,6 +73,8 @@ pub struct ModSpec {
     pub entry: String,
     pub command: Option<String>,
     pub lifecycle: Option<String>,
+    /// `(mod, constraint)` pairs from `requires`, sorted by mod name.
+    pub requires: Vec<(String, String)>,
 }
 
 /// Return the installed mod name that owns a CLI command. Commands are
@@ -86,6 +88,21 @@ pub fn subcommand(name: &str) -> Result<Option<String>, String> {
 
 pub fn has_subcommand(name: &str) -> bool {
     subcommand(name).ok().flatten().is_some()
+}
+
+/// `mods/NAME/` exists but its manifest is missing or unreadable, typically
+/// mid-update (#134). The message names the mod and where it is, instead of
+/// the CLI falling through to its generic usage text.
+pub fn half_installed(name: &str) -> Option<String> {
+    let dir = mods_dir().ok()?.join(name);
+    if !dir.is_dir() {
+        return None;
+    }
+    let reason = read_manifest(&dir.join("extension.toml")).err()?;
+    Some(format!(
+        "mod '{name}' at {} has no manifest (partially installed or mid-update?): {reason}",
+        dir.display()
+    ))
 }
 
 /// Resolve only installed modules. Mods are deliberately independent from the
@@ -266,6 +283,13 @@ pub fn remove(name: &str) -> Result<RemoveReport, String> {
             spec.name
         ));
     }
+    let dependents = dependents(name)?;
+    if !dependents.is_empty() {
+        let list = dependents.join(", ");
+        return Err(format!(
+            "mod {name} is required by {list}; remove {list} first"
+        ));
+    }
     fs::remove_dir_all(&root).map_err(|error| format!("cannot remove mod {name}: {error}"))?;
     Ok(RemoveReport {
         manifest: manifest_from_spec(spec, "removed"),
@@ -321,6 +345,9 @@ fn install_from_checkout(
     }
     let manifest_path = checkout.join("extension.toml");
     let spec = read_manifest(&manifest_path)?;
+    for (dependency, constraint) in &spec.requires {
+        check_requirement(&spec.name, dependency, constraint)?;
+    }
     if let Some(expected_name) = expected_name {
         if spec.name != expected_name {
             return Err(format!(
@@ -491,6 +518,7 @@ pub fn parse_manifest(text: &str) -> Result<ModSpec, String> {
     let mut entry = None;
     let mut command = None;
     let mut lifecycle = None;
+    let mut requires = None;
     for (line_number, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -499,6 +527,12 @@ pub fn parse_manifest(text: &str) -> Result<ModSpec, String> {
         let (key, value) = line
             .split_once('=')
             .ok_or_else(|| format!("extension.toml line {} is not key = value", line_number + 1))?;
+        if key.trim() == "requires" {
+            if requires.replace(parse_requires(value)?).is_some() {
+                return Err("extension.toml repeats key \"requires\"".into());
+            }
+            continue;
+        }
         let value = parse_quoted(value)?;
         let slot = match key.trim() {
             "name" => &mut name,
@@ -520,9 +554,97 @@ pub fn parse_manifest(text: &str) -> Result<ModSpec, String> {
         entry: entry.ok_or_else(|| "extension.toml is missing entry".to_string())?,
         command,
         lifecycle,
+        requires: requires.unwrap_or_default(),
     };
     validate_spec(&spec)?;
+    if spec.requires.iter().any(|(name, _)| *name == spec.name) {
+        return Err(format!("mod {} cannot require itself", spec.name));
+    }
     Ok(spec)
+}
+
+/// `requires = { name = "constraint", ... }` on one line (constraints hold
+/// commas, so pairs are read quote by quote, not split on `,`).
+fn parse_requires(value: &str) -> Result<Vec<(String, String)>, String> {
+    let shape = "requires must be an inline table like { butler = \">=0.4, <0.5\" }";
+    let mut rest = value
+        .trim()
+        .strip_prefix('{')
+        .and_then(|inner| inner.strip_suffix('}'))
+        .ok_or(shape)?
+        .trim();
+    let mut requires = std::collections::BTreeMap::new();
+    while !rest.is_empty() {
+        let (name, after) = rest.split_once('=').ok_or(shape)?;
+        let name = name.trim();
+        if !valid_component(name) {
+            return Err(format!("invalid required mod name {name:?}"));
+        }
+        let quoted = after.trim_start().strip_prefix('"').ok_or(shape)?;
+        let (constraint, after) = quoted.split_once('"').ok_or(shape)?;
+        parse_constraint(constraint)?;
+        if requires
+            .insert(name.to_string(), constraint.to_string())
+            .is_some()
+        {
+            return Err(format!("requires names {name} twice"));
+        }
+        rest = after.trim_start();
+        rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
+    }
+    Ok(requires.into_iter().collect())
+}
+
+/// Comma-separated comparators (`>=`, `>`, `<=`, `<`, `=`), all of which must
+/// hold; empty or `*` means any version.
+fn parse_constraint(constraint: &str) -> Result<Vec<(&str, [u64; 3])>, String> {
+    let constraint = constraint.trim();
+    if constraint.is_empty() || constraint == "*" {
+        return Ok(Vec::new());
+    }
+    constraint
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            let op = [">=", "<=", ">", "<", "="]
+                .into_iter()
+                .find(|op| part.starts_with(op))
+                .ok_or_else(|| format!("constraint {part:?} needs >=, >, <=, < or ="))?;
+            Ok((op, parse_version(&part[op.len()..])?))
+        })
+        .collect()
+}
+
+fn parse_version(text: &str) -> Result<[u64; 3], String> {
+    let parts: Vec<&str> = text.trim().split('.').collect();
+    let mut version = [0; 3];
+    if parts.len() > 3 {
+        return Err(format!("version {text:?} has more than three parts"));
+    }
+    for (slot, part) in version.iter_mut().zip(parts) {
+        *slot = part
+            .parse()
+            .map_err(|_| format!("version {text:?} is not numeric"))?;
+    }
+    Ok(version)
+}
+
+/// `*` accepts any version unparsed; otherwise the numeric core decides, so
+/// `0.1.0-nightly.X` or `1.2.3+build` compare as `0.1.0` and `1.2.3`.
+pub fn satisfies(version: &str, constraint: &str) -> Result<bool, String> {
+    let comparators = parse_constraint(constraint)?;
+    if comparators.is_empty() {
+        return Ok(true);
+    }
+    let core = version.split(['-', '+']).next().unwrap_or(version);
+    let installed = parse_version(core)?;
+    Ok(comparators.iter().all(|(op, wanted)| match *op {
+        ">=" => installed >= *wanted,
+        "<=" => installed <= *wanted,
+        ">" => installed > *wanted,
+        "<" => installed < *wanted,
+        _ => installed == *wanted,
+    }))
 }
 
 fn validate_spec(spec: &ModSpec) -> Result<(), String> {
@@ -723,9 +845,101 @@ fn installed_specs() -> Result<Vec<ModSpec>, String> {
         {
             continue;
         }
-        specs.push(read_manifest(&entry.path().join("extension.toml"))?);
+        // One half-installed mod (#134) must not hide the rest: skip it and
+        // say so once per process. Its own command still gets a named error
+        // from `half_installed`.
+        match read_manifest(&entry.path().join("extension.toml")) {
+            Ok(spec) => specs.push(spec),
+            Err(reason) => warn_skipped(&entry.path(), &reason),
+        }
     }
     Ok(specs)
+}
+
+fn warn_skipped(dir: &Path, reason: &str) {
+    static WARNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !warned.iter().any(|seen| seen == dir) {
+        eprintln!(
+            "remuda: skipping mod at {}: no readable manifest ({reason})",
+            dir.display()
+        );
+        warned.push(dir.to_path_buf());
+    }
+}
+
+/// Installed mods whose `requires` names `name`. A manifest that no longer
+/// parses cannot hold a dependency, so it is skipped rather than fatal.
+fn dependents(name: &str) -> Result<Vec<String>, String> {
+    let Ok(entries) = fs::read_dir(mods_dir()?) else {
+        return Ok(Vec::new());
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| read_manifest(&entry.path().join("extension.toml")).ok())
+        .filter(|spec| spec.requires.iter().any(|(required, _)| required == name))
+        .map(|spec| spec.name)
+        .collect();
+    names.sort();
+    Ok(names)
+}
+
+/// `owner` needs `dependency` installed at a version meeting `constraint`.
+fn check_requirement(owner: &str, dependency: &str, constraint: &str) -> Result<ModSpec, String> {
+    let path = mods_dir()?.join(dependency).join("extension.toml");
+    if !path.is_file() {
+        return Err(format!(
+            "mod {owner} requires {dependency}, which is not installed"
+        ));
+    }
+    let spec = read_manifest(&path)?;
+    let met = satisfies(&spec.version, constraint)
+        .map_err(|error| format!("mod {owner} requires {dependency} {constraint}, but installed {dependency} {} is unreadable: {error}", spec.version))?;
+    if !met {
+        return Err(format!(
+            "mod {owner} requires {dependency} {constraint}, but {dependency} {} is installed",
+            spec.version
+        ));
+    }
+    Ok(spec)
+}
+
+/// Every mod `name` needs, transitively and checked, hosts first (ties by
+/// name); `name` itself is not included. A cycle is refused with its path.
+pub fn requirement_order(name: &str) -> Result<Vec<String>, String> {
+    fn visit(
+        name: &str,
+        requires: &[(String, String)],
+        path: &mut Vec<String>,
+        done: &mut Vec<String>,
+    ) -> Result<(), String> {
+        path.push(name.to_string());
+        for (dependency, constraint) in requires {
+            if done.contains(dependency) {
+                continue;
+            }
+            if let Some(at) = path.iter().position(|seen| seen == dependency) {
+                let mut cycle = path[at..].to_vec();
+                cycle.push(dependency.clone());
+                return Err(format!("mod requires form a cycle: {}", cycle.join(" -> ")));
+            }
+            let spec = check_requirement(name, dependency, constraint)?;
+            visit(dependency, &spec.requires, path, done)?;
+        }
+        path.pop();
+        done.push(name.to_string());
+        Ok(())
+    }
+    let root = mods_dir()?.join(name).join("extension.toml");
+    let Ok(spec) = read_manifest(&root) else {
+        return Ok(Vec::new());
+    };
+    let mut done = Vec::new();
+    visit(name, &spec.requires, &mut Vec::new(), &mut done)?;
+    done.pop();
+    Ok(done)
 }
 
 fn mods_dir() -> Result<PathBuf, String> {
@@ -858,9 +1072,90 @@ fn valid_package_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_manifest, parse_repository, update_all_with, validate_reference, InstallReport,
-        Manifest, MOD_LIFECYCLE_API,
+        parse_manifest, parse_repository, satisfies, update_all_with, validate_reference,
+        InstallReport, Manifest, MOD_LIFECYCLE_API,
     };
+
+    fn with_requires(line: &str) -> Result<super::ModSpec, String> {
+        parse_manifest(&format!(
+            "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\n{line}\n"
+        ))
+    }
+
+    #[test]
+    fn requires_is_an_inline_table_of_name_to_constraint_sorted_by_name() {
+        let spec =
+            with_requires(r#"requires = { zeta = "*", butler = ">=0.4, <0.5" }"#).expect("spec");
+        assert_eq!(
+            spec.requires,
+            vec![
+                ("butler".to_string(), ">=0.4, <0.5".to_string()),
+                ("zeta".into(), "*".into())
+            ]
+        );
+        assert!(with_requires("").expect("no requires").requires.is_empty());
+        assert!(with_requires("requires = {}")
+            .expect("empty")
+            .requires
+            .is_empty());
+        for bad in [
+            r#"requires = "butler""#,
+            r#"requires = { butler = ">=x" }"#,
+            r#"requires = { "bad name" = "*" }"#,
+            r#"requires = { butler = "*", butler = "*" }"#,
+            r#"requires = { guest = "*" }"#,
+            r#"requires = { butler = "~0.4" }"#,
+        ] {
+            assert!(with_requires(bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn a_prerelease_or_build_suffix_compares_on_its_numeric_core() {
+        for (version, constraint, expected) in [
+            ("0.1.0-nightly.20260927234736.a3e951c", "*", true),
+            ("0.1.0-nightly.20260927234736.a3e951c", "", true),
+            ("0.1.0-nightly.20260927234736.a3e951c", ">=0.1, <0.2", true),
+            ("0.2.0-rc.1", "<0.2", false),
+            ("1.2.3+build.5", "=1.2.3", true),
+            ("nightly", "*", true),
+        ] {
+            assert_eq!(
+                satisfies(version, constraint),
+                Ok(expected),
+                "{version} {constraint}"
+            );
+        }
+        assert!(
+            satisfies("nightly", ">=1").is_err(),
+            "a non-numeric core under a real constraint"
+        );
+    }
+
+    #[test]
+    fn a_version_satisfies_every_comparator_in_a_constraint() {
+        for (version, constraint, expected) in [
+            ("0.4.2", ">=0.4, <0.5", true),
+            ("0.5.0", ">=0.4, <0.5", false),
+            ("0.3.9", ">=0.4", false),
+            ("1.2.0", "=1.2", true),
+            ("1.0.1", ">1", true),
+            ("1.0.0", ">1", false),
+            ("2.0", "<=2.0.0", true),
+            ("0.1.0", "*", true),
+            ("0.1.0", "", true),
+        ] {
+            assert_eq!(
+                satisfies(version, constraint),
+                Ok(expected),
+                "{version} {constraint}"
+            );
+        }
+        assert!(
+            satisfies("x.1", ">=0.1").is_err(),
+            "a non-numeric installed version is an error"
+        );
+    }
 
     fn report(name: &str) -> InstallReport {
         InstallReport {
