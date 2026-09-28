@@ -438,7 +438,19 @@ fn stop_daemon(path: &Path) -> Result<(), String> {
 /// most skews are harmless, and stranding someone mid-work behind a version
 /// string is its own incident. `None` when nothing is listening — it will be us.
 fn version_skew(argv: &[&str], path: &Path) -> Option<String> {
-    if matches!(argv, ["daemon"] | ["mcp"] | ["stop", ..]) {
+    // Help, version and upgrade must answer with no daemon at all (#115).
+    if matches!(
+        argv,
+        ["daemon"]
+            | ["mcp"]
+            | ["stop", ..]
+            | [
+                "help" | "-h" | "--help" | "version" | "-V" | "--version" | "upgrade",
+                ..
+            ]
+    ) || (argv.is_empty()
+        && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()))
+    {
         return None;
     }
     remuda_native::ipc::connect(path).ok()?;
@@ -517,21 +529,29 @@ fn split_server_flag(args: &[String]) -> (&str, &[String]) {
 
 /// Run `f`, starting the named daemon first if nothing is listening yet.
 fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> ExitCode {
-    match remuda_native::ipc::connect(path) {
-        Ok(_) => {}
-        Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => {
-            if let Err(e) = start_daemon(server, path) {
-                return fail(e);
-            }
-        }
-        Err(error) => {
-            return fail(format!(
-                "cannot connect to remuda daemon at {}: {error}; refusing to start a second daemon",
-                path.display()
-            ));
-        }
+    match ensure_daemon(server, path) {
+        Ok(()) => f(path),
+        Err(e) => fail(e),
     }
-    f(path)
+}
+
+/// Connect, or start the daemon when nothing proves one is running. The one
+/// place a connect error is worded, so no caller blames a daemon that isn't.
+fn ensure_daemon(server: &str, path: &Path) -> Result<(), String> {
+    match remuda_native::ipc::connect(path) {
+        Ok(_) => Ok(()),
+        Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => {
+            start_daemon(server, path)
+        }
+        // A path the transport cannot even name proves nothing about a daemon.
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            Err(format!("cannot use {}: {error}", path.display()))
+        }
+        Err(error) => Err(format!(
+            "cannot connect to remuda daemon at {}: {error}; refusing to start a second daemon",
+            path.display()
+        )),
+    }
 }
 
 /// Run an installed mod's entry file in the daemon's image. Resolves through
@@ -837,18 +857,7 @@ fn doc_command(path: &Path, args: &[&str]) -> ExitCode {
 }
 
 fn reload_mod_in_daemon(server: &str, path: &Path, name: &str) -> Result<(), String> {
-    match remuda_native::ipc::connect(path) {
-        Ok(_) => {}
-        Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => {
-            start_daemon(server, path)?;
-        }
-        Err(error) => {
-            return Err(format!(
-                "cannot connect to remuda daemon at {}: {error}",
-                path.display()
-            ));
-        }
-    }
+    ensure_daemon(server, path)?;
     match remuda_native::client::request(
         path,
         &Request::Eval {

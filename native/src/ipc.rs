@@ -20,6 +20,22 @@ pub use interprocess::local_socket::{Listener, Stream};
 pub use interprocess::TryClone;
 
 fn name(path: &Path) -> io::Result<Name<'_>> {
+    #[cfg(unix)]
+    {
+        // sun_path capacity, NUL included; the transport's error blamed nothing.
+        const LIMIT: usize = if cfg!(target_os = "linux") { 108 } else { 104 };
+        let len = path.as_os_str().len();
+        if len >= LIMIT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "socket path is {len} bytes, over the platform limit of {}; \
+                     use a shorter REMUDA_RUNTIME_DIR",
+                    LIMIT - 1
+                ),
+            ));
+        }
+    }
     path.to_fs_name::<GenericFilePath>()
 }
 
