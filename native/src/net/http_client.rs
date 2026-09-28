@@ -4,7 +4,9 @@ use base64::Engine as _;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
+use rustls::{
+    CertificateError, ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme,
+};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -641,14 +643,9 @@ fn io_error(error: std::io::Error) -> String {
     } else {
         let message = error.to_string();
         let lower = message.to_ascii_lowercase();
-        if message.contains("SPKI pin mismatch") {
-            "TLS request failed: SPKI pin mismatch".into()
-        } else if error.kind() == std::io::ErrorKind::InvalidData
-            || lower.contains("osstatus")
-            || lower.contains("certificate")
-            || lower.contains("trust")
-            || lower.contains("tls")
-        {
+        if let Some(reason) = tls_failure_reason(&message) {
+            format!("TLS request failed: {reason}")
+        } else if error.kind() == std::io::ErrorKind::InvalidData || lower.contains("osstatus") {
             "TLS request failed: certificate or protocol validation failed".into()
         } else {
             format!("HTTP transport error: {error}")
@@ -657,13 +654,62 @@ fn io_error(error: std::io::Error) -> String {
 }
 fn tls_error(error: TlsError) -> String {
     match error {
-        TlsError::InvalidCertificate(_) => {
-            "TLS request failed: certificate validation failed".into()
+        TlsError::InvalidCertificate(reason) => {
+            format!(
+                "TLS request failed: {}",
+                certificate_failure_reason(&reason)
+            )
         }
         TlsError::NoCertificatesPresented => {
             "TLS request failed: server presented no certificate".into()
         }
-        _ => format!("TLS request failed: {error}"),
+        TlsError::General(message) => {
+            let reason = tls_failure_reason(&message).unwrap_or("handshake validation failed");
+            format!("TLS request failed: {reason}")
+        }
+        _ => "TLS request failed: TLS negotiation failed".into(),
+    }
+}
+
+fn certificate_failure_reason(error: &CertificateError) -> &'static str {
+    match error {
+        CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
+            "server certificate expired"
+        }
+        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
+            "server certificate not yet valid"
+        }
+        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+            "server hostname mismatch"
+        }
+        CertificateError::UnknownIssuer => "server certificate issuer not trusted",
+        CertificateError::Revoked => "server certificate revoked",
+        CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. } => {
+            "server certificate not valid for TLS server authentication"
+        }
+        CertificateError::UnhandledCriticalExtension => {
+            "server certificate has an unsupported critical extension"
+        }
+        _ => "server certificate validation failed",
+    }
+}
+
+fn tls_failure_reason(message: &str) -> Option<&'static str> {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("spki pin mismatch") {
+        Some("SPKI pin mismatch")
+    } else if lower.contains("expired") {
+        Some("server certificate expired")
+    } else if lower.contains("not valid yet") || lower.contains("notvalidyet") {
+        Some("server certificate not yet valid")
+    } else if lower.contains("not valid for name") || lower.contains("notvalidforname") {
+        Some("server hostname mismatch")
+    } else if lower.contains("unknown issuer") || lower.contains("unknownissuer") {
+        Some("server certificate issuer not trusted")
+    } else if lower.contains("invalid purpose") || lower.contains("invalidpurpose") {
+        Some("server certificate not valid for TLS server authentication")
+    } else {
+        None
     }
 }
 
@@ -821,6 +867,9 @@ fn verify_trusted_end_entity(
 
 fn asn1_time(tag: u8, bytes: &[u8]) -> Option<i64> {
     let text = std::str::from_utf8(bytes).ok()?;
+    if !text.is_ascii() {
+        return None;
+    }
     let (year, rest) = match tag {
         0x17 if text.ends_with('Z') && text.len() == 13 => {
             let short = text[0..2].parse::<i64>().ok()?;
@@ -1103,7 +1152,7 @@ fn duration_option(
 
 #[cfg(test)]
 mod tests {
-    use super::{perform, HttpRequest};
+    use super::{perform, CertificateError, HttpRequest, TlsError};
     use base64::Engine as _;
     use rustls::pki_types::ServerName;
     use sha2::{Digest, Sha256};
@@ -1170,6 +1219,26 @@ mod tests {
         ));
         assert!(error.starts_with("TLS request failed:"));
         assert!(!error.contains("-67843"));
+
+        let expired = super::tls_error(TlsError::InvalidCertificate(CertificateError::Expired));
+        assert_eq!(expired, "TLS request failed: server certificate expired");
+        let hostname = super::tls_error(TlsError::InvalidCertificate(
+            CertificateError::NotValidForName,
+        ));
+        assert_eq!(hostname, "TLS request failed: server hostname mismatch");
+        let issuer = super::tls_error(TlsError::InvalidCertificate(
+            CertificateError::UnknownIssuer,
+        ));
+        assert_eq!(
+            issuer,
+            "TLS request failed: server certificate issuer not trusted"
+        );
+        let via_io = super::io_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid peer certificate: certificate not valid for name; OSStatus -67843",
+        ));
+        assert_eq!(via_io, "TLS request failed: server hostname mismatch");
+        assert!(!via_io.contains("-67843"));
     }
 
     #[test]
@@ -1478,6 +1547,15 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("expired"));
+    }
+
+    #[test]
+    fn malformed_non_ascii_asn1_time_is_rejected_without_panicking() {
+        let time = [
+            b'1', 0xc3, 0xa9, b'0', b'1', b'0', b'1', b'0', b'0', b'0', b'0', b'0', b'Z',
+        ];
+        assert_eq!(std::str::from_utf8(&time).unwrap().len(), 13);
+        assert_eq!(super::asn1_time(0x17, &time), None);
     }
 
     #[test]
