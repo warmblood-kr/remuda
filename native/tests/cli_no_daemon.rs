@@ -200,3 +200,59 @@ fn a_half_installed_mod_is_named_instead_of_generic_usage() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("terminal orchestration"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// PR #146 / butler-qa half134 rows 5-6: one half-installed mod must not take
+/// down its siblings. The scan skips it with a warning naming it, a healthy
+/// mod's command still dispatches, and the bad mod's own command still gets
+/// the named error.
+#[test]
+fn a_half_installed_sibling_does_not_hide_healthy_mods() {
+    let dir = scratch("sibling");
+    let mods = dir.join("data/remuda/mods");
+    std::fs::create_dir_all(mods.join("butler/packages/butler")).unwrap(); // no manifest
+    std::fs::create_dir_all(mods.join("probe/packages/probe")).unwrap();
+    std::fs::write(
+        mods.join("probe/extension.toml"),
+        "name = \"probe\"\nentry = \"packages/probe/init.lua\"\napi = \"remuda-lua-v1\"\ncommand = \"probe\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        mods.join("probe/packages/probe/init.lua"),
+        "remuda.extension_command('probe', function(args) return 'pong ' .. (args[1] or '') end)",
+    )
+    .unwrap();
+
+    let help = remuda(&dir, &["help"]);
+    let help_err = String::from_utf8_lossy(&help.stderr);
+    assert!(
+        help_err.contains("probe"),
+        "help lists the healthy mod: {help_err}"
+    );
+    assert!(
+        help_err.contains(&mods.join("butler").display().to_string()),
+        "and names the bad dir: {help_err}"
+    );
+
+    let launch = remuda(&dir, &["probe", "--headless"]);
+    let ping = remuda(&dir, &["probe", "ping"]);
+    let bad = remuda(&dir, &["butler"]);
+    remuda(&dir, &["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        launch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&launch.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&ping.stdout).trim(),
+        "pong ping",
+        "{}",
+        String::from_utf8_lossy(&ping.stderr)
+    );
+    let bad_err = String::from_utf8_lossy(&bad.stderr);
+    assert!(
+        !bad.status.success() && bad_err.contains("mod 'butler' at"),
+        "{bad_err}"
+    );
+}
