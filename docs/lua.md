@@ -56,6 +56,12 @@ convenient.
 restart a daemon or stop sessions; already-loaded Lua definitions remain live
 until the next daemon restart.
 
+A manifest can declare the mods it needs: `requires = { butler = ">=0.4, <0.5" }`.
+- **Constraints:** each is a comma-separated list of `>=`, `>`, `<=`, `<` and `=`, all of which must hold. `*` means any version. An installed version is compared on its numeric core, so `0.1.0-nightly.X` counts as `0.1.0`.
+- **Install:** `mod install` refuses a mod whose requirement is missing or too old, and names it.
+- **Activation:** `exec` and `reload` check the whole chain first. They then activate the lifecycle mods it needs, hosts before guests with ties broken by name, and leave an already active host alone. A requires cycle is refused, with its path, before anything activates.
+- **Remove:** `mod remove NAME` refuses while an installed mod requires NAME, and lists those mods.
+
 An extension repository declares `api = "remuda-lua-v1"` in its
 `extension.toml`. `remuda mod test PATH` is the deterministic local check: it
 validates the manifest, package paths, symlinks, Lua-only contents, and Lua
@@ -188,6 +194,23 @@ A hook that raises an error is logged with its group and id, and counted on that
 remuda.on("before_send", function(text) return text:gsub("%s+$", "") end,
   { group = "tidy", id = "trim", depth = -10 })
 local text = remuda.emit_filter("before_send", "hi  ")  -- "hi"
+## Contributions
+
+`remuda.contribute(point, id, entry)` fills an extension point that a host defines (like VS Code `contributes`). The same point and id replaces the earlier entry.
+
+`remuda.contributions(point)` returns `{id, owner, entry}` rows, sorted by `entry.order` (default 0) and then by id. Each `entry` is a shallow copy: changing its fields never reaches the registry, but nested tables are shared. `contribute` stores a shallow copy too.
+
+A lifecycle mod can declare its contributions: `contributes = { [point] = { {id = ..., ...} } }`.
+- Declared entries are owned by the mod, and their function fields receive `state` first, like hooks.
+- A reload replaces only that mod's entries, and a failed `start` restores the previous ones.
+- A malformed declaration is refused before anything changes.
+- A declared entry whose point and id belong to another mod is refused, naming both mods. Imperative `contribute` calls have no owner yet, so the last writer wins.
+
+```lua
+contributes = {
+  ["butler.command"] = {{ id = "inbox", order = 20, usage = "inbox [NAME]",
+    run = function(state, args, caller) return "..." end }},
+}
 ```
 
 ## Generated reference
