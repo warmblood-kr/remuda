@@ -103,6 +103,9 @@ enum WordClass {
 pub struct Ui {
     pub sessions: Vec<SessionSummary>,
     pub selected: usize,
+    /// A mouse selection can move focus without making the list scroll under
+    /// the pointer. Keyboard navigation resumes selection-following scroll.
+    list_first_visible: Option<usize>,
     pub pan: u16,
     /// `None` follows the normal content-aware width; `Some` is a user drag.
     pub list_width: Option<u16>,
@@ -163,6 +166,7 @@ impl Ui {
         Self {
             sessions,
             selected: 0,
+            list_first_visible: None,
             pan: 0,
             list_width: None,
             list_visible: true,
@@ -204,20 +208,45 @@ impl Ui {
 
     /// Keep the cursor on a real row after the herd changes underneath it.
     pub fn clamp(&mut self) {
+        let selected = self.selected;
         if self.selected >= self.sessions.len() {
             self.selected = self.sessions.len().saturating_sub(1);
         }
+        if self.selected != selected {
+            self.track_list_selection();
+        }
+    }
+
+    fn track_list_selection(&mut self) {
+        let Some(first) = self.list_first_visible else {
+            return;
+        };
+        let visible = (self.preview_rows as usize / self.session_rows).max(1);
+        let max_first = self.sessions.len().saturating_sub(visible);
+        let mut first = first.min(max_first);
+        if self.selected < first {
+            first = self.selected;
+        } else if self.selected >= first.saturating_add(visible) {
+            first = self.selected.saturating_sub(visible - 1);
+        }
+        self.list_first_visible = Some(first.min(max_first));
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        if self.focus == Focus::Session {
-            return self.session_key(key);
+        let selected = self.selected;
+        let action = if self.focus == Focus::Session {
+            self.session_key(key)
+        } else {
+            match self.mode.clone() {
+                Mode::Prompt(buffer) => self.prompt_key(key, buffer),
+                Mode::Confirm(name) => self.confirm_key(key, name),
+                Mode::Browse => self.browse_key(key),
+            }
+        };
+        if self.selected != selected {
+            self.track_list_selection();
         }
-        match self.mode.clone() {
-            Mode::Prompt(buffer) => self.prompt_key(key, buffer),
-            Mode::Confirm(name) => self.confirm_key(key, name),
-            Mode::Browse => self.browse_key(key),
-        }
+        action
     }
 
     /// A press in the list column switches to that row's session, even if
@@ -376,10 +405,12 @@ impl Ui {
         if row < 1 || row > body {
             return Action::Nothing;
         }
-        let index = ((row - 1) as usize / self.session_rows) + list_viewport(self, body);
+        let viewport = list_viewport(self, body);
+        let index = ((row - 1) as usize / self.session_rows) + viewport;
         if index >= self.sessions.len() {
             return Action::Nothing;
         }
+        self.list_first_visible = Some(viewport);
         self.selected = index;
         self.pan = 0;
         self.focus_session()
@@ -472,7 +503,12 @@ impl Ui {
     pub fn follow_focus(&mut self, name: Option<&str>) {
         let Some(name) = name else { return };
         match self.sessions.iter().position(|s| s.name == name && s.alive) {
-            Some(at) => self.selected = at,
+            Some(at) => {
+                if self.selected != at {
+                    self.selected = at;
+                    self.track_list_selection();
+                }
+            }
             // With sessions closing themselves on exit, this is how a ride
             // ordinarily ends: you type `exit`, and you are on the list.
             None => self.focus = Focus::List,
@@ -2246,9 +2282,16 @@ fn list_viewport(ui: &Ui, body: u16) -> usize {
     if visible == 0 {
         return 0;
     }
-    ui.selected
-        .saturating_sub(visible - 1)
-        .min(ui.sessions.len().saturating_sub(visible))
+    let max_first = ui.sessions.len().saturating_sub(visible);
+    let follows_selection = ui.selected.saturating_sub(visible - 1).min(max_first);
+    let Some(first) = ui.list_first_visible.map(|first| first.min(max_first)) else {
+        return follows_selection;
+    };
+    if ui.selected >= first && ui.selected < first.saturating_add(visible) {
+        first
+    } else {
+        follows_selection
+    }
 }
 
 /// The current size requested for the selected session panel. `Size::new`

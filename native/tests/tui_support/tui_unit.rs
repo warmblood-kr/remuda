@@ -292,6 +292,55 @@ fn selected_session_stays_visible_when_the_list_exceeds_a_short_terminal() {
 }
 
 #[test]
+fn clicking_the_top_visible_session_keeps_the_list_under_the_pointer() {
+    let mut ui = make_ui(
+        (0..12)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect(),
+    );
+    for _ in 0..11 {
+        ui.on_key(press(KeyCode::Down));
+    }
+
+    let before = render(&ui, "", "test", 80, 24);
+    let before_top = before.split("\x1b[2;1H").next().expect("first row exists");
+    assert!(
+        before_top.contains("session-5"),
+        "top row before click: {before_top:?}"
+    );
+
+    assert_eq!(
+        ui.on_mouse(click(5, 0), 80, 24),
+        Action::Focus("session-5".into())
+    );
+    assert_eq!(ui.selected, 5);
+
+    let after = render(&ui, "", "test", 80, 24);
+    let after_top = after.split("\x1b[2;1H").next().expect("first row exists");
+    assert!(
+        after_top.contains("session-5"),
+        "clicking the first visible row must not move the list: {after_top:?}"
+    );
+    assert!(
+        !after_top.contains("session-0"),
+        "the list must not snap back to its first row: {after_top:?}"
+    );
+
+    ui.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+    ui.on_key(press(KeyCode::Up));
+    assert_eq!(ui.selected, 4);
+    let after_navigation = render(&ui, "", "test", 80, 24);
+    let navigation_top = after_navigation
+        .split("\x1b[2;1H")
+        .next()
+        .expect("first row exists");
+    assert!(
+        navigation_top.contains("session-4"),
+        "keyboard movement should scroll just enough to keep selection visible: {navigation_top:?}"
+    );
+}
+
+#[test]
 fn enter_points_the_keyboard_at_the_selected_session() {
     let mut ui = make_ui(vec![row("a", true, false), row("b", true, false)]);
     ui.on_key(press(KeyCode::Char('j')));
