@@ -19,6 +19,7 @@ use interprocess::local_socket::traits::ListenerExt;
 use remuda_core::agent::{Cursor, Result as AgentResult};
 use remuda_core::protocol::{collapse_runs, Request, Response};
 use remuda_core::{Clock, Registry, Session, Size};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -541,35 +542,8 @@ fn handle(
 
         // Answer before going. A client left guessing from a hung-up socket
         // cannot tell "it stopped" from "it never heard me".
-        Request::Shutdown {
-            requester_daemon_id,
-            requester_session_id,
-            requester_session_name,
-            override_hosted,
-        } => {
-            let own_daemon_id = std::process::id().to_string();
-            let known_session_name = requester_session_id
-                .as_deref()
-                .and_then(|id| registry.name_for_id(id));
-            let caller_claims_this_daemon = requester_daemon_id.as_deref()
-                == Some(own_daemon_id.as_str())
-                && (requester_session_id.is_some() || requester_session_name.is_some());
-            if !override_hosted && (known_session_name.is_some() || caller_claims_this_daemon) {
-                let identity = known_session_name
-                    .or(requester_session_name)
-                    .or(requester_session_id)
-                    .unwrap_or_else(|| "unknown".into());
-                return reply(
-                    &stream,
-                    &Response::error(format!(
-                        "cannot stop this daemon from one of its own sessions ({identity}); pass --i-am-inside to override"
-                    )),
-                );
-            }
-            reply(&stream, &Response::Ok)?;
-            reap_processes_before_exit(image);
-            socket_owner.cleanup();
-            std::process::exit(0);
+        request @ Request::Shutdown { .. } => {
+            handle_shutdown(stream, registry, image, socket_owner, request)
         }
 
         Request::New {
@@ -578,36 +552,7 @@ fn handle(
             size,
             cwd,
             env,
-        } => {
-            let name = match name {
-                Some(given) => given,
-                None => registry.unique_name(&remuda_core::registry::slug(
-                    command
-                        .first()
-                        .map_or_else(default_shell, String::clone)
-                        .as_str(),
-                )),
-            };
-            let mut session_env = env.unwrap_or_default();
-            let session_id = Session::new_id();
-            session_env.insert("REMUDA_DAEMON_ID".into(), std::process::id().to_string());
-            session_env.insert("REMUDA_SESSION_ID".into(), session_id.clone());
-            session_env.insert("REMUDA_SESSION_NAME".into(), name.clone());
-            match spawn(
-                &name,
-                &session_id,
-                &command,
-                size,
-                cwd.as_deref(),
-                Some(&session_env),
-            ) {
-                Err(e) => reply(&stream, &Response::error(e)),
-                Ok(session) => match registry.register(session) {
-                    Ok(_) => reply(&stream, &Response::Value(name)),
-                    Err(_) => reply(&stream, &Response::error(format!("name taken: {name}"))),
-                },
-            }
-        }
+        } => handle_new(stream, registry, name, command, size, cwd, env),
 
         Request::SendLine { name, text } => {
             respond(&stream, &name, registry.send_line(&name, &text), |()| {
@@ -671,6 +616,85 @@ fn handle(
             // Lua's own message, which already carries the line and a
             // traceback — the same treatment `remuda run` gives a script file.
             Err(e) => reply(&stream, &Response::error(e)),
+        },
+    }
+}
+
+fn handle_shutdown(
+    stream: Stream,
+    registry: &Registry,
+    image: &Image,
+    socket_owner: Arc<SocketOwnership>,
+    request: Request,
+) -> std::io::Result<()> {
+    let Request::Shutdown {
+        requester_daemon_id,
+        requester_session_id,
+        requester_session_name,
+        override_hosted,
+    } = request
+    else {
+        unreachable!("handle_shutdown only accepts Shutdown requests");
+    };
+    let own_daemon_id = std::process::id().to_string();
+    let known_session_name = requester_session_id
+        .as_deref()
+        .and_then(|id| registry.name_for_id(id));
+    let caller_claims_this_daemon = requester_daemon_id.as_deref() == Some(own_daemon_id.as_str())
+        && (requester_session_id.is_some() || requester_session_name.is_some());
+    if !override_hosted && (known_session_name.is_some() || caller_claims_this_daemon) {
+        let identity = known_session_name
+            .or(requester_session_name)
+            .or(requester_session_id)
+            .unwrap_or_else(|| "unknown".into());
+        return reply(
+            &stream,
+            &Response::error(format!(
+                "cannot stop this daemon from one of its own sessions ({identity}); pass --i-am-inside to override"
+            )),
+        );
+    }
+    reply(&stream, &Response::Ok)?;
+    reap_processes_before_exit(image);
+    socket_owner.cleanup();
+    std::process::exit(0);
+}
+
+fn handle_new(
+    stream: Stream,
+    registry: &Registry,
+    name: Option<String>,
+    command: Vec<String>,
+    size: Size,
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
+) -> std::io::Result<()> {
+    let name = match name {
+        Some(given) => given,
+        None => registry.unique_name(&remuda_core::registry::slug(
+            command
+                .first()
+                .map_or_else(default_shell, String::clone)
+                .as_str(),
+        )),
+    };
+    let mut session_env = env.unwrap_or_default();
+    let session_id = Session::new_id();
+    session_env.insert("REMUDA_DAEMON_ID".into(), std::process::id().to_string());
+    session_env.insert("REMUDA_SESSION_ID".into(), session_id.clone());
+    session_env.insert("REMUDA_SESSION_NAME".into(), name.clone());
+    match spawn(
+        &name,
+        &session_id,
+        &command,
+        size,
+        cwd.as_deref(),
+        Some(&session_env),
+    ) {
+        Err(e) => reply(&stream, &Response::error(e)),
+        Ok(session) => match registry.register(session) {
+            Ok(_) => reply(&stream, &Response::Value(name)),
+            Err(_) => reply(&stream, &Response::error(format!("name taken: {name}"))),
         },
     }
 }

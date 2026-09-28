@@ -2118,20 +2118,8 @@ fn stop_refuses_to_kill_a_live_session_without_being_told_twice() {
         "the daemon died despite refusing"
     );
 
-    // -f still refuses without a terminal when live sessions exist.
+    // Outside a hosted session, -f remains the no-prompt path for a live herd.
     let forced = remuda(&dir, &["-s", "s", "stop", "-f"]);
-    assert!(
-        !forced.status.success(),
-        "-f stopped a live herd without a TTY"
-    );
-    assert!(String::from_utf8_lossy(&forced.stderr).contains("nothing to ask on"));
-    assert!(
-        remuda_native::ipc::connect(&path).is_ok(),
-        "the daemon died after refusal"
-    );
-
-    // The explicit override is the non-interactive way past it.
-    let forced = remuda(&dir, &["-s", "s", "stop", "-f", "--yes"]);
     assert!(
         forced.status.success(),
         "{}",
@@ -2171,44 +2159,7 @@ fn a_session_cannot_force_stop_its_own_daemon_without_an_explicit_override() {
     .expect("create managed session");
     assert!(matches!(response, Response::Value(_)));
 
-    let sessions = match client::request(&path, &Request::List).expect("list sessions") {
-        Response::Sessions(sessions) => sessions,
-        response => panic!("unexpected list response: {response:?}"),
-    };
-    let session_id = sessions
-        .iter()
-        .find(|session| session.name == "inside")
-        .expect("inside session")
-        .id
-        .clone();
-    let raw_shutdown = client::request(
-        &path,
-        &Request::Shutdown {
-            requester_daemon_id: Some(daemon.0.id().to_string()),
-            requester_session_id: Some(session_id),
-            requester_session_name: Some("inside".into()),
-            override_hosted: false,
-        },
-    )
-    .expect("raw shutdown response");
-    assert!(
-        matches!(&raw_shutdown, Response::Error(reason) if reason.contains("one of its own sessions")),
-        "raw shutdown was not refused: {raw_shutdown:?}"
-    );
-    let stale_identity = client::request(
-        &path,
-        &Request::Shutdown {
-            requester_daemon_id: Some(daemon.0.id().to_string()),
-            requester_session_id: Some("stale-session-id".into()),
-            requester_session_name: None,
-            override_hosted: false,
-        },
-    )
-    .expect("stale identity response");
-    assert!(
-        matches!(&stale_identity, Response::Error(reason) if reason.contains("one of its own sessions")),
-        "unknown identity from this daemon was not refused: {stale_identity:?}"
-    );
+    assert_session_shutdown_identity_is_refused(&path, daemon.0.id());
 
     let deadline = Instant::now() + PATIENCE;
     let screen = loop {
@@ -2255,6 +2206,48 @@ fn a_session_cannot_force_stop_its_own_daemon_without_an_explicit_override() {
         "daemon did not exit after override"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+fn assert_session_shutdown_identity_is_refused(path: &Path, daemon_id: u32) {
+    let sessions = match client::request(path, &Request::List).expect("list sessions") {
+        Response::Sessions(sessions) => sessions,
+        response => panic!("unexpected list response: {response:?}"),
+    };
+    let session_id = sessions
+        .iter()
+        .find(|session| session.name == "inside")
+        .expect("inside session")
+        .id
+        .clone();
+    let raw_shutdown = client::request(
+        path,
+        &Request::Shutdown {
+            requester_daemon_id: Some(daemon_id.to_string()),
+            requester_session_id: Some(session_id),
+            requester_session_name: Some("inside".into()),
+            override_hosted: false,
+        },
+    )
+    .expect("raw shutdown response");
+    assert!(
+        matches!(&raw_shutdown, Response::Error(reason) if reason.contains("one of its own sessions")),
+        "raw shutdown was not refused: {raw_shutdown:?}"
+    );
+    let stale_identity = client::request(
+        path,
+        &Request::Shutdown {
+            requester_daemon_id: Some(daemon_id.to_string()),
+            requester_session_id: Some("stale-session-id".into()),
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("stale identity response");
+    assert!(
+        matches!(&stale_identity, Response::Error(reason) if reason.contains("one of its own sessions")),
+        "unknown identity from this daemon was not refused: {stale_identity:?}"
+    );
 }
 
 #[cfg(unix)]

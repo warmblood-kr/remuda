@@ -385,7 +385,7 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         eprintln!("remuda: no daemon running for {server:?} — the next command starts one");
         return ExitCode::SUCCESS;
     }
-    if !yes && (!force || has_sessions(path)) {
+    if !yes && !force && has_sessions(path) {
         if let Err(refusal) = confirm_losses(path) {
             return fail(refusal);
         }
