@@ -108,7 +108,7 @@
 <h2 id="request_counts">request_counts</h2>
 <p><code>request_counts() -&gt; string</code> — The daemon's own request-dispatch counts (list/eval/capture_styled), counted at the one place every round trip crosses. Use it to measure how many round trips a real operation actually costs.</p>
 <h2 id="schedule">schedule</h2>
-<p><code>schedule(spec) -&gt; handle</code> — Register a periodic callback, run every <span class="title-ref">every</span> seconds.</p>
+<p><code>schedule(spec) -&gt; handle</code> — Register a periodic callback, run every <span class="title-ref">every</span> seconds; optional <span class="title-ref">after</span> sets the first firing delay from creation. Without it, the first firing depends on daemon uptime.</p>
 <h2 id="schedule_fires">schedule_fires</h2>
 <p><code>schedule_fires() -&gt; {[name]=n}</code> — How many times each named schedule has fired.</p>
 <h2 id="schedule_skips">schedule_skips</h2>

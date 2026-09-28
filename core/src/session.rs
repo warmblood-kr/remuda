@@ -8,7 +8,7 @@ use crate::agent::{
     VersionedSnapshot,
 };
 use crate::clock::Clock;
-use crate::input::{InputBatch, InputDeduplicator, InputOutcome, MAX_INPUT_BYTES};
+use crate::input::{InputBatch, InputDeduplicator, InputError, InputOutcome, InputRateLimiter};
 use crate::protocol::Step;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -47,6 +47,8 @@ pub struct Session {
     input_lock: Mutex<()>,
     /// Bounded retry history for remote byte batches, kept per session.
     input_dedup: Mutex<InputDeduplicator>,
+    /// Per-session byte budget, checked before taking `input_lock`.
+    input_rate: Mutex<InputRateLimiter>,
 }
 
 /// Generate a unique session-start identity from host entropy and a process counter.
@@ -123,6 +125,7 @@ impl Session {
             next_attach_generation: AtomicU64::new(1),
             input_lock: Mutex::new(()),
             input_dedup: Mutex::new(InputDeduplicator::new()),
+            input_rate: Mutex::new(InputRateLimiter::default()),
         }
     }
 
@@ -188,27 +191,40 @@ impl Session {
         self.write_one_burst(bytes)
     }
 
+    /// Check the shared per-session remote-input byte budget.
+    pub fn check_rate(&self, bytes: usize) -> core::result::Result<(), InputError> {
+        let mut rate = self
+            .input_rate
+            .lock()
+            .map_err(|_| InputError::Unavailable)?;
+        rate.check_rate(self.clock.now(), bytes)
+    }
+
     /// Apply a bounded remote batch once for this exact session instance.
     /// Local input shares `input_lock`, so each complete batch stays atomic.
-    pub fn apply_input_batch(&self, batch: InputBatch<'_>) -> InputOutcome {
-        if batch.seq == 0 || batch.bytes.is_empty() || batch.bytes.len() > MAX_INPUT_BYTES {
-            return InputOutcome::Uncertain;
+    pub fn apply_input_batch(
+        &self,
+        batch: InputBatch<'_>,
+    ) -> core::result::Result<InputOutcome, InputError> {
+        if batch.seq == 0 {
+            return Err(InputError::InvalidSequence);
         }
+        self.check_rate(batch.bytes.len())?;
         let Ok(_held) = self.input_lock.lock() else {
-            return InputOutcome::Uncertain;
+            return Ok(InputOutcome::Uncertain);
         };
         if !self.is_alive() {
-            return InputOutcome::Exited;
+            return Ok(InputOutcome::Exited);
         }
         if batch.instance_id != self.instance_id {
-            return InputOutcome::WrongInstance;
+            return Ok(InputOutcome::WrongInstance);
         }
         let Ok(mut deduplicator) = self.input_dedup.lock() else {
-            return InputOutcome::Uncertain;
+            return Ok(InputOutcome::Uncertain);
         };
-        deduplicator.apply(batch.client_id, batch.seq, || {
+        Ok(deduplicator.apply(batch.client_id, batch.seq, || {
             self.write_one_burst(batch.bytes)
-        })
+        }))
     }
 
     /// Above this, a `feed` act is refused rather than executed — a caller's

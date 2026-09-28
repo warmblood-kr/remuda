@@ -1,9 +1,10 @@
 use remuda_core::agent::{AgentError, AgentProcess, Cursor, Result, Size};
 use remuda_core::input::{
-    validate_batch, InputDeduplicator, InputOutcome, INPUT_RING_CAPACITY, MAX_INPUT_BYTES,
+    validate_batch, InputBatch, InputDeduplicator, InputOutcome, INPUT_RATE_BYTES_PER_SECOND,
+    INPUT_RING_CAPACITY, MAX_INPUT_BYTES,
 };
 use remuda_core::{ManualClock, Session};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 #[test]
@@ -67,6 +68,60 @@ fn evicting_a_client_forces_it_to_restart_at_sequence_one() {
 }
 
 #[test]
+fn touching_a_client_moves_it_to_the_back_of_the_lru() {
+    let mut dedup = InputDeduplicator::new();
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    for client in 0..16 {
+        assert_eq!(
+            apply(&mut dedup, [client; 16], 1, &writes),
+            InputOutcome::Ack { duplicate: false }
+        );
+    }
+    assert_eq!(
+        apply(&mut dedup, [0; 16], 1, &writes),
+        InputOutcome::Ack { duplicate: true }
+    );
+    assert_eq!(
+        apply(&mut dedup, [16; 16], 1, &writes),
+        InputOutcome::Ack { duplicate: false }
+    );
+    assert_eq!(
+        apply(&mut dedup, [0; 16], 2, &writes),
+        InputOutcome::Ack { duplicate: false }
+    );
+    assert_eq!(
+        apply(&mut dedup, [1; 16], 2, &writes),
+        InputOutcome::Uncertain
+    );
+    assert_eq!(writes.lock().unwrap().len(), 18);
+}
+
+#[test]
+fn the_rate_cap_is_per_session_bytes_per_second() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let clock = Arc::new(ManualClock::new());
+    let session = Session::new(
+        "rate-input",
+        Box::new(InputRecordingAgent {
+            writes,
+            alive: true,
+            fail_write: false,
+            event_tx: None,
+        }),
+        clock.clone(),
+    );
+    for _ in 0..(INPUT_RATE_BYTES_PER_SECOND / MAX_INPUT_BYTES) {
+        assert_eq!(session.check_rate(MAX_INPUT_BYTES), Ok(()));
+    }
+    assert_eq!(
+        session.check_rate(1),
+        Err(remuda_core::input::InputError::RateLimited)
+    );
+    clock.advance(std::time::Duration::from_secs(1));
+    assert_eq!(session.check_rate(1), Ok(()));
+}
+
+#[test]
 fn malformed_client_ids_and_oversize_batches_are_rejected() {
     assert!(validate_batch("not-an-id", 1, b"line").is_err());
     assert!(validate_batch(&"00".repeat(16), 0, b"line").is_err());
@@ -81,34 +136,34 @@ fn wrong_instance_precedes_duplicate_lookup_and_exited_sessions_are_refused() {
     let live = input_session(Arc::clone(&writes), true);
     let instance = live.instance_id().to_string();
     assert_eq!(
-        live.apply_input_batch(remuda_core::input::InputBatch {
+        live.apply_input_batch(InputBatch {
             instance_id: &instance,
             client_id: [4; 16],
             seq: 1,
             bytes: b"line",
         }),
-        InputOutcome::Ack { duplicate: false }
+        Ok(InputOutcome::Ack { duplicate: false })
     );
     assert_eq!(
-        live.apply_input_batch(remuda_core::input::InputBatch {
+        live.apply_input_batch(InputBatch {
             instance_id: "stale-instance",
             client_id: [4; 16],
             seq: 1,
             bytes: b"line",
         }),
-        InputOutcome::WrongInstance
+        Ok(InputOutcome::WrongInstance)
     );
     assert_eq!(writes.lock().unwrap().len(), 1);
 
     let exited = input_session(Arc::clone(&writes), false);
     assert_eq!(
-        exited.apply_input_batch(remuda_core::input::InputBatch {
+        exited.apply_input_batch(InputBatch {
             instance_id: "stale-instance",
             client_id: [5; 16],
             seq: 1,
             bytes: b"line",
         }),
-        InputOutcome::Exited
+        Ok(InputOutcome::Exited)
     );
     assert_eq!(writes.lock().unwrap().len(), 1);
 }
@@ -123,13 +178,13 @@ fn concurrent_batches_are_written_as_atomic_pieces() {
             thread::spawn(move || {
                 let client_id = [tag; 16];
                 assert_eq!(
-                    session.apply_input_batch(remuda_core::input::InputBatch {
+                    session.apply_input_batch(InputBatch {
                         instance_id: session.instance_id(),
                         client_id,
                         seq: 1,
                         bytes: &[tag; 64],
                     }),
-                    InputOutcome::Ack { duplicate: false }
+                    Ok(InputOutcome::Ack { duplicate: false })
                 );
             })
         })
@@ -144,10 +199,134 @@ fn concurrent_batches_are_written_as_atomic_pieces() {
         .all(|batch| batch.len() == 64 && batch.iter().all(|byte| *byte == batch[0])));
 }
 
+#[test]
+fn invalid_batches_are_errors_and_never_write() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let session = input_session(Arc::clone(&writes), true);
+    for (seq, bytes) in [
+        (0, b"line".to_vec()),
+        (1, Vec::new()),
+        (1, vec![0; MAX_INPUT_BYTES + 1]),
+    ] {
+        assert!(session
+            .apply_input_batch(InputBatch {
+                instance_id: session.instance_id(),
+                client_id: [8; 16],
+                seq,
+                bytes: &bytes,
+            })
+            .is_err());
+    }
+    assert!(writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_failed_write_and_its_retry_are_uncertain_without_recorded_writes() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let session = Session::new(
+        "failed-input",
+        Box::new(InputRecordingAgent {
+            writes: Arc::clone(&writes),
+            alive: true,
+            fail_write: true,
+            event_tx: None,
+        }),
+        Arc::new(ManualClock::new()),
+    );
+    let batch = InputBatch {
+        instance_id: session.instance_id(),
+        client_id: [9; 16],
+        seq: 1,
+        bytes: b"lost",
+    };
+    assert_eq!(
+        session.apply_input_batch(batch),
+        Ok(InputOutcome::Uncertain)
+    );
+    assert_eq!(
+        session.apply_input_batch(batch),
+        Ok(InputOutcome::Uncertain)
+    );
+    assert!(writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_batch_cannot_interleave_with_a_concurrent_feed() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let (event_tx, event_rx) = mpsc::channel();
+    let clock = Arc::new(ManualClock::new());
+    let session = Arc::new(Session::new(
+        "feed-input-atomicity",
+        Box::new(InputRecordingAgent {
+            writes: Arc::clone(&writes),
+            alive: true,
+            fail_write: false,
+            event_tx: Some(event_tx),
+        }),
+        clock.clone(),
+    ));
+    let feed_session = Arc::clone(&session);
+    let feed = thread::spawn(move || {
+        feed_session
+            .feed(&[
+                remuda_core::protocol::Step::Burst(b"feed-before".to_vec()),
+                remuda_core::protocol::Step::Pause(100),
+                remuda_core::protocol::Step::Burst(b"feed-after".to_vec()),
+            ])
+            .expect("feed act succeeds");
+    });
+    expect_input_event(&event_rx, b"feed-before");
+    let batch_session = Arc::clone(&session);
+    let batch = thread::spawn(move || {
+        batch_session
+            .apply_input_batch(InputBatch {
+                instance_id: batch_session.instance_id(),
+                client_id: [10; 16],
+                seq: 1,
+                bytes: b"batch",
+            })
+            .expect("batch succeeds");
+    });
+    assert_no_input_event(&event_rx);
+    clock.advance(std::time::Duration::from_millis(100));
+    expect_input_event(&event_rx, b"feed-after");
+    expect_input_event(&event_rx, b"batch");
+    feed.join().unwrap();
+    batch.join().unwrap();
+    assert_eq!(
+        *writes.lock().unwrap(),
+        vec![
+            b"feed-before".to_vec(),
+            b"feed-after".to_vec(),
+            b"batch".to_vec()
+        ]
+    );
+}
+
+fn expect_input_event(receiver: &mpsc::Receiver<Vec<u8>>, expected: &[u8]) {
+    assert_eq!(
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap(),
+        expected
+    );
+}
+
+fn assert_no_input_event(receiver: &mpsc::Receiver<Vec<u8>>) {
+    assert!(receiver
+        .recv_timeout(std::time::Duration::from_millis(40))
+        .is_err());
+}
+
 fn input_session(writes: Arc<Mutex<Vec<Vec<u8>>>>, alive: bool) -> Session {
     Session::new(
         "input-test",
-        Box::new(InputRecordingAgent { writes, alive }),
+        Box::new(InputRecordingAgent {
+            writes,
+            alive,
+            fail_write: false,
+            event_tx: None,
+        }),
         Arc::new(ManualClock::new()),
     )
 }
@@ -155,6 +334,8 @@ fn input_session(writes: Arc<Mutex<Vec<Vec<u8>>>>, alive: bool) -> Session {
 struct InputRecordingAgent {
     writes: Arc<Mutex<Vec<Vec<u8>>>>,
     alive: bool,
+    fail_write: bool,
+    event_tx: Option<mpsc::Sender<Vec<u8>>>,
 }
 
 impl AgentProcess for InputRecordingAgent {
@@ -162,7 +343,13 @@ impl AgentProcess for InputRecordingAgent {
         if !self.alive {
             return Err(AgentError::Exited);
         }
+        if self.fail_write {
+            return Err(AgentError::Io("injected write failure".into()));
+        }
         self.writes.lock().unwrap().push(bytes.to_vec());
+        if let Some(sender) = &self.event_tx {
+            sender.send(bytes.to_vec()).unwrap();
+        }
         Ok(())
     }
 

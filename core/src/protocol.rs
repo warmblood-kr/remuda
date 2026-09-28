@@ -143,6 +143,8 @@ pub enum Response {
     Uncertain,
     /// The target name now refers to a different session start.
     WrongInstance,
+    /// The per-session input byte budget has been exhausted for this second.
+    RateLimited,
     /// A styled screen, answering [`Request::CaptureStyled`] — as runs, not
     /// cells; see [`StyledRun`]. `cursor` rides the same round trip, so the
     /// pane's caret and its content are always the same frame. See steps/027.

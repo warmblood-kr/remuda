@@ -154,24 +154,28 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             bytes,
             ..
         } => validate_batch(client_id, *seq, bytes).map(|_| ()),
-        Request::New { .. }
-        | Request::SendLine { .. }
-        | Request::Send { .. }
-        | Request::Feed { .. }
-        | Request::Resize { .. }
-        | Request::Capture { .. }
-        | Request::MouseState { .. }
-        | Request::Attach { .. }
-        | Request::AttachTracked { .. }
-        | Request::AttachStatus { .. }
-        | Request::Close { .. }
-        | Request::ListDir { .. }
-        | Request::Mkdir { .. }
-        | Request::RemoveDirAll { .. }
-        | Request::Version
-        | Request::Shutdown { .. }
-        | Request::Eval { .. } => Err(format!("remote front refuses {request:?}")),
+        Request::New { .. } => Err(refusal("New")),
+        Request::SendLine { .. } => Err(refusal("SendLine")),
+        Request::Send { .. } => Err(refusal("Send")),
+        Request::Feed { .. } => Err(refusal("Feed")),
+        Request::Resize { .. } => Err(refusal("Resize")),
+        Request::Capture { .. } => Err(refusal("Capture")),
+        Request::MouseState { .. } => Err(refusal("MouseState")),
+        Request::Attach { .. } => Err(refusal("Attach")),
+        Request::AttachTracked { .. } => Err(refusal("AttachTracked")),
+        Request::AttachStatus { .. } => Err(refusal("AttachStatus")),
+        Request::Close { .. } => Err(refusal("Close")),
+        Request::ListDir { .. } => Err(refusal("ListDir")),
+        Request::Mkdir { .. } => Err(refusal("Mkdir")),
+        Request::RemoveDirAll { .. } => Err(refusal("RemoveDirAll")),
+        Request::Version => Err(refusal("Version")),
+        Request::Shutdown { .. } => Err(refusal("Shutdown")),
+        Request::Eval { .. } => Err(refusal("Eval")),
     }
+}
+
+fn refusal(variant: &str) -> String {
+    format!("remote front refuses {variant}")
 }
 
 #[cfg(test)]
@@ -257,6 +261,16 @@ mod tests {
                 "unexpectedly authorized {request:?}"
             );
         }
+    }
+
+    #[test]
+    fn refusal_names_the_variant_without_echoing_its_contents() {
+        let error = authorize(&Request::Send {
+            name: "private-session-name".into(),
+            bytes: b"secret-input-payload".to_vec(),
+        })
+        .unwrap_err();
+        assert_eq!(error, "remote front refuses Send");
     }
 
     #[test]

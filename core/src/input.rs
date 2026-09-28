@@ -1,11 +1,58 @@
 //! Idempotent, bounded byte batches for one session.
 
 use crate::agent::AgentError;
+use core::fmt;
+use core::time::Duration;
 use std::collections::VecDeque;
 
 pub const INPUT_RING_CAPACITY: usize = 256;
 pub const MAX_INPUT_CLIENTS: usize = 16;
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
+pub const INPUT_RATE_BYTES_PER_SECOND: usize = 256 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InputError {
+    InvalidSequence,
+    InvalidLength,
+    RateLimited,
+    Unavailable,
+}
+
+impl fmt::Display for InputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::InvalidSequence => "input sequence must start at 1",
+            Self::InvalidLength => "input must contain 1 to 65536 bytes",
+            Self::RateLimited => "session input rate limit exceeded",
+            Self::Unavailable => "session input rate check unavailable",
+        };
+        formatter.write_str(message)
+    }
+}
+
+#[derive(Default)]
+pub struct InputRateLimiter {
+    window_second: Option<u64>,
+    bytes_in_window: usize,
+}
+
+impl InputRateLimiter {
+    pub fn check_rate(&mut self, now: Duration, bytes: usize) -> Result<(), InputError> {
+        if bytes == 0 || bytes > MAX_INPUT_BYTES {
+            return Err(InputError::InvalidLength);
+        }
+        let second = now.as_secs();
+        if self.window_second != Some(second) {
+            self.window_second = Some(second);
+            self.bytes_in_window = 0;
+        }
+        if self.bytes_in_window.saturating_add(bytes) > INPUT_RATE_BYTES_PER_SECOND {
+            return Err(InputError::RateLimited);
+        }
+        self.bytes_in_window += bytes;
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct InputBatch<'a> {

@@ -226,6 +226,7 @@ fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> S
         ),
         Ok(Response::Uncertain) => ok_reply(id, tool_error("input outcome is uncertain")),
         Ok(Response::WrongInstance) => ok_reply(id, tool_error("session instance changed")),
+        Ok(Response::RateLimited) => ok_reply(id, tool_error("session input rate limit exceeded")),
         Ok(Response::AttachStarted { .. } | Response::AttachStatus { .. }) => {
             ok_reply(id, tool_error("attach responses are not exposed over MCP"))
         }
