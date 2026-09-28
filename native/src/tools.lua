@@ -376,8 +376,20 @@ end
 function remuda.expect_option(screen, matches)
   if type(screen) ~= "string" or type(matches) ~= "function" then return nil end
   local found
+  local markers = { "│", "┃", "❯", "›", ">" }
   for line in (screen .. "\n"):gmatch("(.-)\n") do
-    line = line:gsub("^%s*[│┃]%s*", ""):gsub("^%s*[❯›>]%s*", "")
+    line = line:gsub("^%s+", "")
+    for _ = 1, #markers do
+      local stripped = false
+      for _, marker in ipairs(markers) do
+        if line:sub(1, #marker) == marker then
+          line = line:sub(#marker + 1):gsub("^%s+", "")
+          stripped = true
+          break
+        end
+      end
+      if not stripped then break end
+    end
     local number, label = line:match("^%s*(%d+)[%.)]%s*(.-)%s*$")
     if number and matches(label) then
       if found then return nil end
