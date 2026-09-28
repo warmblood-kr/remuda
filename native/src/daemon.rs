@@ -716,23 +716,33 @@ fn handle(
         Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
         Request::RemoveDirAll { path: dir } => reply(&stream, &remove_dir_all(&dir)),
 
-        Request::Eval { code, name } => match image.eval_request(&code, name.as_deref()) {
-            Ok(value) => match image.pending_replies().pending_id(&value) {
-                Some(id) => deferred_reply(stream, reader, image, id),
-                None if value.len() > crate::reply_limit::MAX_REPLY_BYTES => reply(
-                    &stream,
-                    &Response::error(format!(
-                        "synchronous reply exceeds the {} MiB output limit ({} bytes)",
-                        crate::reply_limit::MAX_REPLY_BYTES / (1024 * 1024),
-                        value.len()
-                    )),
-                ),
-                None => reply(&stream, &Response::Value(value)),
-            },
-            // Lua's own message, which already carries the line and a
-            // traceback — the same treatment `remuda run` gives a script file.
-            Err(e) => reply(&stream, &Response::error(e)),
+        Request::Eval { code, name } => handle_eval(stream, reader, image, &code, name.as_deref()),
+    }
+}
+
+fn handle_eval(
+    stream: Stream,
+    reader: BufReader<Stream>,
+    image: &Image,
+    code: &str,
+    name: Option<&str>,
+) -> std::io::Result<()> {
+    match image.eval_request(code, name) {
+        Ok(value) => match image.pending_replies().pending_id(&value) {
+            Some(id) => deferred_reply(stream, reader, image, id),
+            None if value.len() > crate::reply_limit::MAX_REPLY_BYTES => reply(
+                &stream,
+                &Response::error(format!(
+                    "synchronous reply exceeds the {} MiB output limit ({} bytes)",
+                    crate::reply_limit::MAX_REPLY_BYTES / (1024 * 1024),
+                    value.len()
+                )),
+            ),
+            None => reply(&stream, &Response::Value(value)),
         },
+        // Lua's own message, which already carries the line and a traceback —
+        // the same treatment `remuda run` gives a script file.
+        Err(error) => reply(&stream, &Response::error(error)),
     }
 }
 
