@@ -28,8 +28,32 @@ pub mod tui;
 pub use portable_pty::CommandBuilder;
 pub use pty::PtyAgent;
 
-use remuda_core::{Clock, Size};
+use remuda_core::{Clock, Size, WallClock};
 use std::time::{Duration, Instant};
+
+/// The host implementation of persistent Unix wall time.
+pub struct SystemWallClock;
+
+impl SystemWallClock {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SystemWallClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WallClock for SystemWallClock {
+    fn unix_seconds(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+}
 
 /// This terminal's size, or the floor if it cannot be determined (no tty, a
 /// pipe, a cron job). `Size::new` clamps anyway, so the worst case is a session

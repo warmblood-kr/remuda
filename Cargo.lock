@@ -654,6 +654,7 @@ name = "remuda-native"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "getrandom",
  "interprocess",
  "libc",
  "mlua",
