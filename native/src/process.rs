@@ -59,6 +59,7 @@ pub fn run_sync(
 ) -> Result<RunOutput, String> {
     validate_run(&argv, timeout_seconds)?;
     let (stdout_permit, stderr_permit) = reserve_run_reader_workers()?;
+    let process_tree = ProcessTree::new().map_err(|error| error.to_string())?;
 
     let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds);
     let (program, args) = argv.split_first().expect("argv checked above");
@@ -70,6 +71,11 @@ pub fn run_sync(
         .stderr(Stdio::piped());
     child_guard::harden(&mut command);
     let mut child = command.spawn().map_err(|error| error.to_string())?;
+    if let Err(error) = process_tree.assign(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error.to_string());
+    }
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
     let child_stdin = child.stdin.take().expect("stdin was piped");
@@ -110,6 +116,7 @@ pub fn run_sync(
     let (child_status, timed_out) = wait_for_process_io(
         &mut child,
         deadline,
+        &process_tree,
         &stdout_reader,
         &stderr_reader,
         &stdin_done,
@@ -181,6 +188,7 @@ fn reserve_run_reader_workers() -> Result<(RunReaderPermit, RunReaderPermit), St
 fn wait_for_process_io(
     child: &mut Child,
     deadline: Instant,
+    process_tree: &ProcessTree,
     stdout_reader: &ReaderState,
     stderr_reader: &ReaderState,
     stdin_done: &AtomicBool,
@@ -191,7 +199,7 @@ fn wait_for_process_io(
             match child.try_wait() {
                 Ok(status) => child_status = status,
                 Err(error) => {
-                    kill_process_tree(child);
+                    process_tree.terminate(child);
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(error.to_string());
@@ -199,11 +207,11 @@ fn wait_for_process_io(
             }
         }
         if let Some(error) = stdout_reader.error() {
-            terminate_child(child);
+            terminate_child(child, process_tree);
             return Err(format!("read process.run stdout: {error}"));
         }
         if let Some(error) = stderr_reader.error() {
-            terminate_child(child);
+            terminate_child(child, process_tree);
             return Err(format!("read process.run stderr: {error}"));
         }
         if stdout_reader.done() && stderr_reader.done() && stdin_done.load(Ordering::Acquire) {
@@ -212,18 +220,34 @@ fn wait_for_process_io(
             }
         }
         if Instant::now() >= deadline {
-            // Only signal a process group while its direct leader is known to
-            // be alive. Once reaped, its pgid may have been reused.
+            // On Unix, only signal the process group while its direct leader
+            // is known to be alive; after reap, its pgid may have been reused.
+            // A Windows Job Object handle remains tied to its job after the
+            // leader exits, so it is safe to terminate in either case.
             let status = match child_status {
-                Some(status) => status,
+                Some(status) => {
+                    // On Windows, the direct child may have exited while a
+                    // grandchild still holds either pipe open. The Job Object
+                    // remains valid after the leader exits, so terminate it
+                    // at the deadline as well.
+                    #[cfg(windows)]
+                    process_tree.terminate(child);
+                    status
+                }
                 None => match child.try_wait() {
-                    Ok(Some(status)) => status,
+                    Ok(Some(status)) => {
+                        #[cfg(windows)]
+                        process_tree.terminate(child);
+                        status
+                    }
                     Ok(None) => {
-                        kill_process_tree(child);
+                        process_tree.terminate(child);
                         let _ = child.kill();
                         child.wait().map_err(|error| error.to_string())?
                     }
                     Err(error) => {
+                        #[cfg(windows)]
+                        process_tree.terminate(child);
                         let _ = child.kill();
                         let _ = child.wait();
                         return Err(error.to_string());
@@ -236,8 +260,8 @@ fn wait_for_process_io(
     }
 }
 
-fn terminate_child(child: &mut Child) {
-    kill_process_tree(child);
+fn terminate_child(child: &mut Child, process_tree: &ProcessTree) {
+    process_tree.terminate(child);
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -330,18 +354,183 @@ mod run_tests {
         assert_eq!(output.len(), RUN_OUTPUT_LIMIT);
         assert!(output.ends_with(RUN_OUTPUT_MARKER));
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn synchronous_process_timeout_kills_grandchild_holding_pipes() {
+        use std::time::{Duration, Instant};
+
+        let stem = std::env::temp_dir().join(format!(
+            "remuda-process-run-grandchild-{}",
+            std::process::id()
+        ));
+        let started_path = stem.with_extension("started");
+        let finished_path = stem.with_extension("finished");
+        let script_path = stem.with_extension("ps1");
+        for path in [&started_path, &finished_path, &script_path] {
+            let _ = std::fs::remove_file(path);
+        }
+        let started = started_path.to_string_lossy().replace('\'', "''");
+        let finished = finished_path.to_string_lossy().replace('\'', "''");
+        std::fs::write(
+            &script_path,
+            format!(
+                "Set-Content -LiteralPath '{started}' -Value started\nStart-Sleep -Seconds 4\nSet-Content -LiteralPath '{finished}' -Value finished\n"
+            ),
+        )
+        .expect("write grandchild script");
+        let script = script_path.to_string_lossy();
+        let command = format!(
+            r#"start "" /b powershell.exe -NoProfile -NonInteractive -File "{script}" & echo spawned"#
+        );
+
+        let started = Instant::now();
+        let result = super::run_sync(
+            vec!["cmd.exe".into(), "/d".into(), "/c".into(), command],
+            None,
+            2.0,
+        )
+        .expect("process.run should return at the timeout");
+        assert!(result.timed_out, "the parent should hit its timeout");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "process.run waited for its grandchild's inherited pipes"
+        );
+        assert!(
+            String::from_utf8_lossy(&result.stdout).contains("spawned"),
+            "the parent must confirm it launched the long-lived grandchild: {:?}",
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert!(
+            started_path.exists(),
+            "the grandchild should have started before process.run timed out"
+        );
+
+        std::thread::sleep(Duration::from_secs(3));
+        let grandchild_survived = finished_path.exists();
+        for path in [&started_path, &finished_path, &script_path] {
+            let _ = std::fs::remove_file(path);
+        }
+        assert!(
+            !grandchild_survived,
+            "the grandchild survived after process.run timed out"
+        );
+    }
 }
 
-#[cfg(unix)]
-fn kill_process_tree(child: &Child) {
-    let pid = child.id() as libc::pid_t;
-    // SAFETY: killpg receives only the child process-group id; child_guard
-    // creates that group before exec, so it cannot name the daemon's group.
-    let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
+struct ProcessTree {
+    #[cfg(windows)]
+    job: KillOnCloseJob,
 }
 
-#[cfg(not(unix))]
-fn kill_process_tree(_child: &Child) {}
+impl ProcessTree {
+    fn new() -> std::io::Result<Self> {
+        #[cfg(windows)]
+        {
+            return Ok(Self {
+                job: KillOnCloseJob::new()?,
+            });
+        }
+        #[cfg(not(windows))]
+        Ok(Self {})
+    }
+
+    fn assign(&self, child: &Child) -> std::io::Result<()> {
+        #[cfg(windows)]
+        self.job.assign(child)?;
+        #[cfg(not(windows))]
+        let _ = child;
+        Ok(())
+    }
+
+    fn terminate(&self, child: &Child) {
+        #[cfg(unix)]
+        {
+            let pid = child.id() as libc::pid_t;
+            // SAFETY: killpg receives only the child process-group id;
+            // child_guard creates that group before exec, so it cannot name
+            // the daemon's group.
+            let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
+        }
+        #[cfg(windows)]
+        {
+            let _ = child;
+            self.job.terminate();
+        }
+        #[cfg(not(any(unix, windows)))]
+        let _ = child;
+    }
+}
+
+#[cfg(windows)]
+struct KillOnCloseJob(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl KillOnCloseJob {
+    fn new() -> std::io::Result<Self> {
+        use windows_sys::Win32::System::JobObjects::{
+            CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        // SAFETY: a null security descriptor and name request a private,
+        // unnamed job owned by this handle.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: `limits` is the structure required for this information
+        // class, and the pointer and byte length remain valid for the call.
+        let configured = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if configured == 0 {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: this handle was just returned by CreateJobObjectW.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            return Err(error);
+        }
+        Ok(Self(handle))
+    }
+
+    fn assign(&self, child: &Child) -> std::io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        // SAFETY: both handles are live and owned for the duration of this
+        // call; Child keeps the process handle open and self owns the job.
+        let assigned = unsafe { AssignProcessToJobObject(self.0, child.as_raw_handle()) };
+        if assigned == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn terminate(&self) {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+
+        // SAFETY: self owns a valid Job Object handle. It may already be
+        // empty or terminated, in which case this best-effort call is benign.
+        unsafe { TerminateJobObject(self.0, RUN_TIMEOUT_EXIT_CODE as u32) };
+    }
+}
+
+#[cfg(windows)]
+impl Drop for KillOnCloseJob {
+    fn drop(&mut self) {
+        // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE terminates any remaining
+        // descendants when this last owned handle is closed.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
 
 struct ProcessState {
     lines: Mutex<VecDeque<String>>,
