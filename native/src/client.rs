@@ -70,6 +70,39 @@ pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
     read_response(&stream)
 }
 
+/// Send one request and stop waiting when the daemon exceeds the supplied
+/// response deadline.
+pub fn request_with_timeout(
+    path: &Path,
+    request: &Request,
+    timeout: std::time::Duration,
+) -> std::io::Result<Response> {
+    let stream = ipc::connect(path)?;
+    send(&stream, request)?;
+    let wake_stream = stream.try_clone()?;
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+    let reader = std::thread::Builder::new()
+        .name("remuda-local-request-reader".into())
+        .spawn(move || {
+            let _ = reply_tx.send(read_response(&stream));
+        })?;
+    let result = match reply_rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            ipc::wake(&wake_stream);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "local daemon request timed out",
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other(
+            "local daemon request reader stopped unexpectedly",
+        )),
+    };
+    let _ = reader.join();
+    result
+}
+
 fn send(mut stream: &Stream, request: &Request) -> std::io::Result<()> {
     let mut line = serde_json::to_string(request)?;
     line.push('\n');
@@ -888,8 +921,10 @@ impl Drop for RawMode {
 mod tests {
     #[cfg(unix)]
     use super::trace_input_read;
-    use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
-    use remuda_core::protocol::Response;
+    use super::{
+        interpret, request_with_timeout, reset_input_modes, write_input_trace, RESET_INPUT_MODES,
+    };
+    use remuda_core::protocol::{Request, Response};
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
@@ -897,6 +932,32 @@ mod tests {
         let mut output = Vec::new();
         reset_input_modes(&mut output).unwrap();
         assert_eq!(output, RESET_INPUT_MODES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_daemon_response_wait_has_a_timeout() {
+        use interprocess::local_socket::traits::ListenerExt as _;
+        let path = std::env::temp_dir().join(format!(
+            "remuda-client-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = crate::ipc::listen(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let _stream = listener.incoming().next().unwrap().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let started = std::time::Instant::now();
+        let error =
+            request_with_timeout(&path, &Request::List, Duration::from_millis(40)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

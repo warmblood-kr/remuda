@@ -5,7 +5,9 @@ use zeroize::Zeroizing;
 
 const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 const MAX_FRAME_SIZE: usize = 65_535;
+pub const MAX_RESPONSE_PAYLOAD: usize = MAX_FRAME_SIZE - 16;
 const TIMESTAMP_SIZE: usize = std::mem::size_of::<i64>();
+const NOISE_PROLOGUE: &[u8] = b"remuda-cluster-v1";
 
 /// An encrypted request plus the initiator state needed to open its response.
 pub struct SealedRequest {
@@ -31,6 +33,8 @@ pub fn seal_request(
 ) -> io::Result<SealedRequest> {
     let params = parse_pattern()?;
     let mut handshake = snow::Builder::new(params)
+        .prologue(NOISE_PROLOGUE)
+        .map_err(frame_error)?
         .local_private_key(initiator_private)
         .map_err(frame_error)?
         .remote_public_key(responder_static)
@@ -57,6 +61,8 @@ pub fn open_request(responder_private: &[u8], message: &[u8]) -> io::Result<Open
     ephemeral.copy_from_slice(&message[..32]);
     reject_low_order_dh(responder_private, &ephemeral)?;
     let mut handshake = snow::Builder::new(parse_pattern()?)
+        .prologue(NOISE_PROLOGUE)
+        .map_err(frame_error)?
         .local_private_key(responder_private)
         .map_err(frame_error)?
         .build_responder()
@@ -153,5 +159,33 @@ mod tests {
             .generate_keypair()
             .unwrap();
         assert!(reject_low_order_dh(&private, &peer.public).is_ok());
+    }
+
+    #[test]
+    fn request_prologue_is_part_of_the_noise_handshake() {
+        let initiator = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let responder = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let sealed = seal_request(&initiator.private, &responder.public, 1000, b"request").unwrap();
+        assert!(open_request(&responder.private, &sealed.message).is_ok());
+
+        let mut legacy = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .local_private_key(&initiator.private)
+            .unwrap()
+            .remote_public_key(&responder.public)
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut plaintext = [0; 64];
+        plaintext[..8].copy_from_slice(&1000i64.to_be_bytes());
+        plaintext[8..15].copy_from_slice(b"request");
+        let mut message = [0; 128];
+        let len = legacy
+            .write_message(&plaintext[..15], &mut message)
+            .unwrap();
+        assert!(open_request(&responder.private, &message[..len]).is_err());
     }
 }

@@ -47,3 +47,14 @@ fn frame_rejects_tampered_request_and_response() {
     *response.last_mut().unwrap() ^= 1;
     assert!(frame::open_response(sealed, &response).is_err());
 }
+
+#[test]
+fn oversized_response_payload_cannot_fit_a_noise_frame() {
+    let responder = keypair();
+    let initiator = keypair();
+    let sealed =
+        frame::seal_request(&initiator.private, &responder.public, 1000, b"request").unwrap();
+    let opened = frame::open_request(&responder.private, &sealed.message).unwrap();
+    let oversized = vec![0; frame::MAX_RESPONSE_PAYLOAD + 1];
+    assert!(frame::seal_response(opened, &oversized).is_err());
+}

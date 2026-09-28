@@ -216,6 +216,8 @@ remuda — a pty manager you can attach to
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster remote [node/session] open the read-only cluster tree
+  remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
+                                  [::] may accept IPv4 too on dual-stack systems
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
@@ -288,6 +290,8 @@ remuda — terminal orchestration for coding agents
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster remote [node/session] open the read-only cluster tree
+  remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
+                                  [::] may accept IPv4 too on dual-stack systems
 
   remuda doc | repl | -e CODE    use the persistent Lua runtime
   remuda --version
