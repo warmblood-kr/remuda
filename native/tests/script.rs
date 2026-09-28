@@ -148,6 +148,133 @@ fn the_bound_surface_is_exactly_the_protocols() {
     );
 }
 
+/// Run `source` in a fresh daemon of its own; the script asserts in Lua.
+fn run_lua(tag: &str, source: &str) {
+    let dir = scratch(tag);
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+    script::run(&path, &write(&dir, &format!("{tag}.lua"), source)).expect(tag);
+}
+
+#[test]
+fn hooks_run_in_depth_order_and_an_id_replaces_its_hook() {
+    // Emacs add-hook DEPTH: lower runs first, ties keep registration order;
+    // re-registering (event, group, id) replaces rather than duplicates.
+    run_lua(
+        "hook-depth",
+        r#"
+        local ran = {}
+        local function mark(tag) return function() ran[#ran + 1] = tag end end
+        remuda.on("d", mark("zero-a"))
+        remuda.on("d", mark("late"), { depth = 90 })
+        remuda.on("d", mark("early"), { depth = -50 })
+        remuda.on("d", mark("zero-b"))
+        remuda.emit("d")
+        assert(table.concat(ran, ",") == "early,zero-a,zero-b,late", table.concat(ran, ","))
+
+        ran = {}
+        remuda.on("r", mark("v1"), { group = "g", id = "x" })
+        remuda.on("r", mark("other"), { group = "g" })
+        remuda.on("r", mark("v2"), { group = "g", id = "x" })
+        remuda.on("r", mark("same-id-other-group"), { group = "h", id = "x" })
+        remuda.emit("r")
+        assert(table.concat(ran, ",") == "other,v2,same-id-other-group", table.concat(ran, ","))
+        assert(not pcall(remuda.on, "r", mark("bad"), { depth = "high" }), "a non-number depth is refused")
+        "#,
+    );
+}
+
+#[test]
+fn emit_protocols_answer_veto_and_filter_and_errors_are_no_answer() {
+    // run-hook-with-args-until-success / -until-failure, and a filter chain.
+    // A handler that errors is "no answer": never a result, never a veto.
+    run_lua(
+        "hook-protocols",
+        r#"
+        remuda.on("ask", function() error("boom") end, { depth = -10 })
+        remuda.on("ask", function() return nil end)
+        remuda.on("ask", function(x) return "answer:" .. x end)
+        remuda.on("ask", function() error("never reached") end, { depth = 50 })
+        assert(remuda.emit_until_success("ask", "q") == "answer:q")
+        assert(remuda.emit_until_success("nobody") == nil)
+
+        remuda.on("allow", function() error("boom") end)
+        remuda.on("allow", function() return nil end)
+        assert(remuda.emit_until_failure("allow") == true, "errors and nil do not veto")
+        remuda.on("allow", function() return false end, { id = "no" })
+        assert(remuda.emit_until_failure("allow") == false, "false vetoes")
+        assert(remuda.emit_until_failure("nobody") == true)
+
+        remuda.on("f", function(v, add) return v + add end)
+        remuda.on("f", function() error("boom") end)
+        remuda.on("f", function() return nil end)
+        remuda.on("f", function(v) return v * 10 end, { depth = 10 })
+        assert(remuda.emit_filter("f", 1, 2) == 30, "errors and nil leave the value unchanged")
+        assert(remuda.emit_filter("nobody", "same") == "same")
+
+        local counts = remuda.event_counts()
+        assert(counts.ask == 1 and counts.allow == 2 and counts.f == 1, "protocol emits are counted")
+        "#,
+    );
+}
+
+#[test]
+fn hook_list_reports_each_hook_and_its_errors_as_a_copy() {
+    run_lua(
+        "hook-list",
+        r#"
+        remuda.on("e", function() error("first") end, { group = "g", id = "bad", depth = 5 })
+        remuda.on("e", function() end)
+        remuda.on("other", function() end)
+        remuda.emit("e")
+        remuda.emit("e")
+
+        local list = remuda.hook_list("e")
+        assert(#list == 2, "only the asked event")
+        local bad = list[2]
+        assert(bad.event == "e" and bad.group == "g" and bad.id == "bad" and bad.depth == 5)
+        assert(bad.errors == 2, "errors counted per hook: " .. tostring(bad.errors))
+        assert(tostring(bad.last_error):find("first", 1, true), tostring(bad.last_error))
+        assert(type(bad.src) == "string" and bad.src ~= "", "src names where the hook was defined")
+        assert(list[1].errors == 0 and list[1].depth == 0)
+        assert(#remuda.hook_list() == 3, "no event means every event")
+
+        bad.errors, bad.fn = 99, nil
+        assert(remuda.hook_list("e")[2].errors == 2, "hook_list hands out copies")
+        assert(list[1].fn == nil, "copies never expose the callback")
+        "#,
+    );
+}
+
+#[test]
+fn butlers_filter_by_assignment_still_works_on_the_new_entry_shape() {
+    // remuda-butler main.lua drops legacy ungrouped Matrix hooks by rebuilding
+    // `remuda.hooks[event]` (writable, deprecated). This must keep working.
+    run_lua(
+        "hook-butler-compat",
+        r#"
+        local fired = {}
+        remuda.on("butler-matrix-line", function() fired[#fired + 1] = "legacy" end)
+        remuda.on("butler-matrix-line", function() fired[#fired + 1] = "grouped" end, { group = "butler", id = "line" })
+        for _, event in ipairs({ "butler-matrix-line", "butler-matrix-submit" }) do
+          local kept = {}
+          for _, hook in ipairs(remuda.hooks[event] or {}) do
+            if hook.group then kept[#kept + 1] = hook end
+          end
+          remuda.hooks[event] = kept
+        end
+        remuda.emit("butler-matrix-line")
+        assert(table.concat(fired, ",") == "grouped", table.concat(fired, ","))
+        local list = remuda.hook_list("butler-matrix-line")
+        assert(#list == 1 and list[1].id == "line", "hook_list sees the filtered table")
+        remuda.on("butler-matrix-line", function() fired[#fired + 1] = "again" end, { group = "butler", id = "line" })
+        fired = {}
+        remuda.emit("butler-matrix-line")
+        assert(table.concat(fired, ",") == "again", "id replace works after a hand filter")
+        "#,
+    );
+}
+
 #[test]
 fn every_word_has_a_registry_entry() {
     // Every BINDINGS name, plus every remuda.tool() registrant (wait_for is

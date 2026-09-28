@@ -26,6 +26,11 @@ _extension_commands
 
 ``table`` — Handlers registered for installed mod commands.
 
+_function_source
+----------------
+
+``_function_source(fn) -> string`` — Where a Lua function was defined, as `source:line`; internal, for `hook_list`, since scripts get no `debug` library.
+
 _process_drain
 --------------
 
@@ -126,6 +131,21 @@ emit
 
 ``emit(event, ...) -> nil`` — Fire an event, running every hook registered for it.
 
+emit_filter
+-----------
+
+``emit_filter(event, value, ...) -> value`` — Thread a value through each hook as `hook(value, ...)`; nil or an error leaves it unchanged.
+
+emit_until_failure
+------------------
+
+``emit_until_failure(event, ...) -> boolean`` — Fire an event until a hook returns false (a veto). An erroring hook is no answer, never a veto.
+
+emit_until_success
+------------------
+
+``emit_until_success(event, ...) -> value?`` — Fire an event until a hook returns non-nil, and return that value. An erroring hook is no answer.
+
 event_counts
 ------------
 
@@ -146,10 +166,15 @@ feed
 
 ``feed(name, steps) -> nil`` — Deliver a sequence of bursts and pauses as one indivisible act.
 
+hook_list
+---------
+
+``hook_list(event?) -> {{event, group, id, depth, src, errors, last_error}...}`` — Copies of the registered hooks, for one event or all, in run order.
+
 hooks
 -----
 
-``table`` — The `remuda.on` registry table, keyed by event name.
+``table`` — Deprecated for reading: use `hook_list`. The `remuda.on` table, keyed by event name; it becomes read-only once no mod edits it by hand.
 
 insert
 ------
@@ -189,7 +214,7 @@ new
 on
 --
 
-``on(event, fn, opts?) -> nil`` — Register a callback to run when an event fires.
+``on(event, fn, opts?) -> nil`` — Register a callback to run when an event fires. `opts`: `group`, `id` (same group+id replaces), `depth` (-100..100, lower first).
 
 process
 -------
