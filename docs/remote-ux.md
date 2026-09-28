@@ -1,6 +1,6 @@
 # Remote session UX draft
 
-This is a UX proposal for `remuda remote HOST/SESSION`. It covers one session at a time over short request/response exchanges, so a lost network request does not end the viewing command. The node name and session remain visible throughout. Nodes are identified by their cluster name; the later composed multi-node view comes separately. The name `control tower` is reserved for that later view.
+Remote mode continues the existing Remuda TUI: the list stays on the left and the selected session stays on the right. The difference is that the left side becomes a virtual tree of nodes and their sessions, addressed as `node/session`. The selected remote screen keeps refreshing over short requests and survives network loss. There is no separate remote-client look. The name `control tower` remains reserved for a later composed multi-node control experience.
 
 All commands below are proposed user-facing syntax for review. The cluster and remote subcommands and their flags are not implemented yet. Example addresses, fingerprints, tokens, and output are illustrative.
 
@@ -51,144 +51,138 @@ Join failed: 100.80.0.12:7443 is unreachable. Check that both machines are on th
 
 ## User journeys
 
-### 1. Host a session
+### 1. Host a session and open the cluster view
 
-On the machine that runs the session, start it with its normal command and a stable session name:
+On the host node, start the session normally:
 
 ```sh
 remuda run -n dev claude
 ```
 
-The daemon owns the session after the initiating terminal detaches or disappears. The host operator gives a registered node name and session name to the viewer. The session is not exposed publicly: remote access is through the VPN, and the selected host must authorize the viewer. Starting a session and granting remote-view access are separate actions.
+From an already joined node, run `remuda remote` to open the same Remuda TUI with the cluster tree on the left and selected-session screen on the right. `remuda remote studio/dev` is a proposed shortcut that opens that same UI with the target selected. The daemon keeps the session alive when the initiating terminal goes away.
 
-A viewer connects from a second machine with:
+At first open, expand the local/current node and collapse other nodes. Use ↑/↓ to move through the tree, ←/→ to collapse or expand node groups, and Enter to select a session and focus its line composer. The current target is always named `node / session` in the right pane. A terminal snapshot is shown there with its capture age; the line composer remains in the familiar Remuda footer area.
+
+### 2. Phone or laptop view on an unstable network
+
+From Termux or a laptop joined to the cluster:
 
 ```sh
-remuda remote laptop/dev
+remuda remote
 ```
 
-The initial command has no flags. Proposed optional flags are `--read-only` to explicitly request viewing without input rights and `--poll INTERVAL` to adjust the refresh interval (default: 3s). They are proposals for review, not implemented CLI behavior.
-
-### 2. Connect from another machine
-
-The node name `laptop` resolves through authenticated cluster membership. `dev` selects the session on that host. While connecting, the command names both pieces so the user can spot a mistaken target:
-
-```text
-remuda remote laptop/dev
-laptop / dev · connecting…
-Resolving host and authorizing session
-```
-
-After authorization, the client shows the most recent captured screen and its age. The selected session is a snapshot view, not a promise of per-keystroke interactive-terminal timing. Entered lines are delivered as input to the session.
+Use the same tree and keyboard model on each platform. Node groups collapse, the current node starts expanded, and other nodes start collapsed. Press `/` to search node/session names; `!` optionally limits the list to sessions needing attention (stale, ended, or with pending input). The selected node and session stay visible while navigating. Selecting `phone / dev` shows its captured screen and an input line; this is not a separate remote app or share-link flow.
 
 ### 3. Network drop and resume
 
-During a VPN or Wi-Fi interruption, keep the last known snapshot on screen and continue to display its age. New input can still be composed locally but is visibly pending. The client retries short sync and input requests in the background. When the host returns, it resumes from the last seen screen version and retries pending input using the same batch ID.
+If one node drops off the VPN, keep its last screen visible and show its reachability and snapshot age in both the tree and right pane. Continue composing text locally. Enter freezes the entire line as a batch; show each pending line until acknowledged. On recovery, resume from the last screen version and retry each batch with its original ID.
 
 ```text
-laptop / dev · stale · reconnecting (last snapshot 28s ago)
+remuda · cluster (2/3 reachable)
+> ▼ studio       local · reachable · sync 1s
+    dev          live
+  ▶ field-laptop unreachable · last sync 28s
+  ▶ buildbox     reachable · sync 2s
 ─────────────────────────────────────────────────────────
+field-laptop / dev · stale snapshot · reconnecting
 $ Please check the migration output
 
-Draft · 37 chars · waiting to send
-Network unavailable. Retrying…
+Input pending · 1 line · retrying with same batch ID
 ```
 
-A line remains in the local draft until the send is acknowledged. Once submitted, it appears in a pending queue until acknowledged. A timeout is ambiguous, so the client must retry that exact batch ID and bytes; it must not create a new batch for a retry. Show `sent` only after the daemon acknowledges the batch. If the daemon cannot establish whether an old batch was applied (for example, its deduplication record has expired), stop and report an uncertain delivery instead of silently resending under a new ID.
+A line stays in the draft until Enter. Once submitted, it remains in the pending queue until the daemon acknowledges it. A timeout retries the exact batch ID and bytes; it never creates a new batch for the same line. If deduplication history cannot prove whether the batch applied, show `delivery uncertain` and do not silently send it again under a new ID.
 
-### 4. Two viewers
+### 4. Two viewers send input
 
-Two clients may open the same session concurrently. Both can view snapshots and see their own snapshot age and connection state. Input rights should be exclusive per session: recommend that the first authorized writer holds a renewable writer lease and a second viewer opens read-only. The second viewer sees `read-only · another viewer is sending input` and may request the lease if the first leaves or explicitly releases it. A race to acquire a lease is resolved by the host; never merge simultaneous independent line editors into one input stream.
-
-A viewer may also select `--read-only` explicitly. That viewer can never accidentally type into the session, even when no other writer is connected. If a writer disconnects, keep its lease briefly while it reconnects so its queued batches can be reconciled; after lease expiry, another viewer may acquire write access. Pending input must be acknowledged or visibly reported as uncertain before a lease is transferred.
+Two viewers can select the same session and each can send lines. Each Enter submits one atomic batch. The host applies complete batches in arrival order, so concurrent batches can be adjacent but never interleave character by character. A small transient hint may say `input from field-laptop` or `input from operator`; input does not wait for exclusive ownership.
 
 ### 5. Switch sessions or nodes
 
-Press Esc to detach from the current view, then run `remuda remote laptop/worker` or `remuda remote buildbox/dev`. These always start a fresh target selection and display the new `HOST / SESSION` before accepting input. If the current draft is nonempty, ask whether to keep it locally or discard it; pending batches stay associated with their original host/session and are never retargeted. Joined node names resolve through cluster membership; this command still opens one session at a time and does not show a multi-node overview.
+Move to another node group or session in the left tree and select it. The right pane changes its target label to the selected `node / session`; no separate command or view is needed. A nonempty local draft prompts to keep or discard it. Submitted pending batches stay associated with their original node/session and are never retargeted. Search with `/`; optionally press `!` to show only sessions needing attention.
 
-### 6. End the view or end the session
+### 6. Detach or terminate
 
-Press Esc to leave the remote view. If a local draft has not been sent, ask whether to keep it in the local client for later or discard it. Detaching does not stop the remote session. Reopen it with `remuda remote laptop/dev`.
+**Detach** means leave the remote TUI; the remote session keeps running. With list/tree focus, press `q` to leave, with no confirmation. Keep any unsent draft locally with its node/session target. When a session has focus, use the existing `Ctrl-\` to return to the list, then `q` to detach. In the line composer, `q` is ordinary draft text; termination is only available when the tree has focus.
 
-Ending the session is a separate, destructive action. Recommend an explicit confirmation in the remote view (`Ctrl-C` twice, with a confirmation prompt) or an explicit close command; do not map Esc or ordinary input to session termination. On the host, the existing Lua close API can end the session:
+**Terminate** means kill the session process. It uses the same `x` key and confirmation as local Remuda: select the live session, press `x`, then confirm `y` at `kill dev? it is running — y / n`. Do not add a remote-only key or map Esc, `q`, or ordinary input to termination. If an ended session is selected, show its final available screen and ended status; the existing `x` behavior for an exited row clears it from the list.
 
-```sh
-remuda -e 'remuda.close("dev")'
-```
-
-When the remote session exits or is closed, stop retrying input and show its final captured screen with an ended marker. Any unsent draft stays local and must not be transmitted to a newly created session that reuses the same name.
+After the process exits, retain its selected final screen/status long enough to identify it as ended, then reflect removal from the remote session list. Any unsent draft stays local and must not go to a later session that reuses the same name.
 
 ## Screen states
 
-The status line always includes `HOST / SESSION`. While the client is connected, the snapshot age reflects when that screen was captured, not when it was rendered locally.
+The same Remuda TUI layout is used in every state: virtual node/session tree on the left, selected screen on the right. Nodes are collapsible groups. Expand the local/current node by default and collapse the rest. Show each node’s reachable/unreachable badge and last-sync age; show session status and pending-input markers on child rows. `/` searches names; optionally `!` filters to sessions needing attention.
 
-### Connecting
-
-```text
-laptop / dev · connecting…
-Resolving host and authorizing session
-```
-
-### Live and writable
+### All nodes up
 
 ```text
-laptop / dev · live · snapshot 1s ago · writer
-───────────────────────────────────────────────
-$ Waiting for test results…
-
-> Type a line; Enter sends · Esc leaves
-```
-
-### Stale and reconnecting
-
-```text
-laptop / dev · stale · reconnecting · snapshot 28s ago
+remuda · cluster (3/3 reachable)
+> ▼ studio       local · reachable · sync 1s
+    dev          live
+  ▶ field-laptop reachable · sync 2s · 2 sessions
+  ▶ buildbox     reachable · sync 1s · 4 sessions
 ──────────────────────────────────────────────────────
+studio / dev · live · snapshot 1s ago
 $ Waiting for test results…
 
-Draft · 37 chars · waiting to send
-Network unavailable. Retrying…
+> Type a line; Enter sends · Ctrl-\ list · q detach
 ```
 
-### Read-only
+### One node unreachable
 
 ```text
-laptop / dev · live · snapshot 1s ago · read-only
-──────────────────────────────────────────────────
+remuda · cluster (2/3 reachable)
+> ▼ studio       local · reachable · sync 1s
+    dev          live
+  ▶ field-laptop unreachable · last sync 28s
+  ▶ buildbox     reachable · sync 2s
+──────────────────────────────────────────────────────
+field-laptop / dev · stale snapshot · reconnecting
 $ Waiting for test results…
 
-Another viewer has the writer lease. Press r to request it; Esc leaves.
+Node unreachable. Keeping last screen; retrying…
 ```
 
-### Ended
+### Stale snapshot while recovering
 
 ```text
-laptop / dev · ended · final snapshot 2s ago
-────────────────────────────────────────────
-Process exited (status 0). Input is disabled.
-Esc leaves.
+remuda · cluster (2/3 reachable)
+> ▼ studio       local · reachable · sync 1s
+    dev          live
+  ▼ field-laptop reconnecting · last sync 28s
+    dev          stale · pending input 1
+  ▶ buildbox     reachable · sync 2s
+──────────────────────────────────────────────────────
+field-laptop / dev · stale · snapshot 28s ago
+$ Waiting for test results…
+
+Input pending · 1 line · retrying with same batch ID
 ```
 
-Other actionable failures should name the target and next step: `laptop / dev · access denied — ask the host operator for access`; `laptop / dev · session not found — check the session name`; `laptop · host unreachable — check VPN, retrying`; `laptop / dev · delivery uncertain — batch <id> may have been applied; do not resend as a new line`.
+### Ended session
+
+```text
+studio / dev · ended · final snapshot 2s ago
+$ Process exited (status 0). Input is disabled.
+x clears ended session · q detaches
+```
+
+Other actionable failures name the target and next step: `field-laptop / dev · access denied — ask the cluster operator`; `field-laptop / dev · session not found — check the session name`; `field-laptop · unreachable — check VPN, retrying`; `field-laptop / dev · delivery uncertain — batch <id> may have been applied; do not resend as a new line`.
 
 ## Input composition and special keys
 
-Recommend a local line editor instead of forwarding every key. Text, cursor movement, Backspace, Delete, and Home/End edit the draft on the client. Enter commits one line to the pending queue and sends it as one idempotent batch. Show the pending line (or a short preview) with `waiting to send`, `sending`, and `sent` acknowledgement states. Editing after Enter creates a new draft and never mutates an already submitted batch.
+The selected session pane stays a snapshot, with the line editor integrated into the existing TUI footer. Text, cursor movement, Backspace, Delete, and Home/End edit the local draft. Enter sends the whole line as one idempotent batch. Show each submitted line with `waiting to send`, `sending`, or `sent` acknowledgement status. Editing after Enter creates a new draft and never changes a submitted batch.
 
-While disconnected, keystrokes are accumulated in the current local draft; pressing Enter freezes that line into one pending batch. Pending batches preserve order. A retry after a timeout reuses the original batch ID and bytes. Show each pending line distinctly so users can tell what has not yet been acknowledged. For a read-only viewer, input is disabled and no characters are queued.
+While offline, characters accumulate in the current draft. Enter freezes that line into the pending queue; pending batches preserve local submission order and retry with the same IDs and bytes. Two viewers’ batches are atomically applied in daemon arrival order. A timeout or reconnect never changes the batch ID. If a batch cannot be proven applied or unapplied, report uncertainty rather than silently duplicating it. Show a small `input from <node/user>` hint when a remote batch arrives, without assigning exclusive input ownership.
 
-Do not silently reinterpret terminal control keys. Recommend: arrows edit the local line; Ctrl-C cancels the current local draft; Esc leaves the view; an explicit `Ctrl-C` confirmation action signals an interrupt to the remote process. Other control keys such as Esc-as-application-input, Tab, or function keys should require a named `send-key` action and confirmation of the target until the interaction model is reviewed. This first UX is for sending lines, not a full-screen remote terminal; applications that require arbitrary control sequences are out of scope for this screen.
+The remote line editor handles ordinary text, not arbitrary terminal key timing. Arrows edit the local line; Ctrl-C cancels its current draft; Ctrl-\ returns from session focus to the list; `q` from list/tree focus detaches from the TUI; `x` on the selected session invokes the same termination confirmation as local Remuda. Special application keys remain outside this line-oriented first UX.
 
-## Open UX decisions
+## Open UX decision
 
-1. **Input:** send each key immediately, flush buffered chunks on a timer, or edit a line and send on Enter. Recommend the line editor: it works with mobile keyboards, allows correction before send, and makes an exactly-once unit visible. Its trade-off is that it is not suitable for full-screen applications.
-2. **Two viewers:** allow all viewers to write with interleaved input, make every extra viewer read-only, or grant one renewable writer lease. Recommend the lease: it gives shared read access without surprising input interleaving. The lease duration and handoff policy need owner review.
-3. **Leaving vs ending:** overload a terminal key, provide an explicit close action, or separate detach and confirmed termination. Recommend separate detach and confirmed termination; network loss or Esc must never kill the host session.
-4. **Host configuration:** accept arbitrary VPN URLs on each invocation or use named configured hosts. Recommend registered node names (`NODE/SESSION`) so a target is short, stable, and easy to verify; cluster membership is the source of truth.
+The tree may offer an attention-only filter (`!`) in addition to `/` name search. Recommend including it if the existing list footer has room; stale nodes, ended sessions, and pending input are the attention states. It does not change the default view: local/current node expanded, other node groups collapsed.
 
 ## Protocol implications
 
-Sync returns a snapshot or diff with a monotonically increasing version; reconnect resumes from the last version. A committed line is `input(session, batch_id, bytes)`, and retries reuse the same ID and bytes so an acknowledged or previously applied batch is never delivered twice. Local requests can reuse the daemon socket. The remote channel uses Remuda’s own short-lived authenticated request/response protocol over the VPN, with joined node keys. Use off-the-shelf channel crypto: the current direction is Noise IK via `snow`, with pinned keys. The protocol needs multiple readers and a host-enforced writer lease. Per-session output events from #190 may later wake a long-poll without changing these user journeys.
+Sync returns the selected session’s latest snapshot plus an output version; a reconnect resumes from the last version. Enter submits `input(session, batch_id, bytes)`, and retries reuse the same ID and bytes. The host deduplicates each viewer’s batch and applies whole batches atomically in arrival order. Local calls reuse the daemon socket; remote calls use Remuda’s authenticated short request/response channel over the VPN, with joined node keys and pinned peers. The channel uses off-the-shelf Noise IK via `snow`; a per-session output event from #190 can later wake sync without changing the TUI.
 
 ### Security and implementation constraints
 
@@ -204,7 +198,7 @@ These references inform the user experience and trust boundaries; they are patte
 
 - [Mosh](https://mosh.org/) is the closest match for unstable mobile links. Borrow its explicit stale/reconnected feedback and its model of synchronizing the latest screen state across loss and roaming. Mosh’s UDP SSP and predictive local echo target a full interactive terminal; Remuda’s first view instead uses short versioned sync requests and a line editor. Do not show speculative text as delivered: a line stays pending until the daemon acknowledges its idempotent batch.
 - [Eternal Terminal](https://eternalterminal.dev/) resumes a byte stream using sequence numbers and buffered replay. Borrow the clear expectation that reconnect resumes the existing work. Reject transparent stream replay for input: a terminal write may have taken effect even when its acknowledgement was lost. Remuda retries a batch ID and shows `delivery uncertain` if deduplication can no longer establish the result.
-- [tmate](https://github.com/tmate-io/tmate) provides distinct read-only and writable session share credentials; [Upterm](https://upterm.dev/docs/upterm.html) makes a host session easy to share and join. (Upterm’s `--read-only` flag applies to SFTP operations, so it is not evidence for terminal access modes.) Borrow visible access mode from tmate and a concise join flow from both. Reject public share links and relay-hosted sessions as the default: Remuda stays on the private VPN and authorizes named cluster nodes. A second viewer starts read-only; the host explicitly grants or transfers the writer lease.
+- [tmate](https://github.com/tmate-io/tmate) provides distinct read-only and writable session share credentials; [Upterm](https://upterm.dev/docs/upterm.html) makes a host session easy to share and join. (Upterm’s `--read-only` flag applies to SFTP operations, so it is not evidence for terminal access modes.) Borrow a concise join flow from both. We considered separate read-only and writable sharing, but the approved Remuda UX lets every authorized viewer submit lines; show only a transient `input from <node/user>` hint. Reject public share links and relay-hosted sessions as the default: Remuda stays on the private VPN and authorizes named cluster nodes.
 
 ### Cluster joining and identity
 
@@ -216,3 +210,7 @@ These references inform the user experience and trust boundaries; they are patte
 - [Magic Wormhole](https://magic-wormhole.readthedocs.io/en/latest/welcome.html) uses a one-time, human-sized PAKE code to establish a protected transfer. Borrow short-lived, single-use bootstrap material and clear expiry errors. Remuda’s join command also pins the first node’s fingerprint; do not rely on a short code alone to authenticate the cluster or add a public mailbox/relay service to this VPN-first UX.
 - [WireGuard](https://www.wireguard.com/protocol/) demonstrates the Noise IK handshake with static peer keys; the [Noise Protocol Framework](https://www.noiseprotocol.org/) provides reviewed protocol patterns. Borrow established handshake primitives and pinned node keys. Do not invent cryptographic primitives or treat an encrypted channel as authorization: the request allowlist, node registry, and revocation checks remain required.
 - [OpenSSH known_hosts and authorized_keys](https://man.openbsd.org/ssh) make host-key checking and an operator-managed authorized-key list familiar. Borrow a displayed, pinned fingerprint and a registry with explicit revocation. Reject SSH as the remote transport for this design, and never silently accept a changed key (TOFU); a mismatch stops the join with an actionable error.
+
+### Tree navigation prior art
+
+For long lists, borrow the hierarchy of [tmux `choose-tree`](https://github.com/tmux/tmux/wiki/Getting-Started/86df5fe449a2d0499cf47a7e16245a3c6d6562d5), which groups sessions/windows/panes and supports collapsed branches; borrow context awareness and search from [k9s](https://k9scli.io/topics/commands/), the host tree pattern from [VS Code Remote Explorer](https://code.visualstudio.com/docs/remote/ssh), and reachability/last-seen filtering from the [Tailscale device list](https://tailscale.com/docs/features/access-control/device-management/how-to/filter). Recommendation: one collapsible node group per host, sessions nested beneath it, local/current node expanded by default and other groups collapsed. Keep the selected session preview on the right in the existing Remuda layout; show reachability and last-sync age on each node row. `/` searches names and `!` filters for attention states. Do not make nodes mutually exclusive contexts that hide the rest of the cluster.
