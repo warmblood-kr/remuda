@@ -344,28 +344,55 @@ const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 /// go through: `Registry::reap()` hands its answer to whoever calls first, so
 /// notifying anywhere else would race it and silently drop the event.
 pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String> {
-    let dead = registry.reap();
-    for name in &dead {
-        notify_exited(image, name);
+    let dead = registry.reap_with_exit_info();
+    for (name, reason, exit_info) in &dead {
+        notify_exited(image, name, reason, exit_info.as_ref());
     }
-    dead
+    dead.into_iter().map(|(name, _, _)| name).collect()
 }
 
 fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<()>> {
+    let session = registry.get(name)?;
     let closed = registry.close(name)?;
     if let Ok(true) = closed {
-        notify_exited(image, name);
+        // If the reaper removed it first, close returns false and the reaper
+        // owns the single notification using the marker's `closed` reason.
+        notify_exited(image, name, "closed", session.exit_info().as_ref());
     }
     Some(closed.map(drop))
 }
 
 /// `close` stops tracking a session itself, so the reaper never sees it die:
 /// whichever of the two removes the entry fires the one `session_exited`.
-fn notify_exited(image: &Image, name: &str) {
+fn notify_exited(
+    image: &Image,
+    name: &str,
+    reason: &str,
+    exit_info: Option<&remuda_core::agent::ExitInfo>,
+) {
+    let mut fields = vec![format!("reason={}", crate::mcp::lua_string(reason))];
+    if let Some(exit_info) = exit_info {
+        if let Some(exit_code) = exit_info.exit_code {
+            fields.push(format!("exit_code={exit_code}"));
+        }
+        if reason != "closed" {
+            if let Some(signal) = exit_info.signal {
+                fields.push(format!("signal={signal}"));
+            }
+            if let Some(signal_name) = &exit_info.signal_name {
+                fields.push(format!(
+                    "signal_name={}",
+                    crate::mcp::lua_string(signal_name)
+                ));
+            }
+        }
+    }
+    let details = format!("{{{}}}", fields.join(", "));
     let _ = image.submit(
         &format!(
-            "remuda.emit('session_exited', {})",
-            crate::mcp::lua_string(name)
+            "remuda.emit('session_exited', {}, {})",
+            crate::mcp::lua_string(name),
+            details,
         ),
         None,
     );
