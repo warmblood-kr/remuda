@@ -20,6 +20,9 @@ pub struct Session {
     /// Reading of [`Clock::now`] taken at the last successful `send_line`.
     /// Meaningful only as a difference against a later reading.
     last_input_at: Mutex<Duration>,
+    /// [`Clock::now`] at the last keystroke through an [`Attached`] guard —
+    /// a human's, never a script's. `None` until one arrives (#136).
+    last_human_input_at: Mutex<Option<Duration>>,
     /// Set while an [`Attached`] guard is alive.
     attached: AtomicBool,
     /// Held for the whole of one input act — every `Burst` **and** every
@@ -54,6 +57,7 @@ impl Session {
             size: Mutex::new(size),
             clock,
             last_input_at: Mutex::new(started),
+            last_human_input_at: Mutex::new(None),
             attached: AtomicBool::new(false),
             input_lock: Mutex::new(()),
         }
@@ -245,6 +249,13 @@ impl Session {
         let last = self.last_input_at.lock().map(|d| *d).unwrap_or_default();
         self.clock.now().saturating_sub(last)
     }
+
+    /// How long since an attached human last typed, or `None` if none has.
+    /// Lets a script hold back rather than type over a half-written line.
+    pub fn human_idle_for(&self) -> Option<Duration> {
+        let last = self.last_human_input_at.lock().ok().and_then(|at| *at)?;
+        Some(self.clock.now().saturating_sub(last))
+    }
 }
 
 /// Exclusive hold on a session by one attached viewer. Caution: this guard is
@@ -263,7 +274,12 @@ impl Attached<'_> {
             .agent
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-        agent.write(bytes)
+        agent.write(bytes)?;
+        // Only after the write lands, as `last_input_at` is.
+        if let Ok(mut at) = self.session.last_human_input_at.lock() {
+            *at = Some(self.session.clock.now());
+        }
+        Ok(())
     }
 
     /// The screen as terminal bytes, for painting on attach. Without this a

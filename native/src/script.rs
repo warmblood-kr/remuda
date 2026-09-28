@@ -722,6 +722,10 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
                 // "*sessions*" buffer, `tools.lua`) can show the same
                 // attached state the list has always drawn.
                 row.set("attached", session.attached)?;
+                // Seconds since an attached human typed; absent (nil) if never.
+                if let Some(human_idle) = session.human_idle {
+                    row.set("human_idle", human_idle.as_secs_f64())?;
+                }
                 rows.set(index + 1, row)?;
             }
             Ok(Value::Table(rows))
