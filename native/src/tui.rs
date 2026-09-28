@@ -1212,6 +1212,7 @@ mod visual_mode_tests {
     fn ui() -> Ui {
         let mut ui = Ui::new(
             vec![SessionSummary {
+                id: String::new(),
                 name: "agent".into(),
                 alive: true,
                 idle: Duration::ZERO,

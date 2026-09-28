@@ -13,8 +13,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
 /// A running agent, addressable by name.
 pub struct Session {
+    id: String,
     name: String,
     agent: Mutex<Box<dyn AgentProcess>>,
     size: Mutex<Size>,
@@ -56,6 +59,26 @@ impl core::fmt::Debug for Session {
 impl Session {
     pub fn new(
         name: impl Into<String>,
+        agent: Box<dyn AgentProcess>,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
+        Self::new_with_id(name, Self::new_id(), agent, clock)
+    }
+
+    /// Generate a daemon-local identity before spawning a session process so
+    /// it can be placed in that process's environment.
+    pub fn new_id() -> String {
+        format!(
+            "{}-{}",
+            std::process::id(),
+            NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// Construct a session with the identity injected into its child process.
+    pub fn new_with_id(
+        name: impl Into<String>,
+        id: impl Into<String>,
         mut agent: Box<dyn AgentProcess>,
         clock: Arc<dyn Clock>,
     ) -> Self {
@@ -74,6 +97,7 @@ impl Session {
             });
         }
         Self {
+            id: id.into(),
             name: name.into(),
             agent: Mutex::new(agent),
             size: Mutex::new(size),
@@ -86,6 +110,10 @@ impl Session {
             next_attach_generation: AtomicU64::new(1),
             input_lock: Mutex::new(()),
         }
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
     }
 
     pub fn name(&self) -> &str {
