@@ -1231,6 +1231,8 @@ mod visual_mode_tests {
             vec![SessionSummary {
                 id: String::new(),
                 name: "agent".into(),
+                instance_id: Some("test-agent".into()),
+                output_version: Some(0),
                 alive: true,
                 idle: Duration::ZERO,
                 output_idle: Some(Duration::ZERO),
@@ -3150,6 +3152,7 @@ fn capture_styled(path: &Path, name: &str, scrollback: usize) -> Result<StyledCa
             cursor,
             scrollback_len,
             scrollback_total,
+            ..
         }) => Ok((
             rows.iter().map(|row| expand_runs(row)).collect(),
             wrapped,
