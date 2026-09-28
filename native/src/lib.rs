@@ -14,6 +14,7 @@ pub mod daemon;
 pub mod dist;
 pub mod image;
 pub mod ipc;
+pub mod json;
 pub mod mcp;
 pub mod mouse;
 #[allow(clippy::disallowed_types)]
@@ -24,6 +25,7 @@ pub mod process;
 mod process_ancestry;
 pub mod pty;
 pub mod remote_front;
+pub mod reply_limit;
 pub mod script;
 pub mod tick;
 pub mod tui;

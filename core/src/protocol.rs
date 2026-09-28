@@ -57,8 +57,9 @@ pub enum Request {
     /// `SendLine` are its one-`Burst` case. An attached terminal does not
     /// block it.
     Feed { name: String, steps: Vec<Step> },
-    /// Resize a session's terminal to its viewer panel. The size is clamped
-    /// during deserialization just like `New`.
+    /// Resize a session's terminal to its viewer panel. Ordinary sizes are
+    /// clamped during deserialization; an explicitly pane-sized value can
+    /// retain its narrower visible width.
     Resize { name: String, size: Size },
     /// Move a session's retained terminal history; positive means older.
     /// Read the screen as text without taking the session over. Needs no
@@ -287,14 +288,20 @@ pub fn expand_runs(runs: &[StyledRun]) -> Vec<StyledCell> {
         .collect()
 }
 
-// `Size` clamps to a floor below which real TUIs silently drop keystrokes, and
-// a wire format is the obvious way to smuggle a violation past a constructor.
-// Serializing is safe as-is; deserializing routes through `Size::new` so a
-// peer — or a corrupted line — cannot hand us an 11-column terminal.
+// `Size::new` clamps to a floor below which real TUIs silently drop
+// keystrokes. Ordinary wire sizes take that same path. Pane sizes carry an
+// explicit opt-in because their child must lay out at the width actually
+// visible beside the list.
 #[derive(Serialize, Deserialize)]
 struct SizeWire {
     cols: u16,
     rows: u16,
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_narrow: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 impl Serialize for Size {
@@ -302,6 +309,7 @@ impl Serialize for Size {
         SizeWire {
             cols: self.cols(),
             rows: self.rows(),
+            allow_narrow: self.cols() < Size::MIN_COLS,
         }
         .serialize(s)
     }
@@ -310,7 +318,11 @@ impl Serialize for Size {
 impl<'de> Deserialize<'de> for Size {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let wire = SizeWire::deserialize(d)?;
-        Ok(Size::new(wire.cols, wire.rows))
+        Ok(if wire.allow_narrow {
+            Size::for_pane(wire.cols, wire.rows)
+        } else {
+            Size::new(wire.cols, wire.rows)
+        })
     }
 }
 
