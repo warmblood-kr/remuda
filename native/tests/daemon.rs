@@ -2397,6 +2397,118 @@ fn assert_session_shutdown_identity_is_refused(path: &Path, daemon_id: u32) {
 
 #[cfg(unix)]
 #[test]
+fn shutdown_uses_peer_ancestry_when_session_environment_is_stripped() {
+    let dir = scratch_dir("stop-ancestry-red");
+    let path = daemon::socket_path_in(&dir, "s");
+    let mut daemon = Daemon::spawn(&dir);
+    let runtime = dir.to_string_lossy();
+    let path_text = path.to_string_lossy();
+    let path_value = std::env::var("PATH").unwrap_or_default();
+    let binary = env!("CARGO_BIN_EXE_remuda");
+    let test_binary = std::env::current_exe().expect("integration test binary path");
+    let cli = format!(
+        "/usr/bin/env -i PATH='{}' REMUDA_RUNTIME_DIR='{}' '{}' -s s stop -f --yes; sleep 30",
+        path_value, runtime, binary
+    );
+    let raw = format!(
+        "/usr/bin/env -i PATH='{}' REMUDA_RUNTIME_DIR='{}' REMUDA_TEST_RAW_SHUTDOWN_SOCKET='{}' '{}' --exact raw_shutdown_descendant_helper --nocapture; sleep 30",
+        path_value,
+        runtime,
+        path_text,
+        test_binary.display()
+    );
+    for (name, command) in [("env-stop", cli), ("raw-stop", raw)] {
+        let response = client::request(
+            &path,
+            &Request::New {
+                name: Some(name.into()),
+                command: vec!["sh".into(), "-c".into(), command],
+                size: Size::new(100, 30),
+                cwd: None,
+                env: Some(std::collections::HashMap::from([(
+                    "REMUDA_RUNTIME_DIR".into(),
+                    runtime.to_string(),
+                )])),
+            },
+        )
+        .expect("start descendant requester");
+        assert!(matches!(response, Response::Value(_)));
+    }
+
+    let deadline = Instant::now() + PATIENCE;
+    let cli_screen = loop {
+        let screen = capture(&path, "env-stop");
+        if screen.contains("cannot stop this daemon") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "env -i requester was not refused: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(cli_screen.contains("--i-am-inside"), "{cli_screen}");
+
+    let deadline = Instant::now() + PATIENCE;
+    let raw_screen = loop {
+        let screen = capture(&path, "raw-stop");
+        if screen.contains("raw_shutdown_descendant_helper") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "raw Shutdown helper did not run: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(raw_screen.contains("ok"), "raw helper failed: {raw_screen}");
+    assert!(
+        remuda_native::ipc::connect(&path).is_ok(),
+        "daemon was stopped"
+    );
+
+    let stopped = client::request(
+        &path,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("outside shutdown");
+    assert_eq!(stopped, Response::Ok);
+    assert!(
+        daemon.left_on_its_own(),
+        "outside caller did not stop daemon"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_shutdown_descendant_helper() {
+    let Ok(path) = std::env::var("REMUDA_TEST_RAW_SHUTDOWN_SOCKET") else {
+        return;
+    };
+    let response = client::request(
+        Path::new(&path),
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("raw descendant shutdown response");
+    assert!(
+        matches!(&response, Response::Error(reason) if reason.contains("one of its own sessions")),
+        "raw descendant Shutdown was not refused: {response:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn a_session_can_stop_a_different_private_daemon() {
     let dir_a = scratch_dir("stop-foreign-a");
     let dir_b = scratch_dir("stop-foreign-b");
