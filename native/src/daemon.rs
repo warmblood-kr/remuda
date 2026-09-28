@@ -955,6 +955,7 @@ fn input(
         Some(Err(remuda_core::input::InputError::RateLimited)) => {
             reply(stream, &Response::RateLimited)
         }
+        Some(Err(remuda_core::input::InputError::Busy)) => reply(stream, &Response::Busy),
         Some(Err(error)) => reply(stream, &Response::error(error.to_string())),
         Some(Ok(remuda_core::input::InputOutcome::Ack { duplicate })) => {
             reply(stream, &Response::Ack { duplicate })
@@ -991,6 +992,10 @@ fn respond<T>(
 ) -> std::io::Result<()> {
     match result {
         None => reply(stream, &Response::error(format!("no such session: {name}"))),
+        Some(Err(remuda_core::AgentError::Busy)) => reply(stream, &Response::Busy),
+        Some(Err(remuda_core::AgentError::WriteTimeout { .. })) => {
+            reply(stream, &Response::WriteTimeout)
+        }
         Some(Err(e)) => reply(stream, &Response::error(e)),
         Some(Ok(v)) => reply(stream, &ok(v)),
     }
@@ -1129,12 +1134,27 @@ fn attach(
         let held = &held;
         let key_thread = scope.spawn(move || {
             let mut buf = [0u8; 4096];
-            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            'keys: while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if held.write_raw(&buf[..n]).is_err() {
-                            break;
+                        // Preserve this exact read buffer until the session
+                        // accepts it. Native PTYs wait for their in-flight
+                        // write to finish before retrying, so a late partial
+                        // write is never replayed as a second keystroke.
+                        loop {
+                            if stop.load(std::sync::atomic::Ordering::SeqCst) || held.is_displaced()
+                            {
+                                break;
+                            }
+                            match held.write_raw(&buf[..n]) {
+                                Ok(()) => break,
+                                Err(remuda_core::AgentError::Exited) => break 'keys,
+                                Err(remuda_core::AgentError::Attached) if held.is_displaced() => {
+                                    break 'keys;
+                                }
+                                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                            }
                         }
                     }
                 }
