@@ -439,6 +439,10 @@ local function reattach(path, entry)
   local parent, key = advice_slot(path)
   local current = parent[key]
   if current == entry.trampoline then return end
+  if current == nil then -- the function is gone, and its advice with it
+    advised[path] = nil
+    return
+  end
   if type(current) == "function" and not trampolines[current] then entry.base = current end
   parent[key] = compose(path, entry)
 end
@@ -585,6 +589,26 @@ register("clear_hooks", "Remove every hook registered under a group.", "clear_ho
 -- declare registrations as data. Reload stages the declaration and migrations
 -- before replacing the mod's hook group and tools.
 local modules = {}
+
+-- #145: a lifecycle mod sees `remuda` through a proxy, so its assignments
+-- come here. It may create new top-level fields, which it then owns; core's
+-- (named in `core_fields` once this file has loaded) and another mod's are
+-- refused. A field left by a legacy exec, unowned, is adopted.
+local core_fields = {}
+local field_owners = {}
+local function set_module_field(name, key, value)
+  if type(key) ~= "string" then error("mod " .. name .. " may only set string-named remuda fields", 2) end
+  if core_fields[key] then
+    error("mod " .. name .. " cannot replace remuda." .. key .. ", which core owns", 2)
+  end
+  local owner = field_owners[key]
+  if owner and owner ~= name then
+    error("mod " .. name .. " cannot replace remuda." .. key .. ", which mod " .. owner .. " owns", 2)
+  end
+  field_owners[key] = value ~= nil and name or nil
+  remuda[key] = value
+end
+remuda._module_set_field = set_module_field
 local module_tool_owners = {}
 
 local function clone_module_state(value, seen)
@@ -748,6 +772,10 @@ function remuda._activate_module(name, candidate, reactivate)
   -- previous activation back (#129). State mutated by that `start` stays.
   local saved_hooks, saved_tools, saved_schedules, saved_commands = {}, {}, {}, {}
   local saved_advice = snapshot_advice()
+  local saved_fields = {}
+  for key, owner in pairs(field_owners) do
+    if owner == name then saved_fields[key] = remuda[key] end
+  end
   for event, registered in pairs(remuda.hooks) do
     saved_hooks[event] = { table.unpack(registered) }
   end
@@ -773,6 +801,11 @@ function remuda._activate_module(name, candidate, reactivate)
     remuda._extension_commands[command], extension_command_owners[command] = nil, nil
   end
   drop_owned_advice(name)
+  -- The mod's fields go too; `start` recreates the ones it still defines,
+  -- and advice on those re-attaches (a field not recreated takes its advice).
+  for key in pairs(saved_fields) do
+    remuda[key], field_owners[key] = nil, nil
+  end
   for index = 1, advice_count do
     local advice = declared_advice[index]
     with_owner(name, remuda.advise, advice.path, advice.how, function(...)
@@ -861,6 +894,12 @@ function remuda._activate_module(name, candidate, reactivate)
     end
     for command, handler in pairs(saved_commands) do
       remuda._extension_commands[command], extension_command_owners[command] = handler, name
+    end
+    for key, owner in pairs(field_owners) do
+      if owner == name then remuda[key], field_owners[key] = nil, nil end
+    end
+    for key, value in pairs(saved_fields) do
+      remuda[key], field_owners[key] = value, name
     end
     restore_advice(saved_advice)
     modules[name] = previous
@@ -1403,3 +1442,6 @@ function remuda.process(spec)
   return remuda._process_spawn(spec.argv, spec.on_line, spec.on_exit)
 end
 register("process", "Spawn a plain-pipe child process; its stdout lines and exit arrive as emit events.", "process(spec) -> id")
+
+-- Everything defined so far is core's; a mod may not replace it (#145).
+for key in pairs(remuda) do core_fields[key] = true end

@@ -548,6 +548,22 @@ fn load_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Result<
                 remuda.get::<Value>(key)
             })?,
         )?;
+        // #145: the mod's own writes reach the real `remuda` table, through
+        // the lifecycle manager's owner checks, once it is active.
+        let active_for_write = Rc::clone(&active);
+        let owner = name.to_string();
+        remuda_meta.set(
+            "__newindex",
+            lua.create_function(move |lua, (_table, key, value): (Table, Value, Value)| {
+                if !active_for_write.get() {
+                    return Err(mlua::Error::runtime(
+                        "lifecycle declarations and migrations cannot call remuda APIs",
+                    ));
+                }
+                let set: mlua::Function = lua.named_registry_value("remuda.lifecycle.set_field")?;
+                set.call::<()>((owner.as_str(), key, value))
+            })?,
+        )?;
         remuda_proxy.set_metatable(Some(remuda_meta))?;
         environment.set("remuda", remuda_proxy)?;
         let declaration: Value = lua
@@ -580,6 +596,9 @@ pub(crate) fn hide_module_activator(lua: &Lua) -> mlua::Result<()> {
     let remuda: Table = lua.globals().get("remuda")?;
     let activate: mlua::Function = remuda.get("_activate_module")?;
     lua.set_named_registry_value("remuda.lifecycle.activate_module", activate)?;
+    let set_field: mlua::Function = remuda.get("_module_set_field")?;
+    lua.set_named_registry_value("remuda.lifecycle.set_field", set_field)?;
+    remuda.set("_module_set_field", Value::Nil)?;
     remuda.set("_activate_module", Value::Nil)
 }
 

@@ -148,8 +148,13 @@ opening a mod's screen does not restart it. The mod owns its declared hooks,
 tools and schedules, and also every `remuda.on` hook and
 `remuda.extension_command` registered while its own code runs (`initialize`,
 `start`, or one of its declared hooks, tools or schedules). `hook_list` shows
-that `owner`. Reload replaces everything the mod owns, and a reload whose
-`start` fails restores the previous set. Other imperative effects
+that `owner`. A mod may also create new top-level `remuda.*` fields (for
+example `function remuda._sample_notify(...) end` in `start`); they are its own.
+Assigning a field core defines, or one another mod owns, is an error; a field
+left by a legacy script is taken over. Reload replaces everything the mod owns,
+and a reload whose `start` fails restores the previous set. A field the new
+`start` does not recreate is removed along with any advice on it; one it does
+recreate keeps its advice. Other imperative effects
 (`remuda.schedule`, `remuda.process`, `remuda.new`, and so on) are not owned
 and survive reload; the mod must find and reuse or cancel them itself.
 
