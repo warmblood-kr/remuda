@@ -20,6 +20,7 @@
 //! `core/clippy.toml` denies outright.
 
 use crate::agent::{Cursor, Result, ScreenSnapshot, Size, StyledCell};
+use crate::input::{InputBatch, InputError, InputOutcome};
 use crate::protocol::Step;
 use crate::session::Session;
 use core::time::Duration;
@@ -90,6 +91,15 @@ pub struct Registry {
 }
 
 impl Registry {
+    pub fn apply_input_batch(
+        &self,
+        name: &str,
+        batch: InputBatch<'_>,
+    ) -> Option<core::result::Result<InputOutcome, InputError>> {
+        self.get(name)
+            .map(|session| session.apply_input_batch(batch))
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

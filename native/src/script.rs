@@ -882,6 +882,10 @@ fn lua_env_to_wire(env: Table) -> mlua::Result<std::collections::HashMap<String,
 fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
     match response {
         Response::Ok => Ok(Value::Nil),
+        Response::Ack { .. } => Ok(Value::Nil),
+        Response::Uncertain => Err(mlua::Error::runtime("input outcome is uncertain")),
+        Response::WrongInstance => Err(mlua::Error::runtime("session instance changed")),
+        Response::RateLimited => Err(mlua::Error::runtime("session input rate limit exceeded")),
         Response::AttachStarted { .. } | Response::AttachStatus { .. } => Err(
             mlua::Error::runtime("attach responses are not exposed to scripts"),
         ),
