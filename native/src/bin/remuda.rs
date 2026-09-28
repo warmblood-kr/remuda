@@ -21,7 +21,7 @@ use remuda_core::protocol::{Request, Response};
 use remuda_native::client::Left;
 use remuda_native::{daemon, dist, terminal_size};
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -31,16 +31,14 @@ mod codex_tui;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (server, rest) = split_server_flag(&args);
+    let (stdin_enabled, rest) = match split_stdin_flag(rest) {
+        Ok(flags) => flags,
+        Err(error) => return fail(error),
+    };
     let argv: Vec<&str> = rest.iter().map(String::as_str).collect();
     let path = daemon::socket_path(server);
 
-    announce_update(&argv);
-    // Asked once, before anything dispatches. A daemon that is already up was
-    // started by some other binary, and this is the cheapest moment to ask which.
-    let skew = version_skew(&argv, &path);
-    if let Some(notice) = &skew {
-        eprintln!("remuda: {notice}");
-    }
+    let skew = prepare_command(&argv, &path);
 
     match argv.as_slice() {
         // The whole ask: typing the program's name opens the herd. Only when
@@ -125,7 +123,7 @@ fn main() -> ExitCode {
         ["cluster", rest @ ..] => cluster_command(server, &path, rest),
 
         [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
-            extension_command(server, &path, command, rest)
+            extension_command(server, &path, command, rest, stdin_enabled)
         }
 
         // `emacsclient -e` for this runtime: the code runs in the daemon's
@@ -203,6 +201,8 @@ remuda — a pty manager you can attach to
   remuda butler launch KIND [N]  launch a claude or codex session
   remuda butler send FROM TO MSG queue a message for an agent
   remuda butler inbox NAME       drain an agent's queued messages
+  remuda --stdin MOD [ARGS…]      opt in to passing up to 1 MiB of stdin to the mod
+  remuda MOD ... -                a literal '-' argument also opts in to stdin
   remuda mod install OWNER/REPO [--ref REF] [--force] [--reload]
                                   install a Lua mod from GitHub
   remuda mod list [--format F]    list installed mods
@@ -294,6 +294,8 @@ remuda — terminal orchestration for coding agents
                                   [::] may accept IPv4 too on dual-stack systems
 
   remuda doc | repl | -e CODE    use the persistent Lua runtime
+  remuda --stdin MOD [ARGS…]     opt in to passing up to 1 MiB of stdin to the mod
+  remuda MOD ... -                a literal '-' argument also opts in to stdin
   remuda --version
 
 Run `remuda mod list` for installed mods and `remuda doc` for the live Lua API.
@@ -924,6 +926,17 @@ fn announce_update(argv: &[&str]) {
     }
 }
 
+fn prepare_command(argv: &[&str], path: &Path) -> Option<String> {
+    announce_update(argv);
+    // Ask once before dispatch. A running daemon belongs to another binary,
+    // and this is the cheapest point to check for a version skew.
+    let skew = version_skew(argv, path);
+    if let Some(notice) = &skew {
+        eprintln!("remuda: {notice}");
+    }
+    skew
+}
+
 /// Split out of `main` for the same reason `list_sessions` was: clippy's line
 /// budget. This one talks to no daemon — it replaces this very binary.
 fn run_upgrade(args: &[&str]) -> ExitCode {
@@ -951,6 +964,22 @@ fn split_server_flag(args: &[String]) -> (&str, &[String]) {
     match args {
         [flag, server, rest @ ..] if flag == "-s" => (server.as_str(), rest),
         _ => ("default", args),
+    }
+}
+
+/// Pull a leading caller-stdin opt-in from argv after the optional server
+/// selector. Without this flag, piped stdin remains untouched for mod commands.
+fn split_stdin_flag(args: &[String]) -> Result<(bool, &[String]), &'static str> {
+    match args {
+        [flag, command, ..]
+            if flag == "--stdin" && remuda_native::packages::has_subcommand(command) =>
+        {
+            Ok((true, &args[1..]))
+        }
+        [flag, ..] if flag == "--stdin" => {
+            Err("--stdin is only valid before an installed mod command")
+        }
+        _ => Ok((false, args)),
     }
 }
 
@@ -1020,7 +1049,13 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
 
 /// Dispatch a manifest-declared mod command. The launch form may select an
 /// agent and/or skip the screen; other arguments belong to the Lua mod.
-fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) -> ExitCode {
+fn extension_command(
+    server: &str,
+    path: &Path,
+    command: &str,
+    args: &[&str],
+    stdin_enabled: bool,
+) -> ExitCode {
     let package = match remuda_native::packages::subcommand(command) {
         Ok(Some(package)) => package,
         Ok(None) => return fail(format!("no installed mod provides command {command}")),
@@ -1035,6 +1070,9 @@ fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) ->
         }
         _ => None,
     };
+    if stdin_enabled && launch.is_some() {
+        return fail("--stdin requires a mod command handler, not a mod launch");
+    }
     if let Some((headless, agent)) = launch {
         return with_daemon(server, path, |path| {
             if let Some(agent) = agent {
@@ -1067,11 +1105,43 @@ fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) ->
         .collect::<Vec<_>>()
         .join(", ");
     let env = caller_env(std::env::vars());
+    let stdin_opted_in = stdin_enabled || args.contains(&"-");
+    let stdin = if stdin_opted_in {
+        const MAX_CALLER_STDIN: usize = 1024 * 1024;
+        let mut bytes = Vec::new();
+        if let Err(error) = std::io::stdin()
+            .take((MAX_CALLER_STDIN + 1) as u64)
+            .read_to_end(&mut bytes)
+        {
+            return fail(format!("read extension command stdin: {error}"));
+        }
+        if bytes.len() > MAX_CALLER_STDIN {
+            return fail("stdin exceeds 1 MiB limit");
+        }
+        Some(bytes)
+    } else {
+        None
+    };
+    let stdin_field = stdin.map_or_else(String::new, |value| {
+        format!(", stdin = {}", lua_bytes_literal(&value))
+    });
     let code = format!(
-        "return remuda._dispatch_extension_command({}, {{{arguments}}}, {{env = {{{env}}}}})",
+        "return remuda._dispatch_extension_command({}, {{{arguments}}}, {{env = {{{env}}}{stdin_field}}})",
         serde_json::to_string(command).expect("command serializes")
     );
     with_daemon(server, path, |path| eval_once(path, &code))
+}
+
+/// Encode arbitrary bytes as a quoted Lua string with fixed-width decimal
+/// escapes, preserving NUL and non-UTF-8 input exactly.
+fn lua_bytes_literal(bytes: &[u8]) -> String {
+    let mut literal = String::with_capacity(bytes.len() * 4 + 2);
+    literal.push('"');
+    for byte in bytes {
+        literal.push_str(&format!("\\{byte:03}"));
+    }
+    literal.push('"');
+    literal
 }
 
 /// The caller's `REMUDA_*` variables as Lua table fields. The handler runs in

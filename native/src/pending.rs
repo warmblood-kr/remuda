@@ -1,5 +1,6 @@
 //! Bounded completion channels for deferred extension-command replies.
 
+use crate::reply_limit::MAX_REPLY_BYTES;
 use mlua::{LuaString, UserData, UserDataMethods};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -8,7 +9,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const MAX_PENDING_REPLIES: usize = 64;
-pub const MAX_DEFERRED_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const PENDING_MARKER_PREFIX: &str = "\u{1e}REMUDA_PENDING:";
 const CLIENT_POLL: Duration = Duration::from_millis(25);
 
@@ -423,9 +423,10 @@ impl UserData for PendingHandle {
                 let stdout_bytes = stdout.as_bytes();
                 let stderr_bytes = stderr.as_bytes();
                 let output_size = stdout_bytes.len().saturating_add(stderr_bytes.len());
-                if output_size > MAX_DEFERRED_OUTPUT_BYTES {
+                if output_size > MAX_REPLY_BYTES {
                     let message = format!(
-                        "deferred command reply exceeds the 16 MiB output limit ({output_size} bytes)"
+                        "deferred command reply exceeds the {} MiB output limit ({output_size} bytes)",
+                        MAX_REPLY_BYTES / (1024 * 1024)
                     );
                     this.complete(Completion::Failure(message.clone()))?;
                     return Err(mlua::Error::runtime(message));
@@ -440,10 +441,11 @@ impl UserData for PendingHandle {
             },
         );
         methods.add_method("reject", |_, this, error: String| {
-            let failure = if error.len() > MAX_DEFERRED_OUTPUT_BYTES {
+            let failure = if error.len() > MAX_REPLY_BYTES {
                 format!(
-                    "deferred command reply exceeds the 16 MiB output limit ({} bytes)",
-                    error.len()
+                    "deferred command reply exceeds the {} MiB output limit ({} bytes)",
+                    MAX_REPLY_BYTES / (1024 * 1024),
+                    error.len(),
                 )
             } else {
                 error
