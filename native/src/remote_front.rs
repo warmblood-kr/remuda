@@ -164,6 +164,11 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::Attach { .. } => Err(refusal("Attach")),
         Request::AttachTracked { .. } => Err(refusal("AttachTracked")),
         Request::AttachStatus { .. } => Err(refusal("AttachStatus")),
+        Request::Close {
+            instance_id: Some(_),
+            confirm: Some(true),
+            ..
+        } => Ok(()),
         Request::Close { .. } => Err(refusal("Close")),
         Request::ListDir { .. } => Err(refusal("ListDir")),
         Request::Mkdir { .. } => Err(refusal("Mkdir")),
@@ -182,6 +187,21 @@ fn refusal(variant: &str) -> String {
 mod tests {
     use super::*;
     use remuda_core::protocol::Request;
+
+    #[test]
+    fn legacy_close_requests_deserialize_and_keep_the_old_wire_shape() {
+        let old_wire = br#"{"Close":{"name":"dev"}}"#;
+        let request: Request = serde_json::from_slice(old_wire).unwrap();
+        assert_eq!(
+            request,
+            Request::Close {
+                name: "dev".into(),
+                instance_id: None,
+                confirm: None,
+            }
+        );
+        assert_eq!(serde_json::to_vec(&request).unwrap(), old_wire);
+    }
 
     #[test]
     fn permits_only_the_read_and_batched_input_surface() {
@@ -242,7 +262,11 @@ mod tests {
                 name: "dev".into(),
                 generation: 0,
             },
-            Request::Close { name: "dev".into() },
+            Request::Close {
+                name: "dev".into(),
+                instance_id: None,
+                confirm: None,
+            },
             Request::ListDir { path: "/".into() },
             Request::Mkdir { path: "/".into() },
             Request::RemoveDirAll { path: "/".into() },
@@ -312,6 +336,47 @@ mod tests {
         let error = authorize(&request).unwrap_err();
         assert!(!error.contains("secret-input-payload"));
         assert!(error.contains("client_id"));
+    }
+
+    #[test]
+    fn close_requires_explicit_confirmation_and_instance_without_echoing_fields() {
+        let request = Request::Close {
+            name: "secret-session-name".into(),
+            instance_id: Some("secret-instance-id".into()),
+            confirm: None,
+        };
+        let error = authorize(&request).unwrap_err();
+        assert_eq!(error, "remote front refuses Close");
+        assert!(!error.contains("secret-session-name"));
+        assert!(!error.contains("secret-instance-id"));
+
+        let request = Request::Close {
+            name: "dev".into(),
+            instance_id: None,
+            confirm: Some(true),
+        };
+        assert_eq!(
+            authorize(&request).unwrap_err(),
+            "remote front refuses Close"
+        );
+    }
+
+    #[test]
+    fn close_is_allowlisted_only_with_identity_and_confirmation() {
+        assert!(authorize(&Request::Close {
+            name: "dev".into(),
+            instance_id: Some("instance-1".into()),
+            confirm: Some(true),
+        })
+        .is_ok());
+        assert_eq!(
+            authorize(&Request::Eval {
+                code: "return 1".into(),
+                name: None
+            })
+            .unwrap_err(),
+            "remote front refuses Eval"
+        );
     }
 
     fn test_socket_path() -> std::path::PathBuf {

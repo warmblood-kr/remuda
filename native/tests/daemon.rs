@@ -999,6 +999,14 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
     new_session(&path, "target");
+    let target_instance = match client::request(&path, &Request::List).expect("list target") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "target")
+            .and_then(|session| session.instance_id)
+            .expect("target instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
 
     // Put something on screen BEFORE attaching, so the repaint has something to
     // prove. A viewer that only streams would show a blank terminal here.
@@ -1064,6 +1072,8 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
             &path,
             &Request::Close {
                 name: "target".into(),
+                instance_id: Some(target_instance.clone()),
+                confirm: Some(true),
             },
         )
     };
@@ -1889,6 +1899,8 @@ fn a_session_exited_hook_fires_once_when_a_session_is_closed() {
         &path,
         &Request::Close {
             name: "closed".into(),
+            instance_id: None,
+            confirm: None,
         },
     )
     .expect("close");
@@ -1910,6 +1922,35 @@ fn a_session_exited_hook_fires_once_when_a_session_is_closed() {
         1,
         "a closed session must fire exactly once"
     );
+}
+
+#[test]
+fn confirmed_close_refuses_a_mismatched_instance_and_keeps_the_session() {
+    let path = scratch("close-wrong-instance");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    let instance_id = match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "target")
+            .and_then(|session| session.instance_id)
+            .expect("session instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+    let response = client::request(
+        &path,
+        &Request::Close {
+            name: "target".into(),
+            instance_id: Some(format!("wrong-{instance_id}")),
+            confirm: Some(true),
+        },
+    )
+    .expect("close response");
+    assert!(matches!(response, Response::Error(_)), "{response:?}");
+    assert!(matches!(
+        client::request(&path, &Request::List),
+        Ok(Response::Sessions(sessions)) if sessions.iter().any(|session| session.name == "target")
+    ));
 }
 
 #[test]

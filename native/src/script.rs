@@ -449,7 +449,17 @@ pub fn bindings(
     table.set(
         "close",
         lua.create_function(move |lua, name: String| {
-            value(lua, ask(&path, Request::Close { name })?)
+            value(
+                lua,
+                ask(
+                    &path,
+                    Request::Close {
+                        name,
+                        instance_id: None,
+                        confirm: None,
+                    },
+                )?,
+            )
         })?,
     )?;
 
