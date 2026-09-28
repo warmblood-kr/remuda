@@ -267,36 +267,41 @@ jobs:
         # draft:true, breaking the public download URL for 10+ minutes
         # before a human noticed. No other workflow/script/webhook in this
         # repo touches releases, and the org audit log was not accessible,
-        # so the external cause is still unknown.
+        # so the external cause is still unknown and needs org audit-log
+        # access this workflow's token doesn't have.
         #
-        # This step does NOT prevent whatever did that — it only turns a
-        # silent revert into a failed run, so it shows up here instead of
-        # leaving a broken download URL for however long until someone
-        # notices externally. Two checks (now, and after a short wait)
-        # because the observed revert landed ~40s after a verified-good
-        # publish, not immediately.
+        # This step is detection, not a root-cause fix: it does NOT prevent
+        # whatever did that — it only turns a silent revert into a failed
+        # run, so it shows up here instead of leaving a broken download URL
+        # for however long until someone notices externally. Checks both
+        # the API's draft flag and the actual public, unauthenticated
+        # download URL (the thing a real colleague's install.sh hits), once
+        # now and once after a short wait, because the observed revert
+        # landed ~40s after a verified-good publish, not immediately.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.plan.outputs.tag }}
         run: |
           set -eu
-          check() { gh release view "$TAG" --json draft --jq .draft; }
+          check_draft() { gh release view "$TAG" --json isDraft --jq .isDraft; }
+          check_download() {
+            curl -s -o /dev/null -w '%{http_code}' -L \
+              "https://github.com/warmblood-kr/remuda/releases/download/$TAG/SHA256SUMS"
+          }
+          verify() {
+            when="$1"
+            draft="$(check_draft)"
+            code="$(check_download)"
+            echo "draft=$draft download-status=$code ($when)"
+            if [ "$draft" = true ] || [ "$code" != 200 ]; then
+              echo "::error::$TAG failed verification $when: draft=$draft, unauthenticated download status=$code (expected draft=false, status=200). External to this workflow (cause unknown) — the download URL may be broken until someone re-publishes $TAG."
+              exit 1
+            fi
+          }
 
-          draft="$(check)"
-          if [ "$draft" = true ]; then
-            echo "::error::$TAG is draft:true immediately after publish — the publish step above did not actually publish it"
-            exit 1
-          fi
-          echo "draft=$draft right after publish"
-
+          verify "right after publish"
           sleep 60
-
-          draft="$(check)"
-          if [ "$draft" = true ]; then
-            echo "::error::$TAG published successfully as draft:false, then reverted to draft:true within 60s. This is external to this workflow (cause unknown, see workflow comments) — the download URL is broken until someone re-publishes $TAG."
-            exit 1
-          fi
-          echo "draft=$draft 60s after publish — no revert detected"
+          verify "60s after publish"
 
       - name: publish the version index
         env:
