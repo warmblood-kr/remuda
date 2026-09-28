@@ -151,6 +151,13 @@ impl fmt::Display for AgentError {
 
 pub type Result<T> = core::result::Result<T, AgentError>;
 
+/// Exit information retained by a process-backed agent after it is reaped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExitInfo {
+    pub exit_code: Option<u32>,
+    pub signal: Option<String>,
+}
+
 /// A styled screen and its scrollback measurements from one parser snapshot.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ScreenSnapshot {
@@ -284,6 +291,11 @@ pub trait AgentProcess: Send {
     fn cursor(&mut self) -> Result<Cursor>;
 
     fn is_alive(&mut self) -> bool;
+
+    /// The known exit status, if this backend has observed one.
+    fn exit_info(&mut self) -> Option<ExitInfo> {
+        None
+    }
 
     /// End the child. Idempotent: calling it on an already-exited process is
     /// not an error, because a caller that raced a self-exit (step 006) must

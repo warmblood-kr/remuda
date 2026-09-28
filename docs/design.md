@@ -97,10 +97,14 @@ every hook it thought it was replacing.
 `on`/`emit`/`clear_hooks` are general-purpose, the same way Emacs's
 `add-hook`/`run-hooks` presuppose nothing about which hook variable is being
 run — a caller may name its own events and call `emit` at whatever moment
-matters to it. remuda itself defines exactly one: `session_exited`, whose one
-positional argument is the dead session's name (a Lua string). It fires once
-per session the daemon notices has died, regardless of what triggered the
-detection — a tick, a `List`, or an `ls()` call.
+matters to it. remuda itself defines exactly one: `session_exited`. Its first
+positional argument is the dead session's name (a Lua string), preserving
+compatibility with existing one-argument handlers. The second argument is a
+table with `reason = "closed"` when an explicit Close request ended the
+session, or `reason = "exited"` when the child process ended. When known, the
+table also includes `exit_code` and/or `signal`. It fires once per session the
+daemon notices has died, regardless of what triggered the detection — a tick,
+a `List`, or an `ls()` call.
 
 `remuda.event_counts()` returns `{[event]=n}`, a shallow copy counting every
 `emit` call for that name, whether or not any hook is registered for it. A

@@ -20,8 +20,8 @@
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use remuda_core::agent::{
-    AgentError, AgentProcess, Color, Cursor, MouseEncoding, MouseMode, MouseState, Result,
-    ScreenSnapshot, Size, StyledCell, VersionedSnapshot,
+    AgentError, AgentProcess, Color, Cursor, ExitInfo, MouseEncoding, MouseMode, MouseState,
+    Result, ScreenSnapshot, Size, StyledCell, VersionedSnapshot,
 };
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -90,6 +90,7 @@ pub struct PtyAgent {
     watchers: Watchers,
     scrollback_total: Arc<AtomicUsize>,
     output_version: Arc<AtomicU64>,
+    exit_info: Option<ExitInfo>,
     master: Option<Box<dyn MasterPty + Send>>,
 }
 
@@ -140,6 +141,7 @@ impl PtyAgent {
             watchers,
             scrollback_total,
             output_version,
+            exit_info: None,
             master: Some(pair.master),
         })
     }
@@ -399,7 +401,14 @@ impl AgentProcess for PtyAgent {
     }
 
     fn is_alive(&mut self) -> bool {
-        let alive = matches!(self.child.try_wait(), Ok(None));
+        let alive = match self.child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(status)) => {
+                self.record_exit_status(status);
+                false
+            }
+            Err(_) => false,
+        };
         if !alive {
             // ConPTY keeps its output pipe open after the child exits until
             // ClosePseudoConsole runs. Release the master so the reader thread
@@ -409,6 +418,10 @@ impl AgentProcess for PtyAgent {
         alive
     }
 
+    fn exit_info(&mut self) -> Option<ExitInfo> {
+        self.exit_info.clone()
+    }
+
     /// Caution: `is_alive` calls `try_wait`, which *reaps* the child on unix, so
     /// `kill()` afterwards fails with ESRCH. The trait's idempotence is
     /// therefore explicit here — an already-gone process is nothing to signal.
@@ -416,7 +429,10 @@ impl AgentProcess for PtyAgent {
         if !self.is_alive() {
             return Ok(());
         }
-        self.child.kill().map_err(io)
+        self.child.kill().map_err(io)?;
+        let status = self.child.wait().map_err(io)?;
+        self.record_exit_status(status);
+        Ok(())
     }
 
     fn resize(&mut self, size: Size) -> Result<()> {
@@ -443,6 +459,20 @@ impl AgentProcess for PtyAgent {
 
     fn process_id(&self) -> Option<u32> {
         self.child.process_id()
+    }
+}
+
+impl PtyAgent {
+    fn record_exit_status(&mut self, status: portable_pty::ExitStatus) {
+        let signal = status.signal().map(str::to_string);
+        self.exit_info = Some(ExitInfo {
+            exit_code: if signal.is_none() {
+                Some(status.exit_code())
+            } else {
+                None
+            },
+            signal,
+        });
     }
 }
 

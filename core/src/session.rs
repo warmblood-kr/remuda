@@ -4,8 +4,8 @@
 //! attachment at a time.
 
 use crate::agent::{
-    AgentError, AgentProcess, Cursor, MouseState, Result, ScreenSnapshot, Size, StyledCell,
-    VersionedSnapshot,
+    AgentError, AgentProcess, Cursor, ExitInfo, MouseState, Result, ScreenSnapshot, Size,
+    StyledCell, VersionedSnapshot,
 };
 use crate::clock::Clock;
 use crate::input::{InputBatch, InputDeduplicator, InputError, InputOutcome, InputRateLimiter};
@@ -373,6 +373,11 @@ impl Session {
             // unknown.
             Err(_) => false,
         }
+    }
+
+    /// The process exit information observed by this session's backend, if known.
+    pub fn exit_info(&self) -> Option<ExitInfo> {
+        self.agent.lock().ok()?.exit_info()
     }
 
     /// The child PID if this process-backed session is still running.
