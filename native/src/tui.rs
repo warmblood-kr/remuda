@@ -619,6 +619,11 @@ impl Ui {
             return;
         };
         let col = display_col_for_cell_index(row, self.visual_cursor.col);
+        let cursor_width = row
+            .get(self.visual_cursor.col)
+            .map(|cell| usize::from(cell.width()).max(1))
+            .unwrap_or(1);
+        let cursor_end = col.saturating_add(cursor_width);
         let total_width: usize = row.iter().map(|cell| usize::from(cell.width())).sum();
         let width = usize::from(self.preview_width.max(1));
         let pan = usize::from(self.pan);
@@ -627,9 +632,8 @@ impl Ui {
         } else {
             let cropped = total_width > pan + width;
             let visible_width = width.saturating_sub(usize::from(cropped));
-            if visible_width > 0 && col >= pan + visible_width {
-                let mut next_pan = col
-                    .saturating_add(1)
+            if visible_width > 0 && cursor_end > pan + visible_width {
+                let mut next_pan = cursor_end
                     .saturating_sub(visible_width)
                     .min(u16::MAX as usize);
                 let right_edge = total_width.saturating_sub(width);
@@ -1312,6 +1316,24 @@ mod visual_mode_tests {
         assert_eq!(ui.pan, 85);
         let display_col = super::display_col_for_cell_index(&ui.visual_screen[0], at(&ui).col);
         assert!(display_col < usize::from(ui.pan) + usize::from(ui.preview_width));
+    }
+
+    #[test]
+    fn visual_cursor_on_wide_glyph_stays_visible_at_crop_boundary() {
+        let mut ui = ui();
+        ui.preview_width = 10;
+        screen_row(&mut ui, &format!("{}한{}", "a".repeat(8), "b".repeat(20)));
+        ui.visual_cursor = TextPoint { row: 0, col: 8 };
+
+        ui.keep_visual_cursor_visible();
+
+        assert_eq!(ui.pan, 1);
+        let (cropped, _) = super::crop_styled(&ui.visual_screen[..1], 10, 1, ui.pan);
+        assert!(
+            cropped[0].contains('한'),
+            "cropped row was: {:?}",
+            cropped[0]
+        );
     }
 
     #[test]
