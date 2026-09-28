@@ -121,6 +121,8 @@ pub struct Ui {
     sessions_text: Vec<String>,
     /// Rows per session, supplied by the Lua sessions-buffer contract.
     session_rows: usize,
+    /// Visible preview rows, refreshed from the terminal dimensions each frame.
+    preview_rows: u16,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -159,6 +161,7 @@ impl Ui {
             notice,
             sessions_text: Vec::new(),
             session_rows: 1,
+            preview_rows: 1,
         }
     }
 
@@ -466,8 +469,9 @@ impl Ui {
                 self.pan = 0;
                 Action::Nothing
             }
-            KeyCode::PageUp => Action::Scroll(i16::MAX),
-            KeyCode::PageDown | KeyCode::End => Action::Scroll(i16::MIN),
+            KeyCode::PageUp => Action::Scroll(self.preview_page_delta()),
+            KeyCode::PageDown => Action::Scroll(-self.preview_page_delta()),
+            KeyCode::End => Action::Scroll(i16::MIN),
             KeyCode::Char('h') => {
                 self.list_width = None;
                 Action::Nothing
@@ -512,6 +516,13 @@ impl Ui {
         } else {
             Action::Copy(name)
         }
+    }
+
+    fn preview_page_delta(&self) -> i16 {
+        self.preview_rows
+            .saturating_sub(1)
+            .max(1)
+            .min(i16::MAX as u16) as i16
     }
 
     fn leave_visual(&mut self) {
@@ -1623,6 +1634,7 @@ fn refresh(
     selection_moved: bool,
 ) -> std::io::Result<(u16, u16)> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    ui.preview_rows = rows.saturating_sub(1).max(1);
     if !skip_list {
         // The buffer is allowed to reorder the herd. Keep the identity, not
         // the old numeric position, so a refresh cannot move a cursor (or an

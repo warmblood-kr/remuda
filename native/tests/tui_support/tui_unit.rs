@@ -79,6 +79,7 @@ fn make_ui(rows: Vec<SessionSummary>) -> Ui {
     let mut ui = Ui::new(rows, "/bin/sh", None);
     // Unit fixtures use the same row contract the Lua renderer publishes.
     ui.session_rows = 3;
+    ui.preview_rows = 23;
     ui
 }
 
@@ -307,29 +308,39 @@ fn shift_wheel_is_forwarded_to_the_child_tui() {
 }
 
 #[test]
-fn page_down_returns_the_preview_to_follow_mode() {
+fn paging_moves_by_one_preview_page_and_end_returns_to_follow() {
     let mut ui = make_ui(vec![row("a", true, false)]);
-    let wheel_up = MouseEvent {
-        kind: MouseEventKind::ScrollUp,
-        column: 19,
-        row: 4,
-        modifiers: KeyModifiers::NONE,
-    };
-    assert_eq!(ui.on_mouse(wheel_up, 80, 24), Action::Scroll(3));
-    // The run loop applies the wheel action to this per-session offset.
     ui.scrollback.insert(
         "a".into(),
         ScrollState {
-            offset: 3,
-            history_rows: 30,
+            offset: 0,
+            history_rows: 100,
         },
     );
 
+    assert_eq!(ui.on_key(press(KeyCode::PageUp)), Action::Scroll(22));
+    scroll_selected(&mut ui, 22);
+    assert_eq!(ui.scrollback["a"].offset, 22);
+    assert_eq!(ui.on_key(press(KeyCode::PageUp)), Action::Scroll(22));
+    scroll_selected(&mut ui, 22);
+    assert_eq!(ui.scrollback["a"].offset, 44, "two PageUps are two pages");
+
     assert_eq!(
         ui.on_key(press(KeyCode::PageDown)),
-        Action::Scroll(i16::MIN),
-        "PageDown should clear preview history offset so following output is visible"
+        Action::Scroll(-22),
+        "PageDown should move by one preview page"
     );
+    scroll_selected(&mut ui, -22);
+    assert_eq!(ui.scrollback["a"].offset, 22);
+    assert_eq!(ui.on_key(press(KeyCode::PageDown)), Action::Scroll(-22));
+    scroll_selected(&mut ui, -22);
+    assert_eq!(
+        ui.scrollback["a"].offset, 0,
+        "PageDown to zero enables follow"
+    );
+
+    ui.scrollback.get_mut("a").unwrap().offset = 80;
+    assert_eq!(ui.on_key(press(KeyCode::End)), Action::Scroll(i16::MIN));
     scroll_selected(&mut ui, i16::MIN);
     assert_eq!(ui.scrollback["a"].offset, 0);
 }
