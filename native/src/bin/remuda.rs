@@ -1031,6 +1031,46 @@ impl Drop for StartupLogCleanup {
     }
 }
 
+fn echo_socket_lock_wait(stderr_path: &Path, offset: &mut usize, announced: &mut bool) {
+    if *announced {
+        return;
+    }
+    let Ok(bytes) = fs::read(stderr_path) else {
+        return;
+    };
+    let Some(tail) = bytes.get(*offset..) else {
+        return;
+    };
+    *offset = bytes.len();
+    let Some(start) = tail
+        .windows(b"waiting for the socket lock".len())
+        .position(|window| window == b"waiting for the socket lock")
+    else {
+        return;
+    };
+    let begin = tail[..start]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let end = tail[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(tail.len(), |index| start + index);
+    eprintln!("{}", String::from_utf8_lossy(&tail[begin..end]).trim());
+    *announced = true;
+}
+
+fn daemon_start_error(path: &Path, stderr_path: &Path, offset: u64, separator: &str) -> String {
+    let said = fs::read(stderr_path)
+        .ok()
+        .and_then(|bytes| bytes.get(offset as usize..).map(<[u8]>::to_vec))
+        .map(|bytes| String::from_utf8_lossy(&bytes).replace(separator, ""))
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "it printed nothing".into());
+    format!("daemon did not come up at {} — {said}", path.display())
+}
+
 /// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
 /// successful *connect*, not on the file existing, and pass `-s <server>`
 /// through — a bare `remuda daemon` re-derives `"default"` and never matches.
@@ -1132,7 +1172,14 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     }
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut observed_log_bytes = offset as usize;
+    let mut announced_lock_wait = false;
     while std::time::Instant::now() < deadline {
+        echo_socket_lock_wait(
+            &stderr_path,
+            &mut observed_log_bytes,
+            &mut announced_lock_wait,
+        );
         if remuda_native::ipc::connect(path).is_ok() {
             // "remuda should always come up in daemon mode" — it already did.
             // What was missing was the line saying so.
@@ -1149,16 +1196,11 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
 
     let _ = child.kill();
     let _ = child.wait();
-    let said = fs::read(&stderr_path)
-        .ok()
-        .and_then(|bytes| bytes.get(offset as usize..).map(<[u8]>::to_vec))
-        .map(|bytes| String::from_utf8_lossy(&bytes).replace(&separator_line, ""))
-        .map(|text| text.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "it printed nothing".into());
-    Err(format!(
-        "daemon did not come up at {} — {said}",
-        path.display()
+    Err(daemon_start_error(
+        path,
+        &stderr_path,
+        offset,
+        &separator_line,
     ))
 }
 
