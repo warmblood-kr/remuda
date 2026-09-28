@@ -1388,12 +1388,11 @@ fn valid_package_name(name: &str) -> bool {
 mod tests {
     #[cfg(unix)]
     use super::{
-        cleanup_tree, copy_tree, create_dir_all_secure, remove_tree, resolve_mods_root,
-        stage_package_tree, test_path,
+        cleanup_tree, copy_tree, create_dir_all_secure, remove_tree, resolve_mods_root, test_path,
     };
     use super::{
-        parse_manifest, parse_repository, satisfies, update_all_with, validate_reference,
-        InstallReport, Manifest, MOD_LIFECYCLE_API,
+        parse_manifest, parse_repository, satisfies, stage_package_tree, update_all_with,
+        validate_reference, InstallReport, Manifest, MOD_LIFECYCLE_API,
     };
     use std::path::Path;
 
