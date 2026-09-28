@@ -111,8 +111,8 @@ fn refresh_waits_for_the_slow_tick_when_nothing_forced_it() {
 fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
     SessionSummary {
         name: name.into(),
-        instance_id: "test-session".into(),
-        output_version: 0,
+        instance_id: Some("test-session".into()),
+        output_version: Some(0),
         alive,
         idle: Duration::from_secs(4),
         output_idle: Some(Duration::from_secs(4)),

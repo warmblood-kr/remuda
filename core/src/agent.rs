@@ -159,6 +159,8 @@ pub struct ScreenSnapshot {
     pub cursor: Cursor,
     pub scrollback_len: usize,
     pub scrollback_total: usize,
+    /// Generation captured under the backend screen lock, when supported.
+    pub output_version: Option<u64>,
 }
 
 /// A live agent process: a screen we can read, a keyboard we can type on.
@@ -248,16 +250,8 @@ pub trait AgentProcess: Send {
             cursor,
             scrollback_len,
             scrollback_total,
+            output_version: None,
         })
-    }
-
-    /// Capture a screen with its output generation when the backend can do so atomically.
-    fn screen_snapshot_version_at(
-        &mut self,
-        scrollback: usize,
-    ) -> Result<(ScreenSnapshot, Option<u64>)> {
-        self.screen_snapshot_at(scrollback)
-            .map(|snapshot| (snapshot, None))
     }
 
     /// A backend generation, if it can synchronize it with screen capture.

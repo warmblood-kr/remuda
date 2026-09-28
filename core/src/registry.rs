@@ -33,11 +33,11 @@ use std::sync::{Arc, Mutex};
 pub struct SessionSummary {
     pub name: String,
     /// Unique to this particular start, even when a later process reuses its name.
-    #[serde(default)]
-    pub instance_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     /// Increases for each processed PTY output chunk.
-    #[serde(default)]
-    pub output_version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_version: Option<u64>,
     pub alive: bool,
     /// Time since the last accepted input; unchanged by agent output.
     pub idle: Duration,
@@ -136,7 +136,7 @@ impl Registry {
             .values()
             .map(|s| SessionSummary {
                 name: s.name().to_string(),
-                instance_id: s.instance_id().to_string(),
+                instance_id: Some(s.instance_id().to_string()),
                 output_version: s.output_version(),
                 alive: s.is_alive(),
                 idle: s.idle_for(),
@@ -242,7 +242,7 @@ impl Registry {
         &self,
         name: &str,
         scrollback: usize,
-    ) -> Option<Result<(ScreenSnapshot, u64, String)>> {
+    ) -> Option<Result<crate::session::VersionedSnapshot>> {
         self.get(name)
             .map(|session| session.screen_snapshot_version_at(scrollback))
     }

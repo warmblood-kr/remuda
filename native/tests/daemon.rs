@@ -220,7 +220,7 @@ fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_vers
     let mut first_daemon = spawn::Daemon::spawn(&runtime);
     start_shell_session(
         &socket,
-        "sleep 0.2; printf first; sleep 0.2; printf later; sleep 30",
+        "sleep 1; printf first; sleep 1; printf later; sleep 30",
     );
     let first_summary = listed_session(&socket);
     let first_version = capture_version(&socket);
@@ -236,7 +236,7 @@ fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_vers
     .expect("decode front response");
     assert!(
         matches!(front_capture, Response::StyledScreen { instance_id, output_version, .. }
-        if instance_id == first_summary.instance_id && output_version == first_version)
+        if instance_id == first_summary.instance_id && output_version == Some(first_version))
     );
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(capture_version(&socket), first_version);
@@ -294,7 +294,14 @@ fn capture_version(socket: &Path) -> u64 {
     )
     .expect("capture session")
     {
-        Response::StyledScreen { output_version, .. } => output_version,
+        Response::StyledScreen {
+            output_version: Some(version),
+            ..
+        } => version,
+        Response::StyledScreen {
+            output_version: None,
+            ..
+        } => panic!("daemon did not provide an output version"),
         other => panic!("unexpected capture response: {other:?}"),
     }
 }
@@ -311,8 +318,8 @@ fn wait_for_output_version(socket: &Path, original: u64) {
 fn old_json_shapes_parse_with_defaults_for_additive_session_fields() {
     let summary = remuda_core::SessionSummary {
         name: "old-client".into(),
-        instance_id: "new-field".into(),
-        output_version: 7,
+        instance_id: Some("new-field".into()),
+        output_version: Some(7),
         alive: true,
         idle: Duration::ZERO,
         output_idle: None,
@@ -327,13 +334,13 @@ fn old_json_shapes_parse_with_defaults_for_additive_session_fields() {
     fields.remove("output_version");
     let decoded: remuda_core::SessionSummary =
         serde_json::from_value(old_summary).expect("parse old session summary");
-    assert!(decoded.instance_id.is_empty());
-    assert_eq!(decoded.output_version, 0);
+    assert_eq!(decoded.instance_id, None);
+    assert_eq!(decoded.output_version, None);
 
     let response = Response::StyledScreen {
         rows: vec![],
-        instance_id: "new-field".into(),
-        output_version: 7,
+        instance_id: Some("new-field".into()),
+        output_version: Some(7),
         wrapped: vec![],
         scrollback_len: 0,
         scrollback_total: 0,
@@ -352,9 +359,35 @@ fn old_json_shapes_parse_with_defaults_for_additive_session_fields() {
     fields.remove("instance_id");
     fields.remove("output_version");
     let decoded: Response = serde_json::from_value(old_response).expect("parse old response");
-    assert!(
-        matches!(decoded, Response::StyledScreen { instance_id, output_version: 0, .. } if instance_id.is_empty())
-    );
+    assert!(matches!(
+        decoded,
+        Response::StyledScreen {
+            instance_id: None,
+            output_version: None,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn resizing_without_child_output_advances_the_output_version() {
+    let runtime = scratch_dir("resize-ver");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut daemon = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let before = capture_version(&socket);
+    let response = client::request(
+        &socket,
+        &Request::Resize {
+            name: "versioned".into(),
+            size: Size::new(81, 24),
+        },
+    )
+    .expect("resize session");
+    assert_eq!(response, Response::Ok);
+    assert!(capture_version(&socket) > before);
+    client::request(&socket, &Request::Shutdown).expect("stop daemon");
+    assert!(daemon.left_on_its_own(), "daemon should stop cleanly");
 }
 
 /// Connect using the original attach wire shape and leave the connection in

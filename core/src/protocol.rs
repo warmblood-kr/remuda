@@ -127,11 +127,11 @@ pub enum Response {
     StyledScreen {
         rows: Vec<Vec<StyledRun>>,
         /// Session identity for this start; absent in responses from old daemons.
-        #[serde(default)]
-        instance_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<String>,
         /// Output generation for clients that only need to redraw changed frames.
-        #[serde(default)]
-        output_version: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_version: Option<u64>,
         #[serde(default)]
         wrapped: Vec<bool>,
         #[serde(default)]

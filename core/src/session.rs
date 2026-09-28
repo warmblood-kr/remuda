@@ -26,8 +26,6 @@ pub struct Session {
     /// dedicated receiver keeps this current even when no caller polls the
     /// screen; `idle_for` remains the distinct since-input measure.
     last_output_at: Arc<Mutex<Duration>>,
-    /// Count of processed PTY output chunks; clients use it to skip unchanged frames.
-    output_version: Arc<AtomicU64>,
     instance_id: String,
     /// [`Clock::now`] at the last keystroke through an [`Attached`] guard —
     /// a human's, never a script's. `None` until one arrives (#136).
@@ -42,6 +40,20 @@ pub struct Session {
     /// `Pause` between them — so a second sender cannot land a write during a
     /// pause, when the `agent` lock is briefly free. See [`Self::feed`].
     input_lock: Mutex<()>,
+}
+
+/// A terminal frame with the identity and output generation captured with it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct VersionedSnapshot {
+    pub snapshot: ScreenSnapshot,
+    pub output_version: Option<u64>,
+    pub instance_id: Option<String>,
+}
+
+/// Generate a unique session-start identity from host entropy and a process counter.
+pub fn generate_instance_id(seed: u128) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!("{seed:032x}-{:016x}", NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Identity and size only. Deliberately takes no lock: a `Debug` that locks
@@ -59,39 +71,18 @@ impl core::fmt::Debug for Session {
 impl Session {
     pub fn new(
         name: impl Into<String>,
-        agent: Box<dyn AgentProcess>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
-        static NEXT_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
-        Self::new_with_instance_id(
-            name,
-            agent,
-            clock,
-            format!(
-                "session-{}",
-                NEXT_INSTANCE_ID.fetch_add(1, Ordering::Relaxed)
-            ),
-        )
-    }
-
-    /// Construct with an identity supplied by the daemon's process-wide ID source.
-    pub fn new_with_instance_id(
-        name: impl Into<String>,
         mut agent: Box<dyn AgentProcess>,
         clock: Arc<dyn Clock>,
-        instance_id: String,
     ) -> Self {
+        let instance_id = generate_instance_id(clock.instance_id_seed());
         let size = agent.size();
         let started = clock.now();
         let last_output_at = Arc::new(Mutex::new(started));
-        let output_version = Arc::new(AtomicU64::new(0));
         if let Some(output) = agent.subscribe() {
             let last_output_at = Arc::clone(&last_output_at);
-            let output_version = Arc::clone(&output_version);
             let clock = Arc::clone(&clock);
             std::thread::spawn(move || {
                 while output.recv().is_ok() {
-                    output_version.fetch_add(1, Ordering::SeqCst);
                     if let Ok(mut at) = last_output_at.lock() {
                         *at = clock.now();
                     }
@@ -105,7 +96,6 @@ impl Session {
             clock,
             last_input_at: Mutex::new(started),
             last_output_at,
-            output_version,
             instance_id,
             last_human_input_at: Mutex::new(None),
             attached: AtomicBool::new(false),
@@ -123,12 +113,11 @@ impl Session {
         &self.instance_id
     }
 
-    pub fn output_version(&self) -> u64 {
+    pub fn output_version(&self) -> Option<u64> {
         self.agent
             .lock()
             .ok()
             .and_then(|mut agent| agent.output_version())
-            .unwrap_or_else(|| self.output_version.load(Ordering::SeqCst))
     }
 
     /// The current terminal size.
@@ -297,27 +286,22 @@ impl Session {
         agent.row_wrapped_at(scrollback)
     }
 
+    /// A screen and its output generation from one session-lock interval.
     pub fn screen_snapshot_at(&self, scrollback: usize) -> Result<ScreenSnapshot> {
-        let mut agent = self
-            .agent
-            .lock()
-            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-        agent.screen_snapshot_at(scrollback)
+        Ok(self.screen_snapshot_version_at(scrollback)?.snapshot)
     }
 
-    /// A screen and its output generation from one session-lock interval.
-    pub fn screen_snapshot_version_at(
-        &self,
-        scrollback: usize,
-    ) -> Result<(ScreenSnapshot, u64, String)> {
+    pub fn screen_snapshot_version_at(&self, scrollback: usize) -> Result<VersionedSnapshot> {
         let mut agent = self
             .agent
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-        let (snapshot, output_version) = agent.screen_snapshot_version_at(scrollback)?;
-        let output_version =
-            output_version.unwrap_or_else(|| self.output_version.load(Ordering::SeqCst));
-        Ok((snapshot, output_version, self.instance_id.clone()))
+        let snapshot = agent.screen_snapshot_at(scrollback)?;
+        Ok(VersionedSnapshot {
+            output_version: snapshot.output_version,
+            instance_id: Some(self.instance_id.clone()),
+            snapshot,
+        })
     }
 
     pub fn is_alive(&self) -> bool {

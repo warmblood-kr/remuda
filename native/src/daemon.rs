@@ -466,11 +466,12 @@ fn capture_styled(
     match registry.screen_snapshot_version_at(name, scrollback) {
         None => reply(stream, &Response::error(format!("no such session: {name}"))),
         Some(Err(e)) => reply(stream, &Response::error(e)),
-        Some(Ok((snapshot, output_version, instance_id))) => {
+        Some(Ok(versioned)) => {
             // Runs on the wire, not cells — see steps/022 for the 44x+
             // measured on a real screen. Cells, counters and cursor all come
             // from one parser snapshot, so new output cannot skew the anchor.
-            let rows = snapshot
+            let rows = versioned
+                .snapshot
                 .cells
                 .iter()
                 .map(|row| collapse_runs(row))
@@ -479,12 +480,12 @@ fn capture_styled(
                 stream,
                 &Response::StyledScreen {
                     rows,
-                    instance_id,
-                    output_version,
-                    wrapped: snapshot.wrapped,
-                    scrollback_len: snapshot.scrollback_len,
-                    scrollback_total: snapshot.scrollback_total,
-                    cursor: snapshot.cursor,
+                    instance_id: versioned.instance_id,
+                    output_version: versioned.output_version,
+                    wrapped: versioned.snapshot.wrapped,
+                    scrollback_len: versioned.snapshot.scrollback_len,
+                    scrollback_total: versioned.snapshot.scrollback_total,
+                    cursor: versioned.snapshot.cursor,
                 },
             )
         }
@@ -730,25 +731,11 @@ fn spawn(
     }
 
     let agent = PtyAgent::spawn(builder, size).map_err(|e| e.to_string())?;
-    Ok(Session::new_with_instance_id(
+    Ok(Session::new(
         name,
         Box::new(agent),
         Arc::new(SystemClock::new()),
-        next_session_instance_id(),
     ))
-}
-
-fn next_session_instance_id() -> String {
-    static START_NANOS: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let started = START_NANOS.get_or_init(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    });
-    let counter = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{started:x}-{:x}-{counter:x}", std::process::id())
 }
 
 /// Hand this connection over to a human. A later attach displaces this one;

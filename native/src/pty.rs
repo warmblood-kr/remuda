@@ -375,21 +375,6 @@ impl AgentProcess for PtyAgent {
             &self.output_version,
             scrollback,
         )
-        .map(|(snapshot, _)| snapshot)
-    }
-
-    fn screen_snapshot_version_at(
-        &mut self,
-        scrollback: usize,
-    ) -> Result<(ScreenSnapshot, Option<u64>)> {
-        let (snapshot, version) = capture_snapshot(
-            &self.screen,
-            self.size,
-            &self.scrollback_total,
-            &self.output_version,
-            scrollback,
-        )?;
-        Ok((snapshot, Some(version)))
     }
 
     fn output_version(&mut self) -> Option<u64> {
@@ -445,11 +430,9 @@ impl AgentProcess for PtyAgent {
                 pixel_height: 0,
             })
             .map_err(io)?;
-        self.screen
-            .lock()
-            .map_err(|_| io("screen lock poisoned"))?
-            .screen_mut()
-            .set_size(size.rows(), size.cols());
+        let mut parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
+        parser.screen_mut().set_size(size.rows(), size.cols());
+        self.output_version.fetch_add(1, Ordering::SeqCst);
         self.size = size;
         Ok(())
     }
@@ -465,7 +448,7 @@ fn capture_snapshot(
     scrollback_total: &AtomicUsize,
     output_version: &AtomicU64,
     scrollback: usize,
-) -> Result<(ScreenSnapshot, u64)> {
+) -> Result<ScreenSnapshot> {
     let mut parser = screen.lock().map_err(|_| io("screen lock poisoned"))?;
     let screen = parser.screen_mut();
     let previous = screen.scrollback();
@@ -496,16 +479,14 @@ fn capture_snapshot(
         )
     });
     let version = output_version.load(Ordering::SeqCst);
-    Ok((
-        ScreenSnapshot {
-            cells,
-            wrapped,
-            cursor,
-            scrollback_len,
-            scrollback_total: scrollback_total.load(Ordering::Relaxed),
-        },
-        version,
-    ))
+    Ok(ScreenSnapshot {
+        cells,
+        wrapped,
+        cursor,
+        scrollback_len,
+        scrollback_total: scrollback_total.load(Ordering::Relaxed),
+        output_version: Some(version),
+    })
 }
 
 #[cfg(test)]
