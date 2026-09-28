@@ -8,6 +8,7 @@ use crate::agent::{
     VersionedSnapshot,
 };
 use crate::clock::Clock;
+use crate::input::{InputBatch, InputDeduplicator, InputOutcome, MAX_INPUT_BYTES};
 use crate::protocol::Step;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,6 +45,8 @@ pub struct Session {
     /// `Pause` between them — so a second sender cannot land a write during a
     /// pause, when the `agent` lock is briefly free. See [`Self::feed`].
     input_lock: Mutex<()>,
+    /// Bounded retry history for remote byte batches, kept per session.
+    input_dedup: Mutex<InputDeduplicator>,
 }
 
 /// Generate a unique session-start identity from host entropy and a process counter.
@@ -119,6 +122,7 @@ impl Session {
             attach_slot: Mutex::new(None),
             next_attach_generation: AtomicU64::new(1),
             input_lock: Mutex::new(()),
+            input_dedup: Mutex::new(InputDeduplicator::new()),
         }
     }
 
@@ -182,6 +186,29 @@ impl Session {
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
         self.write_one_burst(bytes)
+    }
+
+    /// Apply a bounded remote batch once for this exact session instance.
+    /// Local input shares `input_lock`, so each complete batch stays atomic.
+    pub fn apply_input_batch(&self, batch: InputBatch<'_>) -> InputOutcome {
+        if batch.seq == 0 || batch.bytes.is_empty() || batch.bytes.len() > MAX_INPUT_BYTES {
+            return InputOutcome::Uncertain;
+        }
+        let Ok(_held) = self.input_lock.lock() else {
+            return InputOutcome::Uncertain;
+        };
+        if !self.is_alive() {
+            return InputOutcome::Exited;
+        }
+        if batch.instance_id != self.instance_id {
+            return InputOutcome::WrongInstance;
+        }
+        let Ok(mut deduplicator) = self.input_dedup.lock() else {
+            return InputOutcome::Uncertain;
+        };
+        deduplicator.apply(batch.client_id, batch.seq, || {
+            self.write_one_burst(batch.bytes)
+        })
     }
 
     /// Above this, a `feed` act is refused rather than executed — a caller's

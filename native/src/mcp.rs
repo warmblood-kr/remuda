@@ -216,27 +216,39 @@ fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> S
         // the decision it left open was made rather than dropped. `steps/013`.
         Ok(Response::Value(value)) => ok_reply(id, tool_text(&value)),
         Ok(Response::Ok) => ok_reply(id, tool_text("ok")),
+        Ok(Response::Ack { duplicate }) => ok_reply(
+            id,
+            tool_text(if duplicate {
+                "already applied"
+            } else {
+                "applied"
+            }),
+        ),
+        Ok(Response::Uncertain) => ok_reply(id, tool_error("input outcome is uncertain")),
+        Ok(Response::WrongInstance) => ok_reply(id, tool_error("session instance changed")),
         Ok(Response::AttachStarted { .. } | Response::AttachStatus { .. }) => {
             ok_reply(id, tool_error("attach responses are not exposed over MCP"))
         }
-        Ok(Response::Sessions(sessions)) => {
-            let rows: Vec<String> = sessions
-                .iter()
-                .map(|s| {
-                    format!(
-                        "{}\t{}x{}\talive={}\tidle={:.0}s\toutput_idle={:.0}s",
-                        s.name,
-                        s.size.cols(),
-                        s.size.rows(),
-                        s.alive,
-                        s.idle.as_secs_f64(),
-                        s.output_idle.unwrap_or(s.idle).as_secs_f64()
-                    )
-                })
-                .collect();
-            ok_reply(id, tool_text(&rows.join("\n")))
-        }
+        Ok(Response::Sessions(sessions)) => ok_reply(id, sessions_text(sessions)),
     }
+}
+
+fn sessions_text(sessions: Vec<remuda_core::SessionSummary>) -> Value {
+    let rows: Vec<String> = sessions
+        .iter()
+        .map(|session| {
+            format!(
+                "{}\t{}x{}\talive={}\tidle={:.0}s\toutput_idle={:.0}s",
+                session.name,
+                session.size.cols(),
+                session.size.rows(),
+                session.alive,
+                session.idle.as_secs_f64(),
+                session.output_idle.unwrap_or(session.idle).as_secs_f64()
+            )
+        })
+        .collect();
+    tool_text(&rows.join("\n"))
 }
 
 /// What `tools/list` returns: the frame's own, then the image's registry. A

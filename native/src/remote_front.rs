@@ -2,6 +2,7 @@
 
 use crate::ipc::TryClone as _;
 use interprocess::local_socket::traits::ListenerExt as _;
+use remuda_core::input::validate_batch;
 use remuda_core::protocol::Request;
 use std::io::{BufRead, Read, Write};
 use std::path::Path;
@@ -9,7 +10,7 @@ use std::path::Path;
 /// Maximum single JSON frame accepted by this front (512 KiB).
 pub const MAX_FRAME_BYTES: usize = 512 * 1024;
 /// Maximum bytes accepted in one atomic input batch (64 KiB).
-pub const MAX_INPUT_BYTES: usize = 64 * 1024;
+pub const MAX_INPUT_BYTES: usize = remuda_core::input::MAX_INPUT_BYTES;
 /// Maximum simultaneous local front connections.
 pub const MAX_CONNECTIONS: usize = 8;
 /// A connection is closed if one request takes longer than this.
@@ -147,12 +148,12 @@ fn serve_connection(mut stream: crate::ipc::Stream, daemon_path: &Path) -> std::
 pub fn authorize(request: &Request) -> Result<(), String> {
     match request {
         Request::List | Request::CaptureStyled { .. } => Ok(()),
-        Request::Input { bytes, .. } if !bytes.is_empty() && bytes.len() <= MAX_INPUT_BYTES => {
-            Ok(())
-        }
-        Request::Input { .. } => Err(format!(
-            "remote input must contain 1 to {MAX_INPUT_BYTES} bytes"
-        )),
+        Request::Input {
+            client_id,
+            seq,
+            bytes,
+            ..
+        } => validate_batch(client_id, *seq, bytes).map(|_| ()),
         Request::New { .. }
         | Request::SendLine { .. }
         | Request::Send { .. }
@@ -188,6 +189,9 @@ mod tests {
         .is_ok());
         assert!(authorize(&Request::Input {
             name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
             bytes: b"hello\r".to_vec()
         })
         .is_ok());
@@ -262,6 +266,9 @@ mod tests {
             .contains("exceeds"));
         let oversized = Request::Input {
             name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
             bytes: vec![0; MAX_INPUT_BYTES + 1],
         };
         assert!(decode_frame(&serde_json::to_vec(&oversized).unwrap())
@@ -269,11 +276,28 @@ mod tests {
             .contains("input"));
         let empty = Request::Input {
             name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
             bytes: Vec::new(),
         };
         assert!(decode_frame(&serde_json::to_vec(&empty).unwrap())
             .unwrap_err()
             .contains("input"));
+    }
+
+    #[test]
+    fn input_validation_errors_never_echo_batch_bytes() {
+        let request = Request::Input {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "malformed".into(),
+            seq: 0,
+            bytes: b"secret-input-payload".to_vec(),
+        };
+        let error = authorize(&request).unwrap_err();
+        assert!(!error.contains("secret-input-payload"));
+        assert!(error.contains("client_id"));
     }
 
     fn test_socket_path() -> std::path::PathBuf {

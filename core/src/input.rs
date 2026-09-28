@@ -7,6 +7,14 @@ pub const INPUT_RING_CAPACITY: usize = 256;
 pub const MAX_INPUT_CLIENTS: usize = 16;
 pub const MAX_INPUT_BYTES: usize = 64 * 1024;
 
+#[derive(Clone, Copy)]
+pub struct InputBatch<'a> {
+    pub instance_id: &'a str,
+    pub client_id: [u8; 16],
+    pub seq: u64,
+    pub bytes: &'a [u8],
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InputOutcome {
     Ack { duplicate: bool },

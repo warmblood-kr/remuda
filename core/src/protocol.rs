@@ -136,7 +136,9 @@ pub enum Response {
     Sessions(Vec<SessionSummary>),
     Screen(String),
     /// An input batch was applied, or was already applied.
-    Ack { duplicate: bool },
+    Ack {
+        duplicate: bool,
+    },
     /// The daemon cannot prove whether an unknown or evicted batch was applied.
     Uncertain,
     /// The target name now refers to a different session start.

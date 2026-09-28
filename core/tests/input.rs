@@ -1,7 +1,7 @@
+use remuda_core::agent::{AgentError, AgentProcess, Cursor, Result, Size};
 use remuda_core::input::{
     validate_batch, InputDeduplicator, InputOutcome, INPUT_RING_CAPACITY, MAX_INPUT_BYTES,
 };
-use remuda_core::agent::{AgentError, AgentProcess, Cursor, Result, Size};
 use remuda_core::{ManualClock, Session};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -80,12 +80,36 @@ fn wrong_instance_precedes_duplicate_lookup_and_exited_sessions_are_refused() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let live = input_session(Arc::clone(&writes), true);
     let instance = live.instance_id().to_string();
-    assert_eq!(live.apply_input_batch(&instance, [4; 16], 1, b"line"), InputOutcome::Ack { duplicate: false });
-    assert_eq!(live.apply_input_batch("stale-instance", [4; 16], 1, b"line"), InputOutcome::WrongInstance);
+    assert_eq!(
+        live.apply_input_batch(remuda_core::input::InputBatch {
+            instance_id: &instance,
+            client_id: [4; 16],
+            seq: 1,
+            bytes: b"line",
+        }),
+        InputOutcome::Ack { duplicate: false }
+    );
+    assert_eq!(
+        live.apply_input_batch(remuda_core::input::InputBatch {
+            instance_id: "stale-instance",
+            client_id: [4; 16],
+            seq: 1,
+            bytes: b"line",
+        }),
+        InputOutcome::WrongInstance
+    );
     assert_eq!(writes.lock().unwrap().len(), 1);
 
     let exited = input_session(Arc::clone(&writes), false);
-    assert_eq!(exited.apply_input_batch("stale-instance", [5; 16], 1, b"line"), InputOutcome::Exited);
+    assert_eq!(
+        exited.apply_input_batch(remuda_core::input::InputBatch {
+            instance_id: "stale-instance",
+            client_id: [5; 16],
+            seq: 1,
+            bytes: b"line",
+        }),
+        InputOutcome::Exited
+    );
     assert_eq!(writes.lock().unwrap().len(), 1);
 }
 
@@ -98,7 +122,15 @@ fn concurrent_batches_are_written_as_atomic_pieces() {
             let session = Arc::clone(&session);
             thread::spawn(move || {
                 let client_id = [tag; 16];
-                assert_eq!(session.apply_input_batch(session.instance_id(), client_id, 1, &[tag; 64]), InputOutcome::Ack { duplicate: false });
+                assert_eq!(
+                    session.apply_input_batch(remuda_core::input::InputBatch {
+                        instance_id: session.instance_id(),
+                        client_id,
+                        seq: 1,
+                        bytes: &[tag; 64],
+                    }),
+                    InputOutcome::Ack { duplicate: false }
+                );
             })
         })
         .collect();
@@ -107,7 +139,9 @@ fn concurrent_batches_are_written_as_atomic_pieces() {
     }
     let writes = writes.lock().unwrap();
     assert_eq!(writes.len(), 8);
-    assert!(writes.iter().all(|batch| batch.len() == 64 && batch.iter().all(|byte| *byte == batch[0])));
+    assert!(writes
+        .iter()
+        .all(|batch| batch.len() == 64 && batch.iter().all(|byte| *byte == batch[0])));
 }
 
 fn input_session(writes: Arc<Mutex<Vec<Vec<u8>>>>, alive: bool) -> Session {
@@ -132,11 +166,26 @@ impl AgentProcess for InputRecordingAgent {
         Ok(())
     }
 
-    fn screen_text(&mut self) -> Result<String> { Ok(String::new()) }
-    fn cursor(&mut self) -> Result<Cursor> { Ok(Cursor { row: 0, col: 0, visible: true }) }
-    fn is_alive(&mut self) -> bool { self.alive }
-    fn terminate(&mut self) -> Result<()> { self.alive = false; Ok(()) }
-    fn size(&self) -> Size { Size::default() }
+    fn screen_text(&mut self) -> Result<String> {
+        Ok(String::new())
+    }
+    fn cursor(&mut self) -> Result<Cursor> {
+        Ok(Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        })
+    }
+    fn is_alive(&mut self) -> bool {
+        self.alive
+    }
+    fn terminate(&mut self) -> Result<()> {
+        self.alive = false;
+        Ok(())
+    }
+    fn size(&self) -> Size {
+        Size::default()
+    }
 }
 
 fn apply(
