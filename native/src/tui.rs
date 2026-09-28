@@ -1977,11 +1977,7 @@ fn anchor_offset_to_new_history(
 }
 
 /// Keep a scrolled preview on the same history rows as output pushes new rows.
-fn capture_preview(
-    path: &Path,
-    ui: &mut Ui,
-    name: &str,
-) -> Result<(Vec<Vec<StyledCell>>, Vec<bool>, Cursor), String> {
+fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCapture, String> {
     let state = ui.scrollback.entry(name.to_string()).or_default();
     let (mut cells, mut wrapped, mut cursor, mut history_rows, mut history_total) =
         capture_styled(path, name, state.offset)?;
@@ -2177,6 +2173,7 @@ fn parse_shown_target(text: &str) -> Option<ShownTarget> {
 
 /// Rows of cells, each row's soft-wrap flag, and the cursor.
 type StyledCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor, usize, usize);
+type PreviewCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor);
 
 /// Styled counterpart of the (now unused) plain `capture` — see steps/020,
 /// 021. The wire carries runs, expanded back to cells here — see steps/022.

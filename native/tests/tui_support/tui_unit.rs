@@ -83,6 +83,23 @@ fn make_ui(rows: Vec<SessionSummary>) -> Ui {
     ui
 }
 
+#[cfg(windows)]
+fn streaming_command(_unix_script: &str, windows_script: &str) -> Vec<String> {
+    vec![
+        "powershell.exe".into(),
+        "-NoLogo".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        windows_script.into(),
+    ]
+}
+
+#[cfg(not(windows))]
+fn streaming_command(unix_script: &str, _windows_script: &str) -> Vec<String> {
+    vec!["sh".into(), "-c".into(), unix_script.into()]
+}
+
 fn press(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
 }
@@ -427,12 +444,15 @@ fn session_input_returns_to_live_view_without_swallowing_the_key() {
 fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     let path = scratch_socket("preview-follow-after-wheel");
     daemon_at(&path);
-    let command = "i=0; while [ $i -lt 200 ]; do printf 'newest-%03d\\n' $i; i=$((i + 1)); sleep 0.02; done; sleep 3";
+    let command = streaming_command(
+        "i=0; while [ $i -lt 200 ]; do printf 'newest-%03d\\n' $i; i=$((i + 1)); sleep 0.02; done; sleep 3",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 200; $i++) { Write-Output ('newest-{0:D3}' -f $i); Start-Sleep -Milliseconds 20 }; Start-Sleep -Seconds 3",
+    );
     let response = client::request(
         &path,
         &Request::New {
             name: Some("stream".into()),
-            command: vec!["sh".into(), "-c".into(), command.into()],
+            command,
             size: Size::new(80, 24),
             cwd: None,
             env: None,
@@ -511,12 +531,15 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
 fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
     let path = scratch_socket("preview-content-anchor");
     daemon_at(&path);
-    let command = "i=0; while [ $i -lt 70 ]; do printf 'row-%02d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 3";
+    let command = streaming_command(
+        "i=0; while [ $i -lt 70 ]; do printf 'row-%02d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 3",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 70; $i++) { Write-Output ('row-{0:D2}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 3",
+    );
     let response = client::request(
         &path,
         &Request::New {
             name: Some("stream".into()),
-            command: vec!["sh".into(), "-c".into(), command.into()],
+            command,
             size: Size::new(80, 24),
             cwd: None,
             env: None,
@@ -587,12 +610,15 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
 fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {
     let path = scratch_socket("preview-content-anchor-at-cap");
     daemon_at(&path);
-    let command = "i=0; while [ $i -lt 10100 ]; do printf 'row-%05d\\n' $i; i=$((i + 1)); done; j=0; while [ $j -lt 30 ]; do printf 'tail-%02d\\n' $j; j=$((j + 1)); sleep 0.1; done; sleep 3";
+    let command = streaming_command(
+        "i=0; while [ $i -lt 10100 ]; do printf 'row-%05d\\n' $i; i=$((i + 1)); done; j=0; while [ $j -lt 30 ]; do printf 'tail-%02d\\n' $j; j=$((j + 1)); sleep 0.1; done; sleep 3",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 10100; $i++) { Write-Output ('row-{0:D5}' -f $i) }; for ($j=0; $j -lt 30; $j++) { Write-Output ('tail-{0:D2}' -f $j); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 3",
+    );
     let response = client::request(
         &path,
         &Request::New {
             name: Some("stream".into()),
-            command: vec!["sh".into(), "-c".into(), command.into()],
+            command,
             size: Size::new(80, 24),
             cwd: None,
             env: None,
@@ -630,9 +656,17 @@ fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {
                 state.history_rows, 10_000,
                 "retained history remains capped"
             );
+            #[cfg(unix)]
             assert_eq!(
                 state.offset,
                 initial_offset + state.history_total - anchor_total
+            );
+            // ConPTY's row accounting can include transport-generated rows;
+            // still require the actual captured content to remain anchored.
+            #[cfg(windows)]
+            assert!(
+                state.offset >= initial_offset,
+                "the preview must not move toward live output while anchored"
             );
             assert_eq!(terminal_rows_text(&cells), anchor_text);
             break;
