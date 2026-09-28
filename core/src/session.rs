@@ -304,6 +304,12 @@ impl Session {
         }
     }
 
+    /// The child PID if this process-backed session is still running.
+    pub fn process_id_if_alive(&self) -> Option<u32> {
+        let mut agent = self.agent.lock().ok()?;
+        agent.is_alive().then(|| agent.process_id()).flatten()
+    }
+
     /// End the child. Refused while attached, and idempotent on an
     /// already-dead agent. Does not remove the session from a registry — the
     /// last screen survives; [`crate::Registry::close`] does both.

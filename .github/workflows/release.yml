@@ -255,9 +255,15 @@ jobs:
         run: |
           set -eu
           if [ "${{ needs.plan.outputs.channel }}" = nightly ]; then
-            # Rolling: delete the old one so "nightly" always names today's.
-            gh release delete "$TAG" --yes --cleanup-tag || true
-            gh release create "$TAG" --prerelease --target "$GITHUB_SHA" \
+            # Rolling: replace the release but MOVE the tag instead of deleting it.
+            # Deleting the tag (--cleanup-tag) finishes asynchronously and can
+            # untag the NEW release, which GitHub then turns back into a draft.
+            gh release delete "$TAG" --yes || true
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" \
+              -f sha="$GITHUB_SHA" -F force=true \
+              || gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+                   -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA"
+            gh release create "$TAG" --prerelease --verify-tag \
               --title "nightly $VERSION" \
               --notes "Rolling build of main. Version \`$VERSION\`." dist/*
           else

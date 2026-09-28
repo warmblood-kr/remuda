@@ -14,6 +14,7 @@
 
 use crate::image::Image;
 use crate::ipc::{self, Listener, Stream, TryClone};
+use crate::process_ancestry;
 use crate::pty::PtyAgent;
 use interprocess::local_socket::traits::ListenerExt;
 use remuda_core::agent::Result as AgentResult;
@@ -626,17 +627,48 @@ fn handle_shutdown(
             .or(requester_session_name)
             .or(requester_session_id)
             .unwrap_or_else(|| "unknown".into());
-        return reply(
-            &stream,
-            &Response::error(format!(
-                "cannot stop this daemon from one of its own sessions ({identity}); pass --i-am-inside to override"
-            )),
-        );
+        return refuse_hosted_shutdown(&stream, &identity);
+    }
+    if !override_hosted {
+        match process_ancestry::peer_pid(&stream) {
+            Ok(Some(peer_pid)) => match process_ancestry::is_self_or_descendant(
+                peer_pid,
+                &registry.live_process_ids(),
+            ) {
+                process_ancestry::Ancestry::Inside => {
+                    return refuse_hosted_shutdown(&stream, "session process ancestry")
+                }
+                process_ancestry::Ancestry::Outside => {}
+                process_ancestry::Ancestry::Unreadable { pid, error } => eprintln!(
+                    "remuda: shutdown ancestry stopped at unreadable pid {pid} ({error}); treating requester as outside"
+                ),
+            },
+            Ok(None) | Err(_)
+                if process_ancestry::missing_peer_requires_refusal(caller_claims_this_daemon) =>
+            {
+                return refuse_hosted_shutdown(&stream, "self-reported session identity")
+            }
+            Ok(None) => eprintln!(
+                "remuda: shutdown peer process ID unavailable; treating requester as outside"
+            ),
+            Err(error) => eprintln!(
+                "remuda: shutdown peer process ID unavailable ({error}); treating requester as outside"
+            ),
+        }
     }
     reply(&stream, &Response::Ok)?;
     reap_processes_before_exit(image);
     socket_owner.cleanup();
     std::process::exit(0);
+}
+
+fn refuse_hosted_shutdown(stream: &Stream, identity: &str) -> std::io::Result<()> {
+    reply(
+        stream,
+        &Response::error(format!(
+            "cannot stop this daemon from one of its own sessions ({identity}); pass --i-am-inside to override"
+        )),
+    )
 }
 
 fn handle_new(
