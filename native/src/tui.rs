@@ -39,6 +39,8 @@ const TICK: Duration = Duration::from_millis(250);
 /// than `TICK` so a keypress is never left waiting to be noticed. Used to
 /// also be the redraw cadence; see steps/017 for why that was the bug.
 const TICK_TYPING: Duration = Duration::from_millis(40);
+const SCROLL_DOWN_SETTLE: Duration = Duration::from_millis(1500);
+const MAX_ANCHOR_CAPTURES: usize = 3;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -110,7 +112,7 @@ pub struct Ui {
     /// Remuda's own kill ring. It deliberately does not require or alter the
     /// host OS clipboard.
     yank: String,
-    scrollback: HashMap<String, usize>,
+    scrollback: HashMap<String, ScrollState>,
     pub mode: Mode,
     pub focus: Focus,
     /// Visual mode (tmux copy-mode-vi): `visual_cursor` moves; the selection
@@ -134,6 +136,21 @@ pub struct Ui {
     sessions_text: Vec<String>,
     /// Rows per session, supplied by the Lua sessions-buffer contract.
     session_rows: usize,
+    /// Visible preview rows, refreshed from the terminal dimensions each frame.
+    preview_rows: u16,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ScrollState {
+    offset: usize,
+    history_rows: usize,
+    history_total: usize,
+    /// Total corresponding to `offset`; can lag `history_total` when output
+    /// keeps arriving through the bounded capture retries.
+    anchor_total: usize,
+    last_scroll_down: Option<Instant>,
+    scroll_direction: i8,
+    recent_up_output: usize,
 }
 
 impl Ui {
@@ -170,6 +187,7 @@ impl Ui {
             notice,
             sessions_text: Vec::new(),
             session_rows: 1,
+            preview_rows: 1,
         }
     }
 
@@ -380,9 +398,12 @@ impl Ui {
         let Some(session) = self.selected() else {
             return Action::Nothing;
         };
-        // The pane is bottom-anchored (`Viewport::bottom_anchored`); the
-        // current session dimensions from the herd place the click.
-        let row_offset = (session.size.rows() as usize).saturating_sub(body as usize);
+        // Click coordinates follow the same content anchor as the visible crop.
+        let row_offset = if self.visual_screen.is_empty() {
+            (session.size.rows() as usize).saturating_sub(body as usize)
+        } else {
+            ui_preview_row_offset(self, body)
+        };
         let child_row = row_offset + pane_row as usize;
         let child_col = self.pan as usize + pane_col as usize;
         // Only reachable if the outer terminal grew taller/the pan scrolled
@@ -406,8 +427,12 @@ impl Ui {
         if !session.mouse_tracking {
             return Action::Nothing;
         }
-        let child_row =
-            (session.size.rows() as usize).saturating_sub(body as usize) + pane_row as usize;
+        let row_offset = if self.visual_screen.is_empty() {
+            (session.size.rows() as usize).saturating_sub(body as usize)
+        } else {
+            ui_preview_row_offset(self, body)
+        };
+        let child_row = row_offset + pane_row as usize;
         let child_col = self.pan as usize + pane_col as usize;
         remuda_core::keys::mouse(button, child_col as u16, child_row as u16)
             .map_or(Action::Nothing, Action::Type)
@@ -422,7 +447,13 @@ impl Ui {
             self.notice = None;
             return Action::Nothing;
         }
-        to_bytes(key).map_or(Action::Nothing, Action::Type)
+        let bytes = to_bytes(key);
+        if bytes.is_some() {
+            if let Some(name) = self.selected().map(|session| session.name.clone()) {
+                self.scrollback.entry(name).or_default().offset = 0;
+            }
+        }
+        bytes.map_or(Action::Nothing, Action::Type)
     }
 
     /// Follow the session the keyboard is talking to by NAME, and hand the
@@ -497,6 +528,9 @@ impl Ui {
                 self.pan = 0;
                 Action::Nothing
             }
+            KeyCode::PageUp => Action::Scroll(self.preview_page_delta()),
+            KeyCode::PageDown => Action::Scroll(-self.preview_page_delta()),
+            KeyCode::End => Action::Scroll(i16::MIN),
             KeyCode::Char('h') => {
                 self.list_width = None;
                 Action::Nothing
@@ -546,6 +580,13 @@ impl Ui {
         } else {
             Action::Copy(name)
         }
+    }
+
+    fn preview_page_delta(&self) -> i16 {
+        self.preview_rows
+            .saturating_sub(1)
+            .max(1)
+            .min(i16::MAX as u16) as i16
     }
 
     fn leave_visual(&mut self) {
@@ -1033,13 +1074,42 @@ pub struct Viewport {
     height: u16,
 }
 
+fn anchored_row_offset(source_rows: usize, height: u16, bottom_row: usize) -> usize {
+    let max_start = source_rows.saturating_sub(height as usize);
+    bottom_row
+        .min(source_rows.saturating_sub(1))
+        .saturating_add(1)
+        .saturating_sub(height as usize)
+        .min(max_start)
+}
+
 impl Viewport {
     /// Anchor at the bottom: the source's last `height` rows are visible,
     /// the rest scrolled off above — what the preview pane has always done,
     /// since an agent's own input line sits at the bottom.
     pub fn bottom_anchored(source_rows: usize, col_offset: u16, width: u16, height: u16) -> Self {
+        Self::bottom_anchored_at(
+            source_rows,
+            col_offset,
+            width,
+            height,
+            source_rows.saturating_sub(1),
+        )
+    }
+
+    /// Anchor the visible window so `bottom_row` is its last row when
+    /// possible. Short outer terminals use the active content row here,
+    /// avoiding a crop made mostly of blank rows below a top-line session.
+    pub fn bottom_anchored_at(
+        source_rows: usize,
+        col_offset: u16,
+        width: u16,
+        height: u16,
+        bottom_row: usize,
+    ) -> Self {
+        let bottom_row = bottom_row.min(source_rows.saturating_sub(1));
         Self {
-            row_offset: source_rows.saturating_sub(height as usize),
+            row_offset: anchored_row_offset(source_rows, height, bottom_row),
             col_offset,
             width,
             height,
@@ -1328,7 +1398,7 @@ mod visual_mode_tests {
         ui.keep_visual_cursor_visible();
 
         assert_eq!(ui.pan, 1);
-        let (cropped, _) = super::crop_styled(&ui.visual_screen[..1], 10, 1, ui.pan);
+        let (cropped, _) = super::crop_styled(&ui.visual_screen[..1], 10, 1, ui.pan, 0);
         assert!(
             cropped[0].contains('한'),
             "cropped row was: {:?}",
@@ -1439,7 +1509,7 @@ mod visual_mode_tests {
         ));
         let capture_deadline = Instant::now() + Duration::from_secs(5);
         let (cells, wrapped) = loop {
-            let (cells, wrapped, _) = capture_styled(&path, name, 0).expect("real capture");
+            let (cells, wrapped, _, _, _) = capture_styled(&path, name, 0).expect("real capture");
             let captured: String = cells[0].iter().map(|cell| cell.text.as_str()).collect();
             if captured.starts_with(text) {
                 break (cells, wrapped);
@@ -1861,8 +1931,31 @@ fn same_style(a: &StyledCell, b: &StyledCell) -> bool {
 
 /// The styled counterpart of the free `crop`, byte-identical to it when
 /// every cell is plain — see steps/020's oracle.
-fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool) {
-    let viewport = Viewport::bottom_anchored(cells.len(), pan, cols, rows);
+#[cfg(test)]
+fn crop_styled(
+    cells: &[Vec<StyledCell>],
+    cols: u16,
+    rows: u16,
+    pan: u16,
+    bottom_row: usize,
+) -> (Vec<String>, bool) {
+    let row_offset = anchored_row_offset(cells.len(), rows, bottom_row);
+    crop_styled_at_offset(cells, cols, rows, pan, row_offset)
+}
+
+fn crop_styled_at_offset(
+    cells: &[Vec<StyledCell>],
+    cols: u16,
+    rows: u16,
+    pan: u16,
+    row_offset: usize,
+) -> (Vec<String>, bool) {
+    let viewport = Viewport {
+        row_offset: row_offset.min(cells.len().saturating_sub(rows as usize)),
+        col_offset: pan,
+        width: cols,
+        height: rows,
+    };
     let (cropped, cut) = viewport.crop(cells);
     let out = cropped
         .into_iter()
@@ -1887,6 +1980,43 @@ fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Ve
         })
         .collect();
     (out, cut)
+}
+
+/// The crop should end at the most relevant row: the child's cursor, or the
+/// last row containing visible text when content extends below the cursor.
+fn preview_anchor_row(cells: &[Vec<StyledCell>], cursor_row: u16) -> usize {
+    let last_nonempty = cells
+        .iter()
+        .rposition(|row| row.iter().any(|cell| !cell.text.trim().is_empty()));
+    usize::from(cursor_row)
+        .max(last_nonempty.unwrap_or(0))
+        .min(cells.len().saturating_sub(1))
+}
+
+fn preview_row_offset(
+    cells: &[Vec<StyledCell>],
+    cursor: Cursor,
+    height: u16,
+    preserve_history: bool,
+) -> usize {
+    if preserve_history || !cursor.visible {
+        return cells.len().saturating_sub(height as usize);
+    }
+    anchored_row_offset(cells.len(), height, preview_anchor_row(cells, cursor.row))
+        .min(cursor.row as usize)
+}
+
+fn ui_preview_row_offset(ui: &Ui, height: u16) -> usize {
+    let preserve_history = ui
+        .selected()
+        .and_then(|session| ui.scrollback.get(&session.name))
+        .is_some_and(|state| state.offset > 0);
+    preview_row_offset(
+        &ui.visual_screen,
+        ui.preview_cursor,
+        height,
+        preserve_history,
+    )
 }
 
 /// The one text-width rule the list renderer uses. Ambiguous-width
@@ -1936,11 +2066,19 @@ fn locate_cursor(
     preview_w: u16,
     body: u16,
     list_w: u16,
+    preserve_history: bool,
 ) -> Option<(u16, u16)> {
     if !cursor.visible {
         return None;
     }
-    let viewport = Viewport::bottom_anchored(cells.len(), pan, preview_w, body);
+    let mut viewport = Viewport::bottom_anchored_at(
+        cells.len(),
+        pan,
+        preview_w,
+        body,
+        preview_anchor_row(cells, cursor.row),
+    );
+    viewport.row_offset = preview_row_offset(cells, cursor, body, preserve_history);
     let (panel_row, panel_col) =
         viewport.map_cursor(cells, cursor.row as usize, cursor.col as usize)?;
     // Convert pane-local coordinates to 1-based terminal coordinates, adding
@@ -1978,8 +2116,21 @@ pub fn render_styled(
     };
 
     let selected = cells_with_selection(ui, cells);
-    let (lines, cut) = crop_styled(&selected, preview_w, body, ui.pan);
-    let caret = locate_cursor(cells, cursor, ui.pan, preview_w, body, list_w);
+    let preserve_history = ui
+        .selected()
+        .and_then(|session| ui.scrollback.get(&session.name))
+        .is_some_and(|state| state.offset > 0);
+    let row_offset = preview_row_offset(cells, cursor, body, preserve_history);
+    let (lines, cut) = crop_styled_at_offset(&selected, preview_w, body, ui.pan, row_offset);
+    let caret = locate_cursor(
+        cells,
+        cursor,
+        ui.pan,
+        preview_w,
+        body,
+        list_w,
+        preserve_history,
+    );
     // Hide before moving the terminal cursor around the frame. The final
     // caret state below is the only place that makes it visible again.
     let mut out = String::from("\x1b[?2026h\x1b[?25l\x1b[H");
@@ -2213,6 +2364,7 @@ fn refresh(
     selection_moved: bool,
 ) -> std::io::Result<(u16, u16)> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    ui.preview_rows = rows.saturating_sub(1).max(1);
     ui.preview_width = ui_layout(ui, cols).1;
     if !skip_list {
         // The buffer is allowed to reorder the herd. Keep the identity, not
@@ -2288,15 +2440,13 @@ fn refresh(
         ui.last_resized = None;
     }
     let (cells, wrapped, cursor) = match shown.as_ref() {
-        Some(ShownTarget::Session(name)) => {
-            match capture_styled(path, name, *ui.scrollback.get(name).unwrap_or(&0)) {
-                Ok(result) => result,
-                Err(e) => {
-                    ui.notice = Some(format!("{name}: {e}"));
-                    (Vec::new(), Vec::new(), hidden)
-                }
+        Some(ShownTarget::Session(name)) => match capture_preview(path, ui, name) {
+            Ok(result) => result,
+            Err(e) => {
+                ui.notice = Some(format!("{name}: {e}"));
+                (Vec::new(), Vec::new(), hidden)
             }
-        }
+        },
         Some(ShownTarget::Buffer(name)) => match capture_buffer(path, name) {
             Ok((cells, cursor)) => (cells, Vec::new(), cursor),
             Err(e) => {
@@ -2465,14 +2615,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             Action::Kill(name) => ui.notice = kill(path, &name).err(),
             Action::Focus(name) => reconcile_hold(path, &mut ui, &mut held, &name),
             Action::Scroll(delta) => {
-                if let Some(session) = ui.selected() {
-                    let offset = ui.scrollback.entry(session.name.clone()).or_default();
-                    *offset = if delta >= 0 {
-                        offset.saturating_add(delta as usize)
-                    } else {
-                        offset.saturating_sub((-delta) as usize)
-                    };
-                }
+                scroll_selected(&mut ui, delta);
             }
             Action::Copy(name) => copy_screen(path, &mut ui, &name),
             Action::CopySelection(name) => copy_selection(path, &mut ui, &name),
@@ -2487,7 +2630,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
 
 fn copy_screen(path: &Path, ui: &mut Ui, name: &str) {
     match capture_styled(path, name, 0) {
-        Ok((cells, wrapped, _)) => {
+        Ok((cells, wrapped, _, _, _)) => {
             ui.yank = all_screen_text(&cells, &wrapped);
             ui.notice = Some(format!(
                 "copied {} bytes; p pastes into the selected session",
@@ -2499,9 +2642,9 @@ fn copy_screen(path: &Path, ui: &mut Ui, name: &str) {
 }
 
 fn copy_selection(path: &Path, ui: &mut Ui, name: &str) {
-    let offset = *ui.scrollback.get(name).unwrap_or(&0);
+    let offset = ui.scrollback.get(name).map_or(0, |state| state.offset);
     match capture_styled(path, name, offset) {
-        Ok((cells, wrapped, _)) => {
+        Ok((cells, wrapped, _, _, _)) => {
             // Copy-and-cancel, as tmux: the selection has done its job.
             ui.yank = ui.text_selection.take().map_or_else(
                 || all_screen_text(&cells, &wrapped),
@@ -2514,6 +2657,107 @@ fn copy_selection(path: &Path, ui: &mut Ui, name: &str) {
         }
         Err(e) => ui.notice = Some(format!("{name}: {e}")),
     }
+}
+
+fn scroll_state(state: &mut ScrollState, delta: i16) {
+    if delta > 0 {
+        if state.scroll_direction != 1 {
+            state.recent_up_output = 0;
+        }
+        state.scroll_direction = 1;
+        state.offset = state
+            .offset
+            .saturating_add(delta as usize)
+            .min(state.history_rows);
+    } else if delta < 0 {
+        if state.scroll_direction != -1 {
+            state.offset = state.offset.saturating_sub(state.recent_up_output);
+            state.recent_up_output = 0;
+        }
+        state.scroll_direction = -1;
+        state.last_scroll_down = Some(Instant::now());
+        state.offset = state.offset.saturating_sub(delta.unsigned_abs() as usize);
+    }
+}
+
+fn scroll_selected(ui: &mut Ui, delta: i16) {
+    if let Some(name) = ui.selected().map(|session| session.name.clone()) {
+        scroll_state(ui.scrollback.entry(name).or_default(), delta);
+    }
+}
+
+fn anchor_offset_to_new_history(
+    offset: usize,
+    previous_total: usize,
+    current_total: usize,
+    current_rows: usize,
+) -> usize {
+    if offset == 0 {
+        0
+    } else {
+        offset
+            .saturating_add(current_total.saturating_sub(previous_total))
+            .min(current_rows)
+    }
+}
+
+/// Capture at the offset computed from the history total in that capture.
+/// Output can arrive between a probe and its corrective capture; retry until
+/// the offset and the captured total describe the same screen state.
+fn capture_anchored<T>(
+    base_offset: usize,
+    previous_total: usize,
+    mut capture: impl FnMut(usize) -> Result<(T, usize, usize), String>,
+) -> Result<(T, usize, usize, usize, usize), String> {
+    let mut requested = base_offset;
+    for attempt in 0..MAX_ANCHOR_CAPTURES {
+        let (value, rows, total) = capture(requested)?;
+        let anchored = anchor_offset_to_new_history(base_offset, previous_total, total, rows);
+        if anchored == requested {
+            return Ok((value, rows, total, anchored, total));
+        }
+        if attempt + 1 == MAX_ANCHOR_CAPTURES {
+            // The captured cells use `requested`, while `total` may already
+            // include output that arrived after that offset was chosen. Store
+            // the total that corresponds to the captured offset so the next
+            // frame accounts for that missed drift exactly once.
+            let anchor_total = total.saturating_sub(requested.saturating_sub(base_offset));
+            return Ok((value, rows, total, requested, anchor_total));
+        }
+        requested = anchored;
+    }
+    unreachable!("the bounded anchor loop always returns a capture")
+}
+
+/// Keep a scrolled preview on the same history rows as output pushes new rows.
+fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCapture, String> {
+    let state = ui.scrollback.entry(name.to_string()).or_default();
+    let scrolling_down = state
+        .last_scroll_down
+        .is_some_and(|last| last.elapsed() < SCROLL_DOWN_SETTLE);
+    let (cells, wrapped, cursor, history_rows, history_total, anchored, anchor_total) =
+        if scrolling_down {
+            let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, state.offset)?;
+            (cells, wrapped, cursor, rows, total, state.offset, total)
+        } else {
+            let (capture, rows, total, anchored, anchor_total) =
+                capture_anchored(state.offset, state.anchor_total, |offset| {
+                    let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, offset)?;
+                    Ok(((cells, wrapped, cursor), rows, total))
+                })?;
+            let (cells, wrapped, cursor) = capture;
+            (cells, wrapped, cursor, rows, total, anchored, anchor_total)
+        };
+    state.offset = anchored;
+    if state.scroll_direction == 1 {
+        state.recent_up_output = state
+            .recent_up_output
+            .saturating_add(history_total.saturating_sub(state.history_total));
+    }
+    state.history_rows = history_rows;
+    state.history_total = history_total;
+    state.anchor_total = anchor_total;
+    Ok((cells, wrapped, cursor))
 }
 
 fn paste(path: &Path, ui: &mut Ui, held: &Option<(String, Hold)>) {
@@ -2679,7 +2923,8 @@ fn parse_shown_target(text: &str) -> Option<ShownTarget> {
 }
 
 /// Rows of cells, each row's soft-wrap flag, and the cursor.
-type StyledCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor);
+type StyledCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor, usize, usize);
+type PreviewCapture = (Vec<Vec<StyledCell>>, Vec<bool>, Cursor);
 
 /// Styled counterpart of the (now unused) plain `capture` — see steps/020,
 /// 021. The wire carries runs, expanded back to cells here — see steps/022.
@@ -2696,10 +2941,14 @@ fn capture_styled(path: &Path, name: &str, scrollback: usize) -> Result<StyledCa
             rows,
             wrapped,
             cursor,
+            scrollback_len,
+            scrollback_total,
         }) => Ok((
             rows.iter().map(|row| expand_runs(row)).collect(),
             wrapped,
             cursor,
+            scrollback_len,
+            scrollback_total,
         )),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
