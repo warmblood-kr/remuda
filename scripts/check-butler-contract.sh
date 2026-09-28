@@ -40,13 +40,12 @@ echo "core $(git -C "$CORE" rev-parse --short HEAD), butler $(git -C "$BUTLER_RE
 echo "remuda: $(command -v remuda)"
 
 # A leaked stand-in agent can outlive its run (that leak is what this gate
-# catches); kill each run's new ones so none lingers into the next.
-stand_ins() { pgrep -fx 'sleep [1-9][0-9]{4}[12]' | sort || true; }
+# catches). Each run gets its own stand-in id (live_reload.sh reads
+# LIVE_RELOAD_ID), so cleanup kills only this run's, never a concurrent one's.
 run() {
-  local before
-  before=$(stand_ins)
-  "$@" || status=1
-  comm -13 <(echo "$before") <(stand_ins) | xargs kill 2>/dev/null || true
+  local id=$((RANDOM % 90000 + 10000))
+  LIVE_RELOAD_ID=$id "$@" || status=1
+  pkill -fx "sleep ${id}[12]" 2>/dev/null || true
 }
 
 status=0
