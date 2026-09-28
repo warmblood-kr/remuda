@@ -1,34 +1,47 @@
 //! Hash-only, single-use join tokens with persistent expiry.
 
+#[cfg(not(windows))]
 use super::encoding;
 #[cfg(not(windows))]
 use super::storage;
 use remuda_core::WallClock;
+#[cfg(not(windows))]
 use serde::{Deserialize, Serialize};
 use std::io;
 #[cfg(not(windows))]
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(windows))]
+use std::path::PathBuf;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
+#[cfg(not(windows))]
 const TOKEN_FILE: &str = "join_tokens.json";
+#[cfg(not(windows))]
 const TOKEN_LIFETIME_SECONDS: u64 = 10 * 60;
+#[cfg(not(windows))]
 const MAX_OUTSTANDING_TOKENS: usize = 16;
+#[cfg(not(windows))]
 const MAX_TOKEN_FILE_SIZE: usize = 8 * 1024;
+#[cfg(not(windows))]
 const NOISE_PATTERN: &str = "Noise_NN_25519_ChaChaPoly_SHA256";
 
 /// A newly minted bearer token. Keep `token` secret; the state file stores only its hash.
 pub struct MintedJoinToken {
-    pub token: String,
+    pub token: Zeroizing<String>,
     pub expires_at_unix_seconds: u64,
 }
 
 /// Persistent token state rooted in the local cluster directory.
 pub struct JoinTokenStore {
+    #[cfg(not(windows))]
     directory: PathBuf,
+    #[cfg(not(windows))]
     clock: Arc<dyn WallClock>,
 }
 
+#[cfg(not(windows))]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TokenState {
@@ -37,6 +50,7 @@ struct TokenState {
     tokens: Vec<TokenRecord>,
 }
 
+#[cfg(not(windows))]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TokenRecord {
@@ -48,7 +62,10 @@ impl JoinTokenStore {
     /// Open token state in the local initialized cluster directory.
     pub fn open(clock: Arc<dyn WallClock>) -> io::Result<Self> {
         #[cfg(windows)]
-        return Err(unsupported_storage());
+        {
+            let _ = clock;
+            Err(unsupported_storage())
+        }
         #[cfg(not(windows))]
         Self::open_at(&storage::cluster_state_dir()?.join("cluster"), clock)
     }
@@ -107,7 +124,10 @@ impl JoinTokenStore {
     /// Verify and durably consume a token; all later uses are refused.
     pub fn verify_and_consume(&self, token: &str) -> io::Result<()> {
         #[cfg(windows)]
-        return Err(unsupported_storage());
+        {
+            let _ = token;
+            Err(unsupported_storage())
+        }
         #[cfg(not(windows))]
         {
             let hash = token_hash(token)?;
@@ -130,6 +150,7 @@ impl JoinTokenStore {
     }
 }
 
+#[cfg(not(windows))]
 impl TokenState {
     fn new(now: u64) -> Self {
         Self {
@@ -220,26 +241,25 @@ fn validate_state(state: &TokenState) -> io::Result<()> {
     Ok(())
 }
 
-fn random_token() -> io::Result<String> {
-    use zeroize::Zeroizing;
-    let params = NOISE_PATTERN
-        .parse()
-        .map_err(|error: snow::Error| io::Error::other(error))?;
-    let keypair = snow::Builder::new(params)
-        .generate_keypair()
-        .map_err(io::Error::other)?;
-    let private = Zeroizing::new(keypair.private);
-    Ok(encoding::encode_base64(&private))
+#[cfg(not(windows))]
+fn random_token() -> io::Result<Zeroizing<String>> {
+    let mut bytes = Zeroizing::new([0; 32]);
+    getrandom::fill(&mut *bytes).map_err(|error| {
+        io::Error::other(format!("secure token randomness unavailable: {error}"))
+    })?;
+    Ok(Zeroizing::new(encoding::encode_base64(&bytes[..])))
 }
 
+#[cfg(not(windows))]
 fn token_hash(token: &str) -> io::Result<String> {
-    let bytes = encoding::decode_base64(token)?;
+    let bytes = Zeroizing::new(encoding::decode_base64(token).map_err(|_| refused_token())?);
     if bytes.len() != 32 || encoding::encode_base64(&bytes) != token {
         return Err(refused_token());
     }
     hash_bytes(&bytes)
 }
 
+#[cfg(not(windows))]
 fn hash_bytes(bytes: &[u8]) -> io::Result<String> {
     use snow::resolvers::CryptoResolver;
     let params: snow::params::NoiseParams = NOISE_PATTERN
@@ -255,6 +275,7 @@ fn hash_bytes(bytes: &[u8]) -> io::Result<String> {
     Ok(encoding::encode_base64(&digest))
 }
 
+#[cfg(not(windows))]
 fn decode_hash(value: &str) -> io::Result<Vec<u8>> {
     let decoded = encoding::decode_base64(value)?;
     if decoded.len() != 32 || encoding::encode_base64(&decoded) != value {
@@ -266,6 +287,7 @@ fn decode_hash(value: &str) -> io::Result<Vec<u8>> {
     Ok(decoded)
 }
 
+#[cfg(not(windows))]
 fn hashes_equal(first: &str, second: &str) -> bool {
     match (decode_hash(first), decode_hash(second)) {
         (Ok(first), Ok(second)) if first.len() == second.len() => {
@@ -279,6 +301,7 @@ fn hashes_equal(first: &str, second: &str) -> bool {
     }
 }
 
+#[cfg(not(windows))]
 fn refused_token() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,

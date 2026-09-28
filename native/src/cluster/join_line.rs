@@ -4,6 +4,7 @@ use super::encoding;
 use std::fmt;
 use std::io;
 use std::net::SocketAddr;
+use zeroize::Zeroizing;
 
 const JOIN_LINE_VERSION: &str = "remuda-join-v1";
 const MAX_JOIN_LINE_SIZE: usize = 256;
@@ -13,7 +14,7 @@ const MAX_JOIN_LINE_SIZE: usize = 256;
 pub struct JoinLine {
     pub issuer_addr: SocketAddr,
     pub issuer_static_pubkey: [u8; 32],
-    pub token: String,
+    pub token: Zeroizing<String>,
 }
 
 impl fmt::Debug for JoinLine {
@@ -31,12 +32,13 @@ impl JoinLine {
     /// Encode the invitation as one canonical, whitespace-delimited line.
     pub fn encode(&self) -> io::Result<String> {
         validate_endpoint(self.issuer_addr)?;
-        decode_canonical_key(&self.token, "join token")?;
+        validate_token(&self.token)?;
+        validate_static_key(&self.issuer_static_pubkey)?;
         Ok(format!(
             "{JOIN_LINE_VERSION} {} {} {}",
             self.issuer_addr,
             encoding::encode_base64(&self.issuer_static_pubkey),
-            self.token
+            self.token.as_str()
         ))
     }
 
@@ -52,15 +54,19 @@ impl JoinLine {
         if fields[0] != JOIN_LINE_VERSION {
             return Err(invalid_join_line());
         }
-        let issuer_addr = fields[1].parse().map_err(|_| invalid_join_line())?;
+        let issuer_addr: SocketAddr = fields[1].parse().map_err(|_| invalid_join_line())?;
+        if issuer_addr.to_string() != fields[1] {
+            return Err(invalid_join_line());
+        }
         validate_endpoint(issuer_addr)?;
         let public_key = decode_canonical_key(fields[2], "issuer public key")?;
         let issuer_static_pubkey = public_key.try_into().map_err(|_| invalid_join_line())?;
-        decode_canonical_key(fields[3], "join token")?;
+        validate_static_key(&issuer_static_pubkey)?;
+        validate_token(fields[3])?;
         Ok(Self {
             issuer_addr,
             issuer_static_pubkey,
-            token: fields[3].to_owned(),
+            token: Zeroizing::new(fields[3].to_owned()),
         })
     }
 
@@ -76,8 +82,37 @@ impl JoinLine {
     }
 }
 
+fn validate_token(value: &str) -> io::Result<()> {
+    let decoded =
+        Zeroizing::new(encoding::decode_base64(value).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid join token encoding")
+        })?);
+    if decoded.len() != 32 || encoding::encode_base64(&decoded) != value {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "join token must be 32 canonical base64 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_static_key(public_key: &[u8; 32]) -> io::Result<()> {
+    if public_key.iter().all(|byte| *byte == 0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "issuer static public key cannot be all zero",
+        ));
+    }
+    Ok(())
+}
+
 fn decode_canonical_key(value: &str, description: &str) -> io::Result<Vec<u8>> {
-    let decoded = encoding::decode_base64(value)?;
+    let decoded = encoding::decode_base64(value).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("invalid {description} base64 encoding"),
+        )
+    })?;
     if decoded.len() != 32 || encoding::encode_base64(&decoded) != value {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -88,7 +123,10 @@ fn decode_canonical_key(value: &str, description: &str) -> io::Result<Vec<u8>> {
 }
 
 fn validate_endpoint(address: SocketAddr) -> io::Result<()> {
-    if address.port() == 0 || address.ip().is_unspecified() {
+    let ip = address.ip();
+    let broadcast = ip == std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST);
+    let scoped = matches!(address, SocketAddr::V6(value) if value.scope_id() != 0);
+    if address.port() == 0 || ip.is_unspecified() || ip.is_multicast() || broadcast || scoped {
         return Err(invalid_join_line());
     }
     Ok(())
