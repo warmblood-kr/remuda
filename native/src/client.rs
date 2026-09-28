@@ -228,24 +228,26 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     // child exits, but let that key release the attach and
                     // restore terminal modes instead of routing it to nowhere.
                     #[cfg(unix)]
-                    let post_exit_read = read_stdin_timeout(
-                        &mut stdin,
-                        &mut buf,
-                        std::time::Duration::from_secs(86_400),
-                    );
-                    #[cfg(unix)]
-                    match post_exit_read {
-                        Ok(Some(_)) => {
-                            if trace_attach_exit {
-                                eprintln!("attach input trace: post-exit forwarder read a key");
+                    {
+                        let post_exit_read = read_stdin_timeout(
+                            &mut stdin,
+                            &mut buf,
+                            std::time::Duration::from_secs(86_400),
+                        );
+                        match post_exit_read {
+                            Ok(Some(_)) => {
+                                if trace_attach_exit {
+                                    eprintln!("attach input trace: post-exit forwarder read a key");
+                                }
+                                break;
                             }
-                        }
-                        Ok(None) => continue,
-                        Err(error) => {
-                            if trace_attach_exit {
-                                eprintln!("attach input trace: post-exit read error: {error}");
+                            Ok(None) => continue,
+                            Err(error) => {
+                                if trace_attach_exit {
+                                    eprintln!("attach input trace: post-exit read error: {error}");
+                                }
+                                continue;
                             }
-                            continue;
                         }
                     }
                     #[cfg(windows)]
@@ -262,7 +264,6 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                         }
                         break;
                     }
-                    break;
                 }
                 let wait = parser
                     .timeout_remaining()
@@ -825,9 +826,9 @@ impl Drop for RawMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        interpret, reset_input_modes, trace_input_read, write_input_trace, RESET_INPUT_MODES,
-    };
+    #[cfg(unix)]
+    use super::trace_input_read;
+    use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
     use remuda_core::protocol::Response;
     use std::time::{Duration, UNIX_EPOCH};
 

@@ -715,7 +715,7 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         &path,
         &Request::New {
             name: Some("target".into()),
-            command: vec!["sh".into(), "-c".into(), "sleep 1".into()],
+            command: vec!["sh".into(), "-c".into(), "sleep 3".into()],
             size: Size::new(80, 24),
             cwd: None,
             env: None,
@@ -782,12 +782,15 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
     held.write_raw(b"k").expect("release attach with any key");
     let deadline = Instant::now() + PATIENCE;
     while viewer.is_alive() {
-        assert!(
-            Instant::now() < deadline,
-            "attach client did not exit after one key; terminal bytes:\n{}\nviewer screen:\n{}",
-            String::from_utf8_lossy(&viewer_output.try_iter().flatten().collect::<Vec<_>>()),
-            viewer.screen_text().expect("viewer screen on timeout"),
-        );
+        if Instant::now() >= deadline {
+            let output = viewer_output.try_iter().flatten().collect::<Vec<_>>();
+            let saw_dsr = output.windows(4).any(|window| window == b"\x1b[6n");
+            panic!(
+                "attach client did not exit after one key; saw ESC[6n DSR query: {saw_dsr}\nterminal bytes:\n{}\nviewer screen:\n{}",
+                String::from_utf8_lossy(&output),
+                viewer.screen_text().expect("viewer screen on timeout"),
+            );
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(
@@ -797,14 +800,17 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         "0"
     );
     #[cfg(unix)]
-    let _restored = collect_until_bytes(
+    let restored = collect_until_bytes(
         &viewer_output,
         b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
     );
+    #[cfg(windows)]
+    let restored = viewer_output.try_iter().flatten().collect::<Vec<_>>();
     if std::env::var_os("REMUDA_TRACE_ATTACH_EXIT").is_some() {
+        let saw_dsr = restored.windows(4).any(|window| window == b"\x1b[6n");
         eprintln!(
-            "attach input trace terminal bytes:\n{}\nviewer screen:\n{}",
-            String::from_utf8_lossy(&_restored),
+            "attach input trace terminal bytes (saw ESC[6n DSR query: {saw_dsr}):\n{}\nviewer screen:\n{}",
+            String::from_utf8_lossy(&restored),
             viewer
                 .screen_text()
                 .expect("viewer screen after attach exit"),
