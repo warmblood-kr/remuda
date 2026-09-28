@@ -496,7 +496,7 @@ fn failed_reload_does_not_duplicate_imperative_start_hooks_or_schedules() {
     read_value(&image, include_str!("api/v3.lua"));
     read_value(
         &image,
-        "schedule_count = 0; ping_count = 0; \
+        "schedule_count = 0; failed_schedule_count = 0; ping_count = 0; \
          remuda.on('scheduled', function() schedule_count = schedule_count + 1 end); \
          remuda.on('handled', function() ping_count = ping_count + 1 end)",
     );
@@ -510,7 +510,10 @@ fn failed_reload_does_not_duplicate_imperative_start_hooks_or_schedules() {
         &entry,
         r#"return { api = "remuda-module-v1", state_version = 1,
           initialize = function() return {} end,
-          start = function() error("replacement failed") end }"#,
+          start = function()
+            remuda.schedule({ every = 1, run = function() failed_schedule_count = failed_schedule_count + 1 end })
+            error("replacement failed")
+          end }"#,
     );
     for (index, now) in [101, 102].into_iter().enumerate() {
         assert!(image.eval("remuda.reload('sample')", None).is_err());
@@ -522,11 +525,54 @@ fn failed_reload_does_not_duplicate_imperative_start_hooks_or_schedules() {
             "one old schedule should run on each tick after rollback"
         );
         assert_eq!(
+            read_value(&image, "return failed_schedule_count"),
+            "0",
+            "an imperative schedule from a failed start must be cancelled"
+        );
+        assert_eq!(
             read_value(&image, "return ping_count"),
             (index + 1).to_string(),
             "one old id-less hook should run per event after rollback"
         );
     }
+}
+
+#[test]
+fn failed_initial_start_cancels_its_imperative_schedule() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let entry = home.entry();
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function()
+            remuda.schedule({ every = 1, run = function() end })
+            error("initial start failed")
+          end }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-initial-schedule-rollback.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    let error = image.eval("remuda.exec('sample')", None).unwrap_err();
+    assert!(error.contains("initial start failed"), "{error}");
+    assert_eq!(
+        read_value(
+            &image,
+            "local n = 0 for _ in pairs(remuda.schedules) do n = n + 1 end return tostring(n)"
+        ),
+        "0",
+        "a failed initial start must leave no imperative schedules behind"
+    );
 }
 
 #[test]
@@ -612,6 +658,61 @@ fn reloads_own_declared_schedules_and_exec_does_not_restart_an_active_mod() {
         "11:1"
     );
     assert_eq!(read_value(&image, schedules), "1");
+}
+
+#[test]
+fn declared_schedule_after_controls_its_first_fire() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return { ticks = 0 } end,
+          schedules = {{ every = 10, after = 5, run = function(state)
+            state.ticks = state.ticks + 1
+          end }},
+          tools = {{ name = "sample_ticks",
+            about = "Read the declared schedule tick count.",
+            run = function(state) return tostring(state.ticks) end }},
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-declared-after.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(
+        &image,
+        "remuda._run_due_schedules(100); remuda.exec('sample')",
+    );
+    read_value(&image, "remuda._run_due_schedules(100)");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_ticks()"),
+        "0"
+    );
+    read_value(&image, "remuda._run_due_schedules(104.9)");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_ticks()"),
+        "0"
+    );
+    read_value(&image, "remuda._run_due_schedules(105)");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_ticks()"),
+        "1"
+    );
+    read_value(&image, "remuda._run_due_schedules(115)");
+    assert_eq!(
+        read_value(&image, "return remuda.tools.sample_ticks()"),
+        "2"
+    );
 }
 
 // #129: a reload whose start() fails must leave the previous activation's

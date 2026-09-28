@@ -11,6 +11,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,6 +21,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: cargo test --workspace --all-targets --no-fail-fast
+
+  test-aarch64-linux:
+    # The owner runs remuda on Termux (aarch64 Android). Nothing else here
+    # builds for aarch64 Linux, so arch-specific breakage (ring's asm, pty
+    # ioctls, atomics) would first show up on the phone. Same arch and kernel
+    # as Termux; bionic libc is still untested.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - run: command -v cargo || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; }
       - run: cargo test --workspace --all-targets --no-fail-fast
 
   test-windows:
