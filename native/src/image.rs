@@ -546,6 +546,35 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_contribution_owned_by_another_mod_is_refused() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            local function with(id)
+              return { api = "remuda-module-v1", state_version = 1,
+                initialize = function() return {} end,
+                contributes = { ["host.command"] = {{ id = id, label = "mine" }} } }
+            end
+            assert(remuda._activate_module("alpha", with("shared")))
+            local ok, err = pcall(remuda._activate_module, "beta", with("shared"))
+            assert(not ok, "a cross-mod replace must be refused")
+            err = tostring(err)
+            for _, part in ipairs({ "alpha", "beta", "host.command/shared" }) do
+              assert(err:find(part, 1, true), "error must name " .. part .. ": " .. err)
+            end
+            local list = remuda.contributions("host.command")
+            assert(#list == 1 and list[1].owner == "alpha", "the owner's entry is untouched")
+            assert(remuda._activate_module("alpha", with("shared")), "the owner may still reload it")
+            remuda.contribute("host.command", "shared", { label = "imperative" })
+            assert(remuda.contributions("host.command")[1].entry.label == "imperative",
+              "imperative calls stay last-writer-wins until owner-by-extent")
+            "#,
+        )
+        .exec()
+        .expect("cross-mod contribution refusal");
+    }
+
+    #[test]
     fn a_cycle_terminates() {
         assert_eq!(
             shown("(function() local t = {} t.self = t return t end)()"),
