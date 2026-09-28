@@ -579,6 +579,13 @@ fn handle(
             })
         }
 
+        Request::Input { name, lines } => {
+            let text = lines.join("\n");
+            respond(&stream, &name, registry.send_line(&name, &text), |()| {
+                Response::Ok
+            })
+        }
+
         Request::Send { name, bytes } => {
             respond(&stream, &name, registry.send(&name, &bytes), |()| {
                 Response::Ok

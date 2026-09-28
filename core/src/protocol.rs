@@ -40,6 +40,10 @@ pub enum Request {
     /// Deliver one instruction as an indivisible act. An attached terminal is
     /// a viewer, not a delivery lock.
     SendLine { name: String, text: String },
+    /// Submit a whole user-authored line as one indivisible input batch.
+    /// Unlike raw `Send`/`Feed`, this is the only input primitive exposed by
+    /// the restricted remote front.
+    Input { name: String, lines: Vec<String> },
     /// Deliver a burst of input bytes as an indivisible act, appending nothing —
     /// the primitive [`Request::SendLine`] is made of. Indivisible is the
     /// load-bearing word; an attached terminal does not block it.
