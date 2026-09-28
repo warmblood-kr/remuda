@@ -168,6 +168,7 @@ register(
 
 local Schedule = {}
 Schedule.__index = Schedule
+local schedule_clock_now = 0
 
 -- Schedules are multi-registrant, using the same split as `remuda.tool`:
 -- native code provides the fixed tick while this table owns the interval and
@@ -184,21 +185,28 @@ function remuda.schedule(spec)
   if type(spec.every) ~= "number" or spec.every <= 0 then
     error("a schedule needs a positive `every` (seconds)", 2)
   end
+  if spec.after ~= nil and (type(spec.after) ~= "number" or spec.after < 0
+    or spec.after ~= spec.after or spec.after == math.huge) then
+    error("a schedule's `after`, when given, must be a finite non-negative number of seconds", 2)
+  end
   if type(spec.run) ~= "function" then
     error("a schedule needs a `run` function", 2)
   end
   local owner = current_owner
   local handle = setmetatable({ name = spec.name }, Schedule)
+  -- With no `after`, last_run=0 preserves the daemon-uptime-dependent first
+  -- firing. An explicit delay instead anchors the first deadline at creation.
+  local last_run = spec.after == nil and 0 or schedule_clock_now + spec.after - spec.every
   remuda.schedules[handle] = {
     name = spec.name,
     every = spec.every,
     run = owner and function(...) return with_owner(owner, spec.run, ...) end or spec.run,
-    last_run = 0,
+    last_run = last_run,
     owner = owner,
   }
   return handle
 end
-register("schedule", "Register a periodic callback, run every `every` seconds.", "schedule(spec) -> handle")
+register("schedule", "Register a periodic callback, run every `every` seconds; optional `after` sets the first firing delay from creation. Without it, the first firing depends on daemon uptime.", "schedule(spec) -> handle")
 
 -- A no-op on an already-cancelled or unrecognized handle — a caller racing
 -- its own cancel, or cancelling twice, gets silence rather than an error for
@@ -384,13 +392,17 @@ register("expect_option", "Pick a unique numbered menu option by its label.", "e
 -- clock). Fires every schedule whose own interval has elapsed since ITS OWN
 -- last run — native never sees or compares an individual interval itself.
 function remuda._run_due_schedules(now)
+  local schedule_now = now or expect_clock_now or schedule_clock_now
+  schedule_clock_now = schedule_now
   -- Expectations are advanced from the same native one-second clock. A
   -- future PTY output event may call this local directly to reduce latency.
+  -- Preserve expectation-specific injected clocks: nil here lets each
+  -- expectation's options.now() supply its own time, while schedule_now is
+  -- the fallback clock only for periodic schedules.
   local expect_ok, expect_err = pcall(expect_tick, now)
   if not expect_ok and io and io.stderr then
     io.stderr:write("remuda.expect tick failed: " .. tostring(expect_err) .. "\n")
   end
-  local schedule_now = now or expect_clock_now or 0
   -- Snapshot the handles, as `emit` does: a run() that schedules must not add
   -- keys mid-`pairs` (undefined in Lua). A cancel mid-tick still takes effect.
   local handles = {}
@@ -1015,8 +1027,10 @@ function remuda._activate_module(name, candidate, reactivate)
     local schedule = schedules[index]
     if type(schedule) ~= "table" or type(schedule.every) ~= "number" or schedule.every <= 0
       or type(schedule.run) ~= "function"
+      or (schedule.after ~= nil and (type(schedule.after) ~= "number" or schedule.after < 0
+        or schedule.after ~= schedule.after or schedule.after == math.huge))
       or (schedule.name ~= nil and (type(schedule.name) ~= "string" or schedule.name == "")) then
-      error("each module schedule needs a positive every, a run function, and an optional non-empty name", 0)
+      error("each module schedule needs a positive every, a run function, an optional finite non-negative after, and an optional non-empty name", 0)
     end
   end
 
@@ -1211,6 +1225,7 @@ function remuda._activate_module(name, candidate, reactivate)
     schedule_handles[index] = with_owner(name, remuda.schedule, {
       name = declared.name,
       every = declared.every,
+      after = declared.after,
       run = function() return with_owner(name, declared.run, state) end,
     })
   end

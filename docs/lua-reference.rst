@@ -274,7 +274,7 @@ request_counts
 schedule
 --------
 
-``schedule(spec) -> handle`` — Register a periodic callback, run every `every` seconds.
+``schedule(spec) -> handle`` — Register a periodic callback, run every `every` seconds; optional `after` sets the first firing delay from creation. Without it, the first firing depends on daemon uptime.
 
 schedule_fires
 --------------
