@@ -405,6 +405,16 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
         let _ = stdout.flush();
         Left::Exited
     };
+    #[cfg(windows)]
+    if taken_over {
+        // ConPTY stdin may be blocked in a synchronous console read. Once the
+        // takeover outcome is known, returning lets the CLI exit and Windows
+        // tear down that worker instead of waiting forever in `join`.
+        drop(keys);
+    } else {
+        let _ = keys.join();
+    }
+    #[cfg(unix)]
     let _ = keys.join();
     Ok(left)
 }
