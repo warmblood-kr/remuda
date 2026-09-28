@@ -58,6 +58,102 @@ fn daemon_at(path: &Path) -> impl Drop {
     Cleanup(path.to_path_buf())
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_lock_file_is_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("daemon-lock-mode");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    let lock = socket.with_extension("sock.lock");
+    let metadata = std::fs::metadata(&lock).expect("daemon lock file exists");
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        client::request(&socket, &Request::Shutdown).expect("request shutdown"),
+        Response::Ok
+    );
+    assert!(
+        daemon.left_on_its_own(),
+        "daemon exits after shutdown request"
+    );
+    assert!(!socket.exists(), "owned socket removed after shutdown");
+    let metadata = std::fs::metadata(&lock).expect("lock inode remains for waiters");
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_signal_cleanup_preserves_a_replacement_socket_path() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let dir = scratch_dir("daemon-socket-owner");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    assert!(std::fs::symlink_metadata(&socket)
+        .expect("bound socket exists")
+        .file_type()
+        .is_socket());
+
+    std::fs::remove_file(&socket).expect("remove the daemon's socket entry");
+    std::fs::write(&socket, b"replacement owned by another process")
+        .expect("install replacement at the old socket path");
+    let signalled = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(signalled, 0, "send SIGTERM to daemon");
+    assert!(daemon.left_on_its_own(), "daemon handles SIGTERM cleanly");
+    assert_eq!(
+        std::fs::read(&socket).expect("replacement remains after cleanup"),
+        b"replacement owned by another process"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_daemon_starts_serialize_stale_socket_replacement() {
+    let dir = scratch_dir("daemon-start-lock");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let stale = ipc::listen(&socket).expect("create stale socket entry");
+    drop(stale);
+
+    let first = spawn::base_command(&dir)
+        .spawn()
+        .expect("spawn first daemon");
+    let second = spawn::base_command(&dir)
+        .spawn()
+        .expect("spawn second daemon");
+    let mut first = Daemon(first);
+    let mut second = Daemon(second);
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let serving = ipc::connect(&socket).is_ok();
+        let first_done = first.0.try_wait().expect("poll first daemon");
+        let second_done = second.0.try_wait().expect("poll second daemon");
+        if serving && (first_done.is_some() ^ second_done.is_some()) {
+            let Some(loser) = first_done.or(second_done) else {
+                unreachable!("exactly one daemon exited")
+            };
+            assert!(!loser.success(), "only one daemon can own the endpoint");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "daemon startup race did not settle"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert_eq!(
+        client::request(&socket, &Request::Shutdown).expect("stop winning daemon"),
+        Response::Ok
+    );
+    let first_exited = first.left_on_its_own();
+    let second_exited = second.left_on_its_own();
+    assert!(
+        first_exited ^ second_exited,
+        "one daemon exits successfully"
+    );
+}
+
 struct Cleanup(PathBuf);
 impl Drop for Cleanup {
     fn drop(&mut self) {
