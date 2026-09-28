@@ -28,7 +28,12 @@ use std::time::{Duration, Instant};
 const PATIENCE: Duration = Duration::from_secs(10);
 
 fn scratch_dir(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("remuda-race-{}-{tag}", std::process::id()));
+    let root = if cfg!(unix) {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let dir = root.join(format!("rr{}-{tag}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     dir
 }

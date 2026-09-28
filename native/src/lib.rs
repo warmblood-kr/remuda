@@ -16,6 +16,7 @@ pub mod mouse;
 pub mod packages;
 pub mod process;
 pub mod pty;
+pub mod remote_front;
 pub mod script;
 pub mod tick;
 pub mod tui;

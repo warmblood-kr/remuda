@@ -16,10 +16,11 @@ use crate::image::Image;
 use crate::ipc::{self, Listener, Stream, TryClone};
 use crate::pty::PtyAgent;
 use interprocess::local_socket::traits::ListenerExt;
-use remuda_core::agent::{Cursor, Result as AgentResult};
+use remuda_core::agent::Result as AgentResult;
 use remuda_core::protocol::{collapse_runs, Request, Response};
 use remuda_core::{Clock, Registry, Session, Size};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::collections::HashMap;
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -463,43 +464,26 @@ fn capture_styled(
     name: &str,
     scrollback: usize,
 ) -> std::io::Result<()> {
-    match registry.screen_cells_at(name, scrollback) {
+    match registry.screen_snapshot_at(name, scrollback) {
         None => reply(stream, &Response::error(format!("no such session: {name}"))),
         Some(Err(e)) => reply(stream, &Response::error(e)),
-        Some(Ok(cells)) => {
+        Some(Ok(snapshot)) => {
             // Runs on the wire, not cells — see steps/022 for the 44x+
-            // measured on a real screen.
-            let rows = cells.iter().map(|row| collapse_runs(row)).collect();
-            let wrapped = registry
-                .row_wrapped_at(name, scrollback)
-                .and_then(Result::ok)
-                .unwrap_or_default();
-            // The session existed a line above (`screen_cells` answered),
-            // so this only fails on a poisoned lock — hide rather than
-            // guess a position. See steps/027.
-            let cursor = registry
-                .cursor(name)
-                .and_then(Result::ok)
-                .unwrap_or(Cursor {
-                    row: 0,
-                    col: 0,
-                    visible: false,
-                });
-            let cursor = if scrollback == 0 {
-                cursor
-            } else {
-                Cursor {
-                    row: 0,
-                    col: 0,
-                    visible: false,
-                }
-            };
+            // measured on a real screen. Cells, counters and cursor all come
+            // from one parser snapshot, so new output cannot skew the anchor.
+            let rows = snapshot
+                .cells
+                .iter()
+                .map(|row| collapse_runs(row))
+                .collect();
             reply(
                 stream,
                 &Response::StyledScreen {
                     rows,
-                    wrapped,
-                    cursor,
+                    wrapped: snapshot.wrapped,
+                    scrollback_len: snapshot.scrollback_len,
+                    scrollback_total: snapshot.scrollback_total,
+                    cursor: snapshot.cursor,
                 },
             )
         }
@@ -514,14 +498,8 @@ fn handle(
     socket_owner: Arc<SocketOwnership>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
+    let Some(request) = read_request(&stream, &mut reader)? else {
         return Ok(());
-    }
-
-    let request: Request = match serde_json::from_str(&line) {
-        Ok(request) => request,
-        Err(e) => return reply(&stream, &Response::error(format!("bad request: {e}"))),
     };
 
     record_request(counters, &request);
@@ -541,11 +519,8 @@ fn handle(
 
         // Answer before going. A client left guessing from a hung-up socket
         // cannot tell "it stopped" from "it never heard me".
-        Request::Shutdown => {
-            reply(&stream, &Response::Ok)?;
-            reap_processes_before_exit(image);
-            socket_owner.cleanup();
-            std::process::exit(0);
+        request @ Request::Shutdown { .. } => {
+            handle_shutdown(stream, registry, image, socket_owner, request)
         }
 
         Request::New {
@@ -554,30 +529,15 @@ fn handle(
             size,
             cwd,
             env,
-        } => {
-            let name = match name {
-                Some(given) => given,
-                None => registry.unique_name(&remuda_core::registry::slug(
-                    command
-                        .first()
-                        .map_or_else(default_shell, String::clone)
-                        .as_str(),
-                )),
-            };
-            match spawn(&name, &command, size, cwd.as_deref(), env.as_ref()) {
-                Err(e) => reply(&stream, &Response::error(e)),
-                Ok(session) => match registry.register(session) {
-                    Ok(_) => reply(&stream, &Response::Value(name)),
-                    Err(_) => reply(&stream, &Response::error(format!("name taken: {name}"))),
-                },
-            }
-        }
+        } => handle_new(stream, registry, name, command, size, cwd, env),
 
         Request::SendLine { name, text } => {
             respond(&stream, &name, registry.send_line(&name, &text), |()| {
                 Response::Ok
             })
         }
+
+        Request::Input { name, bytes } => input(&stream, registry, &name, &bytes),
 
         Request::Send { name, bytes } => {
             respond(&stream, &name, registry.send(&name, &bytes), |()| {
@@ -639,6 +599,106 @@ fn handle(
     }
 }
 
+fn handle_shutdown(
+    stream: Stream,
+    registry: &Registry,
+    image: &Image,
+    socket_owner: Arc<SocketOwnership>,
+    request: Request,
+) -> std::io::Result<()> {
+    let Request::Shutdown {
+        requester_daemon_id,
+        requester_session_id,
+        requester_session_name,
+        override_hosted,
+    } = request
+    else {
+        unreachable!("handle_shutdown only accepts Shutdown requests");
+    };
+    let own_daemon_id = std::process::id().to_string();
+    let known_session_name = requester_session_id
+        .as_deref()
+        .and_then(|id| registry.name_for_id(id));
+    let caller_claims_this_daemon = requester_daemon_id.as_deref() == Some(own_daemon_id.as_str())
+        && (requester_session_id.is_some() || requester_session_name.is_some());
+    if !override_hosted && (known_session_name.is_some() || caller_claims_this_daemon) {
+        let identity = known_session_name
+            .or(requester_session_name)
+            .or(requester_session_id)
+            .unwrap_or_else(|| "unknown".into());
+        return reply(
+            &stream,
+            &Response::error(format!(
+                "cannot stop this daemon from one of its own sessions ({identity}); pass --i-am-inside to override"
+            )),
+        );
+    }
+    reply(&stream, &Response::Ok)?;
+    reap_processes_before_exit(image);
+    socket_owner.cleanup();
+    std::process::exit(0);
+}
+
+fn handle_new(
+    stream: Stream,
+    registry: &Registry,
+    name: Option<String>,
+    command: Vec<String>,
+    size: Size,
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
+) -> std::io::Result<()> {
+    let name = match name {
+        Some(given) => given,
+        None => registry.unique_name(&remuda_core::registry::slug(
+            command
+                .first()
+                .map_or_else(default_shell, String::clone)
+                .as_str(),
+        )),
+    };
+    let mut session_env = env.unwrap_or_default();
+    let session_id = Session::new_id();
+    session_env.insert("REMUDA_DAEMON_ID".into(), std::process::id().to_string());
+    session_env.insert("REMUDA_SESSION_ID".into(), session_id.clone());
+    session_env.insert("REMUDA_SESSION_NAME".into(), name.clone());
+    match spawn(
+        &name,
+        &session_id,
+        &command,
+        size,
+        cwd.as_deref(),
+        Some(&session_env),
+    ) {
+        Err(e) => reply(&stream, &Response::error(e)),
+        Ok(session) => match registry.register(session) {
+            Ok(_) => reply(&stream, &Response::Value(name)),
+            Err(_) => reply(&stream, &Response::error(format!("name taken: {name}"))),
+        },
+    }
+}
+
+fn read_request(
+    stream: &Stream,
+    reader: &mut impl std::io::BufRead,
+) -> std::io::Result<Option<Request>> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    match serde_json::from_str(&line) {
+        Ok(request) => Ok(Some(request)),
+        Err(error) => {
+            reply(stream, &Response::error(format!("bad request: {error}")))?;
+            Ok(None)
+        }
+    }
+}
+
+fn input(stream: &Stream, registry: &Registry, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    respond(stream, name, registry.send(name, bytes), |()| Response::Ok)
+}
+
 fn mouse_state(stream: &Stream, registry: &Registry, name: &str) -> std::io::Result<()> {
     respond(
         stream,
@@ -694,6 +754,7 @@ fn remove_dir_all(path: &str) -> Response {
 
 fn spawn(
     name: &str,
+    session_id: &str,
     command: &[String],
     size: Size,
     cwd: Option<&str>,
@@ -728,8 +789,9 @@ fn spawn(
     }
 
     let agent = PtyAgent::spawn(builder, size).map_err(|e| e.to_string())?;
-    Ok(Session::new(
+    Ok(Session::new_with_id(
         name,
+        session_id,
         Box::new(agent),
         Arc::new(SystemClock::new()),
     ))

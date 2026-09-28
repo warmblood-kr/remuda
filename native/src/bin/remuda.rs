@@ -204,8 +204,10 @@ remuda — a pty manager you can attach to
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
   remuda upgrade [--channel C]  re-run the installer on stable or nightly
-  remuda stop [-f]              stop the daemon; the next command starts a fresh
-                                  one. Its sessions and Lua image die with it,
+  remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon; the next command
+                                  starts a fresh one. A hosted session needs the
+                                  explicit --i-am-inside override.
+                                  Its sessions and Lua image die with it,
                                   so a live herd is named and confirmed first.
   remuda --version              the version this binary was built with
 
@@ -258,7 +260,7 @@ remuda — terminal orchestration for coding agents
                                  Ctrl-] toggles mouse; wheel scrolls history
                                  --mouse=false disables mouse handling (before or after NAME)
   remuda ls | send NAME TEXT     inspect or message sessions
-  remuda stop [-f]               stop the daemon (sessions are lost)
+  remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon (sessions are lost)
 
   remuda mod install OWNER/REPO  install a mod from GitHub
   remuda mod list | info NAME    inspect installed mods
@@ -368,21 +370,33 @@ fn fate(path: &Path, name: &str) -> String {
 /// binary but cannot touch a daemon already running — this is the verb that
 /// closes that gap.
 fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
-    let force = match args {
-        [] => false,
-        ["-f"] | ["--force"] => true,
-        _ => return fail("usage: remuda stop [-f]"),
-    };
+    let mut force = false;
+    let mut yes = false;
+    let mut inside_override = false;
+    for arg in args {
+        match *arg {
+            "-f" | "--force" if !force => force = true,
+            "--yes" if !yes => yes = true,
+            "--i-am-inside" if !inside_override => inside_override = true,
+            _ => return fail("usage: remuda stop [-f] [--yes]"),
+        }
+    }
     if remuda_native::ipc::connect(path).is_err() {
         eprintln!("remuda: no daemon running for {server:?} — the next command starts one");
         return ExitCode::SUCCESS;
     }
-    if !force {
+    if !yes && !force && has_sessions(path) {
         if let Err(refusal) = confirm_losses(path) {
             return fail(refusal);
         }
     }
-    match stop_daemon(path) {
+    let shutdown = Request::Shutdown {
+        requester_daemon_id: std::env::var("REMUDA_DAEMON_ID").ok(),
+        requester_session_id: std::env::var("REMUDA_SESSION_ID").ok(),
+        requester_session_name: std::env::var("REMUDA_SESSION_NAME").ok(),
+        override_hosted: inside_override,
+    };
+    match stop_daemon(path, shutdown) {
         Ok(()) => {
             eprintln!(
                 "remuda: stopped the daemon for {server:?} — the next command starts a fresh one"
@@ -391,6 +405,11 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         }
         Err(e) => fail(e),
     }
+}
+
+fn has_sessions(path: &Path) -> bool {
+    matches!(remuda_native::client::request(path, &Request::List),
+        Ok(Response::Sessions(sessions)) if !sessions.is_empty())
 }
 
 /// Name what dies before it dies. Killing the daemon takes every session's
@@ -418,7 +437,7 @@ fn confirm_losses(path: &Path) -> Result<(), String> {
     );
     eprintln!("remuda: their processes, their last screens and the Lua image are all lost.");
     if !std::io::stdin().is_terminal() {
-        return Err("nothing to ask on — `remuda stop -f` if that is what you want".into());
+        return Err("nothing to ask on — `remuda stop -f --yes` if that is what you want".into());
     }
     eprint!("remuda: type y to go ahead: ");
     let mut answer = String::new();
@@ -431,19 +450,13 @@ fn confirm_losses(path: &Path) -> Result<(), String> {
     }
 }
 
-/// `Shutdown` is the door. A daemon built before that variant existed refuses
-/// it, and its Lua image is the only lever those already-deployed ones leave —
-/// `os.exit` there ends the same process. Drop the fallback after one release.
-fn stop_daemon(path: &Path) -> Result<(), String> {
-    let asked = remuda_native::client::request(path, &Request::Shutdown);
-    if !matches!(asked, Ok(Response::Ok)) {
-        let _ = remuda_native::client::request(
-            path,
-            &Request::Eval {
-                code: "os.exit(0)".into(),
-                name: None,
-            },
-        );
+fn stop_daemon(path: &Path, shutdown: Request) -> Result<(), String> {
+    let asked = remuda_native::client::request(path, &shutdown);
+    if !matches!(&asked, Ok(Response::Ok)) {
+        return Err(match asked {
+            Ok(Response::Error(reason)) => reason,
+            other => format!("daemon refused shutdown: {}", describe(other)),
+        });
     }
     // The socket file outlives the process on unix, so "gone" is a connect that
     // is refused, never a path that disappeared. `ipc::listen` clears the file.
