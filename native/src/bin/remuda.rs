@@ -233,7 +233,7 @@ the shell's own quoting, or renders for a human in a way the image cannot.
 `new`, `close`, `capture`, `insert`, `key` and `click` are all still there —
 in Lua, where they cost no front page:
 
-  remuda -e 'remuda.close(\"build\")'
+  remuda -e 'remuda.session.close(\"build\")'
 
 Installs follow a channel — `stable` (release tags) or `nightly` (every commit
 on main) — recorded at $XDG_DATA_HOME/remuda/channel by the install script.
@@ -260,9 +260,9 @@ disconnecting a human.
 
 In a script they live on one table, and a refusal is raised, not returned:
 
-  remuda.new(\"build\", {\"make\", \"-j4\"})
+  remuda.session.new(\"build\", {\"make\", \"-j4\"})
   while not remuda.capture(\"build\"):find(\"$ \") do remuda.sleep(0.2) end
-  remuda.close(\"build\")
+  remuda.session.close(\"build\")
 
 `mcp` is for a program running inside a session to reach the manager holding
 it — a client spawns it and owns both pipes, so there is nothing to type here.
@@ -1204,6 +1204,25 @@ fn eval_once(path: &Path, code: &str) -> ExitCode {
                 println!("{value}");
             }
             ExitCode::SUCCESS
+        }
+        Ok(Response::CommandResult {
+            exit_code,
+            stdout_base64,
+            stderr_base64,
+        }) => {
+            use std::io::Write;
+            let (Ok(stdout), Ok(stderr)) = (
+                remuda_native::cluster::encoding::decode_base64(&stdout_base64),
+                remuda_native::cluster::encoding::decode_base64(&stderr_base64),
+            ) else {
+                return fail("invalid deferred command output encoding");
+            };
+            let mut out = std::io::stdout().lock();
+            let mut err = std::io::stderr().lock();
+            if out.write_all(&stdout).is_err() || err.write_all(&stderr).is_err() {
+                return fail("could not write deferred command output");
+            }
+            ExitCode::from(exit_code)
         }
         other => fail(describe(other)),
     }

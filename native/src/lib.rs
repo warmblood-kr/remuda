@@ -18,6 +18,7 @@ pub mod mouse;
 #[allow(clippy::disallowed_types)]
 pub mod net;
 pub mod packages;
+pub mod pending;
 pub mod process;
 mod process_ancestry;
 pub mod pty;

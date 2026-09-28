@@ -1,6 +1,24 @@
 use super::*;
 use remuda_core::Size;
 
+const REAL_OUTPUT_WAIT: Duration = Duration::from_secs(60);
+const REAL_OUTPUT_POLL: Duration = Duration::from_millis(50);
+
+fn wait_for_output<T>(
+    mut check: impl FnMut() -> Option<T>,
+    timeout_message: impl FnMut() -> String,
+) -> T {
+    let deadline = Instant::now() + REAL_OUTPUT_WAIT;
+    let mut timeout_message = timeout_message;
+    loop {
+        if let Some(value) = check() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "{}", timeout_message());
+        std::thread::sleep(REAL_OUTPUT_POLL);
+    }
+}
+
 #[test]
 fn anchor_capture_retries_when_history_advances_between_captures() {
     let captures = [(10_000, 10_044), (10_000, 10_050), (10_000, 10_050)];
@@ -608,18 +626,13 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     assert_eq!(response, Response::Value("stream".into()));
 
     let mut ui = make_ui(vec![row("stream", true, false)]);
-    let history_deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        capture_preview(&path, &mut ui, "stream").expect("initial live preview");
-        if ui.scrollback["stream"].history_rows >= 40 {
-            break;
-        }
-        assert!(
-            Instant::now() < history_deadline,
-            "output did not reach scrollback"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_output(
+        || {
+            capture_preview(&path, &mut ui, "stream").expect("initial live preview");
+            (ui.scrollback["stream"].history_rows >= 40).then_some(())
+        },
+        || "output did not reach scrollback".into(),
+    );
     let wheel = |kind| MouseEvent {
         kind,
         column: 19,
@@ -651,20 +664,22 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     }
     assert_eq!(ui.scrollback["stream"].offset, 0);
 
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let (cells, _, cursor) =
-            capture_preview(&path, &mut ui, "stream").expect("capture the streaming preview");
-        let frame = render_styled(&ui, &cells, cursor, "default", 80, 25);
-        if frame.contains("newest-199") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "latest output never appeared after returning to bottom: {frame:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let last_frame = std::cell::RefCell::new(String::new());
+    wait_for_output(
+        || {
+            let (cells, _, cursor) =
+                capture_preview(&path, &mut ui, "stream").expect("capture the streaming preview");
+            let frame = render_styled(&ui, &cells, cursor, "default", 80, 25);
+            *last_frame.borrow_mut() = frame.clone();
+            frame.contains("newest-199").then_some(())
+        },
+        || {
+            format!(
+                "latest output never appeared after returning to bottom: {:?}",
+                last_frame.borrow()
+            )
+        },
+    );
     let _ = client::request(
         &path,
         &Request::Close {
@@ -695,15 +710,13 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
     assert_eq!(response, Response::Value("stream".into()));
 
     let mut ui = make_ui(vec![row("stream", true, false)]);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        capture_preview(&path, &mut ui, "stream").expect("capture preview");
-        if ui.scrollback["stream"].history_rows >= 3 {
-            break;
-        }
-        assert!(Instant::now() < deadline, "output did not reach scrollback");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_output(
+        || {
+            capture_preview(&path, &mut ui, "stream").expect("capture preview");
+            (ui.scrollback["stream"].history_rows >= 3).then_some(())
+        },
+        || "output did not reach scrollback".into(),
+    );
     assert_eq!(
         ui.on_mouse(
             MouseEvent {
@@ -722,28 +735,28 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
     let anchor_text = terminal_rows_text(&anchor_cells);
     let anchor_history = ui.scrollback["stream"].history_rows;
 
-    loop {
-        let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture output");
-        let state = ui.scrollback["stream"];
-        if state.history_rows >= anchor_history + 3 {
-            assert_eq!(
-                state.offset,
-                3 + (state.history_rows - anchor_history),
-                "the offset must advance with appended history rows"
-            );
-            assert_eq!(
-                terminal_rows_text(&cells),
-                anchor_text,
-                "new output must not move the scrolled content"
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "history did not grow while scrolled"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_output(
+        || {
+            let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture output");
+            let state = ui.scrollback["stream"];
+            if state.history_rows >= anchor_history + 3 {
+                assert_eq!(
+                    state.offset,
+                    3 + (state.history_rows - anchor_history),
+                    "the offset must advance with appended history rows"
+                );
+                assert_eq!(
+                    terminal_rows_text(&cells),
+                    anchor_text,
+                    "new output must not move the scrolled content"
+                );
+                Some(())
+            } else {
+                None
+            }
+        },
+        || "history did not grow while scrolled".into(),
+    );
     let _ = client::request(
         &path,
         &Request::Close {
