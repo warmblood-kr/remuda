@@ -19,7 +19,7 @@
 //! transport. Adding those here would put a socket in the policy layer, which
 //! `core/clippy.toml` denies outright.
 
-use crate::agent::{Cursor, Result, Size, StyledCell};
+use crate::agent::{Cursor, Result, ScreenSnapshot, Size, StyledCell};
 use crate::protocol::Step;
 use crate::session::Session;
 use core::time::Duration;
@@ -31,6 +31,9 @@ use std::sync::{Arc, Mutex};
 /// registry — the caller may be a viewer on another machine.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SessionSummary {
+    /// Stable identity for this daemon lifetime; unlike `name`, it is never reused.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     pub alive: bool,
     /// Time since the last accepted input; unchanged by agent output.
@@ -122,6 +125,14 @@ impl Registry {
         self.lock().get(name).map(Arc::clone)
     }
 
+    /// Look up a tracked session identity without reaping exited sessions.
+    pub fn name_for_id(&self, id: &str) -> Option<String> {
+        self.lock()
+            .values()
+            .find(|session| session.id() == id)
+            .map(|session| session.name().to_string())
+    }
+
     /// A snapshot of every session, sorted by name so callers can diff two
     /// listings without sorting first.
     pub fn list(&self) -> Vec<SessionSummary> {
@@ -129,6 +140,7 @@ impl Registry {
             .lock()
             .values()
             .map(|s| SessionSummary {
+                id: s.id().to_string(),
                 name: s.name().to_string(),
                 alive: s.is_alive(),
                 idle: s.idle_for(),
@@ -209,8 +221,24 @@ impl Registry {
         self.get(name).map(|s| s.screen_cells_at(scrollback))
     }
 
+    pub fn scrollback_len(&self, name: &str) -> Option<usize> {
+        self.get(name).map(|s| s.scrollback_len())
+    }
+
+    pub fn scrollback_total(&self, name: &str) -> Option<usize> {
+        self.get(name).map(|s| s.scrollback_total())
+    }
+
     pub fn row_wrapped_at(&self, name: &str, scrollback: usize) -> Option<Result<Vec<bool>>> {
         self.get(name).map(|s| s.row_wrapped_at(scrollback))
+    }
+
+    pub fn screen_snapshot_at(
+        &self,
+        name: &str,
+        scrollback: usize,
+    ) -> Option<Result<ScreenSnapshot>> {
+        self.get(name).map(|s| s.screen_snapshot_at(scrollback))
     }
 
     pub fn cursor(&self, name: &str) -> Option<Result<Cursor>> {

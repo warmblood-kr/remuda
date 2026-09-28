@@ -29,6 +29,36 @@ use spawn::Daemon;
 #[path = "daemon_support/conpty.rs"]
 mod conpty;
 
+#[cfg(windows)]
+struct AttachedInputWriter<'a, 'session>(&'a remuda_core::session::Attached<'session>);
+
+#[cfg(windows)]
+impl std::io::Write for AttachedInputWriter<'_, '_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .write_raw(bytes)
+            .map(|()| bytes.len())
+            .map_err(|_| std::io::Error::other("ConPTY input write failed"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn answer_pending_conpty_queries(
+    receiver: &Receiver<Vec<u8>>,
+    writer: &mut impl std::io::Write,
+    pending: &mut Vec<u8>,
+    captured: &mut Vec<u8>,
+) {
+    for chunk in receiver.try_iter() {
+        conpty::answer_conpty_cursor_queries(writer, pending, &chunk);
+        captured.extend_from_slice(&chunk);
+    }
+}
+
 /// A runtime directory of our own. Short enough for `sun_path` (~108 bytes) —
 /// a long path fails at bind with a message no caller would guess from a
 /// timeout, which is what the binary's startup-error handling exists for.
@@ -73,7 +103,16 @@ fn daemon_lock_file_is_private() {
     let metadata = std::fs::metadata(&lock).expect("daemon lock file exists");
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     assert_eq!(
-        client::request(&socket, &Request::Shutdown).expect("request shutdown"),
+        client::request(
+            &socket,
+            &Request::Shutdown {
+                requester_daemon_id: None,
+                requester_session_id: None,
+                requester_session_name: None,
+                override_hosted: false,
+            },
+        )
+        .expect("request shutdown"),
         Response::Ok
     );
     assert!(
@@ -146,7 +185,16 @@ fn concurrent_daemon_starts_serialize_stale_socket_replacement() {
     }
 
     assert_eq!(
-        client::request(&socket, &Request::Shutdown).expect("stop winning daemon"),
+        client::request(
+            &socket,
+            &Request::Shutdown {
+                requester_daemon_id: None,
+                requester_session_id: None,
+                requester_session_name: None,
+                override_hosted: false,
+            },
+        )
+        .expect("stop winning daemon"),
         Response::Ok
     );
     let first_exited = first.left_on_its_own();
@@ -807,19 +855,27 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     }
 }
 
-// Unix-only until #185: on Windows the key injected through ConPTY after the
-// attached session exits never reaches the client (CI trace, run 36424446857).
-#[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn any_key_after_attached_session_exit_restores_the_terminal() {
     let dir = scratch_dir("attach-exit-any-key");
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
+    #[cfg(unix)]
+    let target_command = vec!["sh".into(), "-c".into(), "sleep 3".into()];
+    #[cfg(windows)]
+    let target_command = vec![
+        "powershell.exe".into(),
+        "-NoLogo".into(),
+        "-NoProfile".into(),
+        "-Command".into(),
+        "Start-Sleep -Seconds 3".into(),
+    ];
     let created = client::request(
         &path,
         &Request::New {
             name: Some("target".into()),
-            command: vec!["sh".into(), "-c".into(), "sleep 1".into()],
+            command: target_command,
             size: Size::new(80, 24),
             cwd: None,
             env: None,
@@ -853,6 +909,7 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         cmd.env("REMUDA_EXIT_STATUS", &exit_status);
         cmd
     };
+    cmd.env("REMUDA_TRACE_ATTACH_EXIT", "1");
     cmd.env("REMUDA_RUNTIME_DIR", &dir);
     let viewer = Session::new(
         "viewer",
@@ -860,9 +917,22 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         Arc::new(SystemClock::new()),
     );
     let held = viewer.attach();
-    let _output = held.subscribe().expect("capture viewer output");
+    let viewer_output = held.subscribe().expect("capture viewer output");
+    #[cfg(windows)]
+    let mut conpty_pending = Vec::new();
+    #[cfg(windows)]
+    let mut terminal_output = Vec::new();
+    #[cfg(windows)]
+    let mut terminal_writer = AttachedInputWriter(&held);
     let deadline = Instant::now() + PATIENCE;
     loop {
+        #[cfg(windows)]
+        answer_pending_conpty_queries(
+            &viewer_output,
+            &mut terminal_writer,
+            &mut conpty_pending,
+            &mut terminal_output,
+        );
         let response = client::request(&path, &Request::List).expect("list after target exit");
         let target_present = match response {
             Response::Sessions(sessions) => sessions.iter().any(|s| s.name == "target"),
@@ -877,18 +947,56 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Unix captures can assert the text and reset bytes directly. ConPTY can
-    // discard both, so Windows checks the process and its recorded exit code.
+    // Wait until the attach client has painted its post-exit prompt before
+    // sending the release key. The daemon can reap the target before the
+    // client's terminal output reaches this outer ConPTY.
     #[cfg(unix)]
     wait_for_session_screen(&viewer, "[remuda] target");
+    #[cfg(windows)]
+    {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            answer_pending_conpty_queries(
+                &viewer_output,
+                &mut terminal_writer,
+                &mut conpty_pending,
+                &mut terminal_output,
+            );
+            let screen = viewer.screen_text().expect("viewer screen");
+            if screen.contains("press any key") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "attach client never painted its post-exit prompt; terminal bytes:\n{}\nviewer screen:\n{screen}",
+                escaped_tail(&terminal_output),
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     held.write_raw(b"k").expect("release attach with any key");
     let deadline = Instant::now() + PATIENCE;
     while viewer.is_alive() {
-        assert!(
-            Instant::now() < deadline,
-            "attach client did not exit after one key"
+        #[cfg(windows)]
+        answer_pending_conpty_queries(
+            &viewer_output,
+            &mut terminal_writer,
+            &mut conpty_pending,
+            &mut terminal_output,
         );
+        if Instant::now() >= deadline {
+            #[cfg(unix)]
+            let output = viewer_output.try_iter().flatten().collect::<Vec<_>>();
+            #[cfg(windows)]
+            let output = terminal_output.clone();
+            let saw_dsr = output.windows(4).any(|window| window == b"\x1b[6n");
+            panic!(
+                "attach client did not exit after one key; saw ESC[6n DSR query: {saw_dsr}\nterminal bytes:\n{}\nviewer screen:\n{}",
+                String::from_utf8_lossy(&output),
+                viewer.screen_text().expect("viewer screen on timeout"),
+            );
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(
@@ -898,10 +1006,65 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         "0"
     );
     #[cfg(unix)]
-    let _restored = collect_until_bytes(
-        &_output,
+    let restored = collect_until_bytes(
+        &viewer_output,
         b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
     );
+    #[cfg(windows)]
+    let restored = terminal_output;
+    if std::env::var_os("REMUDA_TRACE_ATTACH_EXIT").is_some() {
+        let saw_dsr = restored.windows(4).any(|window| window == b"\x1b[6n");
+        eprintln!(
+            "attach input trace terminal bytes (saw ESC[6n DSR query: {saw_dsr}):\n{}\nviewer screen:\n{}",
+            String::from_utf8_lossy(&restored),
+            viewer
+                .screen_text()
+                .expect("viewer screen after attach exit"),
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn an_exited_conpty_session_is_reaped_by_list() {
+    let dir = scratch_dir("conpty-exit-reap");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("short-lived".into()),
+            command: vec![
+                "powershell.exe".into(),
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                "Start-Sleep -Seconds 1".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start short-lived PowerShell target");
+    assert_eq!(response, Response::Value("short-lived".into()));
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let response = client::request(&path, &Request::List).expect("list sessions");
+        let present = match response {
+            Response::Sessions(sessions) => sessions.iter().any(|s| s.name == "short-lived"),
+            other => panic!("list: {other:?}"),
+        };
+        if !present {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "exited ConPTY session was not reaped"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 #[test]
@@ -2100,7 +2263,7 @@ fn stop_refuses_to_kill_a_live_session_without_being_told_twice() {
         "the daemon died despite refusing"
     );
 
-    // -f is the way past it, and the same daemon now goes.
+    // Outside a hosted session, -f remains the no-prompt path for a live herd.
     let forced = remuda(&dir, &["-s", "s", "stop", "-f"]);
     assert!(
         forced.status.success(),
@@ -2108,6 +2271,183 @@ fn stop_refuses_to_kill_a_live_session_without_being_told_twice() {
         String::from_utf8_lossy(&forced.stderr)
     );
     assert!(daemon.left_on_its_own(), "-f did not stop it");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_session_cannot_force_stop_its_own_daemon_without_an_explicit_override() {
+    let dir = scratch_dir("stop-inside");
+    let path = daemon::socket_path_in(&dir, "s");
+    let mut daemon = Daemon::spawn(&dir);
+    let binary = env!("CARGO_BIN_EXE_remuda");
+    let alias = dir.join("runtime-alias");
+    std::os::unix::fs::symlink(&dir, &alias).expect("runtime symlink");
+    let env = std::collections::HashMap::from([(
+        "REMUDA_RUNTIME_DIR".to_string(),
+        alias.to_string_lossy().into_owned(),
+    )]);
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("inside".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("'{binary}' -s s stop -f --yes; sleep 30"),
+            ],
+            size: Size::new(100, 30),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("create managed session");
+    assert!(matches!(response, Response::Value(_)));
+
+    assert_session_shutdown_identity_is_refused(&path, daemon.0.id());
+
+    let deadline = Instant::now() + PATIENCE;
+    let screen = loop {
+        let screen = capture(&path, "inside");
+        if screen.contains("cannot stop this daemon") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stop command did not report its refusal: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        screen.contains("--i-am-inside"),
+        "missing explicit override guidance: {screen}"
+    );
+    assert!(
+        remuda_native::ipc::connect(&path).is_ok(),
+        "the daemon died"
+    );
+    let stopped = client::request(
+        &path,
+        &Request::New {
+            name: Some("override".into()),
+            command: vec![
+                binary.into(),
+                "-s".into(),
+                "s".into(),
+                "stop".into(),
+                "-f".into(),
+                "--yes".into(),
+                "--i-am-inside".into(),
+            ],
+            size: Size::new(100, 30),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("request override session");
+    assert!(matches!(stopped, Response::Value(_)));
+    assert!(
+        daemon.left_on_its_own(),
+        "daemon did not exit after override"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+fn assert_session_shutdown_identity_is_refused(path: &Path, daemon_id: u32) {
+    let sessions = match client::request(path, &Request::List).expect("list sessions") {
+        Response::Sessions(sessions) => sessions,
+        response => panic!("unexpected list response: {response:?}"),
+    };
+    let session_id = sessions
+        .iter()
+        .find(|session| session.name == "inside")
+        .expect("inside session")
+        .id
+        .clone();
+    let raw_shutdown = client::request(
+        path,
+        &Request::Shutdown {
+            requester_daemon_id: Some(daemon_id.to_string()),
+            requester_session_id: Some(session_id),
+            requester_session_name: Some("inside".into()),
+            override_hosted: false,
+        },
+    )
+    .expect("raw shutdown response");
+    assert!(
+        matches!(&raw_shutdown, Response::Error(reason) if reason.contains("one of its own sessions")),
+        "raw shutdown was not refused: {raw_shutdown:?}"
+    );
+    let stale_identity = client::request(
+        path,
+        &Request::Shutdown {
+            requester_daemon_id: Some(daemon_id.to_string()),
+            requester_session_id: Some("stale-session-id".into()),
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("stale identity response");
+    assert!(
+        matches!(&stale_identity, Response::Error(reason) if reason.contains("one of its own sessions")),
+        "unknown identity from this daemon was not refused: {stale_identity:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_session_can_stop_a_different_private_daemon() {
+    let dir_a = scratch_dir("stop-foreign-a");
+    let dir_b = scratch_dir("stop-foreign-b");
+    let path_a = daemon::socket_path_in(&dir_a, "s");
+    let mut daemon_a = Daemon::spawn(&dir_a);
+    let mut daemon_b = Daemon::spawn(&dir_b);
+    let env = std::collections::HashMap::from([(
+        "REMUDA_RUNTIME_DIR".to_string(),
+        dir_b.to_string_lossy().into_owned(),
+    )]);
+    let response = client::request(
+        &path_a,
+        &Request::New {
+            name: Some("foreign-stop".into()),
+            command: vec![
+                env!("CARGO_BIN_EXE_remuda").into(),
+                "-s".into(),
+                "s".into(),
+                "stop".into(),
+                "-f".into(),
+                "--yes".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start foreign stop command");
+    assert!(matches!(response, Response::Value(_)));
+    assert!(
+        daemon_b.left_on_its_own(),
+        "different daemon was not stopped"
+    );
+    assert!(
+        remuda_native::ipc::connect(&path_a).is_ok(),
+        "the session's own daemon was stopped"
+    );
+    let stopped_a = client::request(
+        &path_a,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("stop session daemon");
+    assert_eq!(stopped_a, Response::Ok);
+    assert!(daemon_a.left_on_its_own(), "session daemon did not stop");
+    let _ = std::fs::remove_dir_all(&dir_a);
+    let _ = std::fs::remove_dir_all(&dir_b);
 }
 
 /// A name with no matching arm is a plain error naming the package, not a
