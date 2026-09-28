@@ -1931,6 +1931,7 @@ fn same_style(a: &StyledCell, b: &StyledCell) -> bool {
 
 /// The styled counterpart of the free `crop`, byte-identical to it when
 /// every cell is plain — see steps/020's oracle.
+#[cfg(test)]
 fn crop_styled(
     cells: &[Vec<StyledCell>],
     cols: u16,

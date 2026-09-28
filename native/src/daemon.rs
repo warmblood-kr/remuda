@@ -19,7 +19,7 @@ use interprocess::local_socket::traits::ListenerExt;
 use remuda_core::agent::Result as AgentResult;
 use remuda_core::protocol::{collapse_runs, Request, Response};
 use remuda_core::{Clock, Registry, Session, Size};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -497,14 +497,8 @@ fn handle(
     socket_owner: Arc<SocketOwnership>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
+    let Some(request) = read_request(&stream, &mut reader)? else {
         return Ok(());
-    }
-
-    let request: Request = match serde_json::from_str(&line) {
-        Ok(request) => request,
-        Err(e) => return reply(&stream, &Response::error(format!("bad request: {e}"))),
     };
 
     record_request(counters, &request);
@@ -561,6 +555,8 @@ fn handle(
                 Response::Ok
             })
         }
+
+        Request::Input { name, bytes } => input(&stream, registry, &name, &bytes),
 
         Request::Send { name, bytes } => {
             respond(&stream, &name, registry.send(&name, &bytes), |()| {
@@ -620,6 +616,27 @@ fn handle(
             Err(e) => reply(&stream, &Response::error(e)),
         },
     }
+}
+
+fn read_request(
+    stream: &Stream,
+    reader: &mut impl std::io::BufRead,
+) -> std::io::Result<Option<Request>> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    match serde_json::from_str(&line) {
+        Ok(request) => Ok(Some(request)),
+        Err(error) => {
+            reply(stream, &Response::error(format!("bad request: {error}")))?;
+            Ok(None)
+        }
+    }
+}
+
+fn input(stream: &Stream, registry: &Registry, name: &str, bytes: &[u8]) -> std::io::Result<()> {
+    respond(stream, name, registry.send(name, bytes), |()| Response::Ok)
 }
 
 fn mouse_state(stream: &Stream, registry: &Registry, name: &str) -> std::io::Result<()> {
