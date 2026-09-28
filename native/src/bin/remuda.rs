@@ -392,7 +392,7 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         }
     }
     if remuda_native::ipc::connect(path).is_err() {
-        eprintln!("remuda: no daemon running for {server:?} — the next command starts one");
+        eprintln!("remuda: no daemon running for {server:?} — a state-creating command starts one");
         return ExitCode::SUCCESS;
     }
     if !yes && !force && has_sessions(path) {
@@ -593,7 +593,7 @@ fn with_existing_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode
             fail(format!("cannot use {}: {error}", path.display()))
         }
         Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => fail(format!(
-            "no daemon running for {server:?} (socket {}); start one with remuda new/run or remuda -e ...",
+            "no daemon running for {server:?} (socket {}); start one with remuda run ... or remuda -e ...",
             path.display(),
         )),
         Err(error) => fail(format!(

@@ -31,7 +31,7 @@ fn read_only_verbs_without_a_daemon_fail_without_starting_one() {
         let output = run(&dir, args);
         let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
         let message = format!(
-            "no daemon running for \"s\" (socket {}); start one with remuda new/run or remuda -e ...",
+            "no daemon running for \"s\" (socket {}); start one with remuda run ... or remuda -e ...",
             socket.display()
         );
         let started = stderr.contains("started a daemon");
