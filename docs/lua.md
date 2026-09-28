@@ -144,10 +144,14 @@ schedules = {
 An optional `start(state)` runs after each activation: the first
 `remuda.exec(NAME)` and every `remuda.reload(NAME)`. `remuda.exec` (and a
 mod's own no-argument command) on an already-active mod does nothing, so
-opening a mod's screen does not restart it. The mod owns only its declared
-hooks, tools and schedules. Anything `start` or a handler registers
-imperatively (`remuda.schedule`, `remuda.process`, `remuda.new`, and so on)
-survives reload; the mod must find and reuse or cancel it itself.
+opening a mod's screen does not restart it. The mod owns its declared hooks,
+tools and schedules, and also every `remuda.on` hook and
+`remuda.extension_command` registered while its own code runs (`initialize`,
+`start`, or one of its declared hooks, tools or schedules). `hook_list` shows
+that `owner`. Reload replaces everything the mod owns, and a reload whose
+`start` fails restores the previous set. Other imperative effects
+(`remuda.schedule`, `remuda.process`, `remuda.new`, and so on) are not owned
+and survive reload; the mod must find and reuse or cancel them itself.
 
 The runtime registry also covers words added with `remuda.tool`, so an
 extension can document itself when it registers its function:

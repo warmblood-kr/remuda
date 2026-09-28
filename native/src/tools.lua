@@ -19,10 +19,27 @@ remuda.tools = {}
 -- forwards its remaining words here after the mod has been explicitly
 -- loaded; it never imports an extension's command parser.
 remuda._extension_commands = {}
+
+-- Owner by dynamic extent (hook-design §3): while a lifecycle mod's own code
+-- runs (initialize, start, and its declared hooks, tools and schedules), what
+-- it registers imperatively is tagged with its name, so reload and rollback
+-- can replace it like the declared registrations.
+local current_owner = nil
+local function with_owner(owner, fn, ...)
+  local outer = current_owner
+  current_owner = owner
+  local result = table.pack(pcall(fn, ...))
+  current_owner = outer
+  if not result[1] then error(result[2], 0) end
+  return table.unpack(result, 2, result.n)
+end
+local extension_command_owners = {}
+
 function remuda.extension_command(name, handler)
   if type(name) ~= "string" or name == "" then error("a mod command needs a name", 2) end
   if type(handler) ~= "function" then error("a mod command needs a handler", 2) end
   remuda._extension_commands[name] = handler
+  extension_command_owners[name] = current_owner
 end
 -- `caller` is what the CLI knows and the daemon does not: `caller.env` holds
 -- the caller's `REMUDA_*` variables (`os.getenv` here reads the daemon's).
@@ -271,7 +288,7 @@ function remuda.on(event, fn, opts)
     error("a hook depth must be a number", 2)
   end
   add_hook(event, { fn = fn, group = opts.group, id = opts.id, depth = opts.depth or 0,
-    src = source_of(fn), errors = 0 })
+    src = source_of(fn), errors = 0, owner = current_owner })
 end
 register("on", "Register a callback to run when an event fires. `opts`: `group`, `id` (same group+id replaces), `depth` (-100..100, lower first).", "on(event, fn, opts?) -> nil")
 
@@ -337,12 +354,12 @@ function remuda.hook_list(event)
   for _, name in ipairs(events) do
     for _, hook in ipairs(remuda.hooks[name]) do
       rows[#rows + 1] = { event = name, group = hook.group, id = hook.id, depth = hook.depth or 0,
-        src = hook.src, errors = hook.errors or 0, last_error = hook.last_error }
+        owner = hook.owner, src = hook.src, errors = hook.errors or 0, last_error = hook.last_error }
     end
   end
   return rows
 end
-register("hook_list", "Copies of the registered hooks, for one event or all, in run order.", "hook_list(event?) -> {{event, group, id, depth, src, errors, last_error}...}")
+register("hook_list", "Copies of the registered hooks, for one event or all, in run order.", "hook_list(event?) -> {{event, group, id, depth, owner, src, errors, last_error}...}")
 
 -- A shallow copy, the same discipline `emit` itself already keeps for its own
 -- hook snapshot above — a caller mutating what it was handed must never
@@ -506,7 +523,7 @@ function remuda._activate_module(name, candidate, reactivate)
   local previous = modules[name]
   local state
   if previous == nil then
-    state = candidate.initialize()
+    state = with_owner(name, candidate.initialize)
     if type(state) ~= "table" then
       error("module initialize must return a state table", 0)
     end
@@ -530,7 +547,7 @@ function remuda._activate_module(name, candidate, reactivate)
 
   -- Snapshot what this activation replaces, so a failing `start` can put the
   -- previous activation back (#129). State mutated by that `start` stays.
-  local saved_hooks, saved_tools, saved_schedules = {}, {}, {}
+  local saved_hooks, saved_tools, saved_schedules, saved_commands = {}, {}, {}, {}
   for event, registered in pairs(remuda.hooks) do
     saved_hooks[event] = { table.unpack(registered) }
   end
@@ -544,11 +561,21 @@ function remuda._activate_module(name, candidate, reactivate)
     saved_schedules[handle] = remuda.schedules[handle]
   end
 
+  for command, owner in pairs(extension_command_owners) do
+    if owner == name then saved_commands[command] = remuda._extension_commands[command] end
+  end
+
+  -- Everything the mod owns goes: its reserved group (declared hooks) and
+  -- whatever it registered imperatively in its own extent.
   local group = "remuda-module:" .. name
+  local function owned(hook) return hook.group == group or hook.owner == name end
+  for command in pairs(saved_commands) do
+    remuda._extension_commands[command], extension_command_owners[command] = nil, nil
+  end
   for event, registered in pairs(remuda.hooks) do
     local kept = {}
     for _, hook in ipairs(registered) do
-      if hook.group ~= group then
+      if not owned(hook) then
         kept[#kept + 1] = hook
       end
     end
@@ -564,14 +591,14 @@ function remuda._activate_module(name, candidate, reactivate)
   for index = 1, hook_count do
     local hook = hooks[index]
     add_hook(hook.event, { fn = function(...)
-      return hook.run(state, ...)
+      return with_owner(name, hook.run, state, ...)
     end, group = group, id = hook.id, depth = type(hook.depth) == "number" and hook.depth or 0,
       src = source_of(hook.run), errors = 0 })
   end
   for index, word in ipairs(prepared_tools) do
     local declared = tools[index]
     word.run = function(arguments, caller)
-      return declared.run(state, arguments, caller)
+      return with_owner(name, declared.run, state, arguments, caller)
     end
     remuda.tools[word.name] = word
     module_tool_owners[word.name] = name
@@ -586,7 +613,7 @@ function remuda._activate_module(name, candidate, reactivate)
     schedule_handles[index] = remuda.schedule({
       name = declared.name,
       every = declared.every,
-      run = function() return declared.run(state) end,
+      run = function() return with_owner(name, declared.run, state) end,
     })
   end
   modules[name] = { version = version, state = state, tools = tool_names, schedules = schedule_handles }
@@ -597,7 +624,7 @@ function remuda._activate_module(name, candidate, reactivate)
       local known = {}
       for _, hook in ipairs(restored) do known[hook] = true end
       for _, hook in ipairs(registered) do
-        if hook.group ~= group and not known[hook] then
+        if not owned(hook) and not known[hook] then
           restored[#restored + 1] = hook
         end
       end
@@ -622,9 +649,18 @@ function remuda._activate_module(name, candidate, reactivate)
     for handle, schedule in pairs(saved_schedules) do
       remuda.schedules[handle] = schedule
     end
+    for command, owner in pairs(extension_command_owners) do
+      if owner == name then remuda._extension_commands[command], extension_command_owners[command] = nil, nil end
+    end
+    for command, handler in pairs(saved_commands) do
+      remuda._extension_commands[command], extension_command_owners[command] = handler, name
+    end
     modules[name] = previous
   end
-  return true, state, candidate.start, rollback
+  local start = candidate.start and function(started_state)
+    return with_owner(name, candidate.start, started_state)
+  end
+  return true, state, start, rollback
 end
 
 local escapes = {

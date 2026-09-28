@@ -436,8 +436,10 @@ fn reload_into_a_failing_start_keeps_the_previous_registrations() {
 
 /// A failed `start` rolls back, but a hook it registered imperatively
 /// survives. It must land by depth, not appended after the restored ones.
+/// A hook a failing `start` registered is owned by the mod (hook-design §3),
+/// so rollback drops it; hooks from outside the mod keep their place.
 #[test]
-fn rollback_keeps_surviving_hooks_in_depth_order() {
+fn rollback_drops_hooks_the_failed_start_registered() {
     let home = DataHome::new();
     let manifest = home.root.join("remuda/mods/sample/extension.toml");
     fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
@@ -480,13 +482,123 @@ fn rollback_keeps_surviving_hooks_in_depth_order() {
             &image,
             "remuda.emit('order'); return table.concat(remuda._ran, ',')"
         ),
-        "-100,0"
+        "0"
     );
     assert_eq!(
         read_value(
             &image,
             "local d = {} for i, h in ipairs(remuda.hook_list('order')) do d[i] = h.depth end return table.concat(d, ',')"
         ),
-        "-100,0"
+        "0"
     );
+}
+
+/// Hook-design (b): what a mod registers imperatively while its own code runs
+/// (`start`, a declared hook) is owned by it, so reload replaces it instead of
+/// piling up, and a failed reload's `start` leaves the previous set intact.
+#[test]
+fn registrations_made_in_a_mods_extent_are_owned_and_replaced_on_reload() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let entry = home.entry();
+    write_entry(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function()
+            remuda.on("owned_probe", function() end)
+            remuda.extension_command("sample-cmd", function() return "v1" end)
+          end,
+          hooks = {{ event = "kick", run = function() remuda.on("kicked_probe", function() end) end }},
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-owner.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(
+        &image,
+        "remuda.on('owned_probe', function() end, { group = 'outsider' })",
+    );
+    read_value(&image, "remuda.exec('sample'); remuda.emit('kick')");
+    read_value(
+        &image,
+        "for _ = 1, 5 do remuda.reload('sample') end; remuda.emit('kick')",
+    );
+    let owners = "local o = {} for _, h in ipairs(remuda.hook_list(EVENT)) do o[#o + 1] = tostring(h.owner) end \
+                  return table.concat(o, ',')";
+    assert_eq!(
+        read_value(&image, &owners.replace("EVENT", "'owned_probe'")),
+        "nil,sample"
+    );
+    assert_eq!(
+        read_value(&image, &owners.replace("EVENT", "'kicked_probe'")),
+        "sample"
+    );
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "v1"
+    );
+
+    // A reload whose start fails keeps v1's owned registrations, drops v2's.
+    write_entry(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function()
+            remuda.on("v2_probe", function() end)
+            error("v2 start fails")
+          end,
+        }"#,
+    );
+    assert!(image.eval("remuda.reload('sample')", None).is_err());
+    assert_eq!(
+        read_value(&image, &owners.replace("EVENT", "'owned_probe'")),
+        "nil,sample"
+    );
+    assert_eq!(
+        read_value(&image, &owners.replace("EVENT", "'v2_probe'")),
+        ""
+    );
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "v1"
+    );
+
+    // A successful reload that no longer registers them drops them all.
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1, initialize = function() return {} end }"#,
+    );
+    read_value(&image, "remuda.reload('sample')");
+    assert_eq!(
+        read_value(&image, &owners.replace("EVENT", "'owned_probe'")),
+        "nil"
+    );
+    assert_eq!(
+        read_value(&image, &owners.replace("EVENT", "'kicked_probe'")),
+        ""
+    );
+    assert!(image
+        .eval(
+            "return remuda._dispatch_extension_command('sample-cmd')",
+            None
+        )
+        .is_err());
 }
