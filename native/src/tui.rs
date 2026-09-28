@@ -378,6 +378,9 @@ impl Ui {
         let Some(session) = self.selected() else {
             return Action::Nothing;
         };
+        if !session.mouse_tracking {
+            return Action::Nothing;
+        }
         let child_row =
             (session.size.rows() as usize).saturating_sub(body as usize) + pane_row as usize;
         let child_col = self.pan as usize + pane_col as usize;
@@ -837,6 +840,7 @@ mod visual_mode_tests {
                 size: Size::new(80, 24),
                 attached: false,
                 human_idle: None,
+                mouse_tracking: false,
             }],
             "sh",
             None,

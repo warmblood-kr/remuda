@@ -198,6 +198,25 @@ fn an_attached_viewer_gets_a_repaint_and_then_a_live_stream() {
 }
 
 #[test]
+fn an_attached_viewer_replays_mouse_modes_set_before_attach() {
+    let session = session("mouse-mode");
+    session
+        .send_line("printf '\\033[?1000h'; printf 'ready-%s\\n' mode")
+        .expect("set child mouse mode");
+    wait_for(&session, "ready-mode");
+    assert!(session.mouse_tracking(), "the pty should remember ?1000h");
+
+    let held = session.attach().expect("attach");
+    let painted = held.screen_bytes().expect("initial state repaint");
+    assert!(
+        painted
+            .windows(b"\x1b[?1000h".len())
+            .any(|w| w == b"\x1b[?1000h"),
+        "the initial repaint must replay the child's mouse mode: {painted:?}"
+    );
+}
+
+#[test]
 fn detaching_leaves_the_agent_untouched_and_the_core_back_in_charge() {
     let session = session("handover");
     let held = session.attach().expect("attach");

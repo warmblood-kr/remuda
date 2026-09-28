@@ -3,11 +3,48 @@
 use crate::ipc::{self, Stream, TryClone};
 use remuda_core::protocol::{Request, Response};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Detach key: Ctrl-\ (0x1C). Chosen because almost nothing binds it, unlike
 /// Ctrl-C/D/Z, which the attached program needs. Consumed, never forwarded.
 pub const DETACH: u8 = 0x1C;
+
+const RESET_INPUT_MODES: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
+
+fn reset_input_modes(output: &mut impl Write) -> std::io::Result<()> {
+    output.write_all(RESET_INPUT_MODES)
+}
+
+fn write_input_trace(output: &mut impl Write, at: SystemTime, bytes: &[u8]) -> std::io::Result<()> {
+    let elapsed = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    write!(
+        output,
+        "{}.{:09} ",
+        elapsed.as_secs(),
+        elapsed.subsec_nanos()
+    )?;
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            output.write_all(b" ")?;
+        }
+        write!(output, "{byte:02x}")?;
+    }
+    output.write_all(b"\n")
+}
+
+fn trace_input_read(path: Option<&Path>, bytes: &[u8]) {
+    let Some(path) = path else { return };
+    let Ok(mut output) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    let _ = write_input_trace(&mut output, SystemTime::now(), bytes);
+}
 
 /// Send one request and read one response.
 pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
@@ -110,6 +147,7 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
     // Only the key thread can tell the two exits apart: the reader below just
     // sees the stream end, which is true of a detach and of a death alike.
     let detached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let trace_input = std::env::var_os("REMUDA_TRACE_INPUT").map(PathBuf::from);
 
     // Keystrokes out, on their own thread; the screen pump runs here.
     let keys = std::thread::spawn({
@@ -122,6 +160,7 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
                 if n == 0 {
                     break;
                 }
+                trace_input_read(trace_input.as_deref(), &buf[..n]);
                 match buf[..n].iter().position(|&b| b == DETACH) {
                     // Forward what was typed before the detach key, then stop.
                     // Dropping those bytes would silently swallow input the
@@ -285,8 +324,10 @@ impl Drop for RawMode {
     /// Leave the alternate screen *before* termios goes back, so the last thing
     /// the terminal does in raw mode is the buffer switch.
     fn drop(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = reset_input_modes(&mut stdout);
         let _ = crossterm::execute!(
-            std::io::stdout(),
+            stdout,
             crossterm::cursor::Show,
             crossterm::terminal::LeaveAlternateScreen,
             crossterm::cursor::Show
@@ -297,8 +338,24 @@ impl Drop for RawMode {
 
 #[cfg(test)]
 mod tests {
-    use super::interpret;
+    use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
     use remuda_core::protocol::Response;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn detach_resets_mouse_and_bracketed_paste_modes() {
+        let mut output = Vec::new();
+        reset_input_modes(&mut output).unwrap();
+        assert_eq!(output, RESET_INPUT_MODES);
+    }
+
+    #[test]
+    fn input_trace_records_a_timestamp_and_each_byte_as_hex() {
+        let mut output = Vec::new();
+        let at = UNIX_EPOCH + Duration::new(7, 42);
+        write_input_trace(&mut output, at, b"\x1b\xff").unwrap();
+        assert_eq!(output, b"7.000000042 1b ff\n");
+    }
 
     /// The line the daemon at 618cda4^ actually sent, byte for byte.
     const STALE: &str =

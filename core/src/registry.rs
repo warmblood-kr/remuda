@@ -42,6 +42,10 @@ pub struct SessionSummary {
     /// Defaulted so a listing from an older daemon still parses.
     #[serde(default)]
     pub human_idle: Option<Duration>,
+    /// Whether the child currently requests mouse input from its terminal.
+    /// Defaulted for sessions listed by an older daemon.
+    #[serde(default)]
+    pub mouse_tracking: bool,
 }
 
 /// A session name from a program's argv[0]: basename, lowercased, anything
@@ -127,6 +131,7 @@ impl Registry {
                 size: s.size(),
                 attached: s.is_attached(),
                 human_idle: s.human_idle_for(),
+                mouse_tracking: s.mouse_tracking(),
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));

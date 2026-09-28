@@ -214,12 +214,19 @@ impl AgentProcess for PtyAgent {
         Ok(parser.screen().contents())
     }
 
-    /// The screen as terminal bytes, cursor included. `contents_formatted`
-    /// emits a full repaint, which is what a just-attached terminal needs — a
-    /// paused agent never redraws on its own.
+    /// The screen and input modes as terminal bytes, cursor included.
+    /// `state_formatted` emits a full repaint plus mouse, paste, and keypad
+    /// modes, which a just-attached terminal needs even if the child is idle.
     fn screen_bytes(&mut self) -> Result<Vec<u8>> {
         let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
-        Ok(parser.screen().contents_formatted())
+        Ok(parser.screen().state_formatted())
+    }
+
+    fn mouse_tracking(&mut self) -> bool {
+        self.screen
+            .lock()
+            .map(|parser| parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
+            .unwrap_or(false)
     }
 
     /// Styled cells off `vt100`'s own grid, including its wide/continuation
