@@ -229,13 +229,32 @@ register("schedule_fires", "How many times each named schedule has fired.", "sch
 -- asymmetry augroup has — naming a group costs nothing, but clearing without
 -- one would wipe every extension's hooks at once, not just the caller's own.
 remuda.hooks = {}
-register("hooks", "The `remuda.on` registry table, keyed by event name.", "table")
+register("hooks", "Deprecated for reading: use `hook_list`. The `remuda.on` table, keyed by event name; it becomes read-only once no mod edits it by hand.", "table")
 
 -- Keyed by event name, counting every `emit` call for it regardless of
 -- whether a hook is registered — `remuda.hooks` above only knows the events
 -- someone `on`'d, not the ones only ever `emit`'d.
 remuda._event_counts = {}
 register("_event_counts", "Internal event-emit counts, keyed by event name. Read via `event_counts()`.", "table")
+
+-- Emacs add-hook DEPTH: lower runs first, ties keep registration order. The
+-- same (group, id) on an event replaces its hook, so `on` is idempotent.
+local function source_of(fn)
+  return remuda._function_source and remuda._function_source(fn) or nil
+end
+
+local function add_hook(event, entry)
+  local hooks = remuda.hooks[event] or {}
+  remuda.hooks[event] = hooks
+  if entry.id ~= nil then
+    for i = #hooks, 1, -1 do
+      if hooks[i].id == entry.id and hooks[i].group == entry.group then table.remove(hooks, i) end
+    end
+  end
+  local at = #hooks + 1
+  while at > 1 and (hooks[at - 1].depth or 0) > entry.depth do at = at - 1 end
+  table.insert(hooks, at, entry)
+end
 
 function remuda.on(event, fn, opts)
   if type(event) ~= "string" or event == "" then
@@ -248,32 +267,82 @@ function remuda.on(event, fn, opts)
   if type(opts.group) == "string" and opts.group:match("^remuda%-module:") then
     error("hook groups beginning with `remuda-module:` are reserved", 2)
   end
-  remuda.hooks[event] = remuda.hooks[event] or {}
-  table.insert(remuda.hooks[event], { fn = fn, group = opts.group })
+  if opts.depth ~= nil and type(opts.depth) ~= "number" then
+    error("a hook depth must be a number", 2)
+  end
+  add_hook(event, { fn = fn, group = opts.group, id = opts.id, depth = opts.depth or 0,
+    src = source_of(fn), errors = 0 })
 end
-register("on", "Register a callback to run when an event fires.", "on(event, fn, opts?) -> nil")
+register("on", "Register a callback to run when an event fires. `opts`: `group`, `id` (same group+id replaces), `depth` (-100..100, lower first).", "on(event, fn, opts?) -> nil")
 
 -- A snapshot, not a live reference to `remuda.hooks[event]` — a hook that
 -- calls `clear_hooks` on its own group must not skip or re-run a sibling
 -- still mid-iteration.
-function remuda.emit(event, ...)
+local function snapshot(event)
   remuda._event_counts[event] = (remuda._event_counts[event] or 0) + 1
-  local hooks = remuda.hooks[event]
-  if not hooks then
-    return
-  end
-  local snapshot = {}
-  for i, hook in ipairs(hooks) do
-    snapshot[i] = hook
-  end
-  for _, hook in ipairs(snapshot) do
-    local ok, err = pcall(hook.fn, ...)
-    if not ok then
-      io.stderr:write("remuda hook error for " .. event .. ": " .. tostring(err) .. "\n")
-    end
-  end
+  local copy = {}
+  for i, hook in ipairs(remuda.hooks[event] or {}) do copy[i] = hook end
+  return copy
+end
+
+-- An error is counted on its hook and logged; the caller sees "no answer".
+local function call_hook(event, hook, ...)
+  local result = table.pack(pcall(hook.fn, ...))
+  if result[1] then return true, table.unpack(result, 2, result.n) end
+  hook.errors, hook.last_error = (hook.errors or 0) + 1, tostring(result[2])
+  local who = (hook.group or hook.id) and (" [" .. tostring(hook.group) .. "/" .. tostring(hook.id) .. "]") or ""
+  io.stderr:write("remuda hook error for " .. event .. who .. ": " .. hook.last_error .. "\n")
+  return false
+end
+
+function remuda.emit(event, ...)
+  for _, hook in ipairs(snapshot(event)) do call_hook(event, hook, ...) end
 end
 register("emit", "Fire an event, running every hook registered for it.", "emit(event, ...) -> nil")
+
+function remuda.emit_until_success(event, ...)
+  for _, hook in ipairs(snapshot(event)) do
+    local ok, value = call_hook(event, hook, ...)
+    if ok and value ~= nil then return value end
+  end
+  return nil
+end
+register("emit_until_success", "Fire an event until a hook returns non-nil, and return that value. An erroring hook is no answer.", "emit_until_success(event, ...) -> value?")
+
+function remuda.emit_until_failure(event, ...)
+  for _, hook in ipairs(snapshot(event)) do
+    local ok, value = call_hook(event, hook, ...)
+    if ok and value == false then return false end
+  end
+  return true
+end
+register("emit_until_failure", "Fire an event until a hook returns false (a veto). An erroring hook is no answer, never a veto.", "emit_until_failure(event, ...) -> boolean")
+
+function remuda.emit_filter(event, value, ...)
+  for _, hook in ipairs(snapshot(event)) do
+    local ok, result = call_hook(event, hook, value, ...)
+    if ok and result ~= nil then value = result end
+  end
+  return value
+end
+register("emit_filter", "Thread a value through each hook as `hook(value, ...)`; nil or an error leaves it unchanged.", "emit_filter(event, value, ...) -> value")
+
+function remuda.hook_list(event)
+  local events = {}
+  for name in pairs(remuda.hooks) do
+    if event == nil or name == event then events[#events + 1] = name end
+  end
+  table.sort(events)
+  local rows = {}
+  for _, name in ipairs(events) do
+    for _, hook in ipairs(remuda.hooks[name]) do
+      rows[#rows + 1] = { event = name, group = hook.group, id = hook.id, depth = hook.depth or 0,
+        src = hook.src, errors = hook.errors or 0, last_error = hook.last_error }
+    end
+  end
+  return rows
+end
+register("hook_list", "Copies of the registered hooks, for one event or all, in run order.", "hook_list(event?) -> {{event, group, id, depth, src, errors, last_error}...}")
 
 -- A shallow copy, the same discipline `emit` itself already keeps for its own
 -- hook snapshot above — a caller mutating what it was handed must never
@@ -494,10 +563,10 @@ function remuda._activate_module(name, candidate, reactivate)
   end
   for index = 1, hook_count do
     local hook = hooks[index]
-    remuda.hooks[hook.event] = remuda.hooks[hook.event] or {}
-    table.insert(remuda.hooks[hook.event], { fn = function(...)
+    add_hook(hook.event, { fn = function(...)
       return hook.run(state, ...)
-    end, group = group })
+    end, group = group, id = hook.id, depth = type(hook.depth) == "number" and hook.depth or 0,
+      src = source_of(hook.run), errors = 0 })
   end
   for index, word in ipairs(prepared_tools) do
     local declared = tools[index]
