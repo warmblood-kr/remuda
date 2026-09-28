@@ -216,6 +216,146 @@ fn daemon_signal_cleanup_preserves_a_replacement_socket_path() {
 
 #[cfg(unix)]
 #[test]
+fn sigusr1_rebinds_a_deleted_socket() {
+    let dir = scratch_dir("daemon-sigusr1-rebind");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    let result = signal_rebind_and_wait(&daemon, &socket);
+
+    let socket_removed = stop_and_clean(&mut daemon, &dir, &socket);
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+    assert!(socket_removed, "shutdown removes the rebound socket");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigusr1_rebind_refreshes_cleanup_identity() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let dir = scratch_dir("daemon-sigusr1-owner");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    let original = std::fs::symlink_metadata(&socket).expect("original socket");
+    let result = signal_rebind_and_wait(&daemon, &socket).and_then(|()| {
+        let rebound = std::fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
+        if !rebound.file_type().is_socket() {
+            return Err("rebound path is not a socket".into());
+        }
+        if (original.dev(), original.ino()) == (rebound.dev(), rebound.ino()) {
+            return Err("rebind kept the old socket inode".into());
+        }
+        std::fs::remove_file(&socket).map_err(|error| error.to_string())?;
+        std::fs::write(&socket, b"replacement after rebind").map_err(|error| error.to_string())?;
+        Ok(())
+    });
+
+    let _ = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    let stopped = daemon.left_on_its_own();
+    let preserved = std::fs::read(&socket).ok().as_deref() == Some(b"replacement after rebind");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+    assert!(stopped, "daemon handles SIGTERM after rebinding");
+    assert!(preserved, "cleanup preserves a replacement path inode");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigusr1_refuses_to_displace_a_live_replacement_socket() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::net::UnixListener;
+
+    let dir = scratch_dir("sigusr1-live");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    std::fs::remove_file(&socket).expect("remove original socket");
+    let replacement = UnixListener::bind(&socket).expect("bind live replacement");
+    replacement
+        .set_nonblocking(true)
+        .expect("make replacement accept nonblocking");
+    let replacement_id = std::fs::symlink_metadata(&socket).expect("replacement metadata");
+    let result = (|| -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // The second accepted probe proves the first refused bind completed
+        // before the test asks the daemon to stop.
+        for _ in 0..2 {
+            let signalled = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGUSR1) };
+            if signalled != 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            loop {
+                match replacement.accept() {
+                    Ok((_stream, _address)) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err("daemon did not probe the live replacement".into());
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+
+        let after = std::fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
+        if (after.dev(), after.ino()) != (replacement_id.dev(), replacement_id.ino()) {
+            return Err("live replacement socket inode changed".into());
+        }
+        if daemon
+            .0
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("daemon exited while handling SIGUSR1".into());
+        }
+        Ok(())
+    })();
+
+    let _ = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    let stopped = daemon.left_on_its_own();
+    let after_shutdown = std::fs::symlink_metadata(&socket).expect("replacement remains");
+    let remains = (after_shutdown.dev(), after_shutdown.ino())
+        == (replacement_id.dev(), replacement_id.ino());
+    drop(replacement);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+    assert!(stopped, "daemon handles SIGTERM after failed rebind");
+    assert!(remains, "shutdown preserves the live replacement socket");
+}
+
+#[cfg(unix)]
+fn signal_rebind_and_wait(daemon: &Daemon, socket: &Path) -> Result<(), String> {
+    std::fs::remove_file(socket).map_err(|error| error.to_string())?;
+    let signalled = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGUSR1) };
+    if signalled != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while ipc::connect(socket).is_err() {
+        if Instant::now() >= deadline {
+            return Err(format!("daemon did not rebind {socket:?} after SIGUSR1"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    match client::request(socket, &Request::List) {
+        Ok(Response::Sessions(_)) => Ok(()),
+        Ok(response) => Err(format!("unexpected response: {response:?}")),
+        Err(error) => Err(format!("rebound socket did not serve requests: {error}")),
+    }
+}
+
+#[cfg(unix)]
+fn stop_and_clean(daemon: &mut Daemon, dir: &Path, socket: &Path) -> bool {
+    let _ = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    let stopped = daemon.left_on_its_own();
+    let socket_removed = !socket.exists();
+    let _ = std::fs::remove_dir_all(dir);
+    stopped && socket_removed
+}
+
+#[cfg(unix)]
+#[test]
 fn concurrent_daemon_starts_serialize_stale_socket_replacement() {
     let dir = scratch_dir("daemon-start-lock");
     let socket = daemon::socket_path_in(&dir, "s");

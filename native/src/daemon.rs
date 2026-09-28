@@ -16,9 +16,14 @@ use crate::image::Image;
 use crate::ipc::{self, Listener, Stream, TryClone};
 use crate::process_ancestry;
 use crate::pty::PtyAgent;
+#[cfg(unix)]
+use interprocess::local_socket::traits::Listener as _;
+#[cfg(windows)]
 use interprocess::local_socket::traits::ListenerExt;
 #[cfg(unix)]
 use interprocess::local_socket::traits::Stream as LocalStream;
+#[cfg(unix)]
+use interprocess::local_socket::ListenerNonblockingMode;
 use remuda_core::agent::Result as AgentResult;
 use remuda_core::protocol::{collapse_runs, Request, Response};
 use remuda_core::{Clock, Registry, Session, Size};
@@ -26,6 +31,8 @@ use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
 
 use crate::SystemClock;
 use portable_pty::CommandBuilder;
@@ -183,7 +190,15 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     // `stop_on_signals` below starts reading.
     #[cfg(unix)]
     let signals = catch_signals()?;
+    #[cfg(unix)]
+    let (repair_tx, repair_rx) = std::sync::mpsc::sync_channel(1);
     let listener: Listener = ipc::listen(path)?;
+    #[cfg(unix)]
+    let mut listener = listener;
+    #[cfg(unix)]
+    listener.do_not_reclaim_name_on_drop();
+    #[cfg(windows)]
+    let listener = listener;
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
 
     let registry = Arc::new(Registry::new());
@@ -215,19 +230,102 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     }
     spawn_ticker(image.clone(), Arc::clone(&counters), Arc::clone(&registry));
     #[cfg(unix)]
-    stop_on_signals(signals, image.clone(), Arc::clone(&socket_owner));
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        let registry = Arc::clone(&registry);
-        let image = image.clone();
-        let counters = Arc::clone(&counters);
-        let socket_owner = Arc::clone(&socket_owner);
-        std::thread::spawn(move || {
-            let _ = handle(stream, &registry, &image, &counters, socket_owner);
-        });
+    stop_on_signals(signals, image.clone(), Arc::clone(&socket_owner), repair_tx);
+    #[cfg(unix)]
+    {
+        listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+        serve_unix(
+            listener,
+            path,
+            repair_rx,
+            registry,
+            image,
+            counters,
+            socket_owner,
+        )
     }
-    socket_owner.cleanup();
-    Ok(())
+    #[cfg(windows)]
+    {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            spawn_connection(stream, &registry, &image, &counters, &socket_owner);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn serve_unix(
+    mut listener: Listener,
+    path: &Path,
+    repair_rx: std::sync::mpsc::Receiver<()>,
+    registry: Arc<Registry>,
+    image: Image,
+    counters: Arc<crate::tick::Counters>,
+    socket_owner: Arc<SocketOwnership>,
+) -> ! {
+    loop {
+        match listener.accept() {
+            Ok(stream) => {
+                if let Err(error) = stream.set_nonblocking(false) {
+                    eprintln!("remuda daemon: could not restore blocking client mode: {error}");
+                    continue;
+                }
+                spawn_connection(stream, &registry, &image, &counters, &socket_owner);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if repair_rx
+                    .recv_timeout(std::time::Duration::from_millis(10))
+                    .is_ok()
+                {
+                    match ipc::listen(path) {
+                        Ok(mut replacement) => {
+                            replacement.do_not_reclaim_name_on_drop();
+                            let refreshed = socket_owner.refresh();
+                            if let Err(error) = &refreshed {
+                                eprintln!(
+                                    "remuda daemon: could not record rebound socket at {}: {error}",
+                                    path.display()
+                                );
+                            }
+                            listener = replacement;
+                            if refreshed.is_ok() {
+                                eprintln!(
+                                    "remuda daemon: rebound socket at {} after SIGUSR1",
+                                    path.display()
+                                );
+                            }
+                        }
+                        Err(error) => eprintln!(
+                            "remuda daemon: could not rebind socket at {} after SIGUSR1: {error}",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => {
+                eprintln!("remuda daemon: accept failed: {error}");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+fn spawn_connection(
+    stream: Stream,
+    registry: &Arc<Registry>,
+    image: &Image,
+    counters: &Arc<crate::tick::Counters>,
+    socket_owner: &Arc<SocketOwnership>,
+) {
+    let registry = Arc::clone(registry);
+    let image = image.clone();
+    let counters = Arc::clone(counters);
+    let socket_owner = Arc::clone(socket_owner);
+    std::thread::spawn(move || {
+        let _ = handle(stream, &registry, &image, &counters, socket_owner);
+    });
 }
 
 /// Serialize stale-socket removal and bind for one daemon name. The lock file
@@ -342,7 +440,7 @@ fn socket_lock_timeout_message(lock_path: &Path, holder: Option<u32>) -> String 
 struct SocketOwnership {
     path: PathBuf,
     #[cfg(unix)]
-    identity: (u64, u64),
+    identity: Mutex<(u64, u64)>,
 }
 
 impl SocketOwnership {
@@ -353,7 +451,7 @@ impl SocketOwnership {
             let metadata = std::fs::symlink_metadata(path)?;
             Ok(Self {
                 path: path.to_path_buf(),
-                identity: (metadata.dev(), metadata.ino()),
+                identity: Mutex::new((metadata.dev(), metadata.ino())),
             })
         }
         #[cfg(windows)]
@@ -370,12 +468,27 @@ impl SocketOwnership {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            let Ok(identity) = self.identity.lock() else {
+                return;
+            };
             if std::fs::symlink_metadata(&self.path)
-                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.identity)
+                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == *identity)
             {
                 let _ = std::fs::remove_file(&self.path);
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn refresh(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(&self.path)?;
+        let mut identity = self
+            .identity
+            .lock()
+            .map_err(|_| std::io::Error::other("socket ownership lock poisoned"))?;
+        *identity = (metadata.dev(), metadata.ino());
+        Ok(())
     }
 }
 
@@ -483,8 +596,9 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
 }
 
 /// SIGTERM/SIGINT: log, reap like `Shutdown`, remove the socket, exit 0. SIGHUP: ignored
-/// when detached (#106), else the same. Caught, never SIG_IGN (pty children would inherit
-/// it); the handler only writes the signal number to a socketpair.
+/// when detached (#106), else the same. SIGUSR1 asks the accept loop to rebind its socket.
+/// Caught, never SIG_IGN (pty children would inherit it); the handler only writes the signal
+/// number to a socketpair.
 #[cfg(unix)]
 fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::os::fd::AsRawFd;
@@ -504,7 +618,7 @@ fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
     WRITE_FD.store(writer.as_raw_fd(), Ordering::Relaxed);
     std::mem::forget(writer);
-    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGUSR1] {
         // SAFETY: installs a handler that only calls write(2).
         unsafe {
             libc::signal(
@@ -522,6 +636,7 @@ fn stop_on_signals(
     mut reader: std::os::unix::net::UnixStream,
     image: Image,
     socket_owner: Arc<SocketOwnership>,
+    repair: std::sync::mpsc::SyncSender<()>,
 ) {
     use std::io::Read;
     // Auto-started (#107), the daemon leads its own session and a HUP is a
@@ -535,7 +650,12 @@ fn stop_on_signals(
         while reader.read_exact(&mut byte).is_ok() {
             // `writeln!`, not `eprintln!`: stderr may be a dead tty (EIO), and
             // a panic here would leave every later signal unhandled.
-            let name = match libc::c_int::from(byte[0]) {
+            let signal = libc::c_int::from(byte[0]);
+            if signal == libc::SIGUSR1 {
+                let _ = repair.try_send(());
+                continue;
+            }
+            let name = match signal {
                 libc::SIGTERM => "SIGTERM",
                 libc::SIGINT => "SIGINT",
                 _ if detached => {
