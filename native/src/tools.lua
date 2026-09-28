@@ -1352,9 +1352,9 @@ remuda.session = {
 setmetatable(remuda.session, {
   __call = function(_, name) return session_handle(name) end,
 })
-register("session", "Callable namespace for session handles and session operations.",
-  "table")
-register("session.list", "List every session in the registry.", "session.list() -> {session...}")
+register("session", "Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close and attach.",
+  "session(name) -> handle; table {list, new, close, attach}")
+register("session.list", "List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.", "session.list() -> {session...}")
 register("session.new", "Start a session, defaulting the command to the user's shell.",
   "session.new(name?, argv?, cwd?, env?) -> string")
 register("session.close", "End a session, live or already self-exited.", "session.close(name) -> nil")
