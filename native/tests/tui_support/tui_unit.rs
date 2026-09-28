@@ -874,16 +874,15 @@ fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buff
     let mut ui = make_ui(vec![row("alpha", true, false), row("bravo", true, true)]);
     // What a real refresh() would have fetched from the "*sessions*"
     // buffer at this scenario's list width (16, per `layout(80, 80)`):
-    // unattached is a bare space, attached is the flag — width 16 is
-    // under the 22-column threshold `tools.lua` uses for the live/dead
-    // word, so neither row shows it. This is `render_styled`'s only
-    // input that no longer comes from `ui.sessions` directly.
+    // unattached has no marker, and the attached horse stays on the name
+    // row. These rows model the live Lua buffer at width 16. This is the
+    // `render_styled` input that no longer comes from `ui.sessions` directly.
     ui.sessions_text = vec![
         "alpha".into(),
-        "live".into(),
         String::new(),
-        "bravo".into(),
-        "live  ⚑".into(),
+        String::new(),
+        "bravo 🏇".into(),
+        String::new(),
         String::new(),
     ];
     let cells = vec![text_row(10); 23];
@@ -893,10 +892,10 @@ fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buff
             "\x1b[?2026h\x1b[?25l\x1b[H\
              \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
              \x1b[2;1H\x1b[Kalpha           │xxxxxxxxxx                                                     \
-             \x1b[3;1H\x1b[Klive            │xxxxxxxxxx                                                     \
+             \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[Kbravo           │xxxxxxxxxx                                                     \
-             \x1b[6;1H\x1b[Klive  ⚑         │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[Kbravo 🏇        │xxxxxxxxxx                                                     \
+             \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1012,8 +1011,8 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
     let (list_w, _) = layout(80, widest(&ui));
     let (rows, lines, _) =
         sessions_buffer_lines(&path, list_w, 0, None).expect("refresh sessions buffer");
-    // tools.lua's three-row contract: bold name (cyan when selected), coloured
-    // state word, the attach flag, then a blank spacer row.
+    // tools.lua's three-row contract: bold name (cyan when selected) plus the
+    // attached marker, detail on row two, then a blank spacer row.
     assert_eq!(rows, 3);
     assert_eq!(
         lines,
@@ -1021,8 +1020,8 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
             "\x1b[1;7;36malpha\x1b[0m \x1b[32m●\x1b[0m".to_string(),
             String::new(),
             String::new(),
-            "\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m".to_string(),
-            "⚑".to_string(),
+            "\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m 🏇".to_string(),
+            String::new(),
             String::new(),
         ],
         "real Lua output for this scenario"
@@ -1039,8 +1038,8 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
              \x1b[2;1H\x1b[K\x1b[1;7;36malpha\x1b[0m \x1b[32m●\x1b[0m         │xxxxxxxxxx                                                     \
              \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m         │xxxxxxxxxx                                                     \
-             \x1b[6;1H\x1b[K⚑               │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m 🏇      │xxxxxxxxxx                                                     \
+             \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1197,7 +1196,7 @@ fn a_nested_entry_never_overflows_a_narrow_list() {
 }
 
 #[test]
-fn a_status_dot_follows_the_name_and_the_state_row_keeps_only_detail() {
+fn attached_horse_marker_joins_the_name_row_with_two_cell_width() {
     // The dot carries live/dead, so row 2 spells neither. Each style is reset
     // before the next begins: the selection style must not reach the dot,
     // and the dot colour must not reach anything after it.
@@ -1226,8 +1225,23 @@ fn a_status_dot_follows_the_name_and_the_state_row_keeps_only_detail() {
     );
     assert_eq!(
         entry(1),
-        ("\x1b[1mbusy\x1b[0m \x1b[32m●\x1b[0m", "⚑"),
+        ("\x1b[1mbusy\x1b[0m \x1b[32m●\x1b[0m 🏇", ""),
         "unselected, live, attached"
+    );
+    assert_eq!(
+        visible_width("🏇"),
+        2,
+        "the marker occupies two terminal cells"
+    );
+    assert_eq!(
+        visible_width(entry(1).0),
+        9,
+        "the ANSI styled row includes both cells"
+    );
+    assert_eq!(
+        visible_width(&fit(entry(1).0, 16)),
+        16,
+        "fitting the row accounts for the horse's two display cells"
     );
     assert_eq!(
         entry(2),
@@ -1401,12 +1415,11 @@ fn render_styled_of_the_empty_session_list_is_byte_identical_when_fed_by_a_real_
         );
 }
 
-/// Pins the live/dead word against real Lua at widths either side of the
-/// old 22-column threshold. Since 2f8ce82 the state word is its own row, so
-/// it survives any list width (the renderer's `fit` truncates, not Lua).
+/// Pins the attached marker against real Lua at narrow widths. The marker
+/// stays on the name row instead of occupying the detail row.
 // `alpha` unattached, `bravo` attached, both alive. Two Eval round trips.
 #[test]
-fn the_live_dead_word_is_pinned_against_real_lua_at_every_width() {
+fn the_attached_marker_stays_on_the_name_row_at_narrow_widths() {
     let path = scratch_socket("e2e-live-dead-threshold");
     daemon_at(&path);
 
@@ -1426,8 +1439,12 @@ fn the_live_dead_word_is_pinned_against_real_lua_at_every_width() {
             .collect();
         assert_eq!(
             states,
-            vec!["", "⚑"],
-            "at width {width}, tools.lua shows the live/dead word before the flag"
+            vec!["", ""],
+            "at width {width}, attached marker must not occupy the detail row"
+        );
+        assert!(
+            lines[3].ends_with(" 🏇"),
+            "first row carries the attached marker: {lines:?}"
         );
     }
 }
@@ -1568,8 +1585,8 @@ fn the_frame_says_what_it_is_showing() {
         "\x1b[1;7;36mclaude\x1b[0m".into(),
         "live".into(),
         String::new(),
-        "busy".into(),
-        "live  ⚑".into(),
+        "busy 🏇".into(),
+        "live".into(),
         String::new(),
     ];
     let frame = render(&ui, "hello", "default", 120, 10);
@@ -1578,7 +1595,10 @@ fn the_frame_says_what_it_is_showing() {
         frame.contains("\x1b[1;7;36mclaude"),
         "the selected first row is reverse video"
     );
-    assert!(frame.contains('⚑'), "and the busy one is flagged");
+    assert!(
+        frame.contains('🏇'),
+        "and the busy one carries the horse marker"
+    );
     assert!(frame.contains("⏎ enter"), "the footer teaches the keys");
     assert!(frame.contains('│'), "and the border is the quiet one");
 }
@@ -1652,13 +1672,9 @@ fn a_pane_below_the_floor_is_raised_rather_than_dropping_keystrokes() {
 
 #[test]
 fn a_squeezed_list_drops_fields_rather_than_being_cut() {
-    // 80-wide terminal, 80-wide sessions: the list floors at 16. At that
-    // width `tools.lua`'s own `remuda._refresh_sessions_buffer` omits
-    // the live/dead word (width < 22) — simulated here as the tail it
-    // would have supplied at each width, since deciding that is no
-    // longer list_row's job (see the "*sessions*" buffer migration
-    // above list_row's own doc comment). What list_row still owns is
-    // degrading the NAME rather than ever truncating the tail it's given.
+    // 80-wide terminal, 80-wide sessions: the list floors at 16. What
+    // list_row owns is degrading the NAME rather than ever truncating the
+    // rest of the Lua-provided row.
     let mut ui = make_ui(vec![row("claude", true, false)]);
     let (list_w, _) = layout(80, 80);
     assert_eq!(list_w, 16);
