@@ -338,6 +338,10 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
             target: (*target).to_string(),
             yes: true,
         },
+        ["revoke", "--yes", target] => ClusterCommand::Revoke {
+            target: (*target).to_string(),
+            yes: true,
+        },
         ["remote"] => ClusterCommand::Remote(None),
         ["remote", target] if target.contains('/') => {
             ClusterCommand::Remote(Some((*target).to_string()))
@@ -372,8 +376,11 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         },
         ClusterCommand::Nodes => match remuda_native::cluster::nodes() {
             Ok(Some((identity, registry))) => {
-                print!("{}", remuda_native::cluster::format_nodes_table(&identity, &registry));
-                ExitCode::SUCCESS
+                let mut stdout = std::io::stdout().lock();
+                match write_nodes_table(&mut stdout, &identity, &registry) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => fail(format!("cluster nodes: {error}")),
+                }
             }
             Ok(None) => fail("cluster is not initialized; run `remuda cluster init`"),
             Err(error) => fail(format!("cluster nodes: {error}")),
@@ -405,10 +412,20 @@ fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
     if entry.node_fp == identity.node_fp {
         return fail("cluster revoke: cannot revoke self");
     }
+    if entry.state == remuda_native::cluster::NodeState::Revoked {
+        println!(
+            "Node {} is already revoked.",
+            remuda_native::cluster::node_label(&entry.node_fp)
+        );
+        return ExitCode::SUCCESS;
+    }
     let fingerprint = entry.node_fp.clone();
     let label = remuda_native::cluster::node_label(&entry.node_fp);
-    use std::io::IsTerminal;
-    let prompt = match revoke_confirmation(yes, std::io::stdin().is_terminal()) {
+    let prompt = match revoke_confirmation(
+        yes,
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+    ) {
         Ok(prompt) => prompt,
         Err(message) => return fail(message),
     };
@@ -435,10 +452,10 @@ fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
     }
 }
 
-fn revoke_confirmation(yes: bool, is_tty: bool) -> Result<bool, &'static str> {
+fn revoke_confirmation(yes: bool, stdin_tty: bool, stderr_tty: bool) -> Result<bool, &'static str> {
     if yes {
         Ok(false)
-    } else if is_tty {
+    } else if stdin_tty && stderr_tty {
         Ok(true)
     } else {
         Err("use --yes to confirm non-interactively")
@@ -450,11 +467,29 @@ fn confirm_revoke(label: &str, fingerprint: &str, prompt: bool) -> std::io::Resu
     if !prompt {
         return Ok(true);
     }
-    print!("Revoke node {label} ({fingerprint})? [y/N] ");
-    io::stdout().flush()?;
+    let mut stderr = io::stderr().lock();
+    write!(stderr, "Revoke node {label} ({fingerprint})? [y/N] ")?;
+    stderr.flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
-    Ok(matches!(answer.trim(), "y" | "Y"))
+    Ok(confirmation_answer_is_yes(&answer))
+}
+
+fn confirmation_answer_is_yes(answer: &str) -> bool {
+    answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes")
+}
+
+fn write_nodes_table<W: Write>(
+    writer: &mut W,
+    identity: &remuda_native::cluster::NodeIdentity,
+    registry: &remuda_native::cluster::Registry,
+) -> std::io::Result<()> {
+    match writer
+        .write_all(remuda_native::cluster::format_nodes_table(identity, registry).as_bytes())
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
 }
 
 fn cluster_init_message(created: bool) -> &'static str {
@@ -467,7 +502,10 @@ fn cluster_init_message(created: bool) -> &'static str {
 
 #[cfg(test)]
 mod cluster_cli_tests {
-    use super::{cluster_init_message, parse_cluster_command, revoke_confirmation, ClusterCommand};
+    use super::{
+        cluster_init_message, confirmation_answer_is_yes, parse_cluster_command,
+        revoke_confirmation, write_nodes_table, ClusterCommand,
+    };
 
     #[test]
     fn cluster_status_and_init_are_recognized() {
@@ -514,16 +552,62 @@ mod cluster_cli_tests {
                 yes: true
             }
         );
+        assert_eq!(
+            parse_cluster_command(&["revoke", "--yes", "SHA256:abc"]),
+            ClusterCommand::Revoke {
+                target: "SHA256:abc".into(),
+                yes: true
+            }
+        );
     }
 
     #[test]
     fn revoke_confirmation_requires_yes_for_non_tty() {
         assert_eq!(
-            revoke_confirmation(false, false),
+            revoke_confirmation(false, false, false),
             Err("use --yes to confirm non-interactively")
         );
-        assert_eq!(revoke_confirmation(true, false), Ok(false));
-        assert_eq!(revoke_confirmation(false, true), Ok(true));
+        assert_eq!(
+            revoke_confirmation(false, true, false),
+            Err("use --yes to confirm non-interactively")
+        );
+        assert_eq!(revoke_confirmation(true, false, false), Ok(false));
+        assert_eq!(revoke_confirmation(false, true, true), Ok(true));
+    }
+
+    #[test]
+    fn confirmation_accepts_yes_case_insensitively_and_defaults_no() {
+        assert!(confirmation_answer_is_yes("y\n"));
+        assert!(confirmation_answer_is_yes("Y"));
+        assert!(confirmation_answer_is_yes("yes\n"));
+        assert!(confirmation_answer_is_yes("YeS"));
+        assert!(!confirmation_answer_is_yes("n"));
+        assert!(!confirmation_answer_is_yes("anything else"));
+        assert!(!confirmation_answer_is_yes(""));
+    }
+
+    #[test]
+    fn nodes_output_ignores_a_broken_pipe() {
+        struct BrokenPipe;
+        impl std::io::Write for BrokenPipe {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let identity = remuda_native::cluster::NodeIdentity {
+            node_name: "node-local".into(),
+            node_fp: "SHA256:local".into(),
+            static_pubkey: vec![],
+        };
+        assert!(write_nodes_table(
+            &mut BrokenPipe,
+            &identity,
+            &remuda_native::cluster::Registry::default()
+        )
+        .is_ok());
     }
 }
 

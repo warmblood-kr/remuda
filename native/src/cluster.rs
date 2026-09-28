@@ -123,27 +123,61 @@ pub fn resolve_node<'a>(
 
 /// Format the local registry with an asterisk on this node's row.
 pub fn format_nodes_table(identity: &NodeIdentity, registry: &Registry) -> String {
-    let mut output = String::from(
-        "NODE              FINGERPRINT                                      STATE    VERSION  BY\n",
-    );
-    for entry in &registry.authorized_nodes {
-        let marker = if entry.node_fp == identity.node_fp {
-            "*"
-        } else {
-            " "
-        };
-        let _ = std::fmt::Write::write_fmt(
-            &mut output,
-            format_args!(
-                "{marker}{:<16}  {:<46}  {:<8} {:<7}  {}\n",
-                node_label(&entry.node_fp),
-                entry.node_fp,
+    let rows: Vec<_> = registry
+        .authorized_nodes
+        .iter()
+        .map(|entry| {
+            (
+                escape_registry_field(&node_label(&entry.node_fp)),
+                escape_registry_field(&entry.node_fp),
                 match entry.state {
                     NodeState::Admitted => "admitted",
                     NodeState::Revoked => "revoked",
                 },
-                entry.version,
-                entry.by
+                entry.version.to_string(),
+                escape_registry_field(&entry.by),
+                entry.node_fp == identity.node_fp,
+            )
+        })
+        .collect();
+    let node_width = rows
+        .iter()
+        .map(|row| row.0.len() + usize::from(row.5))
+        .max()
+        .unwrap_or(0)
+        .max("NODE".len());
+    let fingerprint_width = rows
+        .iter()
+        .map(|row| row.1.len())
+        .max()
+        .unwrap_or(0)
+        .max("FINGERPRINT".len());
+    let version_width = rows
+        .iter()
+        .map(|row| row.3.len())
+        .max()
+        .unwrap_or(0)
+        .max("VERSION".len());
+    let by_width = rows
+        .iter()
+        .map(|row| row.4.len())
+        .max()
+        .unwrap_or(0)
+        .max("BY".len());
+    let mut output = String::new();
+    let _ = std::fmt::Write::write_fmt(
+        &mut output,
+        format_args!(
+            " {:<node_width$}  {:<fingerprint_width$}  {:<8} {:<version_width$}  {:<by_width$}\n",
+            "NODE", "FINGERPRINT", "STATE", "VERSION", "BY"
+        ),
+    );
+    for (node, fingerprint, state, version, by, is_self) in rows {
+        let marker = if is_self { "*" } else { " " };
+        let _ = std::fmt::Write::write_fmt(
+            &mut output,
+            format_args!(
+                "{marker}{node:<node_width$}  {fingerprint:<fingerprint_width$}  {state:<8} {version:<version_width$}  {by:<by_width$}\n"
             ),
         );
     }
@@ -156,11 +190,13 @@ pub fn revoke(_target: &str) -> io::Result<RevokeOutcome> {
     return Err(identity::windows_storage_error());
     #[cfg(not(windows))]
     {
-        let dir = identity::prepare_cluster_dir()?;
-        let _guard = storage::StateLock::acquire(&dir)?;
-        let self_node = identity::load_identity_at(&dir)?;
-        revoke_locked_at(&dir, _target, &self_node)
+        let dir = storage::cluster_state_dir()?.join("cluster");
+        revoke_at(&dir, _target)
     }
+}
+
+fn escape_registry_field(value: &str) -> String {
+    value.chars().flat_map(char::escape_default).collect()
 }
 
 #[cfg(not(windows))]
@@ -169,12 +205,6 @@ fn revoke_locked_at(
     target: &str,
     self_node: &NodeIdentity,
 ) -> io::Result<RevokeOutcome> {
-    if target == self_node.node_fp || target == node_label(&self_node.node_fp) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "cannot revoke self",
-        ));
-    }
     let mut registry = registry::load_registry_at(dir)?;
     let entry = resolve_node(&registry.authorized_nodes, target)?;
     if entry.node_fp == self_node.node_fp {
@@ -202,26 +232,36 @@ fn revoke_locked_at(
     Ok(RevokeOutcome::Revoked)
 }
 
-#[cfg(all(test, not(windows)))]
-fn revoke_at(
-    dir: &std::path::Path,
-    target: &str,
-    self_node: &NodeIdentity,
-) -> io::Result<RevokeOutcome> {
+#[cfg(not(windows))]
+fn revoke_at(dir: &std::path::Path, target: &str) -> io::Result<RevokeOutcome> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => storage::verify_directory(dir)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(cluster_not_initialized_error())
+        }
+        Err(error) => return Err(error),
+    }
     let _guard = storage::StateLock::acquire(dir)?;
-    revoke_locked_at(dir, target, self_node)
+    let self_node = identity::load_identity_at(dir).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            cluster_not_initialized_error()
+        } else {
+            error
+        }
+    })?;
+    revoke_locked_at(dir, target, &self_node)
+}
+
+#[cfg(not(windows))]
+fn cluster_not_initialized_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::NotFound,
+        "cluster is not initialized; run `remuda cluster init`",
+    )
 }
 
 pub fn node_label(fingerprint: &str) -> String {
-    let suffix: String = fingerprint
-        .strip_prefix("SHA256:")
-        .unwrap_or(fingerprint)
-        .bytes()
-        .filter(u8::is_ascii_alphanumeric)
-        .take(8)
-        .map(|byte| char::from(byte).to_ascii_lowercase())
-        .collect();
-    format!("node-{suffix}")
+    identity::node_name(fingerprint)
 }
 
 #[cfg(all(test, unix))]
@@ -268,7 +308,7 @@ mod nodes_revoke_tests {
             ],
         };
         registry::save_registry_at(&dir, &registry).unwrap();
-        let result = revoke_at(&dir, &target.node_name, &self_node).unwrap();
+        let result = revoke_at(&dir, &target.node_name).unwrap();
         assert_eq!(result, RevokeOutcome::Revoked);
         registry = registry::load_registry_at(&dir).unwrap();
         let revoked = registry
@@ -285,7 +325,20 @@ mod nodes_revoke_tests {
     fn revoke_refuses_self() {
         let dir = temp_dir();
         let (self_node, _) = identity::init_identity_at(&dir).unwrap();
-        let result = revoke_at(&dir, &self_node.node_name, &self_node).unwrap_err();
+        registry::save_registry_at(
+            &dir,
+            &Registry {
+                authorized_nodes: vec![AuthorizedNode {
+                    node_fp: self_node.node_fp.clone(),
+                    static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+                    state: NodeState::Admitted,
+                    version: 1,
+                    by: self_node.node_fp.clone(),
+                }],
+            },
+        )
+        .unwrap();
+        let result = revoke_at(&dir, &self_node.node_name).unwrap_err();
         assert!(result.to_string().contains("cannot revoke self"));
     }
 
@@ -308,7 +361,7 @@ mod nodes_revoke_tests {
         )
         .unwrap();
         assert_eq!(
-            revoke_at(&dir, &target.node_fp, &self_node).unwrap(),
+            revoke_at(&dir, &target.node_fp).unwrap(),
             RevokeOutcome::AlreadyRevoked
         );
         assert_eq!(
@@ -347,9 +400,10 @@ mod nodes_revoke_tests {
 
     #[test]
     fn nodes_table_shows_membership_fields_and_marks_self() {
+        let fingerprint = encoding::fingerprint(&[7; 32]);
         let identity = NodeIdentity {
-            node_name: "node-self1234".into(),
-            node_fp: "SHA256:self1234".into(),
+            node_name: identity::node_name(&fingerprint),
+            node_fp: fingerprint.clone(),
             static_pubkey: vec![],
         };
         let registry = Registry {
@@ -362,7 +416,7 @@ mod nodes_revoke_tests {
             }],
         };
         let table = format_nodes_table(&identity, &registry);
-        assert!(table.contains("*node-self1234"));
+        assert!(table.contains(&format!("*{}", identity.node_name)));
         assert!(table.contains("FINGERPRINT"));
         assert!(table.contains("STATE"));
         assert!(table.contains("VERSION"));
@@ -370,6 +424,95 @@ mod nodes_revoke_tests {
         assert!(table.contains("admitted"));
         assert!(table.contains("1"));
         assert!(table.contains(&identity.node_fp));
-        assert!(table.lines().nth(1).unwrap().ends_with(&identity.node_fp));
+        assert!(identity.node_fp.len() > 46);
+        assert_eq!(
+            table.lines().next().unwrap().find("STATE"),
+            table.lines().nth(1).unwrap().find("admitted")
+        );
+    }
+
+    #[test]
+    fn nodes_table_escapes_control_characters_in_registry_fields() {
+        let fingerprint = encoding::fingerprint(&[7; 32]);
+        let identity = NodeIdentity {
+            node_name: identity::node_name(&fingerprint),
+            node_fp: fingerprint,
+            static_pubkey: vec![],
+        };
+        let registry = Registry {
+            authorized_nodes: vec![AuthorizedNode {
+                node_fp: "SHA256:other".into(),
+                static_pubkey: String::new(),
+                state: NodeState::Admitted,
+                version: 1,
+                by: "SHA256:bad\x1b\nvalue".into(),
+            }],
+        };
+        let table = format_nodes_table(&identity, &registry);
+        assert!(table.contains("SHA256:bad\\u{1b}\\nvalue"));
+        assert!(!table.contains('\x1b'));
+        assert_eq!(table.lines().count(), 2);
+    }
+
+    #[test]
+    fn revoke_does_not_create_a_missing_cluster_directory() {
+        let dir = temp_dir().join("missing-cluster");
+        let error = revoke_at(&dir, "unknown").unwrap_err();
+        assert!(error.to_string().contains("cluster is not initialized"));
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn concurrent_revoke_keeps_all_tombstones() {
+        use std::thread;
+
+        let dir = temp_dir();
+        let (self_node, _) = identity::init_identity_at(&dir).unwrap();
+        let mut entries = vec![AuthorizedNode {
+            node_fp: self_node.node_fp.clone(),
+            static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+            state: NodeState::Admitted,
+            version: 1,
+            by: self_node.node_fp.clone(),
+        }];
+        let mut targets = Vec::new();
+        for index in 0..8 {
+            let target_dir = dir.join(format!("target-{index}"));
+            let (target, _) = identity::init_identity_at(&target_dir).unwrap();
+            entries.push(AuthorizedNode {
+                node_fp: target.node_fp.clone(),
+                static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                state: NodeState::Admitted,
+                version: 3,
+                by: self_node.node_fp.clone(),
+            });
+            targets.push(target.node_fp);
+        }
+        registry::save_registry_at(
+            &dir,
+            &Registry {
+                authorized_nodes: entries,
+            },
+        )
+        .unwrap();
+        let workers: Vec<_> = targets
+            .into_iter()
+            .map(|target| {
+                let dir = dir.clone();
+                thread::spawn(move || revoke_at(&dir, &target).unwrap())
+            })
+            .collect();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), RevokeOutcome::Revoked);
+        }
+        let registry = registry::load_registry_at(&dir).unwrap();
+        assert_eq!(
+            registry
+                .authorized_nodes
+                .iter()
+                .filter(|entry| entry.state == NodeState::Revoked)
+                .count(),
+            8
+        );
     }
 }
