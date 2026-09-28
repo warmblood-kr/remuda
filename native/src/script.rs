@@ -596,7 +596,9 @@ fn activate_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Res
         active.set(true);
         if let (Value::Function(start), Value::Function(rollback)) = (start, rollback) {
             let remuda_global: Table = lua.globals().get("remuda")?;
-            let was_active: bool = remuda_global.get("_lifecycle_start_active").unwrap_or(false);
+            let was_active: bool = remuda_global
+                .get("_lifecycle_start_active")
+                .unwrap_or(false);
             remuda_global.set("_lifecycle_start_active", true)?;
             let result = start.call::<()>(state);
             remuda_global.set("_lifecycle_start_active", was_active)?;
