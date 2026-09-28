@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod mouse;
 pub mod packages;
 pub mod process;
+mod process_ancestry;
 pub mod pty;
 pub mod remote_front;
 pub mod script;

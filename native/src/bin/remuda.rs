@@ -65,6 +65,8 @@ fn main() -> ExitCode {
 
         ["_codex_tui", rest @ ..] => codex_tui::run(rest),
 
+        ["_codex_watch", parent_pid, process_group] => run_codex_watch(parent_pid, process_group),
+
         // No daemon involved: this replaces the binary, it does not talk to one.
         ["upgrade", rest @ ..] => run_upgrade(rest),
 
@@ -170,6 +172,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+    }
+}
+
+fn run_codex_watch(parent_pid: &str, process_group: &str) -> ExitCode {
+    match (parent_pid.parse::<i32>(), process_group.parse::<i32>()) {
+        (Ok(parent_pid), Ok(process_group)) => codex_tui::watch_parent(parent_pid, process_group),
+        _ => fail("invalid Codex app-server watch parameters"),
     }
 }
 
