@@ -81,6 +81,38 @@ fn request_counts(path: &Path) -> (u64, u64, u64) {
 }
 
 #[test]
+fn expect_option_strips_whole_utf8_selection_markers() {
+    let dir = scratch("expect-option-utf8");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+    let code = r#"
+        local highlighted = remuda.expect_option(
+            "  Update available\n› 1. Update now\n  2. Skip\n",
+            function(label) return label == "Update now" end
+        )
+        assert(highlighted == "1", "the highlighted UTF-8 option marker must be stripped")
+
+        local boxed = remuda.expect_option(
+            "┌ Options\n│ ❯ 2. Foo\n│   3. Bar\n└\n",
+            function(label) return label == "Foo" end
+        )
+        assert(boxed == "2", "box and selection markers must both be stripped as whole characters")
+        return highlighted .. "," .. boxed
+    "#;
+    let result = match client::request(
+        &path,
+        &Request::Eval {
+            code: code.to_string(),
+            name: None,
+        },
+    ) {
+        Ok(Response::Value(value)) => value,
+        other => panic!("expect_option evaluation failed: {other:?}"),
+    };
+    assert_eq!(result, "1,2");
+}
+
+#[test]
 fn daemon_request_counts_reflect_real_requests_seen_at_dispatch() {
     // "One object, readable two ways": this Rust test is one of those two
     // ways, reading the same `request_counts()` binding a Lua/MCP caller
