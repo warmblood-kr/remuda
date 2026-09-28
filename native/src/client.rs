@@ -220,9 +220,23 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
             let mut parser = crate::mouse::SgrParser::default();
             let mut mouse_on = mouse;
             loop {
+                if output_done.load(std::sync::atomic::Ordering::SeqCst) {
+                    // Keep the advertised "press any key" behavior after the
+                    // child exits, but let that key release the attach and
+                    // restore terminal modes instead of routing it to nowhere.
+                    let Ok(Some(_)) = read_stdin_timeout(
+                        &mut stdin,
+                        &mut buf,
+                        std::time::Duration::from_secs(86_400),
+                    ) else {
+                        continue;
+                    };
+                    break;
+                }
                 let wait = parser
                     .timeout_remaining()
-                    .unwrap_or(std::time::Duration::from_secs(86_400));
+                    .unwrap_or(std::time::Duration::from_millis(25))
+                    .min(std::time::Duration::from_millis(25));
                 let n = match read_stdin_timeout(&mut stdin, &mut buf, wait) {
                     Ok(Some(n)) => n,
                     Ok(None) => {
@@ -239,6 +253,9 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     }
                     Err(_) => break,
                 };
+                if output_done.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
                 if n == 0 {
                     break;
                 }
@@ -327,10 +344,8 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     let left = if detached.load(std::sync::atomic::Ordering::SeqCst) {
         Left::Detached
     } else {
-        // The session ended while the key thread sits in a tty read, and a tty
-        // read cannot be interrupted portably — so `join` below returns only on
-        // the next keystroke, which it then swallows. Say so instead of
-        // freezing: a stated wait is not the same failure as a dead screen.
+        // The key thread remains alive until one key releases the user's
+        // terminal after the session exits.
         let _ = write!(stdout, "\r\n[remuda] {name} ended — press any key\r\n");
         let _ = stdout.flush();
         Left::Exited
