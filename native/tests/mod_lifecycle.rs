@@ -434,8 +434,6 @@ fn reload_into_a_failing_start_keeps_the_previous_registrations() {
     );
 }
 
-/// A failed `start` rolls back, but a hook it registered imperatively
-/// survives. It must land by depth, not appended after the restored ones.
 /// A hook a failing `start` registered is owned by the mod (hook-design §3),
 /// so rollback drops it; hooks from outside the mod keep their place.
 #[test]
