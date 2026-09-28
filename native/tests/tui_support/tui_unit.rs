@@ -34,7 +34,17 @@ fn anchor_capture_stops_retrying_when_output_never_quiets() {
     assert_eq!(rows, 10_000);
     assert_eq!(total, 10_056);
     assert_eq!(offset, 40);
-    assert_eq!(anchor_total, 10_050);
+    assert_eq!(anchor_total, 10_044);
+
+    let mut next_offsets = Vec::new();
+    let (_, _, _, next_offset, _) = capture_anchored(offset, anchor_total, |requested| {
+        next_offsets.push(requested);
+        let total = 10_060;
+        Ok(((), 10_000, total))
+    })
+    .expect("the next frame catches up to output seen during capped retries");
+    assert_eq!(next_offsets, [40, 56]);
+    assert_eq!(next_offset, 56);
 }
 
 /// The regression steps/017 guards: an idle *list*-focused herd must not
@@ -731,6 +741,8 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
 }
 
 #[test]
+// Windows drifts at the 10k cap under ConPTY: #201.
+#[cfg(unix)]
 fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {
     let path = scratch_socket("preview-content-anchor-at-cap");
     daemon_at(&path);

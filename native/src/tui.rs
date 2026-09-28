@@ -2709,7 +2709,6 @@ fn capture_anchored<T>(
     mut capture: impl FnMut(usize) -> Result<(T, usize, usize), String>,
 ) -> Result<(T, usize, usize, usize, usize), String> {
     let mut requested = base_offset;
-    let mut requested_total = previous_total;
     for attempt in 0..MAX_ANCHOR_CAPTURES {
         let (value, rows, total) = capture(requested)?;
         let anchored = anchor_offset_to_new_history(base_offset, previous_total, total, rows);
@@ -2717,13 +2716,14 @@ fn capture_anchored<T>(
             return Ok((value, rows, total, anchored, total));
         }
         if attempt + 1 == MAX_ANCHOR_CAPTURES {
-            // Keep the actual captured offset paired with these cells. Carry
-            // forward the total at which that offset was requested so the
-            // next frame can account for output that arrived during retries.
-            return Ok((value, rows, total, requested, requested_total));
+            // The captured cells use `requested`, while `total` may already
+            // include output that arrived after that offset was chosen. Store
+            // the total that corresponds to the captured offset so the next
+            // frame accounts for that missed drift exactly once.
+            let anchor_total = total.saturating_sub(requested.saturating_sub(base_offset));
+            return Ok((value, rows, total, requested, anchor_total));
         }
         requested = anchored;
-        requested_total = total;
     }
     unreachable!("the bounded anchor loop always returns a capture")
 }
