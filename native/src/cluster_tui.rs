@@ -122,6 +122,10 @@ impl ClusterUi {
 
     fn sessions_synced(&mut self, sessions: Vec<SessionSummary>, at: Duration) {
         let previous = self.sessions.get(self.active).cloned();
+        let selected = self
+            .sessions
+            .get(self.selected)
+            .map(|session| (session.name.clone(), session.instance_id.clone()));
         if self.ended.is_none() {
             if let Some(previous) = previous {
                 let same_start = sessions.iter().any(|session| {
@@ -162,8 +166,15 @@ impl ClusterUi {
             summary.alive = false;
             summary.attached = false;
             self.sessions.push(summary);
-            self.selected = self.sessions.len() - 1;
-            self.active = self.selected;
+            let ended_index = self.sessions.len() - 1;
+            self.selected = selected
+                .and_then(|(name, instance_id)| {
+                    self.sessions.iter().position(|session| {
+                        session.name == name && session.instance_id == instance_id
+                    })
+                })
+                .unwrap_or(ended_index);
+            self.active = ended_index;
         } else {
             self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
             self.active = self.active.min(self.sessions.len().saturating_sub(1));
@@ -390,6 +401,8 @@ impl ClusterUi {
                             self.notice =
                                 Some(("cannot close: session identity is missing".into(), now));
                         }
+                    } else {
+                        self.notice = Some((format!("{} has already ended", session.name), now));
                     }
                 }
             }
@@ -1181,6 +1194,41 @@ mod tests {
         assert!(frame.contains("studio / dev · ended · final snapshot"));
         assert!(frame.contains("final output"));
         assert!(frame.contains("Input is disabled"));
+    }
+
+    #[test]
+    fn sync_keeps_tree_selection_while_showing_an_ended_frame() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new(
+            "studio",
+            vec![session("dev", true), session("worker", true)],
+            clock.now(),
+        );
+        let summary = ui.sessions[0].clone();
+        assert!(ui.record_capture(&summary, "final output".into(), clock.now()));
+        ui.sessions_synced(vec![session("worker", true)], Duration::from_secs(1));
+        assert!(ui.ended.is_some());
+        assert_eq!(ui.sessions[ui.selected].name, "dev");
+
+        ui.key(crossterm::event::KeyCode::Up);
+        assert_eq!(ui.sessions[ui.selected].name, "worker");
+        ui.sessions_synced(vec![session("worker", true)], Duration::from_secs(2));
+
+        assert_eq!(ui.sessions[ui.selected].name, "worker");
+        assert_eq!(ui.sessions[ui.active].name, "dev");
+        assert!(ui.ended.is_some());
+    }
+
+    #[test]
+    fn x_on_a_dead_session_shows_an_already_ended_notice() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", vec![session("dev", false)], clock.now());
+
+        ui.key(crossterm::event::KeyCode::Char('x'));
+
+        let frame = ui.render(80, 24, "", &clock);
+        assert!(frame.contains("dev has already ended"));
+        assert!(!frame.contains("kill dev?"));
     }
 
     #[test]
