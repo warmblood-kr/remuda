@@ -192,6 +192,11 @@ fn the_bound_surface_is_exactly_the_protocols() {
         if session_got ~= session_want then
           error("session namespace is " .. session_got .. ", expected " .. session_want)
         end
+        assert(type(remuda.process) == "table", "process namespace is a table")
+        local process_words = {{}}
+        for key in pairs(remuda.process) do process_words[#process_words + 1] = key end
+        table.sort(process_words)
+        assert(table.concat(process_words, ",") == "run", "process namespace surface must be exactly run")
         "#
     );
 
