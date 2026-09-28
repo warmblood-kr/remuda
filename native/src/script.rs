@@ -312,24 +312,7 @@ pub fn bindings(
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
-
-    table.set(
-        "fail",
-        lua.create_function(
-            |_, (message, code): (String, Option<i64>)| -> mlua::Result<()> {
-                let code = code.unwrap_or(1);
-                if !(1..=255).contains(&code) {
-                    return Err(mlua::Error::runtime(
-                        "remuda.fail exit code must be an integer from 1 through 255",
-                    ));
-                }
-                Err(mlua::Error::external(crate::image::TypedFailure {
-                    message,
-                    code: code as u8,
-                }))
-            },
-        )?,
-    )?;
+    fail_binding(lua, &table)?;
 
     // In-process, not a loopback: the image always runs inside the same
     // daemon this `Registry` belongs to (image.rs), so asking over the wire
@@ -654,6 +637,26 @@ pub(crate) fn hide_module_activator(lua: &Lua) -> mlua::Result<()> {
 /// `remuda.capture_styled(name)` — split out of `bindings` for its line cap.
 /// Only what a script needs to tell a TUI's dim ghost text from typed text,
 /// and where the caret is (#137): not colours or the other attributes.
+fn fail_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
+    table.set(
+        "fail",
+        lua.create_function(
+            |_, (message, code): (String, Option<i64>)| -> mlua::Result<()> {
+                let code = code.unwrap_or(1);
+                if !(1..=255).contains(&code) {
+                    return Err(mlua::Error::runtime(
+                        "remuda.fail exit code must be an integer from 1 through 255",
+                    ));
+                }
+                Err(mlua::Error::external(crate::image::TypedFailure {
+                    message,
+                    code: code as u8,
+                }))
+            },
+        )?,
+    )
+}
+
 fn capture_styled_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
     table.set(
         "capture_styled",
