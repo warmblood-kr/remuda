@@ -236,6 +236,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     let output_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let output_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let trace_input = std::env::var_os("REMUDA_TRACE_INPUT").map(PathBuf::from);
+    let trace_attach_exit = std::env::var_os("REMUDA_TRACE_ATTACH_EXIT").is_some();
     let scrollback = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let output_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
     let attach_path = path.to_path_buf();
@@ -258,6 +259,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
             let mut buf = [0u8; 1024];
             let mut parser = crate::mouse::SgrParser::default();
             let mut mouse_on = mouse;
+            let mut logged_pending_read = false;
             loop {
                 if output_done.load(std::sync::atomic::Ordering::SeqCst) {
                     if output_taken_over.load(std::sync::atomic::Ordering::SeqCst) {
@@ -267,28 +269,72 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     // child exits, but let that key release the attach and
                     // restore terminal modes instead of routing it to nowhere.
                     #[cfg(unix)]
-                    let Ok(Some(_)) = read_stdin_timeout(
-                        &mut stdin,
-                        &mut buf,
-                        std::time::Duration::from_secs(86_400),
-                    ) else {
-                        continue;
-                    };
+                    {
+                        let post_exit_read = read_stdin_timeout(
+                            &mut stdin,
+                            &mut buf,
+                            std::time::Duration::from_secs(86_400),
+                        );
+                        match post_exit_read {
+                            Ok(Some(_)) => {
+                                if trace_attach_exit {
+                                    eprintln!("attach input trace: post-exit forwarder read a key");
+                                }
+                                break;
+                            }
+                            Ok(None) => continue,
+                            Err(error) => {
+                                if trace_attach_exit {
+                                    eprintln!("attach input trace: post-exit read error: {error}");
+                                }
+                                break;
+                            }
+                        }
+                    }
                     #[cfg(windows)]
                     {
-                        // ConPTY input does not signal the console HANDLE for
-                        // WaitForSingleObject. A blocking raw stdin read does
-                        // receive the key and lets the attach return here.
-                        let _ = stdin.read(&mut buf);
+                        if trace_attach_exit {
+                            eprintln!("attach input trace: post-exit ReadConsoleInputW entered");
+                        }
+                        // Once output has ended, wait directly on the console
+                        // input queue. ConPTY keys do not reliably wake the
+                        // handle through WaitForSingleObject.
+                        let result = wait_for_windows_keypress();
+                        if trace_attach_exit {
+                            eprintln!("attach input trace: post-exit ReadConsoleInputW returned: {result:?}");
+                        }
                         break;
                     }
-                    break;
                 }
                 let wait = parser
                     .timeout_remaining()
                     .unwrap_or(std::time::Duration::from_millis(25))
                     .min(std::time::Duration::from_millis(25));
-                let n = match read_stdin_timeout(&mut stdin, &mut buf, wait) {
+                if trace_attach_exit && !logged_pending_read {
+                    eprintln!(
+                        "attach input trace: forwarder entering stdin read; output_done={}",
+                        output_done.load(std::sync::atomic::Ordering::SeqCst)
+                    );
+                    logged_pending_read = true;
+                }
+                let read = read_stdin_timeout(&mut stdin, &mut buf, wait);
+                if trace_attach_exit {
+                    match &read {
+                        Ok(Some(n)) => {
+                            eprintln!(
+                                "attach input trace: forwarder read {n} bytes; output_done={}",
+                                output_done.load(std::sync::atomic::Ordering::SeqCst)
+                            );
+                            logged_pending_read = false;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            eprintln!("attach input trace: forwarder read error: {error}");
+                            logged_pending_read = false;
+                        }
+                    }
+                }
+                let n = match read {
                     Ok(Some(n)) => n,
                     Ok(None) => {
                         route_tokens(
@@ -372,20 +418,25 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     let mut stdout = std::io::stdout();
     let mut buf = [0u8; 8192];
     let mut reader = reader_stream.as_ref();
-    while !output_stop.load(std::sync::atomic::Ordering::SeqCst) {
-        let Ok(n) = reader.read(&mut buf) else {
-            break;
-        };
-        if n == 0 {
-            break;
+    let output_end = loop {
+        if output_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            break "stopped".to_string();
         }
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break "EOF".to_string(),
+            Ok(n) => n,
+            Err(error) => break format!("read error: {error}"),
+        };
         let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
         if scrollback.load(std::sync::atomic::Ordering::SeqCst) != 0 {
             continue;
         }
         if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
-            break;
+            break "stdout write failed".to_string();
         }
+    };
+    if trace_attach_exit {
+        eprintln!("attach input trace: session output reader ended: {output_end}");
     }
 
     let taken_over = was_taken_over(path, name, generation);
@@ -417,6 +468,40 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     #[cfg(unix)]
     let _ = keys.join();
     Ok(left)
+}
+
+#[cfg(windows)]
+fn wait_for_windows_keypress() -> std::io::Result<()> {
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, ReadConsoleInputW, INPUT_RECORD, KEY_EVENT, STD_INPUT_HANDLE,
+    };
+
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let mut records = [INPUT_RECORD::default(); 16];
+    loop {
+        let mut count = 0;
+        if unsafe {
+            ReadConsoleInputW(
+                handle,
+                records.as_mut_ptr(),
+                records.len() as u32,
+                &mut count,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        for record in records.iter().take(count as usize) {
+            if u32::from(record.EventType) == KEY_EVENT {
+                // Console input queues include key-up records as well. Only a
+                // key-down should release the post-exit wait.
+                let key = unsafe { record.Event.KeyEvent };
+                if key.bKeyDown != 0 && key.wVirtualKeyCode != 0 {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -801,9 +886,9 @@ impl Drop for RawMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        interpret, reset_input_modes, trace_input_read, write_input_trace, RESET_INPUT_MODES,
-    };
+    #[cfg(unix)]
+    use super::trace_input_read;
+    use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
     use remuda_core::protocol::Response;
     use std::time::{Duration, UNIX_EPOCH};
 

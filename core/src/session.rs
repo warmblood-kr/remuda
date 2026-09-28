@@ -3,7 +3,9 @@
 //! Input acts stay indivisible, sessions do not resize, and one viewer owns an
 //! attachment at a time.
 
-use crate::agent::{AgentError, AgentProcess, Cursor, MouseState, Result, Size, StyledCell};
+use crate::agent::{
+    AgentError, AgentProcess, Cursor, MouseState, Result, ScreenSnapshot, Size, StyledCell,
+};
 use crate::clock::Clock;
 use crate::protocol::Step;
 use core::time::Duration;
@@ -262,12 +264,34 @@ impl Session {
         agent.screen_cells_at(scrollback)
     }
 
+    pub fn scrollback_len(&self) -> usize {
+        self.agent
+            .lock()
+            .map(|mut agent| agent.scrollback_len())
+            .unwrap_or(0)
+    }
+
+    pub fn scrollback_total(&self) -> usize {
+        self.agent
+            .lock()
+            .map(|mut agent| agent.scrollback_total())
+            .unwrap_or(0)
+    }
+
     pub fn row_wrapped_at(&self, scrollback: usize) -> Result<Vec<bool>> {
         let mut agent = self
             .agent
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
         agent.row_wrapped_at(scrollback)
+    }
+
+    pub fn screen_snapshot_at(&self, scrollback: usize) -> Result<ScreenSnapshot> {
+        let mut agent = self
+            .agent
+            .lock()
+            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        agent.screen_snapshot_at(scrollback)
     }
 
     pub fn is_alive(&self) -> bool {

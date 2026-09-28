@@ -1,6 +1,52 @@
 use super::*;
 use remuda_core::Size;
 
+#[test]
+fn anchor_capture_retries_when_history_advances_between_captures() {
+    let captures = [(10_000, 10_044), (10_000, 10_050), (10_000, 10_050)];
+    let mut requested_offsets = Vec::new();
+    let (_, _, total, offset, anchor_total) = capture_anchored(28, 10_038, |requested| {
+        requested_offsets.push(requested);
+        let (rows, total) = captures[requested_offsets.len() - 1];
+        Ok(((), rows, total))
+    })
+    .expect("capture stabilizes");
+
+    assert_eq!(requested_offsets, [28, 34, 40]);
+    assert_eq!(offset, 40);
+    assert_eq!(total, 10_050);
+    assert_eq!(anchor_total, 10_050);
+}
+
+#[test]
+fn anchor_capture_stops_retrying_when_output_never_quiets() {
+    let mut calls = 0;
+    let (requested, rows, total, offset, anchor_total) =
+        capture_anchored(28, 10_038, |requested| {
+            calls += 1;
+            assert!(calls <= 3, "anchor capture exceeded its retry budget");
+            Ok((requested, 10_000, 10_038 + calls * 6))
+        })
+        .expect("bounded capture returns its final consistent snapshot");
+
+    assert_eq!(calls, 3);
+    assert_eq!(requested, 40);
+    assert_eq!(rows, 10_000);
+    assert_eq!(total, 10_056);
+    assert_eq!(offset, 40);
+    assert_eq!(anchor_total, 10_044);
+
+    let mut next_offsets = Vec::new();
+    let (_, _, _, next_offset, _) = capture_anchored(offset, anchor_total, |requested| {
+        next_offsets.push(requested);
+        let total = 10_060;
+        Ok(((), 10_000, total))
+    })
+    .expect("the next frame catches up to output seen during capped retries");
+    assert_eq!(next_offsets, [40, 56]);
+    assert_eq!(next_offset, 56);
+}
+
 /// The regression steps/017 guards: an idle *list*-focused herd must not
 /// redo the full IPC cycle on every poll wake — `run` only uses the
 /// faster `TICK_TYPING` gate for a focused session, see the next test.
@@ -80,7 +126,25 @@ fn make_ui(rows: Vec<SessionSummary>) -> Ui {
     let mut ui = Ui::new(rows, "/bin/sh", None);
     // Unit fixtures use the same row contract the Lua renderer publishes.
     ui.session_rows = 3;
+    ui.preview_rows = 23;
     ui
+}
+
+#[cfg(windows)]
+fn streaming_command(_unix_script: &str, windows_script: &str) -> Vec<String> {
+    vec![
+        "powershell.exe".into(),
+        "-NoLogo".into(),
+        "-NoProfile".into(),
+        "-NonInteractive".into(),
+        "-Command".into(),
+        windows_script.into(),
+    ]
+}
+
+#[cfg(not(windows))]
+fn streaming_command(unix_script: &str, _windows_script: &str) -> Vec<String> {
+    vec!["sh".into(), "-c".into(), unix_script.into()]
 }
 
 fn press(code: KeyCode) -> KeyEvent {
@@ -304,6 +368,394 @@ fn shift_wheel_is_forwarded_to_the_child_tui() {
         ui.on_mouse(wheel, 80, 24),
         Action::Type(remuda_core::keys::mouse("wheel-down", 3, 5).unwrap())
     );
+}
+
+#[test]
+fn paging_moves_by_one_preview_page_and_end_returns_to_follow() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    ui.scrollback.insert(
+        "a".into(),
+        ScrollState {
+            offset: 0,
+            history_rows: 100,
+            ..ScrollState::default()
+        },
+    );
+
+    assert_eq!(ui.on_key(press(KeyCode::PageUp)), Action::Scroll(22));
+    scroll_selected(&mut ui, 22);
+    assert_eq!(ui.scrollback["a"].offset, 22);
+    assert_eq!(ui.on_key(press(KeyCode::PageUp)), Action::Scroll(22));
+    scroll_selected(&mut ui, 22);
+    assert_eq!(ui.scrollback["a"].offset, 44, "two PageUps are two pages");
+
+    assert_eq!(
+        ui.on_key(press(KeyCode::PageDown)),
+        Action::Scroll(-22),
+        "PageDown should move by one preview page"
+    );
+    scroll_selected(&mut ui, -22);
+    assert_eq!(ui.scrollback["a"].offset, 22);
+    assert_eq!(ui.on_key(press(KeyCode::PageDown)), Action::Scroll(-22));
+    scroll_selected(&mut ui, -22);
+    assert_eq!(
+        ui.scrollback["a"].offset, 0,
+        "PageDown to zero enables follow"
+    );
+
+    ui.scrollback.get_mut("a").unwrap().offset = 80;
+    assert_eq!(ui.on_key(press(KeyCode::End)), Action::Scroll(i16::MIN));
+    scroll_selected(&mut ui, i16::MIN);
+    assert_eq!(ui.scrollback["a"].offset, 0);
+}
+
+#[test]
+fn preview_wheel_down_returns_to_follow_and_clamps_past_bottom() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    let wheel = |kind| MouseEvent {
+        kind,
+        column: 19,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert_eq!(
+        ui.on_mouse(wheel(MouseEventKind::ScrollUp), 80, 24),
+        Action::Scroll(3)
+    );
+    ui.scrollback.insert(
+        "a".into(),
+        ScrollState {
+            offset: 3,
+            history_rows: 30,
+            ..ScrollState::default()
+        },
+    );
+
+    assert_eq!(
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
+        Action::Scroll(-3)
+    );
+    {
+        scroll_state(ui.scrollback.get_mut("a").unwrap(), -3);
+        assert_eq!(
+            ui.scrollback["a"].offset, 0,
+            "wheel-down to the bottom must enable follow"
+        );
+    }
+
+    assert_eq!(
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
+        Action::Scroll(-3)
+    );
+    scroll_state(ui.scrollback.get_mut("a").unwrap(), -3);
+    assert_eq!(
+        ui.scrollback["a"].offset, 0,
+        "scrolling past the bottom stays in follow mode"
+    );
+}
+
+#[test]
+fn scrolled_preview_offset_stays_with_its_content_as_history_grows() {
+    assert_eq!(anchor_offset_to_new_history(6, 40, 43, 100), 9);
+    assert_eq!(anchor_offset_to_new_history(0, 40, 43, 100), 0);
+    assert_eq!(anchor_offset_to_new_history(6, 43, 43, 100), 6);
+}
+
+#[test]
+fn monotonic_history_keeps_anchor_moving_after_the_retained_buffer_is_full() {
+    assert_eq!(anchor_offset_to_new_history(6, 20_000, 20_003, 10_000), 9);
+    assert_eq!(anchor_offset_to_new_history(0, 20_000, 20_003, 10_000), 0);
+}
+
+#[test]
+fn session_input_returns_to_live_view_without_swallowing_the_key() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    ui.on_key(press(KeyCode::Enter));
+    ui.scrollback.insert(
+        "a".into(),
+        ScrollState {
+            offset: 5,
+            history_rows: 20,
+            ..ScrollState::default()
+        },
+    );
+
+    assert_eq!(
+        ui.on_key(press(KeyCode::Char('x'))),
+        Action::Type(b"x".to_vec())
+    );
+    assert_eq!(ui.scrollback["a"].offset, 0);
+}
+
+#[test]
+fn real_preview_follows_output_after_wheel_returns_to_bottom() {
+    let path = scratch_socket("preview-follow-after-wheel");
+    daemon_at(&path);
+    let command = streaming_command(
+        "i=0; while [ $i -lt 200 ]; do printf 'newest-%03d\\n' $i; i=$((i + 1)); sleep 0.02; done; sleep 3",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 200; $i++) { Write-Output ('newest-{0:D3}' -f $i); Start-Sleep -Milliseconds 20 }; Start-Sleep -Seconds 3",
+    );
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("stream".into()),
+            command,
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new streaming session");
+    assert_eq!(response, Response::Value("stream".into()));
+
+    let mut ui = make_ui(vec![row("stream", true, false)]);
+    let history_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        capture_preview(&path, &mut ui, "stream").expect("initial live preview");
+        if ui.scrollback["stream"].history_rows >= 40 {
+            break;
+        }
+        assert!(
+            Instant::now() < history_deadline,
+            "output did not reach scrollback"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let wheel = |kind| MouseEvent {
+        kind,
+        column: 19,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    };
+    for _ in 0..10 {
+        assert_eq!(
+            ui.on_mouse(wheel(MouseEventKind::ScrollUp), 80, 24),
+            Action::Scroll(3)
+        );
+        scroll_selected(&mut ui, 3);
+        capture_preview(&path, &mut ui, "stream").expect("capture scrolling output");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(ui.scrollback["stream"].offset >= 30);
+
+    for _ in 0..30 {
+        assert_eq!(
+            ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
+            Action::Scroll(-3)
+        );
+        scroll_selected(&mut ui, -3);
+        capture_preview(&path, &mut ui, "stream").expect("capture while returning live");
+        if ui.scrollback["stream"].offset == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(ui.scrollback["stream"].offset, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let (cells, _, cursor) =
+            capture_preview(&path, &mut ui, "stream").expect("capture the streaming preview");
+        let frame = render_styled(&ui, &cells, cursor, "default", 80, 25);
+        if frame.contains("newest-199") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "latest output never appeared after returning to bottom: {frame:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = client::request(
+        &path,
+        &Request::Close {
+            name: "stream".into(),
+        },
+    );
+}
+
+#[test]
+fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
+    let path = scratch_socket("preview-content-anchor");
+    daemon_at(&path);
+    let command = streaming_command(
+        "i=0; while [ $i -lt 70 ]; do printf 'row-%02d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 3",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 70; $i++) { Write-Output ('row-{0:D2}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 3",
+    );
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("stream".into()),
+            command,
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new streaming session");
+    assert_eq!(response, Response::Value("stream".into()));
+
+    let mut ui = make_ui(vec![row("stream", true, false)]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        capture_preview(&path, &mut ui, "stream").expect("capture preview");
+        if ui.scrollback["stream"].history_rows >= 3 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "output did not reach scrollback");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        ui.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 19,
+                row: 4,
+                modifiers: KeyModifiers::NONE,
+            },
+            80,
+            24,
+        ),
+        Action::Scroll(3)
+    );
+    scroll_selected(&mut ui, 3);
+    let (anchor_cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("scroll up");
+    let anchor_text = terminal_rows_text(&anchor_cells);
+    let anchor_history = ui.scrollback["stream"].history_rows;
+
+    loop {
+        let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture output");
+        let state = ui.scrollback["stream"];
+        if state.history_rows >= anchor_history + 3 {
+            assert_eq!(
+                state.offset,
+                3 + (state.history_rows - anchor_history),
+                "the offset must advance with appended history rows"
+            );
+            assert_eq!(
+                terminal_rows_text(&cells),
+                anchor_text,
+                "new output must not move the scrolled content"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "history did not grow while scrolled"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = client::request(
+        &path,
+        &Request::Close {
+            name: "stream".into(),
+        },
+    );
+}
+
+#[test]
+// Windows drifts at the 10k cap under ConPTY: #201.
+#[cfg(unix)]
+fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {
+    let path = scratch_socket("preview-content-anchor-at-cap");
+    daemon_at(&path);
+    let command = streaming_command(
+        "i=0; while [ $i -lt 10100 ]; do printf 'row-%05d\\n' $i; i=$((i + 1)); done; j=0; while [ $j -lt 30 ]; do printf 'tail-%02d\\n' $j; j=$((j + 1)); sleep 0.1; done; sleep 3",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 10100; $i++) { Write-Output ('row-{0:D5}' -f $i) }; for ($j=0; $j -lt 30; $j++) { Write-Output ('tail-{0:D2}' -f $j); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 3",
+    );
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("stream".into()),
+            command,
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new long-running session");
+    assert_eq!(response, Response::Value("stream".into()));
+
+    let mut ui = make_ui(vec![row("stream", true, false)]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        capture_preview(&path, &mut ui, "stream").expect("capture history");
+        let state = ui.scrollback["stream"];
+        if state.history_rows == 10_000 && state.history_total > 10_000 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "history did not reach the 10k cap"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(ui.on_key(press(KeyCode::PageUp)), Action::Scroll(22));
+    scroll_selected(&mut ui, 22);
+    let (anchor_cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("scroll up");
+    let anchor_text = terminal_rows_text(&anchor_cells);
+    let anchor_total = ui.scrollback["stream"].history_total;
+    let initial_offset = ui.scrollback["stream"].offset;
+
+    loop {
+        let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture tail");
+        let state = ui.scrollback["stream"];
+        if state.history_total >= anchor_total + 4 {
+            let visible_text = terminal_rows_text(&cells);
+            let text_matches = visible_text == anchor_text;
+            assert_eq!(
+                state.history_rows, 10_000,
+                "retained history remains capped"
+            );
+            #[cfg(unix)]
+            assert_eq!(
+                state.offset,
+                initial_offset + state.history_total - anchor_total,
+                "anchor_total={}, history_total={}, initial_offset={}, offset={}, history_rows={}, text_matches={text_matches}",
+                anchor_total,
+                state.history_total,
+                initial_offset,
+                state.offset,
+                state.history_rows,
+            );
+            // ConPTY can report repaint/scroll operations with a different
+            // row count than the parser's retained history. On Windows the
+            // contract is the visible content staying anchored, not matching
+            // the Unix counter arithmetic exactly.
+            #[cfg(windows)]
+            assert!(
+                text_matches,
+                "Windows anchor drift: anchor_total={}, history_total={}, initial_offset={}, offset={}, history_rows={}, text_matches={text_matches}, anchor_first={:?}, visible_first={:?}",
+                anchor_total,
+                state.history_total,
+                initial_offset,
+                state.offset,
+                state.history_rows,
+                anchor_text.first(),
+                visible_text.first(),
+            );
+            #[cfg(unix)]
+            assert!(text_matches, "visible scrollback content drifted");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "new rows did not arrive beyond the cap"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = client::request(
+        &path,
+        &Request::Close {
+            name: "stream".into(),
+        },
+    );
+}
+
+fn terminal_rows_text(rows: &[Vec<StyledCell>]) -> Vec<String> {
+    rows.iter()
+        .map(|row| row.iter().map(|cell| cell.text.as_str()).collect())
+        .collect()
 }
 
 #[test]
@@ -1920,7 +2372,9 @@ fn scratch_socket(tag: &str) -> std::path::PathBuf {
 fn daemon_at(path: &std::path::Path) {
     let serving = path.to_path_buf();
     std::thread::spawn(move || {
-        let _ = crate::daemon::serve(&serving);
+        if let Err(error) = crate::daemon::serve(&serving) {
+            panic!("test daemon failed to serve {serving:?}: {error}");
+        }
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     while crate::ipc::connect(path).is_err() {
@@ -1987,14 +2441,14 @@ fn capture_styled_10k_history_measurement() {
 
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if let Ok((live, _, _)) = capture_styled(&path, "history", 0) {
+        if let Ok((live, _, _, _, _)) = capture_styled(&path, "history", 0) {
             let visible: String = live
                 .iter()
                 .flatten()
                 .map(|cell| cell.text.as_str())
                 .collect();
             if visible.contains("09999") {
-                let (oldest, _, _) =
+                let (oldest, _, _, _, _) =
                     capture_styled(&path, "history", 9_999).expect("oldest capture");
                 let first: String = oldest[0].iter().map(|cell| cell.text.as_str()).collect();
                 assert!(first.contains("00000"), "oldest line was {first:?}");
@@ -2079,7 +2533,7 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Ok((cells, _, _)) = capture_styled(&path, "alpha", 0) {
+        if let Ok((cells, _, _, _, _)) = capture_styled(&path, "alpha", 0) {
             let first_five: String = cells
                 .first()
                 .map(|row| row.iter().take(5).map(|c| c.text.as_str()).collect())
@@ -2104,7 +2558,7 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
     let ShownTarget::Session(name) = shown.unwrap() else {
         unreachable!("just asserted it above");
     };
-    let (cells, _, cursor) =
+    let (cells, _, cursor, _, _) =
         capture_styled(&path, &name, 0).expect("capture through the window's target");
 
     // No sessions buffer yet: `list_row` falls back to the bare name, which
