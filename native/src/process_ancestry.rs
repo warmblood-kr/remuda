@@ -3,8 +3,8 @@
 //! A shutdown request may come from a shell or tool several processes below a
 //! session's PTY child. The kernel supplies the socket peer PID; this module
 //! follows parent PIDs until it reaches one of the daemon's session children.
-//! Failure to identify the peer or read a complete ancestry chain is treated
-//! as unknown and callers must refuse shutdown unless they explicitly override.
+//! A caller is hosted only when its ancestry reaches one of the daemon's
+//! session children before the chain leaves processes we can inspect.
 
 #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 use interprocess::local_socket::traits::StreamCommon as _;
@@ -55,51 +55,52 @@ pub(crate) fn peer_pid(stream: &crate::ipc::Stream) -> io::Result<Option<u32>> {
     }
 }
 
-pub(crate) fn is_self_or_descendant(mut pid: u32, ancestors: &[u32]) -> io::Result<bool> {
-    let daemon_pid = std::process::id();
-    let daemon_parent = own_parent_pid()?;
+#[derive(Debug)]
+pub(crate) enum Ancestry {
+    Inside,
+    Outside,
+    Unreadable { pid: u32, error: io::Error },
+}
+
+pub(crate) fn missing_peer_requires_refusal(self_reported_identity: bool) -> bool {
+    self_reported_identity
+}
+
+pub(crate) fn is_self_or_descendant(pid: u32, ancestors: &[u32]) -> Ancestry {
+    walk_ancestry(pid, ancestors, std::process::id(), parent_pid)
+}
+
+fn walk_ancestry<F>(mut pid: u32, ancestors: &[u32], daemon_pid: u32, mut parent: F) -> Ancestry
+where
+    F: FnMut(u32) -> io::Result<Option<u32>>,
+{
     let mut visited = std::collections::HashSet::new();
     loop {
         if ancestors.contains(&pid) {
-            return Ok(true);
+            return Ancestry::Inside;
         }
-        // A session process must be encountered before its ancestry reaches
-        // the daemon. Reaching the daemon or its parent proves this caller is
-        // outside every session owned by this daemon, and bounds the walk at
-        // the process tree we can reliably inspect.
-        if pid == daemon_pid || Some(pid) == daemon_parent {
-            return Ok(false);
-        }
-        if pid <= 1 {
-            return Ok(false);
+        // Session children belong to this daemon. Once the walk reaches the
+        // daemon, init, or an unreadable process, it has left that tree.
+        if pid == daemon_pid || pid <= 1 {
+            return Ancestry::Outside;
         }
         if !visited.insert(pid) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cycle in process parent chain",
-            ));
+            return Ancestry::Unreadable {
+                pid,
+                error: io::Error::new(io::ErrorKind::InvalidData, "cycle in process parent chain"),
+            };
         }
-        let Some(parent) = parent_pid(pid)? else {
-            return Ok(false);
+        let next = match parent(pid) {
+            Ok(next) => next,
+            Err(error) => return Ancestry::Unreadable { pid, error },
         };
-        if parent == pid {
-            return Ok(false);
+        let Some(next) = next else {
+            return Ancestry::Outside;
+        };
+        if next == pid {
+            return Ancestry::Outside;
         }
-        pid = parent;
-    }
-}
-
-fn own_parent_pid() -> io::Result<Option<u32>> {
-    #[cfg(unix)]
-    {
-        let pid = unsafe { libc::getppid() };
-        u32::try_from(pid)
-            .map(Some)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon parent PID"))
-    }
-    #[cfg(windows)]
-    {
-        parent_pid(std::process::id())
+        pid = next;
     }
 }
 
@@ -190,11 +191,46 @@ mod tests {
 
     #[test]
     fn current_process_is_its_own_ancestor() {
-        assert!(is_self_or_descendant(std::process::id(), &[std::process::id()]).unwrap());
+        assert!(matches!(
+            is_self_or_descendant(std::process::id(), &[std::process::id()]),
+            Ancestry::Inside
+        ));
     }
 
     #[test]
     fn unrelated_root_pid_is_not_a_descendant() {
-        assert!(!is_self_or_descendant(1, &[u32::MAX]).unwrap());
+        assert!(matches!(
+            is_self_or_descendant(1, &[u32::MAX]),
+            Ancestry::Outside
+        ));
+    }
+
+    #[test]
+    fn unreadable_ancestor_is_outside_but_session_hit_before_it_is_inside() {
+        let parent = |pid| match pid {
+            40 => Ok(Some(30)),
+            30 => Err(io::Error::new(io::ErrorKind::PermissionDenied, "hidden")),
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            walk_ancestry(40, &[], 1, parent),
+            Ancestry::Unreadable { pid: 30, .. }
+        ));
+
+        let parent = |pid| match pid {
+            40 => Ok(Some(25)),
+            25 => Err(io::Error::new(io::ErrorKind::PermissionDenied, "hidden")),
+            _ => unreachable!(),
+        };
+        assert!(matches!(
+            walk_ancestry(40, &[25], 1, parent),
+            Ancestry::Inside
+        ));
+    }
+
+    #[test]
+    fn missing_peer_pid_refuses_only_with_self_reported_identity() {
+        assert!(missing_peer_requires_refusal(true));
+        assert!(!missing_peer_requires_refusal(false));
     }
 }

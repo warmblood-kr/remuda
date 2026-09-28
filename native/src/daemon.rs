@@ -630,28 +630,30 @@ fn handle_shutdown(
         return refuse_hosted_shutdown(&stream, &identity);
     }
     if !override_hosted {
-        let is_hosted = process_ancestry::peer_pid(&stream).and_then(|peer_pid| match peer_pid {
-            Some(peer_pid) => {
-                process_ancestry::is_self_or_descendant(peer_pid, &registry.live_process_ids())
+        match process_ancestry::peer_pid(&stream) {
+            Ok(Some(peer_pid)) => match process_ancestry::is_self_or_descendant(
+                peer_pid,
+                &registry.live_process_ids(),
+            ) {
+                process_ancestry::Ancestry::Inside => {
+                    return refuse_hosted_shutdown(&stream, "session process ancestry")
+                }
+                process_ancestry::Ancestry::Outside => {}
+                process_ancestry::Ancestry::Unreadable { pid, error } => eprintln!(
+                    "remuda: shutdown ancestry stopped at unreadable pid {pid} ({error}); treating requester as outside"
+                ),
+            },
+            Ok(None) | Err(_)
+                if process_ancestry::missing_peer_requires_refusal(caller_claims_this_daemon) =>
+            {
+                return refuse_hosted_shutdown(&stream, "self-reported session identity")
             }
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "local socket did not provide a peer process ID",
-            )),
-        });
-        match is_hosted {
-            Ok(true) => return refuse_hosted_shutdown(&stream, "session process ancestry"),
-            Ok(false) => {}
-            // Unknown peer identity or an incomplete parent chain fails closed.
-            // A caller can explicitly opt in with --i-am-inside.
-            Err(error) => {
-                return reply(
-                    &stream,
-                    &Response::error(
-                        format!("cannot verify the shutdown caller process identity ({error}); pass --i-am-inside to override"),
-                    ),
-                );
-            }
+            Ok(None) => eprintln!(
+                "remuda: shutdown peer process ID unavailable; treating requester as outside"
+            ),
+            Err(error) => eprintln!(
+                "remuda: shutdown peer process ID unavailable ({error}); treating requester as outside"
+            ),
         }
     }
     reply(&stream, &Response::Ok)?;
