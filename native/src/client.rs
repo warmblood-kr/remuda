@@ -234,10 +234,10 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     };
                     #[cfg(windows)]
                     {
-                        // ConPTY input does not signal the console HANDLE for
-                        // WaitForSingleObject. A blocking raw stdin read does
-                        // receive the key and lets the attach return here.
-                        let _ = stdin.read(&mut buf);
+                        // Once output has ended, wait directly on the console
+                        // input queue. ConPTY keys do not reliably wake the
+                        // handle through WaitForSingleObject.
+                        let _ = wait_for_windows_keypress();
                         break;
                     }
                     break;
@@ -361,6 +361,40 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     };
     let _ = keys.join();
     Ok(left)
+}
+
+#[cfg(windows)]
+fn wait_for_windows_keypress() -> std::io::Result<()> {
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, ReadConsoleInputW, INPUT_RECORD, KEY_EVENT, STD_INPUT_HANDLE,
+    };
+
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let mut records = [INPUT_RECORD::default(); 16];
+    loop {
+        let mut count = 0;
+        if unsafe {
+            ReadConsoleInputW(
+                handle,
+                records.as_mut_ptr(),
+                records.len() as u32,
+                &mut count,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        for record in records.iter().take(count as usize) {
+            if u32::from(record.EventType) == KEY_EVENT {
+                // Console input queues include key-up records as well. Only a
+                // key-down should release the post-exit wait.
+                let key = unsafe { record.Event.KeyEvent };
+                if key.bKeyDown != 0 && key.wVirtualKeyCode != 0 {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
