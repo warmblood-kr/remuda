@@ -1798,6 +1798,75 @@ fn capture_styled_reports_the_daemons_own_words_instead_of_an_empty_grid() {
     );
 }
 
+/// Measure the 10k-row capture cost at the live and oldest-history offsets.
+/// Run explicitly with `cargo test capture_styled_10k_history_measurement
+/// -- --ignored --nocapture`; this is a measurement fixture, not a timing assertion.
+#[test]
+#[ignore]
+fn capture_styled_10k_history_measurement() {
+    let path = scratch_socket("capture-10k-baseline");
+    daemon_at(&path);
+    let command = "i=0; while [ $i -lt 10000 ]; do printf '%05d\\n' $i; i=$((i+1)); done; sleep 5";
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("history".to_string()),
+            command: vec!["sh".into(), "-c".into(), command.into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new");
+    assert_eq!(response, Response::Value("history".into()));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok((live, _, _)) = capture_styled(&path, "history", 0) {
+            let visible: String = live
+                .iter()
+                .flatten()
+                .map(|cell| cell.text.as_str())
+                .collect();
+            if visible.contains("09999") {
+                let (oldest, _, _) =
+                    capture_styled(&path, "history", 9_999).expect("oldest capture");
+                let first: String = oldest[0].iter().map(|cell| cell.text.as_str()).collect();
+                assert!(first.contains("00000"), "oldest line was {first:?}");
+
+                let started = Instant::now();
+                let live = capture_styled(&path, "history", 0).expect("live capture");
+                let live_elapsed = started.elapsed();
+                let visible: String = live
+                    .0
+                    .iter()
+                    .flatten()
+                    .map(|cell| cell.text.as_str())
+                    .collect();
+                assert!(visible.contains("09999"), "visible screen omitted the tail");
+
+                let started = Instant::now();
+                let measured = capture_styled(&path, "history", 9_999).expect("history capture");
+                let history_elapsed = started.elapsed();
+                let first: String = measured.0[0]
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect();
+                assert!(first.contains("00000"), "oldest line was {first:?}");
+                eprintln!(
+                    "capture_styled with 10k history: live viewport={live_elapsed:?}, oldest history={history_elapsed:?}"
+                );
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "10k output did not reach scrollback"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The window is real state, not a local variable dressed up: syncing it
 /// to a name and reading it back returns that name.
 // Clearing it (`None`) reads back as `None`, not the literal string

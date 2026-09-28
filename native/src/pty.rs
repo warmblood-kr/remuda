@@ -42,6 +42,30 @@ fn io<E: std::fmt::Display>(e: E) -> AgentError {
     AgentError::Io(e.to_string())
 }
 
+/// Temporarily selects a history viewport while guaranteeing the parser's
+/// live viewport is restored, including while unwinding from a panic.
+fn with_scrollback<T>(
+    screen: &mut vt100::Screen,
+    scrollback: usize,
+    read: impl FnOnce(&vt100::Screen) -> T,
+) -> T {
+    let previous = screen.scrollback();
+    screen.set_scrollback(scrollback);
+    let restore = ScrollbackRestore { screen, previous };
+    read(&*restore.screen)
+}
+
+struct ScrollbackRestore<'a> {
+    screen: &'a mut vt100::Screen,
+    previous: usize,
+}
+
+impl Drop for ScrollbackRestore<'_> {
+    fn drop(&mut self) {
+        self.screen.set_scrollback(self.previous);
+    }
+}
+
 /// `vt100::Color` and [`Color`] are shaped identically on purpose; this is
 /// the one place that fact is spent.
 fn color(c: vt100::Color) -> Color {
@@ -238,19 +262,19 @@ impl AgentProcess for PtyAgent {
     }
 
     fn screen_cells_at(&mut self, scrollback: usize) -> Result<Vec<Vec<StyledCell>>> {
-        let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
-        let mut view = parser.screen().clone();
-        view.set_scrollback(scrollback);
-        Ok(styled_cells(&view, self.size))
+        let mut parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
+        Ok(with_scrollback(parser.screen_mut(), scrollback, |screen| {
+            styled_cells(screen, self.size)
+        }))
     }
 
     fn row_wrapped_at(&mut self, scrollback: usize) -> Result<Vec<bool>> {
-        let parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
-        let mut view = parser.screen().clone();
-        view.set_scrollback(scrollback);
-        Ok((0..self.size.rows())
-            .map(|row| view.row_wrapped(row))
-            .collect())
+        let mut parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
+        Ok(with_scrollback(parser.screen_mut(), scrollback, |screen| {
+            (0..self.size.rows())
+                .map(|row| screen.row_wrapped(row))
+                .collect()
+        }))
     }
 
     fn subscribe(&mut self) -> Option<Receiver<Vec<u8>>> {
@@ -311,6 +335,21 @@ impl AgentProcess for PtyAgent {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn temporary_scrollback_view_restores_after_panic() {
+        let mut parser = vt100::Parser::new(2, 5, 4);
+        parser.process(b"one\r\ntwo\r\nthree\r\nfour\r\n");
+        parser.screen_mut().set_scrollback(1);
+        let original = parser.screen().scrollback();
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_scrollback(parser.screen_mut(), 0, |_| panic!("exercise unwind"));
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(parser.screen().scrollback(), original);
+    }
 
     fn wait_for(agent: &mut PtyAgent, needle: &str) {
         let deadline = Instant::now() + std::time::Duration::from_secs(5);
