@@ -224,6 +224,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     // Keep the advertised "press any key" behavior after the
                     // child exits, but let that key release the attach and
                     // restore terminal modes instead of routing it to nowhere.
+                    #[cfg(unix)]
                     let Ok(Some(_)) = read_stdin_timeout(
                         &mut stdin,
                         &mut buf,
@@ -231,6 +232,10 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     ) else {
                         continue;
                     };
+                    #[cfg(windows)]
+                    if wait_for_windows_keypress().is_err() {
+                        break;
+                    }
                     break;
                 }
                 let wait = parser
@@ -352,6 +357,47 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     };
     let _ = keys.join();
     Ok(left)
+}
+
+#[cfg(windows)]
+fn wait_for_windows_keypress() -> std::io::Result<()> {
+    use windows_sys::Win32::{
+        Foundation::{HANDLE, WAIT_OBJECT_0},
+        System::{
+            Console::{GetStdHandle, ReadConsoleInputW, INPUT_RECORD, KEY_EVENT, STD_INPUT_HANDLE},
+            Threading::{WaitForSingleObject, INFINITE},
+        },
+    };
+
+    let handle: HANDLE = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    loop {
+        if unsafe { WaitForSingleObject(handle, INFINITE) } != WAIT_OBJECT_0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut records = [INPUT_RECORD::default(); 16];
+        let mut count = 0;
+        if unsafe {
+            ReadConsoleInputW(
+                handle,
+                records.as_mut_ptr(),
+                records.len() as u32,
+                &mut count,
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        for record in records.iter().take(count as usize) {
+            if u32::from(record.EventType) == KEY_EVENT {
+                // Console input queues include key-up records as well. Only a
+                // key-down event should release the post-exit wait.
+                let key = unsafe { record.Event.KeyEvent };
+                if key.bKeyDown != 0 && key.wVirtualKeyCode != 0 {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
