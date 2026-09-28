@@ -601,6 +601,15 @@ function remuda._activate_module(name, candidate, reactivate)
           restored[#restored + 1] = hook
         end
       end
+      -- Survivors were appended; put them back by depth. table.sort is not
+      -- stable, so ties fall back to their position.
+      local position = {}
+      for index, hook in ipairs(restored) do position[hook] = index end
+      table.sort(restored, function(a, b)
+        local left, right = a.depth or 0, b.depth or 0
+        if left ~= right then return left < right end
+        return position[a] < position[b]
+      end)
       remuda.hooks[event] = restored
     end
     for tool_name, saved in pairs(saved_tools) do
