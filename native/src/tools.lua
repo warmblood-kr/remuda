@@ -387,7 +387,10 @@ function remuda._run_due_schedules(now)
   schedule_clock_now = schedule_now
   -- Expectations are advanced from the same native one-second clock. A
   -- future PTY output event may call this local directly to reduce latency.
-  local expect_ok, expect_err = pcall(expect_tick, schedule_now)
+  -- Preserve expectation-specific injected clocks: nil here lets each
+  -- expectation's options.now() supply its own time, while schedule_now is
+  -- the fallback clock only for periodic schedules.
+  local expect_ok, expect_err = pcall(expect_tick, now)
   if not expect_ok and io and io.stderr then
     io.stderr:write("remuda.expect tick failed: " .. tostring(expect_err) .. "\n")
   end
