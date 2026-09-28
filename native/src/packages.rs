@@ -88,6 +88,21 @@ pub fn has_subcommand(name: &str) -> bool {
     subcommand(name).ok().flatten().is_some()
 }
 
+/// `mods/NAME/` exists but its manifest is missing or unreadable, typically
+/// mid-update (#134). The message names the mod and where it is, instead of
+/// the CLI falling through to its generic usage text.
+pub fn half_installed(name: &str) -> Option<String> {
+    let dir = mods_dir().ok()?.join(name);
+    if !dir.is_dir() {
+        return None;
+    }
+    let reason = read_manifest(&dir.join("extension.toml")).err()?;
+    Some(format!(
+        "mod '{name}' at {} has no manifest (partially installed or mid-update?): {reason}",
+        dir.display()
+    ))
+}
+
 /// Resolve only installed modules. Mods are deliberately independent from the
 /// Remuda binary; there is no embedded compatibility copy.
 pub fn resolve(name: &str) -> Result<Option<PackageSource>, String> {
@@ -723,9 +738,29 @@ fn installed_specs() -> Result<Vec<ModSpec>, String> {
         {
             continue;
         }
-        specs.push(read_manifest(&entry.path().join("extension.toml"))?);
+        // One half-installed mod (#134) must not hide the rest: skip it and
+        // say so once per process. Its own command still gets a named error
+        // from `half_installed`.
+        match read_manifest(&entry.path().join("extension.toml")) {
+            Ok(spec) => specs.push(spec),
+            Err(reason) => warn_skipped(&entry.path(), &reason),
+        }
     }
     Ok(specs)
+}
+
+fn warn_skipped(dir: &Path, reason: &str) {
+    static WARNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !warned.iter().any(|seen| seen == dir) {
+        eprintln!(
+            "remuda: skipping mod at {}: no readable manifest ({reason})",
+            dir.display()
+        );
+        warned.push(dir.to_path_buf());
+    }
 }
 
 fn mods_dir() -> Result<PathBuf, String> {
