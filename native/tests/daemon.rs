@@ -1006,6 +1006,49 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn an_exited_conpty_session_is_reaped_by_list() {
+    let dir = scratch_dir("conpty-exit-reap");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("short-lived".into()),
+            command: vec![
+                "powershell.exe".into(),
+                "-NoLogo".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                "Start-Sleep -Seconds 1".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start short-lived PowerShell target");
+    assert_eq!(response, Response::Value("short-lived".into()));
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let response = client::request(&path, &Request::List).expect("list sessions");
+        let present = match response {
+            Response::Sessions(sessions) => sessions.iter().any(|s| s.name == "short-lived"),
+            other => panic!("list: {other:?}"),
+        };
+        if !present {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "exited ConPTY session was not reaped"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 #[test]
 fn a_new_attach_takes_over_and_old_raw_clients_get_a_plain_notice() {
     let path = scratch("takeover");
