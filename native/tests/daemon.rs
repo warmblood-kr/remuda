@@ -706,6 +706,9 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     }
 }
 
+// Unix-only until #185: on Windows the key injected through ConPTY after the
+// attached session exits never reaches the client (CI trace, run 36424446857).
+#[cfg(unix)]
 #[test]
 fn any_key_after_attached_session_exit_restores_the_terminal() {
     let dir = scratch_dir("attach-exit-any-key");
