@@ -12,6 +12,9 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_ASSET_BYTES: u64 = 1024 * 1024;
+const MAX_ASSETS: usize = 64;
+const MAX_TOTAL_ASSET_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_REPOSITORY_PART: usize = 128;
 pub const LUA_API_VERSION: &str = "remuda-lua-v1";
 pub const MOD_LIFECYCLE_API: &str = "remuda-module-v1";
@@ -75,6 +78,8 @@ pub struct ModSpec {
     pub lifecycle: Option<String>,
     /// `(mod, constraint)` pairs from `requires`, sorted by mod name.
     pub requires: Vec<(String, String)>,
+    /// Extra inert regular files copied with the package, relative to checkout.
+    pub assets: Vec<String>,
 }
 
 /// Return the installed mod name that owns a CLI command. Commands are
@@ -316,7 +321,7 @@ pub fn test_path(path: &Path) -> Result<ModSpec, String> {
     let package_root = entry_path
         .parent()
         .ok_or_else(|| "manifest entry has no package directory".to_string())?;
-    validate_lua_tree(package_root)?;
+    validate_package(package_root, path, &spec)?;
     Ok(spec)
 }
 
@@ -368,7 +373,7 @@ fn install_from_checkout(
     let package_root = entry_path
         .parent()
         .ok_or_else(|| "manifest entry has no package directory".to_string())?;
-    validate_lua_tree(package_root)?;
+    validate_package(package_root, checkout, &spec)?;
     let package_relative = package_root
         .strip_prefix(checkout)
         .map_err(|_| "manifest entry escaped checkout".to_string())?;
@@ -378,7 +383,8 @@ fn install_from_checkout(
     let target = data.join(&spec.name);
     let staging = temporary_path_in(&data, "install")?;
     let staging_package = staging.join(package_relative);
-    copy_tree(package_root, &staging_package)?;
+    let asset_paths = package_assets(package_root, checkout, &spec)?;
+    copy_tree_with_assets(package_root, &staging_package, &asset_paths)?;
     fs::copy(&manifest_path, staging.join("extension.toml"))
         .map_err(|error| format!("cannot copy extension.toml: {error}"))?;
     let commit = git_commit(checkout)?;
@@ -519,6 +525,7 @@ pub fn parse_manifest(text: &str) -> Result<ModSpec, String> {
     let mut command = None;
     let mut lifecycle = None;
     let mut requires = None;
+    let mut assets = None;
     for (line_number, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -530,6 +537,12 @@ pub fn parse_manifest(text: &str) -> Result<ModSpec, String> {
         if key.trim() == "requires" {
             if requires.replace(parse_requires(value)?).is_some() {
                 return Err("extension.toml repeats key \"requires\"".into());
+            }
+            continue;
+        }
+        if key.trim() == "assets" {
+            if assets.replace(parse_string_array(value)?).is_some() {
+                return Err("extension.toml repeats key \"assets\"".into());
             }
             continue;
         }
@@ -555,6 +568,7 @@ pub fn parse_manifest(text: &str) -> Result<ModSpec, String> {
         command,
         lifecycle,
         requires: requires.unwrap_or_default(),
+        assets: assets.unwrap_or_default(),
     };
     validate_spec(&spec)?;
     if spec.requires.iter().any(|(name, _)| *name == spec.name) {
@@ -593,6 +607,39 @@ fn parse_requires(value: &str) -> Result<Vec<(String, String)>, String> {
         rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
     }
     Ok(requires.into_iter().collect())
+}
+
+fn parse_string_array(value: &str) -> Result<Vec<String>, String> {
+    let value = value.trim();
+    let mut rest = value
+        .strip_prefix('[')
+        .and_then(|v| v.strip_suffix(']'))
+        .ok_or_else(|| "assets must be an array of quoted paths".to_string())?
+        .trim();
+    let mut paths = Vec::new();
+    while !rest.is_empty() {
+        let after_quote = rest
+            .strip_prefix('"')
+            .ok_or_else(|| "assets must be an array of quoted paths".to_string())?;
+        let end = after_quote
+            .find('"')
+            .ok_or_else(|| "assets contains an unterminated path".to_string())?;
+        let quoted = &rest[..end + 2];
+        let path = parse_quoted(quoted)?;
+        if paths.contains(&path) {
+            return Err(format!("assets repeats path {path:?}"));
+        }
+        paths.push(path);
+        rest = after_quote[end + 1..].trim_start();
+        if rest.is_empty() {
+            break;
+        }
+        rest = rest
+            .strip_prefix(',')
+            .ok_or_else(|| "assets paths must be separated by commas".to_string())?
+            .trim_start();
+    }
+    Ok(paths)
 }
 
 /// Comma-separated comparators (`>=`, `>`, `<=`, `<`, `=`), all of which must
@@ -677,23 +724,135 @@ fn validate_spec(spec: &ModSpec) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_lua_tree(path: &Path) -> Result<(), String> {
+fn package_assets(
+    package_root: &Path,
+    checkout: &Path,
+    spec: &ModSpec,
+) -> Result<Vec<PathBuf>, String> {
+    if spec.assets.len() > MAX_ASSETS {
+        return Err(format!("assets may declare at most {MAX_ASSETS} assets"));
+    }
+    let canonical_package = checked_canonical_path(checkout, package_root, "checkout path")?;
+    let mut total_size = 0u64;
+    spec.assets
+        .iter()
+        .map(|asset| {
+            let relative = safe_relative_path(asset, "assets path")?;
+            let full = checkout.join(&relative);
+            let canonical_asset = checked_canonical_path(checkout, &full, "asset path")?;
+            let package_relative = canonical_asset
+                .strip_prefix(&canonical_package)
+                .map_err(|_| format!("assets path {asset:?} must be inside the package root"))?;
+            let metadata = fs::metadata(&canonical_asset).map_err(|error| {
+                format!(
+                    "cannot inspect declared asset {}: {error}",
+                    canonical_asset.display()
+                )
+            })?;
+            if !metadata.is_file() {
+                return Err(format!(
+                    "declared asset {} must be a regular file",
+                    canonical_asset.display()
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                validate_asset_mode(metadata.mode()).map_err(|reason| format!("declared asset {asset:?} {reason}"))?;
+            }
+            if metadata.len() > MAX_ASSET_BYTES {
+                return Err(format!(
+                    "declared asset {asset:?} exceeds the 1 MiB size limit"
+                ));
+            }
+            total_size = total_size
+                .checked_add(metadata.len())
+                .ok_or_else(|| "declared assets exceed the 8 MiB total size limit".to_string())?;
+            if total_size > MAX_TOTAL_ASSET_BYTES {
+                return Err("declared assets exceed the 8 MiB total size limit".into());
+            }
+            Ok(package_relative.to_path_buf())
+        })
+        .collect()
+}
+
+fn validate_package(package_root: &Path, checkout: &Path, spec: &ModSpec) -> Result<(), String> {
+    checked_canonical_path(checkout, package_root, "checkout path")?;
+    let assets = package_assets(package_root, checkout, spec)?;
+    validate_lua_tree(package_root, Path::new(""), &assets)
+}
+
+fn checked_canonical_path(
+    checkout: &Path,
+    candidate: &Path,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let root_metadata = fs::symlink_metadata(checkout)
+        .map_err(|error| format!("cannot inspect checkout {}: {error}", checkout.display()))?;
+    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+        return Err(format!(
+            "checkout {} must be a real directory",
+            checkout.display()
+        ));
+    }
+    let root = fs::canonicalize(checkout).map_err(|error| {
+        format!(
+            "cannot canonicalize checkout {}: {error}",
+            checkout.display()
+        )
+    })?;
+    let relative = candidate
+        .strip_prefix(checkout)
+        .map_err(|_| format!("{label} escapes the checkout"))?;
+    let mut current = checkout.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::Normal(name) => current.push(name),
+            Component::CurDir => continue,
+            _ => return Err(format!("{label} escapes the checkout")),
+        }
+        let metadata = fs::symlink_metadata(&current)
+            .map_err(|error| format!("cannot inspect {label} {}: {error}", current.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "symlinked {label} {} is not allowed",
+                current.display()
+            ));
+        }
+    }
+    let canonical = fs::canonicalize(candidate).map_err(|error| {
+        format!(
+            "cannot canonicalize {label} {}: {error}",
+            candidate.display()
+        )
+    })?;
+    if !canonical.starts_with(&root) {
+        return Err(format!("{label} escapes the checkout"));
+    }
+    Ok(canonical)
+}
+
+fn validate_lua_tree(path: &Path, relative: &Path, assets: &[PathBuf]) -> Result<(), String> {
     for entry in fs::read_dir(path)
         .map_err(|error| format!("cannot read mod package {}: {error}", path.display()))?
     {
         let entry = entry.map_err(|error| error.to_string())?;
         let child = entry.path();
+        let child_relative = relative.join(entry.file_name());
         let metadata = fs::symlink_metadata(&child)
             .map_err(|error| format!("cannot inspect {}: {error}", child.display()))?;
         if metadata.file_type().is_symlink() {
             return Err(format!("mod package contains symlink {}", child.display()));
         }
         if metadata.is_dir() {
-            validate_lua_tree(&child)?;
+            validate_lua_tree(&child, &child_relative, assets)?;
         } else if metadata.is_file() {
             if child.extension() != Some(std::ffi::OsStr::new("lua")) {
+                if assets.iter().any(|asset| asset == &child_relative) {
+                    continue;
+                }
                 return Err(format!(
-                    "mod package contains non-Lua file {}",
+                    "mod package contains non-Lua file {} (declare inert files in extension.toml assets)",
                     child.display()
                 ));
             }
@@ -987,7 +1146,24 @@ fn ensure_regular_file(path: &Path, label: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
+fn copy_tree_with_assets(source: &Path, target: &Path, assets: &[PathBuf]) -> Result<(), String> {
+    let mut copied_asset_bytes = 0;
+    copy_tree_inner(
+        source,
+        target,
+        Path::new(""),
+        assets,
+        &mut copied_asset_bytes,
+    )
+}
+
+fn copy_tree_inner(
+    source: &Path,
+    target: &Path,
+    relative: &Path,
+    assets: &[PathBuf],
+    copied_asset_bytes: &mut u64,
+) -> Result<(), String> {
     let metadata = fs::symlink_metadata(source)
         .map_err(|error| format!("cannot inspect {}: {error}", source.display()))?;
     if metadata.file_type().is_symlink() {
@@ -1000,12 +1176,20 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
             .map_err(|error| format!("cannot read {}: {error}", source.display()))?
         {
             let entry = entry.map_err(|error| error.to_string())?;
-            copy_tree(&entry.path(), &target.join(entry.file_name()))?;
+            let name = entry.file_name();
+            copy_tree_inner(
+                &entry.path(),
+                &target.join(&name),
+                &relative.join(name),
+                assets,
+                copied_asset_bytes,
+            )?;
         }
     } else if metadata.is_file() {
-        if source.extension() != Some(std::ffi::OsStr::new("lua")) {
+        let is_asset = assets.iter().any(|asset| asset == relative);
+        if source.extension() != Some(std::ffi::OsStr::new("lua")) && !is_asset {
             return Err(format!(
-                "mod package contains non-Lua file {}",
+                "mod package contains non-Lua file {} (declare inert files in extension.toml assets)",
                 source.display()
             ));
         }
@@ -1013,8 +1197,14 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
             fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
         }
-        fs::copy(source, target)
-            .map_err(|error| format!("cannot copy {}: {error}", source.display()))?;
+        if is_asset {
+            let copied = copy_asset_file(source, target, *copied_asset_bytes)?;
+            *copied_asset_bytes = copied_asset_bytes.saturating_add(copied);
+        } else {
+            fs::copy(source, target)
+                .map_err(|error| format!("cannot copy {}: {error}", source.display()))?;
+        }
+        set_safe_file_mode(target, &metadata)?;
     } else {
         return Err(format!(
             "mod package contains unsupported file {}",
@@ -1022,6 +1212,77 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn copy_asset_file(source: &Path, target: &Path, already_copied: u64) -> Result<u64, String> {
+    let reader = fs::File::open(source)
+        .map_err(|error| format!("cannot open declared asset {}: {error}", source.display()))?;
+    let copied = copy_asset_reader(reader, target, already_copied)?;
+    let metadata = fs::symlink_metadata(source).map_err(|error| {
+        format!(
+            "cannot inspect declared asset {}: {error}",
+            source.display()
+        )
+    })?;
+    set_safe_file_mode(target, &metadata)?;
+    Ok(copied)
+}
+
+fn set_safe_file_mode(target: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = safe_mode_bits(metadata.mode());
+        fs::set_permissions(target, fs::Permissions::from_mode(mode))
+            .map_err(|error| format!("cannot set safe mode for {}: {error}", target.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        fs::set_permissions(target, metadata.permissions())
+            .map_err(|error| format!("cannot preserve mode for {}: {error}", target.display()))
+    }
+}
+
+#[cfg(unix)]
+fn validate_asset_mode(mode: u32) -> Result<(), &'static str> {
+    if mode & 0o7000 != 0 {
+        Err("has setuid, setgid or sticky mode bits")
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn safe_mode_bits(mode: u32) -> u32 {
+    mode & 0o755
+}
+
+fn copy_asset_reader<R: std::io::Read>(
+    reader: R,
+    target: &Path,
+    already_copied: u64,
+) -> Result<u64, String> {
+    use std::io::Write;
+    let total_remaining = MAX_TOTAL_ASSET_BYTES.saturating_sub(already_copied);
+    let cap = MAX_ASSET_BYTES.min(total_remaining);
+    let mut limited = reader.take(cap.saturating_add(1));
+    let mut output = fs::File::create(target)
+        .map_err(|error| format!("cannot create declared asset {}: {error}", target.display()))?;
+    let copied = std::io::copy(&mut limited, &mut output)
+        .map_err(|error| format!("cannot copy declared asset {}: {error}", target.display()))?;
+    output
+        .flush()
+        .map_err(|error| format!("cannot flush declared asset {}: {error}", target.display()))?;
+    if copied > cap {
+        let _ = fs::remove_file(target);
+        let message = if total_remaining < MAX_ASSET_BYTES {
+            "declared assets exceed the 8 MiB total size limit"
+        } else {
+            "declared asset exceeds the 1 MiB size limit"
+        };
+        return Err(message.into());
+    }
+    Ok(copied)
 }
 
 fn ensure_safe_extension_target(path: &Path) -> Result<(), String> {
@@ -1249,5 +1510,190 @@ api = "remuda-lua-v1""#
         .is_err());
         assert!(validate_reference("--upload-pack=sh").is_err());
         assert!(validate_reference("feature\nattack").is_err());
+    }
+
+    #[test]
+    fn package_assets_must_be_declared_safe_regular_bounded_files() {
+        use std::fs;
+        use std::path::PathBuf;
+        let root = std::env::temp_dir().join(format!("remuda-assets-red-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let package = root.join("packages/guest");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("init.lua"), "return {}\n").unwrap();
+        fs::write(package.join("helper.py"), "print('ok')\n").unwrap();
+        let manifest = root.join("extension.toml");
+        fs::write(&manifest, "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\nassets = [\"packages/guest/helper.py\"]\n").unwrap();
+        assert!(
+            super::test_path(&root).is_ok(),
+            "declared asset should validate"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut mode = fs::metadata(package.join("helper.py"))
+                .unwrap()
+                .permissions();
+            mode.set_mode(0o751);
+            fs::set_permissions(package.join("helper.py"), mode).unwrap();
+        }
+        let copied = root.join("copy/helper.py");
+        super::copy_tree_with_assets(&package, &root.join("copy"), &[PathBuf::from("helper.py")])
+            .unwrap();
+        assert_eq!(fs::read(&copied).unwrap(), b"print('ok')\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&copied).unwrap().permissions().mode() & 0o777,
+                0o751
+            );
+        }
+
+        fs::write(
+            &manifest,
+            "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\n",
+        )
+        .unwrap();
+        assert!(
+            super::test_path(&root).unwrap_err().contains("assets"),
+            "undeclared non-Lua stays rejected"
+        );
+        fs::write(&manifest, "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\nassets = [\"../escape.py\"]\n").unwrap();
+        assert!(super::test_path(&root).unwrap_err().contains("assets"));
+        fs::write(&manifest, "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\nassets = [\"packages/guest/missing.py\"]\n").unwrap();
+        assert!(super::test_path(&root).unwrap_err().contains("missing"));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("helper.py", package.join("link.py")).unwrap();
+            fs::write(&manifest, "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\nassets = [\"packages/guest/link.py\"]\n").unwrap();
+            assert!(super::test_path(&root).unwrap_err().contains("symlink"));
+            fs::remove_file(package.join("link.py")).unwrap();
+        }
+        fs::write(package.join("large.py"), vec![0u8; 1_048_577]).unwrap();
+        fs::write(&manifest, "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\nassets = [\"packages/guest/large.py\"]\n").unwrap();
+        assert!(super::test_path(&root).unwrap_err().contains("1 MiB"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_and_asset_paths_reject_symlinked_ancestors() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("remuda-assets-links-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let checkout = root.join("checkout");
+        let outside = root.join("outside/packages/guest");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("init.lua"), "return {}\n").unwrap();
+        fs::write(outside.join("asset.py"), b"payload").unwrap();
+        fs::write(checkout.join("extension.toml"), "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\nassets = [\"packages/guest/asset.py\"]\n").unwrap();
+        symlink(root.join("outside/packages"), checkout.join("packages")).unwrap();
+        let error = super::test_path(&checkout).unwrap_err();
+        assert!(error.contains("symlinked checkout path"), "{error}");
+        fs::remove_file(checkout.join("packages")).unwrap();
+        fs::create_dir_all(checkout.join("packages/guest")).unwrap();
+        fs::write(checkout.join("packages/guest/init.lua"), "return {}\n").unwrap();
+        fs::create_dir_all(root.join("elsewhere")).unwrap();
+        fs::write(root.join("elsewhere/asset.py"), b"payload").unwrap();
+        symlink(
+            root.join("elsewhere"),
+            checkout.join("packages/guest/nested"),
+        )
+        .unwrap();
+        fs::write(checkout.join("extension.toml"), "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\nassets = [\"packages/guest/nested/asset.py\"]\n").unwrap();
+        let error = super::test_path(&checkout).unwrap_err();
+        assert!(error.contains("symlinked asset path"), "{error}");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_asset_mode_strips_special_and_group_other_write_bits() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        let root = std::env::temp_dir().join(format!("remuda-assets-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("asset.py");
+        let target = root.join("copy.py");
+        fs::write(&source, b"payload").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o4777)).unwrap();
+        let checkout = root.join("checkout");
+        let package = checkout.join("packages/guest");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("init.lua"), "return {}\n").unwrap();
+        fs::set_permissions(package.join("init.lua"), fs::Permissions::from_mode(0o666)).unwrap();
+        fs::write(package.join("asset.py"), b"payload").unwrap();
+        fs::set_permissions(package.join("asset.py"), fs::Permissions::from_mode(0o4777)).unwrap();
+        fs::write(checkout.join("extension.toml"), "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\nassets = [\"packages/guest/asset.py\"]\n").unwrap();
+        assert!(super::test_path(&checkout).unwrap_err().contains("setuid"));
+        super::copy_asset_file(&source, &target, 0).unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
+        let installed_package = root.join("installed/packages/guest");
+        super::copy_tree_with_assets(&package, &installed_package, &[PathBuf::from("asset.py")])
+            .unwrap();
+        assert_eq!(
+            fs::metadata(installed_package.join("init.lua"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o644
+        );
+        assert_eq!(
+            fs::metadata(installed_package.join("asset.py"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn asset_limits_cover_count_total_and_growth_during_copy() {
+        use std::fs;
+        use std::io::Cursor;
+        let root =
+            std::env::temp_dir().join(format!("remuda-assets-limits-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let package = root.join("packages/guest");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("init.lua"), "return {}\n").unwrap();
+        let manifest = root.join("extension.toml");
+        let common =
+            "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\n";
+        let too_many = (0..65)
+            .map(|i| format!("\"packages/guest/{i}.dat\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for i in 0..65 {
+            fs::write(package.join(format!("{i}.dat")), b"x").unwrap();
+        }
+        fs::write(&manifest, format!("{common}assets = [{too_many}]\n")).unwrap();
+        assert!(super::test_path(&root).unwrap_err().contains("64 assets"));
+
+        let total_assets = (0..9)
+            .map(|i| format!("\"packages/guest/{i}.dat\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for i in 0..9 {
+            fs::write(package.join(format!("{i}.dat")), vec![0u8; 1024 * 1024]).unwrap();
+        }
+        fs::write(&manifest, format!("{common}assets = [{total_assets}]\n")).unwrap();
+        assert!(super::test_path(&root).unwrap_err().contains("8 MiB"));
+        let target = root.join("grown.py");
+        let error =
+            super::copy_asset_reader(Cursor::new(vec![0u8; 1_048_577]), &target, 0).unwrap_err();
+        assert!(error.contains("1 MiB"));
+        let _ = fs::remove_dir_all(root);
     }
 }
