@@ -439,6 +439,113 @@ mod tests {
     }
 
     #[test]
+    fn contributions_are_ordered_replaced_by_id_and_handed_out_as_copies() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            remuda.contribute("p", "b", { order = 10 })
+            remuda.contribute("p", "a", { order = 10 })
+            remuda.contribute("p", "z", { order = -5 })
+            remuda.contribute("p", "c", {})
+            remuda.contribute("other", "x", {})
+            local ids = {}
+            for i, item in ipairs(remuda.contributions("p")) do ids[i] = item.id end
+            assert(table.concat(ids, ",") == "z,c,a,b", table.concat(ids, ","))
+
+            remuda.contribute("p", "a", { order = -10, label = "new" })
+            local first = remuda.contributions("p")[1]
+            assert(first.id == "a" and first.entry.label == "new" and first.owner == nil)
+            assert(#remuda.contributions("p") == 4, "same id replaces")
+            assert(#remuda.contributions("none") == 0)
+
+            first.id, first.owner = "hacked", "me"
+            assert(remuda.contributions("p")[1].id == "a", "wrappers are copies")
+            for _, bad in ipairs({ { "", "i", {} }, { "p", "", {} }, { "p", "i", "x" },
+                                   { "p", "i", { order = "1" } } }) do
+              assert(not pcall(remuda.contribute, bad[1], bad[2], bad[3]), "refused: " .. tostring(bad[2]))
+            end
+            "#,
+        )
+        .exec()
+        .expect("contribute/contributions");
+    }
+
+    #[test]
+    fn declared_contributions_are_owned_bound_to_state_and_replaced_on_reload() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            local function declaration(ids)
+              local entries = {}
+              for i, id in ipairs(ids) do
+                entries[i] = { id = id, order = i, run = function(state, x) return state.tag .. ":" .. x end }
+              end
+              return { api = "remuda-module-v1", state_version = 1,
+                initialize = function() return { tag = "s" } end,
+                contributes = { ["host.command"] = entries } }
+            end
+            remuda.contribute("host.command", "foreign", { order = 99 })
+            assert(remuda._activate_module("guest", declaration({ "one", "two" })))
+            local list = remuda.contributions("host.command")
+            assert(#list == 3 and list[1].id == "one" and list[1].owner == "guest")
+            assert(list[1].entry.run("x") == "s:x", "function fields are bound to state")
+            assert(list[3].id == "foreign" and list[3].owner == nil)
+
+            assert(remuda._activate_module("guest", declaration({ "three" })))
+            local ids = {}
+            for i, item in ipairs(remuda.contributions("host.command")) do ids[i] = item.id end
+            assert(table.concat(ids, ",") == "three,foreign", "reload replaces only its own: " .. table.concat(ids, ","))
+            "#,
+        )
+        .exec()
+        .expect("declared contributions");
+    }
+
+    #[test]
+    fn a_failed_start_rolls_back_declared_contributions() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            local function declaration(id)
+              return { api = "remuda-module-v1", state_version = 1,
+                initialize = function() return {} end,
+                contributes = { p = {{ id = id }} } }
+            end
+            assert(remuda._activate_module("guest", declaration("old")))
+            local ok, _, _, rollback = remuda._activate_module("guest", declaration("new"))
+            assert(ok and remuda.contributions("p")[1].id == "new")
+            rollback()
+            local list = remuda.contributions("p")
+            assert(#list == 1 and list[1].id == "old" and list[1].owner == "guest", "rollback restores")
+            "#,
+        )
+        .exec()
+        .expect("rollback of contributions");
+    }
+
+    #[test]
+    fn invalid_declared_contributions_are_refused_before_anything_changes() {
+        let lua = lifecycle_lua();
+        lua.load(
+            r#"
+            local function with(contributes)
+              return { api = "remuda-module-v1", state_version = 1,
+                initialize = function() return {} end, contributes = contributes }
+            end
+            assert(remuda._activate_module("guest", with({ p = {{ id = "kept" }} })))
+            for _, bad in ipairs({ { p = {{ id = "a" }, { id = "a" }} }, { p = {{}} },
+                                   { p = { "x" } }, { [""] = {{ id = "a" }} }, "x" }) do
+              assert(not pcall(remuda._activate_module, "guest", with(bad)))
+              local list = remuda.contributions("p")
+              assert(#list == 1 and list[1].id == "kept", "a refused declaration changed nothing")
+            end
+            "#,
+        )
+        .exec()
+        .expect("invalid declarations");
+    }
+
+    #[test]
     fn a_cycle_terminates() {
         assert_eq!(
             shown("(function() local t = {} t.self = t return t end)()"),
