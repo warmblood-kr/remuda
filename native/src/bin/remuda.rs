@@ -14,7 +14,8 @@
 //!
 //! Everything else — `new`, `close`, `capture`, `insert`, `key`, `click` — lives
 //! in the Lua image, reached by `-e`, `remuda lua <file>`, or `remuda mcp`. The
-//! daemon starts itself on first use. `-s` names one. See `USAGE`.
+//! state-creating commands start the daemon on first use; read-only commands
+//! require it to be running already. `-s` names one. See `USAGE`.
 
 use remuda_core::protocol::{Request, Response};
 use remuda_native::client::Left;
@@ -65,6 +66,8 @@ fn main() -> ExitCode {
 
         ["_codex_tui", rest @ ..] => codex_tui::run(rest),
 
+        ["_codex_watch", parent_pid, process_group] => run_codex_watch(parent_pid, process_group),
+
         // No daemon involved: this replaces the binary, it does not talk to one.
         ["upgrade", rest @ ..] => run_upgrade(rest),
 
@@ -79,7 +82,7 @@ fn main() -> ExitCode {
         // is not a thing to do.
         ["stop", rest @ ..] => stop(server, &path, rest),
 
-        ["ls"] => with_daemon(server, &path, list_sessions),
+        ["ls"] => with_existing_daemon(server, &path, list_sessions),
 
         ["run", rest @ ..] => run_session(server, &path, rest),
 
@@ -119,6 +122,8 @@ fn main() -> ExitCode {
 
         ["exec", name] => with_daemon(server, &path, |path| exec_command(path, name)),
 
+        ["cluster", rest @ ..] => cluster_command(server, &path, rest),
+
         [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
             extension_command(server, &path, command, rest)
         }
@@ -134,7 +139,7 @@ fn main() -> ExitCode {
         ["mod", "update", rest @ ..] => mod_update_command(server, &path, rest),
         ["mod", "remove", rest @ ..] => mod_remove_command(rest),
 
-        ["doc", rest @ ..] => with_daemon(server, &path, |path| doc_command(path, rest)),
+        ["doc", rest @ ..] => with_existing_daemon(server, &path, |path| doc_command(path, rest)),
 
         ["repl"] => with_daemon(server, &path, repl),
 
@@ -173,6 +178,13 @@ fn main() -> ExitCode {
     }
 }
 
+fn run_codex_watch(parent_pid: &str, process_group: &str) -> ExitCode {
+    match (parent_pid.parse::<i32>(), process_group.parse::<i32>()) {
+        (Ok(parent_pid), Ok(process_group)) => codex_tui::watch_parent(parent_pid, process_group),
+        _ => fail("invalid Codex app-server watch parameters"),
+    }
+}
+
 #[allow(dead_code)]
 const DETAILED_USAGE: &str = "\
 remuda — a pty manager you can attach to
@@ -199,6 +211,11 @@ remuda — a pty manager you can attach to
   remuda mod update NAME [--reload] update one installed mod
   remuda mod update --all         update all installed mods
   remuda mod remove NAME          remove one installed mod
+  remuda cluster                  show cluster status
+  remuda cluster init             create this node's cluster identity
+  remuda cluster nodes            list local cluster membership
+  remuda cluster revoke NODE [--yes] revoke a member locally
+  remuda cluster remote [node/session] open the read-only cluster tree
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
@@ -266,6 +283,11 @@ remuda — terminal orchestration for coding agents
   remuda mod list | info NAME    inspect installed mods
   remuda mod update NAME|--all   update a mod
   remuda mod remove NAME         remove a mod
+  remuda cluster                 show cluster status
+  remuda cluster init            create this node's cluster identity
+  remuda cluster nodes           list local cluster membership
+  remuda cluster revoke NODE [--yes] revoke a member locally
+  remuda cluster remote [node/session] open the read-only cluster tree
 
   remuda doc | repl | -e CODE    use the persistent Lua runtime
   remuda --version
@@ -290,6 +312,302 @@ fn help_command() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => fail(error),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClusterCommand {
+    Status,
+    Init,
+    Nodes,
+    Revoke { target: String, yes: bool },
+    Remote(Option<String>),
+    Invalid,
+}
+
+fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
+    match args {
+        [] => ClusterCommand::Status,
+        ["init"] => ClusterCommand::Init,
+        ["nodes"] => ClusterCommand::Nodes,
+        ["revoke", target] => ClusterCommand::Revoke {
+            target: (*target).to_string(),
+            yes: false,
+        },
+        ["revoke", target, "--yes"] => ClusterCommand::Revoke {
+            target: (*target).to_string(),
+            yes: true,
+        },
+        ["revoke", "--yes", target] => ClusterCommand::Revoke {
+            target: (*target).to_string(),
+            yes: true,
+        },
+        ["remote"] => ClusterCommand::Remote(None),
+        ["remote", target] if target.contains('/') => {
+            ClusterCommand::Remote(Some((*target).to_string()))
+        }
+        _ => ClusterCommand::Invalid,
+    }
+}
+
+fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    match parse_cluster_command(args) {
+        ClusterCommand::Status => match remuda_native::cluster::status() {
+            Ok(None) => {
+                println!("This node is not in a cluster; run `remuda cluster init`.");
+                ExitCode::SUCCESS
+            }
+            Ok(Some((identity, members))) => {
+                println!("Node: {}", identity.node_name);
+                println!("Fingerprint: {}", identity.node_fp);
+                println!("Members: {members}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("cluster status: {error}")),
+        },
+        ClusterCommand::Init => match remuda_native::cluster::init() {
+            Ok((identity, created)) => {
+                println!("{}", cluster_init_message(created));
+                println!("Node: {}", identity.node_name);
+                println!("Fingerprint: {}", identity.node_fp);
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("cluster init: {error}")),
+        },
+        ClusterCommand::Nodes => match remuda_native::cluster::nodes() {
+            Ok(Some((identity, registry))) => {
+                let mut stdout = std::io::stdout().lock();
+                match write_nodes_table(&mut stdout, &identity, &registry) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => fail(format!("cluster nodes: {error}")),
+                }
+            }
+            Ok(None) => fail("cluster is not initialized; run `remuda cluster init`"),
+            Err(error) => fail(format!("cluster nodes: {error}")),
+        },
+        ClusterCommand::Revoke { target, yes } => cluster_revoke(&target, yes),
+        ClusterCommand::Remote(target) => {
+            let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into());
+            with_daemon(server, path, |path| {
+                match remuda_native::cluster_tui::run(path, &node, target.as_deref()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => fail(format!("cluster remote: {error}")),
+                }
+            })
+        }
+        ClusterCommand::Invalid => fail("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | remote [node/session]]"),
+    }
+}
+
+fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
+    let (identity, registry) = match remuda_native::cluster::nodes() {
+        Ok(Some(nodes)) => nodes,
+        Ok(None) => return fail("cluster is not initialized; run `remuda cluster init`"),
+        Err(error) => return fail(format!("cluster nodes: {error}")),
+    };
+    let entry = match remuda_native::cluster::resolve_node(&registry.authorized_nodes, target) {
+        Ok(entry) => entry,
+        Err(error) => return fail(format!("cluster revoke: {error}")),
+    };
+    if entry.node_fp == identity.node_fp {
+        return fail("cluster revoke: cannot revoke self");
+    }
+    if entry.state == remuda_native::cluster::NodeState::Revoked {
+        println!(
+            "Node {} is already revoked.",
+            remuda_native::cluster::node_label(&entry.node_fp)
+        );
+        return ExitCode::SUCCESS;
+    }
+    let fingerprint = entry.node_fp.clone();
+    let label = remuda_native::cluster::node_label(&entry.node_fp);
+    let prompt = match revoke_confirmation(
+        yes,
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+    ) {
+        Ok(prompt) => prompt,
+        Err(message) => return fail(message),
+    };
+    match confirm_revoke(&label, &fingerprint, prompt) {
+        Ok(false) => {
+            println!("Revocation cancelled.");
+            return ExitCode::SUCCESS;
+        }
+        Ok(true) => {}
+        Err(error) => return fail(format!("cluster revoke: {error}")),
+    }
+    match remuda_native::cluster::revoke(&fingerprint) {
+        Ok(remuda_native::cluster::RevokeOutcome::Revoked) => {
+            println!(
+                "Node {label} revoked locally; propagates when the cluster transport is enabled."
+            );
+            ExitCode::SUCCESS
+        }
+        Ok(remuda_native::cluster::RevokeOutcome::AlreadyRevoked) => {
+            println!("Node {label} is already revoked.");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(format!("cluster revoke: {error}")),
+    }
+}
+
+fn revoke_confirmation(yes: bool, stdin_tty: bool, stderr_tty: bool) -> Result<bool, &'static str> {
+    if yes {
+        Ok(false)
+    } else if stdin_tty && stderr_tty {
+        Ok(true)
+    } else {
+        Err("use --yes to confirm non-interactively")
+    }
+}
+
+fn confirm_revoke(label: &str, fingerprint: &str, prompt: bool) -> std::io::Result<bool> {
+    use std::io::{self, Write};
+    if !prompt {
+        return Ok(true);
+    }
+    let mut stderr = io::stderr().lock();
+    write!(stderr, "Revoke node {label} ({fingerprint})? [y/N] ")?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(confirmation_answer_is_yes(&answer))
+}
+
+fn confirmation_answer_is_yes(answer: &str) -> bool {
+    answer.trim().eq_ignore_ascii_case("y") || answer.trim().eq_ignore_ascii_case("yes")
+}
+
+fn write_nodes_table<W: Write>(
+    writer: &mut W,
+    identity: &remuda_native::cluster::NodeIdentity,
+    registry: &remuda_native::cluster::Registry,
+) -> std::io::Result<()> {
+    match writer
+        .write_all(remuda_native::cluster::format_nodes_table(identity, registry).as_bytes())
+    {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
+fn cluster_init_message(created: bool) -> &'static str {
+    if created {
+        "Cluster initialized"
+    } else {
+        "Already initialized"
+    }
+}
+
+#[cfg(test)]
+mod cluster_cli_tests {
+    use super::{
+        cluster_init_message, confirmation_answer_is_yes, parse_cluster_command,
+        revoke_confirmation, write_nodes_table, ClusterCommand,
+    };
+
+    #[test]
+    fn cluster_status_and_init_are_recognized() {
+        assert_eq!(parse_cluster_command(&[]), ClusterCommand::Status);
+        assert_eq!(parse_cluster_command(&["init"]), ClusterCommand::Init);
+        assert_eq!(parse_cluster_command(&["join"]), ClusterCommand::Invalid);
+    }
+
+    #[test]
+    fn cluster_remote_accepts_an_optional_target() {
+        assert_eq!(
+            parse_cluster_command(&["remote"]),
+            ClusterCommand::Remote(None)
+        );
+        assert_eq!(
+            parse_cluster_command(&["remote", "studio/dev"]),
+            ClusterCommand::Remote(Some("studio/dev".into()))
+        );
+    }
+
+    #[test]
+    fn repeated_init_uses_already_initialized_wording() {
+        assert_eq!(cluster_init_message(false), "Already initialized");
+    }
+
+    #[test]
+    fn cluster_nodes_is_recognized() {
+        assert_eq!(parse_cluster_command(&["nodes"]), ClusterCommand::Nodes);
+    }
+
+    #[test]
+    fn cluster_revoke_accepts_target_and_yes_flag() {
+        assert_eq!(
+            parse_cluster_command(&["revoke", "node-abcd1234"]),
+            ClusterCommand::Revoke {
+                target: "node-abcd1234".into(),
+                yes: false
+            }
+        );
+        assert_eq!(
+            parse_cluster_command(&["revoke", "SHA256:abc", "--yes"]),
+            ClusterCommand::Revoke {
+                target: "SHA256:abc".into(),
+                yes: true
+            }
+        );
+        assert_eq!(
+            parse_cluster_command(&["revoke", "--yes", "SHA256:abc"]),
+            ClusterCommand::Revoke {
+                target: "SHA256:abc".into(),
+                yes: true
+            }
+        );
+    }
+
+    #[test]
+    fn revoke_confirmation_requires_yes_for_non_tty() {
+        assert_eq!(
+            revoke_confirmation(false, false, false),
+            Err("use --yes to confirm non-interactively")
+        );
+        assert_eq!(
+            revoke_confirmation(false, true, false),
+            Err("use --yes to confirm non-interactively")
+        );
+        assert_eq!(revoke_confirmation(true, false, false), Ok(false));
+        assert_eq!(revoke_confirmation(false, true, true), Ok(true));
+    }
+
+    #[test]
+    fn confirmation_accepts_yes_case_insensitively_and_defaults_no() {
+        assert!(confirmation_answer_is_yes("y\n"));
+        assert!(confirmation_answer_is_yes("Y"));
+        assert!(confirmation_answer_is_yes("yes\n"));
+        assert!(confirmation_answer_is_yes("YeS"));
+        assert!(!confirmation_answer_is_yes("n"));
+        assert!(!confirmation_answer_is_yes("anything else"));
+        assert!(!confirmation_answer_is_yes(""));
+    }
+
+    #[test]
+    fn nodes_output_ignores_a_broken_pipe() {
+        struct BrokenPipe;
+        impl std::io::Write for BrokenPipe {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let identity = remuda_native::cluster::NodeIdentity {
+            node_name: "node-local".into(),
+            node_fp: "SHA256:local".into(),
+            static_pubkey: vec![],
+        };
+        assert!(write_nodes_table(
+            &mut BrokenPipe,
+            &identity,
+            &remuda_native::cluster::Registry::default()
+        )
+        .is_ok());
     }
 }
 
@@ -382,7 +700,7 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         }
     }
     if remuda_native::ipc::connect(path).is_err() {
-        eprintln!("remuda: no daemon running for {server:?} — the next command starts one");
+        eprintln!("remuda: no daemon running for {server:?} — a state-creating command starts one");
         return ExitCode::SUCCESS;
     }
     if !yes && !force && has_sessions(path) {
@@ -572,6 +890,24 @@ fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> Exit
     match ensure_daemon(server, path) {
         Ok(()) => f(path),
         Err(e) => fail(e),
+    }
+}
+
+/// Run a read-only command only against a daemon that already exists.
+fn with_existing_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> ExitCode {
+    match remuda_native::ipc::connect(path) {
+        Ok(_) => f(path),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            fail(format!("cannot use {}: {error}", path.display()))
+        }
+        Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => fail(format!(
+            "no daemon running for {server:?} (socket {}); start one with remuda run ... or remuda -e ...",
+            path.display(),
+        )),
+        Err(error) => fail(format!(
+            "cannot connect to remuda daemon at {}: {error}; refusing to start a second daemon",
+            path.display()
+        )),
     }
 }
 

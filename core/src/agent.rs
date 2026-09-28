@@ -161,6 +161,14 @@ pub struct ScreenSnapshot {
     pub scrollback_total: usize,
 }
 
+/// A captured screen with the session identity and generation captured with it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct VersionedSnapshot {
+    pub snapshot: ScreenSnapshot,
+    pub output_version: Option<u64>,
+    pub instance_id: Option<String>,
+}
+
 /// A live agent process: a screen we can read, a keyboard we can type on.
 /// Caution: every method is sync for correctness, not simplicity — awaiting a
 /// body write and its Enter separately lets a second writer land between them.
@@ -187,6 +195,12 @@ pub trait AgentProcess: Send {
 
     fn mouse_state(&mut self) -> MouseState {
         MouseState::default()
+    }
+
+    /// The operating-system process ID for a process-backed agent.
+    /// Non-process implementations return `None`.
+    fn process_id(&self) -> Option<u32> {
+        None
     }
 
     /// The visible screen as styled cells, for a croppable colour pane.
@@ -225,10 +239,15 @@ pub trait AgentProcess: Send {
         Ok(Vec::new())
     }
 
+    /// A backend generation, if it can synchronize it with screen capture.
+    fn output_version(&mut self) -> Option<u64> {
+        None
+    }
+
     /// Capture the screen and its scrollback counters together when the
     /// backend can provide an atomic snapshot. The default preserves support
     /// for simpler agents that expose these values through separate calls.
-    fn screen_snapshot_at(&mut self, scrollback: usize) -> Result<ScreenSnapshot> {
+    fn screen_snapshot_at(&mut self, scrollback: usize) -> Result<VersionedSnapshot> {
         let cells = self.screen_cells_at(scrollback)?;
         let wrapped = self.row_wrapped_at(scrollback)?;
         let scrollback_len = self.scrollback_len();
@@ -242,12 +261,16 @@ pub trait AgentProcess: Send {
                 visible: false,
             }
         };
-        Ok(ScreenSnapshot {
-            cells,
-            wrapped,
-            cursor,
-            scrollback_len,
-            scrollback_total,
+        Ok(VersionedSnapshot {
+            snapshot: ScreenSnapshot {
+                cells,
+                wrapped,
+                cursor,
+                scrollback_len,
+                scrollback_total,
+            },
+            output_version: self.output_version(),
+            instance_id: None,
         })
     }
 

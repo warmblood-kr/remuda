@@ -28,6 +28,11 @@ on:
 permissions:
   contents: write
 
+# Overlapping nightly runs delete and recreate the same release, leaving it a draft.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   plan:
     runs-on: ubuntu-latest
@@ -88,6 +93,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04 # older glibc → runs on more distros
             bin: remuda
+          - target: aarch64-linux-android
+            os: ubuntu-22.04
+            bin: remuda
           - target: aarch64-apple-darwin
             os: macos-14
             bin: remuda
@@ -108,6 +116,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: set up Android NDK
+        if: matrix.target == 'aarch64-linux-android'
+        id: setup-ndk
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779 # v1.6.0
+        with:
+          ndk-version: r27d
+
+      - name: configure Android API 24 linker
+        if: matrix.target == 'aarch64-linux-android'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          set -eu
+          toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          # Termux supports Android 7.0+ (API 24) for full package support.
+          linker="$toolchain/aarch64-linux-android24-clang"
+          {
+            echo "CC_aarch64_linux_android=$linker"
+            echo "AR_aarch64_linux_android=$toolchain/llvm-ar"
+            echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$linker"
+          } >> "$GITHUB_ENV"
+
       - name: put the toolchain on PATH
         # The self-hosted runner is a launchd service and does not source a
         # shell profile, so an interactively-installed rustup is invisible to
@@ -127,15 +157,30 @@ jobs:
         # a release whose assets are named one thing and whose --version says
         # another. Cheap to assert here, invisible otherwise.
         #
-        # Skipped for the cross-compiled Intel slice: this host cannot run it.
-        # That is the honest cost of building x86_64 on Apple Silicon, and it is
-        # stated rather than hidden — no other target is exempt.
-        if: matrix.target != 'x86_64-apple-darwin'
+        # Android is cross-compiled too and gets its --version check in the
+        # Termux smoke below; this Linux host cannot execute that binary.
+        if: matrix.target != 'x86_64-apple-darwin' && matrix.target != 'aarch64-linux-android'
         run: |
           set -eu
           got=$(./target/${{ matrix.target }}/release/${{ matrix.bin }} --version)
           [ "$got" = "remuda ${{ needs.plan.outputs.version }}+gha.${{ github.run_number }}.${{ github.run_attempt }}.${{ github.sha }}" ] \
             || { echo "::error::--version said '$got'"; exit 1; }
+
+      - name: set up QEMU for Termux smoke
+        if: matrix.target == 'aarch64-linux-android'
+        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+        with:
+          platforms: arm64
+
+      - name: smoke Android binary in Termux
+        if: matrix.target == 'aarch64-linux-android'
+        timeout-minutes: 10
+        run: |
+          set -eu
+          docker run --rm --platform linux/arm64/v8 \
+            -v "$GITHUB_WORKSPACE/target/aarch64-linux-android/release/remuda:/tmp/remuda:ro" \
+            termux/termux-docker:aarch64 \
+            login -c '/tmp/remuda --version && /tmp/remuda -s smoke -e "return 1"'
 
       - name: package
         run: |
@@ -250,9 +295,15 @@ jobs:
         run: |
           set -eu
           if [ "${{ needs.plan.outputs.channel }}" = nightly ]; then
-            # Rolling: delete the old one so "nightly" always names today's.
-            gh release delete "$TAG" --yes --cleanup-tag || true
-            gh release create "$TAG" --prerelease --target "$GITHUB_SHA" \
+            # Rolling: replace the release but MOVE the tag instead of deleting it.
+            # Deleting the tag (--cleanup-tag) finishes asynchronously and can
+            # untag the NEW release, which GitHub then turns back into a draft.
+            gh release delete "$TAG" --yes || true
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" \
+              -f sha="$GITHUB_SHA" -F force=true \
+              || gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+                   -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA"
+            gh release create "$TAG" --prerelease --verify-tag \
               --title "nightly $VERSION" \
               --notes "Rolling build of main. Version \`$VERSION\`." dist/*
           else
@@ -281,6 +332,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.plan.outputs.tag }}
+          BUILT_SHA: ${{ github.sha }}
         run: |
           set -eu
           check_draft() { gh release view "$TAG" --json isDraft --jq .isDraft; }
@@ -298,6 +350,19 @@ jobs:
               exit 1
             fi
           }
+
+          # Concurrency retains at most one pending run, and a newer push can
+          # replace that pending run while this nightly is building. Detect a
+          # stale rolling release explicitly; the latest-wins policy remains
+          # non-blocking and this warning does not fail publication.
+          if [ "$TAG" = nightly ]; then
+            main_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
+            non_release_commits="$(gh api "repos/$GITHUB_REPOSITORY/compare/$BUILT_SHA...main" \
+              --jq '[.commits[].commit.message | select(startswith("release: ") | not)] | length')"
+            if [ "$non_release_commits" != 0 ]; then
+              echo "::warning::nightly was built from $BUILT_SHA, but main HEAD at verification is $main_sha and is ahead by $non_release_commits non-release commit(s); the published nightly may be stale."
+            fi
+          fi
 
           verify "right after publish"
           sleep 60

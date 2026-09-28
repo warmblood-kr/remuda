@@ -25,6 +25,7 @@ remuda._extension_commands = {}
 -- it registers imperatively is tagged with its name, so reload and rollback
 -- can replace it like the declared registrations.
 local current_owner = nil
+local module_tool_owners = {}
 local function with_owner(owner, fn, ...)
   local outer = current_owner
   current_owner = owner
@@ -137,7 +138,13 @@ end
 
 function remuda.tool(spec)
   local word = make_tool(spec)
+  local owner = current_owner
+  if owner then
+    local run = word.run
+    word.run = function(arguments, caller) return with_owner(owner, run, arguments, caller) end
+  end
   remuda.tools[word.name] = word
+  module_tool_owners[word.name] = owner
   register(word.name, word.about, word.name .. "(" .. arg_list(word.args, word.needs) .. ") -> string")
   return word
 end
@@ -161,6 +168,7 @@ register(
 
 local Schedule = {}
 Schedule.__index = Schedule
+local schedule_clock_now = 0
 
 -- Schedules are multi-registrant, using the same split as `remuda.tool`:
 -- native code provides the fixed tick while this table owns the interval and
@@ -177,19 +185,28 @@ function remuda.schedule(spec)
   if type(spec.every) ~= "number" or spec.every <= 0 then
     error("a schedule needs a positive `every` (seconds)", 2)
   end
+  if spec.after ~= nil and (type(spec.after) ~= "number" or spec.after < 0
+    or spec.after ~= spec.after or spec.after == math.huge) then
+    error("a schedule's `after`, when given, must be a finite non-negative number of seconds", 2)
+  end
   if type(spec.run) ~= "function" then
     error("a schedule needs a `run` function", 2)
   end
+  local owner = current_owner
   local handle = setmetatable({ name = spec.name }, Schedule)
+  -- With no `after`, last_run=0 preserves the daemon-uptime-dependent first
+  -- firing. An explicit delay instead anchors the first deadline at creation.
+  local last_run = spec.after == nil and 0 or schedule_clock_now + spec.after - spec.every
   remuda.schedules[handle] = {
     name = spec.name,
     every = spec.every,
-    run = spec.run,
-    last_run = 0,
+    run = owner and function(...) return with_owner(owner, spec.run, ...) end or spec.run,
+    last_run = last_run,
+    owner = owner,
   }
   return handle
 end
-register("schedule", "Register a periodic callback, run every `every` seconds.", "schedule(spec) -> handle")
+register("schedule", "Register a periodic callback, run every `every` seconds; optional `after` sets the first firing delay from creation. Without it, the first firing depends on daemon uptime.", "schedule(spec) -> handle")
 
 -- A no-op on an already-cancelled or unrecognized handle — a caller racing
 -- its own cancel, or cancelling twice, gets silence rather than an error for
@@ -375,13 +392,17 @@ register("expect_option", "Pick a unique numbered menu option by its label.", "e
 -- clock). Fires every schedule whose own interval has elapsed since ITS OWN
 -- last run — native never sees or compares an individual interval itself.
 function remuda._run_due_schedules(now)
+  local schedule_now = now or expect_clock_now or schedule_clock_now
+  schedule_clock_now = schedule_now
   -- Expectations are advanced from the same native one-second clock. A
   -- future PTY output event may call this local directly to reduce latency.
+  -- Preserve expectation-specific injected clocks: nil here lets each
+  -- expectation's options.now() supply its own time, while schedule_now is
+  -- the fallback clock only for periodic schedules.
   local expect_ok, expect_err = pcall(expect_tick, now)
   if not expect_ok and io and io.stderr then
     io.stderr:write("remuda.expect tick failed: " .. tostring(expect_err) .. "\n")
   end
-  local schedule_now = now or expect_clock_now or 0
   -- Snapshot the handles, as `emit` does: a run() that schedules must not add
   -- keys mid-`pairs` (undefined in Lua). A cancel mid-tick still takes effect.
   local handles = {}
@@ -817,6 +838,62 @@ register("contributions", "A point's entries as {id, owner, entry} rows, entry a
 -- declare registrations as data. Reload stages the declaration and migrations
 -- before replacing the mod's hook group and tools.
 local modules = {}
+local field_owners = {}
+
+-- Rollback restores the old activation's declared registrations from the
+-- snapshot. Its start() must rebuild only the imperative registrations it
+-- created, so discard those owner-tagged effects before running it again.
+local function clear_imperative_module_registrations(name, activation)
+  local declared_schedules, declared_tools, declared_advice, declared_contributions = {}, {}, {}, {}
+  for _, handle in ipairs(activation.schedules or {}) do declared_schedules[handle] = true end
+  for _, tool_name in ipairs(activation.tools or {}) do declared_tools[tool_name] = true end
+  for _, advice in ipairs(activation.advice or {}) do declared_advice[advice] = true end
+  for _, contribution in ipairs(activation.contributions or {}) do declared_contributions[contribution] = true end
+
+  for event, registered in pairs(remuda.hooks) do
+    local kept = {}
+    for _, hook in ipairs(registered) do
+      if hook.owner ~= name then kept[#kept + 1] = hook end
+    end
+    remuda.hooks[event] = kept
+  end
+  for handle, schedule in pairs(remuda.schedules) do
+    if schedule.owner == name and not declared_schedules[handle] then remuda.cancel(handle) end
+  end
+  for tool_name, owner in pairs(module_tool_owners) do
+    if owner == name and not declared_tools[tool_name] then
+      remuda.tools[tool_name], remuda._registry[tool_name], module_tool_owners[tool_name] = nil, nil, nil
+    end
+  end
+  for path, entry in pairs(advised) do
+    for index = #entry.list, 1, -1 do
+      local advice = entry.list[index]
+      if advice.owner == name and not declared_advice[advice] then
+        remuda.unadvise(path, advice.id)
+      end
+    end
+  end
+  for _, items in pairs(contributions) do
+    for id, item in pairs(items) do
+      if item.owner == name and not declared_contributions[item] then items[id] = nil end
+    end
+  end
+  for command, owner in pairs(extension_command_owners) do
+    if owner == name then remuda._extension_commands[command], extension_command_owners[command] = nil, nil end
+  end
+  for key, owner in pairs(field_owners) do
+    if owner == name then remuda[key], field_owners[key] = nil, nil end
+  end
+end
+
+local function stop_module_activation(name, module)
+  if not module or not module.stop or module.stopped then return end
+  module.stopped = true
+  local ok, err = pcall(module.stop, module.state)
+  if not ok then
+    io.stderr:write("remuda module stop error for " .. name .. ": " .. tostring(err) .. "\n")
+  end
+end
 
 -- #145: a lifecycle mod sees `remuda` through a proxy, so its assignments
 -- come here. It may create new top-level fields, which it then owns; core's
@@ -824,7 +901,6 @@ local modules = {}
 -- refused. A field left by a legacy exec, unowned, is adopted only in the
 -- mod's own namespace.
 local core_fields = {}
-local field_owners = {}
 local function set_module_field(name, key, value)
   if type(key) ~= "string" then error("mod " .. name .. " may only set string-named remuda fields", 2) end
   if core_fields[key] then
@@ -845,7 +921,6 @@ local function set_module_field(name, key, value)
   remuda[key] = value
 end
 remuda._module_set_field = set_module_field
-local module_tool_owners = {}
 
 local function clone_module_state(value, seen)
   local kind = type(value)
@@ -904,6 +979,9 @@ function remuda._activate_module(name, candidate, reactivate)
   if candidate.start ~= nil and type(candidate.start) ~= "function" then
     error("module start must be a function", 0)
   end
+  if candidate.stop ~= nil and type(candidate.stop) ~= "function" then
+    error("module stop must be a function", 0)
+  end
 
   local hooks = candidate.hooks or {}
   local hook_count = array_length(hooks, "module hooks")
@@ -949,8 +1027,10 @@ function remuda._activate_module(name, candidate, reactivate)
     local schedule = schedules[index]
     if type(schedule) ~= "table" or type(schedule.every) ~= "number" or schedule.every <= 0
       or type(schedule.run) ~= "function"
+      or (schedule.after ~= nil and (type(schedule.after) ~= "number" or schedule.after < 0
+        or schedule.after ~= schedule.after or schedule.after == math.huge))
       or (schedule.name ~= nil and (type(schedule.name) ~= "string" or schedule.name == "")) then
-      error("each module schedule needs a positive every, a run function, and an optional non-empty name", 0)
+      error("each module schedule needs a positive every, a run function, an optional finite non-negative after, and an optional non-empty name", 0)
     end
   end
 
@@ -972,6 +1052,7 @@ function remuda._activate_module(name, candidate, reactivate)
   if type(contributes) ~= "table" then
     error("module contributes must be a table keyed by point", 0)
   end
+  local declared_contributions = {}
   for point, entries in pairs(contributes) do
     local seen = {}
     for index = 1, array_length(entries, "module contributes for " .. tostring(point)) do
@@ -1024,9 +1105,14 @@ function remuda._activate_module(name, candidate, reactivate)
     end
   end
 
+  -- Stop the previous activation while it still owns its registrations and
+  -- before the replacement's start can run. A cleanup error is diagnostic,
+  -- not a reason to prevent reload.
+  stop_module_activation(name, previous)
+
   -- Snapshot what this activation replaces, so a failing `start` can put the
   -- previous activation back (#129). State mutated by that `start` stays.
-  local saved_hooks, saved_tools, saved_schedules, saved_commands = {}, {}, {}, {}
+  local saved_hooks, saved_tools, saved_schedules, saved_owner_schedules, saved_commands = {}, {}, {}, {}, {}
   local saved_advice = snapshot_advice()
   local saved_fields = {}
   for key, owner in pairs(field_owners) do
@@ -1041,8 +1127,16 @@ function remuda._activate_module(name, candidate, reactivate)
   for _, tool_name in ipairs(previous and previous.tools or {}) do
     saved_tools[tool_name] = { remuda.tools[tool_name], remuda._registry[tool_name], module_tool_owners[tool_name] }
   end
+  for tool_name, owner in pairs(module_tool_owners) do
+    if owner == name then
+      saved_tools[tool_name] = { remuda.tools[tool_name], remuda._registry[tool_name], owner }
+    end
+  end
   for _, handle in ipairs(previous and previous.schedules or {}) do
     saved_schedules[handle] = remuda.schedules[handle]
+  end
+  for handle, schedule in pairs(remuda.schedules) do
+    if schedule.owner == name then saved_owner_schedules[handle] = true end
   end
   local saved_contributions = {}
   for point, items in pairs(contributions) do
@@ -1120,21 +1214,52 @@ function remuda._activate_module(name, candidate, reactivate)
       for key, field in pairs(entry) do
         bound[key] = type(field) == "function" and function(...) return field(state, ...) end or field
       end
-      contributions[point][entry.id] = { owner = name, entry = bound }
+      local contribution = { owner = name, entry = bound }
+      contributions[point][entry.id] = contribution
+      declared_contributions[#declared_contributions + 1] = contribution
     end
   end
   local schedule_handles = {}
   for index = 1, schedule_count do
     local declared = schedules[index]
-    schedule_handles[index] = remuda.schedule({
+    schedule_handles[index] = with_owner(name, remuda.schedule, {
       name = declared.name,
       every = declared.every,
+      after = declared.after,
       run = function() return with_owner(name, declared.run, state) end,
     })
   end
-  modules[name] = { version = version, state = state, tools = tool_names, schedules = schedule_handles }
+  local stop = candidate.stop and function(stopped_state)
+    return with_owner(name, candidate.stop, stopped_state)
+  end
+  local start = candidate.start and function(started_state)
+    return with_owner(name, candidate.start, started_state)
+  end
+  local activation = {
+    version = version,
+    state = state,
+    tools = tool_names,
+    schedules = schedule_handles,
+    advice = {},
+    contributions = declared_contributions,
+    stop = stop,
+    start = start,
+    stopped = false,
+  }
+  for index = 1, advice_count do
+    local declared = declared_advice[index]
+    local entry = advised[declared.path]
+    for _, advice in ipairs(entry and entry.list or {}) do
+      if advice.owner == name and advice.id == declared.id then
+        activation.advice[#activation.advice + 1] = advice
+        break
+      end
+    end
+  end
+  modules[name] = activation
 
   local function rollback()
+    stop_module_activation(name, activation)
     for event, registered in pairs(remuda.hooks) do
       local restored = saved_hooks[event] or {}
       local known = {}
@@ -1162,6 +1287,15 @@ function remuda._activate_module(name, candidate, reactivate)
     for _, handle in ipairs(schedule_handles) do
       remuda.cancel(handle)
     end
+    -- A failing start can register schedules imperatively. They have the
+    -- module owner but are absent from the declaration's schedule_handles.
+    -- Preserve schedules that existed before activation; the previous
+    -- activation's restart path will rebuild its own imperative schedules.
+    for handle, schedule in pairs(remuda.schedules) do
+      if schedule.owner == name and not saved_owner_schedules[handle] then
+        remuda.cancel(handle)
+      end
+    end
     for handle, schedule in pairs(saved_schedules) do
       remuda.schedules[handle] = schedule
     end
@@ -1186,11 +1320,59 @@ function remuda._activate_module(name, candidate, reactivate)
       contributions[point] = restored
     end
     modules[name] = previous
-  end
-  local start = candidate.start and function(started_state)
-    return with_owner(name, candidate.start, started_state)
+    if previous and previous.stopped and previous.start then
+      clear_imperative_module_registrations(name, previous)
+      local was_active = remuda._lifecycle_start_active
+      remuda._lifecycle_start_active = true
+      local ok, err = pcall(previous.start, previous.state)
+      remuda._lifecycle_start_active = was_active
+      if ok then
+        previous.stopped = false
+      else
+        io.stderr:write("remuda module restart error for " .. name .. ": " .. tostring(err) .. "\n")
+        for event, registered in pairs(remuda.hooks) do
+          local kept = {}
+          for _, hook in ipairs(registered) do
+            if not owned(hook) then kept[#kept + 1] = hook end
+          end
+          remuda.hooks[event] = kept
+        end
+        for _, tool_name in ipairs(previous.tools) do
+          if module_tool_owners[tool_name] == name then
+            remuda.tools[tool_name], remuda._registry[tool_name], module_tool_owners[tool_name] = nil, nil, nil
+          end
+        end
+        for _, handle in ipairs(previous.schedules) do remuda.cancel(handle) end
+        for command, owner in pairs(extension_command_owners) do
+          if owner == name then
+            remuda._extension_commands[command], extension_command_owners[command] = nil, nil
+          end
+        end
+        for key, owner in pairs(field_owners) do
+          if owner == name then remuda[key], field_owners[key] = nil, nil end
+        end
+        drop_owned_advice(name)
+        for _, items in pairs(contributions) do
+          for id, item in pairs(items) do
+            if item.owner == name then items[id] = nil end
+          end
+        end
+        modules[name] = nil
+      end
+    end
   end
   return true, state, start, rollback
+end
+
+-- Called by the daemon's clean shutdown path. A snapshot avoids mutation
+-- hazards if a stop callback activates another module.
+function remuda._stop_modules()
+  local active = {}
+  for name, module in pairs(modules) do active[#active + 1] = { name, module } end
+  for _, pair in ipairs(active) do
+    local name, module = pair[1], pair[2]
+    stop_module_activation(name, module)
+  end
 end
 
 local escapes = {

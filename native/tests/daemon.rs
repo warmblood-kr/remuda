@@ -231,6 +231,226 @@ fn new_session(path: &Path, name: &str) {
     );
 }
 
+#[test]
+fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_versions_advance() {
+    let runtime = scratch_dir("ver-restart");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut first_daemon = spawn::Daemon::spawn(&runtime);
+    start_shell_session(
+        &socket,
+        "sleep 1; printf first; sleep 1; printf later; sleep 30",
+    );
+    let first_summary = listed_session(&socket);
+    let first_version = wait_for_quiet_output_version(&socket);
+    let front_request = serde_json::to_vec(&Request::CaptureStyled {
+        name: "versioned".into(),
+        scrollback: 0,
+    })
+    .expect("encode front request");
+    let front_capture: Response = serde_json::from_slice(
+        &remuda_native::remote_front::forward_frame(&socket, &front_request)
+            .expect("front forwards capture"),
+    )
+    .expect("decode front response");
+    assert!(
+        matches!(front_capture, Response::StyledScreen { instance_id, output_version, .. }
+        if instance_id == first_summary.instance_id && output_version == Some(first_version))
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(capture_version(&socket), first_version);
+    wait_for_output_version(&socket, first_version);
+
+    client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("stop first daemon");
+    assert!(
+        first_daemon.left_on_its_own(),
+        "first daemon should stop cleanly"
+    );
+
+    let mut second_daemon = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "printf second; sleep 30");
+    let second_summary = listed_session(&socket);
+    assert_ne!(first_summary.instance_id, second_summary.instance_id);
+    let _ = client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    assert!(
+        second_daemon.left_on_its_own(),
+        "second daemon should stop cleanly"
+    );
+}
+
+fn start_shell_session(socket: &Path, script: &str) {
+    let response = client::request(
+        socket,
+        &Request::New {
+            name: Some("versioned".into()),
+            command: vec!["sh".into(), "-c".into(), script.into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start session");
+    assert!(matches!(response, Response::Value(_)));
+}
+
+fn listed_session(socket: &Path) -> remuda_core::SessionSummary {
+    match client::request(socket, &Request::List).expect("list session") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "versioned")
+            .expect("session is listed"),
+        other => panic!("unexpected list response: {other:?}"),
+    }
+}
+
+fn capture_version(socket: &Path) -> u64 {
+    match client::request(
+        socket,
+        &Request::CaptureStyled {
+            name: "versioned".into(),
+            scrollback: 0,
+        },
+    )
+    .expect("capture session")
+    {
+        Response::StyledScreen {
+            output_version: Some(version),
+            ..
+        } => version,
+        Response::StyledScreen {
+            output_version: None,
+            ..
+        } => panic!("daemon did not provide an output version"),
+        other => panic!("unexpected capture response: {other:?}"),
+    }
+}
+
+fn wait_for_output_version(socket: &Path, original: u64) {
+    let deadline = Instant::now() + PATIENCE;
+    while capture_version(socket) <= original {
+        assert!(Instant::now() < deadline, "output version did not increase");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_quiet_output_version(socket: &Path) -> u64 {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let version = capture_version(socket);
+        assert!(
+            Instant::now() < deadline,
+            "output version did not become quiet"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        if capture_version(socket) == version {
+            return version;
+        }
+    }
+}
+
+#[test]
+fn old_json_shapes_parse_with_defaults_for_additive_session_fields() {
+    let summary = remuda_core::SessionSummary {
+        id: "".into(),
+        name: "old-client".into(),
+        instance_id: Some("new-field".into()),
+        output_version: Some(7),
+        alive: true,
+        idle: Duration::ZERO,
+        output_idle: None,
+        size: Size::new(80, 24),
+        attached: false,
+        human_idle: None,
+        mouse_tracking: false,
+    };
+    let mut old_summary = serde_json::to_value(summary).expect("serialize summary");
+    let fields = old_summary.as_object_mut().expect("summary object");
+    fields.remove("id");
+    fields.remove("instance_id");
+    fields.remove("output_version");
+    let decoded: remuda_core::SessionSummary =
+        serde_json::from_value(old_summary).expect("parse old session summary");
+    assert_eq!(decoded.instance_id, None);
+    assert_eq!(decoded.output_version, None);
+
+    let response = Response::StyledScreen {
+        rows: vec![],
+        instance_id: Some("new-field".into()),
+        output_version: Some(7),
+        wrapped: vec![],
+        scrollback_len: 0,
+        scrollback_total: 0,
+        cursor: remuda_core::agent::Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        },
+    };
+    let mut old_response = serde_json::to_value(response).expect("serialize response");
+    let fields = old_response
+        .as_object_mut()
+        .and_then(|variant| variant.get_mut("StyledScreen"))
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("styled response object");
+    fields.remove("instance_id");
+    fields.remove("output_version");
+    let decoded: Response = serde_json::from_value(old_response).expect("parse old response");
+    assert!(matches!(
+        decoded,
+        Response::StyledScreen {
+            instance_id: None,
+            output_version: None,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn resizing_without_child_output_advances_the_output_version() {
+    let runtime = scratch_dir("resize-ver");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut daemon = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let before = capture_version(&socket);
+    let response = client::request(
+        &socket,
+        &Request::Resize {
+            name: "versioned".into(),
+            size: Size::new(81, 24),
+        },
+    )
+    .expect("resize session");
+    assert_eq!(response, Response::Ok);
+    assert!(capture_version(&socket) > before);
+    client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("stop daemon");
+    assert!(daemon.left_on_its_own(), "daemon should stop cleanly");
+}
+
 /// Connect using the original attach wire shape and leave the connection in
 /// raw mode. Reading the acknowledgement one byte at a time keeps any initial
 /// screen bytes in the socket for the caller.
@@ -2397,6 +2617,118 @@ fn assert_session_shutdown_identity_is_refused(path: &Path, daemon_id: u32) {
 
 #[cfg(unix)]
 #[test]
+fn shutdown_uses_peer_ancestry_when_session_environment_is_stripped() {
+    let dir = scratch_dir("stop-ancestry-red");
+    let path = daemon::socket_path_in(&dir, "s");
+    let mut daemon = Daemon::spawn(&dir);
+    let runtime = dir.to_string_lossy();
+    let path_text = path.to_string_lossy();
+    let path_value = std::env::var("PATH").unwrap_or_default();
+    let binary = env!("CARGO_BIN_EXE_remuda");
+    let test_binary = std::env::current_exe().expect("integration test binary path");
+    let cli = format!(
+        "/usr/bin/env -i PATH='{}' REMUDA_RUNTIME_DIR='{}' '{}' -s s stop -f --yes; sleep 30",
+        path_value, runtime, binary
+    );
+    let raw = format!(
+        "/usr/bin/env -i PATH='{}' REMUDA_RUNTIME_DIR='{}' REMUDA_TEST_RAW_SHUTDOWN_SOCKET='{}' '{}' --exact raw_shutdown_descendant_helper --nocapture; sleep 30",
+        path_value,
+        runtime,
+        path_text,
+        test_binary.display()
+    );
+    for (name, command) in [("env-stop", cli), ("raw-stop", raw)] {
+        let response = client::request(
+            &path,
+            &Request::New {
+                name: Some(name.into()),
+                command: vec!["sh".into(), "-c".into(), command],
+                size: Size::new(100, 30),
+                cwd: None,
+                env: Some(std::collections::HashMap::from([(
+                    "REMUDA_RUNTIME_DIR".into(),
+                    runtime.to_string(),
+                )])),
+            },
+        )
+        .expect("start descendant requester");
+        assert!(matches!(response, Response::Value(_)));
+    }
+
+    let deadline = Instant::now() + PATIENCE;
+    let cli_screen = loop {
+        let screen = capture(&path, "env-stop");
+        if screen.contains("cannot stop this daemon") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "env -i requester was not refused: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(cli_screen.contains("--i-am-inside"), "{cli_screen}");
+
+    let deadline = Instant::now() + PATIENCE;
+    let raw_screen = loop {
+        let screen = capture(&path, "raw-stop");
+        if screen.contains("raw_shutdown_descendant_helper") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "raw Shutdown helper did not run: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(raw_screen.contains("ok"), "raw helper failed: {raw_screen}");
+    assert!(
+        remuda_native::ipc::connect(&path).is_ok(),
+        "daemon was stopped"
+    );
+
+    let stopped = client::request(
+        &path,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("outside shutdown");
+    assert_eq!(stopped, Response::Ok);
+    assert!(
+        daemon.left_on_its_own(),
+        "outside caller did not stop daemon"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_shutdown_descendant_helper() {
+    let Ok(path) = std::env::var("REMUDA_TEST_RAW_SHUTDOWN_SOCKET") else {
+        return;
+    };
+    let response = client::request(
+        Path::new(&path),
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    )
+    .expect("raw descendant shutdown response");
+    assert!(
+        matches!(&response, Response::Error(reason) if reason.contains("one of its own sessions")),
+        "raw descendant Shutdown was not refused: {response:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn a_session_can_stop_a_different_private_daemon() {
     let dir_a = scratch_dir("stop-foreign-a");
     let dir_b = scratch_dir("stop-foreign-b");
@@ -2673,6 +3005,91 @@ fn a_sigkilled_daemon_reaps_its_direct_process_child_but_not_an_already_forked_g
     unsafe {
         libc::kill(grandchild_pid, libc::SIGKILL);
     }
+}
+
+/// The Codex app-server is detached into its own process group, so daemon PTY
+/// teardown cannot HUP it. Its parent-death guard must still reap it when the
+/// daemon dies and the session's remuda CLI disappears.
+#[cfg(unix)]
+#[test]
+fn a_sigkilled_daemon_reaps_a_codex_app_server_in_its_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("codex-parent-death");
+    let mut daemon = Daemon::spawn(&dir);
+    let path = daemon::socket_path_in(&dir, "s");
+    let stub_dir = dir.join("bin");
+    std::fs::create_dir_all(&stub_dir).unwrap();
+    let pid_file = dir.join("app-server.pid");
+    let stub = stub_dir.join("codex");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nif [ \"$1\" = app-server ]; then\n  trap '' HUP\n  echo $$ > \"$STUB_PIDFILE\"\nfi\nexec /bin/sleep 60\n",
+    )
+    .unwrap();
+    let mut mode = std::fs::metadata(&stub).unwrap().permissions();
+    mode.set_mode(0o755);
+    std::fs::set_permissions(&stub, mode).unwrap();
+    let env = std::collections::HashMap::from([
+        ("PATH".to_string(), stub_dir.to_string_lossy().into_owned()),
+        (
+            "STUB_PIDFILE".to_string(),
+            pid_file.to_string_lossy().into_owned(),
+        ),
+    ]);
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("codex".into()),
+            command: vec![
+                env!("CARGO_BIN_EXE_remuda").into(),
+                "_codex_tui".into(),
+                "--status".into(),
+                dir.join("status").to_string_lossy().into_owned(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start Codex TUI session");
+    assert!(matches!(response, Response::Value(_)));
+
+    let deadline = Instant::now() + PATIENCE;
+    let app_server_pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            break pid.trim().parse::<i32>().unwrap();
+        }
+        assert!(Instant::now() < deadline, "stub app-server never started");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        pid_alive(app_server_pid),
+        "app-server exited before daemon death"
+    );
+
+    assert_eq!(
+        unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGKILL) },
+        0,
+        "kill private daemon"
+    );
+    let _ = daemon.0.wait();
+    let deadline = Instant::now() + PATIENCE;
+    while pid_alive(app_server_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let app_server_reaped = !pid_alive(app_server_pid);
+    if !app_server_reaped {
+        // Keep a regression failure from leaving the stub process behind.
+        unsafe {
+            libc::kill(app_server_pid, libc::SIGKILL);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        app_server_reaped,
+        "Codex app-server ({app_server_pid}) outlived the killed daemon"
+    );
 }
 
 /// [MEASURED, unix] The one path that DOES reach a grandchild: a clean

@@ -14,10 +14,60 @@ pub trait Clock: Send + Sync {
     /// between two readings are meaningful, and never across two clocks.
     fn now(&self) -> Duration;
 
+    /// Stable entropy for process-wide identifiers; real host clocks override this.
+    fn instance_id_seed(&self) -> u128 {
+        0
+    }
+
     /// Block until `duration` has passed on *this* clock — never
     /// `std::thread::sleep` directly, so a `ManualClock` can make a pause
     /// deterministic instead of a flaky real-time wait.
     fn sleep(&self, duration: Duration);
+}
+
+/// A source of Unix wall time for values whose expiry must survive restart.
+pub trait WallClock: Send + Sync {
+    /// Current seconds since the Unix epoch.
+    fn unix_seconds(&self) -> u64;
+}
+
+/// A wall clock controlled directly by its caller, including backwards steps.
+pub struct ManualWallClock {
+    unix_seconds: std::sync::Mutex<u64>,
+}
+
+impl ManualWallClock {
+    pub fn new(unix_seconds: u64) -> Self {
+        Self {
+            unix_seconds: std::sync::Mutex::new(unix_seconds),
+        }
+    }
+
+    /// Set a reading explicitly, including a simulated clock rollback.
+    pub fn set_unix_seconds(&self, unix_seconds: u64) {
+        *self
+            .unix_seconds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = unix_seconds;
+    }
+
+    /// Advance by the whole seconds in `duration`.
+    pub fn advance(&self, duration: Duration) {
+        let mut unix_seconds = self
+            .unix_seconds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *unix_seconds = unix_seconds.saturating_add(duration.as_secs());
+    }
+}
+
+impl WallClock for ManualWallClock {
+    fn unix_seconds(&self) -> u64 {
+        *self
+            .unix_seconds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 // The real clock lives in `remuda-native`, not here. It sat behind a `native`
@@ -69,5 +119,20 @@ impl Clock for ManualClock {
             .advanced
             .wait_while(guard, |elapsed| *elapsed < target)
             .unwrap_or_else(|p| p.into_inner());
+    }
+}
+
+#[cfg(test)]
+mod wall_clock_tests {
+    use super::{ManualWallClock, WallClock};
+    use core::time::Duration;
+
+    #[test]
+    fn manual_wall_clock_moves_forward_and_can_simulate_rollback() {
+        let clock = ManualWallClock::new(10);
+        clock.advance(Duration::from_secs(5));
+        assert_eq!(clock.unix_seconds(), 15);
+        clock.set_unix_seconds(3);
+        assert_eq!(clock.unix_seconds(), 3);
     }
 }

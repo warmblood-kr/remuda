@@ -7,6 +7,8 @@
 
 pub mod child_guard;
 pub mod client;
+pub mod cluster;
+pub mod cluster_tui;
 pub mod daemon;
 pub mod dist;
 pub mod image;
@@ -15,6 +17,7 @@ pub mod mcp;
 pub mod mouse;
 pub mod packages;
 pub mod process;
+mod process_ancestry;
 pub mod pty;
 pub mod remote_front;
 pub mod script;
@@ -24,8 +27,32 @@ pub mod tui;
 pub use portable_pty::CommandBuilder;
 pub use pty::PtyAgent;
 
-use remuda_core::{Clock, Size};
+use remuda_core::{Clock, Size, WallClock};
 use std::time::{Duration, Instant};
+
+/// The host implementation of persistent Unix wall time.
+pub struct SystemWallClock;
+
+impl SystemWallClock {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for SystemWallClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WallClock for SystemWallClock {
+    fn unix_seconds(&self) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+}
 
 /// This terminal's size, or the floor if it cannot be determined (no tty, a
 /// pipe, a cron job). `Size::new` clamps anyway, so the worst case is a session
@@ -44,12 +71,18 @@ pub fn terminal_size() -> Size {
 /// host facility and the policy layer receives a clock rather than reading one.
 pub struct SystemClock {
     origin: Instant,
+    instance_id_seed: u128,
 }
 
 impl SystemClock {
     pub fn new() -> Self {
         Self {
             origin: Instant::now(),
+            instance_id_seed: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                ^ ((std::process::id() as u128) << 64),
         }
     }
 }
@@ -67,6 +100,10 @@ impl Clock for SystemClock {
 
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
+    }
+
+    fn instance_id_seed(&self) -> u128 {
+        self.instance_id_seed
     }
 }
 

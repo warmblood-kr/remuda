@@ -165,6 +165,13 @@ recreate keeps its advice. Other imperative effects
 (`remuda.schedule`, `remuda.process`, `remuda.new`, and so on) are not owned
 and survive reload; the mod must find and reuse or cancel them itself.
 
+An optional `stop(state)` runs for the old activation before a reload starts
+its replacement, while the old activation still owns its registrations. It
+also runs for each active lifecycle mod during a clean daemon shutdown.
+Failures are logged and cleanup continues; shutdown waits at most two seconds
+for the whole stop pass. A forced daemon termination cannot run Lua stop
+callbacks.
+
 The runtime registry also covers words added with `remuda.tool`, so an
 extension can document itself when it registers its function:
 
@@ -226,6 +233,29 @@ contributes = {
   ["butler.command"] = {{ id = "inbox", order = 20, usage = "inbox [NAME]",
     run = function(state, args, caller) return "..." end }},
 }
+```
+
+## Periodic schedules
+
+`remuda.schedule({every, after?, name?, run})` runs a callback on the daemon's
+periodic tick. `after` is an optional finite, non-negative number of seconds
+from schedule creation to the first callback; later callbacks are spaced by
+`every` seconds from the preceding firing. The scheduler checks about once per
+second, so a callback runs on the first tick at or after its deadline.
+
+Without `after`, the existing first-fire default depends on daemon uptime. The
+first callback is due when the daemon's elapsed-time clock reaches `every`:
+if the daemon has already been running that long, a new schedule can fire on
+the next tick; otherwise it waits until the daemon reaches that uptime. This
+default is not a delay measured from schedule creation.
+
+```lua
+remuda.schedule({
+  name = "refresh",
+  every = 60,
+  after = 10,
+  run = function() refresh_status() end,
+})
 ```
 
 ## Advice

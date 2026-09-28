@@ -14,6 +14,7 @@
 
 use crate::image::Image;
 use crate::ipc::{self, Listener, Stream, TryClone};
+use crate::process_ancestry;
 use crate::pty::PtyAgent;
 use interprocess::local_socket::traits::ListenerExt;
 use remuda_core::agent::Result as AgentResult;
@@ -27,13 +28,11 @@ use std::sync::Arc;
 use crate::SystemClock;
 use portable_pty::CommandBuilder;
 
-/// Where a node's socket lives. Under `$XDG_RUNTIME_DIR` when the system
-/// provides one (it is cleaned up on logout and is not world-writable), else a
-/// per-uid directory under `/tmp`.
+/// Where a node's socket lives. Prefer `$XDG_RUNTIME_DIR`; Android falls back
+/// to its process temp directory, while other Unix systems keep their old path.
 pub fn socket_path(server: &str) -> PathBuf {
     let base = std::env::var_os("REMUDA_RUNTIME_DIR")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from))
         .unwrap_or_else(default_runtime_dir);
     socket_path_in(&base, server)
 }
@@ -59,15 +58,44 @@ pub fn socket_path_in(base: &Path, server: &str) -> PathBuf {
 }
 
 fn default_runtime_dir() -> PathBuf {
+    let xdg_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR");
+    let temp_dir = std::env::temp_dir();
     #[cfg(unix)]
     {
         let who = std::env::var("USER").unwrap_or_else(|_| "nobody".into());
-        PathBuf::from(format!("/tmp/remuda-{who}"))
+        runtime_base_for(
+            cfg!(target_os = "android"),
+            xdg_runtime_dir.as_deref(),
+            &temp_dir,
+            &who,
+        )
     }
     #[cfg(windows)]
     {
         let who = std::env::var("USERNAME").unwrap_or_else(|_| "nobody".into());
-        PathBuf::from(format!(r"\\remuda\{who}"))
+        runtime_base_for(false, xdg_runtime_dir.as_deref(), &temp_dir, &who)
+    }
+}
+
+fn runtime_base_for(
+    is_android: bool,
+    xdg_runtime_dir: Option<&std::ffi::OsStr>,
+    temp_dir: &Path,
+    user: &str,
+) -> PathBuf {
+    if let Some(path) = xdg_runtime_dir {
+        return PathBuf::from(path);
+    }
+    if is_android {
+        return temp_dir.to_path_buf();
+    }
+    #[cfg(unix)]
+    {
+        PathBuf::from(format!("/tmp/remuda-{user}"))
+    }
+    #[cfg(windows)]
+    {
+        PathBuf::from(format!(r"\\remuda\{user}"))
     }
 }
 
@@ -456,6 +484,7 @@ fn reap_processes_before_exit(image: &Image) {
         "for _, id in ipairs(remuda.processes()) do remuda._process_killpg(id) end",
         Some("@remuda/shutdown-reap"),
     );
+    image.stop_modules_bounded();
 }
 
 fn capture_styled(
@@ -464,14 +493,15 @@ fn capture_styled(
     name: &str,
     scrollback: usize,
 ) -> std::io::Result<()> {
-    match registry.screen_snapshot_at(name, scrollback) {
+    match registry.screen_snapshot_version_at(name, scrollback) {
         None => reply(stream, &Response::error(format!("no such session: {name}"))),
         Some(Err(e)) => reply(stream, &Response::error(e)),
-        Some(Ok(snapshot)) => {
+        Some(Ok(versioned)) => {
             // Runs on the wire, not cells — see steps/022 for the 44x+
             // measured on a real screen. Cells, counters and cursor all come
             // from one parser snapshot, so new output cannot skew the anchor.
-            let rows = snapshot
+            let rows = versioned
+                .snapshot
                 .cells
                 .iter()
                 .map(|row| collapse_runs(row))
@@ -480,10 +510,12 @@ fn capture_styled(
                 stream,
                 &Response::StyledScreen {
                     rows,
-                    wrapped: snapshot.wrapped,
-                    scrollback_len: snapshot.scrollback_len,
-                    scrollback_total: snapshot.scrollback_total,
-                    cursor: snapshot.cursor,
+                    instance_id: versioned.instance_id,
+                    output_version: versioned.output_version,
+                    wrapped: versioned.snapshot.wrapped,
+                    scrollback_len: versioned.snapshot.scrollback_len,
+                    scrollback_total: versioned.snapshot.scrollback_total,
+                    cursor: versioned.snapshot.cursor,
                 },
             )
         }
@@ -626,17 +658,48 @@ fn handle_shutdown(
             .or(requester_session_name)
             .or(requester_session_id)
             .unwrap_or_else(|| "unknown".into());
-        return reply(
-            &stream,
-            &Response::error(format!(
-                "cannot stop this daemon from one of its own sessions ({identity}); pass --i-am-inside to override"
-            )),
-        );
+        return refuse_hosted_shutdown(&stream, &identity);
+    }
+    if !override_hosted {
+        match process_ancestry::peer_pid(&stream) {
+            Ok(Some(peer_pid)) => match process_ancestry::is_self_or_descendant(
+                peer_pid,
+                &registry.live_process_ids(),
+            ) {
+                process_ancestry::Ancestry::Inside => {
+                    return refuse_hosted_shutdown(&stream, "session process ancestry")
+                }
+                process_ancestry::Ancestry::Outside => {}
+                process_ancestry::Ancestry::Unreadable { pid, error } => eprintln!(
+                    "remuda: shutdown ancestry stopped at unreadable pid {pid} ({error}); treating requester as outside"
+                ),
+            },
+            Ok(None) | Err(_)
+                if process_ancestry::missing_peer_requires_refusal(caller_claims_this_daemon) =>
+            {
+                return refuse_hosted_shutdown(&stream, "self-reported session identity")
+            }
+            Ok(None) => eprintln!(
+                "remuda: shutdown peer process ID unavailable; treating requester as outside"
+            ),
+            Err(error) => eprintln!(
+                "remuda: shutdown peer process ID unavailable ({error}); treating requester as outside"
+            ),
+        }
     }
     reply(&stream, &Response::Ok)?;
     reap_processes_before_exit(image);
     socket_owner.cleanup();
     std::process::exit(0);
+}
+
+fn refuse_hosted_shutdown(stream: &Stream, identity: &str) -> std::io::Result<()> {
+    reply(
+        stream,
+        &Response::error(format!(
+            "cannot stop this daemon from one of its own sessions ({identity}); pass --i-am-inside to override"
+        )),
+    )
 }
 
 fn handle_new(
@@ -913,9 +976,55 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::shell_or_default;
+    use super::{runtime_base_for, shell_or_default};
     use remuda_core::agent::{Color, StyledCell};
     use remuda_core::protocol::collapse_runs;
+    use std::ffi::OsStr;
+    use std::path::Path;
+
+    #[test]
+    fn android_runtime_base_uses_termux_temp_dir_when_xdg_is_unset() {
+        assert_eq!(
+            runtime_base_for(
+                true,
+                None,
+                Path::new("/data/data/com.termux/files/usr/tmp"),
+                "nobody",
+            ),
+            Path::new("/data/data/com.termux/files/usr/tmp")
+        );
+    }
+
+    #[test]
+    fn android_runtime_base_prefers_xdg_runtime_dir() {
+        assert_eq!(
+            runtime_base_for(
+                true,
+                Some(OsStr::new("/run/user/1000")),
+                Path::new("/data/data/com.termux/files/usr/tmp"),
+                "nobody",
+            ),
+            Path::new("/run/user/1000")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_android_runtime_base_keeps_the_per_user_tmp_path() {
+        assert_eq!(
+            runtime_base_for(false, None, Path::new("/termux/tmp"), "jeongsoo"),
+            Path::new("/tmp/remuda-jeongsoo")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_android_windows_runtime_base_keeps_the_per_user_pipe_prefix() {
+        assert_eq!(
+            runtime_base_for(false, None, Path::new(r"C:\Temp"), "jeongsoo"),
+            Path::new(r"\\remuda\jeongsoo")
+        );
+    }
 
     fn cell(text: &str, fg: Color) -> StyledCell {
         StyledCell {
