@@ -220,6 +220,7 @@ fn node_name(fingerprint: &str) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
     fn temp_dir() -> std::path::PathBuf {
@@ -297,6 +298,22 @@ mod tests {
                 .contains(&dir.join(IDENTITY_FILE).display().to_string()));
             assert!(error.to_string().contains("chmod 600"));
         }
+    }
+
+    #[test]
+    fn refuses_identity_file_longer_than_64_bytes() {
+        let dir = temp_dir().join("cluster");
+        let _ = init_identity_at(&dir).unwrap();
+        let path = dir.join(IDENTITY_FILE);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        let error = load_identity_at(&dir).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exactly 64 bytes"));
     }
 
     #[test]
