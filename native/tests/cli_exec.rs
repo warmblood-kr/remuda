@@ -5,6 +5,9 @@
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_STDIN_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn cli_exec_activates_a_lifecycle_mod() {
@@ -235,7 +238,11 @@ fn stdin_cli(dir: &Path, args: &[&str]) -> Command {
 }
 
 fn setup_stdin_fixture() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("rc-stdin-{}", std::process::id()));
+    // These tests run in parallel in the same integration-test process. Give
+    // each fixture its own runtime directory so one test cannot remove the
+    // other's loaded mod or daemon data.
+    let fixture_id = NEXT_STDIN_FIXTURE.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("rc-stdin-{}-{fixture_id}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let mod_dir = dir.join("data/remuda/mods/sample");
     fs::create_dir_all(mod_dir.join("packages/sample")).unwrap();

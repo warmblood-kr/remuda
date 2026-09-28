@@ -166,10 +166,14 @@ serve RPCs or run hooks and schedules. Keep the command short; use the
 asynchronous `remuda.process{...}` form for longer work.
 The child inherits the daemon's current working directory and full environment,
 including any credentials or secrets in that environment. Windows timeout
-kills only the direct child; descendants may survive. The call still returns
-by its deadline, while background pipe readers remain until surviving
-descendants close their inherited pipes. Unix kills the child's process group,
-but the deadline still bounds the Lua image if a descendant escapes that group.
+kills only the direct child; descendants may survive. Unix kills the child's
+process group while its direct leader is still alive. On either platform, a
+descendant that survives and holds an inherited output pipe can leave a
+background reader alive after the call returns; on Unix this includes a
+descendant that escaped the group with `setsid`. At most 16 output-reader
+workers may be active (eight such calls); further `process.run` calls fail
+with a clear limit error until the readers finish. The call itself still
+returns by its deadline.
 
 The buffer between the reader thread and the Image is capped, on purpose.
 When it fills, the reader thread simply stops reading — the child's own

@@ -76,6 +76,42 @@ if not windows then
   })
   assert(held_pipes.timed_out, "process.run must time out when a descendant holds its pipes")
   assert(os.time() - started < 4, "process.run must return by its deadline when a descendant holds pipes")
+
+  -- A descendant can escape the process group with setsid and keep both
+  -- output pipes alive. Limit detached readers so repeated calls cannot leak
+  -- unbounded threads and file descriptors. Skip systems without setsid.
+  local setsid_probe = pcall(function()
+    local probe = remuda.process.run({ argv = { "setsid", "/bin/true" }, timeout = 1 })
+    assert(probe.code == 0, "setsid probe failed")
+  end)
+  if setsid_probe then
+    local escaped_pids = {}
+    for _ = 1, 8 do
+      local escaped = remuda.process.run({
+        argv = { "/bin/sh", "-c", "setsid /bin/sh -c 'echo $$; exec /bin/sleep 30' &" },
+        timeout = 0.1,
+      })
+      assert(escaped.timed_out, "setsid descendant should leave output pipes open")
+      local pid = escaped.stdout:match("(%d+)")
+      assert(pid, "setsid descendant pid should be captured")
+      escaped_pids[#escaped_pids + 1] = pid
+    end
+    local capped, cap_error = pcall(function()
+      remuda.process.run({ argv = echo_argv, timeout = 1 })
+    end)
+    assert(not capped, "process.run must refuse calls after reaching the detached reader cap")
+    assert(tostring(cap_error):find("limit of 16 output-reader workers", 1, true),
+      "reader cap should explain why the call was refused")
+
+    for _, pid in ipairs(escaped_pids) do os.execute("/bin/kill -KILL " .. pid) end
+    local recovered = false
+    for _ = 1, 40 do
+      os.execute("/bin/sleep 0.05")
+      local ok = pcall(function() remuda.process.run({ argv = echo_argv, timeout = 1 }) end)
+      if ok then recovered = true; break end
+    end
+    assert(recovered, "reader permits should be released after escaped descendants exit")
+  end
 end
 assert(type(remuda.session.list()) == "table", "the daemon should continue handling Lua work after timeout")
 

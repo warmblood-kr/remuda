@@ -17,7 +17,7 @@ use crate::image::Image;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +33,8 @@ const DRAIN_BATCH: usize = 256;
 
 const RUN_OUTPUT_LIMIT: usize = 1024 * 1024;
 const RUN_OUTPUT_MARKER: &[u8] = b"\n[output truncated by remuda.process.run]";
+const RUN_READER_WORKER_LIMIT: usize = 16;
+static ACTIVE_RUN_READER_WORKERS: AtomicUsize = AtomicUsize::new(0);
 pub const RUN_DEFAULT_TIMEOUT: f64 = 5.0;
 pub const RUN_MAX_TIMEOUT: f64 = 30.0;
 pub const RUN_TIMEOUT_EXIT_CODE: i32 = 124;
@@ -56,6 +58,7 @@ pub fn run_sync(
     timeout_seconds: f64,
 ) -> Result<RunOutput, String> {
     validate_run(&argv, timeout_seconds)?;
+    let (stdout_permit, stderr_permit) = reserve_run_reader_workers()?;
 
     let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds);
     let (program, args) = argv.split_first().expect("argv checked above");
@@ -78,12 +81,18 @@ pub fn run_sync(
     let stdout_reader_thread = {
         let capture = stdout_capture.clone();
         let state = stdout_reader.clone();
-        std::thread::spawn(move || capture_bounded(stdout, capture, state))
+        std::thread::spawn(move || {
+            let _permit = stdout_permit;
+            capture_bounded(stdout, capture, state)
+        })
     };
     let stderr_reader_thread = {
         let capture = stderr_capture.clone();
         let state = stderr_reader.clone();
-        std::thread::spawn(move || capture_bounded(stderr, capture, state))
+        std::thread::spawn(move || {
+            let _permit = stderr_permit;
+            capture_bounded(stderr, capture, state)
+        })
     };
     let stdin_done = Arc::new(AtomicBool::new(false));
     let stdin_writer = {
@@ -141,6 +150,34 @@ fn validate_run(argv: &[String], timeout_seconds: f64) -> Result<(), String> {
     Ok(())
 }
 
+struct RunReaderPermit;
+
+impl Drop for RunReaderPermit {
+    fn drop(&mut self) {
+        ACTIVE_RUN_READER_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn reserve_run_reader_workers() -> Result<(RunReaderPermit, RunReaderPermit), String> {
+    let mut active = ACTIVE_RUN_READER_WORKERS.load(Ordering::Acquire);
+    loop {
+        if active + 2 > RUN_READER_WORKER_LIMIT {
+            return Err(format!(
+                "process.run refused: the limit of {RUN_READER_WORKER_LIMIT} output-reader workers is reached because timed-out descendants still hold pipes"
+            ));
+        }
+        match ACTIVE_RUN_READER_WORKERS.compare_exchange_weak(
+            active,
+            active + 2,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok((RunReaderPermit, RunReaderPermit)),
+            Err(current) => active = current,
+        }
+    }
+}
+
 fn wait_for_process_io(
     child: &mut Child,
     deadline: Instant,
@@ -175,14 +212,23 @@ fn wait_for_process_io(
             }
         }
         if Instant::now() >= deadline {
-            // Descendants can keep pipes open after the direct child exits.
-            // Kill its group again and return at the same deadline, without
-            // joining any reader or writer that may still be blocked.
-            kill_process_tree(child);
-            let _ = child.kill();
+            // Only signal a process group while its direct leader is known to
+            // be alive. Once reaped, its pgid may have been reused.
             let status = match child_status {
                 Some(status) => status,
-                None => child.wait().map_err(|error| error.to_string())?,
+                None => match child.try_wait() {
+                    Ok(Some(status)) => status,
+                    Ok(None) => {
+                        kill_process_tree(child);
+                        let _ = child.kill();
+                        child.wait().map_err(|error| error.to_string())?
+                    }
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error.to_string());
+                    }
+                },
             };
             return Ok((status, true));
         }
