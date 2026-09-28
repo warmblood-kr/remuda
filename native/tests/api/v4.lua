@@ -32,6 +32,26 @@ status, branch = remuda._expect_step(handle)
 assert(status == "matched" and branch == "ready", "expect must match a later branch after exp_continue")
 assert(actions[2] == "task is ready", "branch action must receive the matching screen")
 
+-- A continue branch is edge-triggered: volatile screen changes do not replay
+-- it, but one nonmatching capture rearms it for the next occurrence.
+local edges, edge_screen, edge_now = 0, "working 00:01", 40
+local edge_handle = remuda.expect("fake", {
+  { match = "working", continue = true, action = function() edges = edges + 1 end },
+}, { timeout = 20, now = function() return edge_now end, capture = function() return edge_screen end })
+remuda._expect_step(edge_handle)
+edge_now = 41; remuda._expect_step(edge_handle)
+edge_screen, edge_now = "working 00:02", 42; remuda._expect_step(edge_handle)
+assert(edges == 1, "volatile changes in a matching screen must not replay continue actions")
+edge_screen, edge_now = "idle", 43; remuda._expect_step(edge_handle)
+edge_screen, edge_now = "working 00:03", 44; remuda._expect_step(edge_handle)
+assert(edges == 2, "a nonmatch must rearm the continue branch")
+
+local bad_clock = remuda.expect("fake", { { match = "x" } }, {
+  now = function() error("clock failed") end, capture = function() return "x" end,
+})
+local bad_clock_ok, bad_clock_status = pcall(remuda._expect_step, bad_clock)
+assert(bad_clock_ok and bad_clock_status == "error", "throwing injected clocks must become expectation errors")
+
 local typed = {}
 local original_key = remuda.key
 remuda.key = function(session, key)
@@ -92,5 +112,14 @@ assert(scheduled.state.status == "pending", "clock tick must respect the first d
 remuda._run_due_schedules(31)
 assert(scheduled.state.status == "matched" and scheduled.state.branch == "scheduled",
   "the existing clock driver must advance pending expectations")
+
+local schedule_ran = false
+local schedule = remuda.schedule({ every = 1, run = function() schedule_ran = true end })
+local original_expect_tick = remuda._expect_tick
+remuda._expect_tick = function() error("broken expectation tick") end
+local tick_ok = pcall(remuda._run_due_schedules, 32)
+remuda._expect_tick = original_expect_tick
+remuda.cancel(schedule)
+assert(tick_ok and schedule_ran, "a broken expectation tick must not prevent schedules from running")
 
 print("v4 expect matching ok")

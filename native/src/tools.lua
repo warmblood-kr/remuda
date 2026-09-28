@@ -222,9 +222,18 @@ end
 -- the one-second clock below, and a future PTY output event can call this same
 -- function without changing remuda.expect's API.
 function remuda._expect_step(handle, now)
-  now = now or (handle.options.now and handle.options.now()) or expect_clock_now or 0
   local state, options = handle.state, handle.options
   if state.status ~= "pending" then return state.status, state.branch, state.screen end
+  if now == nil and options.now then
+    local ok, value = pcall(options.now)
+    if not ok then
+      state.status, state.error = "error", value
+      if options.on_error then pcall(options.on_error, value, handle) end
+      return state.status, nil, nil
+    end
+    now = value
+  end
+  now = now or expect_clock_now or 0
   if not state.deadline then
     state.deadline = now + handle.timeout
     state.next_at = now + (tonumber(options.interval) or 1)
@@ -243,15 +252,20 @@ function remuda._expect_step(handle, now)
     if options.on_error then pcall(options.on_error, state.error, handle) end
     return state.status, nil, nil
   end
-  if screen ~= state.last_screen then
-    for index, branch in ipairs(handle.branches) do
-      local ok, matched = pcall(branch_matches, branch, screen)
-      if not ok then
-        state.status, state.error = "error", matched
-        if options.on_error then pcall(options.on_error, matched, handle) end
-        return state.status, nil, screen
-      end
-      if matched then
+  local matched_disarmed = false
+  for index, branch in ipairs(handle.branches) do
+    local ok, matched = pcall(branch_matches, branch, screen)
+    if not ok then
+      state.status, state.error = "error", matched
+      if options.on_error then pcall(options.on_error, matched, handle) end
+      return state.status, nil, screen
+    end
+    if not matched and state.disarmed then
+      state.disarmed[index] = nil
+    elseif matched then
+      if branch.continue and state.disarmed and state.disarmed[index] then
+        matched_disarmed = true
+      else
         local ran, err = pcall(run_expect_action, branch, screen, handle)
         if not ran then
           state.status, state.error = "error", err
@@ -260,6 +274,8 @@ function remuda._expect_step(handle, now)
         end
         state.screen, state.branch, state.last_screen = screen, branch.id or index, screen
         if branch.continue then
+          state.disarmed = state.disarmed or {}
+          state.disarmed[index] = true
           state.next_at = now + (tonumber(options.interval) or 1)
           return "continue", state.branch, screen
         end
@@ -267,6 +283,8 @@ function remuda._expect_step(handle, now)
         return state.status, state.branch, screen
       end
     end
+  end
+  if not matched_disarmed then
     local unknown = options.unknown
     local unknown_ok, is_unknown = pcall(function()
       return (type(unknown) == "function" and unknown(screen))
@@ -328,7 +346,11 @@ function remuda._expect_tick(now)
   local keep = {}
   for _, handle in ipairs(pending_expects) do
     if handle.state.status == "pending" then
-      remuda._expect_step(handle, now)
+      local ok, err = pcall(remuda._expect_step, handle, now)
+      if not ok then
+        handle.state.status, handle.state.error = "error", err
+        if handle.options.on_error then pcall(handle.options.on_error, err, handle) end
+      end
       if handle.state.status == "pending" then keep[#keep + 1] = handle end
     end
   end
@@ -357,7 +379,10 @@ register("_expect_option", "Pick a unique numbered menu option by its label.", "
 function remuda._run_due_schedules(now)
   -- Expectations are advanced from the same native one-second clock. A
   -- future PTY output event may call _expect_tick directly to reduce latency.
-  remuda._expect_tick(now)
+  local expect_ok, expect_err = pcall(remuda._expect_tick, now)
+  if not expect_ok and io and io.stderr then
+    io.stderr:write("remuda.expect tick failed: " .. tostring(expect_err) .. "\n")
+  end
   -- Snapshot the handles, as `emit` does: a run() that schedules must not add
   -- keys mid-`pairs` (undefined in Lua). A cancel mid-tick still takes effect.
   local handles = {}
