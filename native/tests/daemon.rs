@@ -628,8 +628,31 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
     .expect("start short-lived target");
     assert_eq!(created, Response::Value("target".into()));
 
-    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
-    cmd.args(["attach", "target"]);
+    let exit_status = dir.join("attach-exit-status");
+    #[cfg(unix)]
+    let mut cmd = {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args([
+            "-c",
+            "\"$REMUDA_BIN\" attach target; printf '%s' \"$?\" > \"$REMUDA_EXIT_STATUS\"",
+        ]);
+        cmd.env("REMUDA_BIN", env!("CARGO_BIN_EXE_remuda"));
+        cmd.env("REMUDA_EXIT_STATUS", &exit_status);
+        cmd
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = CommandBuilder::new("powershell.exe");
+        cmd.args([
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            "& $env:REMUDA_BIN attach target; $code = $LASTEXITCODE; Set-Content -NoNewline -Path $env:REMUDA_EXIT_STATUS -Value $code",
+        ]);
+        cmd.env("REMUDA_BIN", env!("CARGO_BIN_EXE_remuda"));
+        cmd.env("REMUDA_EXIT_STATUS", &exit_status);
+        cmd
+    };
     cmd.env("REMUDA_RUNTIME_DIR", &dir);
     let viewer = Session::new(
         "viewer",
@@ -637,7 +660,7 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         Arc::new(SystemClock::new()),
     );
     let held = viewer.attach().expect("attach viewer");
-    let output = held.subscribe().expect("capture viewer output");
+    let _output = held.subscribe().expect("capture viewer output");
     let deadline = Instant::now() + PATIENCE;
     loop {
         let response = client::request(&path, &Request::List).expect("list after target exit");
@@ -654,19 +677,31 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    // ConPTY may repaint away portions of the raw output stream. The status
-    // prefix is stable on its virtual screen, and the list poll above proves
-    // the daemon has already released the dead session.
+    // Unix captures can assert the text and reset bytes directly. ConPTY can
+    // discard both, so Windows checks the process and its recorded exit code.
+    #[cfg(unix)]
     wait_for_session_screen(&viewer, "[remuda] target");
 
     held.write_raw(b"k").expect("release attach with any key");
+    let deadline = Instant::now() + PATIENCE;
+    while viewer.is_alive() {
+        assert!(
+            Instant::now() < deadline,
+            "attach client did not exit after one key"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&exit_status)
+            .expect("wrapper records attach client exit status")
+            .trim(),
+        "0"
+    );
     #[cfg(unix)]
     let _restored = collect_until_bytes(
-        &output,
+        &_output,
         b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
     );
-    #[cfg(windows)]
-    let _restored = collect_until_bytes(&output, b"\x1b[?2004l");
 }
 
 #[test]
