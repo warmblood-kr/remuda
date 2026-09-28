@@ -14,6 +14,11 @@ pub trait Clock: Send + Sync {
     /// between two readings are meaningful, and never across two clocks.
     fn now(&self) -> Duration;
 
+    /// Stable entropy for process-wide identifiers; real host clocks override this.
+    fn instance_id_seed(&self) -> u128 {
+        0
+    }
+
     /// Block until `duration` has passed on *this* clock — never
     /// `std::thread::sleep` directly, so a `ManualClock` can make a pause
     /// deterministic instead of a flaky real-time wait.
