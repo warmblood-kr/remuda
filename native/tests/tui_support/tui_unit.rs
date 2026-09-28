@@ -109,7 +109,7 @@ fn selected_session_stays_visible_when_the_list_exceeds_a_short_terminal() {
 
     let frame = render(&ui, "", "test", 80, 24);
     assert!(
-        frame.contains("\x1b[20;1H\x1b[7msession-11\x1b[0m"),
+        frame.contains("\x1b[19;1H\x1b[7msession-11\x1b[0m"),
         "the selected final session must be rendered in the 24-row viewport: {frame:?}"
     );
     assert!(
@@ -147,18 +147,17 @@ fn a_click_on_a_list_row_selects_and_enters_it_like_arrow_plus_enter() {
     assert_eq!(ui.focus, Focus::Session, "a click enters, same as Enter");
 }
 
-/// The header (row 0) and anything below the herd's actual rows are both
-/// outside the list — a click there must not panic or move selection.
 #[test]
-fn a_click_outside_any_list_row_is_a_no_op() {
+fn clicks_start_on_the_first_row_and_stop_after_the_list() {
     let mut ui = make_ui(vec![row("a", true, false), row("b", true, false)]);
     assert_eq!(
         ui.on_mouse(click(5, 0), 80, 24),
-        Action::Nothing,
-        "the header row"
+        Action::Focus("a".into()),
+        "the first terminal row selects the first session"
     );
-    assert_eq!(ui.selected, 0, "unmoved by the header click");
-    assert_eq!(ui.focus, Focus::List, "unmoved by the header click");
+    assert_eq!(ui.selected, 0, "first row selected a");
+    assert_eq!(ui.focus, Focus::Session, "the first row click enters a");
+    let mut ui = make_ui(vec![row("a", true, false), row("b", true, false)]);
     // Screen row 8 (0-based 7) is past "b" — the herd has 6 rows.
     assert_eq!(
         ui.on_mouse(click(5, 7), 80, 24),
@@ -991,6 +990,19 @@ fn render_styled_of_the_session_list_moves_the_brand_to_the_footer() {
     ];
     let cells = vec![text_row(10); 23];
     let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
+    let first_line = out
+        .split("\x1b[1;1H\x1b[K")
+        .nth(1)
+        .and_then(|row| row.split("\x1b[2;1H").next())
+        .expect("first body row");
+    assert!(
+        first_line.contains("alpha"),
+        "list starts with its first session: {first_line:?}"
+    );
+    assert!(
+        first_line.contains("xxxxxxxxxx"),
+        "preview starts on row one: {first_line:?}"
+    );
 
     assert!(
         !out.contains("remuda · default│"),
@@ -2060,8 +2072,8 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
     assert_eq!(
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
-             \x1b[1;1H\x1b[K                │hello                                                         →\
-             \x1b[2;1H\x1b[K\x1b[7malpha\x1b[0m           │                                                              →\
+             \x1b[1;1H\x1b[K\x1b[7malpha\x1b[0m           │hello                                                         →\
+             \x1b[2;1H\x1b[K                │                                                              →\
              \x1b[3;1H\x1b[K                │                                                              →\
              \x1b[4;1H\x1b[K                │                                                              →\
              \x1b[5;1H\x1b[K                │                                                              →\

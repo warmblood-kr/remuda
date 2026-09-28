@@ -187,9 +187,8 @@ impl Ui {
         }
         let (list_w, preview_w) = ui_layout(self, cols);
         let body = rows.saturating_sub(1);
-        // crossterm's column/row are 0-based; the frame's own rows are
-        // 1-based (row 1 is the header, row `body+1` is the footer — see
-        // `render`/`render_styled`), so both get +1 before comparing.
+        // crossterm's column/row are 0-based; frame rows are 1-based, so both
+        // get +1 before comparing.
         let col = event.column + 1;
         let row = event.row + 1;
 
@@ -320,10 +319,10 @@ impl Ui {
         if !matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
             return Action::Nothing;
         }
-        if row < 2 || row > body {
+        if row < 1 || row > body {
             return Action::Nothing;
         }
-        let index = ((row - 2) as usize / self.session_rows) + list_viewport(self, body);
+        let index = ((row - 1) as usize / self.session_rows) + list_viewport(self, body);
         if index >= self.sessions.len() {
             return Action::Nothing;
         }
@@ -1151,17 +1150,13 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
     let mut out = String::from("\x1b[H\x1b[2J");
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H", row + 1));
-        // The top-left corner stays quiet; the footer names the server.
+        // Start list rows at the top now that the pane header moved to the footer.
         if ui.list_visible {
-            let left = if row == 0 {
-                String::new()
-            } else {
-                list_row(
-                    ui,
-                    row as usize - 1 + list_viewport(ui, body) * ui.session_rows,
-                    list_w,
-                )
-            };
+            let left = list_row(
+                ui,
+                row as usize + list_viewport(ui, body) * ui.session_rows,
+                list_w,
+            );
             out.push_str(&fit(&left, list_w));
         }
         out.push_str(divider);
@@ -1390,15 +1385,11 @@ pub fn render_styled(
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
         if ui.list_visible {
-            let left = if row == 0 {
-                String::new()
-            } else {
-                list_row(
-                    ui,
-                    row as usize - 1 + list_viewport(ui, body) * ui.session_rows,
-                    list_w,
-                )
-            };
+            let left = list_row(
+                ui,
+                row as usize + list_viewport(ui, body) * ui.session_rows,
+                list_w,
+            );
             out.push_str(&fit(&left, list_w));
         }
         out.push_str(divider);
@@ -1477,7 +1468,7 @@ fn widest(ui: &Ui) -> u16 {
 /// The first session shown in the list, based on Lua's rows-per-session
 /// contract rather than a native presentation policy.
 fn list_viewport(ui: &Ui, body: u16) -> usize {
-    let visible = body.saturating_sub(1) as usize / ui.session_rows;
+    let visible = body as usize / ui.session_rows;
     if visible == 0 {
         return 0;
     }

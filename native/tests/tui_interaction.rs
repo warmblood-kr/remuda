@@ -83,8 +83,22 @@ fn l_hides_the_list_and_gives_the_preview_the_full_terminal_width() {
 
 #[test]
 fn the_server_brand_and_horse_live_in_the_footer_not_the_pane_header() {
-    let frame = render(&ui(), "child screen", "default", 80, 5);
+    let ui = ui();
+    let frame = render(&ui, "child screen", "default", 80, 5);
     assert!(!frame.contains("remuda · default│"));
+    let first_line = frame
+        .split("\x1b[1;1H")
+        .nth(1)
+        .and_then(|row| row.split("\x1b[2;1H").next())
+        .expect("first body row");
+    assert!(
+        first_line.contains("agent"),
+        "first row has the session: {first_line:?}"
+    );
+    assert!(
+        first_line.contains("child screen"),
+        "preview content also starts on the first row: {first_line:?}"
+    );
     let footer = frame.split("\x1b[5;1H").nth(1).expect("footer row");
     assert!(footer.starts_with("remuda · default 🏇"));
 }
