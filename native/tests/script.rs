@@ -106,7 +106,7 @@ fn request_counts(path: &Path) -> (u64, u64, u64) {
 fn expect_option_strips_whole_utf8_selection_markers() {
     let dir = scratch("expect-option-utf8");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
     let code = r#"
         local highlighted = remuda.expect_option(
             "  Update available\n› 1. Update now\n  2. Skip\n",
