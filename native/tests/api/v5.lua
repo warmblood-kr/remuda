@@ -1,6 +1,12 @@
 -- v5 accumulates new words until the next tagged release freezes it. v1-v4
 -- remain frozen; this version introduced nested session words and retains the
 -- callable constructor.
+assert(type(remuda.pending) == "function", "remuda.pending is missing")
+assert(remuda._registry.pending ~= nil, "remuda.pending needs a registry entry")
+assert(remuda._pending_replies == nil, "pending manager internals must remain private")
+
+local bad_timeout = pcall(remuda.pending, { timeout = 301 })
+assert(not bad_timeout, "pending timeout must not exceed 300 seconds")
 
 local session = remuda.session
 assert(type(session) == "table", "remuda.session must be a namespace table")

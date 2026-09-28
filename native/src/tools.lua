@@ -61,6 +61,41 @@ register("tools", "The `remuda.tool` registry table, keyed by tool name.", "tabl
 register("_extension_commands", "Handlers registered for installed mod commands.", "table")
 register("extension_command", "Register a handler for an installed mod command.", "extension_command(name, handler(args, caller)) -> nil")
 register("_dispatch_extension_command", "Dispatch arguments and caller context to a loaded mod command handler.", "_dispatch_extension_command(name, args, caller) -> value")
+register("pending", "Return a bounded handle for an extension command's deferred result.", "pending({timeout?, on_cancel?}) -> handle")
+register("_pending_create", "Create a private pending reply handle.", "_pending_create(timeout?) -> id, handle")
+register("_pending_events", "Drain pending completion and cancellation notifications.", "_pending_events() -> {{id, reason?}...}")
+
+local pending_cancel_handlers = {}
+function remuda.pending(options)
+  if type(options) ~= "table" then
+    error("pending needs an options table", 2)
+  end
+  local timeout = options.timeout
+  if timeout ~= nil and (type(timeout) ~= "number" or timeout <= 0 or timeout > 300) then
+    error("pending timeout must be a positive number no greater than 300 seconds", 2)
+  end
+  local on_cancel = options.on_cancel
+  if on_cancel ~= nil and type(on_cancel) ~= "function" then
+    error("pending on_cancel must be a function", 2)
+  end
+  local id, handle = remuda._pending_create(timeout)
+  if on_cancel then pending_cancel_handlers[id] = on_cancel end
+  return handle
+end
+
+local function deliver_pending_events()
+  for _, event in ipairs(remuda._pending_events()) do
+    local callback = pending_cancel_handlers[event.id]
+    pending_cancel_handlers[event.id] = nil
+    if event.reason and callback then
+      local ok, err = pcall(callback, event.reason)
+      if not ok then
+        io.stderr:write("remuda.pending on_cancel failed: " .. tostring(err) .. "\n")
+      end
+    end
+  end
+end
+_G.__remuda_pending_tick = deliver_pending_events
 
 -- Required names first (a caller's own order, via `needs`), then everything
 -- else marked optional — the same order a hand-written signature would use.
@@ -404,6 +439,7 @@ register("expect_option", "Pick a unique numbered menu option by its label.", "e
 -- clock). Fires every schedule whose own interval has elapsed since ITS OWN
 -- last run — native never sees or compares an individual interval itself.
 function remuda._run_due_schedules(now)
+  deliver_pending_events()
   local schedule_now = now or expect_clock_now or schedule_clock_now
   schedule_clock_now = schedule_now
   -- Expectations are advanced from the same native one-second clock. A
