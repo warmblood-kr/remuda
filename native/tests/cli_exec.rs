@@ -176,7 +176,11 @@ fn typed_failures_print_only_the_message_and_use_the_requested_exit_code() {
             .expect("run remuda")
     };
 
-    let _ = remuda(&["ls"]); // keep daemon startup chatter out of the assertions below
+    let boot = remuda(&["-e", "remuda.new('bootstrap')"]);
+    assert!(
+        boot.status.success(),
+        "explicitly start private daemon: {boot:?}"
+    );
     let eval = remuda(&["-e", "remuda.fail('eval rejected', 17)"]);
     let default_code = remuda(&["-e", "remuda.fail('default rejected')"]);
     let zero_code = remuda(&["-e", "remuda.fail('zero rejected', 0)"]);
