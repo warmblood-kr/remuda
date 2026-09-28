@@ -2383,9 +2383,37 @@ fn a_session_started_here_is_sized_to_the_pane_not_the_terminal() {
 }
 
 #[test]
-fn a_pane_below_the_floor_is_raised_rather_than_dropping_keystrokes() {
+fn a_narrow_pane_opts_out_of_the_default_size_floor() {
     let size = pane_size(&make_ui(vec![]), 80, 24);
-    assert_eq!((size.cols(), size.rows()), (80, 24), "Size::new's floor");
+    assert_eq!((size.cols(), size.rows()), (63, 24));
+    assert_eq!(
+        (Size::new(11, 3).cols(), Size::new(11, 3).rows()),
+        (Size::MIN_COLS, Size::MIN_ROWS),
+        "ordinary sizes keep the safety floor"
+    );
+}
+
+#[test]
+fn a_narrow_shown_list_pane_passes_its_visible_width_to_the_child() {
+    let mut ui = make_ui(vec![row("agent", true, false)]);
+    ui.set_list_width(24, 100);
+    assert_eq!(ui_layout(&ui, 100), (24, 75));
+
+    let size = pane_size(&ui, 100, 30);
+    assert_eq!(size.cols(), 75);
+    assert_eq!(size.rows(), 29);
+
+    let encoded = serde_json::to_vec(&size).expect("serialize pane size");
+    let decoded: Size = serde_json::from_slice(&encoded).expect("deserialize pane size");
+    assert_eq!(decoded, size, "the daemon must preserve the visible width");
+
+    let ordinary: Size =
+        serde_json::from_str(r#"{"cols":75,"rows":29}"#).expect("deserialize ordinary size");
+    assert_eq!(
+        ordinary.cols(),
+        Size::MIN_COLS,
+        "ordinary requests stay floored"
+    );
 }
 
 #[test]
