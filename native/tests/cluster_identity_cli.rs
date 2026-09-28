@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::fs;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -5,7 +7,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[test]
-#[cfg(unix)]
 fn init_and_status_never_print_private_key_material() {
     let root = std::env::temp_dir().join(format!(
         "remuda-cluster-cli-{}-{}",
@@ -38,7 +39,7 @@ fn init_and_status_never_print_private_key_material() {
     transcript.extend(status.stdout);
     transcript.extend(status.stderr);
     assert!(!transcript.windows(32).any(|window| window == &key[..32]));
-    let hex = key
+    let hex = key[..32]
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();

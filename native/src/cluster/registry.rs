@@ -1,12 +1,17 @@
 //! Per-node authorized membership entries, persistence, and merge semantics.
 
-use super::{encoding, storage};
+use super::encoding;
+#[cfg(not(windows))]
+use super::storage;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(not(windows))]
 use std::fs::{self, OpenOptions};
 use std::io;
+#[cfg(not(windows))]
 use std::path::Path;
 
+#[cfg(not(windows))]
 const REGISTRY_FILE: &str = "authorized_nodes.json";
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -84,32 +89,26 @@ pub fn load_registry() -> io::Result<Registry> {
     load_registry_at(&storage::cluster_state_dir()?.join("cluster"))
 }
 
-pub fn save_registry(registry: &Registry) -> io::Result<()> {
+pub fn save_registry(_registry: &Registry) -> io::Result<()> {
     #[cfg(windows)]
     return Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
     ));
     #[cfg(not(windows))]
-    let dir = {
+    {
         let dir = storage::cluster_state_dir()?.join("cluster");
         storage::create_private_directory(&dir)?;
         storage::verify_directory(&dir)?;
-        dir
-    };
-    let lock_guard = storage::StateLock::acquire(&dir)?;
-    let result = save_registry_at(&dir, registry);
-    drop(lock_guard);
-    result
+        let lock_guard = storage::StateLock::acquire(&dir)?;
+        let result = save_registry_at(&dir, _registry);
+        drop(lock_guard);
+        result
+    }
 }
 
+#[cfg(not(windows))]
 pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
-    #[cfg(windows)]
-    return Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
-    ));
-    #[cfg(not(windows))]
     if fs::symlink_metadata(dir).is_ok() {
         storage::verify_directory(dir)?;
     }
@@ -121,12 +120,19 @@ pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = match options.open(path) {
+    let mut file = match options.open(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
+        #[cfg(unix)]
+        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is a symlink; refusing", path.display()),
+            ))
+        }
         Err(error) => return Err(error),
     };
-    storage::check_private_file(&file, "cluster registry")?;
+    storage::check_private_file(&file, "cluster registry", &path)?;
     use std::io::Read;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
@@ -141,6 +147,7 @@ pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
     Ok(folded)
 }
 
+#[cfg(not(windows))]
 pub(super) fn save_registry_at(dir: &Path, registry: &Registry) -> io::Result<()> {
     let mut validated = Registry::default();
     validated.merge(registry)?;
@@ -148,7 +155,7 @@ pub(super) fn save_registry_at(dir: &Path, registry: &Registry) -> io::Result<()
     storage::atomic_write(&dir.join(REGISTRY_FILE), &bytes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::path::PathBuf;
@@ -237,6 +244,71 @@ mod tests {
                 io::ErrorKind::PermissionDenied
             );
         }
+    }
+
+    #[test]
+    fn rejects_public_keys_that_are_not_32_bytes() {
+        let short_key = [7u8; 31];
+        let invalid = AuthorizedNode {
+            node_fp: encoding::fingerprint(&short_key),
+            static_pubkey: encoding::encode_base64(&short_key),
+            state: NodeState::Admitted,
+            version: 1,
+            by: "node".into(),
+        };
+        let mut registry = Registry::default();
+        assert_eq!(
+            registry
+                .merge(&Registry {
+                    authorized_nodes: vec![invalid]
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn registry_open_refuses_symlinks() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_dir();
+        let target = dir.join("registry-target");
+        storage::atomic_write(&target, b"{\"authorized_nodes\":[]}").unwrap();
+        symlink(&target, dir.join(REGISTRY_FILE)).unwrap();
+        assert_eq!(
+            load_registry_at(&dir).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn save_rejects_invalid_fingerprint_before_writing() {
+        let dir = temp_dir();
+        let mut invalid = entry("fp-a", NodeState::Admitted, 1, "a");
+        invalid.node_fp = "SHA256:wrong".into();
+        assert_eq!(
+            save_registry_at(
+                &dir,
+                &Registry {
+                    authorized_nodes: vec![invalid]
+                }
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(!dir.join(REGISTRY_FILE).exists());
+    }
+
+    #[test]
+    fn load_refuses_symlinked_cluster_directory() {
+        use std::os::unix::fs::symlink;
+        let target = temp_dir();
+        let link = target.with_extension("link");
+        symlink(&target, &link).unwrap();
+        let error = load_registry_at(&link).unwrap_err();
+        assert!(error.to_string().contains(&link.display().to_string()));
+        assert!(error.to_string().contains("symlink"));
     }
 
     #[test]

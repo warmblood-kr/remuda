@@ -3,6 +3,7 @@
 pub mod encoding;
 pub mod identity;
 pub mod registry;
+#[cfg(not(windows))]
 mod storage;
 
 pub use identity::NodeIdentity;
@@ -12,20 +13,26 @@ use std::io;
 
 /// Initialize the local identity and cluster-of-one registry.
 pub fn init() -> io::Result<(NodeIdentity, bool)> {
-    let dir = identity::prepare_cluster_dir()?;
-    let (node, created) = identity::init_identity_at(&dir)?;
-    let mut registry = registry::load_registry_at(&dir)?;
-    registry.merge(&Registry {
-        authorized_nodes: vec![AuthorizedNode {
-            node_fp: node.node_fp.clone(),
-            static_pubkey: encoding::encode_base64(&node.static_pubkey),
-            state: NodeState::Admitted,
-            version: 1,
-            by: node.node_fp.clone(),
-        }],
-    })?;
-    registry::save_registry_at(&dir, &registry)?;
-    Ok((node, created))
+    #[cfg(windows)]
+    return Err(identity::windows_storage_error());
+    #[cfg(not(windows))]
+    {
+        let dir = identity::prepare_cluster_dir()?;
+        let _guard = storage::StateLock::acquire(&dir)?;
+        let (node, created) = identity::init_identity_locked(&dir)?;
+        let mut registry = registry::load_registry_at(&dir)?;
+        registry.merge(&Registry {
+            authorized_nodes: vec![AuthorizedNode {
+                node_fp: node.node_fp.clone(),
+                static_pubkey: encoding::encode_base64(&node.static_pubkey),
+                state: NodeState::Admitted,
+                version: 1,
+                by: node.node_fp.clone(),
+            }],
+        })?;
+        registry::save_registry_at(&dir, &registry)?;
+        Ok((node, created))
+    }
 }
 
 /// Return the local identity and admitted member count, or `None` before init.
@@ -36,7 +43,10 @@ pub fn status() -> io::Result<Option<(NodeIdentity, usize)>> {
     {
         let dir = storage::cluster_state_dir()?.join("cluster");
         match std::fs::symlink_metadata(&dir) {
-            Ok(_) => storage::verify_directory(&dir)?,
+            Ok(_) => {
+                identity::check_identity_path(&dir)?;
+                storage::verify_directory(&dir)?;
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         }

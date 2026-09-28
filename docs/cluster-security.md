@@ -7,6 +7,12 @@ opens and validate ownership and permissions on the opened handle. Identity
 private-key buffers are zeroized after use. The registry binds each fingerprint
 to its public key and rejects mismatches; merges key membership by the public
 key so a revoked key cannot be admitted under another fingerprint.
+Initialization holds one exclusive state lock across key initialization and
+registry load, merge, and save.
+
+Ancestor directories above the cluster directory are created with the
+platform's default permissions; only the cluster directory itself is forced
+to mode 0700.
 
 This protects stored identity material from other local users under the normal
 Unix ownership model. It does not protect against compromise of the same user

@@ -1,12 +1,22 @@
 //! Node identity: Snow key generation, secure local persistence, and fingerprints.
 
-use super::{encoding, storage};
+#[cfg(not(windows))]
+use super::encoding;
+#[cfg(not(windows))]
+use super::storage;
+#[cfg(not(windows))]
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read};
+use std::io;
+#[cfg(not(windows))]
+use std::io::Read;
+#[cfg(not(windows))]
 use std::path::Path;
+#[cfg(not(windows))]
 use zeroize::Zeroizing;
 
+#[cfg(not(windows))]
 const NOISE_PATTERN: &str = "Noise_NN_25519_ChaChaPoly_SHA256";
+#[cfg(not(windows))]
 const IDENTITY_FILE: &str = "identity.key";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -23,7 +33,10 @@ pub(super) fn prepare_cluster_dir() -> io::Result<std::path::PathBuf> {
     {
         let dir = storage::cluster_state_dir()?.join("cluster");
         match fs::symlink_metadata(&dir) {
-            Ok(_) => storage::verify_directory(&dir)?,
+            Ok(_) => {
+                check_identity_path(&dir)?;
+                storage::verify_directory(&dir)?;
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 storage::create_private_directory(&dir)?;
                 storage::verify_directory(&dir)?;
@@ -31,6 +44,24 @@ pub(super) fn prepare_cluster_dir() -> io::Result<std::path::PathBuf> {
             Err(e) => return Err(e),
         }
         Ok(dir)
+    }
+}
+
+#[cfg(not(windows))]
+pub(super) fn check_identity_path(dir: &Path) -> io::Result<()> {
+    storage::check_directory_type(dir)?;
+    let path = dir.join(IDENTITY_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is a symlink; refusing (remove it to re-initialize)",
+                path.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
     }
 }
 
@@ -42,13 +73,17 @@ pub(super) fn windows_storage_error() -> io::Error {
     )
 }
 
+#[cfg(all(test, unix))]
 pub(super) fn init_identity_at(dir: &Path) -> io::Result<(NodeIdentity, bool)> {
     #[cfg(windows)]
     return Err(windows_storage_error());
     #[cfg(not(windows))]
     {
         match fs::symlink_metadata(dir) {
-            Ok(_) => storage::verify_directory(dir)?,
+            Ok(_) => {
+                check_identity_path(dir)?;
+                storage::verify_directory(dir)?;
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 storage::create_private_directory(dir)?;
                 storage::verify_directory(dir)?;
@@ -56,8 +91,26 @@ pub(super) fn init_identity_at(dir: &Path) -> io::Result<(NodeIdentity, bool)> {
             Err(e) => return Err(e),
         }
         let _guard = storage::StateLock::acquire(dir)?;
+        init_identity_locked(dir)
+    }
+}
+
+#[cfg(not(windows))]
+pub(super) fn init_identity_locked(dir: &Path) -> io::Result<(NodeIdentity, bool)> {
+    {
+        check_identity_path(dir)?;
+        storage::verify_directory(dir)?;
         let key_path = dir.join(IDENTITY_FILE);
         let (identity, created) = match fs::symlink_metadata(&key_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{} is a symlink; refusing (remove it to re-initialize)",
+                        key_path.display()
+                    ),
+                ))
+            }
             Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => {
                 (load_identity_at(dir)?, false)
             }
@@ -85,7 +138,9 @@ pub(super) fn init_identity_at(dir: &Path) -> io::Result<(NodeIdentity, bool)> {
     }
 }
 
+#[cfg(not(windows))]
 pub(super) fn load_identity_at(dir: &Path) -> io::Result<NodeIdentity> {
+    let path = dir.join(IDENTITY_FILE);
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -93,13 +148,33 @@ pub(super) fn load_identity_at(dir: &Path) -> io::Result<NodeIdentity> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options.open(dir.join(IDENTITY_FILE))?;
-    storage::check_private_file(&file, "cluster identity")?;
-    let mut bytes = Zeroizing::new(Vec::new());
-    file.read_to_end(&mut bytes)?;
-    identity_from_parts(&bytes)
+    let mut file = options.open(&path).map_err(|error| {
+        #[cfg(unix)]
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            return io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} is a symlink; refusing (remove it to re-initialize)",
+                    path.display()
+                ),
+            );
+        }
+        error
+    })?;
+    storage::check_private_file(&file, "cluster identity", &path)?;
+    let mut bytes = Zeroizing::new([0u8; 64]);
+    file.read_exact(&mut bytes[..])?;
+    let mut trailing = [0u8; 1];
+    if file.read(&mut trailing)? != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cluster identity key must be exactly 64 bytes",
+        ));
+    }
+    identity_from_parts(&bytes[..])
 }
 
+#[cfg(not(windows))]
 fn identity_from_parts(bytes: &[u8]) -> io::Result<NodeIdentity> {
     if bytes.len() != 64 {
         return Err(io::Error::new(
@@ -129,6 +204,7 @@ fn identity_from_parts(bytes: &[u8]) -> io::Result<NodeIdentity> {
     })
 }
 
+#[cfg(not(windows))]
 fn node_name(fingerprint: &str) -> String {
     let suffix: String = fingerprint
         .strip_prefix("SHA256:")
@@ -141,7 +217,7 @@ fn node_name(fingerprint: &str) -> String {
     format!("node-{suffix}")
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -191,10 +267,18 @@ mod tests {
         let _ = init_identity_at(&dir).unwrap();
         fs::remove_file(dir.join(IDENTITY_FILE)).unwrap();
         symlink(dir.join("missing-target"), dir.join(IDENTITY_FILE)).unwrap();
-        assert_eq!(
-            init_identity_at(&dir).unwrap_err().kind(),
-            io::ErrorKind::PermissionDenied
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let error = init_identity_at(&dir).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error
+            .to_string()
+            .contains(&dir.join(IDENTITY_FILE).display().to_string()));
+        assert!(error.to_string().contains("is a symlink; refusing"));
+        assert!(error.to_string().contains("remove it to re-initialize"));
     }
 
     #[test]
@@ -208,8 +292,22 @@ mod tests {
                 .unwrap();
             let error = load_identity_at(&dir).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-            assert!(error.to_string().contains("private permissions"));
+            assert!(error
+                .to_string()
+                .contains(&dir.join(IDENTITY_FILE).display().to_string()));
+            assert!(error.to_string().contains("chmod 600"));
         }
+    }
+
+    #[test]
+    fn directory_permission_error_names_path_and_chmod_fix() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir().join("cluster");
+        let _ = init_identity_at(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let error = storage::verify_directory(&dir).unwrap_err();
+        assert!(error.to_string().contains(&dir.display().to_string()));
+        assert!(error.to_string().contains("chmod 700"));
     }
 
     #[test]

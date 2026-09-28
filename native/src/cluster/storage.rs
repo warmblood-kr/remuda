@@ -1,9 +1,13 @@
 //! Shared hardened local state-file operations used by cluster units.
 
+#[cfg(not(windows))]
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
+#[cfg(not(windows))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(windows))]
 pub(super) fn cluster_state_dir() -> io::Result<PathBuf> {
     let base = match std::env::var_os("XDG_STATE_HOME") {
         Some(value) if !value.is_empty() => PathBuf::from(value),
@@ -16,6 +20,7 @@ pub(super) fn cluster_state_dir() -> io::Result<PathBuf> {
     Ok(base.join("remuda"))
 }
 
+#[cfg(not(windows))]
 pub(super) fn create_private_directory(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
@@ -37,14 +42,9 @@ pub(super) fn create_private_directory(dir: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(not(windows))]
 pub(super) fn verify_directory(dir: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(dir)?;
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "cluster state directory must not be a symlink or non-directory",
-        ));
-    }
+    check_directory_type(dir)?;
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -57,28 +57,92 @@ pub(super) fn verify_directory(dir: &Path) -> io::Result<()> {
     {
         use std::os::unix::fs::MetadataExt;
         let meta = file.metadata()?;
-        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+        let expected_uid = unsafe { libc::geteuid() };
+        if meta.uid() != expected_uid {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "cluster state directory must be owned by the current user with mode 0700",
+                format!(
+                    "{} is owned by uid {}, expected {}; run chown {} {}",
+                    dir.display(),
+                    meta.uid(),
+                    expected_uid,
+                    expected_uid,
+                    dir.display()
+                ),
+            ));
+        }
+        let mode = meta.mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} has loose permissions (mode {mode:04o}); run chmod 700 {}",
+                    dir.display(),
+                    dir.display()
+                ),
             ));
         }
     }
     Ok(())
 }
 
-pub(super) fn check_private_file(file: &File, description: &str) -> io::Result<()> {
+#[cfg(not(windows))]
+pub(super) fn check_directory_type(dir: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(dir)?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is a symlink; refusing (remove it to re-initialize)",
+                dir.display()
+            ),
+        ));
+    }
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            format!("{} is not a directory", dir.display()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub(super) fn check_private_file(_file: &File, description: &str, path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let meta = file.metadata()?;
-        if meta.mode() & 0o177 != 0 || meta.uid() != unsafe { libc::geteuid() } {
-            return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{description} has loose permissions or wrong owner; require private permissions and current user ownership")));
+        let meta = _file.metadata()?;
+        let expected_uid = unsafe { libc::geteuid() };
+        if meta.uid() != expected_uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{description} {} is owned by uid {}, expected {}; run chown {} {}",
+                    path.display(),
+                    meta.uid(),
+                    expected_uid,
+                    expected_uid,
+                    path.display()
+                ),
+            ));
+        }
+        let mode = meta.mode() & 0o777;
+        if mode & 0o177 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{description} {} has loose permissions (mode {mode:04o}); run chmod 600 {}",
+                    path.display(),
+                    path.display()
+                ),
+            ));
         }
     }
     Ok(())
 }
 
+#[cfg(not(windows))]
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
@@ -109,7 +173,9 @@ pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+#[cfg(not(windows))]
 pub(super) struct StateLock(File);
+#[cfg(not(windows))]
 impl StateLock {
     pub(super) fn acquire(dir: &Path) -> io::Result<Self> {
         let path = dir.join("identity.lock");
@@ -120,12 +186,13 @@ impl StateLock {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
-        let file = options.open(path)?;
-        check_private_file(&file, "cluster lock")?;
+        let file = options.open(&path)?;
+        check_private_file(&file, "cluster lock", &path)?;
         file.lock()?;
         Ok(Self(file))
     }
 }
+#[cfg(not(windows))]
 impl Drop for StateLock {
     fn drop(&mut self) {
         drop(self.0.unlock());
