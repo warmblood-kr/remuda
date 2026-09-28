@@ -332,6 +332,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.plan.outputs.tag }}
+          BUILT_SHA: ${{ github.sha }}
         run: |
           set -eu
           check_draft() { gh release view "$TAG" --json isDraft --jq .isDraft; }
@@ -349,6 +350,19 @@ jobs:
               exit 1
             fi
           }
+
+          # Concurrency retains at most one pending run, and a newer push can
+          # replace that pending run while this nightly is building. Detect a
+          # stale rolling release explicitly; the latest-wins policy remains
+          # non-blocking and this warning does not fail publication.
+          if [ "$TAG" = nightly ]; then
+            main_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
+            non_release_commits="$(gh api "repos/$GITHUB_REPOSITORY/compare/$BUILT_SHA...main" \
+              --jq '[.commits[].commit.message | select(startswith("release: ") | not)] | length')"
+            if [ "$non_release_commits" != 0 ]; then
+              echo "::warning::nightly was built from $BUILT_SHA, but main HEAD at verification is $main_sha and is ahead by $non_release_commits non-release commit(s); the published nightly may be stale."
+            fi
+          fi
 
           verify "right after publish"
           sleep 60
