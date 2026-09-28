@@ -12,6 +12,7 @@ pub mod dist;
 pub mod image;
 pub mod ipc;
 pub mod mcp;
+pub mod mouse;
 pub mod packages;
 pub mod process;
 pub mod pty;

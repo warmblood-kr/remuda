@@ -19,7 +19,10 @@
 //! a line of policy.
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use remuda_core::agent::{AgentError, AgentProcess, Color, Cursor, Result, Size, StyledCell};
+use remuda_core::agent::{
+    AgentError, AgentProcess, Color, Cursor, MouseEncoding, MouseMode, MouseState, Result, Size,
+    StyledCell,
+};
 use std::io::{Read, Write};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -251,6 +254,29 @@ impl AgentProcess for PtyAgent {
             .lock()
             .map(|parser| parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None)
             .unwrap_or(false)
+    }
+
+    fn mouse_state(&mut self) -> MouseState {
+        self.screen
+            .lock()
+            .map(|parser| {
+                let screen = parser.screen();
+                MouseState {
+                    mode: match screen.mouse_protocol_mode() {
+                        vt100::MouseProtocolMode::None => MouseMode::None,
+                        vt100::MouseProtocolMode::Press => MouseMode::Press,
+                        vt100::MouseProtocolMode::PressRelease => MouseMode::PressRelease,
+                        vt100::MouseProtocolMode::ButtonMotion => MouseMode::ButtonMotion,
+                        vt100::MouseProtocolMode::AnyMotion => MouseMode::AnyMotion,
+                    },
+                    encoding: match screen.mouse_protocol_encoding() {
+                        vt100::MouseProtocolEncoding::Default => MouseEncoding::Default,
+                        vt100::MouseProtocolEncoding::Utf8 => MouseEncoding::Utf8,
+                        vt100::MouseProtocolEncoding::Sgr => MouseEncoding::Sgr,
+                    },
+                }
+            })
+            .unwrap_or_default()
     }
 
     /// Styled cells off `vt100`'s own grid, including its wide/continuation

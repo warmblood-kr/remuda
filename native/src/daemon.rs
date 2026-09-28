@@ -261,6 +261,7 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
         Request::List => counters.counter("request_list").record_hit(),
         Request::Eval { .. } => counters.counter("request_eval").record_hit(),
         Request::CaptureStyled { .. } => counters.counter("request_capture_styled").record_hit(),
+        Request::MouseState { .. } => counters.counter("request_mouse_state").record_hit(),
         _ => {}
     }
 }
@@ -496,6 +497,13 @@ fn handle(
         Request::CaptureStyled { name, scrollback } => {
             capture_styled(&stream, registry, &name, scrollback)
         }
+
+        Request::MouseState { name } => respond(
+            &stream,
+            &name,
+            registry.get(&name).map(|session| Ok(session.mouse_state())),
+            Response::MouseState,
+        ),
 
         Request::Attach { name } => attach(stream, reader, registry, &name),
 

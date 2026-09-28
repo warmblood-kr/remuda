@@ -51,6 +51,13 @@ byte, so it carries no inter-key timing for a stack of nested ttys to mangle.
 agent's own TUI — can swallow `Ctrl-\` before remuda sees it. `remuda attach`
 has always had that ceiling and this shares it.
 
+Direct attach enables terminal mouse input by default. The wheel scrolls the
+session's retained history when its program has mouse reporting off; when the
+program tracks the mouse, reports go to that program. Press `Ctrl-]` to toggle
+mouse handling during an attach, or use `remuda attach NAME --mouse=false` to
+start with it off. Hold Option while dragging to select text in Terminal.app
+or iTerm2; most other terminals use Shift-drag.
+
 A session whose program exits closes itself and leaves the list. Set
 `REMUDA_KEEP_EXITED=1` in the daemon's environment to keep it listed as `dead`
 instead — its last screen is the evidence for why it died.

@@ -92,6 +92,32 @@ pub struct StyledCell {
     pub wide: bool,
 }
 
+/// Mouse reporting selected by the child terminal application.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum MouseMode {
+    #[default]
+    None,
+    Press,
+    PressRelease,
+    ButtonMotion,
+    AnyMotion,
+}
+
+/// Mouse event encoding selected by the child terminal application.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub enum MouseEncoding {
+    #[default]
+    Default,
+    Utf8,
+    Sgr,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+pub struct MouseState {
+    pub mode: MouseMode,
+    pub encoding: MouseEncoding,
+}
+
 #[derive(Debug)]
 pub enum AgentError {
     /// The child is gone. Distinct from an I/O failure: a caller may
@@ -147,6 +173,10 @@ pub trait AgentProcess: Send {
     /// cannot know return false so callers do not inject unsolicited input.
     fn mouse_tracking(&mut self) -> bool {
         false
+    }
+
+    fn mouse_state(&mut self) -> MouseState {
+        MouseState::default()
     }
 
     /// The visible screen as styled cells, for a croppable colour pane.
