@@ -1,8 +1,53 @@
 # Remote session UX draft
 
-This is a UX proposal for `remuda remote HOST/SESSION`. It covers one session at a time over short request/response exchanges, so a lost network request does not end the viewing command. The host alias and session remain visible throughout. The initial host list is static; cluster membership and a composed multi-node view come later. The name `control tower` is reserved for that later view.
+This is a UX proposal for `remuda remote HOST/SESSION`. It covers one session at a time over short request/response exchanges, so a lost network request does not end the viewing command. The node name and session remain visible throughout. Nodes are identified by their cluster name; the later composed multi-node view comes separately. The name `control tower` is reserved for that later view.
 
-All commands below are proposed user-facing syntax for review. The remote subcommand and its flags are not implemented yet.
+All commands below are proposed user-facing syntax for review. The cluster and remote subcommands and their flags are not implemented yet. Example addresses, fingerprints, tokens, and output are illustrative.
+
+## Journey 0: form a cluster
+
+On the first machine, initialize a node. The command creates its node key pair and starts the cluster endpoint on the VPN address. It prints the address, public-key fingerprint, and a short-lived, single-use token in one pasteable line:
+
+```text
+$ remuda cluster
+Cluster initialized
+Node: studio
+Address: 100.80.0.12:7443
+Fingerprint: SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=
+Join command (expires in 10 minutes; single use):
+curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh && "$HOME/.local/bin/remuda" cluster join --address 100.80.0.12:7443 --fingerprint SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= --token 'eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
+```
+
+The operator shares that line with the intended machine over a trusted channel. The token is a bearer secret: it is shown once, expires quickly, and is consumed once. The joining machine pastes it into a shell; the first node's fingerprint is pinned before the secure channel is established, then the joiner registers its own public key. No public discovery or NAT traversal is implied; both nodes are expected to reach one another on the same VPN.
+
+```text
+$ curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh && "$HOME/.local/bin/remuda" cluster join --address 100.80.0.12:7443 --fingerprint SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= --token 'eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
+Downloading remuda…
+Pinned cluster node fingerprint verified
+Joining cluster…
+Joined cluster as node: field-laptop
+```
+
+Operators can inspect membership and revoke a node key:
+
+```text
+$ remuda cluster nodes
+NODE          ADDRESS          STATUS
+studio        100.80.0.12:7443 online
+field-laptop  100.80.0.27:7443 online
+
+$ remuda cluster revoke field-laptop
+Revoke node field-laptop (SHA256:Vmlld2VyLWtleS1leGFtcGxl)? [y/N] y
+Node field-laptop revoked. Existing connections closed.
+```
+
+The specific list formatting and confirmation syntax are proposed UX. These example commands show the POSIX installer; a PowerShell host should print an equivalent install-and-join line for that shell. A token or fingerprint error is fatal and must not fall back to an unpinned connection; unreachable nodes can be retried after the VPN is repaired:
+
+```text
+Join failed: token expired or already used. Run `remuda cluster` on the first node to create a new join command.
+Join failed: fingerprint mismatch for 100.80.0.12:7443. Expected SHA256:QmFz...; received SHA256:YW5vdGhlci1rZXk. Join aborted; verify the command with the cluster operator.
+Join failed: 100.80.0.12:7443 is unreachable. Check that both machines are on the VPN, then retry the join command.
+```
 
 ## User journeys
 
@@ -14,7 +59,7 @@ On the machine that runs the session, start it with its normal command and a sta
 remuda run -n dev claude
 ```
 
-The daemon owns the session after the initiating terminal detaches or disappears. The host operator gives a configured host alias and session name to the viewer. The session is not exposed publicly: remote access is through the VPN, and the selected host must authorize the viewer. Starting a session and granting remote-view access are separate actions.
+The daemon owns the session after the initiating terminal detaches or disappears. The host operator gives a registered node name and session name to the viewer. The session is not exposed publicly: remote access is through the VPN, and the selected host must authorize the viewer. Starting a session and granting remote-view access are separate actions.
 
 A viewer connects from a second machine with:
 
@@ -26,7 +71,7 @@ The initial command has no flags. Proposed optional flags are `--read-only` to e
 
 ### 2. Connect from another machine
 
-The host alias `laptop` resolves through a local static host configuration. `dev` selects the session on that host. While connecting, the command names both pieces so the user can spot a mistaken target:
+The node name `laptop` resolves through authenticated cluster membership. `dev` selects the session on that host. While connecting, the command names both pieces so the user can spot a mistaken target:
 
 ```text
 remuda remote laptop/dev
@@ -57,11 +102,11 @@ Two clients may open the same session concurrently. Both can view snapshots and 
 
 A viewer may also select `--read-only` explicitly. That viewer can never accidentally type into the session, even when no other writer is connected. If a writer disconnects, keep its lease briefly while it reconnects so its queued batches can be reconciled; after lease expiry, another viewer may acquire write access. Pending input must be acknowledged or visibly reported as uncertain before a lease is transferred.
 
-#### 6. Switch sessions or nodes
+### 5. Switch sessions or nodes
 
-Press Esc to detach from the current view, then run `remuda remote laptop/worker` or `remuda remote buildbox/dev`. These always start a fresh target selection and display the new `HOST / SESSION` before accepting input. If the current draft is nonempty, ask whether to keep it locally or discard it; pending batches stay associated with their original host/session and are never retargeted. A later cluster registry may populate the same host aliases and node/session targets; this first command does not show a multi-node overview.
+Press Esc to detach from the current view, then run `remuda remote laptop/worker` or `remuda remote buildbox/dev`. These always start a fresh target selection and display the new `HOST / SESSION` before accepting input. If the current draft is nonempty, ask whether to keep it locally or discard it; pending batches stay associated with their original host/session and are never retargeted. Joined node names resolve through cluster membership; this command still opens one session at a time and does not show a multi-node overview.
 
-### 7. End the view or end the session
+### 6. End the view or end the session
 
 Press Esc to leave the remote view. If a local draft has not been sent, ask whether to keep it in the local client for later or discard it. Detaching does not stop the remote session. Reopen it with `remuda remote laptop/dev`.
 
@@ -139,8 +184,8 @@ Do not silently reinterpret terminal control keys. Recommend: arrows edit the lo
 1. **Input:** send each key immediately, flush buffered chunks on a timer, or edit a line and send on Enter. Recommend the line editor: it works with mobile keyboards, allows correction before send, and makes an exactly-once unit visible. Its trade-off is that it is not suitable for full-screen applications.
 2. **Two viewers:** allow all viewers to write with interleaved input, make every extra viewer read-only, or grant one renewable writer lease. Recommend the lease: it gives shared read access without surprising input interleaving. The lease duration and handoff policy need owner review.
 3. **Leaving vs ending:** overload a terminal key, provide an explicit close action, or separate detach and confirmed termination. Recommend separate detach and confirmed termination; network loss or Esc must never kill the host session.
-4. **Host configuration:** accept arbitrary VPN URLs on each invocation or use named configured hosts. Recommend named aliases (`HOST/SESSION`) so a target is short, stable, and easy to verify; the config command and file format need review.
+4. **Host configuration:** accept arbitrary VPN URLs on each invocation or use named configured hosts. Recommend registered node names (`NODE/SESSION`) so a target is short, stable, and easy to verify; cluster membership is the source of truth.
 
 ## Protocol implications
 
-Sync returns a snapshot or diff with a monotonically increasing version; reconnect resumes from the last version. A committed line is `input(session, batch_id, bytes)`, and retries reuse the same ID and bytes so an acknowledged or previously applied batch is never delivered twice. Local requests can reuse the daemon socket; remote requests are short-lived authenticated request/response over VPN. Authorization identifies the node and session; a later cluster registry can provide node membership and credentials. The protocol needs to support multiple read clients and a host-enforced writer lease. Per-session output events from #190 may later wake a long-poll without changing these user journeys.
+Sync returns a snapshot or diff with a monotonically increasing version; reconnect resumes from the last version. A committed line is `input(session, batch_id, bytes)`, and retries reuse the same ID and bytes so an acknowledged or previously applied batch is never delivered twice. Local requests can reuse the daemon socket; remote requests use Remuda’s own short-lived authenticated request/response channel over the VPN, with joined node keys. Use off-the-shelf channel crypto (for example, Noise via `snow` or mutual TLS); the UX only depends on pinned node identity, one-time join tokens, and revocable node membership. The protocol needs to support multiple read clients and a host-enforced writer lease. Per-session output events from #190 may later wake a long-poll without changing these user journeys.
