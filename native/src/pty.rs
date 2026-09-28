@@ -89,7 +89,7 @@ pub struct PtyAgent {
     child: Box<dyn Child + Send + Sync>,
     watchers: Watchers,
     scrollback_total: Arc<AtomicUsize>,
-    _master: Box<dyn MasterPty + Send>,
+    master: Option<Box<dyn MasterPty + Send>>,
 }
 
 impl PtyAgent {
@@ -136,7 +136,7 @@ impl PtyAgent {
             child,
             watchers,
             scrollback_total,
-            _master: pair.master,
+            master: Some(pair.master),
         })
     }
 }
@@ -419,7 +419,14 @@ impl AgentProcess for PtyAgent {
     }
 
     fn is_alive(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(None))
+        let alive = matches!(self.child.try_wait(), Ok(None));
+        if !alive {
+            // ConPTY keeps its output pipe open after the child exits until
+            // ClosePseudoConsole runs. Release the master so the reader thread
+            // sees EOF and attached clients receive the ordinary end-of-stream.
+            self.master.take();
+        }
+        alive
     }
 
     /// Caution: `is_alive` calls `try_wait`, which *reaps* the child on unix, so
@@ -433,7 +440,9 @@ impl AgentProcess for PtyAgent {
     }
 
     fn resize(&mut self, size: Size) -> Result<()> {
-        self._master
+        self.master
+            .as_ref()
+            .ok_or(AgentError::Exited)?
             .resize(PtySize {
                 rows: size.rows(),
                 cols: size.cols(),
