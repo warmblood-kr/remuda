@@ -14,7 +14,8 @@
 //!
 //! Everything else — `new`, `close`, `capture`, `insert`, `key`, `click` — lives
 //! in the Lua image, reached by `-e`, `remuda lua <file>`, or `remuda mcp`. The
-//! daemon starts itself on first use. `-s` names one. See `USAGE`.
+//! state-creating commands start the daemon on first use; read-only commands
+//! require it to be running already. `-s` names one. See `USAGE`.
 
 use remuda_core::protocol::{Request, Response};
 use remuda_native::client::Left;
@@ -65,6 +66,8 @@ fn main() -> ExitCode {
 
         ["_codex_tui", rest @ ..] => codex_tui::run(rest),
 
+        ["_codex_watch", parent_pid, process_group] => run_codex_watch(parent_pid, process_group),
+
         // No daemon involved: this replaces the binary, it does not talk to one.
         ["upgrade", rest @ ..] => run_upgrade(rest),
 
@@ -79,7 +82,7 @@ fn main() -> ExitCode {
         // is not a thing to do.
         ["stop", rest @ ..] => stop(server, &path, rest),
 
-        ["ls"] => with_daemon(server, &path, list_sessions),
+        ["ls"] => with_existing_daemon(server, &path, list_sessions),
 
         ["run", rest @ ..] => run_session(server, &path, rest),
 
@@ -119,7 +122,7 @@ fn main() -> ExitCode {
 
         ["exec", name] => with_daemon(server, &path, |path| exec_command(path, name)),
 
-        ["cluster", rest @ ..] => cluster_command(&path, rest),
+        ["cluster", rest @ ..] => cluster_command(server, &path, rest),
 
         [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
             extension_command(server, &path, command, rest)
@@ -136,7 +139,7 @@ fn main() -> ExitCode {
         ["mod", "update", rest @ ..] => mod_update_command(server, &path, rest),
         ["mod", "remove", rest @ ..] => mod_remove_command(rest),
 
-        ["doc", rest @ ..] => with_daemon(server, &path, |path| doc_command(path, rest)),
+        ["doc", rest @ ..] => with_existing_daemon(server, &path, |path| doc_command(path, rest)),
 
         ["repl"] => with_daemon(server, &path, repl),
 
@@ -175,6 +178,13 @@ fn main() -> ExitCode {
     }
 }
 
+fn run_codex_watch(parent_pid: &str, process_group: &str) -> ExitCode {
+    match (parent_pid.parse::<i32>(), process_group.parse::<i32>()) {
+        (Ok(parent_pid), Ok(process_group)) => codex_tui::watch_parent(parent_pid, process_group),
+        _ => fail("invalid Codex app-server watch parameters"),
+    }
+}
+
 #[allow(dead_code)]
 const DETAILED_USAGE: &str = "\
 remuda — a pty manager you can attach to
@@ -209,8 +219,10 @@ remuda — a pty manager you can attach to
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
   remuda upgrade [--channel C]  re-run the installer on stable or nightly
-  remuda stop [-f]              stop the daemon; the next command starts a fresh
-                                  one. Its sessions and Lua image die with it,
+  remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon; the next command
+                                  starts a fresh one. A hosted session needs the
+                                  explicit --i-am-inside override.
+                                  Its sessions and Lua image die with it,
                                   so a live herd is named and confirmed first.
   remuda --version              the version this binary was built with
 
@@ -263,7 +275,7 @@ remuda — terminal orchestration for coding agents
                                  Ctrl-] toggles mouse; wheel scrolls history
                                  --mouse=false disables mouse handling (before or after NAME)
   remuda ls | send NAME TEXT     inspect or message sessions
-  remuda stop [-f]               stop the daemon (sessions are lost)
+  remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon (sessions are lost)
 
   remuda mod install OWNER/REPO  install a mod from GitHub
   remuda mod list | info NAME    inspect installed mods
@@ -319,31 +331,54 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
     }
 }
 
-fn cluster_command(path: &Path, args: &[&str]) -> ExitCode {
+fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     match parse_cluster_command(args) {
-        ClusterCommand::Status => {
-            println!("This node is not in a cluster; run `remuda cluster init`.");
-            ExitCode::SUCCESS
-        }
-        ClusterCommand::Init => fail("cluster init is not implemented yet"),
+        ClusterCommand::Status => match remuda_native::cluster::status() {
+            Ok(None) => {
+                println!("This node is not in a cluster; run `remuda cluster init`.");
+                ExitCode::SUCCESS
+            }
+            Ok(Some((identity, members))) => {
+                println!("Node: {}", identity.node_name);
+                println!("Fingerprint: {}", identity.node_fp);
+                println!("Members: {members}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("cluster status: {error}")),
+        },
+        ClusterCommand::Init => match remuda_native::cluster::init() {
+            Ok((identity, created)) => {
+                println!("{}", cluster_init_message(created));
+                println!("Node: {}", identity.node_name);
+                println!("Fingerprint: {}", identity.node_fp);
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("cluster init: {error}")),
+        },
         ClusterCommand::Remote(target) => {
             let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into());
-            with_daemon(
-                "cluster",
-                path,
-                |path| match remuda_native::cluster_tui::run(path, &node, target.as_deref()) {
+            with_daemon(server, path, |path| {
+                match remuda_native::cluster_tui::run(path, &node, target.as_deref()) {
                     Ok(()) => ExitCode::SUCCESS,
                     Err(error) => fail(format!("cluster remote: {error}")),
-                },
-            )
+                }
+            })
         }
         ClusterCommand::Invalid => fail("usage: remuda cluster [init | remote [node/session]]"),
     }
 }
 
+fn cluster_init_message(created: bool) -> &'static str {
+    if created {
+        "Cluster initialized"
+    } else {
+        "Already initialized"
+    }
+}
+
 #[cfg(test)]
 mod cluster_cli_tests {
-    use super::{parse_cluster_command, ClusterCommand};
+    use super::{cluster_init_message, parse_cluster_command, ClusterCommand};
 
     #[test]
     fn cluster_status_and_init_are_recognized() {
@@ -362,6 +397,11 @@ mod cluster_cli_tests {
             parse_cluster_command(&["remote", "studio/dev"]),
             ClusterCommand::Remote(Some("studio/dev".into()))
         );
+    }
+
+    #[test]
+    fn repeated_init_uses_already_initialized_wording() {
+        assert_eq!(cluster_init_message(false), "Already initialized");
     }
 }
 
@@ -442,21 +482,33 @@ fn fate(path: &Path, name: &str) -> String {
 /// binary but cannot touch a daemon already running — this is the verb that
 /// closes that gap.
 fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
-    let force = match args {
-        [] => false,
-        ["-f"] | ["--force"] => true,
-        _ => return fail("usage: remuda stop [-f]"),
-    };
+    let mut force = false;
+    let mut yes = false;
+    let mut inside_override = false;
+    for arg in args {
+        match *arg {
+            "-f" | "--force" if !force => force = true,
+            "--yes" if !yes => yes = true,
+            "--i-am-inside" if !inside_override => inside_override = true,
+            _ => return fail("usage: remuda stop [-f] [--yes]"),
+        }
+    }
     if remuda_native::ipc::connect(path).is_err() {
-        eprintln!("remuda: no daemon running for {server:?} — the next command starts one");
+        eprintln!("remuda: no daemon running for {server:?} — a state-creating command starts one");
         return ExitCode::SUCCESS;
     }
-    if !force {
+    if !yes && !force && has_sessions(path) {
         if let Err(refusal) = confirm_losses(path) {
             return fail(refusal);
         }
     }
-    match stop_daemon(path) {
+    let shutdown = Request::Shutdown {
+        requester_daemon_id: std::env::var("REMUDA_DAEMON_ID").ok(),
+        requester_session_id: std::env::var("REMUDA_SESSION_ID").ok(),
+        requester_session_name: std::env::var("REMUDA_SESSION_NAME").ok(),
+        override_hosted: inside_override,
+    };
+    match stop_daemon(path, shutdown) {
         Ok(()) => {
             eprintln!(
                 "remuda: stopped the daemon for {server:?} — the next command starts a fresh one"
@@ -465,6 +517,11 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         }
         Err(e) => fail(e),
     }
+}
+
+fn has_sessions(path: &Path) -> bool {
+    matches!(remuda_native::client::request(path, &Request::List),
+        Ok(Response::Sessions(sessions)) if !sessions.is_empty())
 }
 
 /// Name what dies before it dies. Killing the daemon takes every session's
@@ -492,7 +549,7 @@ fn confirm_losses(path: &Path) -> Result<(), String> {
     );
     eprintln!("remuda: their processes, their last screens and the Lua image are all lost.");
     if !std::io::stdin().is_terminal() {
-        return Err("nothing to ask on — `remuda stop -f` if that is what you want".into());
+        return Err("nothing to ask on — `remuda stop -f --yes` if that is what you want".into());
     }
     eprint!("remuda: type y to go ahead: ");
     let mut answer = String::new();
@@ -505,19 +562,13 @@ fn confirm_losses(path: &Path) -> Result<(), String> {
     }
 }
 
-/// `Shutdown` is the door. A daemon built before that variant existed refuses
-/// it, and its Lua image is the only lever those already-deployed ones leave —
-/// `os.exit` there ends the same process. Drop the fallback after one release.
-fn stop_daemon(path: &Path) -> Result<(), String> {
-    let asked = remuda_native::client::request(path, &Request::Shutdown);
-    if !matches!(asked, Ok(Response::Ok)) {
-        let _ = remuda_native::client::request(
-            path,
-            &Request::Eval {
-                code: "os.exit(0)".into(),
-                name: None,
-            },
-        );
+fn stop_daemon(path: &Path, shutdown: Request) -> Result<(), String> {
+    let asked = remuda_native::client::request(path, &shutdown);
+    if !matches!(&asked, Ok(Response::Ok)) {
+        return Err(match asked {
+            Ok(Response::Error(reason)) => reason,
+            other => format!("daemon refused shutdown: {}", describe(other)),
+        });
     }
     // The socket file outlives the process on unix, so "gone" is a connect that
     // is refused, never a path that disappeared. `ipc::listen` clears the file.
@@ -633,6 +684,24 @@ fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> Exit
     match ensure_daemon(server, path) {
         Ok(()) => f(path),
         Err(e) => fail(e),
+    }
+}
+
+/// Run a read-only command only against a daemon that already exists.
+fn with_existing_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> ExitCode {
+    match remuda_native::ipc::connect(path) {
+        Ok(_) => f(path),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            fail(format!("cannot use {}: {error}", path.display()))
+        }
+        Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => fail(format!(
+            "no daemon running for {server:?} (socket {}); start one with remuda run ... or remuda -e ...",
+            path.display(),
+        )),
+        Err(error) => fail(format!(
+            "cannot connect to remuda daemon at {}: {error}; refusing to start a second daemon",
+            path.display()
+        )),
     }
 }
 

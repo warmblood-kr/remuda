@@ -7,6 +7,7 @@
 
 pub mod child_guard;
 pub mod client;
+pub mod cluster;
 pub mod cluster_tui;
 pub mod daemon;
 pub mod dist;
@@ -16,6 +17,7 @@ pub mod mcp;
 pub mod mouse;
 pub mod packages;
 pub mod process;
+mod process_ancestry;
 pub mod pty;
 pub mod remote_front;
 pub mod script;

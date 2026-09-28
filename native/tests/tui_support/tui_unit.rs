@@ -110,6 +110,7 @@ fn refresh_waits_for_the_slow_tick_when_nothing_forced_it() {
 
 fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
     SessionSummary {
+        id: String::new(),
         name: name.into(),
         alive,
         idle: Duration::from_secs(4),
@@ -297,6 +298,15 @@ fn a_click_on_a_list_row_selects_and_enters_it_like_arrow_plus_enter() {
     assert_eq!(ui.on_mouse(click(5, 4), 80, 24), Action::Focus("b".into()));
     assert_eq!(ui.selected, 1, "clicked the second row");
     assert_eq!(ui.focus, Focus::Session, "a click enters, same as Enter");
+}
+
+#[test]
+fn mouse_actions_are_ignored_after_daemon_is_gone() {
+    let mut ui = make_ui(vec![row("a", true, false), row("b", true, false)]);
+    ui.daemon_gone = Some("/tmp/dead.sock".into());
+    assert_eq!(ui.on_mouse(click(5, 4), 80, 24), Action::Nothing);
+    assert_eq!(ui.focus, Focus::List);
+    assert_eq!(ui.selected, 0);
 }
 
 #[test]
@@ -2482,6 +2492,155 @@ fn list_reports_a_transport_failure_instead_of_an_empty_herd() {
         "no daemon answered — an empty Ok(vec![]) would read as \
              'no sessions exist', which is not what happened: {result:?}"
     );
+}
+
+#[test]
+fn daemon_gone_requires_three_transport_failures_unless_the_endpoint_is_definitively_dead() {
+    assert!(!daemon_failure_marks_gone(1, false));
+    assert!(!daemon_failure_marks_gone(2, false));
+    assert!(daemon_failure_marks_gone(3, false));
+    assert!(daemon_failure_marks_gone(1, true));
+}
+
+#[cfg(unix)]
+#[test]
+fn refused_socket_is_definitive_only_when_its_lifetime_lock_is_free() {
+    use std::os::fd::AsRawFd;
+
+    let dir = std::env::temp_dir().join(format!("remuda-tui-lock-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make private lock probe directory");
+    let socket = dir.join("s.sock");
+    std::fs::write(&socket, b"stale endpoint").expect("make endpoint exist");
+    let lock_path = dir.join("s.sock.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("open lock file");
+    let refused = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    assert!(
+        !daemon_is_definitively_gone(&socket, &refused),
+        "a held daemon lock means a refused connection is not proof"
+    );
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    assert!(daemon_is_definitively_gone(&socket, &refused));
+    std::fs::remove_dir_all(dir).expect("remove private lock probe directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+
+    let dir = std::env::temp_dir().join(format!("remuda-tui-busy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make private busy daemon directory");
+    let socket = dir.join("s.sock");
+    drop(UnixListener::bind(&socket).expect("bind private endpoint"));
+    let lock_path = dir.join("s.sock.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .expect("open private lifetime lock");
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let connect_error = crate::ipc::connect(&socket).expect_err("placeholder is not a socket");
+    assert_eq!(
+        connect_error.kind(),
+        std::io::ErrorKind::ConnectionRefused,
+        "{connect_error:?}"
+    );
+    assert!(!daemon_is_definitively_gone(&socket, &connect_error));
+
+    let mut ui = make_ui(vec![row("remembered", true, false)]);
+    ui.consecutive_transport_failures = 2;
+    let mut held = None;
+    let mut painted = String::new();
+    let mut shown = None;
+    refresh(
+        &socket,
+        "test",
+        &mut ui,
+        &mut held,
+        &mut painted,
+        &mut shown,
+        false,
+        false,
+    )
+    .expect("refresh handles refused private endpoint");
+    assert!(
+        ui.daemon_gone.is_none(),
+        "held lifetime lock means the daemon may be busy"
+    );
+    assert_eq!(
+        ui.consecutive_transport_failures, 0,
+        "busy refusal must not count"
+    );
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    drop(lock);
+    std::fs::remove_dir_all(dir).expect("remove private busy daemon directory");
+}
+
+#[test]
+fn a_missing_daemon_marks_the_cached_list_stale_and_offers_restart_or_quit() {
+    // Use the daemon's platform-specific address shape. On Windows the IPC
+    // endpoint is a named pipe, and arbitrary filesystem paths are rejected
+    // before connection (so they cannot prove that a daemon is gone).
+    let dir = if cfg!(unix) {
+        std::path::PathBuf::from(format!("/tmp/rm-{}", std::process::id()))
+    } else {
+        std::env::temp_dir().join(format!("remuda-tui-missing-{}", std::process::id()))
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make private missing-daemon fixture");
+    let path = crate::daemon::socket_path_in(&dir, "s");
+    let mut ui = make_ui(vec![row("remembered", true, false)]);
+    ui.mode = Mode::Prompt("sh".into());
+    let mut held = None;
+    let mut painted = String::new();
+    let mut shown = None;
+
+    refresh(
+        &path,
+        "test",
+        &mut ui,
+        &mut held,
+        &mut painted,
+        &mut shown,
+        false,
+        false,
+    )
+    .expect("draw stale list");
+
+    assert_eq!(ui.sessions.len(), 1, "keep the last known sessions");
+    assert_eq!(ui.mode, Mode::Browse, "leave prompts when daemon dies");
+    let frame = render(&ui, "", "test", 80, 24);
+    assert!(
+        frame.contains(&format!("daemon gone (stale): {}", path.display())),
+        "identify the missing daemon and stale list: {frame:?}"
+    );
+    assert!(
+        frame.contains("r restart"),
+        "offer an explicit restart: {frame:?}"
+    );
+    assert!(frame.contains("q quit"), "offer quit: {frame:?}");
+    assert_eq!(ui.on_key(press(KeyCode::Char('r'))), Action::Restart);
+    assert_eq!(ui.on_key(press(KeyCode::Char('q'))), Action::Quit);
+    std::fs::remove_dir_all(dir).expect("remove private missing-daemon fixture");
 }
 
 /// [MEASURED] `capture_styled` (the pane's own function) against a real

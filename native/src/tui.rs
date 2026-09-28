@@ -34,6 +34,7 @@ use crossterm::event::{
 /// How often an idle herd is relisted, recaptured and redrawn — see
 /// [`should_refresh`]. A key always forces an immediate refresh regardless.
 const TICK: Duration = Duration::from_millis(250);
+const DAEMON_FAILURES_BEFORE_GONE: u8 = 3;
 
 /// How often the keyboard is polled while a session has focus — shorter
 /// than `TICK` so a keypress is never left waiting to be noticed. Used to
@@ -63,6 +64,7 @@ pub enum Focus {
 pub enum Action {
     Nothing,
     Quit,
+    Restart,
     /// Bytes for the focused session's pty, already encoded.
     Type(Vec<u8>),
     Start(String),
@@ -130,6 +132,9 @@ pub struct Ui {
     /// One line of feedback under the list — a refusal, or how the last ride
     /// ended. Cleared by the next keypress that does anything.
     pub notice: Option<String>,
+    /// The daemon endpoint is gone; retain the cached session list for context.
+    daemon_gone: Option<String>,
+    consecutive_transport_failures: u8,
     /// The "*sessions*" buffer's rendered rows (`tools.lua`'s
     /// `remuda._refresh_sessions_buffer`).  Lua owns its presentation; Rust
     /// only adds the per-viewer cursor and maps rows back to sessions.
@@ -185,6 +190,8 @@ impl Ui {
             },
             shell: shell.to_string(),
             notice,
+            daemon_gone: None,
+            consecutive_transport_failures: 0,
             sessions_text: Vec::new(),
             session_rows: 1,
             preview_rows: 1,
@@ -217,6 +224,9 @@ impl Ui {
     /// another one already has focus. A press in the session pane forwards
     /// as a real click to the child instead. See steps/030.
     pub fn on_mouse(&mut self, event: MouseEvent, cols: u16, rows: u16) -> Action {
+        if self.daemon_gone.is_some() {
+            return Action::Nothing;
+        }
         if self.mode != Mode::Browse {
             return Action::Nothing;
         }
@@ -470,6 +480,13 @@ impl Ui {
     }
 
     fn browse_key(&mut self, key: KeyEvent) -> Action {
+        if self.daemon_gone.is_some() {
+            return match key.code {
+                KeyCode::Char('r') | KeyCode::Char('R') => Action::Restart,
+                KeyCode::Char('q') | KeyCode::Char('Q') => Action::Quit,
+                _ => Action::Nothing,
+            };
+        }
         if self.visual {
             if self.visual_g_pending {
                 self.visual_g_pending = false;
@@ -1212,6 +1229,7 @@ mod visual_mode_tests {
     fn ui() -> Ui {
         let mut ui = Ui::new(
             vec![SessionSummary {
+                id: String::new(),
                 name: "agent".into(),
                 alive: true,
                 idle: Duration::ZERO,
@@ -2319,6 +2337,14 @@ fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16, cols: u16) -> String
                 "visual: move — hjkl 0$^ wbe ggG   v/space anchor   y/esc/q leave".into()
             }
         }
+        Mode::Browse if let Some(socket) = &ui.daemon_gone => {
+            let prefix = "daemon gone (stale): ";
+            let controls = " · r restart · q quit";
+            let path_width = (cols as usize)
+                .saturating_sub(visible_width(prefix) + visible_width(controls))
+                .min(u16::MAX as usize) as u16;
+            format!("{prefix}{}{controls}", fit(socket, path_width))
+        }
         Mode::Browse => match &ui.notice {
             Some(notice) => format!("remuda: {notice}"),
             None if ui.sessions.is_empty() => "n new   q quit".into(),
@@ -2372,25 +2398,39 @@ fn refresh(
         // attached pane) onto its new neighbour.
         let selected_name = ui.selected().map(|session| session.name.clone());
         match list(path) {
-            Ok(sessions) => ui.sessions = sessions,
+            Ok(sessions) => {
+                if ui.daemon_gone.take().is_some() {
+                    ui.notice = None;
+                }
+                ui.consecutive_transport_failures = 0;
+                ui.sessions = sessions;
+            }
             // Keep the last known herd rather than blanking it: a transport
             // failure is not a report that every session vanished. See steps/021.
-            Err(e) => ui.notice = Some(e),
+            Err(e) => match crate::ipc::connect(path) {
+                Ok(_) => {
+                    ui.consecutive_transport_failures = 0;
+                    ui.notice = Some(e);
+                }
+                Err(probe_error) => record_daemon_probe_failure(path, ui, e, probe_error),
+            },
         }
         // Same skip as the relist above, and for the same reason: a
         // `Type`-forced wake (fast-typing tick) needs none of this, so
         // paying for it there would be the exact per-keystroke IPC cost
         // steps/017/022 exist to avoid.
-        let (list_w, _) = ui_layout(ui, cols);
-        match sessions_buffer_lines(path, list_w, ui.selected, selected_name.as_deref()) {
-            Ok((session_rows, lines, order)) => {
-                ui.session_rows = session_rows;
-                ui.sessions_text = lines;
-                apply_session_order(ui, selected_name.as_deref(), &order);
+        if ui.daemon_gone.is_none() {
+            let (list_w, _) = ui_layout(ui, cols);
+            match sessions_buffer_lines(path, list_w, ui.selected, selected_name.as_deref()) {
+                Ok((session_rows, lines, order)) => {
+                    ui.session_rows = session_rows;
+                    ui.sessions_text = lines;
+                    apply_session_order(ui, selected_name.as_deref(), &order);
+                }
+                // Same fallback as the relist: keep whatever was last drawn
+                // rather than blanking the tail column on a transport hiccup.
+                Err(e) => ui.notice = Some(e),
             }
-            // Same fallback as the relist: keep whatever was last drawn
-            // rather than blanking the tail column on a transport hiccup.
-            Err(e) => ui.notice = Some(e),
         }
     }
     ui.clamp();
@@ -2415,46 +2455,30 @@ fn refresh(
     // touches `self.selected`, and the only actions that do are never
     // `Type` — see the RED test this fixes), so re-syncing the window there
     // would be a per-keystroke Eval for an answer that can't have changed.
-    if !skip_list {
-        let selected_name = ui.selected().map(|s| s.name.clone());
-        // `selection_moved` is `true` only for a real Up/Down keypress that
-        // actually moved `ui.selected` (see `run()`) — never a session
-        // first appearing in the list, `clamp()`, or `follow_focus()`.
-        match window_shown_session(path, selected_name.as_deref(), selection_moved) {
-            Ok(target) => *shown = target,
-            Err(e) => {
-                ui.notice = Some(e);
-                *shown = None;
-            }
-        }
+    if !skip_list && ui.daemon_gone.is_none() {
+        sync_shown_session(path, ui, shown, selection_moved);
     }
-    if let Some(ShownTarget::Session(name)) = shown.as_ref() {
-        let target = pane_size(ui, cols, rows);
-        if ui.last_resized.as_ref() != Some(&(name.clone(), target)) {
-            match resize(path, name, target) {
-                Ok(()) => ui.last_resized = Some((name.clone(), target)),
-                Err(e) => ui.notice = Some(format!("{name}: {e}")),
-            }
-        }
+    resize_shown_session(path, ui, shown, cols, rows);
+    let (cells, wrapped, cursor) = if ui.daemon_gone.is_some() {
+        (Vec::new(), Vec::new(), hidden)
     } else {
-        ui.last_resized = None;
-    }
-    let (cells, wrapped, cursor) = match shown.as_ref() {
-        Some(ShownTarget::Session(name)) => match capture_preview(path, ui, name) {
-            Ok(result) => result,
-            Err(e) => {
-                ui.notice = Some(format!("{name}: {e}"));
-                (Vec::new(), Vec::new(), hidden)
-            }
-        },
-        Some(ShownTarget::Buffer(name)) => match capture_buffer(path, name) {
-            Ok((cells, cursor)) => (cells, Vec::new(), cursor),
-            Err(e) => {
-                ui.notice = Some(format!("{name}: {e}"));
-                (Vec::new(), Vec::new(), hidden)
-            }
-        },
-        None => (Vec::new(), Vec::new(), hidden),
+        match shown.as_ref() {
+            Some(ShownTarget::Session(name)) => match capture_preview(path, ui, name) {
+                Ok(result) => result,
+                Err(e) => {
+                    ui.notice = Some(format!("{name}: {e}"));
+                    (Vec::new(), Vec::new(), hidden)
+                }
+            },
+            Some(ShownTarget::Buffer(name)) => match capture_buffer(path, name) {
+                Ok((cells, cursor)) => (cells, Vec::new(), cursor),
+                Err(e) => {
+                    ui.notice = Some(format!("{name}: {e}"));
+                    (Vec::new(), Vec::new(), hidden)
+                }
+            },
+            None => (Vec::new(), Vec::new(), hidden),
+        }
     };
     ui.preview_cursor = cursor;
     ui.visual_screen = cells.clone();
@@ -2491,6 +2515,45 @@ fn refresh(
         *painted = frame;
     }
     Ok((cols, rows))
+}
+
+fn sync_shown_session(
+    path: &Path,
+    ui: &mut Ui,
+    shown: &mut Option<ShownTarget>,
+    selection_moved: bool,
+) {
+    let selected_name = ui.selected().map(|s| s.name.clone());
+    // `selection_moved` is `true` only for a real Up/Down keypress that
+    // actually moved `ui.selected` (see `run()`) — never a session
+    // first appearing in the list, `clamp()`, or `follow_focus()`.
+    match window_shown_session(path, selected_name.as_deref(), selection_moved) {
+        Ok(target) => *shown = target,
+        Err(e) => {
+            ui.notice = Some(e);
+            *shown = None;
+        }
+    }
+}
+
+fn resize_shown_session(
+    path: &Path,
+    ui: &mut Ui,
+    shown: &Option<ShownTarget>,
+    cols: u16,
+    rows: u16,
+) {
+    if let Some(ShownTarget::Session(name)) = shown.as_ref() {
+        let target = pane_size(ui, cols, rows);
+        if ui.last_resized.as_ref() != Some(&(name.clone(), target)) {
+            match resize(path, name, target) {
+                Ok(()) => ui.last_resized = Some((name.clone(), target)),
+                Err(e) => ui.notice = Some(format!("{name}: {e}")),
+            }
+        }
+    } else {
+        ui.last_resized = None;
+    }
 }
 
 /// Enables SGR mouse reporting on construction, disables it on drop — for
@@ -2596,6 +2659,14 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
         match action {
             Action::Nothing => {}
             Action::Quit => return Ok(()),
+            Action::Restart => match restart_daemon(path, server) {
+                Ok(()) => {
+                    ui.daemon_gone = None;
+                    ui.consecutive_transport_failures = 0;
+                    ui.notice = None;
+                }
+                Err(error) => ui.notice = Some(error),
+            },
             Action::Type(bytes) => {
                 if let Some((name, hold)) = &held {
                     if let Err(e) = hold.keys(&bytes) {
@@ -2657,6 +2728,63 @@ fn copy_selection(path: &Path, ui: &mut Ui, name: &str) {
         }
         Err(e) => ui.notice = Some(format!("{name}: {e}")),
     }
+}
+
+/// Start a replacement only after the user presses `r` in the gone-daemon
+/// state. The child owns the daemon socket and is detached from this terminal.
+fn restart_daemon(path: &Path, server: &str) -> Result<(), String> {
+    if crate::ipc::connect(path).is_ok() {
+        return Ok(());
+    }
+    if path.exists() && !socket_lock_is_free(path) {
+        return Err(format!(
+            "daemon lock is still held for {}; wait or quit",
+            path.display()
+        ));
+    }
+    let exe =
+        std::env::current_exe().map_err(|error| format!("cannot find own binary: {error}"))?;
+    let mut command = std::process::Command::new(exe);
+    command
+        .args(["-s", server, "daemon"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid() is async-signal-safe and this is a fresh child.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("cannot restart daemon: {error}"))?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if crate::ipc::connect(path).is_ok() {
+            return Ok(());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("cannot check restarted daemon: {error}"))?
+        {
+            return Err(format!("restarted daemon exited with {status}"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(format!(
+        "restarted daemon did not answer at {} within five seconds",
+        path.display()
+    ))
 }
 
 fn scroll_state(state: &mut ScrollState, delta: i16) {
@@ -2819,6 +2947,85 @@ fn list(path: &Path) -> Result<Vec<SessionSummary>, String> {
         Ok(Response::Sessions(sessions)) => Ok(sessions),
         Ok(Response::Error(reason)) => Err(reason),
         other => Err(format!("{other:?}")),
+    }
+}
+
+fn daemon_is_definitively_gone(path: &Path, error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        if !path.exists() {
+            return true;
+        }
+        if error.kind() == std::io::ErrorKind::ConnectionRefused {
+            return socket_lock_is_free(path);
+        }
+    }
+    false
+}
+
+fn daemon_failure_marks_gone(consecutive: u8, definitive: bool) -> bool {
+    definitive || consecutive >= DAEMON_FAILURES_BEFORE_GONE
+}
+
+fn record_daemon_probe_failure(
+    path: &Path,
+    ui: &mut Ui,
+    list_error: String,
+    probe_error: std::io::Error,
+) {
+    let definitive = daemon_is_definitively_gone(path, &probe_error);
+    let busy_refusal = probe_error.kind() == std::io::ErrorKind::ConnectionRefused
+        && path.exists()
+        && !socket_lock_is_free(path);
+    if !definitive {
+        if busy_refusal {
+            ui.consecutive_transport_failures = 0;
+        } else {
+            ui.consecutive_transport_failures = ui.consecutive_transport_failures.saturating_add(1);
+        }
+    }
+    if daemon_failure_marks_gone(ui.consecutive_transport_failures, definitive) {
+        ui.daemon_gone = Some(path.display().to_string());
+        ui.notice = None;
+        ui.focus = Focus::List;
+        ui.mode = Mode::Browse;
+        ui.visual = false;
+        ui.text_selection = None;
+    } else {
+        ui.notice = Some(list_error);
+    }
+}
+
+fn socket_lock_is_free(socket: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let mut lock_name = socket.as_os_str().to_os_string();
+        lock_name.push(".lock");
+        let lock_path = Path::new(&lock_name);
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(lock_path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+        };
+        // Probe the exact exclusive lock the daemon holds for its lifetime.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            return false;
+        }
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        let _ = socket;
+        false
     }
 }
 

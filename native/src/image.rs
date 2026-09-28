@@ -64,9 +64,13 @@ pub fn typed_failure_message(value: &str) -> Option<(u8, &str)> {
 /// goes. The reply channel is per-job rather than shared, so two callers
 /// waiting at once cannot receive each other's result.
 struct Job {
-    code: String,
-    name: Option<String>,
+    kind: JobKind,
     reply: Sender<Result<String, String>>,
+}
+
+enum JobKind {
+    Eval { code: String, name: Option<String> },
+    StopModules,
 }
 
 /// A handle to the daemon's Lua image. Cloneable and `Send`; the interpreter
@@ -121,8 +125,13 @@ impl Image {
                 printed.borrow_mut().clear();
                 let answer = match &ready {
                     Err(why) => Err(format!("image failed to start: {why}")),
-                    Ok(()) => eval(&lua, &job.code, job.name.as_deref())
-                        .map(|value| join_output(&printed.borrow(), &value)),
+                    Ok(()) => match &job.kind {
+                        JobKind::Eval { code, name } => eval(&lua, code, name.as_deref())
+                            .map(|value| join_output(&printed.borrow(), &value)),
+                        JobKind::StopModules => script::stop_modules(&lua)
+                            .map(|()| String::new())
+                            .map_err(|error| error.to_string()),
+                    },
                 };
                 // A caller that gave up and dropped its receiver is not an
                 // error: `remuda -e` can be Ctrl-C'd mid-evaluation, and the
@@ -144,8 +153,10 @@ impl Image {
         let (reply, answer) = channel();
         self.jobs
             .send(Job {
-                code: code.to_string(),
-                name: name.map(str::to_string),
+                kind: JobKind::Eval {
+                    code: code.to_string(),
+                    name: name.map(str::to_string),
+                },
                 reply,
             })
             .map_err(|_| "the image is not running".to_string())?;
@@ -159,6 +170,23 @@ impl Image {
         self.submit(code, name)?
             .recv()
             .map_err(|_| "the image stopped without answering".to_string())?
+    }
+
+    /// Best-effort module cleanup for clean daemon shutdown. A stuck user
+    /// callback must not hold shutdown indefinitely.
+    pub fn stop_modules_bounded(&self) {
+        const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        let (reply, answer) = channel();
+        if self
+            .jobs
+            .send(Job {
+                kind: JobKind::StopModules,
+                reply,
+            })
+            .is_ok()
+        {
+            let _ = answer.recv_timeout(STOP_TIMEOUT);
+        }
     }
 }
 

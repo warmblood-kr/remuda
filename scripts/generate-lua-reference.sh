@@ -4,7 +4,14 @@ set -eu
 output=${1:-docs/lua-reference.rst}
 html_output=${2:-docs/lua-reference.html}
 runtime_dir=$(mktemp -d "${TMPDIR:-/tmp}/remuda-doc.XXXXXX")
-trap 'rm -rf "$runtime_dir"' EXIT HUP INT TERM
+cleanup() {
+  if [ -x target/debug/remuda ]; then
+    REMUDA_RUNTIME_DIR="$runtime_dir" REMUDA_NO_UPDATE_CHECK=1 \
+      target/debug/remuda stop -f >/dev/null 2>&1 || true
+  fi
+  rm -rf "$runtime_dir"
+}
+trap cleanup EXIT HUP INT TERM
 
 command -v pandoc >/dev/null 2>&1 || {
   echo "pandoc is required to render the generated RST reference as HTML" >&2
@@ -12,6 +19,8 @@ command -v pandoc >/dev/null 2>&1 || {
 }
 
 cargo build -p remuda-native --bin remuda
+REMUDA_RUNTIME_DIR="$runtime_dir" REMUDA_NO_UPDATE_CHECK=1 \
+  target/debug/remuda -e 'return true' >/dev/null
 REMUDA_RUNTIME_DIR="$runtime_dir" REMUDA_NO_UPDATE_CHECK=1 \
   target/debug/remuda doc >"$output"
 

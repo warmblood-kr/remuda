@@ -258,6 +258,7 @@ mod tests {
 
     fn sessions() -> Vec<SessionSummary> {
         vec![SessionSummary {
+            id: "session-dev".into(),
             name: "dev".into(),
             alive: true,
             idle: Duration::ZERO,
@@ -284,6 +285,7 @@ mod tests {
     fn arrows_move_the_tree_cursor_and_enter_selects_the_session() {
         let mut sessions = sessions();
         sessions.push(SessionSummary {
+            id: "session-shell".into(),
             name: "shell".into(),
             alive: true,
             idle: Duration::ZERO,
