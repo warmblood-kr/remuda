@@ -457,6 +457,14 @@ impl Session {
     /// already-dead agent. Does not remove the session from a registry — the
     /// last screen survives; [`crate::Registry::close`] does both.
     pub fn terminate(&self) -> Result<()> {
+        self.terminate_inner(true)
+    }
+
+    pub(crate) fn terminate_for_close(&self) -> Result<()> {
+        self.terminate_inner(false)
+    }
+
+    fn terminate_inner(&self, wake_waiters: bool) -> Result<()> {
         if self.attached.load(Ordering::SeqCst) {
             return Err(AgentError::Attached);
         }
@@ -466,10 +474,14 @@ impl Session {
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
         let result = agent.terminate();
         drop(agent);
-        if result.is_ok() {
+        if result.is_ok() && wake_waiters {
             Self::notify_output_changed(&self.output_changed);
         }
         result
+    }
+
+    pub(crate) fn wake_sync_waiters(&self) {
+        Self::notify_output_changed(&self.output_changed);
     }
 
     /// Take hold for a human at a terminal, displacing any current holder.

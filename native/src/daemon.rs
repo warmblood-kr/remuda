@@ -33,7 +33,7 @@ use portable_pty::CommandBuilder;
 
 /// Each protocol connection carries one request; cap all simultaneous long
 /// polls so they cannot consume an unbounded number of daemon worker threads.
-const MAX_CONCURRENT_SYNCS: usize = 16;
+pub(crate) const MAX_CONCURRENT_SYNCS: usize = 16;
 static ACTIVE_SYNCS: AtomicUsize = AtomicUsize::new(0);
 
 struct SyncPermit;
@@ -47,6 +47,10 @@ impl SyncPermit {
             .ok()
             .map(|_| Self)
     }
+}
+
+fn acquire_sync_permit() -> Result<SyncPermit, Response> {
+    SyncPermit::acquire().ok_or(Response::SyncAtCapacity)
 }
 
 impl Drop for SyncPermit {
@@ -755,8 +759,9 @@ fn handle_sync(
     {
         return reply(stream, &Response::WrongInstance);
     }
-    let Some(_permit) = SyncPermit::acquire() else {
-        return reply(stream, &Response::SyncAtCapacity);
+    let _permit = match acquire_sync_permit() {
+        Ok(permit) => permit,
+        Err(response) => return reply(stream, &response),
     };
     let result = remuda_core::sync::wait(&session, since, timeout_ms);
     if let Some(expected) = expected_instance.as_deref() {
@@ -1178,14 +1183,21 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{runtime_base_for, shell_or_default, SyncPermit, MAX_CONCURRENT_SYNCS};
+    use super::{
+        acquire_sync_permit, runtime_base_for, shell_or_default, SyncPermit, MAX_CONCURRENT_SYNCS,
+    };
     use remuda_core::agent::{Color, StyledCell};
     use remuda_core::protocol::collapse_runs;
+    use remuda_core::protocol::Response;
     use std::ffi::OsStr;
     use std::path::Path;
+    use std::sync::Mutex;
+
+    static SYNC_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn sync_concurrency_is_bounded() {
+        let _lock = SYNC_PERMIT_TEST_LOCK.lock().unwrap();
         let mut permits: Vec<_> = (0..MAX_CONCURRENT_SYNCS)
             .map(|_| SyncPermit::acquire().expect("permit within sync capacity"))
             .collect();
@@ -1196,6 +1208,25 @@ mod tests {
         drop(permits.pop());
         let reusable = SyncPermit::acquire().expect("a released slot must be reusable");
         drop(reusable);
+        drop(permits);
+    }
+
+    #[test]
+    fn daemon_sync_capacity_refusal_is_typed_on_wire() {
+        let _lock = SYNC_PERMIT_TEST_LOCK.lock().unwrap();
+        let permits: Vec<_> = (0..MAX_CONCURRENT_SYNCS)
+            .map(|_| SyncPermit::acquire().expect("fill daemon Sync capacity"))
+            .collect();
+        let response = match acquire_sync_permit() {
+            Ok(_) => panic!("over-cap Sync must be refused"),
+            Err(response) => response,
+        };
+        assert_eq!(response, Response::SyncAtCapacity);
+        let mut wire = serde_json::to_vec(&response).expect("serialize protocol response");
+        wire.push(b'\n');
+        let decoded: Response =
+            serde_json::from_slice(&wire[..wire.len() - 1]).expect("decode daemon response frame");
+        assert_eq!(decoded, Response::SyncAtCapacity);
         drop(permits);
     }
 

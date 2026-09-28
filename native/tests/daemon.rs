@@ -411,11 +411,14 @@ fn sync_returns_immediately_when_since_is_older_than_current_output() {
 fn sync_waits_for_output_and_returns_the_new_snapshot() {
     let runtime = scratch_dir("sync-output");
     let socket = daemon::socket_path_in(&runtime, "s");
+    let trigger = runtime.join("release-sync-output");
+    let trigger_arg = shell_test_path(&trigger);
+    let script =
+        format!("while [ ! -e {trigger_arg} ]; do sleep 0.02; done; printf after-sync; sleep 30");
     let mut running = spawn::Daemon::spawn(&runtime);
-    start_shell_session(&socket, "sleep 1.5; printf after-sync; sleep 30");
+    start_shell_session(&socket, &script);
     let since = wait_for_quiet_output_version(&socket);
     let request_socket = socket.clone();
-    let started = Instant::now();
     let request = std::thread::spawn(move || {
         client::request(
             &request_socket,
@@ -428,18 +431,20 @@ fn sync_waits_for_output_and_returns_the_new_snapshot() {
         )
         .expect("sync response")
     });
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(150));
     assert!(
         !request.is_finished(),
         "sync should wait while the version is unchanged"
     );
+    let triggered_at = Instant::now();
+    std::fs::write(&trigger, b"go").expect("release shell output");
     let response = request.join().expect("sync worker");
     assert!(
         matches!(response, Response::Sync { output_version, snapshot, .. }
         if output_version > since && snapshot.rows.iter().flatten().any(|run| run.text.contains("after-sync")))
     );
     assert!(
-        started.elapsed() < Duration::from_millis(2_500),
+        triggered_at.elapsed() < Duration::from_secs(1),
         "output notification should wake Sync well before its 5s timeout"
     );
     stop_daemon(&runtime, &socket, &mut running);
@@ -453,7 +458,6 @@ fn sync_waiter_wakes_when_session_is_resized() {
     start_shell_session(&socket, "sleep 30");
     let since = wait_for_quiet_output_version(&socket);
     let request_socket = socket.clone();
-    let started = Instant::now();
     let request = std::thread::spawn(move || {
         client::request(
             &request_socket,
@@ -466,7 +470,7 @@ fn sync_waiter_wakes_when_session_is_resized() {
         )
         .expect("sync response after resize")
     });
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(150));
     assert!(matches!(
         client::request(
             &socket,
@@ -477,10 +481,11 @@ fn sync_waiter_wakes_when_session_is_resized() {
         ),
         Ok(Response::Ok)
     ));
+    let triggered_at = Instant::now();
     let response = request.join().expect("sync worker");
     assert!(matches!(response, Response::Sync { output_version, .. } if output_version > since));
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        triggered_at.elapsed() < Duration::from_secs(1),
         "resize notification should wake Sync well before its 5s timeout"
     );
     stop_daemon(&runtime, &socket, &mut running);
@@ -518,7 +523,6 @@ fn sync_waiter_wakes_when_child_exits() {
     start_shell_session(&socket, "sleep 30");
     let since = wait_for_quiet_output_version(&socket);
     let request_socket = socket.clone();
-    let started = Instant::now();
     let request = std::thread::spawn(move || {
         client::request(
             &request_socket,
@@ -531,7 +535,7 @@ fn sync_waiter_wakes_when_child_exits() {
         )
         .expect("sync response after child exit")
     });
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(150));
     assert!(
         matches!(
             client::request(
@@ -544,9 +548,10 @@ fn sync_waiter_wakes_when_child_exits() {
         ),
         "closing the child must succeed while Sync is waiting"
     );
+    let triggered_at = Instant::now();
     let response = request.join().expect("sync worker");
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        triggered_at.elapsed() < Duration::from_secs(1),
         "child exit must wake the waiter before its Sync timeout"
     );
     assert!(matches!(response, Response::Error(message) if message.contains("exited")));
@@ -562,7 +567,6 @@ fn sync_rechecks_instance_after_close_and_relaunch_during_wait() {
     let old_instance = listed_session(&socket).instance_id.expect("instance id");
     let since = wait_for_quiet_output_version(&socket);
     let request_socket = socket.clone();
-    let started = Instant::now();
     let request = std::thread::spawn(move || {
         client::request(
             &request_socket,
@@ -575,7 +579,7 @@ fn sync_rechecks_instance_after_close_and_relaunch_during_wait() {
         )
         .expect("sync response after relaunch")
     });
-    std::thread::sleep(Duration::from_millis(50));
+    std::thread::sleep(Duration::from_millis(150));
     assert!(matches!(
         client::request(
             &socket,
@@ -586,10 +590,11 @@ fn sync_rechecks_instance_after_close_and_relaunch_during_wait() {
         Ok(Response::Ok)
     ));
     start_shell_session(&socket, "sleep 30");
+    let triggered_at = Instant::now();
     let response = request.join().expect("sync worker");
     assert_eq!(response, Response::WrongInstance);
     assert!(
-        started.elapsed() < Duration::from_secs(1),
+        triggered_at.elapsed() < Duration::from_secs(1),
         "post-wait instance check should return promptly"
     );
     stop_daemon(&runtime, &socket, &mut running);
@@ -664,6 +669,25 @@ fn wait_for_quiet_output_version(socket: &Path) -> u64 {
             return version;
         }
     }
+}
+
+fn shell_test_path(path: &Path) -> String {
+    #[cfg(windows)]
+    let value = {
+        let value = path.to_string_lossy().replace('\\', "/");
+        if let Some((drive, rest)) = value.split_once(':') {
+            format!(
+                "/{}/{}",
+                drive.to_ascii_lowercase(),
+                rest.trim_start_matches('/')
+            )
+        } else {
+            value
+        }
+    };
+    #[cfg(not(windows))]
+    let value = path.to_string_lossy().into_owned();
+    format!("\"{}\"", value.replace('"', "\\\""))
 }
 
 #[test]

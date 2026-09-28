@@ -18,6 +18,7 @@ pub const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 const SYNC_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 /// Keep at least half of the daemon's 16 Sync slots available to local callers.
 const MAX_REMOTE_SYNCS: usize = 8;
+const _: () = assert!(MAX_REMOTE_SYNCS * 2 <= crate::daemon::MAX_CONCURRENT_SYNCS);
 static ACTIVE_REMOTE_SYNCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 struct RemoteSyncPermit;
@@ -255,14 +256,25 @@ fn refusal(variant: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use remuda_core::protocol::Request;
+    use remuda_core::protocol::{Request, Response};
 
     #[test]
-    fn remote_sync_subcap_reserves_half_the_daemon_slots() {
+    fn remote_sync_capacity_refusal_is_typed_on_wire() {
         let permits: Vec<_> = (0..MAX_REMOTE_SYNCS)
             .map(|_| RemoteSyncPermit::acquire().expect("permit within remote sub-cap"))
             .collect();
-        assert!(RemoteSyncPermit::acquire().is_none());
+        let request = Request::Sync {
+            name: "dev".into(),
+            instance_id: None,
+            since: 0,
+            timeout_ms: 100,
+        };
+        let frame = serde_json::to_vec(&request).expect("encode Sync request");
+        let wire_response = forward_frame(Path::new("no-daemon-needed-at-cap"), &frame)
+            .expect("remote over-cap response frame");
+        let response: Response =
+            serde_json::from_slice(&wire_response).expect("decode remote response");
+        assert_eq!(response, Response::SyncAtCapacity);
         drop(permits);
         assert!(RemoteSyncPermit::acquire().is_some());
     }
