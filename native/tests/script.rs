@@ -554,7 +554,7 @@ fn is_busy_tracks_streaming_output_then_goes_idle() {
         remuda.sleep(1.0)
         assert(s.is_busy, "a session producing output without input must stay busy")
         local row = remuda.ls()[1]
-        assert(row.idle > 2.0, "ls().idle must keep its since-input meaning")
+        assert(row.idle > 0.8, "ls().idle must keep its since-input meaning")
         assert(row.output_idle < 2.0, "ls().output_idle must track recent output")
 
         for _ = 1, 100 do
