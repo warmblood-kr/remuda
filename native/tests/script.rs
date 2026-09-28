@@ -549,18 +549,21 @@ fn is_busy_tracks_streaming_output_then_goes_idle() {
     let _daemon = daemon_at(&path);
 
     let source = r#"
-        remuda.new("streaming", {"sh", "-c", "i=0; while [ $i -lt 40 ]; do printf x; sleep 0.1; i=$((i + 1)); done; sleep 30"})
+        remuda.new("streaming", {"sh", "-c", "i=0; while [ $i -lt 20 ]; do printf x; sleep 0.1; i=$((i + 1)); done; sleep 30"})
         local s = remuda.session("streaming")
-        remuda.sleep(2.5)
+        remuda.sleep(1.0)
         assert(s.is_busy, "a session producing output without input must stay busy")
         local row = remuda.ls()[1]
         assert(row.idle > 2.0, "ls().idle must keep its since-input meaning")
         assert(row.output_idle < 2.0, "ls().output_idle must track recent output")
 
-        remuda.sleep(4.0)
+        for _ = 1, 100 do
+            if not s.is_busy then break end
+            remuda.sleep(0.1)
+        end
         assert(not s.is_busy, "a session quiet for more than 2s must become idle")
         row = remuda.ls()[1]
-        assert(row.idle > 5.0, "output must not reset since-input idle")
+        assert(row.idle > 3.0, "output must not reset since-input idle")
         assert(row.output_idle >= 2.0, "output_idle must age after streaming stops")
     "#;
 
