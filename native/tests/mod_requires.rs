@@ -219,3 +219,21 @@ fn exec_refuses_a_missing_too_old_or_cyclic_requirement() {
         "nothing activated"
     );
 }
+
+#[test]
+fn a_nightly_host_version_satisfies_and_a_non_numeric_one_is_named() {
+    let home = Home::new("nightly");
+    home.installed("host", "0.1.0-nightly.20260927234736.a3e951c", "");
+    home.installed("any", "1.0.0", r#"requires = { host = "*" }"#);
+    home.installed("ranged", "1.0.0", r#"requires = { host = ">=0.1, <0.2" }"#);
+    for guest in ["any", "ranged"] {
+        let out = home.remuda(&["exec", guest]);
+        assert!(out.status.success(), "{guest}: {}", stderr(&out));
+    }
+
+    home.installed("odd", "banana", "");
+    home.installed("strict", "1.0.0", r#"requires = { odd = ">=1" }"#);
+    let out = home.remuda(&["exec", "strict"]);
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains("odd") && stderr(&out).contains("banana"), "{}", stderr(&out));
+}

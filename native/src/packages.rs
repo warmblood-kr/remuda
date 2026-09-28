@@ -1070,6 +1070,21 @@ mod tests {
     }
 
     #[test]
+    fn a_prerelease_or_build_suffix_compares_on_its_numeric_core() {
+        for (version, constraint, expected) in [
+            ("0.1.0-nightly.20260927234736.a3e951c", "*", true),
+            ("0.1.0-nightly.20260927234736.a3e951c", "", true),
+            ("0.1.0-nightly.20260927234736.a3e951c", ">=0.1, <0.2", true),
+            ("0.2.0-rc.1", "<0.2", false),
+            ("1.2.3+build.5", "=1.2.3", true),
+            ("nightly", "*", true),
+        ] {
+            assert_eq!(satisfies(version, constraint), Ok(expected), "{version} {constraint}");
+        }
+        assert!(satisfies("nightly", ">=1").is_err(), "a non-numeric core under a real constraint");
+    }
+
+    #[test]
     fn a_version_satisfies_every_comparator_in_a_constraint() {
         for (version, constraint, expected) in [
             ("0.4.2", ">=0.4, <0.5", true),
