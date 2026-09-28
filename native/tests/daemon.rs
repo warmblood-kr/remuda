@@ -241,7 +241,7 @@ fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_vers
         "sleep 1; printf first; sleep 1; printf later; sleep 30",
     );
     let first_summary = listed_session(&socket);
-    let first_version = capture_version(&socket);
+    let first_version = wait_for_quiet_output_version(&socket);
     let front_request = serde_json::to_vec(&Request::CaptureStyled {
         name: "versioned".into(),
         scrollback: 0,
@@ -346,6 +346,21 @@ fn wait_for_output_version(socket: &Path, original: u64) {
     while capture_version(socket) <= original {
         assert!(Instant::now() < deadline, "output version did not increase");
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_quiet_output_version(socket: &Path) -> u64 {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let version = capture_version(socket);
+        assert!(
+            Instant::now() < deadline,
+            "output version did not become quiet"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        if capture_version(socket) == version {
+            return version;
+        }
     }
 }
 
