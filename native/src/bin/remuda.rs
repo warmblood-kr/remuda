@@ -14,7 +14,8 @@
 //!
 //! Everything else — `new`, `close`, `capture`, `insert`, `key`, `click` — lives
 //! in the Lua image, reached by `-e`, `remuda lua <file>`, or `remuda mcp`. The
-//! daemon starts itself on first use. `-s` names one. See `USAGE`.
+//! state-creating commands start the daemon on first use; read-only commands
+//! require it to be running already. `-s` names one. See `USAGE`.
 
 use remuda_core::protocol::{Request, Response};
 use remuda_native::client::Left;
@@ -79,7 +80,7 @@ fn main() -> ExitCode {
         // is not a thing to do.
         ["stop", rest @ ..] => stop(server, &path, rest),
 
-        ["ls"] => with_daemon(server, &path, list_sessions),
+        ["ls"] => with_existing_daemon(server, &path, list_sessions),
 
         ["run", rest @ ..] => run_session(server, &path, rest),
 
@@ -134,7 +135,7 @@ fn main() -> ExitCode {
         ["mod", "update", rest @ ..] => mod_update_command(server, &path, rest),
         ["mod", "remove", rest @ ..] => mod_remove_command(rest),
 
-        ["doc", rest @ ..] => with_daemon(server, &path, |path| doc_command(path, rest)),
+        ["doc", rest @ ..] => with_existing_daemon(server, &path, |path| doc_command(path, rest)),
 
         ["repl"] => with_daemon(server, &path, repl),
 
@@ -572,6 +573,24 @@ fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> Exit
     match ensure_daemon(server, path) {
         Ok(()) => f(path),
         Err(e) => fail(e),
+    }
+}
+
+/// Run a read-only command only against a daemon that already exists.
+fn with_existing_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> ExitCode {
+    match remuda_native::ipc::connect(path) {
+        Ok(_) => f(path),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            fail(format!("cannot use {}: {error}", path.display()))
+        }
+        Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => fail(format!(
+            "no daemon running for {server:?} (socket {}); start one with remuda new/run or remuda -e ...",
+            path.display(),
+        )),
+        Err(error) => fail(format!(
+            "cannot connect to remuda daemon at {}: {error}; refusing to start a second daemon",
+            path.display()
+        )),
     }
 }
 

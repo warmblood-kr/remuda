@@ -185,6 +185,11 @@ status "wrote $init_lua"
 status "restarting the daemon to verify the new loader actually re-registers butler..."
 env -u PWD remuda stop -f >&2
 
+# `ls` is read-only and must not create the daemon it is checking for. Use
+# eval (which may create state) as the explicit startup path; the boot loader
+# still has to restore the butler session on its own.
+env -u PWD remuda -e 'return true' >/dev/null
+
 # Bounded retry, not a single immediate check: native/src/daemon.rs's
 # load_user_config runs on its own thread, CONCURRENTLY with
 # listener.incoming() starting, not strictly before it (see steps/035's "A
