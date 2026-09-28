@@ -117,6 +117,7 @@ pub struct Ui {
     visual_cursor: TextPoint,
     visual_g_pending: bool,
     visual_screen: Vec<Vec<StyledCell>>,
+    preview_width: u16,
     preview_cursor: Cursor,
     /// What `n` prefills the prompt with. Held rather than read at the prompt,
     /// so the pure state machine still needs no environment.
@@ -155,6 +156,7 @@ impl Ui {
             visual_cursor: TextPoint { row: 0, col: 0 },
             visual_g_pending: false,
             visual_screen: Vec::new(),
+            preview_width: 80,
             preview_cursor: Cursor {
                 row: 0,
                 col: 0,
@@ -565,6 +567,7 @@ impl Ui {
         cursor.row = cursor.row.saturating_add_signed(dr as isize).min(max_row);
         cursor.col = cursor.col.saturating_add_signed(dc as isize).min(max_col);
         let cursor = self.visual_cursor;
+        self.keep_visual_cursor_visible();
         self.extend_visual(cursor);
     }
 
@@ -574,7 +577,22 @@ impl Ui {
         };
         self.visual_cursor.row = point.row.min((size.rows() as usize).saturating_sub(1));
         self.visual_cursor.col = point.col.min((size.cols() as usize).saturating_sub(1));
+        self.keep_visual_cursor_visible();
         self.extend_visual(self.visual_cursor);
+    }
+
+    fn keep_visual_cursor_visible(&mut self) {
+        let width = usize::from(self.preview_width.max(1));
+        let col = self.visual_cursor.col;
+        let pan = usize::from(self.pan);
+        if col < pan {
+            self.pan = col as u16;
+        } else if col >= pan + width {
+            self.pan = col
+                .saturating_add(1)
+                .saturating_sub(width)
+                .min(u16::MAX as usize) as u16;
+        }
     }
 
     fn extend_visual(&mut self, cursor: TextPoint) {
@@ -660,11 +678,16 @@ impl Ui {
                 .unwrap_or(WordClass::Blank)
         };
         let current = class_at(here);
+        let last_word_col = words
+            .iter()
+            .rev()
+            .find(|(_, class)| *class != WordClass::Blank)
+            .map_or(0, |(at, _)| *at);
         let mut col = here;
-        while class_at(col) == current && current != WordClass::Blank {
+        while col < last_word_col && class_at(col) == current && current != WordClass::Blank {
             col += 1;
         }
-        while class_at(col) == WordClass::Blank && col < words.last().map_or(0, |(at, _)| *at) {
+        while class_at(col) == WordClass::Blank && col < last_word_col {
             col += 1;
         }
         if let Some((at, _)) = words
@@ -674,6 +697,11 @@ impl Ui {
             self.move_visual_to(TextPoint {
                 row: self.visual_cursor.row,
                 col: *at,
+            });
+        } else {
+            self.move_visual_to(TextPoint {
+                row: self.visual_cursor.row,
+                col: last_word_col,
             });
         }
     }
@@ -1170,6 +1198,24 @@ mod visual_mode_tests {
     }
 
     #[test]
+    fn w_from_inside_the_last_word_clamps_to_the_row_end() {
+        let mut ui = ui();
+        screen_row(&mut ui, "longword");
+        press(&mut ui, "v");
+        ui.visual_cursor.col = 3;
+        press(&mut ui, "w");
+        assert_eq!(at(&ui), TextPoint { row: 0, col: 7 });
+    }
+
+    #[test]
+    fn w_on_a_single_word_row_terminates_at_its_last_cell() {
+        let mut ui = ui();
+        screen_row(&mut ui, "singleword");
+        press(&mut ui, "vw");
+        assert_eq!(at(&ui), TextPoint { row: 0, col: 9 });
+    }
+
+    #[test]
     fn b_moves_to_previous_word_start() {
         let mut ui = ui();
         screen_row(&mut ui, "one two three");
@@ -1185,6 +1231,46 @@ mod visual_mode_tests {
         screen_row(&mut ui, "한글 ok");
         press(&mut ui, "ve");
         assert_eq!(at(&ui), TextPoint { row: 0, col: 2 });
+    }
+
+    #[test]
+    fn b_and_e_at_the_row_end_stay_on_the_last_word() {
+        let mut ui = ui();
+        screen_row(&mut ui, "one two");
+        press(&mut ui, "v");
+        ui.visual_cursor.col = 6;
+        press(&mut ui, "b");
+        assert_eq!(at(&ui), TextPoint { row: 0, col: 4 });
+        ui.visual_cursor.col = 6;
+        press(&mut ui, "e");
+        assert_eq!(at(&ui), TextPoint { row: 0, col: 6 });
+    }
+
+    #[test]
+    fn every_vim_motion_handles_an_empty_line() {
+        for motion in ["0", "$", "^", "w", "b", "e", "gg", "G"] {
+            let mut ui = ui();
+            screen_row(&mut ui, "");
+            press(&mut ui, "v");
+            press(&mut ui, motion);
+            assert_eq!(at(&ui).col, 0, "motion {motion}");
+            assert_eq!(
+                at(&ui).row,
+                if motion == "G" { 23 } else { 0 },
+                "motion {motion}"
+            );
+        }
+    }
+
+    #[test]
+    fn visual_motion_pans_to_keep_the_cursor_visible() {
+        let mut ui = ui();
+        ui.preview_width = 10;
+        screen_row(&mut ui, &format!("{}", "x".repeat(94)));
+        press(&mut ui, "v$");
+        assert_eq!(at(&ui).col, 93);
+        assert_eq!(ui.pan, 84);
+        assert!(at(&ui).col < usize::from(ui.pan) + usize::from(ui.preview_width));
     }
 
     #[test]
@@ -1914,6 +2000,7 @@ fn refresh(
     selection_moved: bool,
 ) -> std::io::Result<(u16, u16)> {
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    ui.preview_width = ui_layout(ui, cols).1;
     if !skip_list {
         // The buffer is allowed to reorder the herd. Keep the identity, not
         // the old numeric position, so a refresh cannot move a cursor (or an
