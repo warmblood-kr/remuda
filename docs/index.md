@@ -7,6 +7,14 @@ A terminal orchestrator with a programmable layer. You keep a herd of agent
 sessions running, attach to one and ride it, swap to another. The herd outlives
 any single ride.
 
+### Cascading spawn
+
+![A terminal session tree: butler has spawned a lead session, which has in
+turn spawned several of its own worker sessions, shown nested in the
+sidebar](remuda-cascading-spawn.png)
+
+The butler spawns a lead; a worker can spawn its own workers (cascading).
+
 ### Programmable
 
 The daemon holds one Lua interpreter for its whole lifetime, so a script keeps
