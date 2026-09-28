@@ -253,33 +253,35 @@ pub(super) fn apply_update(
                 "registry entry is attributed to a revoked member",
             ));
         }
-        let exists = current
+        let known = current
             .authorized_nodes
             .iter()
-            .any(|known| known.node_fp == entry.node_fp);
-        let prior_endpoint = current
-            .authorized_nodes
-            .iter()
-            .find(|known| known.node_fp == entry.node_fp)
-            .and_then(|known| known.endpoint.as_ref());
+            .find(|known| known.node_fp == entry.node_fp);
+        let exists = known.is_some();
         let endpoint_admission =
             !exists && entry.state == NodeState::Admitted && entry.by == update.sender_fp;
-        if prior_endpoint != entry.endpoint.as_ref()
-            && entry.node_fp != update.sender_fp
-            && !endpoint_admission
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "only a node may update its own endpoint",
-            ));
-        }
         if !exists && entry.state == NodeState::Admitted && entry.by != update.sender_fp {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "new admission must be vouched for by the update sender",
             ));
         }
-        accepted.push(entry.clone());
+        let mut accepted_entry = entry.clone();
+        if let Some(known) = known {
+            let endpoint_changed = known.endpoint != entry.endpoint;
+            let wins = prefer(entry, known);
+            if endpoint_changed
+                && wins
+                && entry.state == NodeState::Admitted
+                && entry.node_fp != update.sender_fp
+                && !endpoint_admission
+            {
+                // Endpoint hints are owned by their node, but an untrusted
+                // hint must not block an otherwise winning registry update.
+                accepted_entry.endpoint = known.endpoint.clone();
+            }
+        }
+        accepted.push(accepted_entry);
     }
     let received = Registry {
         authorized_nodes: accepted,
@@ -1023,24 +1025,28 @@ mod tests {
     }
 
     #[test]
-    fn only_a_node_can_set_or_change_its_endpoint_in_an_update() {
+    fn non_owner_endpoint_change_is_dropped_without_rejecting_update() {
         let sender = admitted_sender();
-        let target = entry("endpoint-target", NodeState::Admitted, 1, "sender");
+        let mut target = entry("endpoint-target", NodeState::Admitted, 1, "sender");
+        target.endpoint = Some("192.0.2.10:9443".into());
         let mut registry = Registry {
             authorized_nodes: vec![sender.clone(), target.clone()],
         };
         let mut forged = target.clone();
         forged.endpoint = Some("192.0.2.20:9443".into());
+        forged.version += 1;
         let update = RegistryUpdate {
             sender_fp: sender.node_fp.clone(),
             entries: vec![forged],
         };
-        assert_eq!(
-            apply_as_sender(&mut registry, &update, &public_key(&sender))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::PermissionDenied
-        );
+        apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+        let updated = registry
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == target.node_fp)
+            .unwrap();
+        assert_eq!(updated.version, target.version + 1);
+        assert_eq!(updated.endpoint.as_deref(), Some("192.0.2.10:9443"));
 
         let mut self_update = sender.clone();
         self_update.endpoint = Some("192.0.2.10:9443".into());
@@ -1060,6 +1066,64 @@ mod tests {
                 .as_deref(),
             Some("192.0.2.10:9443")
         );
+    }
+
+    #[test]
+    fn probe_revoke_is_not_blocked_by_endpoint_mismatch() {
+        let sender = admitted_sender();
+        let mut target = entry("revoked-endpoint-target", NodeState::Admitted, 4, "sender");
+        target.endpoint = Some("192.0.2.10:9443".into());
+        let mut registry = Registry {
+            authorized_nodes: vec![sender.clone(), target.clone()],
+        };
+        let mut tombstone = target.clone();
+        tombstone.state = NodeState::Revoked;
+        tombstone.version += 1;
+        tombstone.by = sender.node_fp.clone();
+        tombstone.endpoint = None;
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![tombstone],
+        };
+        apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+        let revoked = registry
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == target.node_fp)
+            .unwrap();
+        assert_eq!(revoked.state, NodeState::Revoked);
+        assert_eq!(revoked.endpoint, None);
+    }
+
+    #[test]
+    fn probe_stale_relayed_entry_with_old_endpoint_does_not_reject_update() {
+        let sender = admitted_sender();
+        let mut target = entry("stale-endpoint-target", NodeState::Admitted, 5, "sender");
+        target.endpoint = Some("192.0.2.20:9443".into());
+        let mut registry = Registry {
+            authorized_nodes: vec![sender.clone(), target.clone()],
+        };
+        let mut stale = target.clone();
+        stale.version -= 1;
+        stale.endpoint = Some("192.0.2.10:9443".into());
+        let mut unrelated = entry("unrelated-admission", NodeState::Admitted, 1, "sender");
+        unrelated.by = sender.node_fp.clone();
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![stale, unrelated.clone()],
+        };
+        apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+        let retained = registry
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == target.node_fp)
+            .unwrap();
+        assert_eq!(retained.version, target.version);
+        assert_eq!(retained.endpoint.as_deref(), Some("192.0.2.20:9443"));
+        assert!(registry
+            .authorized_nodes
+            .iter()
+            .any(|entry| entry.node_fp == unrelated.node_fp));
     }
 
     #[test]

@@ -102,30 +102,6 @@ pub fn mint_join_line(address: std::net::SocketAddr) -> io::Result<join_line::Jo
     }
 }
 
-/// Atomically validate a bearer token and admit its authenticated Noise key.
-pub fn admit_join(token: &str, peer_static: &[u8], endpoint: Option<&str>) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        let _ = (token, peer_static, endpoint);
-        return Err(identity::windows_storage_error());
-    }
-    #[cfg(not(windows))]
-    {
-        if peer_static.len() != 32 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid join key",
-            ));
-        }
-        let dir = storage::cluster_state_dir()?.join("cluster");
-        let token_store = join_token::JoinTokenStore::open_at(
-            &dir,
-            std::sync::Arc::new(crate::SystemWallClock::new()),
-        )?;
-        token_store.verify_consume_with(token, || admit_join_locked_at(&dir, peer_static, endpoint))
-    }
-}
-
 /// Admit a peer while the caller holds this node's cluster state lock.
 #[cfg(not(windows))]
 pub(crate) fn admit_join_locked(peer_static: &[u8], endpoint: Option<&str>) -> io::Result<()> {

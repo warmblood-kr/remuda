@@ -552,8 +552,19 @@ fn cluster_join(
     invitation: &remuda_native::cluster::join_line::JoinLine,
     bind_addr: Option<std::net::SocketAddr>,
 ) -> std::io::Result<()> {
+    cluster_join_with_private_loader(shown_fingerprint, invitation, bind_addr, || {
+        remuda_native::cluster::identity::load_static_private_key()
+    })
+}
+
+fn cluster_join_with_private_loader(
+    shown_fingerprint: &str,
+    invitation: &remuda_native::cluster::join_line::JoinLine,
+    bind_addr: Option<std::net::SocketAddr>,
+    load_private: impl FnOnce() -> std::io::Result<zeroize::Zeroizing<Vec<u8>>>,
+) -> std::io::Result<()> {
     invitation.verify_pin(shown_fingerprint)?;
-    let private = remuda_native::cluster::identity::load_static_private_key()?;
+    let private = load_private()?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(std::io::Error::other)?
@@ -610,11 +621,28 @@ fn cluster_init_message(created: bool) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)]
 mod cluster_cli_tests {
+    #[cfg(unix)]
+    use super::cluster_join_with_private_loader;
     use super::{
         cluster_init_message, confirmation_answer_is_yes, parse_cluster_command,
         revoke_confirmation, write_nodes_table, ClusterCommand,
     };
+    #[cfg(unix)]
+    use remuda_native::cluster::join_line::JoinLine;
+    #[cfg(unix)]
+    use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(unix)]
+    use std::sync::Arc;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+    #[cfg(unix)]
+    use zeroize::Zeroizing;
 
     #[test]
     fn cluster_status_and_init_are_recognized() {
@@ -660,6 +688,58 @@ mod cluster_cli_tests {
             parse_cluster_command(&["join", &fingerprint, &line, "--bind", "0.0.0.0:9443"]),
             ClusterCommand::Invalid
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_types)]
+    fn mismatched_join_pin_fails_before_connecting() {
+        let keypair = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let expected = remuda_native::cluster::encoding::fingerprint(&keypair.public);
+        let invitation = JoinLine {
+            issuer_addr: "127.0.0.1:9".parse().unwrap(),
+            issuer_fingerprint: expected.clone(),
+            issuer_static_pubkey: keypair.public.as_slice().try_into().unwrap(),
+            token: Zeroizing::new(remuda_native::cluster::encoding::encode_base64(&[9; 32])),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut invitation = invitation;
+        invitation.issuer_addr = address;
+
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let count = accepts.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let mut request = [0; 1024];
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("listener accept failed: {error}"),
+                }
+            }
+        });
+
+        let result = cluster_join_with_private_loader("SHA256:wrong", &invitation, None, || {
+            Ok(Zeroizing::new(keypair.private))
+        });
+        let error = result.unwrap_err().to_string();
+        server.join().unwrap();
+        assert!(error.contains("expected SHA256:wrong"), "{error}");
+        assert!(error.contains(&format!("received {expected}")), "{error}");
+        assert_eq!(accepts.load(Ordering::SeqCst), 0);
     }
 
     #[test]

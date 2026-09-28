@@ -110,13 +110,17 @@ fn refused_join_admission_does_not_consume_token() {
     let clock = Arc::new(ManualWallClock::new(1_700_000_000));
     let store = JoinTokenStore::open_at(&dir, clock).unwrap();
     let minted = store.mint().unwrap();
+    let token_state = dir.join("join_tokens.json");
+    let before = fs::read(&token_state).unwrap();
     let refused = store.verify_consume_with(&minted.token, || {
+        assert_ne!(fs::read(&token_state).unwrap(), before);
         Err::<(), _>(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "registry full",
         ))
     });
     assert!(refused.is_err());
+    assert_eq!(fs::read(&token_state).unwrap(), before);
     assert!(store.verify_and_consume(&minted.token).is_ok());
     assert!(store.verify_and_consume(&minted.token).is_err());
     remove_dir(&dir);
@@ -134,6 +138,27 @@ fn join_token_rejects_expired_and_unknown_values() {
     assert!(store.verify_and_consume(&well_formed_but_unknown).is_err());
     clock.advance(Duration::from_secs(600));
     assert!(store.verify_and_consume(&minted.token).is_err());
+    remove_dir(&dir);
+}
+
+#[test]
+#[cfg(all(unix, not(windows)))]
+fn bad_join_token_does_not_rewrite_token_state() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = private_dir();
+    let clock = Arc::new(ManualWallClock::new(1_700_000_000));
+    let store = JoinTokenStore::open_at(&dir, clock).unwrap();
+    let _minted = store.mint().unwrap();
+    let path = dir.join("join_tokens.json");
+    let before = fs::metadata(&path).unwrap();
+    let contents = fs::read(&path).unwrap();
+
+    assert!(store.verify_and_consume("unknown").is_err());
+
+    let after = fs::metadata(&path).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), contents);
+    assert_eq!(after.ino(), before.ino(), "bad token replaced token state");
     remove_dir(&dir);
 }
 
@@ -368,5 +393,22 @@ fn join_line_pin_check_matches_and_rejects_mismatch() {
         token: Zeroizing::new(remuda_native::cluster::encoding::encode_base64(&[9; 32])),
     };
     assert!(line.verify_pin(&expected_fp).is_ok());
-    assert!(line.verify_pin("SHA256:wrong").is_err());
+    let error = line.verify_pin("SHA256:wrong").unwrap_err();
+    assert!(error.to_string().contains("expected SHA256:wrong"));
+    assert!(error
+        .to_string()
+        .contains(&format!("received {expected_fp}")));
+}
+
+#[test]
+fn join_line_rejects_fingerprint_that_does_not_match_key() {
+    let line = format!(
+        "remuda-join-v1 10.0.0.1:443 {} {} {}",
+        fingerprint(&[8; 32]),
+        remuda_native::cluster::encoding::encode_base64(&[7; 32]),
+        remuda_native::cluster::encoding::encode_base64(&[9; 32])
+    );
+    let error = JoinLine::decode(&line).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("does not match"));
 }

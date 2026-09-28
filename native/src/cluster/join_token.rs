@@ -126,8 +126,8 @@ impl JoinTokenStore {
         self.verify_consume_with(token, || Ok(()))
     }
 
-    /// Validate a token and perform admission while holding the same state lock.
-    /// The token remains valid if the admission callback refuses the request.
+    /// Persist token consumption before admission while holding the state lock.
+    /// If admission refuses, restore the token before releasing the lock.
     pub fn verify_consume_with<T>(
         &self,
         token: &str,
@@ -148,14 +148,24 @@ impl JoinTokenStore {
             let position = state.tokens.iter().position(|record| {
                 record.expires_at_unix_seconds > now && hashes_equal(&record.hash, &hash)
             });
-            if let Some(position) = position {
-                let result = admit()?;
-                state.tokens.remove(position);
-                save_state(&self.directory, &state)?;
-                Ok(result)
-            } else {
-                save_state(&self.directory, &state)?;
-                Err(refused_token())
+            let Some(position) = position else {
+                // Do not let invalid-token traffic rewrite the persistent file.
+                return Err(refused_token());
+            };
+            let consumed = state.tokens.remove(position);
+            save_state(&self.directory, &state)?;
+            match admit() {
+                Ok(result) => Ok(result),
+                Err(admission_error) => {
+                    state.tokens.push(consumed);
+                    if let Err(restore_error) = save_state(&self.directory, &state) {
+                        return Err(io::Error::other(format!(
+                            "join admission failed ({}); token restoration failed ({restore_error})",
+                            admission_error
+                        )));
+                    }
+                    Err(admission_error)
+                }
             }
         }
     }

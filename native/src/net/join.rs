@@ -6,6 +6,8 @@ use std::net::SocketAddr;
 use std::net::TcpStream;
 use std::time::Duration;
 
+const MAX_JOIN_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// Complete a Join exchange after the caller has checked the separate pin.
 pub fn join(
     invitation: &JoinLine,
@@ -35,8 +37,7 @@ pub fn join(
         sealed.message.len()
     )?;
     stream.write_all(&sealed.message)?;
-    let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
+    let response = read_join_response(&mut stream)?;
     let split = response
         .windows(4)
         .position(|bytes| bytes == b"\r\n\r\n")
@@ -64,4 +65,35 @@ pub fn join(
 
 fn invalid_join_response() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid join response")
+}
+
+fn read_join_response(mut reader: impl Read) -> io::Result<Vec<u8>> {
+    let mut response = Vec::new();
+    reader
+        .by_ref()
+        .take((MAX_JOIN_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut response)?;
+    if response.len() > MAX_JOIN_RESPONSE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "join response exceeds its size limit",
+        ));
+    }
+    Ok(response)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn join_response_read_is_bounded_to_64_kibibytes() {
+        let response = vec![b'x'; MAX_JOIN_RESPONSE_BYTES];
+        assert_eq!(
+            read_join_response(Cursor::new(&response)).unwrap(),
+            response
+        );
+        assert!(read_join_response(Cursor::new(vec![b'x'; MAX_JOIN_RESPONSE_BYTES + 1])).is_err());
+    }
 }

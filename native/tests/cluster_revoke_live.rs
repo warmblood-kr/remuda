@@ -237,6 +237,17 @@ fn revoking_a_live_member_refuses_its_next_list_and_new_connections() {
         "mint join invitation",
     );
     let join_line = invite.lines().nth(1).unwrap();
+    let pin_mismatch = b.run(&["cluster", "join", "SHA256:wrong", join_line]);
+    assert!(!pin_mismatch.status.success());
+    let mismatch_error = String::from_utf8_lossy(&pin_mismatch.stderr);
+    assert!(
+        mismatch_error.contains("expected SHA256:wrong"),
+        "{mismatch_error}"
+    );
+    assert!(
+        mismatch_error.contains(&identity_fingerprint(&a_identity)),
+        "{mismatch_error}"
+    );
     successful(
         b.run(&[
             "cluster",

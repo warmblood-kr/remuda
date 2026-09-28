@@ -81,12 +81,14 @@ impl JoinLine {
 
     /// Verify the shown fingerprint before any handshake is attempted.
     pub fn verify_pin(&self, shown_fingerprint: &str) -> io::Result<()> {
-        if self.issuer_fingerprint != shown_fingerprint
-            || encoding::fingerprint(&self.issuer_static_pubkey) != shown_fingerprint
-        {
+        let key_fingerprint = encoding::fingerprint(&self.issuer_static_pubkey);
+        if self.issuer_fingerprint != key_fingerprint || key_fingerprint != shown_fingerprint {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "issuer static key does not match the shown fingerprint",
+                format!(
+                    "issuer fingerprint mismatch: expected {shown_fingerprint}, received {key_fingerprint} (invitation declares {})",
+                    self.issuer_fingerprint
+                ),
             ));
         }
         Ok(())
