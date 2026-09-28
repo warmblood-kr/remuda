@@ -221,9 +221,10 @@ end
 -- One step is kept separate from the wake-up source: the current driver is
 -- the one-second clock below, and a future PTY output event can call this same
 -- function without changing remuda.expect's API.
-function remuda._expect_step(handle, now)
+local function expect_step(handle, now)
   local state, options = handle.state, handle.options
   if state.status ~= "pending" then return state.status, state.branch, state.screen end
+  state.last_result = nil
   if now == nil and options.now then
     local ok, value = pcall(options.now)
     if not ok then
@@ -277,6 +278,7 @@ function remuda._expect_step(handle, now)
           state.disarmed = state.disarmed or {}
           state.disarmed[index] = true
           state.next_at = now + (tonumber(options.interval) or 1)
+          state.last_result = "continue"
           return "continue", state.branch, screen
         end
         state.status = "matched"
@@ -316,8 +318,6 @@ function remuda._expect_step(handle, now)
   state.next_at = now + (tonumber(options.interval) or 1)
   return "waiting", nil, screen
 end
-register("_expect_step", "Advance one screen expectation; used by the clock and injectable tests.", "_expect_step(handle, now?) -> status, branch, screen")
-
 function remuda.expect(session, branches, options)
   if type(session) ~= "string" or session == "" then error("expect needs a session name", 2) end
   if type(branches) ~= "table" or #branches == 0 then error("expect needs at least one branch", 2) end
@@ -341,12 +341,12 @@ function remuda.expect(session, branches, options)
 end
 register("expect", "Watch a session asynchronously. Branches match a Lua pattern or predicate and run a key list or callback; `continue` keeps watching. Options accept a bounded timeout and unknown-screen matcher/callback.", "expect(session, branches, options?) -> handle")
 
-function remuda._expect_tick(now)
+local function expect_tick(now)
   expect_clock_now = now or expect_clock_now or 0
   local keep = {}
   for _, handle in ipairs(pending_expects) do
     if handle.state.status == "pending" then
-      local ok, err = pcall(remuda._expect_step, handle, now)
+      local ok, err = pcall(expect_step, handle, now)
       if not ok then
         handle.state.status, handle.state.error = "error", err
         if handle.options.on_error then pcall(handle.options.on_error, err, handle) end
@@ -356,9 +356,7 @@ function remuda._expect_tick(now)
   end
   pending_expects = keep
 end
-register("_expect_tick", "Advance pending screen expectations on a clock tick.", "_expect_tick(now) -> nil")
-
-function remuda._expect_option(screen, matches)
+function remuda.expect_option(screen, matches)
   if type(screen) ~= "string" or type(matches) ~= "function" then return nil end
   local found
   for line in (screen .. "\n"):gmatch("(.-)\n") do
@@ -371,18 +369,19 @@ function remuda._expect_option(screen, matches)
   end
   return found
 end
-register("_expect_option", "Pick a unique numbered menu option by its label.", "_expect_option(screen, label_predicate) -> number|nil")
+register("expect_option", "Pick a unique numbered menu option by its label.", "expect_option(screen, label_predicate) -> number|nil")
 
 -- Called once per native tick with the current time (seconds, native's
 -- clock). Fires every schedule whose own interval has elapsed since ITS OWN
 -- last run — native never sees or compares an individual interval itself.
 function remuda._run_due_schedules(now)
   -- Expectations are advanced from the same native one-second clock. A
-  -- future PTY output event may call _expect_tick directly to reduce latency.
-  local expect_ok, expect_err = pcall(remuda._expect_tick, now)
+  -- future PTY output event may call this local directly to reduce latency.
+  local expect_ok, expect_err = pcall(expect_tick, now)
   if not expect_ok and io and io.stderr then
     io.stderr:write("remuda.expect tick failed: " .. tostring(expect_err) .. "\n")
   end
+  local schedule_now = now or expect_clock_now or 0
   -- Snapshot the handles, as `emit` does: a run() that schedules must not add
   -- keys mid-`pairs` (undefined in Lua). A cancel mid-tick still takes effect.
   local handles = {}
@@ -391,8 +390,8 @@ function remuda._run_due_schedules(now)
   end
   for _, handle in ipairs(handles) do
     local schedule = remuda.schedules[handle]
-    if schedule and now - schedule.last_run >= schedule.every then
-      schedule.last_run = now
+    if schedule and schedule_now - schedule.last_run >= schedule.every then
+      schedule.last_run = schedule_now
       if schedule.name then
         remuda._schedule_fire_counts[schedule.name] = (remuda._schedule_fire_counts[schedule.name] or 0) + 1
       end

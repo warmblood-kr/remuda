@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 66] = [
+pub const BINDINGS: [&str; 68] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -65,6 +65,8 @@ pub const BINDINGS: [&str; 66] = [
     "emit_until_success",
     "event_counts",
     "exec",
+    "expect",
+    "expect_option",
     "extension_command",
     "feed",
     "hook_list",
