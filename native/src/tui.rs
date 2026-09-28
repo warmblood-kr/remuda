@@ -2294,11 +2294,12 @@ fn list_viewport(ui: &Ui, body: u16) -> usize {
     }
 }
 
-/// The current size requested for the selected session panel. `Size::new`
-/// still floors it at 80×24 so agent TUIs retain a usable compositor.
+/// The current size requested for the selected session panel. The pane opts
+/// out of the column floor so the child lays out to the visible width; the
+/// ordinary `Size::new` path keeps its 80-column safety floor.
 pub fn pane_size(ui: &Ui, cols: u16, rows: u16) -> Size {
     let (_, preview_w) = ui_layout(ui, cols);
-    Size::new(preview_w, rows.saturating_sub(1))
+    Size::for_pane(preview_w, rows.saturating_sub(1))
 }
 
 /// A row that degrades instead of being cut. When the preview claims most of

@@ -264,6 +264,44 @@ fn deferred_output_over_limit_is_an_error_without_truncation() {
 }
 
 #[test]
+fn synchronous_value_over_limit_is_an_error_and_daemon_stays_healthy() {
+    let (dir, remuda) = fixture("oversize_sync");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let oversized = remuda(&["-e", "return string.rep('x', 16 * 1024 * 1024 + 1)"]);
+    let healthy = remuda(&["-e", "return 'still healthy'"]);
+    let _ = remuda(&["stop", "-f"]);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        oversized.status.code(),
+        Some(1),
+        "status: {:?}",
+        oversized.status
+    );
+    assert!(
+        oversized.stdout.is_empty(),
+        "unexpected stdout length: {}",
+        oversized.stdout.len()
+    );
+    assert!(
+        String::from_utf8_lossy(&oversized.stderr).contains("16 MiB"),
+        "oversized synchronous value should report the reply limit: {}",
+        String::from_utf8_lossy(&oversized.stderr)
+    );
+    assert!(
+        healthy.status.success(),
+        "daemon did not recover: {healthy:?}"
+    );
+    assert_eq!(healthy.stdout, b"still healthy\n", "{healthy:?}");
+}
+
+#[test]
 fn maximum_deferred_output_round_trips_with_base64_wire_encoding() {
     let (dir, remuda) = fixture("max_output");
     let _cleanup = PrivateDaemonCleanup(dir.clone());
