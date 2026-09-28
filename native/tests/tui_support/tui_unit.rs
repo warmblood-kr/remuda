@@ -1003,7 +1003,7 @@ fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buff
              \x1b[2;1H\x1b[Kalpha           │xxxxxxxxxx                                                     \
              \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[Kbravo 🏇        │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[Kbravo         🏇│xxxxxxxxxx                                                     \
              \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1147,7 +1147,7 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
              \x1b[2;1H\x1b[K\x1b[1;7;36malpha\x1b[0m \x1b[32m●\x1b[0m         │xxxxxxxxxx                                                     \
              \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K\x1b[1mbravo\x1b[0m \x1b[32m●\x1b[0m 🏇      │xxxxxxxxxx                                                     \
+             \x1b[5;1H\x1b[K\x1b[1mbravo\x1b[0m       \x1b[32m●\x1b[0m 🏇│xxxxxxxxxx                                                     \
              \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
              \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
@@ -1554,6 +1554,49 @@ fn the_attached_marker_stays_on_the_name_row_at_narrow_widths() {
         assert!(
             lines[3].ends_with(" 🏇"),
             "first row carries the attached marker: {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn an_attached_horse_survives_long_name_cropping_at_16_and_40_cells() {
+    const ATTACHED: &str = "attached-name-abcdefghijklmnopqrstuvwxyz-한글";
+    const PLAIN: &str = "plain-name-abcdefghijklmnopqrstuvwxyz-한글";
+    let path = scratch_socket("attached-marker-long-name");
+    daemon_at(&path);
+    eval(
+        &path,
+        r#"
+          remuda.ls = function() return {
+            { name = "attached-name-abcdefghijklmnopqrstuvwxyz-한글", alive = true, attached = true },
+            { name = "plain-name-abcdefghijklmnopqrstuvwxyz-한글", alive = true, attached = false },
+          } end
+        "#,
+    );
+
+    for width in [16, 40] {
+        let (rows, lines, _) =
+            sessions_buffer_lines(&path, width, 0, None).expect("refresh sessions buffer");
+        let mut ui = make_ui(vec![row(ATTACHED, true, true), row(PLAIN, true, false)]);
+        ui.session_rows = rows;
+        ui.sessions_text = lines.clone();
+
+        let attached = list_row(&ui, 0, width);
+        assert!(
+            attached.ends_with(" 🏇"),
+            "the horse stays at the row end at width {width}: {attached:?}"
+        );
+        assert!(
+            attached.contains('→'),
+            "the long name is ellipsized: {attached:?}"
+        );
+        assert_eq!(visible_width(&attached), width as usize);
+
+        let plain = list_row(&ui, rows, width);
+        assert_eq!(
+            plain,
+            fit(&lines[rows], width),
+            "unattached rows retain normal fitting"
         );
     }
 }
