@@ -15,10 +15,11 @@
 use crate::child_guard;
 use crate::image::Image;
 use std::collections::{HashMap, VecDeque};
-use std::io::BufRead;
+use std::io::{BufRead, Read, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 // ponytail: fixed cap, not adaptive — a helper that fills this before Lua
 // drains it just blocks on its own stdout write (the intended backpressure).
@@ -29,6 +30,144 @@ const BUFFER_CAP: usize = 4096;
 // drains in one job, small enough that one job can't hog the Image's FIFO
 // for long under a flood. Revisit if either edge is hit in practice.
 const DRAIN_BATCH: usize = 256;
+
+const RUN_OUTPUT_LIMIT: usize = 1024 * 1024;
+const RUN_OUTPUT_MARKER: &[u8] = b"\n[output truncated by remuda.process.run]";
+pub const RUN_DEFAULT_TIMEOUT: f64 = 5.0;
+pub const RUN_MAX_TIMEOUT: f64 = 30.0;
+pub const RUN_TIMEOUT_EXIT_CODE: i32 = 124;
+
+/// Result from the bounded synchronous `remuda.process.run` word. Output is
+/// raw bytes (Lua strings are byte strings); each stream is capped separately.
+pub struct RunOutput {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub timed_out: bool,
+}
+
+/// Run one child with argv directly (never through a shell). This is a
+/// deliberately synchronous exception: its enforced deadline bounds how long
+/// it can hold the daemon's single Lua image.
+pub fn run_sync(
+    argv: Vec<String>,
+    stdin: Option<Vec<u8>>,
+    timeout_seconds: f64,
+) -> Result<RunOutput, String> {
+    if argv.is_empty() || argv[0].is_empty() {
+        return Err("a process.run call needs a non-empty argv[1]".into());
+    }
+    if !timeout_seconds.is_finite() || timeout_seconds <= 0.0 {
+        return Err("process.run timeout must be a positive finite number".into());
+    }
+    if timeout_seconds > RUN_MAX_TIMEOUT {
+        return Err(format!(
+            "process.run timeout cannot exceed {RUN_MAX_TIMEOUT} seconds"
+        ));
+    }
+
+    let (program, args) = argv.split_first().expect("argv checked above");
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    child_guard::harden(&mut command);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let child_stdin = child.stdin.take().expect("stdin was piped");
+
+    let stdout_reader = std::thread::spawn(move || capture_bounded(stdout));
+    let stderr_reader = std::thread::spawn(move || capture_bounded(stderr));
+    let stdin_writer = std::thread::spawn(move || {
+        if let Some(input) = stdin {
+            let mut child_stdin = child_stdin;
+            let _ = child_stdin.write_all(&input);
+        }
+        // Dropping stdin signals EOF to children which read until end.
+    });
+
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds);
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break (status, false);
+        }
+        if Instant::now() >= deadline {
+            kill_process_tree(&child);
+            let _ = child.kill();
+            let status = child.wait().map_err(|error| error.to_string())?;
+            break (status, true);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    let _ = stdin_writer.join();
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "process.run stdout reader panicked".to_string())?
+        .map_err(|error| format!("read process.run stdout: {error}"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "process.run stderr reader panicked".to_string())?
+        .map_err(|error| format!("read process.run stderr: {error}"))?;
+
+    Ok(RunOutput {
+        code: if timed_out {
+            RUN_TIMEOUT_EXIT_CODE
+        } else {
+            status.code().unwrap_or(-1)
+        },
+        stdout,
+        stderr,
+        timed_out,
+    })
+}
+
+fn capture_bounded(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
+    let retained_limit = RUN_OUTPUT_LIMIT - RUN_OUTPUT_MARKER.len();
+    let mut output = Vec::with_capacity(RUN_OUTPUT_LIMIT);
+    let mut buffer = [0u8; 8192];
+    let mut truncated = false;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let retain = retained_limit.saturating_sub(output.len()).min(read);
+        output.extend_from_slice(&buffer[..retain]);
+        truncated |= retain < read;
+    }
+    if truncated {
+        output.extend_from_slice(RUN_OUTPUT_MARKER);
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::{capture_bounded, RUN_OUTPUT_LIMIT, RUN_OUTPUT_MARKER};
+    use std::io::Cursor;
+
+    #[test]
+    fn synchronous_process_output_is_capped_with_a_marker() {
+        let output = capture_bounded(Cursor::new(vec![b'x'; RUN_OUTPUT_LIMIT + 1])).unwrap();
+        assert_eq!(output.len(), RUN_OUTPUT_LIMIT);
+        assert!(output.ends_with(RUN_OUTPUT_MARKER));
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_tree(child: &Child) {
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: killpg receives only the child process-group id; child_guard
+    // creates that group before exec, so it cannot name the daemon's group.
+    let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
+}
+
+#[cfg(not(unix))]
+fn kill_process_tree(_child: &Child) {}
 
 struct ProcessState {
     lines: Mutex<VecDeque<String>>,

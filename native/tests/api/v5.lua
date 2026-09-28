@@ -1,5 +1,6 @@
--- v5 introduces nested session words while retaining the callable constructor.
--- v1-v4 remain frozen; this fixture is the first version for the new vocabulary.
+-- v5 accumulates new words until the next tagged release freezes it. v1-v4
+-- remain frozen; this version introduced nested session words and retains the
+-- callable constructor.
 
 local session = remuda.session
 assert(type(session) == "table", "remuda.session must be a namespace table")
@@ -33,5 +34,36 @@ for _, row in ipairs(remuda.ls()) do
 end
 assert(legacy_found, "deprecated flat session aliases must remain compatible in v5")
 remuda.close(legacy_name)
+
+-- v5 also carries the bounded synchronous process word until the next API
+-- version is frozen. It executes argv directly, with bounded time and output.
+assert(type(remuda.process) == "table", "remuda.process must be a callable namespace table")
+local process_mt = getmetatable(remuda.process)
+assert(process_mt and type(process_mt.__call) == "function",
+  "remuda.process must preserve the asynchronous process(spec) call")
+assert(type(remuda.process.run) == "function", "remuda.process.run is missing")
+
+local windows = package.config:sub(1, 1) == "\\"
+local echo_argv = windows
+  and { "cmd.exe", "/c", "echo", "remuda-process-run-v5" }
+  or { "/bin/echo", "remuda-process-run-v5" }
+local result = remuda.process.run({ argv = echo_argv, timeout = 3 })
+assert(result.code == 0, "process.run should return the child exit code")
+assert(result.stdout:find("remuda-process-run-v5", 1, true), "process.run should capture stdout")
+assert(result.stderr == "", "process.run should capture stderr separately")
+assert(result.timed_out == false, "a completed process must not be marked timed out")
+
+local slow_argv = windows
+  and { "ping.exe", "-n", "30", "127.0.0.1" }
+  or { "/bin/sleep", "10" }
+local timed = remuda.process.run({ argv = slow_argv, timeout = 0.2 })
+assert(timed.timed_out, "process.run must kill a child when its timeout expires")
+assert(timed.code == 124, "timed-out process.run must return timeout code 124")
+assert(type(remuda.session.list()) == "table", "the daemon should continue handling Lua work after timeout")
+
+local bad_timeout = pcall(function()
+  remuda.process.run({ argv = echo_argv, timeout = 31 })
+end)
+assert(not bad_timeout, "process.run must reject a timeout above the 30-second hard cap")
 
 print("v5 ok")

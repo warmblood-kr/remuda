@@ -220,3 +220,88 @@ fn typed_failures_print_only_the_message_and_use_the_requested_exit_code() {
         "remuda doc omitted remuda.fail: {docs:?}"
     );
 }
+
+#[test]
+fn extension_commands_receive_bounded_non_tty_stdin() {
+    use std::io::Write;
+
+    const MAX_STDIN: usize = 1024 * 1024;
+    let dir = std::env::temp_dir().join(format!("rc-stdin-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let mod_dir = dir.join("data/remuda/mods/sample");
+    fs::create_dir_all(mod_dir.join("packages/sample")).unwrap();
+    fs::write(
+        mod_dir.join("extension.toml"),
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\ncommand = \"sample\"\n",
+    )
+    .unwrap();
+    fs::write(
+        mod_dir.join("packages/sample/init.lua"),
+        r#"remuda.extension_command("sample", function(args, caller)
+          if args[1] == "-" then return caller.stdin or "<missing>" end
+          return "unexpected args"
+        end)"#,
+    )
+    .unwrap();
+
+    let cli = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+        command
+            .args(["-s", "s"])
+            .args(args)
+            .env("REMUDA_RUNTIME_DIR", &dir)
+            .env("REMUDA_SUPPRESS_DEPRECATIONS", "1")
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("HOME", &dir);
+        command
+    };
+    let boot = cli(&["-e", "remuda.ls()"]).output().expect("start daemon");
+    assert!(boot.status.success(), "daemon boot failed: {boot:?}");
+    let loaded = cli(&["exec", "sample"]).output().expect("load mod");
+    assert!(loaded.status.success(), "mod load failed: {loaded:?}");
+
+    let payload = b"message from pipe\nwith \"quotes\" and backslash \\";
+    let mut command = cli(&["sample", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run extension command with piped stdin");
+    command
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(payload)
+        .expect("write stdin payload");
+    let output = command.wait_with_output().expect("extension result");
+    assert!(output.status.success(), "stdin command failed: {output:?}");
+    assert_eq!(output.stdout, [payload.as_slice(), b"\n"].concat());
+
+    let oversized = vec![b'x'; MAX_STDIN + 1];
+    let mut command = cli(&["sample", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run oversized extension command");
+    command
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(&oversized)
+        .expect("write oversized stdin");
+    let output = command
+        .wait_with_output()
+        .expect("oversized extension result");
+    assert!(
+        !output.status.success(),
+        "oversized stdin should be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("stdin exceeds 1 MiB limit"),
+        "unexpected oversized stdin error: {output:?}"
+    );
+
+    let _ = cli(&["stop", "-f"]).output();
+    let _ = fs::remove_dir_all(&dir);
+}

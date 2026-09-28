@@ -21,7 +21,7 @@ use remuda_core::protocol::{Request, Response};
 use remuda_native::client::Left;
 use remuda_native::{daemon, dist, terminal_size};
 use std::fs;
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -998,8 +998,30 @@ fn extension_command(server: &str, path: &Path, command: &str, args: &[&str]) ->
         .collect::<Vec<_>>()
         .join(", ");
     let env = caller_env(std::env::vars());
+    let stdin = if std::io::stdin().is_terminal() {
+        None
+    } else {
+        const MAX_CALLER_STDIN: usize = 1024 * 1024;
+        let mut bytes = Vec::new();
+        if let Err(error) = std::io::stdin()
+            .take((MAX_CALLER_STDIN + 1) as u64)
+            .read_to_end(&mut bytes)
+        {
+            return fail(format!("read extension command stdin: {error}"));
+        }
+        if bytes.len() > MAX_CALLER_STDIN {
+            return fail("stdin exceeds 1 MiB limit");
+        }
+        match String::from_utf8(bytes) {
+            Ok(value) => Some(value),
+            Err(_) => return fail("extension command stdin must be valid UTF-8"),
+        }
+    };
+    let stdin_field = stdin.map_or_else(String::new, |value| {
+        format!(", stdin = {}", remuda_native::mcp::lua_string(&value))
+    });
     let code = format!(
-        "return remuda._dispatch_extension_command({}, {{{arguments}}}, {{env = {{{env}}}}})",
+        "return remuda._dispatch_extension_command({}, {{{arguments}}}, {{env = {{{env}}}{stdin_field}}})",
         serde_json::to_string(command).expect("command serializes")
     );
     with_daemon(server, path, |path| eval_once(path, &code))

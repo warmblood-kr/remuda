@@ -38,6 +38,7 @@ pub const BINDINGS: [&str; 70] = [
     "_function_source",
     "_process_drain",
     "_process_killpg",
+    "_process_run",
     "_process_spawn",
     "_refresh_sessions_buffer",
     "_registry",
@@ -213,6 +214,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_registry",
         "The word registry itself: name, about and signature for every bound word.",
         "table",
+    ),
+    (
+        "_process_run",
+        "Run an argv process synchronously with a bounded timeout and captured output; internal, called by `remuda.process.run`.",
+        "_process_run(argv, stdin?, timeout) -> result",
     ),
     (
         "_process_spawn",
@@ -811,6 +817,26 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
                 spawner
                     .spawn(spawn_image.clone(), argv, on_line, on_exit)
                     .map_err(mlua::Error::external)
+            },
+        )?,
+    )?;
+
+    table.set(
+        "_process_run",
+        lua.create_function(
+            |lua, (argv, stdin, timeout): (Vec<String>, Option<mlua::LuaString>, f64)| {
+                let output = crate::process::run_sync(
+                    argv,
+                    stdin.map(|value| value.as_bytes().to_vec()),
+                    timeout,
+                )
+                .map_err(mlua::Error::runtime)?;
+                let result = lua.create_table()?;
+                result.set("code", output.code)?;
+                result.set("stdout", lua.create_string(&output.stdout)?)?;
+                result.set("stderr", lua.create_string(&output.stderr)?)?;
+                result.set("timed_out", output.timed_out)?;
+                Ok(result)
             },
         )?,
     )?;

@@ -1962,9 +1962,15 @@ remuda.tool({
   end,
 })
 
-function remuda.process(spec)
+local function process_start(spec)
+  if type(spec) ~= "table" then error("a process needs a spec table", 2) end
   if type(spec.argv) ~= "table" or #spec.argv == 0 then
     error("a process needs a non-empty `argv`", 2)
+  end
+  for i, arg in ipairs(spec.argv) do
+    if type(arg) ~= "string" or (i == 1 and arg == "") then
+      error("a process argv must contain strings and a non-empty executable", 2)
+    end
   end
   if spec.on_line ~= nil and (type(spec.on_line) ~= "string" or spec.on_line == "") then
     error("a process's `on_line`, when given, must be a non-empty string", 2)
@@ -1974,7 +1980,31 @@ function remuda.process(spec)
   end
   return remuda._process_spawn(spec.argv, spec.on_line, spec.on_exit)
 end
-register("process", "Spawn a plain-pipe child process; its stdout lines and exit arrive as emit events.", "process(spec) -> id")
+local function process_run(spec)
+  if type(spec) ~= "table" then error("process.run needs a spec table", 2) end
+  if type(spec.argv) ~= "table" or #spec.argv == 0 then
+    error("process.run needs a non-empty `argv`", 2)
+  end
+  for i, arg in ipairs(spec.argv) do
+    if type(arg) ~= "string" or (i == 1 and arg == "") then
+      error("process.run argv must contain strings and a non-empty executable", 2)
+    end
+  end
+  if spec.stdin ~= nil and type(spec.stdin) ~= "string" then
+    error("process.run stdin must be a string", 2)
+  end
+  local timeout = spec.timeout
+  if timeout == nil then timeout = 5 end
+  if type(timeout) ~= "number" or timeout ~= timeout or timeout <= 0 or timeout > 30 then
+    error("process.run timeout must be positive and at most 30 seconds", 2)
+  end
+  return remuda._process_run(spec.argv, spec.stdin, timeout)
+end
+remuda.process = setmetatable({ run = process_run }, {
+  __call = function(_, spec) return process_start(spec) end,
+})
+register("process", "Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output.", "process(spec) -> id; process.run(spec) -> {code, stdout, stderr, timed_out}")
+register("process.run", "Run argv directly without a shell; blocks the Lua image until exit or timeout (default 5s, max 30s), captures each stream up to 1 MiB.", "process.run{argv, stdin?, timeout?} -> {code, stdout, stderr, timed_out}")
 
 -- Everything defined so far is core's; a mod may not replace it (#145).
 for key in pairs(remuda) do core_fields[key] = true end
