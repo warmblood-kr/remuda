@@ -582,13 +582,20 @@ fn capture_styled_marks_dim_spans_and_reports_the_cursor() {
     let path = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&path);
     let code = r#"
-        remuda.new("styled", {"sh"})
-        remuda.send("styled", "printf '\\033[2mgh%sst\\033[0m-plain\\n' o")
-        local deadline = 500
-        while deadline > 0 and not remuda.capture("styled"):find("ghost%-plain") do
-          remuda.sleep(0.02)
-          deadline = deadline - 1
+        -- Wait on what the screen shows, never on timing: first the shell's
+        -- prompt (so the command is not typed before sh reads), then the
+        -- output row itself. A timeout fails loudly with the screen.
+        local function await(pattern)
+          for _ = 1, 1000 do
+            if remuda.capture("styled"):find(pattern) then return end
+            remuda.sleep(0.02)
+          end
+          error("never saw " .. pattern .. " on screen:\n" .. remuda.capture("styled"))
         end
+        remuda.new("styled", {"sh"})
+        await("%S")
+        remuda.send("styled", "printf '\\033[2mgh%sst\\033[0m-plain\\n' o")
+        await("ghost%-plain")
         local screen, dim = remuda.capture_styled("styled"), {}
         for _, row in ipairs(screen.rows) do
           if row[1] and row[1].text:find("^ghost") then -- the output, not the echo
