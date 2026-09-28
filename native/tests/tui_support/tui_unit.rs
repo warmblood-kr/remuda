@@ -2597,7 +2597,17 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
 
 #[test]
 fn a_missing_daemon_marks_the_cached_list_stale_and_offers_restart_or_quit() {
-    let path = std::path::PathBuf::from(format!("/tmp/remuda-dead-{}.sock", std::process::id()));
+    // Use the daemon's platform-specific address shape. On Windows the IPC
+    // endpoint is a named pipe, and arbitrary filesystem paths are rejected
+    // before connection (so they cannot prove that a daemon is gone).
+    let dir = if cfg!(unix) {
+        std::path::PathBuf::from(format!("/tmp/rm-{}", std::process::id()))
+    } else {
+        std::env::temp_dir().join(format!("remuda-tui-missing-{}", std::process::id()))
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make private missing-daemon fixture");
+    let path = crate::daemon::socket_path_in(&dir, "s");
     let mut ui = make_ui(vec![row("remembered", true, false)]);
     ui.mode = Mode::Prompt("sh".into());
     let mut held = None;
@@ -2630,6 +2640,7 @@ fn a_missing_daemon_marks_the_cached_list_stale_and_offers_restart_or_quit() {
     assert!(frame.contains("q quit"), "offer quit: {frame:?}");
     assert_eq!(ui.on_key(press(KeyCode::Char('r'))), Action::Restart);
     assert_eq!(ui.on_key(press(KeyCode::Char('q'))), Action::Quit);
+    std::fs::remove_dir_all(dir).expect("remove private missing-daemon fixture");
 }
 
 /// [MEASURED] `capture_styled` (the pane's own function) against a real
