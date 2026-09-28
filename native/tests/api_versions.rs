@@ -103,6 +103,21 @@ fn exercise_session_exit_payload(path: &std::path::Path) {
         path,
         &format!("remuda._api_v5_assert_exit({exit_name:?}, 'exited', 23)"),
     );
+
+    #[cfg(unix)]
+    {
+        let signal_name = format!("api-v5-signal-{}", std::process::id());
+        start_session(
+            path,
+            &signal_name,
+            vec!["/bin/sh".into(), "-c".into(), "kill -TERM $$".into()],
+        );
+        wait_for_exit_event(path, &signal_name);
+        eval(
+            path,
+            &format!("remuda._api_v5_assert_exit({signal_name:?}, 'exited', nil, 15, 'SIGTERM')"),
+        );
+    }
 }
 
 #[test]

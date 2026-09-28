@@ -155,7 +155,8 @@ pub type Result<T> = core::result::Result<T, AgentError>;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExitInfo {
     pub exit_code: Option<u32>,
-    pub signal: Option<String>,
+    pub signal: Option<i32>,
+    pub signal_name: Option<String>,
 }
 
 /// A styled screen and its scrollback measurements from one parser snapshot.

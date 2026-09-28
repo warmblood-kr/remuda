@@ -373,8 +373,16 @@ fn notify_exited(
         if let Some(exit_code) = exit_info.exit_code {
             fields.push(format!("exit_code={exit_code}"));
         }
-        if let Some(signal) = &exit_info.signal {
-            fields.push(format!("signal={}", crate::mcp::lua_string(signal)));
+        if reason != "closed" {
+            if let Some(signal) = exit_info.signal {
+                fields.push(format!("signal={signal}"));
+            }
+            if let Some(signal_name) = &exit_info.signal_name {
+                fields.push(format!(
+                    "signal_name={}",
+                    crate::mcp::lua_string(signal_name)
+                ));
+            }
         }
     }
     let details = format!("{{{}}}", fields.join(", "));

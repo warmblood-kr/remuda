@@ -16,7 +16,7 @@ function remuda._api_v5_exit_seen(name)
   return false
 end
 
-function remuda._api_v5_assert_exit(name, reason, exit_code)
+function remuda._api_v5_assert_exit(name, reason, exit_code, signal, signal_name)
   local event
   for _, candidate in ipairs(remuda._api_v5_exit_events) do
     if candidate.name == name then event = candidate; break end
@@ -31,8 +31,24 @@ function remuda._api_v5_assert_exit(name, reason, exit_code)
     assert(event.details.exit_code == exit_code,
       "unexpected session_exited exit code: " .. tostring(event.details.exit_code))
   end
+  if signal ~= nil then
+    assert(event.details.signal == signal,
+      "unexpected session_exited signal: " .. tostring(event.details.signal))
+  end
+  if signal_name ~= nil then
+    assert(event.details.signal_name == signal_name,
+      "unexpected session_exited signal name: " .. tostring(event.details.signal_name))
+  end
   if event.details.signal ~= nil then
-    assert(type(event.details.signal) == "string", "session_exited signal must be a string")
+    assert(type(event.details.signal) == "number", "session_exited signal must be a number")
+  end
+  if event.details.signal_name ~= nil then
+    assert(type(event.details.signal_name) == "string", "session_exited signal_name must be a string")
+    assert(type(event.details.signal) == "number", "signal_name requires a numeric signal")
+  end
+  if reason == "closed" then
+    assert(event.details.signal == nil and event.details.signal_name == nil,
+      "closed sessions must omit signal details")
   end
   local legacy_received_name = false
   for _, legacy_name in ipairs(remuda._api_v5_legacy_exit_names) do

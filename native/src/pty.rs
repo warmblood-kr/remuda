@@ -464,7 +464,10 @@ impl AgentProcess for PtyAgent {
 
 impl PtyAgent {
     fn record_exit_status(&mut self, status: portable_pty::ExitStatus) {
-        let signal = status.signal().map(str::to_string);
+        let signal = status
+            .signal()
+            .and_then(|description| description.rsplit_once(':'))
+            .and_then(|(_, number)| number.trim().parse::<i32>().ok());
         self.exit_info = Some(ExitInfo {
             exit_code: if signal.is_none() {
                 Some(status.exit_code())
@@ -472,8 +475,29 @@ impl PtyAgent {
                 None
             },
             signal,
+            signal_name: signal_name(signal.unwrap_or_default()),
         });
     }
+}
+
+fn signal_name(signal: i32) -> Option<String> {
+    #[cfg(unix)]
+    let name = match signal {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGSEGV => "SIGSEGV",
+        _ => return None,
+    };
+    #[cfg(not(unix))]
+    let name = {
+        let _ = signal;
+        return None;
+    };
+    Some(name.to_string())
 }
 
 fn capture_snapshot(
