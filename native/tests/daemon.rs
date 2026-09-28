@@ -2787,6 +2787,91 @@ fn a_sigkilled_daemon_reaps_its_direct_process_child_but_not_an_already_forked_g
     }
 }
 
+/// The Codex app-server is detached into its own process group, so daemon PTY
+/// teardown cannot HUP it. Its parent-death guard must still reap it when the
+/// daemon dies and the session's remuda CLI disappears.
+#[cfg(unix)]
+#[test]
+fn a_sigkilled_daemon_reaps_a_codex_app_server_in_its_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("codex-parent-death");
+    let mut daemon = Daemon::spawn(&dir);
+    let path = daemon::socket_path_in(&dir, "s");
+    let stub_dir = dir.join("bin");
+    std::fs::create_dir_all(&stub_dir).unwrap();
+    let pid_file = dir.join("app-server.pid");
+    let stub = stub_dir.join("codex");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nif [ \"$1\" = app-server ]; then\n  trap '' HUP\n  echo $$ > \"$STUB_PIDFILE\"\nfi\nexec /bin/sleep 60\n",
+    )
+    .unwrap();
+    let mut mode = std::fs::metadata(&stub).unwrap().permissions();
+    mode.set_mode(0o755);
+    std::fs::set_permissions(&stub, mode).unwrap();
+    let env = std::collections::HashMap::from([
+        ("PATH".to_string(), stub_dir.to_string_lossy().into_owned()),
+        (
+            "STUB_PIDFILE".to_string(),
+            pid_file.to_string_lossy().into_owned(),
+        ),
+    ]);
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("codex".into()),
+            command: vec![
+                env!("CARGO_BIN_EXE_remuda").into(),
+                "_codex_tui".into(),
+                "--status".into(),
+                dir.join("status").to_string_lossy().into_owned(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start Codex TUI session");
+    assert!(matches!(response, Response::Value(_)));
+
+    let deadline = Instant::now() + PATIENCE;
+    let app_server_pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            break pid.trim().parse::<i32>().unwrap();
+        }
+        assert!(Instant::now() < deadline, "stub app-server never started");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        pid_alive(app_server_pid),
+        "app-server exited before daemon death"
+    );
+
+    assert_eq!(
+        unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGKILL) },
+        0,
+        "kill private daemon"
+    );
+    let _ = daemon.0.wait();
+    let deadline = Instant::now() + PATIENCE;
+    while pid_alive(app_server_pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let app_server_reaped = !pid_alive(app_server_pid);
+    if !app_server_reaped {
+        // Keep a regression failure from leaving the stub process behind.
+        unsafe {
+            libc::kill(app_server_pid, libc::SIGKILL);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        app_server_reaped,
+        "Codex app-server ({app_server_pid}) outlived the killed daemon"
+    );
+}
+
 /// [MEASURED, unix] The one path that DOES reach a grandchild: a clean
 /// `remuda stop` sends `Request::Shutdown`, which runs
 /// `reap_processes_before_exit` (daemon.rs) before the process exits —
