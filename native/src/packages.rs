@@ -73,6 +73,8 @@ pub struct ModSpec {
     pub entry: String,
     pub command: Option<String>,
     pub lifecycle: Option<String>,
+    /// `(mod, constraint)` pairs from `requires`, sorted by mod name.
+    pub requires: Vec<(String, String)>,
 }
 
 /// Return the installed mod name that owns a CLI command. Commands are
@@ -491,6 +493,7 @@ pub fn parse_manifest(text: &str) -> Result<ModSpec, String> {
     let mut entry = None;
     let mut command = None;
     let mut lifecycle = None;
+    let mut requires = None;
     for (line_number, raw) in text.lines().enumerate() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -499,6 +502,12 @@ pub fn parse_manifest(text: &str) -> Result<ModSpec, String> {
         let (key, value) = line
             .split_once('=')
             .ok_or_else(|| format!("extension.toml line {} is not key = value", line_number + 1))?;
+        if key.trim() == "requires" {
+            if requires.replace(parse_requires(value)?).is_some() {
+                return Err("extension.toml repeats key \"requires\"".into());
+            }
+            continue;
+        }
         let value = parse_quoted(value)?;
         let slot = match key.trim() {
             "name" => &mut name,
@@ -520,9 +529,86 @@ pub fn parse_manifest(text: &str) -> Result<ModSpec, String> {
         entry: entry.ok_or_else(|| "extension.toml is missing entry".to_string())?,
         command,
         lifecycle,
+        requires: requires.unwrap_or_default(),
     };
     validate_spec(&spec)?;
+    if spec.requires.iter().any(|(name, _)| *name == spec.name) {
+        return Err(format!("mod {} cannot require itself", spec.name));
+    }
     Ok(spec)
+}
+
+/// `requires = { name = "constraint", ... }` on one line (constraints hold
+/// commas, so pairs are read quote by quote, not split on `,`).
+fn parse_requires(value: &str) -> Result<Vec<(String, String)>, String> {
+    let shape = "requires must be an inline table like { butler = \">=0.4, <0.5\" }";
+    let mut rest = value
+        .trim()
+        .strip_prefix('{')
+        .and_then(|inner| inner.strip_suffix('}'))
+        .ok_or(shape)?
+        .trim();
+    let mut requires = std::collections::BTreeMap::new();
+    while !rest.is_empty() {
+        let (name, after) = rest.split_once('=').ok_or(shape)?;
+        let name = name.trim();
+        if !valid_component(name) {
+            return Err(format!("invalid required mod name {name:?}"));
+        }
+        let quoted = after.trim_start().strip_prefix('"').ok_or(shape)?;
+        let (constraint, after) = quoted.split_once('"').ok_or(shape)?;
+        parse_constraint(constraint)?;
+        if requires.insert(name.to_string(), constraint.to_string()).is_some() {
+            return Err(format!("requires names {name} twice"));
+        }
+        rest = after.trim_start();
+        rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
+    }
+    Ok(requires.into_iter().collect())
+}
+
+/// Comma-separated comparators (`>=`, `>`, `<=`, `<`, `=`), all of which must
+/// hold; empty or `*` means any version.
+fn parse_constraint(constraint: &str) -> Result<Vec<(&str, [u64; 3])>, String> {
+    let constraint = constraint.trim();
+    if constraint.is_empty() || constraint == "*" {
+        return Ok(Vec::new());
+    }
+    constraint
+        .split(',')
+        .map(|part| {
+            let part = part.trim();
+            let op = [">=", "<=", ">", "<", "="]
+                .into_iter()
+                .find(|op| part.starts_with(op))
+                .ok_or_else(|| format!("constraint {part:?} needs >=, >, <=, < or ="))?;
+            Ok((op, parse_version(&part[op.len()..])?))
+        })
+        .collect()
+}
+
+fn parse_version(text: &str) -> Result<[u64; 3], String> {
+    let parts: Vec<&str> = text.trim().split('.').collect();
+    let mut version = [0; 3];
+    if parts.len() > 3 {
+        return Err(format!("version {text:?} has more than three parts"));
+    }
+    for (slot, part) in version.iter_mut().zip(parts) {
+        *slot = part.parse().map_err(|_| format!("version {text:?} is not numeric"))?;
+    }
+    Ok(version)
+}
+
+/// Whether an installed `version` meets a `requires` constraint.
+pub fn satisfies(version: &str, constraint: &str) -> Result<bool, String> {
+    let installed = parse_version(version)?;
+    Ok(parse_constraint(constraint)?.iter().all(|(op, wanted)| match *op {
+        ">=" => installed >= *wanted,
+        "<=" => installed <= *wanted,
+        ">" => installed > *wanted,
+        "<" => installed < *wanted,
+        _ => installed == *wanted,
+    }))
 }
 
 fn validate_spec(spec: &ModSpec) -> Result<(), String> {
@@ -858,9 +944,54 @@ fn valid_package_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_manifest, parse_repository, update_all_with, validate_reference, InstallReport,
-        Manifest, MOD_LIFECYCLE_API,
+        parse_manifest, parse_repository, satisfies, update_all_with, validate_reference,
+        InstallReport, Manifest, MOD_LIFECYCLE_API,
     };
+
+    fn with_requires(line: &str) -> Result<super::ModSpec, String> {
+        parse_manifest(&format!(
+            "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\n{line}\n"
+        ))
+    }
+
+    #[test]
+    fn requires_is_an_inline_table_of_name_to_constraint_sorted_by_name() {
+        let spec = with_requires(r#"requires = { zeta = "*", butler = ">=0.4, <0.5" }"#).expect("spec");
+        assert_eq!(
+            spec.requires,
+            vec![("butler".to_string(), ">=0.4, <0.5".to_string()), ("zeta".into(), "*".into())]
+        );
+        assert!(with_requires("").expect("no requires").requires.is_empty());
+        assert!(with_requires("requires = {}").expect("empty").requires.is_empty());
+        for bad in [
+            r#"requires = "butler""#,
+            r#"requires = { butler = ">=x" }"#,
+            r#"requires = { "bad name" = "*" }"#,
+            r#"requires = { butler = "*", butler = "*" }"#,
+            r#"requires = { guest = "*" }"#,
+            r#"requires = { butler = "~0.4" }"#,
+        ] {
+            assert!(with_requires(bad).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn a_version_satisfies_every_comparator_in_a_constraint() {
+        for (version, constraint, expected) in [
+            ("0.4.2", ">=0.4, <0.5", true),
+            ("0.5.0", ">=0.4, <0.5", false),
+            ("0.3.9", ">=0.4", false),
+            ("1.2.0", "=1.2", true),
+            ("1.0.1", ">1", true),
+            ("1.0.0", ">1", false),
+            ("2.0", "<=2.0.0", true),
+            ("0.1.0", "*", true),
+            ("0.1.0", "", true),
+        ] {
+            assert_eq!(satisfies(version, constraint), Ok(expected), "{version} {constraint}");
+        }
+        assert!(satisfies("x.1", ">=0.1").is_err(), "a non-numeric installed version is an error");
+    }
 
     fn report(name: &str) -> InstallReport {
         InstallReport {
