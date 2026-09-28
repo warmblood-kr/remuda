@@ -28,7 +28,7 @@ pub mod registry;
 pub mod session;
 pub mod sync;
 
-pub use agent::{AgentError, AgentProcess, Cursor, ScriptedAgent, Size};
+pub use agent::{AgentError, AgentProcess, Cursor, ExitInfo, ScriptedAgent, Size};
 pub use clock::{Clock, ManualClock, ManualWallClock, WallClock};
 pub use registry::{Registry, SessionSummary};
 pub use session::Session;
