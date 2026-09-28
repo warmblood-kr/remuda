@@ -370,7 +370,6 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
         Request::List => counters.counter("request_list").record_hit(),
         Request::Eval { .. } => counters.counter("request_eval").record_hit(),
         Request::CaptureStyled { .. } => counters.counter("request_capture_styled").record_hit(),
-        Request::MouseState { .. } => counters.counter("request_mouse_state").record_hit(),
         _ => {}
     }
 }
@@ -592,14 +591,19 @@ fn handle(
             capture_styled(&stream, registry, &name, scrollback)
         }
 
-        Request::MouseState { name } => respond(
-            &stream,
-            &name,
-            registry.get(&name).map(|session| Ok(session.mouse_state())),
-            Response::MouseState,
-        ),
+        Request::MouseState { name } => mouse_state(&stream, registry, &name),
 
-        Request::Attach { name } => attach(stream, reader, registry, &name),
+        Request::Attach { name } => attach(stream, reader, registry, &name, false),
+        Request::AttachTracked { name } => attach(stream, reader, registry, &name, true),
+        Request::AttachStatus { name, generation } => {
+            let response = registry.get(&name).map_or_else(
+                || Response::error(format!("no such session: {name}")),
+                |session| Response::AttachStatus {
+                    taken_over: session.was_attachment_taken_over(generation),
+                },
+            );
+            reply(&stream, &response)
+        }
 
         Request::Close { name } => respond(&stream, &name, close(registry, image, &name), |()| {
             Response::Ok
@@ -616,6 +620,15 @@ fn handle(
             Err(e) => reply(&stream, &Response::error(e)),
         },
     }
+}
+
+fn mouse_state(stream: &Stream, registry: &Registry, name: &str) -> std::io::Result<()> {
+    respond(
+        stream,
+        name,
+        registry.get(name).map(|session| Ok(session.mouse_state())),
+        Response::MouseState,
+    )
 }
 
 /// The `None`/`Some(Err)`/`Some(Ok)` shape several `Request` arms share: no
@@ -705,14 +718,14 @@ fn spawn(
     ))
 }
 
-/// Hand this connection over to a human. Exclusivity is enforced by
-/// `Session::attach` returning `None`, not here, so a second viewer is refused
-/// even when it arrives over some later transport.
+/// Hand this connection over to a human. A later attach displaces this one;
+/// the old connection receives a printable notice before it is closed.
 fn attach(
     stream: Stream,
     mut reader: BufReader<Stream>,
     registry: &Registry,
     name: &str,
+    tracked: bool,
 ) -> std::io::Result<()> {
     let Some(session) = registry.get(name) else {
         return reply(
@@ -720,13 +733,15 @@ fn attach(
             &Response::error(format!("no such session: {name}")),
         );
     };
-    let Some(held) = session.attach() else {
-        return reply(
-            &stream,
-            &Response::error("already attached by someone else"),
-        );
+    let held = session.attach();
+    let acknowledgement = if tracked {
+        Response::AttachStarted {
+            generation: held.generation(),
+        }
+    } else {
+        Response::Ok
     };
-    reply(&stream, &Response::Ok)?;
+    reply(&stream, &acknowledgement)?;
 
     // Paint what is already on screen before streaming anything new, or the
     // viewer sees a blank terminal until the program next redraws.
@@ -778,6 +793,9 @@ fn attach(
 
         if let Some(rx) = held.subscribe() {
             while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                if held.is_displaced() {
+                    break;
+                }
                 match rx.recv_timeout(std::time::Duration::from_millis(100)) {
                     Ok(chunk) => {
                         if out.write_all(&chunk).is_err() || out.flush().is_err() {
@@ -786,11 +804,19 @@ fn attach(
                     }
                     // Timeout: nothing was printed, which is the normal state of
                     // an idle agent. Loop back and re-check whether we are done.
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        continue;
+                    }
                     // The sender is gone: the process exited.
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
+        }
+        if held.is_displaced() {
+            // Keep this plain text so older clients display a useful reason
+            // before observing the ordinary EOF, even if input ended the pump.
+            let _ = out.write_all(b"\r\n[remuda] attached elsewhere, detached\r\n");
+            let _ = out.flush();
         }
         done.store(true, std::sync::atomic::Ordering::SeqCst);
         // Unblocks the key thread's read so the scope can close.

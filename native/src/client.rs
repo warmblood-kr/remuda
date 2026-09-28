@@ -147,6 +147,7 @@ fn skew(detail: &str) -> String {
 pub enum Left {
     Detached,
     Exited,
+    TakenOver,
 }
 
 /// Give this terminal to a session until the user presses [`DETACH`] or the
@@ -156,29 +157,65 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
     attach_with_mouse(path, name, true)
 }
 
+enum AttachAck {
+    Tracked(u64),
+    Legacy,
+    Unsupported,
+    Refused(String),
+}
+
+fn attach_ack(line: &str) -> AttachAck {
+    match interpret(line) {
+        Response::AttachStarted { generation } => AttachAck::Tracked(generation),
+        Response::Ok => AttachAck::Legacy,
+        Response::Error(reason) if reason.starts_with("the daemon is not this build") => {
+            AttachAck::Unsupported
+        }
+        Response::Error(reason) => AttachAck::Refused(reason),
+        _ => AttachAck::Refused("daemon did not acknowledge attach".into()),
+    }
+}
+
+fn begin_attach(path: &Path, name: &str) -> std::io::Result<(Stream, Option<u64>)> {
+    let mut stream = ipc::connect(path)?;
+    send(&stream, &Request::AttachTracked { name: name.into() })?;
+    match attach_ack(&read_protocol_line(&mut stream)?) {
+        AttachAck::Tracked(generation) => Ok((stream, Some(generation))),
+        AttachAck::Legacy => Ok((stream, None)),
+        AttachAck::Unsupported => {
+            drop(stream);
+            let mut stream = ipc::connect(path)?;
+            send(&stream, &Request::Attach { name: name.into() })?;
+            match interpret(&read_protocol_line(&mut stream)?) {
+                Response::Ok => Ok((stream, None)),
+                Response::Error(reason) => Err(std::io::Error::other(reason)),
+                _ => Err(std::io::Error::other("daemon did not acknowledge attach")),
+            }
+        }
+        AttachAck::Refused(reason) => Err(std::io::Error::other(reason)),
+    }
+}
+
+fn was_taken_over(path: &Path, name: &str, generation: Option<u64>) -> bool {
+    generation.is_some_and(|generation| {
+        matches!(
+            request(
+                path,
+                &Request::AttachStatus {
+                    name: name.into(),
+                    generation
+                }
+            ),
+            Ok(Response::AttachStatus { taken_over: true })
+        )
+    })
+}
+
 // This lifecycle is intentionally linear: attach, start the input reader,
 // drain output, wake the reader and restore the terminal in one scope.
 #[allow(clippy::too_many_lines)]
 pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Result<Left> {
-    let mut stream = ipc::connect(path)?;
-    send(
-        &stream,
-        &Request::Attach {
-            name: name.to_string(),
-        },
-    )?;
-
-    // The acknowledgement is read before raw mode goes on. Failing here must
-    // leave the terminal exactly as we found it, and a raw terminal printing an
-    // error message is how a tool loses a user's trust in one keystroke.
-    let line = read_protocol_line(&mut stream)?;
-    match interpret(&line) {
-        Response::Ok => {}
-        Response::Error(reason) => {
-            return Err(std::io::Error::other(reason));
-        }
-        _ => return Err(std::io::Error::other("daemon did not acknowledge attach")),
-    }
+    let (stream, generation) = begin_attach(path, name)?;
 
     let _raw = RawMode::enable()?;
     if mouse {
@@ -195,6 +232,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     // Only the key thread can tell the two exits apart: the reader below just
     // sees the stream end, which is true of a detach and of a death alike.
     let detached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output_taken_over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let output_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let output_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let trace_input = std::env::var_os("REMUDA_TRACE_INPUT").map(PathBuf::from);
@@ -208,6 +246,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
         let mut stream = reader_stream.as_ref().try_clone()?;
         let reader_stream = std::sync::Arc::clone(&reader_stream);
         let detached = std::sync::Arc::clone(&detached);
+        let output_taken_over = std::sync::Arc::clone(&output_taken_over);
         let output_stop = std::sync::Arc::clone(&output_stop);
         let output_done = std::sync::Arc::clone(&output_done);
         let scrollback = std::sync::Arc::clone(&scrollback);
@@ -221,6 +260,9 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
             let mut mouse_on = mouse;
             loop {
                 if output_done.load(std::sync::atomic::Ordering::SeqCst) {
+                    if output_taken_over.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
                     // Keep the advertised "press any key" behavior after the
                     // child exits, but let that key release the attach and
                     // restore terminal modes instead of routing it to nowhere.
@@ -346,11 +388,15 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
         }
     }
 
+    let taken_over = was_taken_over(path, name, generation);
+    output_taken_over.store(taken_over, std::sync::atomic::Ordering::SeqCst);
     output_done.store(true, std::sync::atomic::Ordering::SeqCst);
     ipc::stop_reader(&reader_stream, &output_stop, || {
         output_done.load(std::sync::atomic::Ordering::SeqCst)
     });
-    let left = if detached.load(std::sync::atomic::Ordering::SeqCst) {
+    let left = if taken_over {
+        Left::TakenOver
+    } else if detached.load(std::sync::atomic::Ordering::SeqCst) {
         Left::Detached
     } else {
         // The key thread remains alive until one key releases the user's
@@ -359,6 +405,16 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
         let _ = stdout.flush();
         Left::Exited
     };
+    #[cfg(windows)]
+    if taken_over {
+        // ConPTY stdin may be blocked in a synchronous console read. Once the
+        // takeover outcome is known, returning lets the CLI exit and Windows
+        // tear down that worker instead of waiting forever in `join`.
+        drop(keys);
+    } else {
+        let _ = keys.join();
+    }
+    #[cfg(unix)]
     let _ = keys.join();
     Ok(left)
 }
