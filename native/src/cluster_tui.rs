@@ -267,6 +267,8 @@ mod tests {
             attached: false,
             human_idle: None,
             mouse_tracking: false,
+            instance_id: None,
+            output_version: None,
         }]
     }
 
@@ -294,6 +296,8 @@ mod tests {
             attached: false,
             human_idle: None,
             mouse_tracking: false,
+            instance_id: None,
+            output_version: None,
         });
         let clock = ManualClock::new();
         let mut ui = ClusterUi::new("studio", sessions, clock.now());
