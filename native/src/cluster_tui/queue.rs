@@ -86,6 +86,26 @@ impl InputQueue {
             .cloned()
     }
 
+    pub fn restart_waiting_target(
+        &mut self,
+        name: &str,
+        instance_id: &str,
+        client_id: &str,
+    ) -> u64 {
+        let mut next_seq = 1;
+        for batch in &mut self.batches {
+            if batch.name == name
+                && batch.instance_id == instance_id
+                && batch.state == QueueState::Waiting
+            {
+                batch.client_id = client_id.into();
+                batch.seq = next_seq;
+                next_seq += 1;
+            }
+        }
+        next_seq
+    }
+
     pub fn begin_due(&mut self, now: Instant) -> Option<PendingBatch> {
         let batch = self
             .batches
@@ -100,52 +120,77 @@ impl InputQueue {
     }
 
     pub fn finish(&mut self, seq: u64, outcome: SendOutcome, now: Instant) -> Option<QueueEvent> {
-        let batch = self
-            .batches
-            .iter_mut()
-            .find(|batch| batch.seq == seq && batch.state == QueueState::Sending)?;
-        match outcome {
-            SendOutcome::Ack { duplicate } => {
-                batch.state = QueueState::Sent;
-                batch.status = "sent".into();
-                Some(QueueEvent::Sent { seq, duplicate })
+        let event = {
+            let batch = self
+                .batches
+                .iter_mut()
+                .find(|batch| batch.seq == seq && batch.state == QueueState::Sending)?;
+            match outcome {
+                SendOutcome::Ack { duplicate } => {
+                    batch.state = QueueState::Sent;
+                    batch.status = "sent".into();
+                    Some(QueueEvent::Sent { seq, duplicate })
+                }
+                SendOutcome::Uncertain => {
+                    mark_uncertain(batch, "delivery uncertain".into());
+                    Some(QueueEvent::Uncertain {
+                        seq,
+                        reason: batch.status.clone(),
+                    })
+                }
+                SendOutcome::WrongInstance => {
+                    batch.state = QueueState::Dropped;
+                    batch.status = "session restarted; input dropped".into();
+                    Some(QueueEvent::Dropped {
+                        seq,
+                        reason: batch.status.clone(),
+                    })
+                }
+                SendOutcome::RateLimited => {
+                    batch.rate_retries = batch.rate_retries.saturating_add(1);
+                    schedule_retry(batch, now, "rate limited; retrying")
+                }
+                SendOutcome::IoFailure(detail) if batch.io_retries < MAX_IO_RETRIES => {
+                    batch.io_retries += 1;
+                    schedule_retry(batch, now, &format!("connection lost; retrying: {detail}"))
+                }
+                SendOutcome::IoFailure(detail) => {
+                    mark_uncertain(batch, format!("delivery uncertain after retries: {detail}"));
+                    Some(QueueEvent::Uncertain {
+                        seq,
+                        reason: batch.status.clone(),
+                    })
+                }
+                SendOutcome::Error(reason) => {
+                    batch.state = QueueState::Failed;
+                    batch.status = reason.clone();
+                    Some(QueueEvent::Failed { seq, reason })
+                }
             }
-            SendOutcome::Uncertain => {
-                mark_uncertain(batch, "delivery uncertain".into());
-                Some(QueueEvent::Uncertain {
-                    seq,
-                    reason: batch.status.clone(),
-                })
+        };
+        self.prune_finished();
+        event
+    }
+
+    fn prune_finished(&mut self) {
+        let mut batches: Vec<_> = self.batches.drain(..).collect();
+        let mut finished = 0;
+        let mut retained = VecDeque::with_capacity(batches.len());
+        for batch in batches.drain(..).rev() {
+            let terminal = matches!(
+                batch.state,
+                QueueState::Sent | QueueState::Uncertain | QueueState::Dropped | QueueState::Failed
+            );
+            if terminal {
+                finished += 1;
+                if finished > 3 {
+                    continue;
+                }
             }
-            SendOutcome::WrongInstance => {
-                batch.state = QueueState::Dropped;
-                batch.status = "session restarted; input dropped".into();
-                Some(QueueEvent::Dropped {
-                    seq,
-                    reason: batch.status.clone(),
-                })
-            }
-            SendOutcome::RateLimited => {
-                batch.rate_retries = batch.rate_retries.saturating_add(1);
-                schedule_retry(batch, now, "rate limited; retrying")
-            }
-            SendOutcome::IoFailure(detail) if batch.io_retries < MAX_IO_RETRIES => {
-                batch.io_retries += 1;
-                schedule_retry(batch, now, &format!("connection lost; retrying: {detail}"))
-            }
-            SendOutcome::IoFailure(detail) => {
-                mark_uncertain(batch, format!("delivery uncertain after retries: {detail}"));
-                Some(QueueEvent::Uncertain {
-                    seq,
-                    reason: batch.status.clone(),
-                })
-            }
-            SendOutcome::Error(reason) => {
-                batch.state = QueueState::Failed;
-                batch.status = reason.clone();
-                Some(QueueEvent::Failed { seq, reason })
-            }
+            retained.push_back(batch);
         }
+        retained.make_contiguous().reverse();
+        self.batches = retained;
     }
 }
 
@@ -211,5 +256,25 @@ mod tests {
         assert!(matches!(retry, super::QueueEvent::RetryScheduled { .. }));
         assert!(queue.begin_due(now + Duration::from_millis(1)).is_none());
         assert!(queue.begin_due(now + Duration::from_secs(1)).is_some());
+    }
+
+    #[test]
+    fn queue_prunes_old_finished_batches_but_keeps_the_last_three() {
+        let now = Instant::now();
+        let mut queue = InputQueue::default();
+        for seq in 1..=5 {
+            queue.enqueue(
+                "dev".into(),
+                "instance-a".into(),
+                "client".into(),
+                seq,
+                vec![seq as u8],
+                now,
+            );
+            queue.begin_due(now).unwrap();
+            queue.finish(seq, SendOutcome::Ack { duplicate: false }, now);
+        }
+        let items: Vec<_> = queue.items().map(|batch| batch.seq).collect();
+        assert_eq!(items, [3, 4, 5]);
     }
 }
