@@ -3,7 +3,53 @@
 use remuda_core::Registry;
 use remuda_native::{image::Image, tick::Counters};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct IsolatedModHome {
+    root: std::path::PathBuf,
+    old_home: Option<std::ffi::OsString>,
+    old_xdg_data_home: Option<std::ffi::OsString>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl IsolatedModHome {
+    fn new(test_name: &str) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("remuda-{test_name}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(root.join("data")).unwrap();
+        let old_home = std::env::var_os("HOME");
+        let old_xdg_data_home = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("HOME", &root);
+        std::env::set_var("XDG_DATA_HOME", root.join("data"));
+        Self {
+            root,
+            old_home,
+            old_xdg_data_home,
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for IsolatedModHome {
+    fn drop(&mut self) {
+        match self.old_home.take() {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match self.old_xdg_data_home.take() {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
 
 fn image(tag: &str) -> Image {
     let image = Image::spawn(
@@ -129,8 +175,9 @@ fn advice_errors_name_the_chain_and_bad_calls_are_refused() {
 /// new definition becomes the base (Emacs `defalias` respecting advice).
 #[test]
 fn advice_survives_a_mod_redefining_the_function() {
-    let root = std::env::temp_dir().join(format!("remuda-advice-reattach-{}", std::process::id()));
-    let mod_dir = root.join("remuda/mods/host");
+    let isolated_home = IsolatedModHome::new("advice-reattach");
+    let root = &isolated_home.root;
+    let mod_dir = root.join("data/remuda/mods/host");
     std::fs::create_dir_all(mod_dir.join("packages/host")).unwrap();
     std::fs::write(
         mod_dir.join("extension.toml"),
@@ -138,7 +185,6 @@ fn advice_survives_a_mod_redefining_the_function() {
     )
     .unwrap();
     let entry = mod_dir.join("packages/host/init.lua");
-    std::env::set_var("XDG_DATA_HOME", &root);
     let image = image("reattach");
     std::fs::write(&entry, "function remuda._adv_host(x) return 'v1:' .. x end").unwrap();
     read(&image, "remuda.exec('host')");
@@ -146,7 +192,6 @@ fn advice_survives_a_mod_redefining_the_function() {
     std::fs::write(&entry, "function remuda._adv_host(x) return 'v2:' .. x end").unwrap();
     read(&image, "remuda.exec('host')");
     assert_eq!(read(&image, "return remuda._adv_host('x')"), "[v2:x]");
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// PR #144 review: the monkey-patch idiom `local orig = remuda.x; function
