@@ -616,7 +616,8 @@ impl Ui {
 
     fn set_list_width(&mut self, width: u16, cols: u16) {
         let usable = cols.saturating_sub(1);
-        self.list_width = Some(width.clamp(16, usable.saturating_sub(16)));
+        let max = usable.saturating_sub(16).max(16).min(usable);
+        self.list_width = Some(width.clamp(16.min(max), max));
     }
 }
 
@@ -680,10 +681,8 @@ fn ui_layout(ui: &Ui, term_cols: u16) -> (u16, u16) {
     }
     let usable = term_cols.saturating_sub(1);
     let automatic = content_list_width(ui, usable);
-    let list = ui
-        .list_width
-        .unwrap_or(automatic)
-        .clamp(16, usable.saturating_sub(16));
+    let max = usable.saturating_sub(16).max(16).min(usable);
+    let list = ui.list_width.unwrap_or(automatic).clamp(16.min(max), max);
     (list, usable.saturating_sub(list))
 }
 

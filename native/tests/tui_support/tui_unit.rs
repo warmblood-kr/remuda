@@ -521,6 +521,25 @@ fn a_shown_list_fits_its_content_without_overriding_a_manual_width() {
 }
 
 #[test]
+fn narrow_terminals_clamp_content_fit_and_manual_widths_without_panicking() {
+    let mut ui = make_ui(vec![row("long-enough-to-fit", true, false)]);
+    for cols in [30u16, 20u16] {
+        let usable = cols.saturating_sub(1);
+        let (list, preview) = ui_layout(&ui, cols);
+        assert!(list + preview <= usable, "content fit at {cols} cols");
+
+        ui.set_list_width(24, 120);
+        let (list, preview) = ui_layout(&ui, cols);
+        assert!(list + preview <= usable, "manual width at {cols} cols");
+
+        ui.list_width = None;
+        ui.set_list_width(24, cols);
+        let (list, preview) = ui_layout(&ui, cols);
+        assert!(list + preview <= usable, "drag at {cols} cols");
+    }
+}
+
+#[test]
 fn a_terminal_too_small_to_split_still_produces_a_frame() {
     let (list, preview) = layout(10, 80);
     assert_eq!(list + preview, 9, "the divider, and no underflow");
