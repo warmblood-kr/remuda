@@ -231,6 +231,10 @@ fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> S
             ok_reply(id, tool_error("attach responses are not exposed over MCP"))
         }
         Ok(Response::Sessions(sessions)) => ok_reply(id, sessions_text(sessions)),
+        Ok(Response::ClusterRegistryPage { .. } | Response::ClusterRegistryAck { .. }) => ok_reply(
+            id,
+            tool_error("cluster registry responses are not exposed over MCP"),
+        ),
     }
 }
 

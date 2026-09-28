@@ -97,6 +97,15 @@ pub enum Request {
     /// outlives the binary that spawned it, so this is a client's only way to
     /// learn it is talking to yesterday's code before a field mismatch does.
     Version,
+    /// Read a bounded page of the authenticated peer's registry. `digest`
+    /// lets the peer return an unchanged response; entries use canonical JSON
+    /// strings so the policy crate does not depend on the host JSON codec.
+    ClusterRegistrySync {
+        digest: Option<String>,
+        offset: usize,
+    },
+    /// Apply one bounded, canonical registry update from an authenticated peer.
+    ClusterRegistryUpdate { update_json: String },
     /// Stop the daemon, so the next command starts a fresh one. The daemon
     /// refuses a request identifying one of its own sessions unless the
     /// caller explicitly overrides the hosted-session guard.
@@ -185,6 +194,20 @@ pub enum Response {
     /// Directory entries, answering [`Request::ListDir`] — names only, no
     /// path prefix, sorted for a stable diff.
     Entries(Vec<String>),
+    /// One page of the registry replication snapshot.
+    ClusterRegistryPage {
+        sender_fp: String,
+        digest: String,
+        offset: usize,
+        entries_json: String,
+        next_offset: Option<usize>,
+        unchanged: bool,
+    },
+    /// A registry update was accepted (whether or not it changed local state).
+    ClusterRegistryAck {
+        digest: String,
+        applied: bool,
+    },
 }
 
 impl Response {

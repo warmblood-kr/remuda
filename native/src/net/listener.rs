@@ -5,7 +5,7 @@ use super::{frame, replay};
 use crate::cluster::{self, identity, join_token::JoinTokenStore, NodeState};
 use remuda_core::protocol::{Request, Response};
 use remuda_core::WallClock;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
@@ -23,7 +23,13 @@ pub const MAX_BODY_BYTES: usize = 65_535;
 pub const MAX_GLOBAL_REQUESTS: usize = 64;
 pub const MAX_PEER_REQUESTS: usize = 8;
 pub const MAX_PREAUTH_PER_IP: usize = 4;
+pub const MAX_JOIN_ATTEMPTS_PER_IP: usize = 10;
+const JOIN_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
+const MAX_JOIN_ATTEMPT_IPS: usize = 4096;
 pub const MAX_HELD_REQUEST: Duration = Duration::from_secs(30);
+const MAX_REGISTRY_UPDATE_JSON_BYTES: usize = 48 * 1024;
+const MAX_REGISTRY_PAGE_ENTRIES: usize = 32;
+const MAX_REGISTRY_RATE_BUCKETS: usize = cluster::registry::MAX_REGISTRY_ENTRIES;
 const SOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_READ_TIME: Duration = Duration::from_secs(5);
 const LOCAL_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
@@ -61,13 +67,15 @@ pub struct Listener {
 }
 
 type MemberAuthorizer = Arc<dyn Fn(&[u8]) -> io::Result<()> + Send + Sync>;
-type FrameDispatcher = Arc<dyn Fn(&[u8]) -> io::Result<Vec<u8>> + Send + Sync>;
+type JoinAdmitter = Arc<dyn Fn(&[u8], Option<&str>) -> io::Result<()> + Send + Sync>;
+type FrameDispatcher = Arc<dyn Fn(&[u8], &[u8]) -> io::Result<Vec<u8>> + Send + Sync>;
 
 struct ListenerState {
     responder_private: Zeroizing<Vec<u8>>,
     replay: Mutex<replay::ReplayWindow>,
     limiter: Arc<RequestLimiter>,
     join_tokens: JoinTokenStore,
+    admit_join: JoinAdmitter,
 }
 
 struct MemberRegistryCache {
@@ -79,6 +87,13 @@ struct RequestLimiter {
     active_global: AtomicUsize,
     active_ips: Mutex<HashMap<std::net::IpAddr, usize>>,
     active_peers: Mutex<HashMap<String, usize>>,
+    join_attempts: Mutex<HashMap<std::net::IpAddr, VecDeque<Instant>>>,
+    registry_requests: Mutex<HashMap<String, RegistryTokenBucket>>,
+}
+
+struct RegistryTokenBucket {
+    tokens: f64,
+    last_refill: Instant,
 }
 
 struct GlobalPermit(Arc<RequestLimiter>);
@@ -147,19 +162,27 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
     let authorize: MemberAuthorizer =
         Arc::new(move |peer_static| authorizer_cache.authorize(peer_static));
     let dispatch_path = daemon_path.to_path_buf();
-    let dispatch: FrameDispatcher =
-        Arc::new(move |payload| dispatch_payload(payload, &dispatch_path));
-    Ok(Listener {
+    let request_limiter = Arc::new(RequestLimiter::default());
+    let dispatch_limiter = request_limiter.clone();
+    let dispatch: FrameDispatcher = Arc::new(move |payload, peer_static| {
+        dispatch_payload(payload, peer_static, &dispatch_path, &dispatch_limiter)
+    });
+    let listener = Listener {
         socket,
         state: Arc::new(ListenerState {
             responder_private,
             replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
-            limiter: Arc::new(RequestLimiter::default()),
+            limiter: request_limiter,
             join_tokens,
+            admit_join: Arc::new(cluster::admit_join_locked),
         }),
         authorize,
         dispatch,
-    })
+    };
+    let _ = std::thread::Builder::new()
+        .name("remuda-cluster-startup-sync".into())
+        .spawn(cluster::replication::startup_sync);
+    Ok(listener)
 }
 
 /// Bind and serve requests until the listener fails.
@@ -172,7 +195,7 @@ impl Listener {
         self.socket.local_addr()
     }
 
-    /// Run until stopped; token rollback/expiry state is observed every five seconds.
+    /// Run until stopped; token state and registry changes are observed every five seconds.
     pub fn serve_until(&self, stop: &AtomicBool) -> io::Result<()> {
         std::thread::scope(|scope| {
             let (observe_error_tx, observe_error_rx) = std::sync::mpsc::channel::<io::Error>();
@@ -182,6 +205,7 @@ impl Listener {
                     let _ = observe_error_tx.send(error);
                     return;
                 }
+                let mut observed_registry = cluster::registry::registry_revision_token().ok();
                 loop {
                     match observer_stop_rx.recv_timeout(OBSERVE_INTERVAL) {
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -189,6 +213,17 @@ impl Listener {
                             if let Err(error) = self.state.join_tokens.observe() {
                                 let _ = observe_error_tx.send(error);
                                 break;
+                            }
+                            match cluster::registry::registry_revision_token() {
+                                Ok(revision) if observed_registry.as_ref() != Some(&revision) => {
+                                    observed_registry = Some(revision);
+                                    cluster::replication::registry_changed();
+                                }
+                                Ok(revision) => observed_registry = Some(revision),
+                                Err(error) => {
+                                    let _ = observe_error_tx.send(error);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -295,6 +330,35 @@ fn log_listener_error(context: &str, error: &io::Error) {
 }
 
 impl RequestLimiter {
+    fn acquire_registry_request(&self, fingerprint: &str) -> bool {
+        const BURST: f64 = 10.0;
+        const REFILL_PER_SECOND: f64 = 1.0;
+        let now = Instant::now();
+        let mut buckets = self
+            .registry_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < Duration::from_secs(60));
+        if !buckets.contains_key(fingerprint) && buckets.len() >= MAX_REGISTRY_RATE_BUCKETS {
+            return false;
+        }
+        let bucket = buckets
+            .entry(fingerprint.to_owned())
+            .or_insert(RegistryTokenBucket {
+                tokens: BURST,
+                last_refill: now,
+            });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * REFILL_PER_SECOND).min(BURST);
+        bucket.last_refill = now;
+        if bucket.tokens < 1.0 {
+            return false;
+        }
+        bucket.tokens -= 1.0;
+        true
+    }
+
     fn acquire_ip(self: &Arc<Self>, address: std::net::IpAddr) -> Option<Arc<IpPermit>> {
         let mut ips = self
             .active_ips
@@ -334,6 +398,37 @@ impl RequestLimiter {
             limiter: self.clone(),
             fingerprint: fingerprint.to_owned(),
         }))
+    }
+
+    fn allow_join_attempt(&self, address: std::net::IpAddr, now: Instant) -> bool {
+        let mut attempts = self
+            .join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attempts.retain(|_, times| {
+            while times
+                .front()
+                .is_some_and(|time| now.saturating_duration_since(*time) >= JOIN_ATTEMPT_WINDOW)
+            {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
+        if !attempts.contains_key(&address) && attempts.len() >= MAX_JOIN_ATTEMPT_IPS {
+            if let Some(oldest_ip) = attempts
+                .iter()
+                .min_by_key(|(_, times)| times.front().copied())
+                .map(|(ip, _)| *ip)
+            {
+                attempts.remove(&oldest_ip);
+            }
+        }
+        let bucket = attempts.entry(address).or_default();
+        if bucket.len() >= MAX_JOIN_ATTEMPTS_PER_IP {
+            return false;
+        }
+        bucket.push_back(now);
+        true
     }
 }
 
@@ -581,16 +676,92 @@ where
     Ok(response)
 }
 
-fn dispatch_payload(payload: &[u8], daemon_path: &Path) -> io::Result<Vec<u8>> {
-    let request = crate::remote_front::decode_frame(payload)
-        .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
-    authorize_remote_request(&request)?;
-    crate::remote_front::forward_frame_with_timeout(
-        daemon_path,
-        payload,
-        LOCAL_DAEMON_REQUEST_TIMEOUT.min(MAX_HELD_REQUEST),
-    )
-    .map_err(|reason| io::Error::other(format!("local request failed: {reason}")))
+fn dispatch_payload(
+    payload: &[u8],
+    peer_static: &[u8],
+    daemon_path: &Path,
+    limiter: &RequestLimiter,
+) -> io::Result<Vec<u8>> {
+    let request: Request = serde_json::from_slice(payload)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid cluster request"))?;
+    match request {
+        Request::ClusterRegistrySync { digest, offset } => {
+            let peer_fp = cluster::encoding::fingerprint(peer_static);
+            if !limiter.acquire_registry_request(&peer_fp) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "registry replication rate limit exceeded",
+                ));
+            }
+            let (identity, registry) = cluster::nodes()?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized")
+            })?;
+            let current_digest = registry.digest()?;
+            let unchanged = digest.as_deref() == Some(current_digest.as_str());
+            if offset > registry.authorized_nodes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "registry page offset is out of bounds",
+                ));
+            }
+            let start = offset.min(registry.authorized_nodes.len());
+            let end = start
+                .saturating_add(MAX_REGISTRY_PAGE_ENTRIES)
+                .min(registry.authorized_nodes.len());
+            let page = if unchanged {
+                Vec::new()
+            } else {
+                registry.authorized_nodes[start..end].to_vec()
+            };
+            let entries_json = serde_json::to_string(&page).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "registry encode failed")
+            })?;
+            let next_offset = (!unchanged && end < registry.authorized_nodes.len()).then_some(end);
+            serde_json::to_vec(&Response::ClusterRegistryPage {
+                sender_fp: identity.node_fp,
+                digest: current_digest,
+                offset,
+                entries_json,
+                next_offset,
+                unchanged,
+            })
+            .map_err(|_| io::Error::other("registry response encode failed"))
+        }
+        Request::ClusterRegistryUpdate { update_json } => {
+            let peer_fp = cluster::encoding::fingerprint(peer_static);
+            if !limiter.acquire_registry_request(&peer_fp) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "registry replication rate limit exceeded",
+                ));
+            }
+            if update_json.len() > MAX_REGISTRY_UPDATE_JSON_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "registry update exceeds page byte cap",
+                ));
+            }
+            let update = cluster::registry::RegistryUpdate::decode(update_json.as_bytes())?;
+            let outcome = cluster::registry::apply_registry_update(&update, peer_static)?;
+            let (_, registry) = cluster::nodes()?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized")
+            })?;
+            serde_json::to_vec(&Response::ClusterRegistryAck {
+                digest: registry.digest()?,
+                applied: !outcome.applied.is_empty(),
+            })
+            .map_err(|_| io::Error::other("registry acknowledgement encode failed"))
+        }
+        request => {
+            authorize_remote_request(&request)?;
+            crate::remote_front::forward_frame_with_timeout(
+                daemon_path,
+                payload,
+                LOCAL_DAEMON_REQUEST_TIMEOUT.min(MAX_HELD_REQUEST),
+            )
+            .map_err(|reason| io::Error::other(format!("local request failed: {reason}")))
+        }
+    }
 }
 
 fn spawn_connection_handler(
@@ -611,13 +782,22 @@ fn spawn_connection_handler(
         .name("remuda-cluster-listener".into())
         .spawn(move || {
             let _ip_permit = ip_permit;
-            handle_connection_with(stream, state, global_permit, authorize, dispatch, limits);
+            handle_connection_with(
+                stream,
+                remote_addr,
+                state,
+                global_permit,
+                authorize,
+                dispatch,
+                limits,
+            );
         })
         .map(|_| ())
 }
 
 fn handle_connection_with(
     stream: TcpStream,
+    remote_addr: SocketAddr,
     state: Arc<ListenerState>,
     global_permit: Arc<GlobalPermit>,
     authorize: MemberAuthorizer,
@@ -635,9 +815,7 @@ fn handle_connection_with(
         Err(_) => return ignore_response_error(write_http_response(stream, 400, b"bad frame")),
     };
     let peer_fp = cluster::encoding::fingerprint(&opened.peer_static);
-    if authorize(&opened.peer_static).is_err() {
-        return ignore_response_error(write_http_response(stream, 403, b"not admitted"));
-    }
+    let admitted = authorize(&opened.peer_static).is_ok();
     let now = crate::SystemWallClock::new().unix_seconds() as i64;
     let replay = state
         .replay
@@ -646,6 +824,9 @@ fn handle_connection_with(
         .check_and_insert(&peer_fp, opened.ephemeral, opened.timestamp_seconds, now);
     if replay.is_err() {
         return ignore_response_error(write_http_response(stream, 409, b"replayed or stale frame"));
+    }
+    if !admitted {
+        return handle_unknown_peer_join(stream, remote_addr, state, opened);
     }
     let Some(peer_permit) = state.limiter.acquire_peer(&peer_fp) else {
         return ignore_response_error(write_http_response(
@@ -670,7 +851,7 @@ fn handle_connection_with(
                 &peer_static,
                 |key| authorize_worker(key),
                 limits.post_dispatch_hold,
-                || dispatch_worker(&payload),
+                || dispatch_worker(&payload, &peer_static),
             );
             let _ = reply_tx.send(result);
         });
@@ -691,6 +872,54 @@ fn handle_connection_with(
         return send_encrypted_response(stream, opened, &refused);
     }
     send_encrypted_response(stream, opened, &response)
+}
+
+fn handle_unknown_peer_join(
+    stream: TcpStream,
+    remote_addr: SocketAddr,
+    state: Arc<ListenerState>,
+    opened: frame::OpenedRequest,
+) {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct JoinRequest {
+        join: JoinToken,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct JoinToken {
+        token: String,
+        #[serde(default)]
+        endpoint: Option<String>,
+    }
+    let request: JoinRequest = match serde_json::from_slice(&opened.payload) {
+        Ok(request) => request,
+        Err(_) => return ignore_response_error(write_http_response(stream, 403, b"not admitted")),
+    };
+    if !state
+        .limiter
+        .allow_join_attempt(remote_addr.ip(), Instant::now())
+    {
+        return ignore_response_error(write_http_response(
+            stream,
+            429,
+            b"join attempt rate limit reached",
+        ));
+    }
+    let result = state
+        .join_tokens
+        .verify_consume_with(&request.join.token, || {
+            (state.admit_join)(&opened.peer_static, request.join.endpoint.as_deref())
+        });
+    if result.is_ok() {
+        cluster::registry_changed();
+    }
+    let response = if result.is_ok() {
+        b"{\"joined\":true}".as_slice()
+    } else {
+        b"{\"joined\":false}".as_slice()
+    };
+    send_encrypted_response(stream, opened, response);
 }
 
 fn encode_error(reason: &str) -> Vec<u8> {
@@ -763,6 +992,29 @@ mod tests {
             dispatch: FrameDispatcher,
             limits: ConnectionLimits,
         ) -> Self {
+            Self::start_with_admitter(
+                responder_private,
+                responder_public,
+                authorize,
+                dispatch,
+                limits,
+                Arc::new(|_, _| {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "admission refused",
+                    ))
+                }),
+            )
+        }
+
+        fn start_with_admitter(
+            responder_private: Vec<u8>,
+            responder_public: Vec<u8>,
+            authorize: MemberAuthorizer,
+            dispatch: FrameDispatcher,
+            limits: ConnectionLimits,
+            admit_join: JoinAdmitter,
+        ) -> Self {
             use std::os::unix::fs::PermissionsExt;
             let responder_private_for_test = responder_private.clone();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -783,6 +1035,7 @@ mod tests {
                 replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
+                admit_join,
             });
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = stop.clone();
@@ -839,6 +1092,7 @@ mod tests {
                 replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
+                admit_join: Arc::new(cluster::admit_join_locked),
             });
             let listener = Listener {
                 socket: listener,
@@ -944,7 +1198,7 @@ mod tests {
 
     #[cfg(unix)]
     fn socket_server(
-        dispatch: impl Fn(&[u8]) -> io::Result<Vec<u8>> + Send + Sync + 'static,
+        dispatch: impl Fn(&[u8], &[u8]) -> io::Result<Vec<u8>> + Send + Sync + 'static,
         held_timeout: Duration,
         post_dispatch_hold_limit: Duration,
         idle_timeout: Duration,
@@ -960,6 +1214,7 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: crate::cluster::encoding::fingerprint(&peer.public),
                 static_pubkey: crate::cluster::encoding::encode_base64(&peer.public),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: "test".into(),
@@ -996,7 +1251,7 @@ mod tests {
             responder.private,
             responder.public,
             Arc::new(|_| Ok(())),
-            Arc::new(|_| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
+            Arc::new(|_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
         );
         (server, peer)
     }
@@ -1263,6 +1518,7 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: fingerprint.clone(),
                 static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: fingerprint,
@@ -1345,11 +1601,45 @@ mod tests {
         assert!(limiter.acquire_ip(source).is_some());
     }
 
+    #[test]
+    fn request_limiter_caps_join_attempts_per_ip_for_a_monotonic_minute() {
+        let limiter = RequestLimiter::default();
+        let address = "192.0.2.44".parse().unwrap();
+        let start = Instant::now();
+        for attempt in 0..MAX_JOIN_ATTEMPTS_PER_IP {
+            assert!(
+                limiter.allow_join_attempt(address, start + Duration::from_secs(attempt as u64))
+            );
+        }
+        assert!(!limiter.allow_join_attempt(address, start + Duration::from_secs(20)));
+        assert!(limiter.allow_join_attempt(
+            address,
+            start + JOIN_ATTEMPT_WINDOW + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn registry_requests_allow_ten_burst_per_peer() {
+        let limiter = RequestLimiter::default();
+        for _ in 0..10 {
+            assert!(limiter.acquire_registry_request("peer-a"));
+        }
+        assert!(!limiter.acquire_registry_request("peer-a"));
+        assert!(limiter.acquire_registry_request("peer-b"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn socket_accepts_a_fresh_ik_request_and_refuses_its_replay() {
         let (server, peer, _) = socket_server(
-            |payload| dispatch_payload(payload, Path::new("unused-daemon-path")),
+            |payload, peer| {
+                dispatch_payload(
+                    payload,
+                    peer,
+                    Path::new("unused-daemon-path"),
+                    &RequestLimiter::default(),
+                )
+            },
             socket_test_timeout(),
             socket_test_timeout(),
             socket_test_timeout(),
@@ -1376,11 +1666,71 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn socket_admits_unknown_join_once_and_passes_optional_endpoint() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let admissions = Arc::new(Mutex::new(Vec::new()));
+        let recorded = admissions.clone();
+        let server = SocketTestServer::start_with_admitter(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "unknown"))),
+            Arc::new(|_, _| panic!("Join must not reach daemon dispatch")),
+            ConnectionLimits {
+                outer_hold: socket_test_timeout(),
+                post_dispatch_hold: socket_test_timeout(),
+                idle_read: socket_test_timeout(),
+                total_read: socket_test_timeout(),
+            },
+            Arc::new(move |key, endpoint| {
+                recorded.lock().unwrap().push((
+                    cluster::encoding::fingerprint(key),
+                    endpoint.map(str::to_owned),
+                ));
+                Ok(())
+            }),
+        );
+        let token_store =
+            JoinTokenStore::open_at(&server.state_dir, Arc::new(crate::SystemWallClock::new()))
+                .unwrap();
+        let minted = token_store.mint().unwrap();
+        let make_payload = || {
+            serde_json::to_vec(&serde_json::json!({
+                "join": {
+                    "token": minted.token.as_str(),
+                    "endpoint": "198.51.100.20:9443"
+                }
+            }))
+            .unwrap()
+        };
+        let first = sealed_payload_request(&peer, &server, &make_payload());
+        let (status, response) = server.exchange(first);
+        assert_eq!(status, 200);
+        assert_eq!(response, b"{\"joined\":true}");
+        let reused = sealed_payload_request(&peer, &server, &make_payload());
+        let (status, response) = server.exchange(reused);
+        assert_eq!(status, 200);
+        assert_eq!(response, b"{\"joined\":false}");
+        assert_eq!(
+            admissions.lock().unwrap().as_slice(),
+            &[(
+                cluster::encoding::fingerprint(&peer.public),
+                Some("198.51.100.20:9443".into())
+            )]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn socket_rejects_low_order_unknown_and_mismatched_static_keys_before_dispatch() {
         let dispatched = Arc::new(AtomicUsize::new(0));
         let dispatched_for_worker = dispatched.clone();
         let (server, peer, registry) = socket_server(
-            move |_| {
+            move |_, _| {
                 dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
                 Ok(serde_json::to_vec(&Response::Ok).unwrap())
             },
@@ -1425,7 +1775,14 @@ mod tests {
     #[test]
     fn socket_denials_and_malformed_json_never_echo_request_payloads() {
         let (server, peer, _) = socket_server(
-            |payload| dispatch_payload(payload, Path::new("unused-daemon-path")),
+            |payload, peer| {
+                dispatch_payload(
+                    payload,
+                    peer,
+                    Path::new("unused-daemon-path"),
+                    &RequestLimiter::default(),
+                )
+            },
             socket_test_timeout(),
             socket_test_timeout(),
             socket_test_timeout(),
@@ -1463,6 +1820,51 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn bad_join_tokens_are_rate_limited_without_writing_token_state() {
+        use std::os::unix::fs::MetadataExt;
+
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let server = SocketTestServer::start_production(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Err(permission_denied())),
+            Arc::new(|_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
+        );
+        let token_path = server.state_dir.join("join_tokens.json");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !token_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let initial_bytes =
+            std::fs::read(&token_path).expect("listener startup observes token state");
+        let initial_inode = std::fs::metadata(&token_path).unwrap().ino();
+        let request = serde_json::json!({
+            "join": { "token": crate::cluster::encoding::encode_base64(&[9; 32]) }
+        });
+        let payload = serde_json::to_vec(&request).unwrap();
+        for _ in 0..MAX_JOIN_ATTEMPTS_PER_IP {
+            let sealed = sealed_payload_request(&peer, &server, &payload);
+            let (status, response) = server.exchange(sealed);
+            assert_eq!(status, 200);
+            assert_eq!(response, b"{\"joined\":false}");
+        }
+        let too_many = sealed_payload_request(&peer, &server, &payload);
+        assert_eq!(server.exchange(too_many).0, 429);
+        assert_eq!(std::fs::read(&token_path).unwrap(), initial_bytes);
+        assert_eq!(
+            std::fs::metadata(&token_path).unwrap().ino(),
+            initial_inode,
+            "bad tokens must not replace token state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn socket_remote_input_is_refused_without_dispatch() {
         let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
             .generate_keypair()
@@ -1474,7 +1876,14 @@ mod tests {
             responder.private,
             responder.public,
             Arc::new(|_| Ok(())),
-            Arc::new(|payload| dispatch_payload(payload, Path::new("unused-daemon-path"))),
+            Arc::new(|payload, peer| {
+                dispatch_payload(
+                    payload,
+                    peer,
+                    Path::new("unused-daemon-path"),
+                    &RequestLimiter::default(),
+                )
+            }),
         );
         let request = Request::Input {
             name: "session".into(),
@@ -1501,7 +1910,7 @@ mod tests {
         let release_rx = Arc::new(Mutex::new(release_rx));
         let worker_release_rx = release_rx.clone();
         let (server, peer, registry) = socket_server(
-            move |_| {
+            move |_, _| {
                 entered_tx.send(()).unwrap();
                 worker_release_rx.lock().unwrap().recv().unwrap();
                 Ok(serde_json::to_vec(&Response::Value("held secret".into())).unwrap())
@@ -1537,7 +1946,7 @@ mod tests {
     #[test]
     fn socket_held_requests_obey_outer_deadline_and_post_dispatch_hold_check() {
         let (server, peer, _) = socket_server(
-            |_| {
+            |_, _| {
                 std::thread::sleep(Duration::from_millis(250));
                 Ok(serde_json::to_vec(&Response::Ok).unwrap())
             },
@@ -1553,7 +1962,7 @@ mod tests {
         assert!(matches!(response, Response::Error(message) if message.contains("timed out")));
 
         let (server, peer, _) = socket_server(
-            |_| {
+            |_, _| {
                 std::thread::sleep(Duration::from_millis(80));
                 Ok(serde_json::to_vec(&Response::Ok).unwrap())
             },
@@ -1573,7 +1982,7 @@ mod tests {
     #[test]
     fn socket_http_requires_content_length_and_rejects_an_over_cap_body() {
         let (server, _peer, _) = socket_server(
-            |_| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
             socket_test_timeout(),
             socket_test_timeout(),
             socket_test_timeout(),
@@ -1608,7 +2017,7 @@ mod tests {
     #[test]
     fn socket_idle_read_deadline_closes_a_slowloris_request() {
         let (server, _peer, _) = socket_server(
-            |_| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
             socket_test_timeout(),
             socket_test_timeout(),
             Duration::from_millis(80),
@@ -1631,7 +2040,7 @@ mod tests {
     #[test]
     fn socket_total_read_deadline_stops_a_slow_drip_that_beats_idle_timeout() {
         let (server, _peer, _) = socket_server(
-            |_| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
             socket_test_timeout(),
             socket_test_timeout(),
             Duration::from_millis(150),
@@ -1664,6 +2073,7 @@ mod tests {
         registry.authorized_nodes.push(AuthorizedNode {
             node_fp: fingerprint.clone(),
             static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+            endpoint: None,
             state: NodeState::Admitted,
             version: 1,
             by: fingerprint,
@@ -1684,6 +2094,7 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: fingerprint.clone(),
                 static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: fingerprint,

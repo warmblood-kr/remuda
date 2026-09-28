@@ -951,6 +951,9 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::MouseState(_) => Err(mlua::Error::runtime(
             "mouse state is not exposed to scripts",
         )),
+        Response::ClusterRegistryPage { .. } | Response::ClusterRegistryAck { .. } => Err(
+            mlua::Error::runtime("cluster registry responses are not exposed to scripts"),
+        ),
     }
 }
 
