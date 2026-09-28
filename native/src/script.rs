@@ -838,6 +838,9 @@ fn lua_env_to_wire(env: Table) -> mlua::Result<std::collections::HashMap<String,
 fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
     match response {
         Response::Ok => Ok(Value::Nil),
+        Response::AttachStarted { .. } | Response::AttachStatus { .. } => Err(
+            mlua::Error::runtime("attach responses are not exposed to scripts"),
+        ),
         Response::Screen(text) => Ok(Value::String(lua.create_string(&text)?)),
         // No binding here asks for an `Eval`, so this arm is unreachable in
         // practice — spelled out rather than folded into a wildcard so that

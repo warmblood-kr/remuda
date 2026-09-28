@@ -166,7 +166,7 @@ fn an_attached_viewer_gets_a_repaint_and_then_a_live_stream() {
     session.send_line("echo $((11*11))-before").expect("send");
     wait_for(&session, "121-before");
 
-    let held = session.attach().expect("attach");
+    let held = session.attach();
 
     let painted = held.screen_bytes().expect("repaint");
     let painted = String::from_utf8_lossy(&painted);
@@ -206,7 +206,7 @@ fn an_attached_viewer_replays_mouse_modes_set_before_attach() {
     wait_for(&session, "ready-mode");
     assert!(session.mouse_tracking(), "the pty should remember ?1000h");
 
-    let held = session.attach().expect("attach");
+    let held = session.attach();
     let painted = held.screen_bytes().expect("initial state repaint");
     assert!(
         painted
@@ -219,7 +219,7 @@ fn an_attached_viewer_replays_mouse_modes_set_before_attach() {
 #[test]
 fn detaching_leaves_the_agent_untouched_and_the_core_back_in_charge() {
     let session = session("handover");
-    let held = session.attach().expect("attach");
+    let held = session.attach();
     held.write_raw(b"echo $((5*5))-typed\r")
         .expect("keystrokes");
     wait_for(&session, "25-typed");

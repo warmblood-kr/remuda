@@ -67,6 +67,10 @@ pub enum Request {
     /// Take the session over for a human at a terminal. On `Ok`, this
     /// connection becomes a byte pipe.
     Attach { name: String },
+    /// Attach with a generation that can be checked after the raw stream ends.
+    AttachTracked { name: String },
+    /// Ask whether a tracked attachment was superseded while its stream ended.
+    AttachStatus { name: String, generation: u64 },
     /// End a session — live or already self-exited — and stop tracking it.
     /// Refused while a human is attached. A session that ended on its own is
     /// dropped by `List`; this is for one still alive.
@@ -129,6 +133,14 @@ pub enum Response {
     /// nothing" from "the expression returned nothing".
     Value(String),
     Ok,
+    /// A tracked attachment was accepted and its generation is returned.
+    AttachStarted {
+        generation: u64,
+    },
+    /// Whether this generation was displaced by a newer attachment.
+    AttachStatus {
+        taken_over: bool,
+    },
     /// The reason, in words meant for a person. A client prints this; it does
     /// not parse it.
     Error(String),
