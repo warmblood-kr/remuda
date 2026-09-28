@@ -420,7 +420,7 @@ fn close_instance(
 ) -> Option<AgentResult<()>> {
     let closed = registry.close_instance(name, instance_id)?;
     if let Ok(true) = closed {
-        notify_exited(image, name);
+        notify_exited(image, name, "closed", None);
     }
     Some(closed.map(drop))
 }
