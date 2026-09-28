@@ -191,8 +191,16 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
         let image = image.clone();
         let counters = Arc::clone(&counters);
         let socket_owner = Arc::clone(&socket_owner);
+        let socket_path = path.to_path_buf();
         std::thread::spawn(move || {
-            let _ = handle(stream, &registry, &image, &counters, socket_owner);
+            let _ = handle(
+                stream,
+                &registry,
+                &image,
+                &counters,
+                socket_owner,
+                &socket_path,
+            );
         });
     }
     socket_owner.cleanup();
@@ -512,6 +520,7 @@ fn handle(
     image: &Image,
     counters: &crate::tick::Counters,
     socket_owner: Arc<SocketOwnership>,
+    socket_path: &Path,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
@@ -564,7 +573,13 @@ fn handle(
                         .as_str(),
                 )),
             };
-            match spawn(&name, &command, size, cwd.as_deref(), env.as_ref()) {
+            let mut session_env = env.unwrap_or_default();
+            session_env.insert("REMUDA_SESSION_NAME".into(), name.clone());
+            session_env.insert(
+                "REMUDA_SOCKET_PATH".into(),
+                socket_path.to_string_lossy().into_owned(),
+            );
+            match spawn(&name, &command, size, cwd.as_deref(), Some(&session_env)) {
                 Err(e) => reply(&stream, &Response::error(e)),
                 Ok(session) => match registry.register(session) {
                     Ok(_) => reply(&stream, &Response::Value(name)),

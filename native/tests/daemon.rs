@@ -2100,14 +2100,84 @@ fn stop_refuses_to_kill_a_live_session_without_being_told_twice() {
         "the daemon died despite refusing"
     );
 
-    // -f is the way past it, and the same daemon now goes.
+    // -f still refuses without a terminal when live sessions exist.
     let forced = remuda(&dir, &["-s", "s", "stop", "-f"]);
+    assert!(
+        !forced.status.success(),
+        "-f stopped a live herd without a TTY"
+    );
+    assert!(String::from_utf8_lossy(&forced.stderr).contains("nothing to ask on"));
+    assert!(
+        remuda_native::ipc::connect(&path).is_ok(),
+        "the daemon died after refusal"
+    );
+
+    // The explicit override is the non-interactive way past it.
+    let forced = remuda(&dir, &["-s", "s", "stop", "-f", "--yes"]);
     assert!(
         forced.status.success(),
         "{}",
         String::from_utf8_lossy(&forced.stderr)
     );
     assert!(daemon.left_on_its_own(), "-f did not stop it");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_session_cannot_force_stop_its_own_daemon_without_an_explicit_override() {
+    let dir = scratch_dir("stop-inside");
+    let path = daemon::socket_path_in(&dir, "s");
+    let mut daemon = Daemon::spawn(&dir);
+    let binary = env!("CARGO_BIN_EXE_remuda");
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("inside".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("'{binary}' -s s stop -f; sleep 30"),
+            ],
+            size: Size::new(100, 30),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("create managed session");
+    assert!(matches!(response, Response::Value(_)));
+
+    let deadline = Instant::now() + PATIENCE;
+    let screen = loop {
+        let screen = capture(&path, "inside");
+        if screen.contains("cannot stop this daemon") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stop command did not report its refusal: {screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        screen.contains("--yes"),
+        "missing explicit override guidance: {screen}"
+    );
+    assert!(
+        remuda_native::ipc::connect(&path).is_ok(),
+        "the daemon died"
+    );
+    let stopped = remuda(&dir, &["-s", "s", "stop", "-f", "--yes"]);
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(
+        daemon.left_on_its_own(),
+        "daemon did not exit after override"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A name with no matching arm is a plain error naming the package, not a
