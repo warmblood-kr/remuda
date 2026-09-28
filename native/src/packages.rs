@@ -375,13 +375,9 @@ fn install_from_checkout(
         .strip_prefix(&canonical_checkout)
         .map_err(|_| "manifest entry escaped checkout".to_string())?;
     let data = mods_dir()?;
-    fs::create_dir_all(&data)
-        .map_err(|error| format!("cannot create {}: {error}", data.display()))?;
     let target = data.join(&spec.name);
-    let staging = temporary_path_in(&data, "install")?;
-    let staging_package = staging.join(package_relative);
-    copy_tree(&package_root, &staging_package)?;
-    copy_file_with_safe_mode(&manifest_path, &staging.join("extension.toml"))?;
+    let mut staging = stage_package_tree(&data, &package_root, package_relative)?;
+    copy_file_with_safe_mode(&manifest_path, &staging.path().join("extension.toml"))?;
     let commit = git_commit(checkout)?;
     let mut source = format!("https://github.com/{owner}/{repo}.git\ncommit={commit}\n");
     if let Some(reference) = &reference {
@@ -389,13 +385,12 @@ fn install_from_checkout(
         source.push_str(reference);
         source.push('\n');
     }
-    let source_path = staging.join("source");
+    let source_path = staging.path().join("source");
     fs::write(&source_path, source)
         .map_err(|error| format!("cannot write source metadata: {error}"))?;
     mask_installed_file_mode(&source_path)?;
     if fs::symlink_metadata(&target).is_ok() {
         if !force {
-            let _ = fs::remove_dir_all(&staging);
             return Err(format!(
                 "mod {} is already installed; pass --force to replace it",
                 spec.name
@@ -407,16 +402,17 @@ fn install_from_checkout(
             .map_err(|error| format!("cannot prepare backup {}: {error}", backup.display()))?;
         fs::rename(&target, &backup)
             .map_err(|error| format!("cannot stage existing mod {}: {error}", target.display()))?;
-        if let Err(error) = fs::rename(&staging, &target) {
+        fs::rename(staging.path(), &target).map_err(|error| {
             let _ = fs::rename(&backup, &target);
-            let _ = fs::remove_dir_all(&staging);
-            return Err(format!("cannot commit mod install: {error}"));
-        }
+            format!("cannot commit mod install: {error}")
+        })?;
+        staging.disarm();
         fs::remove_dir_all(&backup)
             .map_err(|error| format!("cannot remove old mod backup: {error}"))?;
     } else {
-        fs::rename(&staging, &target)
+        fs::rename(staging.path(), &target)
             .map_err(|error| format!("cannot commit mod install: {error}"))?;
+        staging.disarm();
     }
     Ok(InstallReport {
         manifest: manifest_from_spec(spec, "disk"),
@@ -1039,6 +1035,70 @@ fn temporary_path_in(parent: &Path, label: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn stage_package_tree(
+    data: &Path,
+    package_root: &Path,
+    package_relative: &Path,
+) -> Result<StagingDir, String> {
+    fs::create_dir_all(data)
+        .map_err(|error| format!("cannot create {}: {error}", data.display()))?;
+    mask_installed_permissions(data)?;
+    let staging = StagingDir::create(temporary_path_in(data, "install")?);
+    mask_installed_permissions(staging.path())?;
+    let package_parent_relative = package_relative.parent().unwrap_or_else(|| Path::new(""));
+    let staging_package_parent = staging.path().join(package_parent_relative);
+    fs::create_dir_all(&staging_package_parent).map_err(|error| {
+        format!(
+            "cannot create {}: {error}",
+            staging_package_parent.display()
+        )
+    })?;
+    let source_package_parent = package_root
+        .parent()
+        .ok_or_else(|| "manifest entry has no packages directory".to_string())?;
+    let source_parent_permissions = fs::metadata(source_package_parent)
+        .map_err(|error| {
+            format!(
+                "cannot inspect {}: {error}",
+                source_package_parent.display()
+            )
+        })?
+        .permissions();
+    set_safe_installed_permissions(&staging_package_parent, &source_parent_permissions)?;
+    copy_tree(package_root, &staging.path().join(package_relative))?;
+    Ok(staging)
+}
+
+struct StagingDir {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+impl StagingDir {
+    fn create(path: PathBuf) -> Self {
+        Self {
+            path,
+            cleanup: true,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup = false;
+    }
+}
+
+impl Drop for StagingDir {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 fn ensure_regular_file(path: &Path, label: &str) -> Result<(), String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("cannot access {label} {}: {error}", path.display()))?;
@@ -1057,6 +1117,7 @@ fn copy_tree(source: &Path, target: &Path) -> Result<(), String> {
     if metadata.is_dir() {
         fs::create_dir_all(target)
             .map_err(|error| format!("cannot create {}: {error}", target.display()))?;
+        set_safe_installed_permissions(target, &metadata.permissions())?;
         for entry in fs::read_dir(source)
             .map_err(|error| format!("cannot read {}: {error}", source.display()))?
         {
@@ -1090,17 +1151,29 @@ fn copy_file_with_safe_mode(source: &Path, target: &Path) -> Result<(), String> 
         .permissions();
     fs::copy(source, target)
         .map_err(|error| format!("cannot copy {}: {error}", source.display()))?;
-    set_installed_file_permissions(target, &permissions)
+    set_safe_installed_permissions(target, &permissions)
 }
 
 fn mask_installed_file_mode(path: &Path) -> Result<(), String> {
     let permissions = fs::metadata(path)
         .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
         .permissions();
-    set_installed_file_permissions(path, &permissions)
+    set_safe_installed_permissions(path, &permissions)
 }
 
-fn set_installed_file_permissions(target: &Path, source: &fs::Permissions) -> Result<(), String> {
+fn mask_installed_permissions(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "install directory {} must be a real directory",
+            path.display()
+        ));
+    }
+    set_safe_installed_permissions(path, &metadata.permissions())
+}
+
+fn set_safe_installed_permissions(target: &Path, source: &fs::Permissions) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1163,9 +1236,10 @@ fn valid_package_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        copy_tree, parse_manifest, parse_repository, satisfies, test_path, update_all_with,
-        validate_reference, InstallReport, Manifest, MOD_LIFECYCLE_API,
+        copy_tree, parse_manifest, parse_repository, satisfies, stage_package_tree, test_path,
+        update_all_with, validate_reference, InstallReport, Manifest, MOD_LIFECYCLE_API,
     };
+    use std::path::Path;
 
     fn with_requires(line: &str) -> Result<super::ModSpec, String> {
         parse_manifest(&format!(
@@ -1218,6 +1292,53 @@ mod tests {
                 & 0o7777,
             0o755
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copied_directory_modes_are_masked_to_0755() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("remuda-mod-dirmode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let source = root.join("source/packages/guest/nested");
+        let data = root.join("installed");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("init.lua"), "return {}\n").unwrap();
+
+        let staging = stage_package_tree(
+            &data,
+            &root.join("source/packages/guest"),
+            Path::new("packages/guest"),
+        )
+        .unwrap();
+        for directory in [
+            data.clone(),
+            staging.path().to_path_buf(),
+            staging.path().join("packages"),
+            staging.path().join("packages/guest"),
+            staging.path().join("packages/guest/nested"),
+        ] {
+            assert_eq!(
+                std::fs::metadata(directory).unwrap().permissions().mode() & 0o7777,
+                0o755
+            );
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_package_copy_removes_its_staging_directory() {
+        let root = std::env::temp_dir().join(format!("remuda-mod-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let data = root.join("mods");
+        let package = root.join("checkout/packages/guest");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("not-lua.txt"), "not allowed\n").unwrap();
+
+        assert!(stage_package_tree(&data, &package, Path::new("packages/guest")).is_err());
+        assert_eq!(std::fs::read_dir(&data).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(root);
     }
 
