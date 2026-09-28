@@ -70,10 +70,18 @@ jobs:
       - name: confirm launchd actually loaded the agent
         run: |
           set -eu
-          out=$(launchctl print "gui/$(id -u)/kr.warmblood.remuda.butler")
+          # An interval job idles as 'not running' between runs, so state
+          # alone proves nothing: run it once and require a clean exit.
+          label="gui/$(id -u)/kr.warmblood.remuda.butler"
+          launchctl print "$label" >/dev/null
+          launchctl kickstart "$label"
+          for _ in $(seq 20); do
+            out=$(launchctl print "$label")
+            echo "$out" | grep -Eq 'last exit code = 0$' && { echo "$out"; exit 0; }
+            sleep 0.5
+          done
           echo "$out"
-          echo "$out" | grep -Eq 'state = (running|waiting)' \
-            || { echo "::error::launchctl print did not show a running/waiting state for the loaded agent"; exit 1; }
+          echo "::error::the loaded agent did not run to a clean exit (last exit code != 0)"; exit 1
 
       - name: cleanup — bootout the agent
         # Hygiene, not load-bearing: the runner is destroyed right after this
