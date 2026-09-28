@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 64] = [
+pub const BINDINGS: [&str; 66] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -57,6 +57,8 @@ pub const BINDINGS: [&str; 64] = [
     "clear_hooks",
     "click",
     "close",
+    "contribute",
+    "contributions",
     "emit",
     "emit_filter",
     "emit_until_failure",
@@ -505,6 +507,8 @@ fn exec_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
         })
 }
 
+/// A top-level mod first gets its `requires` checked as a whole, then its
+/// lifecycle hosts activated in order (exec leaves an active one alone).
 fn execute_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Result<()> {
     let loaded = load_package(lua, name, require_lifecycle);
     // A mod that redefined an advised function keeps its advice: the new
@@ -518,6 +522,20 @@ fn execute_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Resu
 }
 
 fn load_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Result<()> {
+    if !name.contains('/') {
+        for host in crate::packages::requirement_order(name).map_err(mlua::Error::runtime)? {
+            let lifecycle = crate::packages::resolve(&host)
+                .map_err(mlua::Error::runtime)?
+                .is_some_and(|package| package.lifecycle.is_some());
+            if lifecycle {
+                activate_package(lua, &host, false)?;
+            }
+        }
+    }
+    activate_package(lua, name, require_lifecycle)
+}
+
+fn activate_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Result<()> {
     let package = crate::packages::resolve(name)
         .map_err(mlua::Error::runtime)?
         .ok_or_else(|| mlua::Error::runtime(format!("no such package: {name}")))?;
