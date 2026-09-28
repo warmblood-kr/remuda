@@ -158,6 +158,24 @@ remuda.tool("review", "Review a session", function(name)
 end, "review(name) -> string")
 ```
 
+## Contributions
+
+`remuda.contribute(point, id, entry)` fills an extension point that a host defines (like VS Code `contributes`). The same point and id replaces the earlier entry.
+
+`remuda.contributions(point)` returns copies of `{id, owner, entry}`, sorted by `entry.order` (default 0) and then by id.
+
+A lifecycle mod can declare its contributions: `contributes = { [point] = { {id = ..., ...} } }`.
+- Declared entries are owned by the mod, and their function fields receive `state` first, like hooks.
+- A reload replaces only that mod's entries, and a failed `start` restores the previous ones.
+- A malformed declaration is refused before anything changes.
+
+```lua
+contributes = {
+  ["butler.command"] = {{ id = "inbox", order = 20, usage = "inbox [NAME]",
+    run = function(state, args, caller) return "..." end }},
+}
+```
+
 ## Generated reference
 
 The reference below is extracted from the built Remuda runtime; it is not a

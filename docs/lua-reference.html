@@ -3,8 +3,12 @@
 <p><code>_call(name, arguments, caller) -&gt; string</code> — Dispatch one MCP tools/call by name.</p>
 <h2 id="descriptors">_descriptors</h2>
 <p><code>_descriptors() -&gt; string</code> — MCP tool descriptors for everything <span class="title-ref">remuda.tool</span> has registered.</p>
+<h2 id="dispatch_extension_command">_dispatch_extension_command</h2>
+<p><code>_dispatch_extension_command(name, args, caller) -&gt; value</code> — Dispatch arguments and caller context to a loaded mod command handler.</p>
 <h2 id="event_counts">_event_counts</h2>
 <p><code>table</code> — Internal event-emit counts, keyed by event name. Read via <span class="title-ref">event_counts()</span>.</p>
+<h2 id="extension_commands">_extension_commands</h2>
+<p><code>table</code> — Handlers registered for installed mod commands.</p>
 <h2 id="process_drain">_process_drain</h2>
 <p><code>_process_drain(id) -&gt; nil</code> — Deliver buffered process output as emit events; internal, an Image job only.</p>
 <h2 id="process_killpg">_process_killpg</h2>
@@ -39,12 +43,18 @@
 <p><code>click(name, col, row, button?) -&gt; nil</code> — Send a mouse click at a terminal cell.</p>
 <h2 id="close">close</h2>
 <p><code>close(name) -&gt; nil</code> — End a session, live or already self-exited.</p>
+<h2 id="contribute">contribute</h2>
+<p><code>contribute(point, id, entry) -&gt; nil</code> — Fill an extension point: the same point and id replaces. <span class="title-ref">entry.order</span> sorts (default 0).</p>
+<h2 id="contributions">contributions</h2>
+<p><code>contributions(point) -&gt; {{id, owner, entry}...}</code> — A point's entries as copies of {id, owner, entry}, by entry.order then id.</p>
 <h2 id="emit">emit</h2>
 <p><code>emit(event, ...) -&gt; nil</code> — Fire an event, running every hook registered for it.</p>
 <h2 id="event_counts-1">event_counts</h2>
 <p><code>event_counts() -&gt; {[event]=n}</code> — How many times each event has been emitted.</p>
 <h2 id="exec">exec</h2>
 <p><code>exec(name) -&gt; nil</code> — Run an installed mod's entry source, by name, in this same image.</p>
+<h2 id="extension_command">extension_command</h2>
+<p><code>extension_command(name, handler(args, caller)) -&gt; nil</code> — Register a handler for an installed mod command.</p>
 <h2 id="feed">feed</h2>
 <p><code>feed(name, steps) -&gt; nil</code> — Deliver a sequence of bursts and pauses as one indivisible act.</p>
 <h2 id="hooks">hooks</h2>
@@ -69,6 +79,8 @@
 <p><code>process(spec) -&gt; id</code> — Spawn a plain-pipe child process; its stdout lines and exit arrive as emit events.</p>
 <h2 id="processes">processes</h2>
 <p><code>processes() -&gt; {id...}</code> — List the ids of every process started with <span class="title-ref">remuda.process</span> that is still running.</p>
+<h2 id="reload">reload</h2>
+<p><code>reload(name) -&gt; nil</code> — Reload a lifecycle-managed mod in this image, preserving state and replacing its registrations.</p>
 <h2 id="remove_dir_all">remove_dir_all</h2>
 <p><code>remove_dir_all(dir) -&gt; nil</code> — Remove a directory and everything under it.</p>
 <h2 id="request_counts">request_counts</h2>

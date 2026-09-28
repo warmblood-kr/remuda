@@ -11,10 +11,20 @@ _descriptors
 
 ``_descriptors() -> string`` — MCP tool descriptors for everything `remuda.tool` has registered.
 
+_dispatch_extension_command
+---------------------------
+
+``_dispatch_extension_command(name, args, caller) -> value`` — Dispatch arguments and caller context to a loaded mod command handler.
+
 _event_counts
 -------------
 
 ``table`` — Internal event-emit counts, keyed by event name. Read via `event_counts()`.
+
+_extension_commands
+-------------------
+
+``table`` — Handlers registered for installed mod commands.
 
 _process_drain
 --------------
@@ -101,6 +111,16 @@ close
 
 ``close(name) -> nil`` — End a session, live or already self-exited.
 
+contribute
+----------
+
+``contribute(point, id, entry) -> nil`` — Fill an extension point: the same point and id replaces. `entry.order` sorts (default 0).
+
+contributions
+-------------
+
+``contributions(point) -> {{id, owner, entry}...}`` — A point's entries as copies of {id, owner, entry}, by entry.order then id.
+
 emit
 ----
 
@@ -115,6 +135,11 @@ exec
 ----
 
 ``exec(name) -> nil`` — Run an installed mod's entry source, by name, in this same image.
+
+extension_command
+-----------------
+
+``extension_command(name, handler(args, caller)) -> nil`` — Register a handler for an installed mod command.
 
 feed
 ----
@@ -175,6 +200,11 @@ processes
 ---------
 
 ``processes() -> {id...}`` — List the ids of every process started with `remuda.process` that is still running.
+
+reload
+------
+
+``reload(name) -> nil`` — Reload a lifecycle-managed mod in this image, preserving state and replacing its registrations.
 
 remove_dir_all
 --------------

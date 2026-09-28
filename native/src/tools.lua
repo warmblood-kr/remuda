@@ -310,6 +310,39 @@ function remuda.clear_hooks(opts)
 end
 register("clear_hooks", "Remove every hook registered under a group.", "clear_hooks(opts) -> nil")
 
+-- An owned, ordered registry (VS Code `contributes`): a host defines a point,
+-- extensions fill it. A mod's declared entries are replaced on reload.
+local contributions = {}
+
+local function contribution_problem(point, id, entry)
+  if type(point) ~= "string" or point == "" then return "a contribution needs a point name" end
+  if type(id) ~= "string" or id == "" then return "a contribution needs an id" end
+  if type(entry) ~= "table" then return "a contribution entry must be a table" end
+  if entry.order ~= nil and type(entry.order) ~= "number" then return "a contribution order must be a number" end
+end
+
+function remuda.contribute(point, id, entry)
+  local problem = contribution_problem(point, id, entry)
+  if problem then error(problem, 2) end
+  contributions[point] = contributions[point] or {}
+  contributions[point][id] = { entry = entry }
+end
+register("contribute", "Fill an extension point: the same point and id replaces. `entry.order` sorts (default 0).", "contribute(point, id, entry) -> nil")
+
+function remuda.contributions(point)
+  local rows = {}
+  for id, item in pairs(contributions[point] or {}) do
+    rows[#rows + 1] = { id = id, owner = item.owner, entry = item.entry }
+  end
+  table.sort(rows, function(a, b)
+    local left, right = a.entry.order or 0, b.entry.order or 0
+    if left ~= right then return left < right end
+    return a.id < b.id
+  end)
+  return rows
+end
+register("contributions", "A point's entries as copies of {id, owner, entry}, by entry.order then id.", "contributions(point) -> {{id, owner, entry}...}")
+
 -- Opt-in lifecycle-managed mods keep their initialized state in the image and
 -- declare registrations as data. Reload stages the declaration and migrations
 -- before replacing the mod's hook group and tools.
@@ -423,6 +456,21 @@ function remuda._activate_module(name, candidate, reactivate)
     end
   end
 
+  local contributes = candidate.contributes or {}
+  if type(contributes) ~= "table" then
+    error("module contributes must be a table keyed by point", 0)
+  end
+  for point, entries in pairs(contributes) do
+    local seen = {}
+    for index = 1, array_length(entries, "module contributes for " .. tostring(point)) do
+      local entry = entries[index]
+      local problem = contribution_problem(point, type(entry) == "table" and entry.id or nil, entry)
+      if problem then error("module " .. problem, 0) end
+      if seen[entry.id] then error("module declares duplicate contribution " .. point .. "/" .. entry.id, 0) end
+      seen[entry.id] = true
+    end
+  end
+
   local migrations = candidate.migrations or {}
   if type(migrations) ~= "table" then
     error("module migrations must be a table keyed by prior state version", 0)
@@ -474,6 +522,11 @@ function remuda._activate_module(name, candidate, reactivate)
   for _, handle in ipairs(previous and previous.schedules or {}) do
     saved_schedules[handle] = remuda.schedules[handle]
   end
+  local saved_contributions = {}
+  for point, items in pairs(contributions) do
+    saved_contributions[point] = {}
+    for id, item in pairs(items) do saved_contributions[point][id] = item end
+  end
 
   local group = "remuda-module:" .. name
   for event, registered in pairs(remuda.hooks) do
@@ -511,6 +564,21 @@ function remuda._activate_module(name, candidate, reactivate)
   for _, handle in ipairs(previous and previous.schedules or {}) do
     remuda.cancel(handle)
   end
+  for _, items in pairs(contributions) do
+    for id, item in pairs(items) do
+      if item.owner == name then items[id] = nil end
+    end
+  end
+  for point, entries in pairs(contributes) do
+    contributions[point] = contributions[point] or {}
+    for _, entry in ipairs(entries) do
+      local bound = {}
+      for key, field in pairs(entry) do
+        bound[key] = type(field) == "function" and function(...) return field(state, ...) end or field
+      end
+      contributions[point][entry.id] = { owner = name, entry = bound }
+    end
+  end
   local schedule_handles = {}
   for index = 1, schedule_count do
     local declared = schedules[index]
@@ -543,6 +611,13 @@ function remuda._activate_module(name, candidate, reactivate)
     end
     for handle, schedule in pairs(saved_schedules) do
       remuda.schedules[handle] = schedule
+    end
+    for point, items in pairs(contributions) do
+      local restored = saved_contributions[point] or {}
+      for id, item in pairs(items) do
+        if item.owner ~= name and restored[id] == nil then restored[id] = item end
+      end
+      contributions[point] = restored
     end
     modules[name] = previous
   end
