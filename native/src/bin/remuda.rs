@@ -122,6 +122,8 @@ fn main() -> ExitCode {
 
         ["exec", name] => with_daemon(server, &path, |path| exec_command(path, name)),
 
+        ["cluster", rest @ ..] => cluster_command(rest),
+
         [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
             extension_command(server, &path, command, rest)
         }
@@ -209,6 +211,8 @@ remuda — a pty manager you can attach to
   remuda mod update NAME [--reload] update one installed mod
   remuda mod update --all         update all installed mods
   remuda mod remove NAME          remove one installed mod
+  remuda cluster                  show cluster status
+  remuda cluster init             create this node's cluster identity
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
@@ -276,6 +280,8 @@ remuda — terminal orchestration for coding agents
   remuda mod list | info NAME    inspect installed mods
   remuda mod update NAME|--all   update a mod
   remuda mod remove NAME         remove a mod
+  remuda cluster                 show cluster status
+  remuda cluster init            create this node's cluster identity
 
   remuda doc | repl | -e CODE    use the persistent Lua runtime
   remuda --version
@@ -300,6 +306,74 @@ fn help_command() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => fail(error),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ClusterCommand {
+    Status,
+    Init,
+    Invalid,
+}
+
+fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
+    match args {
+        [] => ClusterCommand::Status,
+        ["init"] => ClusterCommand::Init,
+        _ => ClusterCommand::Invalid,
+    }
+}
+
+fn cluster_command(args: &[&str]) -> ExitCode {
+    match parse_cluster_command(args) {
+        ClusterCommand::Status => match remuda_native::cluster::status() {
+            Ok(None) => {
+                println!("This node is not in a cluster; run `remuda cluster init`.");
+                ExitCode::SUCCESS
+            }
+            Ok(Some((identity, members))) => {
+                println!("Node: {}", identity.node_name);
+                println!("Fingerprint: {}", identity.node_fp);
+                println!("Members: {members}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("cluster status: {error}")),
+        },
+        ClusterCommand::Init => match remuda_native::cluster::init() {
+            Ok((identity, created)) => {
+                println!("{}", cluster_init_message(created));
+                println!("Node: {}", identity.node_name);
+                println!("Fingerprint: {}", identity.node_fp);
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("cluster init: {error}")),
+        },
+        ClusterCommand::Invalid => fail("usage: remuda cluster [init]"),
+    }
+}
+
+fn cluster_init_message(created: bool) -> &'static str {
+    if created {
+        "Cluster initialized"
+    } else {
+        "Already initialized"
+    }
+}
+
+#[cfg(test)]
+mod cluster_cli_tests {
+    use super::{cluster_init_message, parse_cluster_command, ClusterCommand};
+
+    #[test]
+    fn cluster_status_and_init_are_recognized() {
+        assert_eq!(parse_cluster_command(&[]), ClusterCommand::Status);
+        assert_eq!(parse_cluster_command(&["init"]), ClusterCommand::Init);
+        assert_eq!(parse_cluster_command(&["join"]), ClusterCommand::Invalid);
+    }
+
+    #[test]
+    fn repeated_init_uses_already_initialized_wording() {
+        assert_eq!(cluster_init_message(false), "Already initialized");
     }
 }
 
