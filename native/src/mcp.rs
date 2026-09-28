@@ -224,15 +224,32 @@ fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> S
                 "applied"
             }),
         ),
-        Ok(Response::Uncertain) => ok_reply(id, tool_error("input outcome is uncertain")),
-        Ok(Response::WrongInstance) => ok_reply(id, tool_error("session instance changed")),
-        Ok(Response::RateLimited) => ok_reply(id, tool_error("session input rate limit exceeded")),
-        Ok(Response::Busy) => ok_reply(id, tool_error("session input is busy")),
-        Ok(Response::WriteTimeout) => ok_reply(id, tool_error("session PTY write timed out")),
+        Ok(
+            response @ (Response::Uncertain
+            | Response::WrongInstance
+            | Response::RateLimited
+            | Response::Busy
+            | Response::WriteTimeout),
+        ) => input_error_reply(id, input_error_message(&response)),
         Ok(Response::AttachStarted { .. } | Response::AttachStatus { .. }) => {
             ok_reply(id, tool_error("attach responses are not exposed over MCP"))
         }
         Ok(Response::Sessions(sessions)) => ok_reply(id, sessions_text(sessions)),
+    }
+}
+
+fn input_error_reply(id: Value, message: &str) -> String {
+    ok_reply(id, tool_error(message))
+}
+
+fn input_error_message(response: &Response) -> &'static str {
+    match response {
+        Response::Uncertain => "input outcome is uncertain; bytes may be partial or late",
+        Response::WrongInstance => "session instance changed",
+        Response::RateLimited => "session input rate limit exceeded",
+        Response::Busy => "session input is busy",
+        Response::WriteTimeout => "session PTY write timed out; delivery may be partial or late",
+        _ => unreachable!("only input errors are passed here"),
     }
 }
 

@@ -439,6 +439,84 @@ fn stalled_pty_write_times_out_without_blocking_reads_and_recovers() {
 }
 
 #[cfg(unix)]
+#[test]
+fn attached_keystrokes_survive_a_pty_write_timeout_without_detaching() {
+    let runtime = scratch_dir("attach-write-timeout");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&socket);
+    let marker = runtime.join("start-reader");
+    let capture_path = runtime.join("typed-bytes");
+    let mut env = std::collections::HashMap::new();
+    env.insert("READER_MARKER".into(), marker.display().to_string());
+    env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    let response = client::request(
+        &socket,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty -echo; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat >\"$CAPTURE_PATH\"".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start non-reading child");
+    assert!(matches!(response, Response::Value(_)));
+
+    let stream = raw_attach(&socket, "target");
+    let mut typed = vec![b'\n'; 1024 * 1024];
+    typed.extend_from_slice(b"last-human-keystrokes\n");
+    let expected = typed.clone();
+    let (stream_tx, stream_rx) = std::sync::mpsc::channel();
+    let sender = std::thread::spawn(move || {
+        let mut stream = stream;
+        let result = stream.write_all(&typed);
+        let _ = stream_tx.send((stream, result));
+    });
+
+    // Let the attach pump reach its write deadline while the child does not
+    // read, then prove the connection remains attached while waiting.
+    std::thread::sleep(Duration::from_millis(2300));
+    assert_eq!(target_row(&socket, "r.attached"), "true");
+    assert!(
+        !capture_path.exists(),
+        "the child has not begun draining its terminal input"
+    );
+
+    std::fs::write(&marker, b"read now").expect("allow child to read typed bytes");
+    let (stream, result) = stream_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("attach client write completes after child starts reading");
+    result.expect("send all human input to attach socket");
+    sender.join().expect("attach client writer thread");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::fs::read(&capture_path).ok().as_deref() == Some(expected.as_slice()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attached bytes did not drain exactly"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(target_row(&socket, "r.attached"), "true");
+    drop(stream);
+    let detached_deadline = Instant::now() + PATIENCE;
+    while target_row(&socket, "r.attached") == "true" {
+        assert!(
+            Instant::now() < detached_deadline,
+            "attach did not release on EOF"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
 fn start_reader_waiting_session(socket: &Path, runtime: &Path) -> PathBuf {
     // Keep the master unread until the test signals it, then drain input so
     // recovery is deterministic regardless of parallel test scheduling.

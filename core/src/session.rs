@@ -197,6 +197,12 @@ impl Session {
         rate.check_rate(self.clock.now(), bytes)
     }
 
+    fn refund_rate(&self, bytes: usize) {
+        if let Ok(mut rate) = self.input_rate.lock() {
+            rate.refund_rate(self.clock.now(), bytes);
+        }
+    }
+
     /// Apply a bounded remote batch once for this exact session instance.
     /// Local input shares `input_lock`, so each complete batch stays atomic.
     pub fn apply_input_batch(
@@ -206,59 +212,121 @@ impl Session {
         if batch.seq == 0 {
             return Err(InputError::InvalidSequence);
         }
-        self.check_rate(batch.bytes.len())?;
         if !self.is_alive() {
             return Ok(InputOutcome::Exited);
         }
         if batch.instance_id != self.instance_id {
             return Ok(InputOutcome::WrongInstance);
         }
-        if let Some(outcome) = self
-            .input_dedup
-            .lock()
-            .map_err(|_| InputError::Unavailable)?
-            .lookup(batch.client_id, batch.seq)
-        {
+        if let Some(outcome) = self.batch_result(batch.client_id, batch.seq)? {
             return Ok(outcome);
         }
+        self.ensure_writer_idle()?;
+        self.check_rate(batch.bytes.len())?;
+        let _held = match self.acquire_input_lock() {
+            Ok(held) => held,
+            Err(AgentError::Busy) => {
+                self.refund_rate(batch.bytes.len());
+                return Err(InputError::Busy);
+            }
+            Err(_) => return Err(InputError::Unavailable),
+        };
+        if !self.is_alive() {
+            self.refund_rate(batch.bytes.len());
+            return Ok(InputOutcome::Exited);
+        }
+        if batch.instance_id != self.instance_id {
+            self.refund_rate(batch.bytes.len());
+            return Ok(InputOutcome::WrongInstance);
+        }
+        if let Err(error) = self.ensure_writer_idle() {
+            self.refund_rate(batch.bytes.len());
+            return Err(error);
+        }
+        if let Some(outcome) = self.reserve_batch(batch.client_id, batch.seq)? {
+            self.refund_rate(batch.bytes.len());
+            return Ok(outcome);
+        }
+        self.finish_input_batch(batch, self.write_one_burst(batch.bytes))
+    }
+
+    fn batch_result(
+        &self,
+        client_id: [u8; 16],
+        seq: u64,
+    ) -> core::result::Result<Option<InputOutcome>, InputError> {
+        self.input_dedup
+            .lock()
+            .map(|mut deduplicator| deduplicator.lookup(client_id, seq))
+            .map_err(|_| InputError::Unavailable)
+    }
+
+    fn reserve_batch(
+        &self,
+        client_id: [u8; 16],
+        seq: u64,
+    ) -> core::result::Result<Option<InputOutcome>, InputError> {
+        let Ok(mut deduplicator) = self.input_dedup.lock() else {
+            return Ok(Some(InputOutcome::Uncertain));
+        };
+        if let Some(outcome) = deduplicator.lookup(client_id, seq) {
+            return Ok(Some(outcome));
+        }
+        if deduplicator.reserve(client_id, seq) {
+            Ok(None)
+        } else {
+            Ok(Some(
+                deduplicator
+                    .lookup(client_id, seq)
+                    .unwrap_or(InputOutcome::Uncertain),
+            ))
+        }
+    }
+
+    fn finish_input_batch(
+        &self,
+        batch: InputBatch<'_>,
+        result: Result<()>,
+    ) -> core::result::Result<InputOutcome, InputError> {
+        match result {
+            Ok(()) => {
+                if let Ok(mut deduplicator) = self.input_dedup.lock() {
+                    deduplicator.complete(batch.client_id, batch.seq, true);
+                }
+                Ok(InputOutcome::Ack { duplicate: false })
+            }
+            Err(AgentError::Busy) => {
+                if let Ok(mut deduplicator) = self.input_dedup.lock() {
+                    deduplicator.release(batch.client_id, batch.seq);
+                }
+                self.refund_rate(batch.bytes.len());
+                Err(InputError::Busy)
+            }
+            Err(AgentError::Exited) => {
+                if let Ok(mut deduplicator) = self.input_dedup.lock() {
+                    deduplicator.release(batch.client_id, batch.seq);
+                }
+                self.refund_rate(batch.bytes.len());
+                Ok(InputOutcome::Exited)
+            }
+            Err(_) => {
+                if let Ok(mut deduplicator) = self.input_dedup.lock() {
+                    deduplicator.complete(batch.client_id, batch.seq, false);
+                }
+                Ok(InputOutcome::Uncertain)
+            }
+        }
+    }
+
+    fn ensure_writer_idle(&self) -> core::result::Result<(), InputError> {
         if self
             .input_writer_busy()
             .map_err(|_| InputError::Unavailable)?
         {
-            return Err(InputError::Busy);
-        }
-        let _held = self.acquire_input_lock().map_err(|error| match error {
-            AgentError::Busy => InputError::Busy,
-            _ => InputError::Unavailable,
-        })?;
-        if !self.is_alive() {
-            return Ok(InputOutcome::Exited);
-        }
-        if batch.instance_id != self.instance_id {
-            return Ok(InputOutcome::WrongInstance);
-        }
-        let Ok(mut deduplicator) = self.input_dedup.lock() else {
-            return Ok(InputOutcome::Uncertain);
-        };
-        if let Some(outcome) = deduplicator.lookup(batch.client_id, batch.seq) {
-            return Ok(outcome);
-        }
-        if !deduplicator.reserve(batch.client_id, batch.seq) {
-            return Ok(deduplicator
-                .lookup(batch.client_id, batch.seq)
-                .unwrap_or(InputOutcome::Uncertain));
-        }
-        drop(deduplicator);
-
-        let applied = self.write_one_burst(batch.bytes).is_ok();
-        if let Ok(mut deduplicator) = self.input_dedup.lock() {
-            deduplicator.complete(batch.client_id, batch.seq, applied);
-        }
-        Ok(if applied {
-            InputOutcome::Ack { duplicate: false }
+            Err(InputError::Busy)
         } else {
-            InputOutcome::Uncertain
-        })
+            Ok(())
+        }
     }
 
     /// Above this, a `feed` act is refused rather than executed — a caller's
@@ -297,6 +365,14 @@ impl Session {
     /// The one place that touches the backend. PTY handles wait without the
     /// process mutex; callers hold `input_lock` except an attachment writer.
     fn write_one_burst(&self, bytes: &[u8]) -> Result<()> {
+        self.write_one_burst_with(bytes, false)
+    }
+
+    fn write_one_burst_to_completion(&self, bytes: &[u8]) -> Result<()> {
+        self.write_one_burst_with(bytes, true)
+    }
+
+    fn write_one_burst_with(&self, bytes: &[u8], wait_to_completion: bool) -> Result<()> {
         let writer = {
             let mut agent = self
                 .agent
@@ -307,14 +383,25 @@ impl Session {
             }
             agent.input_writer()
         };
-        if let Some(writer) = writer {
-            writer.write_bounded(bytes)?;
+        let result = if let Some(writer) = writer {
+            if wait_to_completion {
+                writer.write_to_completion(bytes)
+            } else {
+                writer.write_bounded(bytes)
+            }
         } else {
             let mut agent = self
                 .agent
                 .lock()
                 .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-            agent.write(bytes)?;
+            agent.write(bytes)
+        };
+        if let Err(error) = result {
+            return if matches!(error, AgentError::Exited) || !self.is_alive() {
+                Err(AgentError::Exited)
+            } else {
+                Err(error)
+            };
         }
 
         // Recorded only after the write lands, so a failed write does not look
@@ -326,16 +413,22 @@ impl Session {
     }
 
     fn acquire_input_lock(&self) -> Result<MutexGuard<'_, ()>> {
-        match self.input_lock.try_lock() {
-            Ok(guard) => Ok(guard),
-            Err(TryLockError::Poisoned(_)) => {
-                Err(AgentError::Io("session input lock poisoned".into()))
+        loop {
+            match self.input_lock.try_lock() {
+                Ok(guard) => return Ok(guard),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err(AgentError::Io("session input lock poisoned".into()));
+                }
+                Err(TryLockError::WouldBlock) if self.input_writer_busy()? => {
+                    return Err(AgentError::Busy);
+                }
+                Err(TryLockError::WouldBlock) => {
+                    // Feed pauses intentionally keep other input atomic, but
+                    // poll so a later burst that stalls the PTY can refuse the
+                    // waiting act instead of leaving it queued indefinitely.
+                    std::thread::yield_now();
+                }
             }
-            Err(TryLockError::WouldBlock) if self.input_writer_busy()? => Err(AgentError::Busy),
-            Err(TryLockError::WouldBlock) => self
-                .input_lock
-                .lock()
-                .map_err(|_| AgentError::Io("session input lock poisoned".into())),
         }
     }
 
@@ -546,7 +639,7 @@ impl Attached<'_> {
         {
             return Err(AgentError::Attached);
         }
-        self.session.write_one_burst(bytes)?;
+        self.session.write_one_burst_to_completion(bytes)?;
         // Only after the write lands, as `last_input_at` is.
         if let Ok(mut at) = self.session.last_human_input_at.lock() {
             *at = Some(self.session.clock.now());

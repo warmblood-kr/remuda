@@ -54,6 +54,12 @@ impl InputRateLimiter {
         self.bytes_in_window += bytes;
         Ok(())
     }
+
+    pub fn refund_rate(&mut self, now: Duration, bytes: usize) {
+        if self.window_second == Some(now.as_secs()) {
+            self.bytes_in_window = self.bytes_in_window.saturating_sub(bytes);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -178,6 +184,17 @@ impl InputDeduplicator {
             .and_then(|client| client.entries.iter_mut().find(|entry| entry.seq == seq))
         {
             entry.applied = applied;
+        }
+    }
+
+    /// Forget a reservation when the writer refused a task before it was sent.
+    pub(crate) fn release(&mut self, client_id: [u8; 16], seq: u64) {
+        if let Some(client) = self
+            .clients
+            .iter_mut()
+            .find(|client| client.id == client_id)
+        {
+            client.entries.retain(|entry| entry.seq != seq);
         }
     }
 }

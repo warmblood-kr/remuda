@@ -66,24 +66,8 @@ impl PtyInputWriter {
             timeout,
         })
     }
-}
 
-fn run_writer(receiver: Receiver<WriteTask>, writer: SharedWriter, busy: Arc<AtomicBool>) {
-    while let Ok(task) = receiver.recv() {
-        let result = match writer.lock() {
-            Ok(mut writer) => writer
-                .write_all(&task.bytes)
-                .and_then(|()| writer.flush())
-                .map_err(io),
-            Err(_) => Err(io("pty writer lock poisoned")),
-        };
-        busy.store(false, Ordering::Release);
-        let _ = task.result.send(result);
-    }
-}
-
-impl AgentWriter for PtyInputWriter {
-    fn write_bounded(&self, bytes: &[u8]) -> Result<()> {
+    fn submit(&self, bytes: &[u8]) -> Result<Receiver<Result<()>>> {
         self.busy
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| AgentError::Busy)?;
@@ -93,23 +77,67 @@ impl AgentWriter for PtyInputWriter {
             result,
         };
         match self.sender.try_send(task) {
-            Ok(()) => {}
+            Ok(()) => Ok(receiver),
             Err(TrySendError::Full(_)) => {
                 self.busy.store(false, Ordering::Release);
-                return Err(AgentError::Busy);
+                Err(AgentError::Busy)
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.busy.store(false, Ordering::Release);
-                return Err(AgentError::Io("pty writer worker stopped".into()));
+                Err(AgentError::Io("pty writer worker stopped".into()))
             }
         }
-        match receiver.recv_timeout(self.timeout) {
+    }
+}
+
+fn run_writer(receiver: Receiver<WriteTask>, writer: SharedWriter, busy: Arc<AtomicBool>) {
+    while let Ok(task) = receiver.recv() {
+        let reset_busy = BusyReset(&busy);
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match writer.lock() {
+                Ok(mut writer) => writer
+                    .write_all(&task.bytes)
+                    .and_then(|()| writer.flush())
+                    .map_err(io),
+                Err(_) => Err(io("pty writer lock poisoned")),
+            }))
+            .unwrap_or_else(|_| Err(io("pty writer panicked")));
+        drop(reset_busy);
+        let _ = task.result.send(result);
+    }
+}
+
+struct BusyReset<'a>(&'a AtomicBool);
+
+impl Drop for BusyReset<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl AgentWriter for PtyInputWriter {
+    fn write_bounded(&self, bytes: &[u8]) -> Result<()> {
+        match self.submit(bytes)?.recv_timeout(self.timeout) {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(AgentError::WriteTimeout {
                 timeout: self.timeout,
             }),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 Err(AgentError::Io("pty writer worker stopped".into()))
+            }
+        }
+    }
+
+    fn write_to_completion(&self, bytes: &[u8]) -> Result<()> {
+        loop {
+            match self.submit(bytes) {
+                Ok(receiver) => {
+                    return receiver
+                        .recv()
+                        .map_err(|_| AgentError::Io("pty writer worker stopped".into()))?;
+                }
+                Err(AgentError::Busy) => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => return Err(error),
             }
         }
     }
@@ -308,14 +336,13 @@ fn process_output(
     (row + 1, col + 1)
 }
 
-/// Reply to a cursor-position query. One `write_all` under the same lock every
-/// other write takes, so no divisible write appears and PRINCIPLES §6
-/// invariant 1 holds: no caller can land inside another's burst.
+/// Reply to a cursor-position query when the writer is free. The reader never
+/// waits behind a stalled input write; a busy child can ask again later.
 // ponytail: matched within one read. ConPTY writes the query as a single
 // four-byte message; a split one would be missed until the next ask.
 fn answer_cursor_query(writer: &SharedWriter, (row, col): (u16, u16)) {
     let reply = format!("\x1b[{row};{col}R");
-    if let Ok(mut writer) = writer.lock() {
+    if let Ok(mut writer) = writer.try_lock() {
         let _ = writer.write_all(reply.as_bytes());
         let _ = writer.flush();
     }
@@ -545,6 +572,31 @@ mod input_writer_tests {
         first: AtomicBool,
     }
 
+    struct PanickingWrite;
+
+    impl Write for PanickingWrite {
+        fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+            panic!("injected PTY writer panic");
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct CaptureWrites(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWrites {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     impl Write for StalledWrite {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             if !self.first.swap(true, Ordering::AcqRel) {
@@ -602,6 +654,36 @@ mod input_writer_tests {
         }
         assert!(!writer.is_busy());
         writer.write_bounded(b"recovered").unwrap();
+    }
+
+    #[test]
+    fn worker_panic_resets_busy_instead_of_sticking_the_session() {
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(PanickingWrite)));
+        let writer = PtyInputWriter::spawn(writer, Duration::from_millis(100)).unwrap();
+
+        assert!(matches!(
+            writer.write_bounded(b"panic"),
+            Err(AgentError::Io(_))
+        ));
+        assert!(!writer.is_busy());
+        assert!(matches!(
+            writer.write_bounded(b"still available"),
+            Err(AgentError::Io(_))
+        ));
+        assert!(!writer.is_busy());
+    }
+
+    #[test]
+    fn cursor_query_does_not_block_behind_a_stalled_input_write() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer: SharedWriter =
+            Arc::new(Mutex::new(Box::new(CaptureWrites(Arc::clone(&captured)))));
+        let guard = writer.lock().unwrap();
+        let started = std::time::Instant::now();
+        answer_cursor_query(&writer, (1, 2));
+        assert!(started.elapsed() < Duration::from_millis(100));
+        drop(guard);
+        assert!(captured.lock().unwrap().is_empty());
     }
 }
 

@@ -150,7 +150,10 @@ impl fmt::Display for AgentError {
             AgentError::Attached => write!(f, "a human is attached to this session"),
             AgentError::Busy => write!(f, "a session input write is already in flight"),
             AgentError::WriteTimeout { timeout } => {
-                write!(f, "PTY write exceeded {timeout:?}; delivery is uncertain")
+                write!(
+                    f,
+                    "PTY write exceeded {timeout:?}; delivery may be partial or late"
+                )
             }
             AgentError::PauseTooLong { total, cap } => {
                 write!(f, "feed's pauses total {total:?}, over the {cap:?} cap")
@@ -165,6 +168,12 @@ pub type Result<T> = core::result::Result<T, AgentError>;
 /// A backend writer that can wait independently of the locked process object.
 pub trait AgentWriter: Send + Sync {
     fn write_bounded(&self, bytes: &[u8]) -> Result<()>;
+    /// Write these bytes once and wait for their actual completion. Interactive
+    /// input uses this path so a timeout cannot silently drop a keystroke or
+    /// cause a possibly partial write to be replayed.
+    fn write_to_completion(&self, bytes: &[u8]) -> Result<()> {
+        self.write_bounded(bytes)
+    }
     fn is_busy(&self) -> bool;
 }
 
