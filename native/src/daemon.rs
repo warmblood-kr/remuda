@@ -455,6 +455,7 @@ fn reap_processes_before_exit(image: &Image) {
         "for _, id in ipairs(remuda.processes()) do remuda._process_killpg(id) end",
         Some("@remuda/shutdown-reap"),
     );
+    image.stop_modules_bounded();
 }
 
 fn capture_styled(

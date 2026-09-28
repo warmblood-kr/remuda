@@ -904,6 +904,9 @@ function remuda._activate_module(name, candidate, reactivate)
   if candidate.start ~= nil and type(candidate.start) ~= "function" then
     error("module start must be a function", 0)
   end
+  if candidate.stop ~= nil and type(candidate.stop) ~= "function" then
+    error("module stop must be a function", 0)
+  end
 
   local hooks = candidate.hooks or {}
   local hook_count = array_length(hooks, "module hooks")
@@ -1024,6 +1027,16 @@ function remuda._activate_module(name, candidate, reactivate)
     end
   end
 
+  -- Stop the previous activation while it still owns its registrations and
+  -- before the replacement's start can run. A cleanup error is diagnostic,
+  -- not a reason to prevent reload.
+  if previous and previous.stop then
+    local ok, err = pcall(with_owner, name, previous.stop, previous.state)
+    if not ok then
+      io.stderr:write("remuda module stop error for " .. name .. ": " .. tostring(err) .. "\n")
+    end
+  end
+
   -- Snapshot what this activation replaces, so a failing `start` can put the
   -- previous activation back (#129). State mutated by that `start` stays.
   local saved_hooks, saved_tools, saved_schedules, saved_commands = {}, {}, {}, {}
@@ -1132,7 +1145,10 @@ function remuda._activate_module(name, candidate, reactivate)
       run = function() return with_owner(name, declared.run, state) end,
     })
   end
-  modules[name] = { version = version, state = state, tools = tool_names, schedules = schedule_handles }
+  local stop = candidate.stop and function(stopped_state)
+    return with_owner(name, candidate.stop, stopped_state)
+  end
+  modules[name] = { version = version, state = state, tools = tool_names, schedules = schedule_handles, stop = stop }
 
   local function rollback()
     for event, registered in pairs(remuda.hooks) do
@@ -1191,6 +1207,22 @@ function remuda._activate_module(name, candidate, reactivate)
     return with_owner(name, candidate.start, started_state)
   end
   return true, state, start, rollback
+end
+
+-- Called by the daemon's clean shutdown path. A snapshot avoids mutation
+-- hazards if a stop callback activates another module.
+function remuda._stop_modules()
+  local active = {}
+  for name, module in pairs(modules) do active[#active + 1] = { name, module } end
+  for _, pair in ipairs(active) do
+    local name, module = pair[1], pair[2]
+    if module.stop then
+      local ok, err = pcall(module.stop, module.state)
+      if not ok then
+        io.stderr:write("remuda module stop error for " .. name .. ": " .. tostring(err) .. "\n")
+      end
+    end
+  end
 end
 
 local escapes = {

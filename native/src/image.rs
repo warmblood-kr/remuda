@@ -160,6 +160,15 @@ impl Image {
             .recv()
             .map_err(|_| "the image stopped without answering".to_string())?
     }
+
+    /// Best-effort module cleanup for clean daemon shutdown. A stuck user
+    /// callback must not hold shutdown indefinitely.
+    pub fn stop_modules_bounded(&self) {
+        const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Ok(answer) = self.submit("remuda._stop_modules()", Some("@remuda/shutdown-modules")) {
+            let _ = answer.recv_timeout(STOP_TIMEOUT);
+        }
+    }
 }
 
 /// Evaluate one chunk, expression-first: `return <code>` is tried before plain

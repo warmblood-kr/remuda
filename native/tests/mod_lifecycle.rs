@@ -286,6 +286,32 @@ fn lifecycle_start_runs_once_after_activation_and_surfaces_errors() {
 }
 
 #[test]
+fn lifecycle_stop_runs_before_the_next_activation_starts() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(&manifest, "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n").unwrap();
+    let entry = home.entry();
+    write_entry(&entry, r#"return { api = "remuda-module-v1", state_version = 1,
+      initialize = function() return {} end,
+      start = function() remuda.emit("order", "old-start") end,
+      stop = function() remuda.emit("order", "old-stop"); error("ignored stop failure") end }"#);
+    let image = Image::spawn(Path::new("/tmp/remuda-mod-lifecycle-stop.sock"),
+        Arc::new(Registry::new()), Arc::new(Counters::default()));
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "order = {}; remuda.on('order', function(v) table.insert(order, v) end)");
+    read_value(&image, "remuda.exec('sample')");
+    write_entry(&entry, r#"return { api = "remuda-module-v1", state_version = 1,
+      initialize = function() return {} end,
+      start = function() remuda.emit("order", "new-start") end,
+      stop = function() remuda.emit("order", "new-stop") end }"#);
+    read_value(&image, "remuda.reload('sample')");
+    assert_eq!(read_value(&image, "return table.concat(order, ',')"), "old-start,old-stop,new-start");
+    image.stop_modules_bounded();
+    assert_eq!(read_value(&image, "return table.concat(order, ',')"), "old-start,old-stop,new-start,new-stop");
+}
+
+#[test]
 fn mod_command_handler_receives_caller_env() {
     // #95: the handler runs in the daemon, so `os.getenv` is the daemon's; the
     // caller's `REMUDA_*` variables arrive as the second handler argument.
