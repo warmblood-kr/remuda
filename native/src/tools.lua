@@ -419,7 +419,7 @@ function remuda.contribute(point, id, entry)
   local problem = contribution_problem(point, id, entry)
   if problem then error(problem, 2) end
   contributions[point] = contributions[point] or {}
-  contributions[point][id] = { entry = shallow_copy(entry) }
+  contributions[point][id] = { owner = current_owner, entry = shallow_copy(entry) }
 end
 register("contribute", "Fill an extension point: the same point and id replaces. `entry.order` sorts (default 0).", "contribute(point, id, entry) -> nil")
 

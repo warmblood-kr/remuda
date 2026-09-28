@@ -491,6 +491,100 @@ fn rollback_drops_hooks_the_failed_start_registered() {
     );
 }
 
+#[test]
+fn imperative_contributions_are_owned_by_the_lifecycle_extent() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let entry = home.entry();
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function() remuda.contribute("probe", "v1", { label = "v1" }) end }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-contribution-owner.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "remuda.exec('sample')");
+    let ids = "local rows, ids = remuda.contributions('probe'), {} for _, row in ipairs(rows) do ids[#ids + 1] = row.id end return table.concat(ids, ',')";
+    assert_eq!(read_value(&image, ids), "v1");
+
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function() remuda.contribute("probe", "v2", { label = "v2" }) end }"#,
+    );
+    read_value(&image, "remuda.reload('sample')");
+    assert_eq!(read_value(&image, ids), "v2");
+
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function()
+            remuda.contribute("probe", "failed", { label = "failed" })
+            error("contribution start fails")
+          end }"#,
+    );
+    let error = image.eval("remuda.reload('sample')", None).unwrap_err();
+    assert!(error.contains("contribution start fails"), "{error}");
+    assert_eq!(read_value(&image, ids), "v2");
+}
+
+#[test]
+fn failed_start_drops_its_imperative_contributions() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let entry = home.entry();
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function() remuda.contribute("probe", "live", { label = "live" }) end }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-contribution-rollback.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "remuda.exec('sample')");
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function()
+            remuda.contribute("probe", "failed", { label = "failed" })
+            error("contribution start fails")
+          end }"#,
+    );
+    let error = image.eval("remuda.reload('sample')", None).unwrap_err();
+    assert!(error.contains("contribution start fails"), "{error}");
+    assert_eq!(
+        read_value(
+            &image,
+            "local rows = remuda.contributions('probe'); local ids = {} for _, row in ipairs(rows) do ids[#ids + 1] = row.id end return table.concat(ids, ',')"
+        ),
+        "live"
+    );
+}
+
 /// Hook-design (b): what a mod registers imperatively while its own code runs
 /// (`start`, a declared hook) is owned by it, so reload replaces it instead of
 /// piling up, and a failed reload's `start` leaves the previous set intact.
