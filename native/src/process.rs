@@ -44,6 +44,7 @@ pub struct RunOutput {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub timed_out: bool,
+    pub signal: Option<i32>,
 }
 
 /// Run one child with argv directly (never through a shell). This is a
@@ -54,18 +55,9 @@ pub fn run_sync(
     stdin: Option<Vec<u8>>,
     timeout_seconds: f64,
 ) -> Result<RunOutput, String> {
-    if argv.is_empty() || argv[0].is_empty() {
-        return Err("a process.run call needs a non-empty argv[1]".into());
-    }
-    if !timeout_seconds.is_finite() || timeout_seconds <= 0.0 {
-        return Err("process.run timeout must be a positive finite number".into());
-    }
-    if timeout_seconds > RUN_MAX_TIMEOUT {
-        return Err(format!(
-            "process.run timeout cannot exceed {RUN_MAX_TIMEOUT} seconds"
-        ));
-    }
+    validate_run(&argv, timeout_seconds)?;
 
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds);
     let (program, args) = argv.split_first().expect("argv checked above");
     let mut command = Command::new(program);
     command
@@ -79,80 +71,216 @@ pub fn run_sync(
     let stderr = child.stderr.take().expect("stderr was piped");
     let child_stdin = child.stdin.take().expect("stdin was piped");
 
-    let stdout_reader = std::thread::spawn(move || capture_bounded(stdout));
-    let stderr_reader = std::thread::spawn(move || capture_bounded(stderr));
-    let stdin_writer = std::thread::spawn(move || {
-        if let Some(input) = stdin {
-            let mut child_stdin = child_stdin;
-            let _ = child_stdin.write_all(&input);
-        }
-        // Dropping stdin signals EOF to children which read until end.
-    });
-
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds);
-    let (status, timed_out) = loop {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            break (status, false);
-        }
-        if Instant::now() >= deadline {
-            kill_process_tree(&child);
-            let _ = child.kill();
-            let status = child.wait().map_err(|error| error.to_string())?;
-            break (status, true);
-        }
-        std::thread::sleep(Duration::from_millis(5));
+    let stdout_capture = Arc::new(Mutex::new(BoundedCapture::default()));
+    let stderr_capture = Arc::new(Mutex::new(BoundedCapture::default()));
+    let stdout_reader = ReaderState::new();
+    let stderr_reader = ReaderState::new();
+    let stdout_reader_thread = {
+        let capture = stdout_capture.clone();
+        let state = stdout_reader.clone();
+        std::thread::spawn(move || capture_bounded(stdout, capture, state))
+    };
+    let stderr_reader_thread = {
+        let capture = stderr_capture.clone();
+        let state = stderr_reader.clone();
+        std::thread::spawn(move || capture_bounded(stderr, capture, state))
+    };
+    let stdin_done = Arc::new(AtomicBool::new(false));
+    let stdin_writer = {
+        let done = stdin_done.clone();
+        std::thread::spawn(move || {
+            if let Some(input) = stdin {
+                let mut child_stdin = child_stdin;
+                let _ = child_stdin.write_all(&input);
+            }
+            // Dropping stdin signals EOF to children which read until end.
+            done.store(true, Ordering::Release);
+        })
     };
 
-    let _ = stdin_writer.join();
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| "process.run stdout reader panicked".to_string())?
-        .map_err(|error| format!("read process.run stdout: {error}"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| "process.run stderr reader panicked".to_string())?
-        .map_err(|error| format!("read process.run stderr: {error}"))?;
+    let (child_status, timed_out) = wait_for_process_io(
+        &mut child,
+        deadline,
+        &stdout_reader,
+        &stderr_reader,
+        &stdin_done,
+    )?;
+
+    // All three workers are finished on the successful path. On timeout,
+    // dropping their handles detaches them so an escaped descendant holding
+    // a pipe cannot keep the Lua image blocked past the deadline.
+    drop((stdout_reader_thread, stderr_reader_thread, stdin_writer));
+    let stdout = stdout_capture.lock().unwrap().snapshot();
+    let stderr = stderr_capture.lock().unwrap().snapshot();
 
     Ok(RunOutput {
         code: if timed_out {
             RUN_TIMEOUT_EXIT_CODE
         } else {
-            status.code().unwrap_or(-1)
+            child_status.code().unwrap_or(-1)
         },
         stdout,
         stderr,
         timed_out,
+        signal: exit_signal(&child_status),
     })
 }
 
-fn capture_bounded(mut reader: impl Read) -> std::io::Result<Vec<u8>> {
-    let retained_limit = RUN_OUTPUT_LIMIT - RUN_OUTPUT_MARKER.len();
-    let mut output = Vec::with_capacity(RUN_OUTPUT_LIMIT);
-    let mut buffer = [0u8; 8192];
-    let mut truncated = false;
+fn validate_run(argv: &[String], timeout_seconds: f64) -> Result<(), String> {
+    if argv.is_empty() || argv[0].is_empty() {
+        return Err("a process.run call needs a non-empty argv[1]".into());
+    }
+    if !timeout_seconds.is_finite() || timeout_seconds <= 0.0 {
+        return Err("process.run timeout must be a positive finite number".into());
+    }
+    if timeout_seconds > RUN_MAX_TIMEOUT {
+        return Err(format!(
+            "process.run timeout cannot exceed {RUN_MAX_TIMEOUT} seconds"
+        ));
+    }
+    Ok(())
+}
+
+fn wait_for_process_io(
+    child: &mut Child,
+    deadline: Instant,
+    stdout_reader: &ReaderState,
+    stderr_reader: &ReaderState,
+    stdin_done: &AtomicBool,
+) -> Result<(std::process::ExitStatus, bool), String> {
+    let mut child_status = None;
     loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
+        if child_status.is_none() {
+            match child.try_wait() {
+                Ok(status) => child_status = status,
+                Err(error) => {
+                    kill_process_tree(child);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.to_string());
+                }
+            }
         }
-        let retain = retained_limit.saturating_sub(output.len()).min(read);
-        output.extend_from_slice(&buffer[..retain]);
-        truncated |= retain < read;
+        if let Some(error) = stdout_reader.error() {
+            terminate_child(child);
+            return Err(format!("read process.run stdout: {error}"));
+        }
+        if let Some(error) = stderr_reader.error() {
+            terminate_child(child);
+            return Err(format!("read process.run stderr: {error}"));
+        }
+        if stdout_reader.done() && stderr_reader.done() && stdin_done.load(Ordering::Acquire) {
+            if let Some(status) = child_status.take() {
+                return Ok((status, false));
+            }
+        }
+        if Instant::now() >= deadline {
+            // Descendants can keep pipes open after the direct child exits.
+            // Kill its group again and return at the same deadline, without
+            // joining any reader or writer that may still be blocked.
+            kill_process_tree(child);
+            let _ = child.kill();
+            let status = match child_status {
+                Some(status) => status,
+                None => child.wait().map_err(|error| error.to_string())?,
+            };
+            return Ok((status, true));
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
-    if truncated {
-        output.extend_from_slice(RUN_OUTPUT_MARKER);
+}
+
+fn terminate_child(child: &mut Child) {
+    kill_process_tree(child);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[derive(Default)]
+struct BoundedCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl BoundedCapture {
+    fn push(&mut self, bytes: &[u8]) {
+        let retained_limit = RUN_OUTPUT_LIMIT - RUN_OUTPUT_MARKER.len();
+        let retain = retained_limit
+            .saturating_sub(self.bytes.len())
+            .min(bytes.len());
+        self.bytes.extend_from_slice(&bytes[..retain]);
+        self.truncated |= retain < bytes.len();
     }
-    Ok(output)
+
+    fn snapshot(&self) -> Vec<u8> {
+        let mut output = self.bytes.clone();
+        if self.truncated {
+            output.extend_from_slice(RUN_OUTPUT_MARKER);
+        }
+        output
+    }
+}
+
+#[derive(Clone, Default)]
+struct ReaderState {
+    done: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+impl ReaderState {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    fn error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
+    }
+}
+
+fn capture_bounded(mut reader: impl Read, capture: Arc<Mutex<BoundedCapture>>, state: ReaderState) {
+    let mut buffer = [0u8; 8192];
+    let result = loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break Ok(()),
+            Ok(read) => capture.lock().unwrap().push(&buffer[..read]),
+            Err(error) => break Err(error.to_string()),
+        }
+    };
+    if let Err(error) = result {
+        *state.error.lock().unwrap() = Some(error);
+    }
+    state.done.store(true, Ordering::Release);
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 #[cfg(test)]
 mod run_tests {
-    use super::{capture_bounded, RUN_OUTPUT_LIMIT, RUN_OUTPUT_MARKER};
+    use super::{BoundedCapture, RUN_OUTPUT_LIMIT, RUN_OUTPUT_MARKER};
     use std::io::Cursor;
 
     #[test]
     fn synchronous_process_output_is_capped_with_a_marker() {
-        let output = capture_bounded(Cursor::new(vec![b'x'; RUN_OUTPUT_LIMIT + 1])).unwrap();
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(BoundedCapture::default()));
+        super::capture_bounded(
+            Cursor::new(vec![b'x'; RUN_OUTPUT_LIMIT + 1]),
+            capture.clone(),
+            super::ReaderState::new(),
+        );
+        let output = capture.lock().unwrap().snapshot();
         assert_eq!(output.len(), RUN_OUTPUT_LIMIT);
         assert!(output.ends_with(RUN_OUTPUT_MARKER));
     }

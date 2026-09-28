@@ -3,6 +3,7 @@
 //! chunk and discard the declaration. #98 item 3.
 
 use std::fs;
+use std::path::Path;
 use std::process::{Command, Output};
 
 #[test]
@@ -221,11 +222,19 @@ fn typed_failures_print_only_the_message_and_use_the_requested_exit_code() {
     );
 }
 
-#[test]
-fn extension_commands_receive_bounded_non_tty_stdin() {
-    use std::io::Write;
+fn stdin_cli(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+    command
+        .args(["-s", "s"])
+        .args(args)
+        .env("REMUDA_RUNTIME_DIR", dir)
+        .env("REMUDA_SUPPRESS_DEPRECATIONS", "1")
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("HOME", dir);
+    command
+}
 
-    const MAX_STDIN: usize = 1024 * 1024;
+fn setup_stdin_fixture() -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("rc-stdin-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     let mod_dir = dir.join("data/remuda/mods/sample");
@@ -239,29 +248,41 @@ fn extension_commands_receive_bounded_non_tty_stdin() {
         mod_dir.join("packages/sample/init.lua"),
         r#"remuda.extension_command("sample", function(args, caller)
           if args[1] == "-" then return caller.stdin or "<missing>" end
-          return "unexpected args"
+          if args[1] == "bytes" then
+            local bytes = {}
+            for i = 1, #caller.stdin do bytes[#bytes + 1] = tostring(string.byte(caller.stdin, i)) end
+            return table.concat(bytes, ",")
+          end
+          return caller.stdin == nil and "<nil>" or "unexpected stdin"
         end)"#,
     )
     .unwrap();
 
-    let cli = |args: &[&str]| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
-        command
-            .args(["-s", "s"])
-            .args(args)
-            .env("REMUDA_RUNTIME_DIR", &dir)
-            .env("REMUDA_SUPPRESS_DEPRECATIONS", "1")
-            .env("XDG_DATA_HOME", dir.join("data"))
-            .env("HOME", &dir);
-        command
-    };
-    let boot = cli(&["-e", "remuda.ls()"]).output().expect("start daemon");
+    let boot = stdin_cli(&dir, &["-e", "remuda.session.list()"])
+        .output()
+        .expect("start daemon");
     assert!(boot.status.success(), "daemon boot failed: {boot:?}");
-    let loaded = cli(&["exec", "sample"]).output().expect("load mod");
+    let loaded = stdin_cli(&dir, &["exec", "sample"])
+        .output()
+        .expect("load mod");
     assert!(loaded.status.success(), "mod load failed: {loaded:?}");
+    dir
+}
+
+fn cleanup_stdin_fixture(dir: &Path) {
+    let _ = stdin_cli(dir, &["stop", "-f"]).output();
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn extension_commands_receive_stdin_with_dash_and_enforce_limit() {
+    use std::io::Write;
+
+    const MAX_STDIN: usize = 1024 * 1024;
+    let dir = setup_stdin_fixture();
 
     let payload = b"message from pipe\nwith \"quotes\" and backslash \\";
-    let mut command = cli(&["sample", "-"])
+    let mut command = stdin_cli(&dir, &["sample", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -278,7 +299,7 @@ fn extension_commands_receive_bounded_non_tty_stdin() {
     assert_eq!(output.stdout, [payload.as_slice(), b"\n"].concat());
 
     let oversized = vec![b'x'; MAX_STDIN + 1];
-    let mut command = cli(&["sample", "-"])
+    let mut command = stdin_cli(&dir, &["sample", "-"])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -302,6 +323,54 @@ fn extension_commands_receive_bounded_non_tty_stdin() {
         "unexpected oversized stdin error: {output:?}"
     );
 
-    let _ = cli(&["stop", "-f"]).output();
-    let _ = fs::remove_dir_all(&dir);
+    cleanup_stdin_fixture(&dir);
+}
+
+#[test]
+fn extension_commands_accept_binary_stdin_only_when_requested() {
+    use std::io::Write;
+
+    let dir = setup_stdin_fixture();
+    let bytes = [0, 0xff, b'A'];
+    let mut command = stdin_cli(&dir, &["--stdin", "sample", "bytes"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run extension command with binary stdin");
+    command
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(&bytes)
+        .expect("write binary stdin payload");
+    let output = command.wait_with_output().expect("binary stdin result");
+    assert!(
+        output.status.success(),
+        "binary stdin command failed: {output:?}"
+    );
+    assert_eq!(output.stdout, b"0,255,65\n");
+
+    // Keep stdin open: an ordinary extension command must not wait for EOF.
+    let mut command = stdin_cli(&dir, &["sample", "no-stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run extension command without stdin opt-in");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = command.try_wait().expect("poll extension command") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = command.kill();
+            panic!("extension command blocked on an unrequested stdin pipe");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(status.success(), "no-stdin extension failed: {status:?}");
+    let output = command.wait_with_output().expect("no-stdin command result");
+    assert_eq!(output.stdout, b"<nil>\n");
+    cleanup_stdin_fixture(&dir);
 }

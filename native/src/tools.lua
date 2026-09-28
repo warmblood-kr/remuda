@@ -2004,7 +2004,7 @@ remuda.process = setmetatable({ run = process_run }, {
   __call = function(_, spec) return process_start(spec) end,
 })
 register("process", "Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output.", "process(spec) -> id; process.run(spec) -> {code, stdout, stderr, timed_out}")
-register("process.run", "Run argv directly without a shell; blocks the Lua image until exit or timeout (default 5s, max 30s), captures each stream up to 1 MiB.", "process.run{argv, stdin?, timeout?} -> {code, stdout, stderr, timed_out}")
+register("process.run", "Run argv directly without a shell; inherits the daemon's environment and working directory. Blocks the Lua image until exit or timeout (default 5s, max 30s), captures each stream up to 1 MiB. Windows timeout kills only the direct child; surviving descendants may keep output pipes open.", "process.run{argv, stdin?, timeout?} -> {code, stdout, stderr, timed_out, signal?}")
 
 -- Everything defined so far is core's; a mod may not replace it (#145).
 for key in pairs(remuda) do core_fields[key] = true end

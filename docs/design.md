@@ -156,12 +156,20 @@ ever blocks waiting for that to happen.
 
 For short commands that need an immediate result, `remuda.process.run{argv=,
 stdin=, timeout=}` runs the executable directly, without a shell, and returns
-`{code, stdout, stderr, timed_out}`. `timeout` defaults to 5 seconds and cannot
-exceed 30; timeout kills the child and reports code 124. Each captured output
-stream is limited to 1 MiB and ends with a truncation marker when capped.
+`{code, stdout, stderr, timed_out, signal?}`. `timeout` defaults to 5 seconds
+and cannot exceed 30; timeout kills the child and reports code 124. On Unix,
+`signal` gives the terminating signal when the child died from one. Each
+captured output stream is limited to 1 MiB and ends with a truncation marker
+when capped.
 This call is synchronous: while it runs, the daemon's single Lua Image cannot
 serve RPCs or run hooks and schedules. Keep the command short; use the
 asynchronous `remuda.process{...}` form for longer work.
+The child inherits the daemon's current working directory and full environment,
+including any credentials or secrets in that environment. Windows timeout
+kills only the direct child; descendants may survive. The call still returns
+by its deadline, while background pipe readers remain until surviving
+descendants close their inherited pipes. Unix kills the child's process group,
+but the deadline still bounds the Lua image if a descendant escapes that group.
 
 The buffer between the reader thread and the Image is capped, on purpose.
 When it fills, the reader thread simply stops reading — the child's own

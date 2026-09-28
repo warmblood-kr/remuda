@@ -836,6 +836,9 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
                 result.set("stdout", lua.create_string(&output.stdout)?)?;
                 result.set("stderr", lua.create_string(&output.stderr)?)?;
                 result.set("timed_out", output.timed_out)?;
+                if let Some(signal) = output.signal {
+                    result.set("signal", signal)?;
+                }
                 Ok(result)
             },
         )?,

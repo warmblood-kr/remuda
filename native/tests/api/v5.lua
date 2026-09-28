@@ -66,6 +66,17 @@ local slow_argv = windows
 local timed = remuda.process.run({ argv = slow_argv, timeout = 0.2 })
 assert(timed.timed_out, "process.run must kill a child when its timeout expires")
 assert(timed.code == 124, "timed-out process.run must return timeout code 124")
+if not windows then
+  assert(timed.signal == 9, "process.run should report Unix SIGKILL when timeout kills the child")
+  -- The shell exits immediately, but its background child inherits stdout
+  -- and stderr. The entire call, including pipe draining, must obey timeout.
+  local started = os.time()
+  local held_pipes = remuda.process.run({
+    argv = { "/bin/sh", "-c", "sleep 6 & echo child-started" }, timeout = 0.2,
+  })
+  assert(held_pipes.timed_out, "process.run must time out when a descendant holds its pipes")
+  assert(os.time() - started < 4, "process.run must return by its deadline when a descendant holds pipes")
+end
 assert(type(remuda.session.list()) == "table", "the daemon should continue handling Lua work after timeout")
 
 local bad_timeout = pcall(function()
