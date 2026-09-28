@@ -398,9 +398,12 @@ impl Ui {
         let Some(session) = self.selected() else {
             return Action::Nothing;
         };
-        // The pane is bottom-anchored (`Viewport::bottom_anchored`); the
-        // current session dimensions from the herd place the click.
-        let row_offset = (session.size.rows() as usize).saturating_sub(body as usize);
+        // Click coordinates follow the same content anchor as the visible crop.
+        let row_offset = if self.visual_screen.is_empty() {
+            (session.size.rows() as usize).saturating_sub(body as usize)
+        } else {
+            ui_preview_row_offset(self, body)
+        };
         let child_row = row_offset + pane_row as usize;
         let child_col = self.pan as usize + pane_col as usize;
         // Only reachable if the outer terminal grew taller/the pan scrolled
@@ -424,8 +427,12 @@ impl Ui {
         if !session.mouse_tracking {
             return Action::Nothing;
         }
-        let child_row =
-            (session.size.rows() as usize).saturating_sub(body as usize) + pane_row as usize;
+        let row_offset = if self.visual_screen.is_empty() {
+            (session.size.rows() as usize).saturating_sub(body as usize)
+        } else {
+            ui_preview_row_offset(self, body)
+        };
+        let child_row = row_offset + pane_row as usize;
         let child_col = self.pan as usize + pane_col as usize;
         remuda_core::keys::mouse(button, child_col as u16, child_row as u16)
             .map_or(Action::Nothing, Action::Type)
@@ -1067,13 +1074,42 @@ pub struct Viewport {
     height: u16,
 }
 
+fn anchored_row_offset(source_rows: usize, height: u16, bottom_row: usize) -> usize {
+    let max_start = source_rows.saturating_sub(height as usize);
+    bottom_row
+        .min(source_rows.saturating_sub(1))
+        .saturating_add(1)
+        .saturating_sub(height as usize)
+        .min(max_start)
+}
+
 impl Viewport {
     /// Anchor at the bottom: the source's last `height` rows are visible,
     /// the rest scrolled off above — what the preview pane has always done,
     /// since an agent's own input line sits at the bottom.
     pub fn bottom_anchored(source_rows: usize, col_offset: u16, width: u16, height: u16) -> Self {
+        Self::bottom_anchored_at(
+            source_rows,
+            col_offset,
+            width,
+            height,
+            source_rows.saturating_sub(1),
+        )
+    }
+
+    /// Anchor the visible window so `bottom_row` is its last row when
+    /// possible. Short outer terminals use the active content row here,
+    /// avoiding a crop made mostly of blank rows below a top-line session.
+    pub fn bottom_anchored_at(
+        source_rows: usize,
+        col_offset: u16,
+        width: u16,
+        height: u16,
+        bottom_row: usize,
+    ) -> Self {
+        let bottom_row = bottom_row.min(source_rows.saturating_sub(1));
         Self {
-            row_offset: source_rows.saturating_sub(height as usize),
+            row_offset: anchored_row_offset(source_rows, height, bottom_row),
             col_offset,
             width,
             height,
@@ -1362,7 +1398,7 @@ mod visual_mode_tests {
         ui.keep_visual_cursor_visible();
 
         assert_eq!(ui.pan, 1);
-        let (cropped, _) = super::crop_styled(&ui.visual_screen[..1], 10, 1, ui.pan);
+        let (cropped, _) = super::crop_styled(&ui.visual_screen[..1], 10, 1, ui.pan, 0);
         assert!(
             cropped[0].contains('한'),
             "cropped row was: {:?}",
@@ -1895,8 +1931,31 @@ fn same_style(a: &StyledCell, b: &StyledCell) -> bool {
 
 /// The styled counterpart of the free `crop`, byte-identical to it when
 /// every cell is plain — see steps/020's oracle.
-fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Vec<String>, bool) {
-    let viewport = Viewport::bottom_anchored(cells.len(), pan, cols, rows);
+#[cfg(test)]
+fn crop_styled(
+    cells: &[Vec<StyledCell>],
+    cols: u16,
+    rows: u16,
+    pan: u16,
+    bottom_row: usize,
+) -> (Vec<String>, bool) {
+    let row_offset = anchored_row_offset(cells.len(), rows, bottom_row);
+    crop_styled_at_offset(cells, cols, rows, pan, row_offset)
+}
+
+fn crop_styled_at_offset(
+    cells: &[Vec<StyledCell>],
+    cols: u16,
+    rows: u16,
+    pan: u16,
+    row_offset: usize,
+) -> (Vec<String>, bool) {
+    let viewport = Viewport {
+        row_offset: row_offset.min(cells.len().saturating_sub(rows as usize)),
+        col_offset: pan,
+        width: cols,
+        height: rows,
+    };
     let (cropped, cut) = viewport.crop(cells);
     let out = cropped
         .into_iter()
@@ -1921,6 +1980,43 @@ fn crop_styled(cells: &[Vec<StyledCell>], cols: u16, rows: u16, pan: u16) -> (Ve
         })
         .collect();
     (out, cut)
+}
+
+/// The crop should end at the most relevant row: the child's cursor, or the
+/// last row containing visible text when content extends below the cursor.
+fn preview_anchor_row(cells: &[Vec<StyledCell>], cursor_row: u16) -> usize {
+    let last_nonempty = cells
+        .iter()
+        .rposition(|row| row.iter().any(|cell| !cell.text.trim().is_empty()));
+    usize::from(cursor_row)
+        .max(last_nonempty.unwrap_or(0))
+        .min(cells.len().saturating_sub(1))
+}
+
+fn preview_row_offset(
+    cells: &[Vec<StyledCell>],
+    cursor: Cursor,
+    height: u16,
+    preserve_history: bool,
+) -> usize {
+    if preserve_history || !cursor.visible {
+        return cells.len().saturating_sub(height as usize);
+    }
+    anchored_row_offset(cells.len(), height, preview_anchor_row(cells, cursor.row))
+        .min(cursor.row as usize)
+}
+
+fn ui_preview_row_offset(ui: &Ui, height: u16) -> usize {
+    let preserve_history = ui
+        .selected()
+        .and_then(|session| ui.scrollback.get(&session.name))
+        .is_some_and(|state| state.offset > 0);
+    preview_row_offset(
+        &ui.visual_screen,
+        ui.preview_cursor,
+        height,
+        preserve_history,
+    )
 }
 
 /// The one text-width rule the list renderer uses. Ambiguous-width
@@ -1970,11 +2066,19 @@ fn locate_cursor(
     preview_w: u16,
     body: u16,
     list_w: u16,
+    preserve_history: bool,
 ) -> Option<(u16, u16)> {
     if !cursor.visible {
         return None;
     }
-    let viewport = Viewport::bottom_anchored(cells.len(), pan, preview_w, body);
+    let mut viewport = Viewport::bottom_anchored_at(
+        cells.len(),
+        pan,
+        preview_w,
+        body,
+        preview_anchor_row(cells, cursor.row),
+    );
+    viewport.row_offset = preview_row_offset(cells, cursor, body, preserve_history);
     let (panel_row, panel_col) =
         viewport.map_cursor(cells, cursor.row as usize, cursor.col as usize)?;
     // Convert pane-local coordinates to 1-based terminal coordinates, adding
@@ -2012,8 +2116,21 @@ pub fn render_styled(
     };
 
     let selected = cells_with_selection(ui, cells);
-    let (lines, cut) = crop_styled(&selected, preview_w, body, ui.pan);
-    let caret = locate_cursor(cells, cursor, ui.pan, preview_w, body, list_w);
+    let preserve_history = ui
+        .selected()
+        .and_then(|session| ui.scrollback.get(&session.name))
+        .is_some_and(|state| state.offset > 0);
+    let row_offset = preview_row_offset(cells, cursor, body, preserve_history);
+    let (lines, cut) = crop_styled_at_offset(&selected, preview_w, body, ui.pan, row_offset);
+    let caret = locate_cursor(
+        cells,
+        cursor,
+        ui.pan,
+        preview_w,
+        body,
+        list_w,
+        preserve_history,
+    );
     // Hide before moving the terminal cursor around the frame. The final
     // caret state below is the only place that makes it visible again.
     let mut out = String::from("\x1b[?2026h\x1b[?25l\x1b[H");

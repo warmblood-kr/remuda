@@ -129,6 +129,94 @@ fn make_ui(rows: Vec<SessionSummary>) -> Ui {
     ui
 }
 
+#[test]
+fn short_terminal_preview_keeps_a_top_line_visible_at_all_supported_heights() {
+    let mut ui = make_ui(vec![row("shell", true, false)]);
+    ui.list_visible = false;
+    let mut cells = vec![vec![remuda_core::agent::StyledCell::default(); 80]; 24];
+    for (col, ch) in "one-line".chars().enumerate() {
+        cells[0][col] = remuda_core::agent::StyledCell {
+            text: ch.to_string(),
+            ..remuda_core::agent::StyledCell::default()
+        };
+    }
+    let cursor = remuda_core::agent::Cursor {
+        row: 0,
+        col: 8,
+        visible: true,
+    };
+
+    for terminal_rows in [10, 12, 16, 20, 24] {
+        let frame = render_styled(&ui, &cells, cursor, "test", 80, terminal_rows);
+        assert!(
+            frame.contains("one-line"),
+            "top-line session content disappeared at terminal height {terminal_rows}"
+        );
+    }
+}
+
+#[test]
+fn a_visible_cursor_stays_in_a_short_crop_even_with_a_footer_below_it() {
+    fn cell(text: &str) -> remuda_core::agent::StyledCell {
+        remuda_core::agent::StyledCell {
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+    let mut cells = vec![vec![cell(" "); 80]; 24];
+    cells[0][0] = cell("cursor");
+    cells[23][0] = cell("footer");
+    let cursor = Cursor {
+        row: 0,
+        col: 0,
+        visible: true,
+    };
+
+    let mut ui = make_ui(vec![row("shell", true, false)]);
+    ui.list_visible = false;
+    for body in [2, 3] {
+        let frame = render_styled(&ui, &cells, cursor, "test", 80, body + 1);
+        let (lines, _) = crop_styled(&cells, 80, body, 0, cursor.row as usize);
+        assert!(lines.iter().any(|line| line.contains("cursor")));
+        assert!(
+            frame.contains("cursor"),
+            "cursor row was cropped: {frame:?}"
+        );
+        assert!(frame.contains("\x1b[1;1H"), "caret was cropped: {frame:?}");
+    }
+}
+
+#[test]
+fn hidden_cursor_keeps_the_bottom_crop_stable_as_historical_output_grows() {
+    fn cell(text: &str) -> remuda_core::agent::StyledCell {
+        remuda_core::agent::StyledCell {
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+    let mut before = vec![vec![cell(" "); 80]; 24];
+    before[20][0] = cell("older");
+    let mut after = before.clone();
+    after[21][0] = cell("new output");
+    let hidden = hidden_cursor();
+
+    let mut ui = make_ui(vec![row("shell", true, false)]);
+    ui.list_visible = false;
+    ui.scrollback.entry("shell".into()).or_default().offset = 5;
+    let before_offset = preview_row_offset(&before, hidden, 2, true);
+    let after_offset = preview_row_offset(&after, hidden, 2, true);
+    assert_eq!(
+        before_offset, after_offset,
+        "historical view must not follow new last text row"
+    );
+    let before_frame = render_styled(&ui, &before, hidden, "test", 80, 3);
+    let after_frame = render_styled(&ui, &after, hidden, "test", 80, 3);
+    assert_eq!(
+        before_frame, after_frame,
+        "new output must not move the short historical crop"
+    );
+}
+
 #[cfg(windows)]
 fn streaming_command(_unix_script: &str, windows_script: &str) -> Vec<String> {
     vec![
@@ -1157,7 +1245,8 @@ fn the_styled_crop_matches_plain_crop_when_every_cell_is_default() {
             for pan in 0..=max_len + 2 {
                 for rows in 0..=max_rows + 2 {
                     let want = crop(screen, cols, rows, pan);
-                    let (got_lines, got_cut) = crop_styled(&cells, cols, rows, pan);
+                    let (got_lines, got_cut) =
+                        crop_styled(&cells, cols, rows, pan, cells.len().saturating_sub(1));
                     // Defensive: a default-only row should never actually
                     // carry a trailing reset, but strip one if present
                     // rather than assume it.
@@ -1221,7 +1310,7 @@ fn a_cut_after_a_wide_cell_never_overflows_the_pane_width() {
     let row = vec![plain("a"), plain("b"), wide, continuation, plain("x")];
     let cols = 4;
 
-    let (lines, cut) = crop_styled(&[row], cols, 1, 0);
+    let (lines, cut) = crop_styled(&[row], cols, 1, 0, 0);
     assert!(
         cut,
         "there is more content than fits — this must be marked cut"
@@ -2064,14 +2153,13 @@ fn a_hidden_cursor_never_gets_a_show_sequence() {
     );
 }
 
-/// A cursor scrolled above the bottom-anchored viewport (more session
-/// rows than the pane has height for) must not paint a caret at some
-/// clamped, wrong row — steps/027's axis 3.
+/// A visible cursor stays in the preview even when the outer terminal is
+/// shorter than the session screen; it must not be clamped to a wrong row.
 #[test]
-fn a_cursor_scrolled_out_of_the_viewport_is_hidden_not_clamped() {
+fn a_visible_cursor_stays_in_the_preview_when_the_outer_terminal_is_short() {
     let ui = make_ui(vec![row("claude", true, false)]);
-    // 20 session rows into a 9-row body (rows=10): row_offset = 11, so
-    // session row 0 is 11 rows above the visible window.
+    // 20 session rows into a 9-row body (rows=10): the content-aware
+    // viewport must move up to include the still-visible cursor at row 0.
     let cells = vec![text_row(10); 20];
     let cursor = Cursor {
         row: 0,
@@ -2080,8 +2168,8 @@ fn a_cursor_scrolled_out_of_the_viewport_is_hidden_not_clamped() {
     };
     let out = render_styled(&ui, &cells, cursor, "default", 80, 10);
     assert!(
-        out.ends_with("\x1b[?25l\x1b[?2026l"),
-        "row 0 is scrolled off above the visible window: {out:?}"
+        out.contains("\x1b[1;18H\x1b[?25h"),
+        "cursor row remains visible: {out:?}"
     );
 }
 
