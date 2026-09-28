@@ -26,9 +26,28 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// A stand-in at the private server's socket that only records connections.
+/// Run `args` against a stand-in at the private server's socket that only
+/// records connections, hanging up at once so a connecting CLI fails fast.
+fn touches_daemon(tag: &str, args: &[&str]) -> (Output, bool) {
+    let dir = scratch(tag);
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+    std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+    let listener = UnixListener::bind(&socket).expect("bind stand-in");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        while listener.accept().is_ok() {
+            let _ = tx.send(());
+        }
+    });
+    let out = remuda(&dir, args);
+    let touched = rx.try_recv().is_ok();
+    let _ = std::fs::remove_dir_all(&dir);
+    (out, touched)
+}
+
 #[test]
 fn help_and_version_never_connect_to_a_daemon() {
+    // Bare `remuda` here has no tty (output() nulls stdin), so it prints help.
     for args in [
         &["--help"][..],
         &["-h"],
@@ -36,26 +55,23 @@ fn help_and_version_never_connect_to_a_daemon() {
         &["--version"],
         &["-V"],
         &["version"],
+        &[],
     ] {
-        let dir = scratch("help");
-        let socket = remuda_native::daemon::socket_path_in(&dir, "s");
-        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        let listener = UnixListener::bind(&socket).expect("bind stand-in");
-        let (tx, rx) = std::sync::mpsc::channel();
-        // Accept and hang up at once, so a connecting CLI fails fast, not hangs.
-        std::thread::spawn(move || {
-            while listener.accept().is_ok() {
-                let _ = tx.send(());
-            }
-        });
-
-        let out = remuda(&dir, args);
-        let touched = rx.try_recv().is_ok();
-        let _ = std::fs::remove_dir_all(&dir);
-
+        let (out, touched) = touches_daemon("help", args);
         assert!(out.status.success(), "{args:?} failed: {out:?}");
         assert!(!touched, "{args:?} connected to the daemon socket");
     }
+}
+
+/// A bad channel fails before any download, after the handshake would have run.
+#[test]
+fn upgrade_never_connects_to_a_daemon() {
+    let (out, touched) = touches_daemon("upgrade", &["upgrade", "--channel", "bogus"]);
+    assert!(
+        !out.status.success(),
+        "a bogus channel was accepted: {out:?}"
+    );
+    assert!(!touched, "upgrade connected to the daemon socket");
 }
 
 #[test]
@@ -74,6 +90,73 @@ fn a_socket_path_over_sun_path_names_the_length_not_a_second_daemon() {
     assert!(
         !said.contains("second daemon"),
         "blamed a second daemon: {said}"
+    );
+    assert!(said.contains("REMUDA_RUNTIME_DIR"), "no cure named: {said}");
+}
+
+/// `mod install --reload` reaches the daemon through its own connect path; a
+/// local repo stands in for GitHub via git's `insteadOf`.
+#[test]
+fn mod_reload_over_sun_path_names_the_length_not_a_daemon() {
+    let root = scratch("reload");
+    let repo = root.join("src/owner/sample.git");
+    std::fs::create_dir_all(repo.join("packages/sample")).unwrap();
+    std::fs::write(
+        repo.join("extension.toml"),
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("packages/sample/init.lua"),
+        "return { api = \"remuda-module-v1\", state_version = 1 }",
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .current_dir(&repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(ok.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "sample",
+    ]);
+
+    let long = root.join("x".repeat(120));
+    std::fs::create_dir_all(&long).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "mod", "install", "owner/sample", "--reload"])
+        .env("REMUDA_RUNTIME_DIR", &long)
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("HOME", &root)
+        .env("REMUDA_NO_UPDATE_CHECK", "1")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env(
+            "GIT_CONFIG_KEY_0",
+            format!("url.file://{}/.insteadOf", root.join("src").display()),
+        )
+        .env("GIT_CONFIG_VALUE_0", "https://github.com/")
+        .output()
+        .expect("run remuda");
+    let said = String::from_utf8_lossy(&out.stderr).to_string();
+    let _ = std::fs::remove_dir_all(&root);
+
+    assert!(
+        said.contains("installed mod sample"),
+        "install itself failed: {said}"
+    );
+    assert!(
+        !said.contains("cannot connect to remuda daemon"),
+        "blamed a daemon: {said}"
     );
     assert!(said.contains("REMUDA_RUNTIME_DIR"), "no cure named: {said}");
 }
