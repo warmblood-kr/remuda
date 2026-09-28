@@ -757,35 +757,16 @@ fn a_mod_owns_the_top_level_fields_it_creates() {
         Arc::new(Counters::default()),
     );
     read_value(&image, include_str!("api/v3.lua"));
-    // Condition 3: a legacy-created seam is adopted and keeps working.
-    read_value(
-        &image,
-        "function remuda._butler_register_compaction_schedule() return 'legacy' end",
-    );
     let v1 = r#"return { api = "remuda-module-v1", state_version = 1,
         initialize = function() return {} end,
         start = function()
           function remuda._f145(x) return "v1:" .. x end
-          function remuda._butler_register_compaction_schedule() return "lifecycle" end
         end }"#;
     install(&home, "sample", v1);
     read_value(&image, "remuda.exec('sample')");
     assert_eq!(read_value(&image, "return remuda._f145('x')"), "v1:x");
-    assert_eq!(
-        read_value(
-            &image,
-            "return remuda._butler_register_compaction_schedule()"
-        ),
-        "lifecycle"
-    );
     read_value(&image, "remuda.reload('sample')");
-    assert_eq!(
-        read_value(
-            &image,
-            "return remuda._butler_register_compaction_schedule()"
-        ),
-        "lifecycle"
-    );
+    assert_eq!(read_value(&image, "return remuda._f145('x')"), "v1:x");
 
     // Advice from outside survives the mod recreating the field on reload.
     read_value(&image, "remuda.advise('remuda._f145', 'filter_return', function(r) return r .. '!' end, { id = 'bang' })");
@@ -908,4 +889,63 @@ fn advice_on_a_mod_field_follows_the_advising_mod() {
     read_value(&image, "remuda.reload('h')");
     assert_eq!(read_value(&image, call), "A(B(h:x))");
     assert_eq!(read_value(&image, owners), "a@a,b@b");
+}
+
+/// #145 namespace rule: a mod NAME adopts an unowned legacy field only under
+/// `remuda._NAME_*` or `remuda.NAME_*`; any other one is refused, naming the
+/// field, the mod and the allowed prefix. Condition 3 rides on this: Butler
+/// keeps `remuda._butler_register_compaction_schedule` working.
+#[test]
+fn a_mod_adopts_legacy_fields_only_in_its_own_namespace() {
+    let home = DataHome::new();
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-namespace.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(
+        &image,
+        "function remuda._butler_register_compaction_schedule() return 'legacy' end \
+         remuda._butler_x = 'legacy' remuda._other_x = 'legacy'",
+    );
+    let adopting = |field: &str| {
+        format!(
+            r#"return {{ api = "remuda-module-v1", state_version = 1,
+                initialize = function() return {{}} end,
+                start = function() remuda.{field} = function() return "lifecycle" end end }}"#
+        )
+    };
+    install(
+        &home,
+        "butler",
+        &adopting("_butler_register_compaction_schedule"),
+    );
+    read_value(&image, "remuda.exec('butler'); remuda.reload('butler')");
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._butler_register_compaction_schedule()"
+        ),
+        "lifecycle"
+    );
+
+    install(&home, "butler", &adopting("_butler_x"));
+    read_value(&image, "remuda.reload('butler')");
+    assert_eq!(read_value(&image, "return remuda._butler_x()"), "lifecycle");
+
+    install(&home, "butler", &adopting("_other_x"));
+    let error = image.eval("remuda.reload('butler')", None).unwrap_err();
+    assert!(
+        error.contains("remuda._other_x") && error.contains("butler") && error.contains("_butler_"),
+        "{error}"
+    );
+    assert_eq!(read_value(&image, "return remuda._other_x"), "legacy");
+
+    install(&home, "foo", &adopting("_butler_x"));
+    let error = image.eval("remuda.exec('foo')", None).unwrap_err();
+    assert!(
+        error.contains("remuda._butler_x") && error.contains("foo"),
+        "{error}"
+    );
 }

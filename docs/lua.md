@@ -150,8 +150,9 @@ tools and schedules, and also every `remuda.on` hook and
 `start`, or one of its declared hooks, tools or schedules). `hook_list` shows
 that `owner`. A mod may also create new top-level `remuda.*` fields (for
 example `function remuda._sample_notify(...) end` in `start`); they are its own.
-Assigning a field core defines, or one another mod owns, is an error; a field
-left by a legacy script is taken over. Reload replaces everything the mod owns,
+Assigning a field core defines, or one another mod owns, is an error. A field
+left by a legacy script is taken over only in the mod's own namespace,
+`remuda._NAME_*` or `remuda.NAME_*`; any other existing field is an error. Reload replaces everything the mod owns,
 and a reload whose `start` fails restores the previous set. A field the new
 `start` does not recreate is removed along with any advice on it; one it does
 recreate keeps its advice. Other imperative effects

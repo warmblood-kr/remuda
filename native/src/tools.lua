@@ -593,7 +593,8 @@ local modules = {}
 -- #145: a lifecycle mod sees `remuda` through a proxy, so its assignments
 -- come here. It may create new top-level fields, which it then owns; core's
 -- (named in `core_fields` once this file has loaded) and another mod's are
--- refused. A field left by a legacy exec, unowned, is adopted.
+-- refused. A field left by a legacy exec, unowned, is adopted only in the
+-- mod's own namespace.
 local core_fields = {}
 local field_owners = {}
 local function set_module_field(name, key, value)
@@ -604,6 +605,13 @@ local function set_module_field(name, key, value)
   local owner = field_owners[key]
   if owner and owner ~= name then
     error("mod " .. name .. " cannot replace remuda." .. key .. ", which mod " .. owner .. " owns", 2)
+  end
+  -- An unowned field that already exists (left by a legacy exec) is adopted
+  -- only in the mod's own namespace, remuda._NAME_* or remuda.NAME_*.
+  if not owner and remuda[key] ~= nil
+    and key:sub(1, #name + 2) ~= "_" .. name .. "_" and key:sub(1, #name + 1) ~= name .. "_" then
+    error("mod " .. name .. " cannot take over remuda." .. key .. ": it may adopt existing fields"
+      .. " only under remuda._" .. name .. "_* or remuda." .. name .. "_*", 2)
   end
   field_owners[key] = value ~= nil and name or nil
   remuda[key] = value
