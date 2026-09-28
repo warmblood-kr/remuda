@@ -180,7 +180,7 @@ jobs:
           docker run --rm --platform linux/arm64/v8 \
             -v "$GITHUB_WORKSPACE/target/aarch64-linux-android/release/remuda:/tmp/remuda:ro" \
             termux/termux-docker:aarch64 \
-            bash -c '/tmp/remuda --version && /tmp/remuda -s smoke -e "return 1"'
+            login -c '/tmp/remuda --version && /tmp/remuda -s smoke -e "return 1"'
 
       - name: package
         run: |
