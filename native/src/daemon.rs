@@ -238,6 +238,11 @@ struct SocketLock {
     _file: std::fs::File,
 }
 
+#[cfg(unix)]
+const SOCKET_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(unix)]
+const SOCKET_LOCK_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl SocketLock {
     fn acquire(socket: &Path) -> std::io::Result<Self> {
         #[cfg(unix)]
@@ -250,18 +255,32 @@ impl SocketLock {
             let mut lock_name = socket.as_os_str().to_os_string();
             lock_name.push(".lock");
             let lock_path = PathBuf::from(lock_name);
-            let file = std::fs::OpenOptions::new()
+            let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .read(true)
                 .write(true)
                 .mode(0o600)
                 .open(&lock_path)?;
-            std::fs::set_permissions(lock_path, std::fs::Permissions::from_mode(0o600))?;
+            std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))?;
+            let started = std::time::Instant::now();
+            let deadline = started + SOCKET_LOCK_WAIT;
+            let mut announced = false;
             loop {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        socket_lock_timeout_message(&lock_path, socket_lock_holder(&lock_path)),
+                    ));
+                }
                 let result =
                     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                 if result == 0 {
+                    use std::io::{Seek, SeekFrom};
+                    file.set_len(0)?;
+                    file.seek(SeekFrom::Start(0))?;
+                    writeln!(file, "{}", std::process::id())?;
+                    file.flush()?;
                     break;
                 }
                 let error = std::io::Error::last_os_error();
@@ -272,8 +291,19 @@ impl SocketLock {
                             "Remuda daemon is already listening",
                         ));
                     }
+                    let holder = socket_lock_holder(&lock_path);
+                    let elapsed = started.elapsed();
+                    if !announced && elapsed >= SOCKET_LOCK_NOTICE_AFTER {
+                        eprintln!(
+                            "remuda: waiting for the socket lock held by another remuda daemon (pid {})",
+                            holder.map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
+                        );
+                        announced = true;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(10));
-                } else if error.kind() != std::io::ErrorKind::Interrupted {
+                } else if error.kind() == std::io::ErrorKind::Interrupted {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                } else {
                     return Err(error);
                 }
             }
@@ -284,6 +314,26 @@ impl SocketLock {
             let _ = socket;
             Ok(Self {})
         }
+    }
+}
+
+#[cfg(unix)]
+fn socket_lock_holder(lock_path: &Path) -> Option<u32> {
+    std::fs::read_to_string(lock_path).ok()?.trim().parse().ok()
+}
+
+#[cfg(unix)]
+fn socket_lock_timeout_message(lock_path: &Path, holder: Option<u32>) -> String {
+    match holder {
+        Some(pid) => format!(
+            "timed out waiting for the socket lock held by remuda daemon pid {pid}; \
+             if it is stopped, run `kill -CONT {pid}` to resume it; if it is stuck, \
+             verify it is this daemon, run `kill {pid}`, then retry"
+        ),
+        None => format!(
+            "timed out waiting for the socket lock (holder pid unavailable; inspect {})",
+            lock_path.display()
+        ),
     }
 }
 
@@ -666,15 +716,33 @@ fn handle(
         Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
         Request::RemoveDirAll { path: dir } => reply(&stream, &remove_dir_all(&dir)),
 
-        Request::Eval { code, name } => match image.eval_request(&code, name.as_deref()) {
-            Ok(value) => match image.pending_replies().pending_id(&value) {
-                Some(id) => deferred_reply(stream, reader, image, id),
-                None => reply(&stream, &Response::Value(value)),
-            },
-            // Lua's own message, which already carries the line and a
-            // traceback — the same treatment `remuda run` gives a script file.
-            Err(e) => reply(&stream, &Response::error(e)),
+        Request::Eval { code, name } => handle_eval(stream, reader, image, &code, name.as_deref()),
+    }
+}
+
+fn handle_eval(
+    stream: Stream,
+    reader: BufReader<Stream>,
+    image: &Image,
+    code: &str,
+    name: Option<&str>,
+) -> std::io::Result<()> {
+    match image.eval_request(code, name) {
+        Ok(value) => match image.pending_replies().pending_id(&value) {
+            Some(id) => deferred_reply(stream, reader, image, id),
+            None if value.len() > crate::reply_limit::MAX_REPLY_BYTES => reply(
+                &stream,
+                &Response::error(format!(
+                    "synchronous reply exceeds the {} MiB output limit ({} bytes)",
+                    crate::reply_limit::MAX_REPLY_BYTES / (1024 * 1024),
+                    value.len()
+                )),
+            ),
+            None => reply(&stream, &Response::Value(value)),
         },
+        // Lua's own message, which already carries the line and a traceback —
+        // the same treatment `remuda run` gives a script file.
+        Err(error) => reply(&stream, &Response::error(error)),
     }
 }
 
@@ -887,6 +955,7 @@ fn input(
         Some(Err(remuda_core::input::InputError::RateLimited)) => {
             reply(stream, &Response::RateLimited)
         }
+        Some(Err(remuda_core::input::InputError::Busy)) => reply(stream, &Response::Busy),
         Some(Err(error)) => reply(stream, &Response::error(error.to_string())),
         Some(Ok(remuda_core::input::InputOutcome::Ack { duplicate })) => {
             reply(stream, &Response::Ack { duplicate })
@@ -923,6 +992,10 @@ fn respond<T>(
 ) -> std::io::Result<()> {
     match result {
         None => reply(stream, &Response::error(format!("no such session: {name}"))),
+        Some(Err(remuda_core::AgentError::Busy)) => reply(stream, &Response::Busy),
+        Some(Err(remuda_core::AgentError::WriteTimeout { .. })) => {
+            reply(stream, &Response::WriteTimeout)
+        }
         Some(Err(e)) => reply(stream, &Response::error(e)),
         Some(Ok(v)) => reply(stream, &ok(v)),
     }
@@ -1061,12 +1134,27 @@ fn attach(
         let held = &held;
         let key_thread = scope.spawn(move || {
             let mut buf = [0u8; 4096];
-            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            'keys: while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if held.write_raw(&buf[..n]).is_err() {
-                            break;
+                        // Preserve this exact read buffer until the session
+                        // accepts it. Native PTYs wait for their in-flight
+                        // write to finish before retrying, so a late partial
+                        // write is never replayed as a second keystroke.
+                        loop {
+                            if stop.load(std::sync::atomic::Ordering::SeqCst) || held.is_displaced()
+                            {
+                                break;
+                            }
+                            match held.write_raw(&buf[..n]) {
+                                Ok(()) => break,
+                                Err(remuda_core::AgentError::Exited) => break 'keys,
+                                Err(remuda_core::AgentError::Attached) if held.is_displaced() => {
+                                    break 'keys;
+                                }
+                                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                            }
                         }
                     }
                 }
@@ -1108,10 +1196,50 @@ fn attach(
     Ok(())
 }
 
+struct LimitedReplyWriter<'a> {
+    bytes: &'a mut Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for LimitedReplyWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized daemon reply exceeds the wire limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
-    let mut line = serde_json::to_string(response)?;
-    line.push('\n');
-    stream.write_all(line.as_bytes())?;
+    let wire_limit = crate::reply_limit::max_reply_wire_bytes();
+    let mut line = Vec::with_capacity(1024);
+    let serialized = serde_json::to_writer(
+        LimitedReplyWriter {
+            bytes: &mut line,
+            limit: wire_limit - 1,
+        },
+        response,
+    );
+    if serialized.is_err() {
+        line.clear();
+        serde_json::to_writer(
+            LimitedReplyWriter {
+                bytes: &mut line,
+                limit: wire_limit - 1,
+            },
+            &Response::error("daemon reply exceeds the maximum serialized size"),
+        )?;
+    }
+    line.push(b'\n');
+    stream.write_all(&line)?;
     stream.flush()
 }
 

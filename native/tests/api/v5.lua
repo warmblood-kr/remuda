@@ -97,4 +97,104 @@ end
 assert(legacy_found, "deprecated flat session aliases must remain compatible in v5")
 remuda.close(legacy_name)
 
+-- v5 also carries the bounded synchronous process word until the next API
+-- version is frozen. It executes argv directly, with bounded time and output.
+assert(type(remuda.process) == "table", "remuda.process must be a callable namespace table")
+local process_mt = getmetatable(remuda.process)
+assert(process_mt and type(process_mt.__call) == "function",
+  "remuda.process must preserve the asynchronous process(spec) call")
+assert(type(remuda.process.run) == "function", "remuda.process.run is missing")
+
+local windows = package.config:sub(1, 1) == "\\"
+local echo_argv = windows
+  and { "cmd.exe", "/c", "echo", "remuda-process-run-v5" }
+  or { "/bin/echo", "remuda-process-run-v5" }
+local result = remuda.process.run({ argv = echo_argv, timeout = 3 })
+assert(result.code == 0, "process.run should return the child exit code")
+assert(result.stdout:find("remuda-process-run-v5", 1, true), "process.run should capture stdout")
+assert(result.stderr == "", "process.run should capture stderr separately")
+assert(result.timed_out == false, "a completed process must not be marked timed out")
+
+local async_id = remuda.process({ argv = echo_argv })
+assert(type(async_id) == "number", "the callable process namespace must preserve process(spec)")
+if not windows then
+  local piped = remuda.process.run({ argv = { "/bin/cat" }, stdin = "process stdin v5", timeout = 3 })
+  assert(piped.stdout == "process stdin v5", "process.run should pass stdin to the child")
+end
+
+local slow_argv = windows
+  and { "ping.exe", "-n", "30", "127.0.0.1" }
+  or { "/bin/sleep", "10" }
+local timed = remuda.process.run({ argv = slow_argv, timeout = 0.2 })
+assert(timed.timed_out, "process.run must kill a child when its timeout expires")
+assert(timed.code == 124, "timed-out process.run must return timeout code 124")
+if not windows then
+  assert(timed.signal == 9, "process.run should report Unix SIGKILL when timeout kills the child")
+  -- The shell exits immediately, but its background child inherits stdout
+  -- and stderr. The entire call, including pipe draining, must obey timeout.
+  local started = os.time()
+  local held_pipes = remuda.process.run({
+    argv = { "/bin/sh", "-c", "sleep 30 & echo $!" }, timeout = 0.2,
+  })
+  local held_pid = held_pipes.stdout:match("(%d+)")
+  if held_pid then os.execute("/bin/kill -KILL " .. held_pid) end
+  assert(held_pipes.timed_out, "process.run must time out when a descendant holds its pipes")
+  assert(held_pid, "the pipe-holding descendant pid should be captured")
+  assert(os.time() - started < 4, "process.run must return by its deadline when a descendant holds pipes")
+
+  -- A descendant can escape the process group with setsid and keep both
+  -- output pipes alive. Limit detached readers so repeated calls cannot leak
+  -- unbounded threads and file descriptors. Skip systems without setsid.
+  local setsid_probe = pcall(function()
+    local probe = remuda.process.run({ argv = { "setsid", "/bin/true" }, timeout = 1 })
+    assert(probe.code == 0, "setsid probe failed")
+  end)
+  if setsid_probe then
+    local escaped_pids = {}
+    local exercised_cap, cap_error = pcall(function()
+      for _ = 1, 8 do
+        local escaped = remuda.process.run({
+          argv = { "/bin/sh", "-c", "setsid /bin/sh -c 'echo $$; exec /bin/sleep 30' &" },
+          timeout = 0.1,
+        })
+        assert(escaped.timed_out, "setsid descendant should leave output pipes open")
+        local pid = escaped.stdout:match("(%d+)")
+        assert(pid, "setsid descendant pid should be captured")
+        escaped_pids[#escaped_pids + 1] = pid
+      end
+      local capped, refusal = pcall(function()
+        remuda.process.run({ argv = echo_argv, timeout = 1 })
+      end)
+      assert(not capped, "process.run must refuse calls after reaching the detached reader cap")
+      assert(tostring(refusal):find("limit of 16 output-reader workers", 1, true),
+        "reader cap should explain why the call was refused")
+    end)
+    for _, pid in ipairs(escaped_pids) do os.execute("/bin/kill -KILL " .. pid) end
+    local recovered = false
+    for _ = 1, 40 do
+      os.execute("/bin/sleep 0.05")
+      local ok = pcall(function() remuda.process.run({ argv = echo_argv, timeout = 1 }) end)
+      if ok then recovered = true; break end
+    end
+    assert(exercised_cap, tostring(cap_error))
+    assert(recovered, "reader permits should be released after escaped descendants exit")
+  end
+end
+assert(type(remuda.session.list()) == "table", "the daemon should continue handling Lua work after timeout")
+
+local bad_timeout = pcall(function()
+  remuda.process.run({ argv = echo_argv, timeout = 31 })
+end)
+assert(not bad_timeout, "process.run must reject a timeout above the 30-second hard cap")
+local json = remuda.json
+assert(type(json) == "table", "remuda.json is missing from the v5 surface")
+local decoded, decode_error = json.decode('{"values":[true,null]}')
+assert(decoded and decode_error == nil, tostring(decode_error))
+assert(json.encode(decoded) == '{"values":[true,null]}', "json encode/decode must round-trip")
+local duplicate, duplicate_error = json.decode('{"key":1,"key":2}')
+assert(duplicate == nil and duplicate_error == "duplicate key", "duplicate JSON keys must be rejected")
+local too_deep = string.rep("[", 65) .. "0" .. string.rep("]", 65)
+local limited, limit_error = json.decode(too_deep)
+assert(limited == nil and type(limit_error) == "string", "JSON depth limit must be enforced")
+
 print("v5 ok")

@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 73] = [
+pub const BINDINGS: [&str; 75] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -40,6 +40,7 @@ pub const BINDINGS: [&str; 73] = [
     "_pending_events",
     "_process_drain",
     "_process_killpg",
+    "_process_run",
     "_process_spawn",
     "_refresh_sessions_buffer",
     "_registry",
@@ -76,6 +77,7 @@ pub const BINDINGS: [&str; 73] = [
     "hooks",
     "http",
     "insert",
+    "json",
     "key",
     "kill",
     "list_dir",
@@ -141,6 +143,36 @@ const WORDS: &[(&str, &str, &str)] = &[
         "insert",
         "Insert raw bytes into a session with nothing appended.",
         "insert(name, text) -> nil",
+    ),
+    (
+        "json",
+        "Bounded JSON conversion for Lua values and UTF-8 JSON text.",
+        "table",
+    ),
+    (
+        "json.decode",
+        "Decode strict UTF-8 JSON; repeated object keys and over-limit input return nil, error.",
+        "json.decode(text) -> value, nil | nil, error",
+    ),
+    (
+        "json.encode",
+        "Encode a Lua value as bounded JSON; unsupported values raise a clear error.",
+        "json.encode(value, options?) -> string",
+    ),
+    (
+        "json.null",
+        "The sentinel that represents JSON null in Lua tables.",
+        "value",
+    ),
+    (
+        "json.array",
+        "Tag a dense Lua table as a JSON array, including an empty table.",
+        "json.array(table) -> table",
+    ),
+    (
+        "json.object",
+        "Tag a string-keyed Lua table as a JSON object, including an empty table.",
+        "json.object(table) -> table",
     ),
     (
         "key",
@@ -228,6 +260,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "table",
     ),
     (
+        "_process_run",
+        "Run an argv process synchronously with a bounded timeout and captured output; internal, called by `remuda.process.run`.",
+        "_process_run(argv, stdin?, timeout) -> result",
+    ),
+    (
         "_process_spawn",
         "Spawn a plain-pipe child process; internal, wrapped by `remuda.process`.",
         "_process_spawn(argv, on_line?, on_exit?) -> id",
@@ -272,6 +309,7 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
         row.set("signature", *signature)?;
         registry.set(*name, row)?;
     }
+    table.set("json", crate::json::bindings(lua)?)?;
     table.set("_registry", registry)
 }
 
@@ -872,6 +910,29 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
         )?,
     )?;
 
+    table.set(
+        "_process_run",
+        lua.create_function(
+            |lua, (argv, stdin, timeout): (Vec<String>, Option<mlua::LuaString>, f64)| {
+                let output = crate::process::run_sync(
+                    argv,
+                    stdin.map(|value| value.as_bytes().to_vec()),
+                    timeout,
+                )
+                .map_err(mlua::Error::runtime)?;
+                let result = lua.create_table()?;
+                result.set("code", output.code)?;
+                result.set("stdout", lua.create_string(&output.stdout)?)?;
+                result.set("stderr", lua.create_string(&output.stderr)?)?;
+                result.set("timed_out", output.timed_out)?;
+                if let Some(signal) = output.signal {
+                    result.set("signal", signal)?;
+                }
+                Ok(result)
+            },
+        )?,
+    )?;
+
     let drainer = processes.clone();
     let drain_image = image;
     table.set(
@@ -940,9 +1001,15 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
     match response {
         Response::Ok => Ok(Value::Nil),
         Response::Ack { .. } => Ok(Value::Nil),
-        Response::Uncertain => Err(mlua::Error::runtime("input outcome is uncertain")),
+        Response::Uncertain => Err(mlua::Error::runtime(
+            "input outcome is uncertain; bytes may be partial or late",
+        )),
         Response::WrongInstance => Err(mlua::Error::runtime("session instance changed")),
         Response::RateLimited => Err(mlua::Error::runtime("session input rate limit exceeded")),
+        Response::Busy => Err(mlua::Error::runtime("session input is busy")),
+        Response::WriteTimeout => Err(mlua::Error::runtime(
+            "session PTY write timed out; delivery may be partial or late",
+        )),
         Response::AttachStarted { .. } | Response::AttachStatus { .. } => Err(
             mlua::Error::runtime("attach responses are not exposed to scripts"),
         ),

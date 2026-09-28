@@ -161,6 +161,27 @@ handler were already special cases of: something outside the Image posts a
 job, the Image runs it whenever its FIFO gets there, and nothing outside
 ever blocks waiting for that to happen.
 
+For short commands that need an immediate result, `remuda.process.run{argv=,
+stdin=, timeout=}` runs the executable directly, without a shell, and returns
+`{code, stdout, stderr, timed_out, signal?}`. `timeout` defaults to 5 seconds
+and cannot exceed 30; timeout kills the child and reports code 124. On Unix,
+`signal` gives the terminating signal when the child died from one. Each
+captured output stream is limited to 1 MiB and ends with a truncation marker
+when capped.
+This call is synchronous: while it runs, the daemon's single Lua Image cannot
+serve RPCs or run hooks and schedules. Keep the command short; use the
+asynchronous `remuda.process{...}` form for longer work.
+The child inherits the daemon's current working directory and full environment,
+including any credentials or secrets in that environment. Windows timeout
+kills only the direct child; descendants may survive. Unix kills the child's
+process group while its direct leader is still alive. On either platform, a
+descendant that survives and holds an inherited output pipe can leave a
+background reader alive after the call returns; on Unix this includes a
+descendant that escaped the group with `setsid`. At most 16 output-reader
+workers may be active (eight such calls); further `process.run` calls fail
+with a clear limit error until the readers finish. The call itself still
+returns by its deadline.
+
 The buffer between the reader thread and the Image is capped, on purpose.
 When it fills, the reader thread simply stops reading — the child's own
 `write()` blocks against the now-full OS pipe, exactly the way a slow
