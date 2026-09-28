@@ -67,6 +67,7 @@ fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
         name: name.into(),
         alive,
         idle: Duration::from_secs(4),
+        output_idle: Some(Duration::from_secs(4)),
         size: Size::new(80, 24),
         attached,
         human_idle: None,

@@ -856,6 +856,7 @@ mod visual_mode_tests {
                 name: "agent".into(),
                 alive: true,
                 idle: Duration::ZERO,
+                output_idle: Some(Duration::ZERO),
                 size: Size::new(80, 24),
                 attached: false,
                 human_idle: None,
