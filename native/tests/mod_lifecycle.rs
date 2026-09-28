@@ -850,3 +850,62 @@ fn a_mod_owns_the_top_level_fields_it_creates() {
         "0"
     );
 }
+
+/// #145: advice follows its owner, not the field's. Reloading one advising
+/// mod drops only its layer; reloading the field's owner, which recreates the
+/// field, keeps every other mod's advice.
+#[test]
+fn advice_on_a_mod_field_follows_the_advising_mod() {
+    let home = DataHome::new();
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-field-advice.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    install(
+        &home,
+        "h",
+        r#"return { api = "remuda-module-v1", state_version = 1,
+        initialize = function() return {} end,
+        start = function() function remuda._h_f(x) return "h:" .. x end end }"#,
+    );
+    let a_with = r#"return { api = "remuda-module-v1", state_version = 1,
+        initialize = function() return {} end,
+        advice = {{ path = "remuda._h_f", how = "around", id = "a", depth = -10,
+          run = function(state, orig, x) return "A(" .. orig(x) .. ")" end }} }"#;
+    install(&home, "a", a_with);
+    install(
+        &home,
+        "b",
+        r#"return { api = "remuda-module-v1", state_version = 1,
+        initialize = function() return {} end,
+        start = function()
+          remuda.advise("remuda._h_f", "around", function(orig, x) return "B(" .. orig(x) .. ")" end, { id = "b", depth = 10 })
+        end }"#,
+    );
+    read_value(
+        &image,
+        "remuda.exec('h'); remuda.exec('a'); remuda.exec('b')",
+    );
+    let call = "return remuda._h_f('x')";
+    let owners = "local r = {} for _, a in ipairs(remuda.advice_list('remuda._h_f')) do \
+                  r[#r + 1] = a.id .. '@' .. tostring(a.owner) end return table.concat(r, ',')";
+    assert_eq!(read_value(&image, call), "A(B(h:x))");
+
+    install(
+        &home,
+        "a",
+        r#"return { api = "remuda-module-v1", state_version = 1,
+        initialize = function() return {} end }"#,
+    );
+    read_value(&image, "remuda.reload('a')");
+    assert_eq!(read_value(&image, call), "B(h:x)");
+    assert_eq!(read_value(&image, owners), "b@b");
+
+    install(&home, "a", a_with);
+    read_value(&image, "remuda.reload('a')");
+    read_value(&image, "remuda.reload('h')");
+    assert_eq!(read_value(&image, call), "A(B(h:x))");
+    assert_eq!(read_value(&image, owners), "a@a,b@b");
+}
