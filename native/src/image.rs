@@ -565,9 +565,11 @@ mod tests {
             local list = remuda.contributions("host.command")
             assert(#list == 1 and list[1].owner == "alpha", "the owner's entry is untouched")
             assert(remuda._activate_module("alpha", with("shared")), "the owner may still reload it")
-            remuda.contribute("host.command", "shared", { label = "imperative" })
-            assert(remuda.contributions("host.command")[1].entry.label == "imperative",
-              "imperative calls stay last-writer-wins until owner-by-extent")
+            local replaced, err = pcall(remuda.contribute, "host.command", "shared", { label = "imperative" })
+            assert(not replaced and tostring(err):find("alpha", 1, true),
+              "an owner-less caller cannot replace a mod's contribution")
+            assert(remuda.contributions("host.command")[1].entry.label == "mine",
+              "the owner's entry remains untouched")
             "#,
         )
         .exec()

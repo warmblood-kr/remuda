@@ -124,7 +124,7 @@ close
 contribute
 ----------
 
-``contribute(point, id, entry) -> nil`` — Fill an extension point: the same point and id replaces. `entry.order` sorts (default 0).
+``contribute(point, id, entry) -> nil`` — Fill an extension point: the same owner can replace its entry; another mod cannot. `entry.order` sorts (default 0).
 
 contributions
 -------------

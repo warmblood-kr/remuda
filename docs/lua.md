@@ -204,7 +204,7 @@ A lifecycle mod can declare its contributions: `contributes = { [point] = { {id 
 - Declared entries are owned by the mod, and their function fields receive `state` first, like hooks.
 - A reload replaces only that mod's entries, and a failed `start` restores the previous ones.
 - A malformed declaration is refused before anything changes.
-- A declared entry whose point and id belong to another mod is refused, naming both mods. Imperative `contribute` calls made during a mod's lifecycle extent carry that mod's owner, so reload replaces them and a failed `start` rolls them back. Calls outside a mod extent have no owner and keep last-writer-wins behavior.
+- A declared entry whose point and id belong to another mod is refused, naming both mods. Imperative `contribute` calls made during a mod's lifecycle extent carry that mod's owner, so reload replaces them and a failed `start` rolls them back. A call outside a mod extent has no owner: it can replace an unowned entry, but cannot replace an entry owned by a mod.
 
 ```lua
 contributes = {
