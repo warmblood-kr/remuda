@@ -1,9 +1,10 @@
 //! Node identity: Snow key generation, secure local persistence, and fingerprints.
 
-use super::registry::{self, NodeState};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use super::{encoding, storage};
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read};
+use std::path::Path;
+use zeroize::Zeroizing;
 
 const NOISE_PATTERN: &str = "Noise_NN_25519_ChaChaPoly_SHA256";
 const IDENTITY_FILE: &str = "identity.key";
@@ -15,57 +16,87 @@ pub struct NodeIdentity {
     pub static_pubkey: Vec<u8>,
 }
 
-/// Initialize one local identity and its cluster-of-one registry.
-pub fn init() -> io::Result<NodeIdentity> {
-    init_at(&cluster_state_dir()?.join("cluster"))
-}
-
-/// Display identity and admitted member count, or `None` before initialization.
-pub fn status() -> io::Result<Option<(NodeIdentity, usize)>> {
-    let dir = cluster_state_dir()?.join("cluster");
-    if !dir.join(IDENTITY_FILE).exists() {
-        return Ok(None);
+pub(super) fn prepare_cluster_dir() -> io::Result<std::path::PathBuf> {
+    #[cfg(windows)]
+    return Err(windows_storage_error());
+    #[cfg(not(windows))]
+    {
+        let dir = storage::cluster_state_dir()?.join("cluster");
+        match fs::symlink_metadata(&dir) {
+            Ok(_) => storage::verify_directory(&dir)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                storage::create_private_directory(&dir)?;
+                storage::verify_directory(&dir)?;
+            }
+            Err(e) => return Err(e),
+        }
+        Ok(dir)
     }
-    let identity = load_identity(&dir)?;
-    let registry = registry::load_registry_at(&dir)?;
-    let members = registry
-        .authorized_nodes
-        .iter()
-        .filter(|entry| entry.state == NodeState::Admitted)
-        .count();
-    Ok(Some((identity, members)))
 }
 
-fn init_at(dir: &Path) -> io::Result<NodeIdentity> {
-    fs::create_dir_all(dir)?;
-    secure_directory(dir)?;
-    let lock_guard = IdentityLock::acquire(dir)?;
-    let key_path = dir.join(IDENTITY_FILE);
-    let identity = if key_path.exists() {
-        load_identity(dir)?
-    } else {
-        let keypair = snow::Builder::new(NOISE_PATTERN.parse().expect("static Noise pattern"))
-            .generate_keypair()
-            .map_err(io::Error::other)?;
-        let mut bytes = keypair.private;
-        bytes.extend_from_slice(&keypair.public);
-        atomic_write(&key_path, &bytes)?;
-        identity_from_parts(&bytes)?
-    };
-    let mut registry = registry::load_registry_at(dir)?;
-    let before = registry.clone();
-    registry.ensure_self(&identity);
-    if registry != before {
-        registry::save_registry_at(dir, &registry)?;
+#[cfg(windows)]
+pub(super) fn windows_storage_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
+    )
+}
+
+pub(super) fn init_identity_at(dir: &Path) -> io::Result<(NodeIdentity, bool)> {
+    #[cfg(windows)]
+    return Err(windows_storage_error());
+    #[cfg(not(windows))]
+    {
+        match fs::symlink_metadata(dir) {
+            Ok(_) => storage::verify_directory(dir)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                storage::create_private_directory(dir)?;
+                storage::verify_directory(dir)?;
+            }
+            Err(e) => return Err(e),
+        }
+        let _guard = storage::StateLock::acquire(dir)?;
+        let key_path = dir.join(IDENTITY_FILE);
+        let (identity, created) = match fs::symlink_metadata(&key_path) {
+            Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => {
+                (load_identity_at(dir)?, false)
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cluster identity path must be a regular file, not a symlink",
+                ))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let keypair =
+                    snow::Builder::new(NOISE_PATTERN.parse().expect("static Noise pattern"))
+                        .generate_keypair()
+                        .map_err(io::Error::other)?;
+                let private = Zeroizing::new(keypair.private);
+                let mut material = Zeroizing::new(Vec::with_capacity(64));
+                material.extend_from_slice(&private);
+                material.extend_from_slice(&keypair.public);
+                storage::atomic_write(&key_path, &material)?;
+                (identity_from_parts(&material)?, true)
+            }
+            Err(e) => return Err(e),
+        };
+        Ok((identity, created))
     }
-    drop(lock_guard);
-    Ok(identity)
 }
 
-fn load_identity(dir: &Path) -> io::Result<NodeIdentity> {
-    let path = dir.join(IDENTITY_FILE);
-    check_private_mode(&path)?;
-    let bytes = fs::read(path)?;
+pub(super) fn load_identity_at(dir: &Path) -> io::Result<NodeIdentity> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(dir.join(IDENTITY_FILE))?;
+    storage::check_private_file(&file, "cluster identity")?;
+    let mut bytes = Zeroizing::new(Vec::new());
+    file.read_to_end(&mut bytes)?;
     identity_from_parts(&bytes)
 }
 
@@ -90,88 +121,12 @@ fn identity_from_parts(bytes: &[u8]) -> io::Result<NodeIdentity> {
         ));
     }
     let static_pubkey = bytes[32..].to_vec();
-    let node_fp = fingerprint(&static_pubkey);
+    let node_fp = encoding::fingerprint(&static_pubkey);
     Ok(NodeIdentity {
         node_name: node_name(&node_fp),
         node_fp,
         static_pubkey,
     })
-}
-
-pub(crate) fn cluster_state_dir() -> io::Result<PathBuf> {
-    let base = match std::env::var_os("XDG_STATE_HOME") {
-        Some(value) if !value.is_empty() => PathBuf::from(value),
-        _ => PathBuf::from(
-            std::env::var_os("HOME")
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?,
-        )
-        .join(".local/state"),
-    };
-    Ok(base.join("remuda"))
-}
-
-pub(super) fn secure_directory(dir: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
-}
-
-fn check_private_mode(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(path)?.permissions().mode() & 0o777;
-        if mode & !0o600 != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "cluster identity {} has loose permissions; run chmod 600",
-                    path.display()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temp = parent.join(format!(
-        ".{name}-{}-{}.tmp",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temp)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
-    let result = write_then_rename(&mut file, &temp, path, bytes);
-    if result.is_err() {
-        let _ = fs::remove_file(temp);
-    }
-    result
-}
-
-fn write_then_rename(file: &mut File, temp: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(temp, path)?;
-    Ok(())
 }
 
 fn node_name(fingerprint: &str) -> String {
@@ -186,93 +141,12 @@ fn node_name(fingerprint: &str) -> String {
     format!("node-{suffix}")
 }
 
-fn fingerprint(public_key: &[u8]) -> String {
-    format!(
-        "SHA256:{}",
-        base64(&sha256(public_key)).trim_end_matches('=')
-    )
-}
-
-fn base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::new();
-    for chunk in bytes.chunks(3) {
-        let a = chunk[0];
-        let b = *chunk.get(1).unwrap_or(&0);
-        let c = *chunk.get(2).unwrap_or(&0);
-        result.push(TABLE[(a >> 2) as usize] as char);
-        result.push(TABLE[(((a & 3) << 4) | (b >> 4)) as usize] as char);
-        result.push(if chunk.len() > 1 {
-            TABLE[(((b & 15) << 2) | (c >> 6)) as usize] as char
-        } else {
-            '='
-        });
-        result.push(if chunk.len() > 2 {
-            TABLE[(c & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    result
-}
-
-pub(super) fn public_key_text(bytes: &[u8]) -> String {
-    base64(bytes)
-}
-
-// Reuse Snow's SHA-256 provider rather than adding another crypto crate.
-fn sha256(input: &[u8]) -> Vec<u8> {
-    use snow::resolvers::CryptoResolver;
-    let params: snow::params::NoiseParams = NOISE_PATTERN.parse().expect("static Noise pattern");
-    let resolver = snow::resolvers::DefaultResolver;
-    let mut hash = resolver
-        .resolve_hash(&params.hash)
-        .expect("Snow SHA-256 provider");
-    hash.input(input);
-    let mut digest = vec![0; hash.hash_len()];
-    hash.result(&mut digest);
-    digest
-}
-
-pub(super) struct IdentityLock {
-    lock_file: File,
-}
-
-impl IdentityLock {
-    pub(super) fn acquire(dir: &Path) -> io::Result<Self> {
-        let path = dir.join("identity.lock");
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let file = options.open(&path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        }
-        file.lock()?;
-        Ok(Self { lock_file: file })
-    }
-}
-
-impl Drop for IdentityLock {
-    fn drop(&mut self) {
-        drop(self.lock_file.unlock());
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
-
     static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    fn temp_dir() -> PathBuf {
+    fn temp_dir() -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!(
             "remuda-cluster-identity-{}-{}",
             std::process::id(),
@@ -286,16 +160,12 @@ mod tests {
     #[test]
     fn init_is_idempotent_and_key_is_private_with_stable_fingerprint() {
         let dir = temp_dir().join("cluster");
-        let first = init_at(&dir).unwrap();
-        let before = fs::read(dir.join(IDENTITY_FILE)).unwrap();
-        let second = init_at(&dir).unwrap();
-        assert_eq!(first, second);
-        assert_eq!(before, fs::read(dir.join(IDENTITY_FILE)).unwrap());
-        let members = registry::load_registry_at(&dir).unwrap().authorized_nodes;
-        assert_eq!(members.len(), 1);
-        assert_eq!(members[0].node_fp, first.node_fp);
-        assert_eq!(members[0].state, NodeState::Admitted);
-        assert_eq!(members[0].version, 1);
+        let first = init_identity_at(&dir).unwrap();
+        let key = fs::read(dir.join(IDENTITY_FILE)).unwrap();
+        let second = init_identity_at(&dir).unwrap();
+        assert_eq!(first.0, second.0);
+        assert!(first.1 && !second.1);
+        assert_eq!(key, fs::read(dir.join(IDENTITY_FILE)).unwrap());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -315,27 +185,40 @@ mod tests {
     }
 
     #[test]
+    fn rejects_dangling_identity_symlink_instead_of_regenerating() {
+        use std::os::unix::fs::symlink;
+        let dir = temp_dir().join("cluster");
+        let _ = init_identity_at(&dir).unwrap();
+        fs::remove_file(dir.join(IDENTITY_FILE)).unwrap();
+        symlink(dir.join("missing-target"), dir.join(IDENTITY_FILE)).unwrap();
+        assert_eq!(
+            init_identity_at(&dir).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
     fn refuses_identity_file_with_loose_permissions() {
         let dir = temp_dir().join("cluster");
-        let _ = init_at(&dir).unwrap();
+        let _ = init_identity_at(&dir).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(dir.join(IDENTITY_FILE), fs::Permissions::from_mode(0o644))
                 .unwrap();
-            let error = load_identity(&dir).unwrap_err();
+            let error = load_identity_at(&dir).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-            assert!(error.to_string().contains("chmod 600"));
+            assert!(error.to_string().contains("private permissions"));
         }
     }
 
     #[test]
     fn fingerprint_uses_sha256_and_openssh_base64_format() {
+        assert_eq!(encoding::encode_base64(b"abc"), "YWJj");
         assert_eq!(
-            base64(&sha256(b"abc")),
-            "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0="
+            encoding::fingerprint(b"abc"),
+            "SHA256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0"
         );
-        assert!(fingerprint(b"public key").starts_with("SHA256:"));
-        assert!(!fingerprint(b"public key").ends_with('='));
+        assert!(!encoding::fingerprint(b"public key").ends_with('='));
     }
 }

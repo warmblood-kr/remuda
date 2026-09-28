@@ -330,8 +330,8 @@ fn cluster_command(args: &[&str]) -> ExitCode {
             Err(error) => fail(format!("cluster status: {error}")),
         },
         ClusterCommand::Init => match remuda_native::cluster::init() {
-            Ok(identity) => {
-                println!("Cluster initialized");
+            Ok((identity, created)) => {
+                println!("{}", cluster_init_message(created));
                 println!("Node: {}", identity.node_name);
                 println!("Fingerprint: {}", identity.node_fp);
                 ExitCode::SUCCESS
@@ -342,15 +342,28 @@ fn cluster_command(args: &[&str]) -> ExitCode {
     }
 }
 
+fn cluster_init_message(created: bool) -> &'static str {
+    if created {
+        "Cluster initialized"
+    } else {
+        "Already initialized"
+    }
+}
+
 #[cfg(test)]
 mod cluster_cli_tests {
-    use super::{parse_cluster_command, ClusterCommand};
+    use super::{cluster_init_message, parse_cluster_command, ClusterCommand};
 
     #[test]
     fn cluster_status_and_init_are_recognized() {
         assert_eq!(parse_cluster_command(&[]), ClusterCommand::Status);
         assert_eq!(parse_cluster_command(&["init"]), ClusterCommand::Init);
         assert_eq!(parse_cluster_command(&["join"]), ClusterCommand::Invalid);
+    }
+
+    #[test]
+    fn repeated_init_uses_already_initialized_wording() {
+        assert_eq!(cluster_init_message(false), "Already initialized");
     }
 }
 

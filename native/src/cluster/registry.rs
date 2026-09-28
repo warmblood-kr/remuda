@@ -1,9 +1,9 @@
 //! Per-node authorized membership entries, persistence, and merge semantics.
 
-use super::identity;
+use super::{encoding, storage};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::Path;
 
@@ -31,77 +31,121 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn merge(&mut self, received: &Registry) {
-        let mut merged: BTreeMap<String, AuthorizedNode> = self
+    pub fn merge(&mut self, received: &Registry) -> io::Result<()> {
+        let mut merged = BTreeMap::new();
+        for entry in self
             .authorized_nodes
-            .drain(..)
-            .map(|entry| (entry.node_fp.clone(), entry))
-            .collect();
-        for incoming in &received.authorized_nodes {
-            match merged.get(&incoming.node_fp) {
-                Some(current)
-                    if current.state == NodeState::Revoked
-                        && (incoming.state == NodeState::Admitted
-                            || current.version >= incoming.version) => {}
-                Some(_) if incoming.state == NodeState::Revoked => {
-                    merged.insert(incoming.node_fp.clone(), incoming.clone());
+            .iter()
+            .chain(&received.authorized_nodes)
+        {
+            let key = validate_entry(entry)?;
+            match merged.get(&key) {
+                Some(current) => {
+                    if prefer(entry, current) {
+                        merged.insert(key, entry.clone());
+                    }
                 }
-                Some(current) if current.version > incoming.version => {}
-                Some(current)
-                    if current.version == incoming.version && current.by >= incoming.by => {}
-                _ => {
-                    merged.insert(incoming.node_fp.clone(), incoming.clone());
+                None => {
+                    merged.insert(key, entry.clone());
                 }
             }
         }
         self.authorized_nodes = merged.into_values().collect();
+        Ok(())
     }
 }
 
-impl Registry {
-    pub fn ensure_self(&mut self, identity: &identity::NodeIdentity) {
-        if !self
-            .authorized_nodes
-            .iter()
-            .any(|entry| entry.node_fp == identity.node_fp)
-        {
-            self.authorized_nodes.push(AuthorizedNode {
-                node_fp: identity.node_fp.clone(),
-                static_pubkey: identity::public_key_text(&identity.static_pubkey),
-                state: NodeState::Admitted,
-                version: 1,
-                by: identity.node_fp.clone(),
-            });
-        }
+fn validate_entry(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
+    let public_key = encoding::decode_base64(&entry.static_pubkey)?;
+    if public_key.len() != 32 || encoding::fingerprint(&public_key) != entry.node_fp {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "registry fingerprint does not match public key",
+        ));
     }
+    Ok(public_key)
+}
+
+fn prefer(incoming: &AuthorizedNode, current: &AuthorizedNode) -> bool {
+    if incoming.state != current.state {
+        return incoming.state == NodeState::Revoked;
+    }
+    incoming.version > current.version
+        || (incoming.version == current.version && incoming.by > current.by)
 }
 
 pub fn load_registry() -> io::Result<Registry> {
-    load_registry_at(&identity::cluster_state_dir()?.join("cluster"))
+    #[cfg(windows)]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
+    ));
+    #[cfg(not(windows))]
+    load_registry_at(&storage::cluster_state_dir()?.join("cluster"))
 }
 
 pub fn save_registry(registry: &Registry) -> io::Result<()> {
-    let dir = identity::cluster_state_dir()?.join("cluster");
-    fs::create_dir_all(&dir)?;
-    identity::secure_directory(&dir)?;
-    let lock_guard = identity::IdentityLock::acquire(&dir)?;
+    #[cfg(windows)]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
+    ));
+    #[cfg(not(windows))]
+    let dir = {
+        let dir = storage::cluster_state_dir()?.join("cluster");
+        storage::create_private_directory(&dir)?;
+        storage::verify_directory(&dir)?;
+        dir
+    };
+    let lock_guard = storage::StateLock::acquire(&dir)?;
     let result = save_registry_at(&dir, registry);
     drop(lock_guard);
     result
 }
 
 pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
-    let path = dir.join(REGISTRY_FILE);
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Registry::default()),
-        Err(error) => Err(error),
+    #[cfg(windows)]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
+    ));
+    #[cfg(not(windows))]
+    if fs::symlink_metadata(dir).is_ok() {
+        storage::verify_directory(dir)?;
     }
+    let path = dir.join(REGISTRY_FILE);
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
+        Err(error) => return Err(error),
+    };
+    storage::check_private_file(&file, "cluster registry")?;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let registry: Registry = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    let mut folded = Registry::default();
+    for entry in registry.authorized_nodes {
+        validate_entry(&entry)?;
+        folded.merge(&Registry {
+            authorized_nodes: vec![entry],
+        })?;
+    }
+    Ok(folded)
 }
 
 pub(super) fn save_registry_at(dir: &Path, registry: &Registry) -> io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(registry).map_err(io::Error::other)?;
-    identity::atomic_write(&dir.join(REGISTRY_FILE), &bytes)
+    let mut validated = Registry::default();
+    validated.merge(registry)?;
+    let bytes = serde_json::to_vec_pretty(&validated).map_err(io::Error::other)?;
+    storage::atomic_write(&dir.join(REGISTRY_FILE), &bytes)
 }
 
 #[cfg(test)]
@@ -119,14 +163,19 @@ mod tests {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
+        storage::create_private_directory(&path).unwrap();
         path
     }
 
     fn entry(fp: &str, state: NodeState, version: u64, by: &str) -> AuthorizedNode {
+        let mut key = [0u8; 32];
+        for (index, byte) in fp.bytes().enumerate() {
+            key[index % 32] ^= byte;
+        }
+        let actual_fp = encoding::fingerprint(&key);
         AuthorizedNode {
-            node_fp: fp.into(),
-            static_pubkey: format!("pub-{fp}"),
+            node_fp: actual_fp,
+            static_pubkey: encoding::encode_base64(&key),
             state,
             version,
             by: by.into(),
@@ -144,14 +193,89 @@ mod tests {
     }
 
     #[test]
+    fn load_folds_duplicate_pubkeys_and_preserves_tombstone() {
+        let dir = temp_dir();
+        let revoked = entry("fp-a", NodeState::Revoked, 2, "a");
+        let admitted = entry("fp-a", NodeState::Admitted, 1, "z");
+        let json = serde_json::to_vec(&Registry {
+            authorized_nodes: vec![revoked, admitted],
+        })
+        .unwrap();
+        storage::atomic_write(&dir.join(REGISTRY_FILE), &json).unwrap();
+        let loaded = load_registry_at(&dir).unwrap();
+        assert_eq!(loaded.authorized_nodes.len(), 1);
+        assert_eq!(loaded.authorized_nodes[0].state, NodeState::Revoked);
+    }
+
+    #[test]
+    fn load_rejects_fingerprint_that_does_not_match_public_key() {
+        let dir = temp_dir();
+        let mut invalid = entry("fp-a", NodeState::Admitted, 1, "a");
+        invalid.node_fp = "SHA256:wrong".into();
+        let json = serde_json::to_vec(&Registry {
+            authorized_nodes: vec![invalid],
+        })
+        .unwrap();
+        storage::atomic_write(&dir.join(REGISTRY_FILE), &json).unwrap();
+        assert_eq!(
+            load_registry_at(&dir).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn load_rejects_registry_with_loose_permissions() {
+        let dir = temp_dir();
+        storage::atomic_write(&dir.join(REGISTRY_FILE), b"{}").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.join(REGISTRY_FILE), fs::Permissions::from_mode(0o644))
+                .unwrap();
+            assert_eq!(
+                load_registry_at(&dir).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+        }
+    }
+
+    #[test]
     fn merge_uses_highest_version_for_admitted_entries() {
         let mut registry = Registry {
             authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 2, "b")],
         };
-        registry.merge(&Registry {
-            authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 3, "c")],
-        });
+        registry
+            .merge(&Registry {
+                authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 3, "c")],
+            })
+            .unwrap();
         assert_eq!(registry.authorized_nodes[0].version, 3);
+    }
+
+    #[test]
+    fn existing_higher_version_admit_is_retained() {
+        let mut registry = Registry {
+            authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 4, "a")],
+        };
+        registry
+            .merge(&Registry {
+                authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 3, "z")],
+            })
+            .unwrap();
+        assert_eq!(registry.authorized_nodes[0].version, 4);
+    }
+
+    #[test]
+    fn equal_version_admit_uses_larger_by_tiebreak() {
+        let mut registry = Registry {
+            authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 3, "a")],
+        };
+        registry
+            .merge(&Registry {
+                authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 3, "z")],
+            })
+            .unwrap();
+        assert_eq!(registry.authorized_nodes[0].by, "z");
     }
 
     #[test]
@@ -159,9 +283,11 @@ mod tests {
         let mut registry = Registry {
             authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 2, "b")],
         };
-        registry.merge(&Registry {
-            authorized_nodes: vec![entry("fp-a", NodeState::Revoked, 2, "c")],
-        });
+        registry
+            .merge(&Registry {
+                authorized_nodes: vec![entry("fp-a", NodeState::Revoked, 2, "c")],
+            })
+            .unwrap();
         assert_eq!(registry.authorized_nodes[0].state, NodeState::Revoked);
     }
 
@@ -170,12 +296,93 @@ mod tests {
         let mut registry = Registry {
             authorized_nodes: vec![entry("fp-a", NodeState::Revoked, 2, "b")],
         };
-        registry.merge(&Registry {
-            authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 1, "a")],
-        });
-        registry.merge(&Registry {
-            authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 99, "c")],
-        });
+        registry
+            .merge(&Registry {
+                authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 1, "a")],
+            })
+            .unwrap();
+        registry
+            .merge(&Registry {
+                authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 99, "c")],
+            })
+            .unwrap();
+        assert_eq!(registry.authorized_nodes[0].state, NodeState::Revoked);
+    }
+
+    #[test]
+    fn lower_version_revoke_wins_over_higher_version_admit() {
+        let mut registry = Registry {
+            authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 5, "z")],
+        };
+        registry
+            .merge(&Registry {
+                authorized_nodes: vec![entry("fp-a", NodeState::Revoked, 1, "a")],
+            })
+            .unwrap();
+        assert_eq!(registry.authorized_nodes[0].state, NodeState::Revoked);
+    }
+
+    #[test]
+    fn same_version_revoke_wins_even_when_by_favors_admit() {
+        let mut registry = Registry {
+            authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 2, "z")],
+        };
+        registry
+            .merge(&Registry {
+                authorized_nodes: vec![entry("fp-a", NodeState::Revoked, 2, "a")],
+            })
+            .unwrap();
+        assert_eq!(registry.authorized_nodes[0].state, NodeState::Revoked);
+    }
+
+    #[test]
+    fn mismatched_fingerprint_is_rejected_during_merge() {
+        let mut registry = Registry {
+            authorized_nodes: vec![entry("fp-a", NodeState::Revoked, 2, "a")],
+        };
+        let mut incoming = entry("fp-b", NodeState::Admitted, 99, "z");
+        incoming.static_pubkey = registry.authorized_nodes[0].static_pubkey.clone();
+        let before = registry.clone();
+        assert!(registry
+            .merge(&Registry {
+                authorized_nodes: vec![incoming]
+            })
+            .is_err());
+        assert_eq!(registry, before);
+        assert_eq!(registry.authorized_nodes.len(), 1);
+        assert_eq!(registry.authorized_nodes[0].state, NodeState::Revoked);
+    }
+
+    #[test]
+    fn same_fingerprint_cannot_swap_the_public_key() {
+        let mut registry = Registry {
+            authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 2, "a")],
+        };
+        let mut incoming = entry("fp-a", NodeState::Admitted, 3, "z");
+        incoming.static_pubkey = entry("fp-b", NodeState::Admitted, 1, "b").static_pubkey;
+        let before = registry.clone();
+        assert!(registry
+            .merge(&Registry {
+                authorized_nodes: vec![incoming]
+            })
+            .is_err());
+        assert_eq!(registry, before);
+        assert_eq!(
+            registry.authorized_nodes[0].static_pubkey,
+            entry("fp-a", NodeState::Admitted, 1, "a").static_pubkey
+        );
+    }
+
+    #[test]
+    fn duplicate_local_entries_are_folded_through_merge_rules() {
+        let mut registry = Registry {
+            authorized_nodes: vec![
+                entry("fp-a", NodeState::Revoked, 2, "a"),
+                entry("fp-a", NodeState::Admitted, 1, "z"),
+            ],
+        };
+        registry.merge(&Registry::default()).unwrap();
+        assert_eq!(registry.authorized_nodes.len(), 1);
         assert_eq!(registry.authorized_nodes[0].state, NodeState::Revoked);
     }
 }
