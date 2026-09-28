@@ -32,20 +32,21 @@ error; completion after expiry is ignored and logged once. A pending handle
 must not wait, poll, or otherwise block Lua.
 
 An optional `on_cancel(reason)` callback lets a handler cancel work when the
-client disconnects or the handle times out. `reason` is `"client_disconnected"`
-or `"timeout"`. It runs at most once on the Lua tick, never on the connection
-handler thread, and is not called after the reply has resolved or been rejected.
-The handle's timeout error is still sent to a connected client when timeout
-causes cancellation.
+client disconnects, the handle times out, or the daemon shuts down. `reason` is
+`"client_disconnected"`, `"timeout"`, or `"shutdown"`. It runs at most once on
+the Lua tick, never on the connection handler thread, and is not called after
+the reply has resolved or been rejected. The handle's timeout error is still
+sent to a connected client when timeout causes cancellation.
 
 ## Completion rules and errors
 
 - A handle accepts one terminal outcome: resolved, rejected, timed out, or
   cancelled because its client went away. A second `resolve` or `reject` is a
   programming error and returns an error without changing the first outcome.
-- The combined stdout and stderr reply must fit the existing command reply size
-  limit. An oversized result completes with a clear size-limit error; it is not
-  silently cut off.
+- A deferred result's combined stdout and stderr must be at most
+  `MAX_DEFERRED_OUTPUT_BYTES` (16 MiB). Oversized results complete with a clear
+  size-limit error; they are not silently cut off. This bound applies only to
+  deferred results; today's synchronous return path is unchanged.
 - An invalid timeout (non-number, non-positive, or above 300 seconds), an
   invalid exit code or output type, a missing result field, or completion after
   another terminal outcome is reported as a Lua API error. Command rejection,
@@ -76,15 +77,13 @@ cancellation handle and later calls its callback on the tick:
 
 ```lua
 remuda.extension_command("lookup", function(args)
-  local url = args[1]
   local request
-  local reply = remuda.pending { timeout = 90,
-    on_cancel = function(reason) request:cancel() end }
-  request = remuda.http.request { method = "GET", url = url, timeout = 60,
+  local reply = remuda.pending { timeout = 90, on_cancel = function()
+    if request then request:cancel() end end }
+  request = remuda.http.request { method = "GET", url = args[1], timeout = 60,
     callback = function(result)
       if result.error then reply:resolve(1, "", result.error)
-      else reply:resolve(0, result.body, "") end
-    end }
+      else reply:resolve(0, result.body, "") end end }
   return reply
 end)
 ```
@@ -95,12 +94,28 @@ or the client disconnects first, `on_cancel` cancels the HTTP operation; any
 already queued callback that attempts to complete a terminal handle has no
 effect.
 
+## Capacity, shutdown, and module lifecycle
+
+At most 64 pending replies may exist per daemon. Creating another handle over
+the cap fails immediately with a clear capacity error; it does not wait or
+queue without a bound. Each pending reply owns a waiting connection-handler
+thread, which is why this limit is separate from the per-handle timeout.
+
+On daemon shutdown, each still-connected pending caller receives a clear
+`daemon stopping` error. The daemon queues `on_cancel("shutdown")` for each
+such handle on the Lua tick as a best effort before stopping the Lua runtime.
+Shutdown does not block indefinitely to run callbacks; cancellation delivery
+has a bounded drain period.
+
+A pending handle remains valid if the module that created it is stopped or
+reloaded. Its captured closures may still resolve or reject it, and it remains
+subject to its timeout and client lifecycle. Module stop or reload does not
+silently discard or extend the pending reply.
+
 ## Command clients
 
 The CLI extension-command caller waits for the deferred result and prints it
 using its ordinary success or error behavior. The daemon's Lua event loop
-remains available during that wait. MCP callers can use the same semantics
-only when their tool invocation is routed through the same extension-command
-dispatch and reply path. A separate MCP pending mechanism is outside this API;
-if MCP dispatch does not share that path, it remains synchronous until a
-separate API is specified.
+remains available during that wait. MCP tool calls currently enter
+`remuda._call`, not `remuda._dispatch_extension_command`, so they remain
+synchronous. A separate MCP pending mechanism is outside this API.

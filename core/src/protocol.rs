@@ -155,6 +155,12 @@ pub enum Response {
     /// distinct from `Screen` so a client can tell "the session printed
     /// nothing" from "the expression returned nothing".
     Value(String),
+    /// A command result completed through a bounded pending reply handle.
+    CommandResult {
+        exit_code: u8,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
     Ok,
     /// A tracked attachment was accepted and its generation is returned.
     AttachStarted {

@@ -999,6 +999,19 @@ fn eval_once(path: &Path, code: &str) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
+        Ok(Response::CommandResult {
+            exit_code,
+            stdout,
+            stderr,
+        }) => {
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            let mut err = std::io::stderr().lock();
+            if out.write_all(&stdout).is_err() || err.write_all(&stderr).is_err() {
+                return fail("could not write deferred command output");
+            }
+            ExitCode::from(exit_code)
+        }
         other => fail(describe(other)),
     }
 }

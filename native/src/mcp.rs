@@ -215,6 +215,10 @@ fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> S
         // the arm the old comment called unreachable is now the common one, and
         // the decision it left open was made rather than dropped. `steps/013`.
         Ok(Response::Value(value)) => ok_reply(id, tool_text(&value)),
+        Ok(Response::CommandResult { .. }) => ok_reply(
+            id,
+            tool_error("deferred replies are not supported by MCP tool calls"),
+        ),
         Ok(Response::Ok) => ok_reply(id, tool_text("ok")),
         Ok(Response::AttachStarted { .. } | Response::AttachStatus { .. }) => {
             ok_reply(id, tool_error("attach responses are not exposed over MCP"))

@@ -78,6 +78,7 @@ enum JobKind {
 #[derive(Clone)]
 pub struct Image {
     jobs: Sender<Job>,
+    pending: crate::pending::PendingReplies,
 }
 
 impl Image {
@@ -94,7 +95,10 @@ impl Image {
     ) -> Self {
         let (jobs, inbox) = channel::<Job>();
         let socket: PathBuf = socket.to_path_buf();
-        let image = Self { jobs };
+        let image = Self {
+            jobs,
+            pending: crate::pending::PendingReplies::default(),
+        };
         let handle = image.clone();
 
         std::thread::spawn(move || {
@@ -107,7 +111,7 @@ impl Image {
 
             // A failure here means no image at all, so every eval must say so
             // rather than the thread dying quietly and every caller hanging.
-            let ready = script::bindings(&lua, &socket, registry, counters, handle)
+            let ready = script::bindings(&lua, &socket, registry, counters, handle.clone())
                 .and_then(|table| lua.globals().set("remuda", table))
                 // The tool frame is Lua over those bindings, not a second set of
                 // them. It must load *after* the table exists and *before* any
@@ -126,8 +130,22 @@ impl Image {
                 let answer = match &ready {
                     Err(why) => Err(format!("image failed to start: {why}")),
                     Ok(()) => match &job.kind {
-                        JobKind::Eval { code, name } => eval(&lua, code, name.as_deref())
-                            .map(|value| join_output(&printed.borrow(), &value)),
+                        JobKind::Eval { code, name } => {
+                            handle.pending.begin_eval();
+                            let answer = eval(&lua, code, name.as_deref()).map(|value| {
+                                if handle.pending.pending_id(&value).is_some() {
+                                    value
+                                } else {
+                                    join_output(&printed.borrow(), &value)
+                                }
+                            });
+                            let pending_id = answer
+                                .as_ref()
+                                .ok()
+                                .and_then(|value| handle.pending.pending_id(value));
+                            handle.pending.finish_eval(pending_id);
+                            answer
+                        }
                         JobKind::StopModules => script::stop_modules(&lua)
                             .map(|()| String::new())
                             .map_err(|error| error.to_string()),
@@ -161,6 +179,20 @@ impl Image {
             })
             .map_err(|_| "the image is not running".to_string())?;
         Ok(answer)
+    }
+
+    pub fn pending_replies(&self) -> crate::pending::PendingReplies {
+        self.pending.clone()
+    }
+
+    /// Notify every deferred caller before modules and the Lua runtime stop.
+    pub fn shutdown_pending_replies(&self) {
+        self.pending.shutdown();
+        const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Ok(answer) = self.submit("__remuda_pending_tick()", Some("@remuda/pending-shutdown"))
+        {
+            let _ = answer.recv_timeout(DRAIN_TIMEOUT);
+        }
     }
 
     /// Evaluate `code` in the image and wait for the result. State persists
@@ -224,6 +256,14 @@ fn eval(lua: &Lua, code: &str, name: Option<&str>) -> Result<String, String> {
             .map(TypedFailure::wire_message)
             .unwrap_or_else(|| error.to_string())
     })?;
+
+    if values.len() == 1 {
+        if let Some(mlua::Value::UserData(data)) = values.iter().next() {
+            if let Ok(handle) = data.borrow::<crate::pending::PendingHandle>() {
+                return Ok(handle.marker().to_string());
+            }
+        }
+    }
 
     let rendered: Vec<String> = values.iter().map(render).collect();
     Ok(rendered.join("\t"))

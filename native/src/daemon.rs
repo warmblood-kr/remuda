@@ -17,6 +17,7 @@ use crate::ipc::{self, Listener, Stream, TryClone};
 use crate::process_ancestry;
 use crate::pty::PtyAgent;
 use interprocess::local_socket::traits::ListenerExt;
+use interprocess::local_socket::traits::Stream as LocalStream;
 use remuda_core::agent::Result as AgentResult;
 use remuda_core::protocol::{collapse_runs, Request, Response};
 use remuda_core::{Clock, Registry, Session, Size};
@@ -453,6 +454,7 @@ fn stop_on_signals(
 /// covers a grandchild PDEATHSIG alone can't reach (see child_guard.rs).
 /// Only THIS death mode runs any code at all; SIGTERM/SIGKILL run none.
 fn reap_processes_before_exit(image: &Image) {
+    image.shutdown_pending_replies();
     let _ = image.eval(
         "for _, id in ipairs(remuda.processes()) do remuda._process_killpg(id) end",
         Some("@remuda/shutdown-reap"),
@@ -596,11 +598,54 @@ fn handle(
         Request::RemoveDirAll { path: dir } => reply(&stream, &remove_dir_all(&dir)),
 
         Request::Eval { code, name } => match image.eval(&code, name.as_deref()) {
-            Ok(value) => reply(&stream, &Response::Value(value)),
+            Ok(value) => match image.pending_replies().pending_id(&value) {
+                Some(id) => deferred_reply(stream, reader, image, id),
+                None => reply(&stream, &Response::Value(value)),
+            },
             // Lua's own message, which already carries the line and a
             // traceback — the same treatment `remuda run` gives a script file.
             Err(e) => reply(&stream, &Response::error(e)),
         },
+    }
+}
+
+fn deferred_reply(
+    stream: Stream,
+    mut reader: BufReader<Stream>,
+    image: &Image,
+    id: u64,
+) -> std::io::Result<()> {
+    stream.set_nonblocking(true)?;
+    let result = image.pending_replies().wait(id, || {
+        let mut extra = [0u8; 1];
+        match reader.read(&mut extra) {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => false,
+            Err(_) => true,
+        }
+    });
+    let _ = stream.set_nonblocking(false);
+    match result {
+        Ok(result) => {
+            let response = match result.completion {
+                Ok(crate::pending::Completion::Result(result)) => Some(Response::CommandResult {
+                    exit_code: result.exit_code,
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                }),
+                Ok(crate::pending::Completion::Failure(error)) => Some(Response::error(error)),
+                Err(error) if error == "client disconnected" => None,
+                Err(error) => Some(Response::error(error)),
+            };
+            let sent = response.map_or(Ok(()), |response| reply(&stream, &response));
+            if let Some(ack) = result.shutdown_ack {
+                let _ = ack.send(());
+            }
+            sent
+        }
+        Err(error) => reply(&stream, &Response::error(error)),
     }
 }
 
@@ -660,6 +705,7 @@ fn handle_shutdown(
             ),
         }
     }
+    image.shutdown_pending_replies();
     reply(&stream, &Response::Ok)?;
     reap_processes_before_exit(image);
     socket_owner.cleanup();
