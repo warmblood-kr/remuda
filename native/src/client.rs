@@ -219,7 +219,26 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
             let mut buf = [0u8; 1024];
             let mut parser = crate::mouse::SgrParser::default();
             let mut mouse_on = mouse;
-            while let Ok(n) = stdin.read(&mut buf) {
+            loop {
+                let wait = parser
+                    .timeout_remaining()
+                    .unwrap_or(std::time::Duration::from_secs(86_400));
+                let n = match read_stdin_timeout(&mut stdin, &mut buf, wait) {
+                    Ok(Some(n)) => n,
+                    Ok(None) => {
+                        route_tokens(
+                            &path,
+                            &name,
+                            &mut stream,
+                            parser.flush_expired(),
+                            &mut mouse_on,
+                            &scrollback,
+                            &output_lock,
+                        );
+                        continue;
+                    }
+                    Err(_) => break,
+                };
                 if n == 0 {
                     break;
                 }
@@ -229,15 +248,20 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     // Dropping those bytes would silently swallow input the
                     // user believes they sent.
                     Some(at) => {
-                        route_tokens(
-                            &path,
-                            &name,
-                            &mut stream,
-                            parser.feed(&buf[..at]),
-                            &mut mouse_on,
-                            &scrollback,
-                            &output_lock,
-                        );
+                        if mouse {
+                            route_tokens(
+                                &path,
+                                &name,
+                                &mut stream,
+                                parser.feed(&buf[..at]),
+                                &mut mouse_on,
+                                &scrollback,
+                                &output_lock,
+                            );
+                        } else if at > 0 {
+                            let _ = stream.write_all(&buf[..at]);
+                            let _ = stream.flush();
+                        }
                         route_tokens(
                             &path,
                             &name,
@@ -251,15 +275,20 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                         break;
                     }
                     None => {
-                        route_tokens(
-                            &path,
-                            &name,
-                            &mut stream,
-                            parser.feed(&buf[..n]),
-                            &mut mouse_on,
-                            &scrollback,
-                            &output_lock,
-                        );
+                        if mouse {
+                            route_tokens(
+                                &path,
+                                &name,
+                                &mut stream,
+                                parser.feed(&buf[..n]),
+                                &mut mouse_on,
+                                &scrollback,
+                                &output_lock,
+                            );
+                        } else {
+                            let _ = stream.write_all(&buf[..n]);
+                            let _ = stream.flush();
+                        }
                     }
                 }
             }
@@ -308,6 +337,64 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     };
     let _ = keys.join();
     Ok(left)
+}
+
+#[cfg(unix)]
+fn read_stdin_timeout(
+    _stdin: &mut impl Read,
+    buf: &mut [u8],
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<usize>> {
+    use std::os::fd::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pfd, 1, millis) };
+        if ready > 0 {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            return if n < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(Some(n as usize))
+            };
+        }
+        if ready == 0 {
+            return Ok(None);
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn read_stdin_timeout(
+    stdin: &mut impl Read,
+    buf: &mut [u8],
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<usize>> {
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        System::{
+            Console::{GetStdHandle, STD_INPUT_HANDLE},
+            Threading::{WaitForSingleObject, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        },
+    };
+    let handle: HANDLE = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
+    match unsafe { WaitForSingleObject(handle, millis) } {
+        WAIT_OBJECT_0 => stdin.read(buf).map(Some),
+        WAIT_TIMEOUT => Ok(None),
+        _ => Err(std::io::Error::last_os_error()),
+    }
 }
 
 fn route_tokens(
@@ -399,6 +486,10 @@ fn route_tokens(
                         output_lock,
                     );
                 }
+            }
+            InputToken::Paste(bytes) => {
+                let _ = stream.write_all(&bytes);
+                let _ = stream.flush();
             }
         }
     }

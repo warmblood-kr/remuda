@@ -101,6 +101,12 @@ fn main() -> ExitCode {
         ["attach", name, "--mouse=true"] => {
             with_daemon(server, &path, |path| ride_with_mouse(path, name, true))
         }
+        ["attach", "--mouse=false", name] => {
+            with_daemon(server, &path, |path| ride_with_mouse(path, name, false))
+        }
+        ["attach", "--mouse=true", name] => {
+            with_daemon(server, &path, |path| ride_with_mouse(path, name, true))
+        }
 
         ["lua", script] => with_daemon(server, &path, |path| {
             match remuda_native::script::run(path, Path::new(script)) {
@@ -250,7 +256,7 @@ remuda — terminal orchestration for coding agents
   remuda run [-n NAME] COMMAND   start and enter a session
   remuda attach NAME             enter a session; Ctrl-\\ detaches
                                  Ctrl-] toggles mouse; wheel scrolls history
-                                 use --mouse=false to disable mouse handling
+                                 --mouse=false disables mouse handling (before or after NAME)
   remuda ls | send NAME TEXT     inspect or message sessions
   remuda stop [-f]               stop the daemon (sessions are lost)
 

@@ -55,7 +55,7 @@ Direct attach enables terminal mouse input by default. The wheel scrolls the
 session's retained history when its program has mouse reporting off; when the
 program tracks the mouse, reports go to that program. Press `Ctrl-]` to toggle
 mouse handling during an attach, or use `remuda attach NAME --mouse=false` to
-start with it off. Hold Option while dragging to select text in Terminal.app
+start with it off. The option can appear before or after `NAME`. Hold Option while dragging to select text in Terminal.app
 or iTerm2; most other terminals use Shift-drag.
 
 A session whose program exits closes itself and leaves the list. Set

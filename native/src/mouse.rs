@@ -73,12 +73,22 @@ pub fn route_mouse_event(
 pub enum InputToken {
     Bytes(Vec<u8>),
     Mouse(SgrMouse),
+    /// Bytes between bracketed-paste markers, including both markers. They
+    /// bypass mouse parsing and attach hotkeys verbatim.
+    Paste(Vec<u8>),
 }
+
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
 
 #[derive(Default)]
 pub struct SgrParser {
     pending: Vec<u8>,
+    pending_since: Option<std::time::Instant>,
+    in_paste: bool,
 }
+
+const ESC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Translate a host SGR event into the live child terminal's selected wire
 /// format. Unsupported release or motion reports are omitted.
@@ -134,17 +144,67 @@ pub fn encode_for_child(event: SgrMouse, state: MouseState) -> Option<Vec<u8>> {
 
 impl SgrParser {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<InputToken> {
+        if self.pending.is_empty() && bytes.contains(&0x1b) {
+            self.pending_since = Some(std::time::Instant::now());
+        }
         self.pending.extend_from_slice(bytes);
-        self.parse(false)
+        let tokens = self.parse(false);
+        if self.pending.is_empty() {
+            self.pending_since = None;
+        }
+        tokens
     }
 
     pub fn finish(&mut self) -> Vec<InputToken> {
-        self.parse(true)
+        let tokens = self.parse(true);
+        self.pending_since = None;
+        tokens
+    }
+
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub fn timeout_remaining(&self) -> Option<std::time::Duration> {
+        self.pending_since
+            .map(|since| ESC_TIMEOUT.saturating_sub(since.elapsed()))
+    }
+
+    pub fn flush_expired(&mut self) -> Vec<InputToken> {
+        if self
+            .pending_since
+            .is_some_and(|since| since.elapsed() >= ESC_TIMEOUT)
+        {
+            self.finish()
+        } else {
+            Vec::new()
+        }
     }
 
     fn parse(&mut self, finishing: bool) -> Vec<InputToken> {
         let mut out = Vec::new();
         loop {
+            if self.in_paste {
+                if let Some(end) = self
+                    .pending
+                    .windows(PASTE_END.len())
+                    .position(|window| window == PASTE_END)
+                {
+                    let len = end + PASTE_END.len();
+                    out.push(InputToken::Paste(self.pending.drain(..len).collect()));
+                    self.in_paste = false;
+                    continue;
+                }
+                let held = longest_suffix_prefix(&self.pending, PASTE_END);
+                let deliver = self.pending.len().saturating_sub(held);
+                if deliver > 0 {
+                    out.push(InputToken::Paste(self.pending.drain(..deliver).collect()));
+                }
+                if finishing && !self.pending.is_empty() {
+                    out.push(InputToken::Paste(std::mem::take(&mut self.pending)));
+                }
+                break;
+            }
             let Some(at) = self.pending.iter().position(|&b| b == 0x1b) else {
                 if !self.pending.is_empty() {
                     out.push(InputToken::Bytes(std::mem::take(&mut self.pending)));
@@ -154,27 +214,47 @@ impl SgrParser {
             if at > 0 {
                 out.push(InputToken::Bytes(self.pending.drain(..at).collect()));
             }
-            if self.pending.len() < 3 {
+            if self.pending.starts_with(PASTE_START) {
+                out.push(InputToken::Paste(
+                    self.pending.drain(..PASTE_START.len()).collect(),
+                ));
+                self.in_paste = true;
+                continue;
+            }
+            if PASTE_START.starts_with(&self.pending) {
                 if finishing {
                     out.push(InputToken::Bytes(std::mem::take(&mut self.pending)));
                 }
                 break;
             }
-            if self.pending[..3] != *b"\x1b[<" {
-                if self.pending[1] == b'[' {
-                    if let Some(end) = self.pending[2..]
-                        .iter()
-                        .position(|b| (0x40..=0x7e).contains(b))
-                    {
-                        let len = end + 3;
-                        out.push(InputToken::Bytes(self.pending.drain(..len).collect()));
-                        continue;
-                    }
-                    if !finishing {
-                        break;
-                    }
+            if self.pending.len() == 1 {
+                if finishing {
+                    out.push(InputToken::Bytes(std::mem::take(&mut self.pending)));
                 }
-                out.push(InputToken::Bytes(vec![self.pending.remove(0)]));
+                break;
+            }
+            if self.pending[1] != b'[' {
+                out.push(InputToken::Bytes(std::mem::take(&mut self.pending)));
+                continue;
+            }
+            if self.pending.len() == 2 {
+                if finishing {
+                    out.push(InputToken::Bytes(std::mem::take(&mut self.pending)));
+                }
+                break;
+            }
+            if self.pending[2] != b'<' {
+                if let Some(end) = self.pending[2..]
+                    .iter()
+                    .position(|b| (0x40..=0x7e).contains(b))
+                {
+                    let len = end + 3;
+                    out.push(InputToken::Bytes(self.pending.drain(..len).collect()));
+                    continue;
+                }
+                // Once the third byte is not `<`, this cannot become an SGR
+                // mouse report. Preserve it now; the input loop must not wait.
+                out.push(InputToken::Bytes(std::mem::take(&mut self.pending)));
                 continue;
             }
             match parse_sgr(&self.pending) {
@@ -203,6 +283,13 @@ impl SgrParser {
         }
         merged
     }
+}
+
+fn longest_suffix_prefix(bytes: &[u8], prefix: &[u8]) -> usize {
+    (1..=bytes.len().min(prefix.len()))
+        .rev()
+        .find(|&len| bytes[bytes.len() - len..] == prefix[..len])
+        .unwrap_or(0)
 }
 
 enum Parse {
@@ -286,6 +373,48 @@ mod tests {
         let mut parser = SgrParser::default();
         let input = b"\x1b[<nopeM";
         assert_eq!(parser.feed(input), vec![InputToken::Bytes(input.to_vec())]);
+    }
+
+    #[test]
+    fn esc_deadline_and_alt_key_disambiguation() {
+        let mut parser = SgrParser::default();
+        assert!(parser.feed(b"\x1b").is_empty());
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert_eq!(
+            parser.flush_expired(),
+            vec![InputToken::Bytes(b"\x1b".to_vec())]
+        );
+        assert_eq!(parser.feed(b"x"), vec![InputToken::Bytes(b"x".to_vec())]);
+        let mut parser = SgrParser::default();
+        assert_eq!(
+            parser.feed(b"\x1bx"),
+            vec![InputToken::Bytes(b"\x1bx".to_vec())]
+        );
+    }
+
+    #[test]
+    fn split_bracketed_paste_preserves_sgr_and_hotkey_bytes() {
+        let mut parser = SgrParser::default();
+        assert!(parser.feed(b"\x1b[20").is_empty());
+        assert_eq!(
+            parser.feed(b"0~\x1b[<64;1;2M\x1d\x1b[20"),
+            vec![
+                InputToken::Paste(b"\x1b[200~".to_vec()),
+                InputToken::Paste(b"\x1b[<64;1;2M\x1d".to_vec())
+            ]
+        );
+        assert_eq!(
+            parser.feed(b"1~\x1b[<64;2;3M"),
+            vec![
+                InputToken::Paste(b"\x1b[201~".to_vec()),
+                InputToken::Mouse(SgrMouse {
+                    button: 64,
+                    x: 2,
+                    y: 3,
+                    release: false
+                })
+            ]
+        );
     }
 
     #[test]

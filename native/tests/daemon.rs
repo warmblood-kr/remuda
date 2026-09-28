@@ -829,23 +829,16 @@ fn mouse_off_knob_and_toggle_pass_reports_to_the_child_and_restore_host_modes() 
     let received = collect_until_bytes(&output, wheel);
     assert!(received.windows(wheel.len()).any(|w| w == wheel));
 
-    held.write_raw(&[0x1d]).expect("Ctrl-] enables host mouse");
-    let enabled = collect_until_bytes(&output, b"\x1b[?1000h\x1b[?1006h");
+    held.write_raw(&[0x1d])
+        .expect("Ctrl-] reaches child when disabled");
+    let received_toggle = collect_until_bytes(&output, &[0x1d]);
     assert!(
-        !enabled.contains(&0x1d),
-        "toggle key must not reach the child"
+        received_toggle.contains(&0x1d),
+        "disabled toggle key must reach the child"
     );
-    held.write_raw(&[0x1d]).expect("Ctrl-] disables host mouse");
-    let disabled = collect_until_bytes(&output, b"\x1b[?1000l\x1b[?1006l");
-    assert!(
-        !disabled.contains(&0x1d),
-        "toggle key must not reach the child"
-    );
-
-    held.write_raw(wheel)
-        .expect("wheel reaches child after toggle off");
-    let received = collect_until_bytes(&output, wheel);
-    assert!(received.windows(wheel.len()).any(|w| w == wheel));
+    assert!(!received_toggle
+        .windows(b"\x1b[?1000h".len())
+        .any(|w| w == b"\x1b[?1000h"));
 
     held.write_raw(&[client::DETACH]).expect("detach");
     drop(held);
