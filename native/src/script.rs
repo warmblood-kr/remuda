@@ -630,10 +630,18 @@ pub(crate) fn hide_module_activator(lua: &Lua) -> mlua::Result<()> {
     let remuda: Table = lua.globals().get("remuda")?;
     let activate: mlua::Function = remuda.get("_activate_module")?;
     lua.set_named_registry_value("remuda.lifecycle.activate_module", activate)?;
+    let stop_modules: mlua::Function = remuda.get("_stop_modules")?;
+    lua.set_named_registry_value("remuda.lifecycle.stop_modules", stop_modules)?;
     let set_field: mlua::Function = remuda.get("_module_set_field")?;
     lua.set_named_registry_value("remuda.lifecycle.set_field", set_field)?;
     remuda.set("_module_set_field", Value::Nil)?;
+    remuda.set("_stop_modules", Value::Nil)?;
     remuda.set("_activate_module", Value::Nil)
+}
+
+pub(crate) fn stop_modules(lua: &Lua) -> mlua::Result<()> {
+    let stop_modules: mlua::Function = lua.named_registry_value("remuda.lifecycle.stop_modules")?;
+    stop_modules.call(())
 }
 
 /// `remuda.capture_styled(name)` — split out of `bindings` for its line cap.
