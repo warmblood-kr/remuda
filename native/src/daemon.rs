@@ -1026,6 +1026,8 @@ fn attach(
     // already gone. The core got "a human is attached" forever.
     let done = std::sync::atomic::AtomicBool::new(false);
     let done = &done;
+    let input_failed = std::sync::atomic::AtomicBool::new(false);
+    let input_failed = &input_failed;
     // Checked before every read of the key pump below, not just its first —
     // a cancel that arrives before a read is pending is a documented no-op
     // on Windows, so the flag (not the cancel alone) is what actually stops
@@ -1044,21 +1046,26 @@ fn attach(
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         // Preserve this exact read buffer until the session
-                        // accepts it. Native PTYs wait for their in-flight
-                        // write to finish before retrying, so a late partial
-                        // write is never replayed as a second keystroke.
-                        loop {
-                            if stop.load(std::sync::atomic::Ordering::SeqCst) || held.is_displaced()
+                        // or fails. Busy means no write was queued; every other
+                        // error may follow a partial write and ends this pump.
+                        match forward_attach_input(
+                            || held.write_raw(&buf[..n]),
+                            || {
+                                stop.load(std::sync::atomic::Ordering::SeqCst)
+                                    || held.is_displaced()
+                            },
+                        ) {
+                            Ok(()) => {}
+                            Err(remuda_core::AgentError::Exited) => break 'keys,
+                            Err(remuda_core::AgentError::Attached)
+                                if stop.load(std::sync::atomic::Ordering::SeqCst)
+                                    || held.is_displaced() =>
                             {
-                                break;
+                                break 'keys;
                             }
-                            match held.write_raw(&buf[..n]) {
-                                Ok(()) => break,
-                                Err(remuda_core::AgentError::Exited) => break 'keys,
-                                Err(remuda_core::AgentError::Attached) if held.is_displaced() => {
-                                    break 'keys;
-                                }
-                                Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                            Err(_) => {
+                                input_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                                break 'keys;
                             }
                         }
                     }
@@ -1094,11 +1101,39 @@ fn attach(
             let _ = out.write_all(b"\r\n[remuda] attached elsewhere, detached\r\n");
             let _ = out.flush();
         }
+        if input_failed.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = report_attach_input_failure(&mut out);
+        }
         done.store(true, std::sync::atomic::Ordering::SeqCst);
         // Unblocks the key thread's read so the scope can close.
         ipc::stop_reader(&stream, stop, || key_thread.is_finished());
     });
     Ok(())
+}
+
+const ATTACH_INPUT_FAILURE_NOTICE: &str =
+    "\r\n[remuda] input stopped after a PTY write error; some bytes may have been delivered partially or lost\r\n";
+
+fn report_attach_input_failure(output: &mut impl Write) -> std::io::Result<()> {
+    output.write_all(ATTACH_INPUT_FAILURE_NOTICE.as_bytes())?;
+    output.flush()
+}
+
+fn forward_attach_input(
+    mut write: impl FnMut() -> AgentResult<()>,
+    mut stopping: impl FnMut() -> bool,
+) -> AgentResult<()> {
+    loop {
+        if stopping() {
+            return Err(remuda_core::agent::AgentError::Attached);
+        }
+        match write() {
+            Err(remuda_core::agent::AgentError::Busy) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
 }
 
 fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
@@ -1110,11 +1145,54 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{runtime_base_for, shell_or_default};
-    use remuda_core::agent::{Color, StyledCell};
+    use super::{
+        forward_attach_input, report_attach_input_failure, runtime_base_for, shell_or_default,
+        ATTACH_INPUT_FAILURE_NOTICE,
+    };
+    use remuda_core::agent::{AgentError, Color, StyledCell};
     use remuda_core::protocol::collapse_runs;
     use std::ffi::OsStr;
     use std::path::Path;
+
+    #[test]
+    fn attach_input_does_not_replay_after_terminal_write_error_and_has_a_human_notice() {
+        let mut attempts = 0;
+        let result = forward_attach_input(
+            || {
+                attempts += 1;
+                Err(AgentError::Io("injected partial write failure".into()))
+            },
+            || false,
+        );
+        assert!(matches!(result, Err(AgentError::Io(_))));
+        assert_eq!(
+            attempts, 1,
+            "a possibly partial write must never be replayed"
+        );
+        assert!(ATTACH_INPUT_FAILURE_NOTICE.contains("input stopped"));
+        assert!(ATTACH_INPUT_FAILURE_NOTICE.contains("may have been delivered"));
+        let mut notice = Vec::new();
+        report_attach_input_failure(&mut notice).unwrap();
+        assert_eq!(notice, ATTACH_INPUT_FAILURE_NOTICE.as_bytes());
+    }
+
+    #[test]
+    fn attach_input_retries_busy_only_until_the_original_buffer_is_accepted() {
+        let mut attempts = 0;
+        let result = forward_attach_input(
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(AgentError::Busy)
+                } else {
+                    Ok(())
+                }
+            },
+            || false,
+        );
+        assert!(result.is_ok());
+        assert_eq!(attempts, 2);
+    }
 
     #[test]
     fn android_runtime_base_uses_termux_temp_dir_when_xdg_is_unset() {
