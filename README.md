@@ -72,6 +72,14 @@ To record the bytes your terminal sends while attached, set
 appends one line per input read, with a Unix timestamp and the bytes in
 lowercase hexadecimal. This helps diagnose terminal-specific wheel behavior.
 
+## Cascading spawn
+
+![A terminal session tree: butler has spawned a lead session, which has in
+turn spawned several of its own worker sessions, shown nested in the
+sidebar](docs/remuda-cascading-spawn.png)
+
+The butler spawns a lead; a worker can spawn its own workers (cascading).
+
 ## Install
 
 No stable release has been published yet (see [Channels](#channels) below),
