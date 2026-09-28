@@ -1,6 +1,7 @@
 //! One-shot Noise IK frames for cluster requests and responses.
 
 use std::io;
+use zeroize::Zeroizing;
 
 const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 const MAX_FRAME_SIZE: usize = 65_535;
@@ -54,6 +55,7 @@ pub fn open_request(responder_private: &[u8], message: &[u8]) -> io::Result<Open
     }
     let mut ephemeral = [0; 32];
     ephemeral.copy_from_slice(&message[..32]);
+    reject_low_order_dh(responder_private, &ephemeral)?;
     let mut handshake = snow::Builder::new(parse_pattern()?)
         .local_private_key(responder_private)
         .map_err(frame_error)?
@@ -75,6 +77,7 @@ pub fn open_request(responder_private: &[u8], message: &[u8]) -> io::Result<Open
         .get_remote_static()
         .ok_or_else(invalid_frame)?
         .to_vec();
+    reject_low_order_dh(responder_private, &peer_static)?;
     Ok(OpenedRequest {
         peer_static,
         ephemeral,
@@ -82,6 +85,23 @@ pub fn open_request(responder_private: &[u8], message: &[u8]) -> io::Result<Open
         payload: plaintext[TIMESTAMP_SIZE..length].to_vec(),
         handshake,
     })
+}
+
+fn reject_low_order_dh(private_key: &[u8], public_key: &[u8]) -> io::Result<()> {
+    if private_key.len() != 32 || public_key.len() != 32 {
+        return Err(invalid_frame());
+    }
+    use snow::resolvers::CryptoResolver;
+    let params = parse_pattern()?;
+    let resolver = snow::resolvers::DefaultResolver;
+    let mut dh = resolver.resolve_dh(&params.dh).ok_or_else(invalid_frame)?;
+    dh.set(private_key);
+    let mut shared = Zeroizing::new([0; 32]);
+    dh.dh(public_key, &mut shared[..]).map_err(frame_error)?;
+    if shared.iter().all(|byte| *byte == 0) {
+        return Err(invalid_frame());
+    }
+    Ok(())
 }
 
 /// Encrypt a response as Noise IK message 2.
@@ -119,4 +139,19 @@ fn frame_error(error: snow::Error) -> io::Error {
 
 fn invalid_frame() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "invalid Noise IK frame")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_low_order_dh_result() {
+        let private = [7; 32];
+        assert!(reject_low_order_dh(&private, &[0; 32]).is_err());
+        let peer = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        assert!(reject_low_order_dh(&private, &peer.public).is_ok());
+    }
 }

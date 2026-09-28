@@ -80,7 +80,7 @@ pub(super) fn decode_base64(value: &str) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(super) fn fingerprint(public_key: &[u8]) -> String {
+pub fn fingerprint(public_key: &[u8]) -> String {
     use snow::resolvers::CryptoResolver;
     let params: snow::params::NoiseParams = "Noise_NN_25519_ChaChaPoly_SHA256"
         .parse()

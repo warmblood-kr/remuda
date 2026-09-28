@@ -152,6 +152,19 @@ fn join_token_unobserved_rollback_extends_lifetime_by_rollback_duration() {
 
 #[test]
 #[cfg(not(windows))]
+fn join_token_periodic_observe_expires_tokens_after_clock_rollback() {
+    let dir = private_dir();
+    let clock = Arc::new(ManualWallClock::new(1_700_000_000));
+    let store = JoinTokenStore::open_at(&dir, clock.clone()).unwrap();
+    let token = store.mint().unwrap();
+    clock.set_unix_seconds(1_699_999_999);
+    store.observe().unwrap();
+    assert!(store.verify_and_consume(&token.token).is_err());
+    remove_dir(&dir);
+}
+
+#[test]
+#[cfg(not(windows))]
 fn join_token_concurrent_consumers_allow_exactly_one_success() {
     let dir = private_dir();
     let clock = Arc::new(ManualWallClock::new(1_700_000_000));

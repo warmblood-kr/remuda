@@ -320,8 +320,15 @@ enum ClusterCommand {
     Status,
     Init,
     Nodes,
-    Revoke { target: String, yes: bool },
+    Revoke {
+        target: String,
+        yes: bool,
+    },
     Remote(Option<String>),
+    Listen {
+        bind_addr: std::net::SocketAddr,
+        allow_public: bool,
+    },
     Invalid,
 }
 
@@ -346,6 +353,23 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
         ["remote", target] if target.contains('/') => {
             ClusterCommand::Remote(Some((*target).to_string()))
         }
+        ["listen", "--bind", address] => address
+            .parse()
+            .ok()
+            .map(|bind_addr| ClusterCommand::Listen {
+                bind_addr,
+                allow_public: false,
+            })
+            .unwrap_or(ClusterCommand::Invalid),
+        ["listen", "--bind", address, "--allow-public"]
+        | ["listen", "--allow-public", "--bind", address] => address
+            .parse()
+            .ok()
+            .map(|bind_addr| ClusterCommand::Listen {
+                bind_addr,
+                allow_public: true,
+            })
+            .unwrap_or(ClusterCommand::Invalid),
         _ => ClusterCommand::Invalid,
     }
 }
@@ -395,7 +419,26 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                 }
             })
         }
-        ClusterCommand::Invalid => fail("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | remote [node/session]]"),
+        ClusterCommand::Listen {
+            bind_addr,
+            allow_public,
+        } => with_daemon(server, path, |daemon_path| {
+            let config = remuda_native::net::listener::ListenerConfig {
+                bind_addr,
+                allow_unspecified: allow_public,
+            };
+            match remuda_native::net::listener::bind(config, daemon_path) {
+                Ok(listener) => {
+                    eprintln!("remuda: cluster listener on {}", listener.local_addr().unwrap_or(bind_addr));
+                    match listener.serve() {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(error) => fail(format!("cluster listener: {error}")),
+                    }
+                }
+                Err(error) => fail(format!("cluster listener: {error}")),
+            }
+        }),
+        ClusterCommand::Invalid => fail("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | remote [node/session] | listen --bind ADDR [--allow-public]]"),
     }
 }
 
@@ -523,6 +566,28 @@ mod cluster_cli_tests {
         assert_eq!(
             parse_cluster_command(&["remote", "studio/dev"]),
             ClusterCommand::Remote(Some("studio/dev".into()))
+        );
+    }
+
+    #[test]
+    fn cluster_listener_requires_explicit_bind_and_public_wildcard_opt_in() {
+        assert_eq!(
+            parse_cluster_command(&["listen", "--bind", "192.0.2.4:9443"]),
+            ClusterCommand::Listen {
+                bind_addr: "192.0.2.4:9443".parse().unwrap(),
+                allow_public: false,
+            }
+        );
+        assert_eq!(
+            parse_cluster_command(&["listen", "--bind", "0.0.0.0:9443", "--allow-public"]),
+            ClusterCommand::Listen {
+                bind_addr: "0.0.0.0:9443".parse().unwrap(),
+                allow_public: true,
+            }
+        );
+        assert_eq!(
+            parse_cluster_command(&["listen", "--bind", "not-an-address"]),
+            ClusterCommand::Invalid
         );
     }
 
