@@ -251,6 +251,20 @@ pub trait AgentProcess: Send {
         })
     }
 
+    /// Capture a screen with its output generation when the backend can do so atomically.
+    fn screen_snapshot_version_at(
+        &mut self,
+        scrollback: usize,
+    ) -> Result<(ScreenSnapshot, Option<u64>)> {
+        self.screen_snapshot_at(scrollback)
+            .map(|snapshot| (snapshot, None))
+    }
+
+    /// A backend generation, if it can synchronize it with screen capture.
+    fn output_version(&mut self) -> Option<u64> {
+        None
+    }
+
     /// Subscribe to output as it arrives. Sessions track output activity and
     /// viewers can consume it without screen polling. `None` means this backend
     /// cannot stream, so viewers fall back to `screen_bytes`.

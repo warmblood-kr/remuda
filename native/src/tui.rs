@@ -1177,6 +1177,8 @@ mod visual_mode_tests {
         let mut ui = Ui::new(
             vec![SessionSummary {
                 name: "agent".into(),
+                instance_id: "test-agent".into(),
+                output_version: 0,
                 alive: true,
                 idle: Duration::ZERO,
                 output_idle: Some(Duration::ZERO),
@@ -2826,6 +2828,7 @@ fn capture_styled(path: &Path, name: &str, scrollback: usize) -> Result<StyledCa
             cursor,
             scrollback_len,
             scrollback_total,
+            ..
         }) => Ok((
             rows.iter().map(|row| expand_runs(row)).collect(),
             wrapped,

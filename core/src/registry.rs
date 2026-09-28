@@ -32,6 +32,12 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub name: String,
+    /// Unique to this particular start, even when a later process reuses its name.
+    #[serde(default)]
+    pub instance_id: String,
+    /// Increases for each processed PTY output chunk.
+    #[serde(default)]
+    pub output_version: u64,
     pub alive: bool,
     /// Time since the last accepted input; unchanged by agent output.
     pub idle: Duration,
@@ -130,6 +136,8 @@ impl Registry {
             .values()
             .map(|s| SessionSummary {
                 name: s.name().to_string(),
+                instance_id: s.instance_id().to_string(),
+                output_version: s.output_version(),
                 alive: s.is_alive(),
                 idle: s.idle_for(),
                 output_idle: Some(s.output_idle_for()),
@@ -227,6 +235,16 @@ impl Registry {
         scrollback: usize,
     ) -> Option<Result<ScreenSnapshot>> {
         self.get(name).map(|s| s.screen_snapshot_at(scrollback))
+    }
+
+    /// A screen and its output generation read within one session-lock interval.
+    pub fn screen_snapshot_version_at(
+        &self,
+        name: &str,
+        scrollback: usize,
+    ) -> Option<Result<(ScreenSnapshot, u64, String)>> {
+        self.get(name)
+            .map(|session| session.screen_snapshot_version_at(scrollback))
     }
 
     pub fn cursor(&self, name: &str) -> Option<Result<Cursor>> {

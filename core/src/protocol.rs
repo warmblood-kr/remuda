@@ -126,6 +126,12 @@ pub enum Response {
     /// pane's caret and its content are always the same frame. See steps/027.
     StyledScreen {
         rows: Vec<Vec<StyledRun>>,
+        /// Session identity for this start; absent in responses from old daemons.
+        #[serde(default)]
+        instance_id: String,
+        /// Output generation for clients that only need to redraw changed frames.
+        #[serde(default)]
+        output_version: u64,
         #[serde(default)]
         wrapped: Vec<bool>,
         #[serde(default)]

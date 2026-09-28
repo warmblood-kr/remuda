@@ -24,7 +24,7 @@ use remuda_core::agent::{
     ScreenSnapshot, Size, StyledCell,
 };
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -89,6 +89,7 @@ pub struct PtyAgent {
     child: Box<dyn Child + Send + Sync>,
     watchers: Watchers,
     scrollback_total: Arc<AtomicUsize>,
+    output_version: Arc<AtomicU64>,
     master: Option<Box<dyn MasterPty + Send>>,
 }
 
@@ -121,12 +122,14 @@ impl PtyAgent {
         )));
         let watchers: Watchers = Arc::new(Mutex::new(Vec::new()));
         let scrollback_total = Arc::new(AtomicUsize::new(0));
+        let output_version = Arc::new(AtomicU64::new(0));
         spawn_reader(
             reader,
             Arc::clone(&screen),
             Arc::clone(&watchers),
             Arc::clone(&writer),
             Arc::clone(&scrollback_total),
+            Arc::clone(&output_version),
         );
 
         Ok(Self {
@@ -136,6 +139,7 @@ impl PtyAgent {
             child,
             watchers,
             scrollback_total,
+            output_version,
             master: Some(pair.master),
         })
     }
@@ -150,6 +154,7 @@ fn spawn_reader(
     watchers: Watchers,
     writer: SharedWriter,
     scrollback_total: Arc<AtomicUsize>,
+    output_version: Arc<AtomicU64>,
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -159,7 +164,11 @@ fn spawn_reader(
             }
             let asked = buf[..n].windows(DSR_CURSOR.len()).any(|w| w == DSR_CURSOR);
             let at = match screen.lock() {
-                Ok(mut parser) => process_output(&mut parser, &buf[..n], &scrollback_total),
+                Ok(mut parser) => {
+                    let at = process_output(&mut parser, &buf[..n], &scrollback_total);
+                    output_version.fetch_add(1, Ordering::SeqCst);
+                    at
+                }
                 // Poisoned: the grid can no longer be trusted.
                 Err(_) => break,
             };
@@ -359,46 +368,32 @@ impl AgentProcess for PtyAgent {
     }
 
     fn screen_snapshot_at(&mut self, scrollback: usize) -> Result<ScreenSnapshot> {
-        let mut parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
-        let size = self.size;
-        let screen = parser.screen_mut();
-        let previous = screen.scrollback();
-        screen.set_scrollback(usize::MAX);
-        let scrollback_len = screen.scrollback();
-        screen.set_scrollback(previous);
+        capture_snapshot(
+            &self.screen,
+            self.size,
+            &self.scrollback_total,
+            &self.output_version,
+            scrollback,
+        )
+        .map(|(snapshot, _)| snapshot)
+    }
 
-        let (cells, wrapped, cursor) = with_scrollback(screen, scrollback, |screen| {
-            let cursor = if scrollback == 0 {
-                let (row, col) = display_cursor(screen);
-                Cursor {
-                    row,
-                    col,
-                    visible: !screen.hide_cursor(),
-                }
-            } else {
-                Cursor {
-                    row: 0,
-                    col: 0,
-                    visible: false,
-                }
-            };
-            (
-                styled_cells(screen, size),
-                (0..size.rows())
-                    .map(|row| screen.row_wrapped(row))
-                    .collect(),
-                cursor,
-            )
-        });
-        let scrollback_total = self.scrollback_total.load(Ordering::Relaxed);
+    fn screen_snapshot_version_at(
+        &mut self,
+        scrollback: usize,
+    ) -> Result<(ScreenSnapshot, Option<u64>)> {
+        let (snapshot, version) = capture_snapshot(
+            &self.screen,
+            self.size,
+            &self.scrollback_total,
+            &self.output_version,
+            scrollback,
+        )?;
+        Ok((snapshot, Some(version)))
+    }
 
-        Ok(ScreenSnapshot {
-            cells,
-            wrapped,
-            cursor,
-            scrollback_len,
-            scrollback_total,
-        })
+    fn output_version(&mut self) -> Option<u64> {
+        Some(self.output_version.load(Ordering::SeqCst))
     }
 
     fn subscribe(&mut self) -> Option<Receiver<Vec<u8>>> {
@@ -462,6 +457,55 @@ impl AgentProcess for PtyAgent {
     fn size(&self) -> Size {
         self.size
     }
+}
+
+fn capture_snapshot(
+    screen: &Arc<Mutex<vt100::Parser>>,
+    size: Size,
+    scrollback_total: &AtomicUsize,
+    output_version: &AtomicU64,
+    scrollback: usize,
+) -> Result<(ScreenSnapshot, u64)> {
+    let mut parser = screen.lock().map_err(|_| io("screen lock poisoned"))?;
+    let screen = parser.screen_mut();
+    let previous = screen.scrollback();
+    screen.set_scrollback(usize::MAX);
+    let scrollback_len = screen.scrollback();
+    screen.set_scrollback(previous);
+    let (cells, wrapped, cursor) = with_scrollback(screen, scrollback, |screen| {
+        let cursor = if scrollback == 0 {
+            let (row, col) = display_cursor(screen);
+            Cursor {
+                row,
+                col,
+                visible: !screen.hide_cursor(),
+            }
+        } else {
+            Cursor {
+                row: 0,
+                col: 0,
+                visible: false,
+            }
+        };
+        (
+            styled_cells(screen, size),
+            (0..size.rows())
+                .map(|row| screen.row_wrapped(row))
+                .collect(),
+            cursor,
+        )
+    });
+    let version = output_version.load(Ordering::SeqCst);
+    Ok((
+        ScreenSnapshot {
+            cells,
+            wrapped,
+            cursor,
+            scrollback_len,
+            scrollback_total: scrollback_total.load(Ordering::Relaxed),
+        },
+        version,
+    ))
 }
 
 #[cfg(test)]

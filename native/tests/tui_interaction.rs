@@ -7,6 +7,8 @@ fn ui_with_mouse_tracking(mouse_tracking: bool) -> Ui {
     Ui::new(
         vec![SessionSummary {
             name: "agent".into(),
+            instance_id: "test-agent".into(),
+            output_version: 0,
             alive: true,
             idle: Duration::ZERO,
             output_idle: Some(Duration::ZERO),

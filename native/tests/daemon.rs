@@ -213,6 +213,150 @@ fn new_session(path: &Path, name: &str) {
     );
 }
 
+#[test]
+fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_versions_advance() {
+    let runtime = scratch_dir("ver-restart");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut first_daemon = spawn::Daemon::spawn(&runtime);
+    start_shell_session(
+        &socket,
+        "sleep 0.2; printf first; sleep 0.2; printf later; sleep 30",
+    );
+    let first_summary = listed_session(&socket);
+    let first_version = capture_version(&socket);
+    let front_request = serde_json::to_vec(&Request::CaptureStyled {
+        name: "versioned".into(),
+        scrollback: 0,
+    })
+    .expect("encode front request");
+    let front_capture: Response = serde_json::from_slice(
+        &remuda_native::remote_front::forward_frame(&socket, &front_request)
+            .expect("front forwards capture"),
+    )
+    .expect("decode front response");
+    assert!(
+        matches!(front_capture, Response::StyledScreen { instance_id, output_version, .. }
+        if instance_id == first_summary.instance_id && output_version == first_version)
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(capture_version(&socket), first_version);
+    wait_for_output_version(&socket, first_version);
+
+    client::request(&socket, &Request::Shutdown).expect("stop first daemon");
+    assert!(
+        first_daemon.left_on_its_own(),
+        "first daemon should stop cleanly"
+    );
+
+    let mut second_daemon = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "printf second; sleep 30");
+    let second_summary = listed_session(&socket);
+    assert_ne!(first_summary.instance_id, second_summary.instance_id);
+    let _ = client::request(&socket, &Request::Shutdown);
+    assert!(
+        second_daemon.left_on_its_own(),
+        "second daemon should stop cleanly"
+    );
+}
+
+fn start_shell_session(socket: &Path, script: &str) {
+    let response = client::request(
+        socket,
+        &Request::New {
+            name: Some("versioned".into()),
+            command: vec!["sh".into(), "-c".into(), script.into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start session");
+    assert!(matches!(response, Response::Value(_)));
+}
+
+fn listed_session(socket: &Path) -> remuda_core::SessionSummary {
+    match client::request(socket, &Request::List).expect("list session") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "versioned")
+            .expect("session is listed"),
+        other => panic!("unexpected list response: {other:?}"),
+    }
+}
+
+fn capture_version(socket: &Path) -> u64 {
+    match client::request(
+        socket,
+        &Request::CaptureStyled {
+            name: "versioned".into(),
+            scrollback: 0,
+        },
+    )
+    .expect("capture session")
+    {
+        Response::StyledScreen { output_version, .. } => output_version,
+        other => panic!("unexpected capture response: {other:?}"),
+    }
+}
+
+fn wait_for_output_version(socket: &Path, original: u64) {
+    let deadline = Instant::now() + PATIENCE;
+    while capture_version(socket) <= original {
+        assert!(Instant::now() < deadline, "output version did not increase");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn old_json_shapes_parse_with_defaults_for_additive_session_fields() {
+    let summary = remuda_core::SessionSummary {
+        name: "old-client".into(),
+        instance_id: "new-field".into(),
+        output_version: 7,
+        alive: true,
+        idle: Duration::ZERO,
+        output_idle: None,
+        size: Size::new(80, 24),
+        attached: false,
+        human_idle: None,
+        mouse_tracking: false,
+    };
+    let mut old_summary = serde_json::to_value(summary).expect("serialize summary");
+    let fields = old_summary.as_object_mut().expect("summary object");
+    fields.remove("instance_id");
+    fields.remove("output_version");
+    let decoded: remuda_core::SessionSummary =
+        serde_json::from_value(old_summary).expect("parse old session summary");
+    assert!(decoded.instance_id.is_empty());
+    assert_eq!(decoded.output_version, 0);
+
+    let response = Response::StyledScreen {
+        rows: vec![],
+        instance_id: "new-field".into(),
+        output_version: 7,
+        wrapped: vec![],
+        scrollback_len: 0,
+        scrollback_total: 0,
+        cursor: remuda_core::agent::Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        },
+    };
+    let mut old_response = serde_json::to_value(response).expect("serialize response");
+    let fields = old_response
+        .as_object_mut()
+        .and_then(|variant| variant.get_mut("StyledScreen"))
+        .and_then(serde_json::Value::as_object_mut)
+        .expect("styled response object");
+    fields.remove("instance_id");
+    fields.remove("output_version");
+    let decoded: Response = serde_json::from_value(old_response).expect("parse old response");
+    assert!(
+        matches!(decoded, Response::StyledScreen { instance_id, output_version: 0, .. } if instance_id.is_empty())
+    );
+}
+
 /// Connect using the original attach wire shape and leave the connection in
 /// raw mode. Reading the acknowledgement one byte at a time keeps any initial
 /// screen bytes in the socket for the caller.
