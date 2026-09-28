@@ -206,6 +206,9 @@ impl Ui {
     /// another one already has focus. A press in the session pane forwards
     /// as a real click to the child instead. See steps/030.
     pub fn on_mouse(&mut self, event: MouseEvent, cols: u16, rows: u16) -> Action {
+        if self.daemon_gone.is_some() {
+            return Action::Nothing;
+        }
         if self.mode != Mode::Browse {
             return Action::Nothing;
         }
@@ -2257,10 +2260,11 @@ fn refresh(
                     ui.notice = Some(e);
                 }
                 Err(probe_error) => {
-                    ui.consecutive_transport_failures =
-                        ui.consecutive_transport_failures.saturating_add(1);
                     let definitive = daemon_is_definitively_gone(path, &probe_error);
-                    if daemon_failure_marks_gone(ui.consecutive_transport_failures, definitive) {
+                    let busy_refusal = probe_error.kind() == std::io::ErrorKind::ConnectionRefused
+                        && path.exists()
+                        && !socket_lock_is_free(path);
+                    if definitive {
                         ui.daemon_gone = Some(path.display().to_string());
                         ui.notice = None;
                         ui.focus = Focus::List;
@@ -2268,7 +2272,22 @@ fn refresh(
                         ui.visual = false;
                         ui.text_selection = None;
                     } else {
-                        ui.notice = Some(e);
+                        if busy_refusal {
+                            ui.consecutive_transport_failures = 0;
+                        } else {
+                            ui.consecutive_transport_failures =
+                                ui.consecutive_transport_failures.saturating_add(1);
+                        }
+                        if daemon_failure_marks_gone(ui.consecutive_transport_failures, false) {
+                            ui.daemon_gone = Some(path.display().to_string());
+                            ui.notice = None;
+                            ui.focus = Focus::List;
+                            ui.mode = Mode::Browse;
+                            ui.visual = false;
+                            ui.text_selection = None;
+                        } else {
+                            ui.notice = Some(e);
+                        }
                     }
                 }
             },

@@ -148,6 +148,15 @@ fn a_click_on_a_list_row_selects_and_enters_it_like_arrow_plus_enter() {
 }
 
 #[test]
+fn mouse_actions_are_ignored_after_daemon_is_gone() {
+    let mut ui = make_ui(vec![row("a", true, false), row("b", true, false)]);
+    ui.daemon_gone = Some("/tmp/dead.sock".into());
+    assert_eq!(ui.on_mouse(click(5, 4), 80, 24), Action::Nothing);
+    assert_eq!(ui.focus, Focus::List);
+    assert_eq!(ui.selected, 0);
+}
+
+#[test]
 fn clicks_start_on_the_first_row_and_stop_after_the_list() {
     let mut ui = make_ui(vec![row("a", true, false), row("b", true, false)]);
     assert_eq!(
@@ -1981,6 +1990,66 @@ fn refused_socket_is_definitive_only_when_its_lifetime_lock_is_free() {
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     assert!(daemon_is_definitively_gone(&socket, &refused));
     std::fs::remove_dir_all(dir).expect("remove private lock probe directory");
+}
+
+#[cfg(unix)]
+#[test]
+fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixListener;
+
+    let dir = std::env::temp_dir().join(format!("remuda-tui-busy-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("make private busy daemon directory");
+    let socket = dir.join("s.sock");
+    drop(UnixListener::bind(&socket).expect("bind private endpoint"));
+    let lock_path = dir.join("s.sock.lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .expect("open private lifetime lock");
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let connect_error = crate::ipc::connect(&socket).expect_err("placeholder is not a socket");
+    assert_eq!(
+        connect_error.kind(),
+        std::io::ErrorKind::ConnectionRefused,
+        "{connect_error:?}"
+    );
+    assert!(!daemon_is_definitively_gone(&socket, &connect_error));
+
+    let mut ui = make_ui(vec![row("remembered", true, false)]);
+    ui.consecutive_transport_failures = 2;
+    let mut held = None;
+    let mut painted = String::new();
+    let mut shown = None;
+    refresh(
+        &socket,
+        "test",
+        &mut ui,
+        &mut held,
+        &mut painted,
+        &mut shown,
+        false,
+        false,
+    )
+    .expect("refresh handles refused private endpoint");
+    assert!(
+        ui.daemon_gone.is_none(),
+        "held lifetime lock means the daemon may be busy"
+    );
+    assert_eq!(
+        ui.consecutive_transport_failures, 0,
+        "busy refusal must not count"
+    );
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    drop(lock);
+    std::fs::remove_dir_all(dir).expect("remove private busy daemon directory");
 }
 
 #[test]
