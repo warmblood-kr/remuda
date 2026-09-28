@@ -276,7 +276,21 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("remuda-front-{}-{stamp}.sock", std::process::id()))
+        let base = std::env::temp_dir().join(format!("rf-{}-{stamp}", std::process::id()));
+        crate::daemon::socket_path_in(&base, "front")
+    }
+
+    fn cleanup_test_socket(path: &Path) {
+        #[cfg(unix)]
+        {
+            let _ = std::fs::remove_file(path);
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::remove_dir(parent);
+                if let Some(base) = parent.parent() {
+                    let _ = std::fs::remove_dir(base);
+                }
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -287,7 +301,7 @@ mod tests {
         let listener = listen_front(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         drop(listener);
-        let _ = std::fs::remove_file(path);
+        cleanup_test_socket(&path);
         assert_eq!(mode, 0o600);
     }
 
@@ -308,7 +322,7 @@ mod tests {
         let result = client.read(&mut byte);
         let elapsed = start.elapsed();
         let _ = worker.join();
-        let _ = std::fs::remove_file(socket);
+        cleanup_test_socket(&socket);
         assert!(
             matches!(result, Err(_) | Ok(0)),
             "stalled connection stayed open"
@@ -350,6 +364,6 @@ mod tests {
             remuda_core::protocol::Response::Error(_)
         ));
         drop(clients);
-        let _ = std::fs::remove_file(socket);
+        cleanup_test_socket(&socket);
     }
 }

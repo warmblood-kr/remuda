@@ -2,33 +2,32 @@
 
 Remote mode continues the existing Remuda TUI: the list stays on the left and the selected session stays on the right. The difference is that the left side becomes a virtual tree of nodes and their sessions, addressed as `node/session`. The selected remote screen keeps refreshing over short requests and survives network loss. There is no separate remote-client look. The name `control tower` remains reserved for a later composed multi-node control experience.
 
-All commands below are proposed user-facing syntax for review. The cluster and remote subcommands and their flags are not implemented yet. Example addresses, fingerprints, tokens, and output are illustrative.
+The approved command tree is `remuda cluster init`, `remuda cluster join <line>`, `remuda cluster nodes`, `remuda cluster revoke <node>`, and `remuda cluster remote [node/session]`. These subcommands are not implemented yet. Example addresses, fingerprints, tokens, and output are illustrative.
 
 ## Journey 0: form a cluster
 
-On the first machine, initialize a node. The command creates its node key pair and starts the cluster endpoint on the VPN address. It prints the address, public-key fingerprint, and a short-lived, single-use token in one pasteable line:
+On the first machine, initialize a cluster of one. `remuda cluster init` creates the node key pair and starts the cluster endpoint on the VPN address. Bare `remuda cluster` shows cluster status after initialization, or the init hint when no cluster exists. Initialization prints the address, public-key fingerprint, and a short-lived, single-use join line:
 
 ```text
-$ remuda cluster
+$ remuda cluster init
 Cluster initialized
 Node: studio
 Address: 100.80.0.12:7443
 Fingerprint: SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=
-Join command (expires in 10 minutes; single use):
-curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh && "$HOME/.local/bin/remuda" cluster join --address 100.80.0.12:7443 --fingerprint SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= --token 'eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
+Join line (expires in 10 minutes; single use):
+remuda-join://100.80.0.12:7443?fingerprint=SHA256%3AQmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU%3D&token=eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu
 ```
 
-The operator shares that line with the intended machine over a trusted channel. The token is a bearer secret: it is shown once, expires quickly, and is consumed once. The joining machine pastes it into a shell; the first node's fingerprint is pinned before the secure channel is established, then the joiner registers its own public key. No public discovery or NAT traversal is implied; both nodes are expected to reach one another on the same VPN.
+The operator shares the join line with the intended machine over a trusted channel. The line is a bearer secret: it is shown once, expires quickly, and is consumed once. On the joining machine, run `remuda cluster join <line>` with the received line. The first node's fingerprint is pinned before the secure channel is established, then the joiner registers its own public key. No public discovery or NAT traversal is implied; both nodes are expected to reach one another on the same VPN.
 
 ```text
-$ curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh && "$HOME/.local/bin/remuda" cluster join --address 100.80.0.12:7443 --fingerprint SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= --token 'eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
-Downloading remuda…
+$ remuda cluster join 'remuda-join://100.80.0.12:7443?fingerprint=SHA256%3AQmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU%3D&token=eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
 Pinned cluster node fingerprint verified
 Joining cluster…
 Joined cluster as node: field-laptop
 ```
 
-Operators can inspect membership and revoke a node key:
+Every member knows the public keys of every cluster member through a replicated, signed `authorized_nodes` list. Any member can admit or revoke a node; membership changes are pushed to peers, and nodes fetch the current list at startup. Operators can inspect membership and revoke a node key from any member:
 
 ```text
 $ remuda cluster nodes
@@ -41,10 +40,10 @@ Revoke node field-laptop (SHA256:Vmlld2VyLWtleS1leGFtcGxl)? [y/N] y
 Node field-laptop revoked. Existing connections closed.
 ```
 
-The specific list formatting and confirmation syntax are proposed UX. These example commands show the POSIX installer; a PowerShell host should print an equivalent install-and-join line for that shell. A token or fingerprint error is fatal and must not fall back to an unpinned connection; unreachable nodes can be retried after the VPN is repaired:
+The list formatting and confirmation syntax are illustrative. The join line is shell-quoted in this example; a PowerShell host should show equivalent quoting. A token or fingerprint error is fatal and must not fall back to an unpinned connection; unreachable nodes can be retried after the VPN is repaired:
 
 ```text
-Join failed: token expired or already used. Run `remuda cluster` on the first node to create a new join command.
+Join failed: token expired or already used. Run `remuda cluster init` on the first node to create a new join line.
 Join failed: fingerprint mismatch for 100.80.0.12:7443. Expected SHA256:QmFz...; received SHA256:YW5vdGhlci1rZXk. Join aborted; verify the command with the cluster operator.
 Join failed: 100.80.0.12:7443 is unreachable. Check that both machines are on the VPN, then retry the join command.
 ```
@@ -59,7 +58,7 @@ On the host node, start the session normally:
 remuda run -n dev claude
 ```
 
-From an already joined node, run `remuda remote` to open the same Remuda TUI with the cluster tree on the left and selected-session screen on the right. `remuda remote studio/dev` is a proposed shortcut that opens that same UI with the target selected. The daemon keeps the session alive when the initiating terminal goes away.
+From an already joined node, run `remuda cluster remote` to open the same Remuda TUI with the cluster tree on the left and selected-session screen on the right. `remuda cluster remote studio/dev` opens that same UI with the target selected. The daemon keeps the session alive when the initiating terminal goes away.
 
 At first open, expand the local/current node and collapse other nodes. Use ↑/↓ to move through the tree, ←/→ to collapse or expand node groups, and Enter to select a session and focus its line composer. The current target is always named `node / session` in the right pane. A terminal snapshot is shown there with its capture age; the line composer remains in the familiar Remuda footer area.
 
@@ -68,7 +67,7 @@ At first open, expand the local/current node and collapse other nodes. Use ↑/�
 From Termux or a laptop joined to the cluster:
 
 ```sh
-remuda remote
+remuda cluster remote
 ```
 
 Use the same tree and keyboard model on each platform. Node groups collapse, the current node starts expanded, and other nodes start collapsed. Press `/` to search node/session names; `!` optionally limits the list to sessions needing attention (stale, ended, or with pending input). The selected node and session stay visible while navigating. Selecting `phone / dev` shows its captured screen and an input line; this is not a separate remote app or share-link flow.
@@ -187,7 +186,7 @@ Sync returns the selected session’s latest snapshot plus an output version; a 
 ### Security and implementation constraints
 
 - The allowlisted request front comes first, initially on a local socket. It exposes only the operations required by this UX; never forward the general daemon protocol or arbitrary Lua remotely. The network listener is a later layer over that restricted front.
-- If the listener needs TCP, allow exactly one scoped clippy TCP-ban exception in its module (`#[allow]` at that module), with a `clippy.toml` and documentation note that names #191. Bind only to the configured VPN address; never default to `0.0.0.0`. Start the listener only after `remuda cluster` initialization.
+- If the listener needs TCP, allow exactly one scoped clippy TCP-ban exception in its module (`#[allow]` at that module), with a `clippy.toml` and documentation note that names #191. Bind only to the configured VPN address; never default to `0.0.0.0`. Start the listener only after `remuda cluster init`.
 - Join commands pin the first node’s key fingerprint and carry a one-time, expiring token that authorizes the joining node. Subsequent requests authenticate with registered node keys. Revoking a node key immediately rejects its later requests.
 
 ## Prior art
