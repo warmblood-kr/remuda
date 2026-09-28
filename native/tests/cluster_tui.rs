@@ -4,7 +4,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use remuda_core::protocol::{Request, Response};
 use remuda_core::Size;
 use remuda_native::cluster_tui::composer::{ComposerAction, LineComposer};
-use remuda_native::cluster_tui::queue::{InputQueue, QueueEvent, QueueState};
+use remuda_native::cluster_tui::queue::{InputQueue, QueueEvent, QueueState, MAX_IO_RETRIES};
 use remuda_native::cluster_tui::sender::InputSender;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -181,4 +181,105 @@ fn local_daemon_composer_input_appears_once_in_capture() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(screen.matches("line:once only").count(), 1);
+}
+
+#[test]
+fn lost_sequence_rotates_client_before_the_next_line() {
+    let mut daemon = PrivateDaemon::start();
+    daemon.wait_ready();
+    let response = remuda_native::client::request(
+        &daemon.path(),
+        &Request::New {
+            name: Some("recovery-session".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                r#"stty -echo; IFS= read -r line; printf 'line:%s\n' "$line"; sleep 30"#.into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, Response::Value(name) if name == "recovery-session"));
+    let instance_id = match remuda_native::client::request(&daemon.path(), &Request::List).unwrap()
+    {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "recovery-session")
+            .and_then(|session| session.instance_id)
+            .expect("List must expose the running session instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+
+    let now = Instant::now();
+    let mut sender = InputSender::with_client_id([0x31; 16]);
+    let mut queue = InputQueue::default();
+    sender
+        .enqueue(
+            &mut queue,
+            "recovery-session",
+            &instance_id,
+            b"lost\r".to_vec(),
+            now,
+        )
+        .unwrap();
+    let first_client = queue.items().next().unwrap().client_id.clone();
+    sender
+        .enqueue(
+            &mut queue,
+            "recovery-session",
+            &instance_id,
+            b"after loss\r".to_vec(),
+            now,
+        )
+        .unwrap();
+    for attempt in 0..=MAX_IO_RETRIES {
+        let at = now + Duration::from_secs(u64::from(attempt) + 1);
+        let result = sender.attempt_due(&mut queue, at, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "simulated lost sequence",
+            ))
+        });
+        if attempt == MAX_IO_RETRIES {
+            assert!(matches!(result, Some(QueueEvent::Uncertain { seq: 1, .. })));
+        } else {
+            assert!(matches!(
+                result,
+                Some(QueueEvent::RetryScheduled { seq: 1, .. })
+            ));
+        }
+    }
+
+    let next = queue.items().next_back().unwrap();
+    assert_eq!(next.seq, 1);
+    assert_ne!(next.client_id, first_client);
+    let result = sender.attempt_due(&mut queue, now + Duration::from_secs(11), |request| {
+        remuda_native::client::request(&daemon.path(), request)
+    });
+    assert!(matches!(result, Some(QueueEvent::Sent { seq: 1, .. })));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let screen = loop {
+        let screen = match remuda_native::client::request(
+            &daemon.path(),
+            &Request::Capture {
+                name: "recovery-session".into(),
+            },
+        )
+        .unwrap()
+        {
+            Response::Screen(screen) => screen,
+            other => panic!("unexpected Capture response: {other:?}"),
+        };
+        if screen.contains("line:after loss") {
+            break screen;
+        }
+        assert!(Instant::now() < deadline, "recovered input never appeared");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(screen.matches("line:after loss").count(), 1);
+    assert!(!screen.contains("line:lost"));
 }

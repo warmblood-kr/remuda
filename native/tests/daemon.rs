@@ -1954,6 +1954,35 @@ fn confirmed_close_refuses_a_mismatched_instance_and_keeps_the_session() {
 }
 
 #[test]
+fn confirmed_close_ends_the_matching_instance() {
+    let path = scratch("close-confirmed-instance");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    let instance_id = match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "target")
+            .and_then(|session| session.instance_id)
+            .expect("session instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+    let response = client::request(
+        &path,
+        &Request::Close {
+            name: "target".into(),
+            instance_id: Some(instance_id),
+            confirm: Some(true),
+        },
+    )
+    .expect("confirmed close");
+    assert_eq!(response, Response::Ok);
+    assert!(matches!(
+        client::request(&path, &Request::List),
+        Ok(Response::Sessions(sessions)) if sessions.iter().all(|session| session.name != "target")
+    ));
+}
+
+#[test]
 fn a_session_exited_hook_still_fires_once_when_ls_reaps_before_the_tick() {
     // `Registry::reap()` removes what it finds and hands it only to whoever
     // calls first. A `List` that reaps well inside TICK_PERIOD must not make

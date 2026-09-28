@@ -71,7 +71,6 @@ pub struct ClusterUi {
     input_sender: InputSender,
     input_queue: InputQueue,
     notice: Option<(String, Duration)>,
-    input_hint: Option<(String, Duration)>,
     pending_close: Option<(String, String)>,
     confirmation: Confirmation,
     ended: Option<EndedState>,
@@ -110,7 +109,6 @@ impl ClusterUi {
             input_sender,
             input_queue: InputQueue::default(),
             notice: None,
-            input_hint: None,
             pending_close: None,
             confirmation: Confirmation::default(),
             ended: None,
@@ -321,25 +319,14 @@ impl ClusterUi {
         frame.push(divider);
         frame.push(pane_header);
         let queue_rows: Vec<&PendingBatch> = self.input_queue.items().rev().take(3).collect();
-        let hint = self
-            .input_hint
-            .as_ref()
-            .filter(|(_, at)| now.saturating_sub(*at) < Duration::from_secs(3));
         let notice = self
             .notice
             .as_ref()
             .filter(|(_, at)| now.saturating_sub(*at) < Duration::from_secs(5));
         let footer_rows = if self.composer_focused { 2 } else { 1 };
-        let reserved = frame.len()
-            + queue_rows.len()
-            + usize::from(hint.is_some())
-            + usize::from(notice.is_some())
-            + footer_rows;
+        let reserved = frame.len() + queue_rows.len() + usize::from(notice.is_some()) + footer_rows;
         let screen_rows = height.saturating_sub(reserved);
         frame.extend(screen.lines().take(screen_rows).map(str::to_string));
-        if let Some((hint, _)) = hint {
-            frame.push(hint.clone());
-        }
         if let Some((notice, _)) = notice {
             frame.push(notice.clone());
         }
@@ -539,12 +526,10 @@ impl ClusterUi {
         let event =
             self.input_sender
                 .send_started(&mut self.input_queue, Instant::now(), |request| {
-                    crate::client::request(path, request)
+                    crate::client::request_with_timeout(path, request, sender::INPUT_SEND_TIMEOUT)
                 });
         match event {
-            Some(QueueEvent::Sent { .. }) => {
-                self.input_hint = Some((format!("input from {}", self.node), now));
-            }
+            Some(QueueEvent::Sent { .. }) => {}
             Some(QueueEvent::Uncertain { reason, .. })
             | Some(QueueEvent::Dropped { reason, .. })
             | Some(QueueEvent::Failed { reason, .. }) => {
@@ -604,10 +589,7 @@ impl ClusterUi {
             .items()
             .filter(|batch| {
                 batch.name == session.name
-                    && matches!(
-                        batch.state,
-                        QueueState::Waiting | QueueState::Sending | QueueState::Uncertain
-                    )
+                    && matches!(batch.state, QueueState::Waiting | QueueState::Sending)
             })
             .count()
     }
@@ -820,7 +802,7 @@ mod tests {
     use remuda_core::clock::{Clock, ManualClock};
     use remuda_core::protocol::Response;
     use remuda_core::{SessionSummary, Size};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn sessions() -> Vec<SessionSummary> {
         vec![SessionSummary {
@@ -983,6 +965,32 @@ mod tests {
         assert!(frame.contains("ended"));
         assert!(!frame.contains("    dev"));
         assert!(frame.contains("attention: on"));
+    }
+
+    #[test]
+    fn uncertain_input_is_visible_but_does_not_count_as_pending_attention() {
+        let clock = ManualClock::new();
+        let now = Instant::now();
+        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], clock.now());
+        ui.input_sender
+            .enqueue(
+                &mut ui.input_queue,
+                "dev",
+                "instance-dev",
+                b"line\r".to_vec(),
+                now,
+            )
+            .unwrap();
+        ui.input_sender.attempt_due(&mut ui.input_queue, now, |_| {
+            Ok(remuda_core::protocol::Response::Uncertain)
+        });
+        let frame = ui.render(80, 24, "", &clock);
+        assert!(frame.contains("Input delivery uncertain"));
+        assert!(!frame.contains("pending input 1"));
+        ui.key(crossterm::event::KeyCode::Char('!'));
+        assert!(ui
+            .render(80, 24, "", &clock)
+            .contains("no sessions need attention"));
     }
 
     #[test]

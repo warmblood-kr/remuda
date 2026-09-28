@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Detach key: Ctrl-\ (0x1C). Chosen because almost nothing binds it, unlike
 /// Ctrl-C/D/Z, which the attached program needs. Consumed, never forwarded.
 pub const DETACH: u8 = 0x1C;
+pub const EMPTY_REPLY_ERROR: &str = "the daemon hung up without answering";
 
 const RESET_INPUT_MODES: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
@@ -70,6 +71,43 @@ pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
     read_response(&stream)
 }
 
+/// Send one request with a bounded wait for its local daemon reply. Waking the
+/// cloned stream interrupts the worker's pending read on Unix and Windows.
+pub fn request_with_timeout(
+    path: &Path,
+    request: &Request,
+    timeout: std::time::Duration,
+) -> std::io::Result<Response> {
+    let stream = ipc::connect(path)?;
+    let wake_stream = stream.try_clone()?;
+    let request = request.clone();
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let result = send(&stream, &request).and_then(|()| read_response(&stream));
+        let _ = reply_tx.send(result);
+    });
+    match reply_rx.recv_timeout(timeout) {
+        Ok(result) => {
+            worker
+                .join()
+                .map_err(|_| std::io::Error::other("daemon request worker panicked"))?;
+            result
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            ipc::wake(&wake_stream);
+            let _ = worker.join();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "daemon request timed out",
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = worker.join();
+            Err(std::io::Error::other("daemon request worker stopped"))
+        }
+    }
+}
+
 fn send(mut stream: &Stream, request: &Request) -> std::io::Result<()> {
     let mut line = serde_json::to_string(request)?;
     line.push('\n');
@@ -93,7 +131,7 @@ const CANNOT_READ: &str = "bad request: ";
 /// a malformed request that is NOT skew must still say what it was.
 fn interpret(line: &str) -> Response {
     if line.trim().is_empty() {
-        return Response::error("the daemon hung up without answering");
+        return Response::error(EMPTY_REPLY_ERROR);
     }
     match serde_json::from_str::<Response>(line) {
         // We serialized that request from this binary's own `Request`, so a
