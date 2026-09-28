@@ -25,6 +25,7 @@ remuda._extension_commands = {}
 -- it registers imperatively is tagged with its name, so reload and rollback
 -- can replace it like the declared registrations.
 local current_owner = nil
+local module_tool_owners = {}
 local function with_owner(owner, fn, ...)
   local outer = current_owner
   current_owner = owner
@@ -137,7 +138,13 @@ end
 
 function remuda.tool(spec)
   local word = make_tool(spec)
+  local owner = current_owner
+  if owner then
+    local run = word.run
+    word.run = function(arguments, caller) return with_owner(owner, run, arguments, caller) end
+  end
   remuda.tools[word.name] = word
+  module_tool_owners[word.name] = owner
   register(word.name, word.about, word.name .. "(" .. arg_list(word.args, word.needs) .. ") -> string")
   return word
 end
@@ -180,12 +187,14 @@ function remuda.schedule(spec)
   if type(spec.run) ~= "function" then
     error("a schedule needs a `run` function", 2)
   end
+  local owner = current_owner
   local handle = setmetatable({ name = spec.name }, Schedule)
   remuda.schedules[handle] = {
     name = spec.name,
     every = spec.every,
-    run = spec.run,
+    run = owner and function(...) return with_owner(owner, spec.run, ...) end or spec.run,
     last_run = 0,
+    owner = owner,
   }
   return handle
 end
@@ -817,6 +826,53 @@ register("contributions", "A point's entries as {id, owner, entry} rows, entry a
 -- declare registrations as data. Reload stages the declaration and migrations
 -- before replacing the mod's hook group and tools.
 local modules = {}
+local field_owners = {}
+
+-- Rollback restores the old activation's declared registrations from the
+-- snapshot. Its start() must rebuild only the imperative registrations it
+-- created, so discard those owner-tagged effects before running it again.
+local function clear_imperative_module_registrations(name, activation)
+  local declared_schedules, declared_tools, declared_advice, declared_contributions = {}, {}, {}, {}
+  for _, handle in ipairs(activation.schedules or {}) do declared_schedules[handle] = true end
+  for _, tool_name in ipairs(activation.tools or {}) do declared_tools[tool_name] = true end
+  for _, advice in ipairs(activation.advice or {}) do declared_advice[advice] = true end
+  for _, contribution in ipairs(activation.contributions or {}) do declared_contributions[contribution] = true end
+
+  for event, registered in pairs(remuda.hooks) do
+    local kept = {}
+    for _, hook in ipairs(registered) do
+      if hook.owner ~= name then kept[#kept + 1] = hook end
+    end
+    remuda.hooks[event] = kept
+  end
+  for handle, schedule in pairs(remuda.schedules) do
+    if schedule.owner == name and not declared_schedules[handle] then remuda.cancel(handle) end
+  end
+  for tool_name, owner in pairs(module_tool_owners) do
+    if owner == name and not declared_tools[tool_name] then
+      remuda.tools[tool_name], remuda._registry[tool_name], module_tool_owners[tool_name] = nil, nil, nil
+    end
+  end
+  for path, entry in pairs(advised) do
+    for index = #entry.list, 1, -1 do
+      local advice = entry.list[index]
+      if advice.owner == name and not declared_advice[advice] then
+        remuda.unadvise(path, advice.id)
+      end
+    end
+  end
+  for _, items in pairs(contributions) do
+    for id, item in pairs(items) do
+      if item.owner == name and not declared_contributions[item] then items[id] = nil end
+    end
+  end
+  for command, owner in pairs(extension_command_owners) do
+    if owner == name then remuda._extension_commands[command], extension_command_owners[command] = nil, nil end
+  end
+  for key, owner in pairs(field_owners) do
+    if owner == name then remuda[key], field_owners[key] = nil, nil end
+  end
+end
 
 local function stop_module_activation(name, module)
   if not module or not module.stop or module.stopped then return end
@@ -833,7 +889,6 @@ end
 -- refused. A field left by a legacy exec, unowned, is adopted only in the
 -- mod's own namespace.
 local core_fields = {}
-local field_owners = {}
 local function set_module_field(name, key, value)
   if type(key) ~= "string" then error("mod " .. name .. " may only set string-named remuda fields", 2) end
   if core_fields[key] then
@@ -854,7 +909,6 @@ local function set_module_field(name, key, value)
   remuda[key] = value
 end
 remuda._module_set_field = set_module_field
-local module_tool_owners = {}
 
 local function clone_module_state(value, seen)
   local kind = type(value)
@@ -984,6 +1038,7 @@ function remuda._activate_module(name, candidate, reactivate)
   if type(contributes) ~= "table" then
     error("module contributes must be a table keyed by point", 0)
   end
+  local declared_contributions = {}
   for point, entries in pairs(contributes) do
     local seen = {}
     for index = 1, array_length(entries, "module contributes for " .. tostring(point)) do
@@ -1057,6 +1112,11 @@ function remuda._activate_module(name, candidate, reactivate)
   end
   for _, tool_name in ipairs(previous and previous.tools or {}) do
     saved_tools[tool_name] = { remuda.tools[tool_name], remuda._registry[tool_name], module_tool_owners[tool_name] }
+  end
+  for tool_name, owner in pairs(module_tool_owners) do
+    if owner == name then
+      saved_tools[tool_name] = { remuda.tools[tool_name], remuda._registry[tool_name], owner }
+    end
   end
   for _, handle in ipairs(previous and previous.schedules or {}) do
     saved_schedules[handle] = remuda.schedules[handle]
@@ -1137,13 +1197,15 @@ function remuda._activate_module(name, candidate, reactivate)
       for key, field in pairs(entry) do
         bound[key] = type(field) == "function" and function(...) return field(state, ...) end or field
       end
-      contributions[point][entry.id] = { owner = name, entry = bound }
+      local contribution = { owner = name, entry = bound }
+      contributions[point][entry.id] = contribution
+      declared_contributions[#declared_contributions + 1] = contribution
     end
   end
   local schedule_handles = {}
   for index = 1, schedule_count do
     local declared = schedules[index]
-    schedule_handles[index] = remuda.schedule({
+    schedule_handles[index] = with_owner(name, remuda.schedule, {
       name = declared.name,
       every = declared.every,
       run = function() return with_owner(name, declared.run, state) end,
@@ -1160,10 +1222,22 @@ function remuda._activate_module(name, candidate, reactivate)
     state = state,
     tools = tool_names,
     schedules = schedule_handles,
+    advice = {},
+    contributions = declared_contributions,
     stop = stop,
     start = start,
     stopped = false,
   }
+  for index = 1, advice_count do
+    local declared = declared_advice[index]
+    local entry = advised[declared.path]
+    for _, advice in ipairs(entry and entry.list or {}) do
+      if advice.owner == name and advice.id == declared.id then
+        activation.advice[#activation.advice + 1] = advice
+        break
+      end
+    end
+  end
   modules[name] = activation
 
   local function rollback()
@@ -1220,6 +1294,7 @@ function remuda._activate_module(name, candidate, reactivate)
     end
     modules[name] = previous
     if previous and previous.stopped and previous.start then
+      clear_imperative_module_registrations(name, previous)
       local was_active = remuda._lifecycle_start_active
       remuda._lifecycle_start_active = true
       local ok, err = pcall(previous.start, previous.state)

@@ -468,6 +468,68 @@ fn failed_previous_restart_leaves_module_inactive_without_a_second_stop() {
 }
 
 #[test]
+fn failed_reload_does_not_duplicate_imperative_start_hooks_or_schedules() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let entry = home.entry();
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function()
+            remuda.schedule({ every = 1, run = function() remuda.emit("scheduled") end })
+            remuda.on("ping", function() remuda.emit("handled") end)
+          end,
+          stop = function() end }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-imperative-rollback.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(
+        &image,
+        "schedule_count = 0; ping_count = 0; \
+         remuda.on('scheduled', function() schedule_count = schedule_count + 1 end); \
+         remuda.on('handled', function() ping_count = ping_count + 1 end)",
+    );
+    read_value(
+        &image,
+        "remuda.exec('sample'); remuda._run_due_schedules(100)",
+    );
+    assert_eq!(read_value(&image, "return schedule_count"), "1");
+
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function() error("replacement failed") end }"#,
+    );
+    for (index, now) in [101, 102].into_iter().enumerate() {
+        assert!(image.eval("remuda.reload('sample')", None).is_err());
+        read_value(&image, &format!("remuda._run_due_schedules({now})"));
+        read_value(&image, "remuda.emit('ping')");
+        assert_eq!(
+            read_value(&image, "return schedule_count"),
+            (index + 2).to_string(),
+            "one old schedule should run on each tick after rollback"
+        );
+        assert_eq!(
+            read_value(&image, "return ping_count"),
+            (index + 1).to_string(),
+            "one old id-less hook should run per event after rollback"
+        );
+    }
+}
+
+#[test]
 fn mod_command_handler_receives_caller_env() {
     // #95: the handler runs in the daemon, so `os.getenv` is the daemon's; the
     // caller's `REMUDA_*` variables arrive as the second handler argument.
