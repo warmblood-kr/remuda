@@ -1362,6 +1362,11 @@ fn describe(response: std::io::Result<Response>) -> String {
 }
 
 fn fail(message: impl std::fmt::Display) -> ExitCode {
+    let message = message.to_string();
+    if let Some((code, text)) = remuda_native::image::typed_failure_message(&message) {
+        eprintln!("{text}");
+        return ExitCode::from(code);
+    }
     eprintln!("remuda: {message}");
     ExitCode::FAILURE
 }

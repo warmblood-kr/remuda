@@ -73,6 +73,8 @@
 <p><code>exec(name) -&gt; nil</code> — Run an installed mod's entry source, by name, in this same image.</p>
 <h2 id="extension_command">extension_command</h2>
 <p><code>extension_command(name, handler(args, caller)) -&gt; nil</code> — Register a handler for an installed mod command.</p>
+<h2 id="fail">fail</h2>
+<p><code>fail(message, code?) -&gt; never (default code 1; valid codes are 1..255)</code> — Raise a deliberate CLI failure with a message and exit code.</p>
 <h2 id="feed">feed</h2>
 <p><code>feed(name, steps) -&gt; nil</code> — Deliver a sequence of bursts and pauses as one indivisible act.</p>
 <h2 id="hook_list">hook_list</h2>
