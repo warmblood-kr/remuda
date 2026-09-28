@@ -87,6 +87,13 @@ struct TextSelection {
     end: TextPoint,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WordClass {
+    Blank,
+    Keyword,
+    Punctuation,
+}
+
 pub struct Ui {
     pub sessions: Vec<SessionSummary>,
     pub selected: usize,
@@ -108,6 +115,8 @@ pub struct Ui {
     /// (`text_selection`) exists only once `v`/Space anchors it there.
     visual: bool,
     visual_cursor: TextPoint,
+    visual_g_pending: bool,
+    visual_screen: Vec<Vec<StyledCell>>,
     preview_cursor: Cursor,
     /// What `n` prefills the prompt with. Held rather than read at the prompt,
     /// so the pure state machine still needs no environment.
@@ -144,6 +153,8 @@ impl Ui {
             focus: Focus::List,
             visual: false,
             visual_cursor: TextPoint { row: 0, col: 0 },
+            visual_g_pending: false,
+            visual_screen: Vec::new(),
             preview_cursor: Cursor {
                 row: 0,
                 col: 0,
@@ -415,6 +426,13 @@ impl Ui {
 
     fn browse_key(&mut self, key: KeyEvent) -> Action {
         if self.visual {
+            if self.visual_g_pending {
+                self.visual_g_pending = false;
+                if key.code == KeyCode::Char('g') {
+                    self.move_visual_to(TextPoint { row: 0, col: 0 });
+                    return Action::Nothing;
+                }
+            }
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.leave_visual(),
                 // Yank and leave in one key; with no anchor there is nothing
@@ -434,6 +452,17 @@ impl Ui {
                 KeyCode::Char('j') | KeyCode::Down => self.move_visual(0, 1),
                 KeyCode::Char('k') | KeyCode::Up => self.move_visual(0, -1),
                 KeyCode::Char('l') | KeyCode::Right => self.move_visual(1, 0),
+                KeyCode::Char('0') => self.move_visual_to(TextPoint {
+                    row: self.visual_cursor.row,
+                    col: 0,
+                }),
+                KeyCode::Char('$') => self.visual_line_end(),
+                KeyCode::Char('^') => self.visual_first_nonblank(),
+                KeyCode::Char('w') => self.visual_word_forward(),
+                KeyCode::Char('b') => self.visual_word_backward(),
+                KeyCode::Char('e') => self.visual_word_end(),
+                KeyCode::Char('g') => self.visual_g_pending = true,
+                KeyCode::Char('G') => self.visual_bottom(),
                 _ => {}
             }
             return Action::Nothing;
@@ -536,9 +565,195 @@ impl Ui {
         cursor.row = cursor.row.saturating_add_signed(dr as isize).min(max_row);
         cursor.col = cursor.col.saturating_add_signed(dc as isize).min(max_col);
         let cursor = self.visual_cursor;
+        self.extend_visual(cursor);
+    }
+
+    fn move_visual_to(&mut self, point: TextPoint) {
+        let Some(size) = self.selected().map(|s| s.size) else {
+            return;
+        };
+        self.visual_cursor.row = point.row.min((size.rows() as usize).saturating_sub(1));
+        self.visual_cursor.col = point.col.min((size.cols() as usize).saturating_sub(1));
+        self.extend_visual(self.visual_cursor);
+    }
+
+    fn extend_visual(&mut self, cursor: TextPoint) {
         if let Some(selection) = &mut self.text_selection {
             selection.end = cursor;
         }
+    }
+
+    fn visual_row(&self) -> &[StyledCell] {
+        self.visual_screen
+            .get(self.visual_cursor.row)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    fn visual_line_end(&mut self) {
+        let row = self.visual_row();
+        let col = row
+            .iter()
+            .scan(0usize, |col, cell| {
+                let start = *col;
+                *col += usize::from(cell.width());
+                Some((start, cell))
+            })
+            .filter(|(_, cell)| cell.width() > 0 && !cell.text.chars().all(char::is_whitespace))
+            .map(|(col, _)| col)
+            .last()
+            .unwrap_or(0);
+        self.move_visual_to(TextPoint {
+            row: self.visual_cursor.row,
+            col,
+        });
+    }
+
+    fn visual_first_nonblank(&mut self) {
+        let row = self.visual_row();
+        let col = row
+            .iter()
+            .scan(0usize, |col, cell| {
+                let start = *col;
+                *col += usize::from(cell.width());
+                Some((start, cell))
+            })
+            .find(|(_, cell)| cell.width() > 0 && !cell.text.chars().all(char::is_whitespace))
+            .map_or(0, |(col, _)| col);
+        self.move_visual_to(TextPoint {
+            row: self.visual_cursor.row,
+            col,
+        });
+    }
+
+    fn visual_words(&self) -> Vec<(usize, WordClass)> {
+        let mut words = Vec::new();
+        let mut col = 0usize;
+        for cell in self.visual_row() {
+            let width = usize::from(cell.width());
+            if width == 0 {
+                continue;
+            }
+            let class = cell.text.chars().next().map_or(WordClass::Blank, |ch| {
+                if ch.is_whitespace() {
+                    WordClass::Blank
+                } else if ch.is_alphanumeric() || ch == '_' {
+                    WordClass::Keyword
+                } else {
+                    WordClass::Punctuation
+                }
+            });
+            words.push((col, class));
+            col += width;
+        }
+        words
+    }
+
+    fn visual_word_forward(&mut self) {
+        let words = self.visual_words();
+        let here = self.visual_cursor.col;
+        let class_at = |col: usize| {
+            words
+                .iter()
+                .rev()
+                .find(|(at, _)| *at <= col)
+                .map(|(_, class)| *class)
+                .unwrap_or(WordClass::Blank)
+        };
+        let current = class_at(here);
+        let mut col = here;
+        while class_at(col) == current && current != WordClass::Blank {
+            col += 1;
+        }
+        while class_at(col) == WordClass::Blank && col < words.last().map_or(0, |(at, _)| *at) {
+            col += 1;
+        }
+        if let Some((at, _)) = words
+            .iter()
+            .find(|(at, class)| *at >= col && *class != WordClass::Blank)
+        {
+            self.move_visual_to(TextPoint {
+                row: self.visual_cursor.row,
+                col: *at,
+            });
+        }
+    }
+
+    fn visual_word_backward(&mut self) {
+        let words = self.visual_words();
+        let here = self.visual_cursor.col;
+        let class_at = |col: usize| {
+            words
+                .iter()
+                .rev()
+                .find(|(at, _)| *at <= col)
+                .map(|(_, class)| *class)
+                .unwrap_or(WordClass::Blank)
+        };
+        let mut col = here.saturating_sub(1);
+        while col > 0 && class_at(col) == WordClass::Blank {
+            col -= 1;
+        }
+        let class = class_at(col);
+        while col > 0 && class_at(col - 1) == class {
+            col -= 1;
+        }
+        let target = words
+            .iter()
+            .rev()
+            .find(|(at, cls)| *at <= col && *cls != WordClass::Blank)
+            .map_or(0, |(at, _)| *at);
+        self.move_visual_to(TextPoint {
+            row: self.visual_cursor.row,
+            col: target,
+        });
+    }
+
+    fn visual_word_end(&mut self) {
+        let words = self.visual_words();
+        let here = self.visual_cursor.col;
+        let current = words.iter().rposition(|(at, _)| *at <= here);
+        let target = current
+            .filter(|index| words[*index].1 != WordClass::Blank)
+            .and_then(|index| {
+                let class = words[index].1;
+                let end = (index..words.len())
+                    .take_while(|i| words[*i].1 == class)
+                    .last()?;
+                if words[end].0 <= here {
+                    words
+                        .iter()
+                        .enumerate()
+                        .skip(end + 1)
+                        .find(|(_, (_, class))| *class != WordClass::Blank)
+                        .map(|(i, _)| i)
+                } else {
+                    Some(end)
+                }
+            })
+            .or_else(|| {
+                words
+                    .iter()
+                    .position(|(at, class)| *at >= here && *class != WordClass::Blank)
+            });
+        if let Some(index) = target {
+            let class = words[index].1;
+            let end = (index..words.len())
+                .take_while(|i| words[*i].1 == class)
+                .last()
+                .unwrap_or(index);
+            self.move_visual_to(TextPoint {
+                row: self.visual_cursor.row,
+                col: words[end].0,
+            });
+        }
+    }
+
+    fn visual_bottom(&mut self) {
+        let row = self.visual_screen.len().saturating_sub(1);
+        self.move_visual_to(TextPoint {
+            row,
+            col: self.visual_cursor.col,
+        });
     }
 
     /// Refuse before focus moves, not after: an occupied or dead session cannot
@@ -844,7 +1059,7 @@ mod visual_mode_tests {
     //! Visual mode on the tmux copy-mode-vi model: `v` gives a movable
     //! cursor and no selection; `v`/Space anchors; motions extend; `y` yanks
     //! and leaves; Esc/`q` cancel; `v` while anchored clears the anchor.
-    use super::{selected_screen_text, Action, Ui};
+    use super::{selected_screen_text, Action, TextPoint, Ui};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use remuda_core::agent::{Cursor, StyledCell};
     use remuda_core::{SessionSummary, Size};
@@ -857,7 +1072,7 @@ mod visual_mode_tests {
                 alive: true,
                 idle: Duration::ZERO,
                 output_idle: Some(Duration::ZERO),
-                size: Size::new(80, 24),
+                size: Size::new(120, 24),
                 attached: false,
                 human_idle: None,
                 mouse_tracking: false,
@@ -899,6 +1114,87 @@ mod visual_mode_tests {
             .collect();
         let selection = ui.text_selection.as_ref().expect("an anchored selection");
         selected_screen_text(&cells, &[false], selection)
+    }
+
+    fn screen_row(ui: &mut Ui, text: &str) {
+        let mut row = Vec::new();
+        for ch in text.chars() {
+            let wide = ch.len_utf8() > 1 && (ch.is_alphanumeric() || !ch.is_ascii());
+            row.push(StyledCell {
+                text: ch.to_string(),
+                wide,
+                ..StyledCell::default()
+            });
+            if wide {
+                row.push(StyledCell::default());
+            }
+        }
+        ui.visual_screen = vec![row; 24];
+    }
+
+    fn at(ui: &Ui) -> TextPoint {
+        ui.visual_cursor
+    }
+
+    #[test]
+    fn zero_moves_to_line_start() {
+        let mut ui = ui();
+        screen_row(&mut ui, "0123456789");
+        press(&mut ui, "v");
+        press(&mut ui, "0");
+        assert_eq!(at(&ui), TextPoint { row: 0, col: 0 });
+    }
+
+    #[test]
+    fn dollar_moves_to_true_end_past_pane_and_wide_cells() {
+        let mut ui = ui();
+        screen_row(&mut ui, &format!("ab한{}", "x".repeat(90)));
+        press(&mut ui, "v$");
+        assert_eq!(at(&ui), TextPoint { row: 0, col: 93 });
+    }
+
+    #[test]
+    fn caret_moves_to_first_nonblank_without_landing_inside_wide_cell() {
+        let mut ui = ui();
+        screen_row(&mut ui, "  한x");
+        press(&mut ui, "v^");
+        assert_eq!(at(&ui), TextPoint { row: 0, col: 2 });
+    }
+
+    #[test]
+    fn w_moves_to_next_word_start() {
+        let mut ui = ui();
+        screen_row(&mut ui, "one two! 한글 ok");
+        press(&mut ui, "vw");
+        assert_eq!(at(&ui), TextPoint { row: 0, col: 4 });
+    }
+
+    #[test]
+    fn b_moves_to_previous_word_start() {
+        let mut ui = ui();
+        screen_row(&mut ui, "one two three");
+        press(&mut ui, "v");
+        ui.visual_cursor.col = 8;
+        press(&mut ui, "b");
+        assert_eq!(at(&ui), TextPoint { row: 0, col: 4 });
+    }
+
+    #[test]
+    fn e_moves_to_word_end_without_splitting_wide_character() {
+        let mut ui = ui();
+        screen_row(&mut ui, "한글 ok");
+        press(&mut ui, "ve");
+        assert_eq!(at(&ui), TextPoint { row: 0, col: 2 });
+    }
+
+    #[test]
+    fn gg_and_capital_g_move_to_top_and_bottom_rows() {
+        let mut ui = ui();
+        screen_row(&mut ui, "line");
+        press(&mut ui, "vG");
+        assert_eq!(at(&ui).row, 23);
+        press(&mut ui, "gg");
+        assert_eq!(at(&ui).row, 0);
     }
 
     #[test]
@@ -946,6 +1242,15 @@ mod visual_mode_tests {
         press(&mut ui, "vvlv");
         assert!(ui.visual);
         assert!(ui.text_selection.is_none());
+    }
+
+    #[test]
+    fn vim_motions_extend_an_anchored_selection() {
+        let mut ui = ui();
+        screen_row(&mut ui, "one two");
+        press(&mut ui, "vv$");
+        assert_eq!(ui.text_selection.as_ref().unwrap().end, at(&ui));
+        assert_eq!(at(&ui).col, 6);
     }
 
     #[test]
@@ -1567,9 +1872,9 @@ fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
         ),
         Mode::Browse if ui.visual => {
             if ui.anchored() {
-                "visual: selecting — hjkl extend   y yank   v clear   esc/q cancel".into()
+                "visual: selecting — hjkl 0$^ wbe ggG   y yank   v clear   esc/q cancel".into()
             } else {
-                "visual: move — hjkl move   v/space anchor   y/esc/q leave".into()
+                "visual: move — hjkl 0$^ wbe ggG   v/space anchor   y/esc/q leave".into()
             }
         }
         Mode::Browse => match &ui.notice {
@@ -1700,6 +2005,9 @@ fn refresh(
         None => (Vec::new(), Vec::new(), hidden),
     };
     ui.preview_cursor = cursor;
+    if ui.visual {
+        ui.visual_screen = cells.clone();
+    }
     let frame = render_styled(ui, &cells, cursor, server, cols, rows);
     // The write is gated on change, as it always was — but before
     // `should_refresh` existed, everything ABOVE this line (a relist, an IPC
