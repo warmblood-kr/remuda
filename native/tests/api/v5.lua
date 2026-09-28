@@ -40,4 +40,15 @@ end
 assert(legacy_found, "deprecated flat session aliases must remain compatible in v5")
 remuda.close(legacy_name)
 
+local json = remuda.json
+assert(type(json) == "table", "remuda.json is missing from the v5 surface")
+local decoded, decode_error = json.decode('{"values":[true,null]}')
+assert(decoded and decode_error == nil, tostring(decode_error))
+assert(json.encode(decoded) == '{"values":[true,null]}', "json encode/decode must round-trip")
+local duplicate, duplicate_error = json.decode('{"key":1,"key":2}')
+assert(duplicate == nil and duplicate_error == "duplicate key", "duplicate JSON keys must be rejected")
+local too_deep = string.rep("[", 65) .. "0" .. string.rep("]", 65)
+local limited, limit_error = json.decode(too_deep)
+assert(limited == nil and type(limit_error) == "string", "JSON depth limit must be enforced")
+
 print("v5 ok")

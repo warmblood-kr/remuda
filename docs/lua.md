@@ -86,13 +86,14 @@ rejected. Tagging refuses a table that already has a non-JSON metatable.
 `remuda.json.encode(value, { pretty = true })` returns formatted JSON when
 requested; the default is compact JSON. It refuses nil, non-finite numbers,
 invalid UTF-8 strings or keys, cycles, functions, threads, userdata, and values
-that do not form a valid array or object. Decode and encode both cap nesting at
-64 containers and JSON text/output at 8 MiB. Decode also caps the document at
-100,000 JSON values to bound memory use. Object key order is not preserved;
-encoded keys are sorted. Decode rejects duplicate object keys with
+that do not form a valid array or object. Decode and encode cap nesting at 64
+containers, JSON text/output at 8 MiB, and each document at 100,000 JSON values
+to bound memory use. Object key order is not preserved; encoded keys are
+sorted. Decode rejects duplicate object keys with
 `nil, "duplicate key"` instead of choosing one value. Integer JSON numbers
 outside Lua's signed integer range are represented as finite Lua numbers when
-possible.
+possible. Very small non-integer values can underflow to `0.0`, and negative
+zero remains the floating-point value `-0.0`.
 
 A manifest can declare the mods it needs: `requires = { butler = ">=0.4, <0.5" }`.
 - **Constraints:** each is a comma-separated list of `>=`, `>`, `<=`, `<` and `=`, all of which must hold. `*` means any version. An installed version is compared on its numeric core, so `0.1.0-nightly.X` counts as `0.1.0`.

@@ -425,7 +425,12 @@ fn remuda_json_round_trips_values_and_rejects_bad_inputs() {
 
         local pretty = remuda.json.encode({ value = 1 }, { pretty = true })
         assert(pretty:find("\n", 1, true), pretty)
-        assert(not pcall(remuda.json.encode, string.rep("x", 8 * 1024 * 1024)), "large output is refused")
+        local output_ok, output_error = pcall(remuda.json.encode, string.rep(string.char(0), 1500000))
+        assert(not output_ok and tostring(output_error):find("encoded output exceeds", 1, true), tostring(output_error))
+        local many = remuda.json.array{}
+        for i = 1, 100000 do many[i] = remuda.json.null end
+        local values_ok, values_error = pcall(remuda.json.encode, many)
+        assert(not values_ok and tostring(values_error):find("maximum JSON value count exceeded", 1, true), tostring(values_error))
         "#,
     );
 }

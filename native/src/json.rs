@@ -202,22 +202,81 @@ enum TableKind {
     Object,
 }
 
-#[derive(Default)]
 struct EncodeState {
     active: HashSet<*const c_void>,
-    text_bytes: usize,
+    values: usize,
+    output_bytes: usize,
+    pretty: bool,
 }
 
 impl EncodeState {
-    fn account_text(&mut self, bytes: usize) -> mlua::Result<()> {
-        self.text_bytes = self
-            .text_bytes
+    fn new(pretty: bool) -> Self {
+        Self {
+            active: HashSet::new(),
+            values: 0,
+            output_bytes: 0,
+            pretty,
+        }
+    }
+
+    fn account_value(&mut self) -> mlua::Result<()> {
+        if self.values >= MAX_VALUES {
+            return Err(runtime_error("maximum JSON value count exceeded"));
+        }
+        self.values += 1;
+        Ok(())
+    }
+
+    fn account_output(&mut self, bytes: usize) -> mlua::Result<()> {
+        self.output_bytes = self
+            .output_bytes
             .checked_add(bytes)
-            .ok_or_else(|| runtime_error("input exceeds 8388608 bytes"))?;
-        if self.text_bytes > MAX_BYTES {
-            return Err(runtime_error("input exceeds 8388608 bytes"));
+            .ok_or_else(|| runtime_error(format!("encoded output exceeds {MAX_BYTES} bytes")))?;
+        if self.output_bytes > MAX_BYTES {
+            return Err(runtime_error(format!(
+                "encoded output exceeds {MAX_BYTES} bytes"
+            )));
         }
         Ok(())
+    }
+
+    fn account_string(&mut self, value: &str) -> mlua::Result<()> {
+        let mut bytes = 2usize;
+        for byte in value.bytes() {
+            bytes += match byte {
+                b'"' | b'\\' | b'\x08' | b'\x0c' | b'\n' | b'\r' | b'\t' => 2,
+                0..=0x1f => 6,
+                _ => 1,
+            };
+            if bytes > MAX_BYTES {
+                return Err(runtime_error(format!(
+                    "encoded output exceeds {MAX_BYTES} bytes"
+                )));
+            }
+        }
+        self.account_output(bytes)
+    }
+
+    fn account_container(
+        &mut self,
+        kind: TableKind,
+        values: usize,
+        depth: usize,
+    ) -> mlua::Result<()> {
+        let mut bytes = 2usize;
+        if values > 0 {
+            bytes += values - 1;
+            if kind == TableKind::Object {
+                bytes += values;
+                if self.pretty {
+                    bytes += values;
+                }
+            }
+            if self.pretty {
+                bytes += values + 1 + 2 * ((depth + 1) * values + depth);
+            }
+        }
+        self.account_output(bytes)
     }
 }
 
@@ -260,18 +319,31 @@ fn to_json(
         Value::Nil => Err(runtime_error(
             "nil is not a JSON value; use remuda.json.null",
         )),
-        Value::LightUserData(value) if Value::LightUserData(value) == Value::NULL => Ok(Json::Null),
+        Value::LightUserData(value) if Value::LightUserData(value) == Value::NULL => {
+            state.account_output(4)?;
+            Ok(Json::Null)
+        }
         Value::LightUserData(_) => Err(runtime_error("lightuserdata is not a JSON value")),
-        Value::Boolean(value) => Ok(Json::Bool(value)),
-        Value::Integer(value) => Ok(Json::Number(value.into())),
-        Value::Number(value) => Number::from_f64(value)
-            .map(Json::Number)
-            .ok_or_else(|| runtime_error("NaN and infinity are not JSON numbers")),
+        Value::Boolean(value) => {
+            state.account_output(if value { 4 } else { 5 })?;
+            Ok(Json::Bool(value))
+        }
+        Value::Integer(value) => {
+            let number: Number = value.into();
+            state.account_output(number.to_string().len())?;
+            Ok(Json::Number(number))
+        }
+        Value::Number(value) => {
+            let number = Number::from_f64(value)
+                .ok_or_else(|| runtime_error("NaN and infinity are not JSON numbers"))?;
+            state.account_output(number.to_string().len())?;
+            Ok(Json::Number(number))
+        }
         Value::String(value) => {
             let text = value
                 .to_str()
                 .map_err(|_| runtime_error("JSON strings must be valid UTF-8"))?;
-            state.account_text(text.len())?;
+            state.account_string(text.as_ref())?;
             Ok(Json::String(text.to_string()))
         }
         Value::Table(table) => {
@@ -299,9 +371,12 @@ fn table_to_json(
     state: &mut EncodeState,
 ) -> mlua::Result<Json> {
     let kind = table_kind(table, array_mt, object_mt)?;
-    let entries = table
-        .pairs::<Value, Value>()
-        .collect::<mlua::Result<Vec<_>>>()?;
+    let mut entries = Vec::new();
+    for pair in table.pairs::<Value, Value>() {
+        let pair = pair?;
+        state.account_value()?;
+        entries.push(pair);
+    }
     if kind == Some(TableKind::Array) || (kind.is_none() && is_dense_array(&entries)) {
         return encode_array(entries, depth, array_mt, object_mt, state);
     }
@@ -367,6 +442,7 @@ fn encode_array(
             "JSON arrays must be dense with keys from 1 to n",
         ));
     }
+    state.account_container(TableKind::Array, values.len(), depth)?;
     let mut encoded = Vec::with_capacity(values.len());
     for (_, value) in values {
         encoded.push(to_json(value, depth + 1, array_mt, object_mt, state)?);
@@ -387,6 +463,7 @@ fn encode_object(
             "empty tables are ambiguous; use remuda.json.array or remuda.json.object",
         ));
     }
+    state.account_container(TableKind::Object, entries.len(), depth)?;
     let mut object = Map::new();
     for (key, value) in entries {
         let Value::String(key) = key else {
@@ -394,9 +471,9 @@ fn encode_object(
         };
         let key = key
             .to_str()
-            .map_err(|_| runtime_error("JSON object keys must be valid UTF-8"))?
-            .to_string();
-        state.account_text(key.len())?;
+            .map_err(|_| runtime_error("JSON object keys must be valid UTF-8"))?;
+        state.account_string(key.as_ref())?;
+        let key = key.to_string();
         object.insert(key, to_json(value, depth + 1, array_mt, object_mt, state)?);
     }
     Ok(Json::Object(object))
@@ -473,7 +550,9 @@ fn bind_encode(
                 .transpose()?
                 .flatten()
                 .unwrap_or(false);
-            let value = to_json(value, 0, &array_mt, &object_mt, &mut EncodeState::default())?;
+            let mut state = EncodeState::new(pretty);
+            state.account_value()?;
+            let value = to_json(value, 0, &array_mt, &object_mt, &mut state)?;
             let text = if pretty {
                 serde_json::to_string_pretty(&value)
             } else {
@@ -481,7 +560,9 @@ fn bind_encode(
             }
             .map_err(|error| runtime_error(error.to_string()))?;
             if text.len() > MAX_BYTES {
-                return Err(runtime_error(format!("output exceeds {MAX_BYTES} bytes")));
+                return Err(runtime_error(format!(
+                    "encoded output exceeds {MAX_BYTES} bytes"
+                )));
             }
             Ok(text)
         })?,
