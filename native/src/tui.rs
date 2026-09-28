@@ -1266,7 +1266,7 @@ mod visual_mode_tests {
     fn visual_motion_pans_to_keep_the_cursor_visible() {
         let mut ui = ui();
         ui.preview_width = 10;
-        screen_row(&mut ui, &format!("{}", "x".repeat(94)));
+        screen_row(&mut ui, &"x".repeat(94));
         press(&mut ui, "v$");
         assert_eq!(at(&ui).col, 93);
         assert_eq!(ui.pan, 84);
