@@ -119,7 +119,7 @@ fn main() -> ExitCode {
 
         ["exec", name] => with_daemon(server, &path, |path| exec_command(path, name)),
 
-        ["cluster", rest @ ..] => cluster_command(rest),
+        ["cluster", rest @ ..] => cluster_command(&path, rest),
 
         [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
             extension_command(server, &path, command, rest)
@@ -203,6 +203,7 @@ remuda — a pty manager you can attach to
   remuda mod remove NAME          remove one installed mod
   remuda cluster                  show cluster status
   remuda cluster init             create this node's cluster identity
+  remuda cluster remote [node/session] open the read-only cluster tree
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
@@ -270,6 +271,7 @@ remuda — terminal orchestration for coding agents
   remuda mod remove NAME         remove a mod
   remuda cluster                 show cluster status
   remuda cluster init            create this node's cluster identity
+  remuda cluster remote [node/session] open the read-only cluster tree
 
   remuda doc | repl | -e CODE    use the persistent Lua runtime
   remuda --version
@@ -301,6 +303,7 @@ fn help_command() -> ExitCode {
 enum ClusterCommand {
     Status,
     Init,
+    Remote(Option<String>),
     Invalid,
 }
 
@@ -308,18 +311,33 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
     match args {
         [] => ClusterCommand::Status,
         ["init"] => ClusterCommand::Init,
+        ["remote"] => ClusterCommand::Remote(None),
+        ["remote", target] if target.contains('/') => {
+            ClusterCommand::Remote(Some((*target).to_string()))
+        }
         _ => ClusterCommand::Invalid,
     }
 }
 
-fn cluster_command(args: &[&str]) -> ExitCode {
+fn cluster_command(path: &Path, args: &[&str]) -> ExitCode {
     match parse_cluster_command(args) {
         ClusterCommand::Status => {
             println!("This node is not in a cluster; run `remuda cluster init`.");
             ExitCode::SUCCESS
         }
         ClusterCommand::Init => fail("cluster init is not implemented yet"),
-        ClusterCommand::Invalid => fail("usage: remuda cluster [init]"),
+        ClusterCommand::Remote(target) => {
+            let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into());
+            with_daemon(
+                "cluster",
+                path,
+                |path| match remuda_native::cluster_tui::run(path, &node, target.as_deref()) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => fail(format!("cluster remote: {error}")),
+                },
+            )
+        }
+        ClusterCommand::Invalid => fail("usage: remuda cluster [init | remote [node/session]]"),
     }
 }
 
@@ -332,6 +350,18 @@ mod cluster_cli_tests {
         assert_eq!(parse_cluster_command(&[]), ClusterCommand::Status);
         assert_eq!(parse_cluster_command(&["init"]), ClusterCommand::Init);
         assert_eq!(parse_cluster_command(&["join"]), ClusterCommand::Invalid);
+    }
+
+    #[test]
+    fn cluster_remote_accepts_an_optional_target() {
+        assert_eq!(
+            parse_cluster_command(&["remote"]),
+            ClusterCommand::Remote(None)
+        );
+        assert_eq!(
+            parse_cluster_command(&["remote", "studio/dev"]),
+            ClusterCommand::Remote(Some("studio/dev".into()))
+        );
     }
 }
 
