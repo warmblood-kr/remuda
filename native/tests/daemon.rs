@@ -16,6 +16,7 @@ use remuda_core::{Session, Size};
 use remuda_native::{client, daemon, ipc, CommandBuilder, PtyAgent, SystemClock};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -65,6 +66,14 @@ fn answer_pending_conpty_queries(
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("remuda-t{}-{tag}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+fn unique_scratch_dir(tag: &str) -> PathBuf {
+    static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(1);
+    let run = NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("remuda-u{}-{run}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create unique test runtime directory");
     dir
 }
 
@@ -519,7 +528,7 @@ fn attached_keystrokes_survive_a_pty_write_timeout_without_detaching() {
 #[cfg(unix)]
 #[test]
 fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
-    let runtime = scratch_dir("probe-attach-send-stall");
+    let runtime = unique_scratch_dir("probe-attach-stall");
     let socket = daemon::socket_path_in(&runtime, "s");
     let _daemon = daemon_at(&socket);
     let marker = runtime.join("start-reader");
@@ -551,18 +560,52 @@ fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
     let expected_send = send_bytes.clone();
     let send_socket = socket.clone();
     let started = Instant::now();
+    let (send_finished_tx, send_finished_rx) = std::sync::mpsc::channel();
     let sender = std::thread::spawn(move || {
-        client::request(
-            &send_socket,
-            &Request::Send {
-                name: "target".into(),
-                bytes: send_bytes,
-            },
-        )
+        let result = loop {
+            match client::request(
+                &send_socket,
+                &Request::Send {
+                    name: "target".into(),
+                    bytes: send_bytes.clone(),
+                },
+            ) {
+                Ok(Response::Busy) => std::thread::sleep(Duration::from_millis(10)),
+                result => break result,
+            }
+        };
+        let _ = send_finished_tx.send(());
+        result
     });
 
-    // Let Send fill the PTY and hold the per-session writer before attaching.
-    std::thread::sleep(Duration::from_millis(400));
+    // Empty sends make safe probes: they cannot affect the captured bytes.
+    // Wait until a probe sees the large Send occupying the writer before
+    // attaching, rather than assuming that a fixed delay was enough.
+    let busy_deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        match client::request(
+            &socket,
+            &Request::Send {
+                name: "target".into(),
+                bytes: Vec::new(),
+            },
+        )
+        .expect("probe whether the large Send owns the writer")
+        {
+            Response::Busy => break,
+            Response::Ok => {
+                if send_finished_rx.try_recv().is_ok() {
+                    panic!("large Send ended before the writer became busy");
+                }
+            }
+            other => panic!("unexpected empty Send probe response: {other:?}"),
+        }
+        assert!(
+            Instant::now() < busy_deadline,
+            "large Send never occupied the session writer"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let mut stream = raw_attach(&socket, "target");
     stream
         .write_all(b"HUMAN-ONE\n")
