@@ -19,6 +19,7 @@ pub enum ReplayError {
 struct SeenFrame {
     peer: String,
     inserted_at: Instant,
+    timestamp_seconds: i64,
 }
 
 /// Bounded cache of Noise ephemerals accepted inside the timestamp window.
@@ -75,7 +76,7 @@ impl ReplayWindow {
         if distance.abs() > i128::from(REPLAY_WINDOW_SECONDS) {
             return Err(ReplayError::OutsideWindow);
         }
-        self.evict_expired(monotonic_now);
+        self.evict_expired(monotonic_now, now_seconds);
         if self.seen.contains_key(&ephemeral) {
             return Err(ReplayError::AlreadySeen);
         }
@@ -91,19 +92,25 @@ impl ReplayWindow {
             SeenFrame {
                 peer: peer.clone(),
                 inserted_at: monotonic_now,
+                timestamp_seconds,
             },
         );
         *self.peer_counts.entry(peer).or_default() += 1;
         Ok(())
     }
 
-    fn evict_expired(&mut self, now: Instant) {
+    fn evict_expired(&mut self, monotonic_now: Instant, now_seconds: i64) {
         let expired = self
             .seen
             .iter()
             .filter_map(|(ephemeral, entry)| {
-                (now.saturating_duration_since(entry.inserted_at) >= MAX_REPLAY_RETENTION)
-                    .then_some(*ephemeral)
+                let timestamp_distance =
+                    i128::from(entry.timestamp_seconds) - i128::from(now_seconds);
+                let monotonic_expired = monotonic_now.saturating_duration_since(entry.inserted_at)
+                    >= MAX_REPLAY_RETENTION;
+                let timestamp_expired =
+                    timestamp_distance.abs() > i128::from(REPLAY_WINDOW_SECONDS);
+                (monotonic_expired && timestamp_expired).then_some(*ephemeral)
             })
             .collect::<Vec<_>>();
         for ephemeral in expired {

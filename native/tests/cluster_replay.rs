@@ -112,3 +112,22 @@ fn replay_eviction_uses_monotonic_age_across_wall_clock_jumps() {
         Err(replay::ReplayError::AlreadySeen)
     ));
 }
+
+#[test]
+fn replay_with_future_skew_remains_cached_at_the_timestamp_window_edge() {
+    let mut window = replay::ReplayWindow::new(8);
+    let monotonic = std::time::Instant::now();
+    window
+        .check_and_insert_at("peer", [7; 32], 1060, 1000, monotonic)
+        .unwrap();
+    assert!(matches!(
+        window.check_and_insert_at(
+            "peer",
+            [7; 32],
+            1060,
+            1120,
+            monotonic + std::time::Duration::from_secs(120)
+        ),
+        Err(replay::ReplayError::AlreadySeen)
+    ));
+}

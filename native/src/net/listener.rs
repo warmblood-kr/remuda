@@ -8,7 +8,9 @@ use remuda_core::WallClock;
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(all(test, unix))]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -54,12 +56,15 @@ impl ListenerConfig {
 pub struct Listener {
     socket: TcpListener,
     state: Arc<ListenerState>,
+    authorize: MemberAuthorizer,
+    dispatch: FrameDispatcher,
 }
+
+type MemberAuthorizer = Arc<dyn Fn(&[u8]) -> io::Result<()> + Send + Sync>;
+type FrameDispatcher = Arc<dyn Fn(&[u8]) -> io::Result<Vec<u8>> + Send + Sync>;
 
 struct ListenerState {
     responder_private: Zeroizing<Vec<u8>>,
-    daemon_path: PathBuf,
-    registry_cache: Arc<MemberRegistryCache>,
     replay: Mutex<replay::ReplayWindow>,
     limiter: Arc<RequestLimiter>,
     join_tokens: JoinTokenStore,
@@ -138,16 +143,22 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
     let join_tokens = JoinTokenStore::open(Arc::new(crate::SystemWallClock::new()))?;
     let socket = TcpListener::bind(config.bind_addr)?;
     socket.set_nonblocking(true)?;
+    let authorizer_cache = registry_cache.clone();
+    let authorize: MemberAuthorizer =
+        Arc::new(move |peer_static| authorizer_cache.authorize(peer_static));
+    let dispatch_path = daemon_path.to_path_buf();
+    let dispatch: FrameDispatcher =
+        Arc::new(move |payload| dispatch_payload(payload, &dispatch_path));
     Ok(Listener {
         socket,
         state: Arc::new(ListenerState {
             responder_private,
-            daemon_path: daemon_path.to_path_buf(),
-            registry_cache,
             replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
             limiter: Arc::new(RequestLimiter::default()),
             join_tokens,
         }),
+        authorize,
+        dispatch,
     })
 }
 
@@ -183,6 +194,15 @@ impl Listener {
                     }
                 }
             });
+            let state = self.state.clone();
+            let authorize = self.authorize.clone();
+            let dispatch = self.dispatch.clone();
+            let limits = ConnectionLimits {
+                outer_hold: MAX_HELD_REQUEST,
+                post_dispatch_hold: MAX_HELD_REQUEST,
+                idle_read: SOCKET_IDLE_TIMEOUT,
+                total_read: MAX_REQUEST_READ_TIME,
+            };
             let result = serve_socket_until(
                 &self.socket,
                 stop,
@@ -191,25 +211,15 @@ impl Listener {
                     Err(std::sync::mpsc::TryRecvError::Empty)
                     | Err(std::sync::mpsc::TryRecvError::Disconnected) => Ok(()),
                 },
-                |stream, remote_addr| {
-                    let Some(ip_permit) = self.state.limiter.acquire_ip(remote_addr.ip()) else {
-                        return write_http_response(
-                            stream,
-                            429,
-                            b"source address request capacity reached",
-                        );
-                    };
-                    let Some(global_permit) = self.state.limiter.acquire_global() else {
-                        return write_http_response(stream, 503, b"request capacity reached");
-                    };
-                    let state = self.state.clone();
-                    std::thread::Builder::new()
-                        .name("remuda-cluster-listener".into())
-                        .spawn(move || {
-                            let _ip_permit = ip_permit;
-                            handle_connection(stream, state, global_permit)
-                        })
-                        .map(|_| ())
+                move |stream, remote_addr| {
+                    spawn_connection_handler(
+                        stream,
+                        remote_addr,
+                        state.clone(),
+                        authorize.clone(),
+                        dispatch.clone(),
+                        limits,
+                    )
                 },
             );
             let _ = observer_stop_tx.send(());
@@ -583,31 +593,28 @@ fn dispatch_payload(payload: &[u8], daemon_path: &Path) -> io::Result<Vec<u8>> {
     .map_err(|reason| io::Error::other(format!("local request failed: {reason}")))
 }
 
-fn handle_connection(
+fn spawn_connection_handler(
     stream: TcpStream,
+    remote_addr: SocketAddr,
     state: Arc<ListenerState>,
-    global_permit: Arc<GlobalPermit>,
-) {
-    let daemon_path = state.daemon_path.clone();
-    let dispatch = Arc::new(move |payload: &[u8]| dispatch_payload(payload, &daemon_path));
-    let registry_cache = state.registry_cache.clone();
-    handle_connection_with(
-        stream,
-        state,
-        global_permit,
-        Arc::new(move |peer_static| registry_cache.authorize(peer_static)),
-        dispatch,
-        ConnectionLimits {
-            outer_hold: MAX_HELD_REQUEST,
-            post_dispatch_hold: MAX_HELD_REQUEST,
-            idle_read: SOCKET_IDLE_TIMEOUT,
-            total_read: MAX_REQUEST_READ_TIME,
-        },
-    );
+    authorize: MemberAuthorizer,
+    dispatch: FrameDispatcher,
+    limits: ConnectionLimits,
+) -> io::Result<()> {
+    let Some(ip_permit) = state.limiter.acquire_ip(remote_addr.ip()) else {
+        return write_http_response(stream, 429, b"source address request capacity reached");
+    };
+    let Some(global_permit) = state.limiter.acquire_global() else {
+        return write_http_response(stream, 503, b"request capacity reached");
+    };
+    std::thread::Builder::new()
+        .name("remuda-cluster-listener".into())
+        .spawn(move || {
+            let _ip_permit = ip_permit;
+            handle_connection_with(stream, state, global_permit, authorize, dispatch, limits);
+        })
+        .map(|_| ())
 }
-
-type MemberAuthorizer = Arc<dyn Fn(&[u8]) -> io::Result<()> + Send + Sync>;
-type FrameDispatcher = Arc<dyn Fn(&[u8]) -> io::Result<Vec<u8>> + Send + Sync>;
 
 fn handle_connection_with(
     stream: TcpStream,
@@ -771,10 +778,6 @@ mod tests {
                     .unwrap();
             let state = Arc::new(ListenerState {
                 responder_private: Zeroizing::new(responder_private),
-                daemon_path: PathBuf::new(),
-                registry_cache: Arc::new(MemberRegistryCache {
-                    cached: Mutex::new(("test".to_owned(), Registry::default())),
-                }),
                 replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
@@ -787,34 +790,61 @@ mod tests {
                     &thread_stop,
                     || Ok(()),
                     move |stream, remote_addr| {
-                        let Some(ip_permit) = state.limiter.acquire_ip(remote_addr.ip()) else {
-                            return write_http_response(
-                                stream,
-                                429,
-                                b"source address request capacity reached",
-                            );
-                        };
-                        let Some(global_permit) = state.limiter.acquire_global() else {
-                            return write_http_response(stream, 503, b"request capacity reached");
-                        };
-                        let connection_state = state.clone();
-                        let connection_authorize = authorize.clone();
-                        let connection_dispatch = dispatch.clone();
-                        std::thread::spawn(move || {
-                            let _ip_permit = ip_permit;
-                            handle_connection_with(
-                                stream,
-                                connection_state,
-                                global_permit,
-                                connection_authorize,
-                                connection_dispatch,
-                                limits,
-                            );
-                        });
-                        Ok(())
+                        spawn_connection_handler(
+                            stream,
+                            remote_addr,
+                            state.clone(),
+                            authorize.clone(),
+                            dispatch.clone(),
+                            limits,
+                        )
                     },
                 )
             });
+            Self {
+                address,
+                responder_public,
+                stop,
+                thread: Some(thread),
+                state_dir,
+            }
+        }
+
+        fn start_production(
+            responder_private: Vec<u8>,
+            responder_public: Vec<u8>,
+            authorize: MemberAuthorizer,
+            dispatch: FrameDispatcher,
+        ) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let state_dir = std::env::temp_dir().join(format!(
+                "remuda-listener-production-test-{}-{}",
+                std::process::id(),
+                LISTENER_ERROR_COUNT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&state_dir).unwrap();
+            std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let join_tokens =
+                JoinTokenStore::open_at(&state_dir, Arc::new(crate::SystemWallClock::new()))
+                    .unwrap();
+            let state = Arc::new(ListenerState {
+                responder_private: Zeroizing::new(responder_private),
+                replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
+                limiter: Arc::new(RequestLimiter::default()),
+                join_tokens,
+            });
+            let listener = Listener {
+                socket: listener,
+                state,
+                authorize,
+                dispatch,
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread_stop = stop.clone();
+            let thread = std::thread::spawn(move || listener.serve_until(&thread_stop));
             Self {
                 address,
                 responder_public,
@@ -950,6 +980,23 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn production_socket_server() -> (SocketTestServer, snow::Keypair) {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let server = SocketTestServer::start_production(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Ok(())),
+            Arc::new(|_| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
+        );
+        (server, peer)
+    }
+
+    #[cfg(unix)]
     fn sealed_list_request(
         peer: &snow::Keypair,
         server: &SocketTestServer,
@@ -1025,6 +1072,13 @@ mod tests {
     }
 
     #[test]
+    fn bounded_http_parser_names_missing_content_length() {
+        let request = b"POST /cluster HTTP/1.1\r\nHost: node\r\n\r\n";
+        let error = parse_http_request(Cursor::new(request)).err().unwrap();
+        assert_eq!(error.to_string(), "Content-Length is required");
+    }
+
+    #[test]
     fn accepted_stream_reads_a_body_sent_after_a_split_write() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -1051,6 +1105,41 @@ mod tests {
         let parsed = parse_socket_request_with_timeout(&stream, MAX_REQUEST_READ_TIME).unwrap();
         client.join().unwrap();
         assert_eq!(parsed.body, b"test");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_serve_until_reads_a_body_sent_after_a_split_write() {
+        let (server, _) = production_socket_server();
+        let mut stream = TcpStream::connect(server.address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(b"POST /cluster HTTP/1.1\r\nHost: node\r\nContent-Length: 4\r\n\r\n")
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        stream.write_all(b"test").unwrap();
+        assert_eq!(
+            read_http_response(&mut stream).unwrap(),
+            (400, b"bad frame".to_vec())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_serve_until_caps_pre_auth_connections_per_source_ip() {
+        let (server, _) = production_socket_server();
+        let held = (0..MAX_PREAUTH_PER_IP)
+            .map(|_| TcpStream::connect(server.address).unwrap())
+            .collect::<Vec<_>>();
+        std::thread::sleep(Duration::from_millis(100));
+        let mut fifth = TcpStream::connect(server.address).unwrap();
+        fifth.set_read_timeout(Some(socket_test_timeout())).unwrap();
+        let (status, body) = read_http_response(&mut fifth).unwrap();
+        assert_eq!(status, 429);
+        assert_eq!(body, b"source address request capacity reached");
+        drop(held);
     }
 
     #[cfg(unix)]
@@ -1295,10 +1384,16 @@ mod tests {
             socket_test_timeout(),
             socket_test_timeout(),
         );
-        let (status, _) = server
-            .send_raw(&[0; 32], b"Content-Length: 32\r\n")
+        let mut low_order =
+            sealed_payload_request(&peer, &server, &serde_json::to_vec(&Request::List).unwrap())
+                .message;
+        assert!(low_order.len() > 32);
+        low_order[..32].fill(0);
+        let content_length = format!("Content-Length: {}\r\n", low_order.len());
+        let (status, body) = server
+            .send_raw(&low_order, content_length.as_bytes())
             .unwrap();
-        assert_eq!(status, 400);
+        assert_eq!((status, body), (400, b"bad frame".to_vec()));
 
         let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
             .generate_keypair()
@@ -1363,20 +1458,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn socket_remote_input_is_refused_without_dispatch() {
-        let dispatched = Arc::new(AtomicUsize::new(0));
-        let worker_dispatched = dispatched.clone();
-        let (server, peer, _) = socket_server(
-            move |payload| {
-                let request = crate::remote_front::decode_frame(payload)
-                    .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
-                authorize_remote_request(&request)?;
-                worker_dispatched.fetch_add(1, Ordering::SeqCst);
-                Ok(serde_json::to_vec(&Response::Ok).unwrap())
-            },
-            socket_test_timeout(),
-            socket_test_timeout(),
-            socket_test_timeout(),
-            socket_test_timeout(),
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let server = SocketTestServer::start_production(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Ok(())),
+            Arc::new(|payload| dispatch_payload(payload, Path::new("unused-daemon-path"))),
         );
         let request = Request::Input {
             name: "session".into(),
@@ -1390,10 +1482,9 @@ mod tests {
         assert_eq!(status, 200);
         let response: Response = serde_json::from_slice(&response).unwrap();
         assert!(
-            matches!(&response, Response::Error(message) if message.contains("remote front refuses Input")),
+            matches!(&response, Response::Error(message) if message == "remote front refuses Input"),
             "unexpected response: {response:?}"
         );
-        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(unix)]
@@ -1482,7 +1573,10 @@ mod tests {
             socket_test_timeout(),
             socket_test_timeout(),
         );
-        assert_eq!(server.send_raw(b"", b"").unwrap().0, 400);
+        assert_eq!(
+            server.send_raw(b"", b"").unwrap(),
+            (400, b"bad request".to_vec())
+        );
         let over_cap = vec![0; MAX_BODY_BYTES + 1];
         let header = format!("Content-Length: {}\r\n", over_cap.len());
         let full_body_result = server.send_raw(&over_cap, header.as_bytes());
@@ -1512,12 +1606,12 @@ mod tests {
             socket_test_timeout(),
             socket_test_timeout(),
             Duration::from_millis(80),
-            Duration::from_millis(300),
+            Duration::from_secs(2),
         );
         let started = Instant::now();
         let mut stream = TcpStream::connect(server.address).unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         stream
             .write_all(b"POST /cluster HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\n")
