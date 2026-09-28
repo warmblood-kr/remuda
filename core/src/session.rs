@@ -13,7 +13,7 @@ use crate::protocol::Step;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -44,7 +44,8 @@ pub struct Session {
     /// Held for the whole of one input act — every `Burst` **and** every
     /// `Pause` between them — so a second sender cannot land a write during a
     /// pause, when the `agent` lock is briefly free. See [`Self::feed`].
-    input_lock: Mutex<()>,
+    input_lock: Mutex<bool>,
+    input_ready: Condvar,
     /// Bounded retry history for remote byte batches, kept per session.
     input_dedup: Mutex<InputDeduplicator>,
     /// Per-session byte budget, checked before taking `input_lock`.
@@ -123,7 +124,8 @@ impl Session {
             attached: AtomicBool::new(false),
             attach_slot: Mutex::new(None),
             next_attach_generation: AtomicU64::new(1),
-            input_lock: Mutex::new(()),
+            input_lock: Mutex::new(false),
+            input_ready: Condvar::new(),
             input_dedup: Mutex::new(InputDeduplicator::new()),
             input_rate: Mutex::new(InputRateLimiter::default()),
         }
@@ -412,23 +414,23 @@ impl Session {
         Ok(())
     }
 
-    fn acquire_input_lock(&self) -> Result<MutexGuard<'_, ()>> {
+    fn acquire_input_lock(&self) -> Result<InputActGuard<'_>> {
+        let mut locked = self
+            .input_lock
+            .lock()
+            .map_err(|_| AgentError::Io("session input lock poisoned".into()))?;
         loop {
-            match self.input_lock.try_lock() {
-                Ok(guard) => return Ok(guard),
-                Err(TryLockError::Poisoned(_)) => {
-                    return Err(AgentError::Io("session input lock poisoned".into()));
-                }
-                Err(TryLockError::WouldBlock) if self.input_writer_busy()? => {
-                    return Err(AgentError::Busy);
-                }
-                Err(TryLockError::WouldBlock) => {
-                    // Feed pauses intentionally keep other input atomic, but
-                    // poll so a later burst that stalls the PTY can refuse the
-                    // waiting act instead of leaving it queued indefinitely.
-                    std::thread::yield_now();
-                }
+            if !*locked {
+                *locked = true;
+                return Ok(InputActGuard { session: self });
             }
+            if self.input_writer_busy()? {
+                return Err(AgentError::Busy);
+            }
+            locked = self
+                .input_ready
+                .wait(locked)
+                .map_err(|_| AgentError::Io("session input lock poisoned".into()))?;
         }
     }
 
@@ -602,6 +604,22 @@ impl Session {
     pub fn human_idle_for(&self) -> Option<Duration> {
         let last = self.last_human_input_at.lock().ok().and_then(|at| *at)?;
         Some(self.clock.now().saturating_sub(last))
+    }
+}
+
+struct InputActGuard<'a> {
+    session: &'a Session,
+}
+
+impl Drop for InputActGuard<'_> {
+    fn drop(&mut self) {
+        let mut locked = self
+            .session
+            .input_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *locked = false;
+        self.session.input_ready.notify_all();
     }
 }
 
