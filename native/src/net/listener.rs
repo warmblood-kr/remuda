@@ -491,6 +491,13 @@ fn invalid_http(message: &'static str) -> io::Error {
 }
 
 fn authorize_remote_request(request: &Request) -> io::Result<()> {
+    // Enable after #252 (PTY write timeout) merges.
+    if matches!(request, Request::Input { .. }) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "remote front refuses Input",
+        ));
+    }
     crate::remote_front::authorize(request)
         .map_err(|reason| io::Error::new(io::ErrorKind::PermissionDenied, reason))
 }
@@ -981,16 +988,17 @@ mod tests {
     }
 
     #[test]
-    fn remote_input_uses_the_pr4_rate_checked_batch_path() {
+    fn remote_input_is_refused_until_pty_timeout_merges() {
         assert!(authorize_remote_request(&Request::List).is_ok());
-        assert!(authorize_remote_request(&Request::Input {
+        let error = authorize_remote_request(&Request::Input {
             name: "session".into(),
             instance_id: "instance".into(),
             client_id: "00000000000000000000000000000001".into(),
             seq: 1,
             bytes: b"hello\r".to_vec(),
         })
-        .is_ok());
+        .unwrap_err();
+        assert_eq!(error.to_string(), "remote front refuses Input");
     }
 
     #[test]
@@ -1045,6 +1053,7 @@ mod tests {
         assert_eq!(parsed.body, b"test");
     }
 
+    #[cfg(unix)]
     #[test]
     fn accept_loop_survives_a_connection_handler_error() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1349,6 +1358,42 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.contains("invalid remote request"));
         assert!(!response.contains(secret));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_remote_input_is_refused_without_dispatch() {
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let worker_dispatched = dispatched.clone();
+        let (server, peer, _) = socket_server(
+            move |payload| {
+                let request = crate::remote_front::decode_frame(payload)
+                    .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
+                authorize_remote_request(&request)?;
+                worker_dispatched.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::to_vec(&Response::Ok).unwrap())
+            },
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+        );
+        let request = Request::Input {
+            name: "session".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
+            bytes: b"hello\r".to_vec(),
+        };
+        let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
+        let (status, response) = server.exchange(sealed);
+        assert_eq!(status, 200);
+        let response: Response = serde_json::from_slice(&response).unwrap();
+        assert!(
+            matches!(&response, Response::Error(message) if message.contains("remote front refuses Input")),
+            "unexpected response: {response:?}"
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(unix)]
