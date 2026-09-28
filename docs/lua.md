@@ -164,6 +164,34 @@ remuda.tool("review", "Review a session", function(name)
 end, "review(name) -> string")
 ```
 
+## Hooks
+
+`remuda.on(event, fn, {group, id, depth})` registers a hook.
+- `depth` runs from -100 to 100. Lower depths run first, and hooks with equal depth run in registration order (like Emacs `add-hook`).
+- Registering the same `group` and `id` again replaces that hook, so calling `on` twice is safe.
+- A declared mod hook may carry `id` and `depth` too.
+
+Four ways to fire an event:
+
+| Call | Result |
+|---|---|
+| `emit(event, ...)` | Runs every hook. |
+| `emit_until_success(event, ...)` | Returns the first non-nil result. |
+| `emit_until_failure(event, ...)` | Returns `false` as soon as a hook returns `false` (a veto), otherwise `true`. |
+| `emit_filter(event, value, ...)` | Passes `value` through each hook as `hook(value, ...)` and returns the result. A hook returning nil leaves the value unchanged. |
+
+A hook that raises an error is logged with its group and id, and counted on that hook. It never counts as an answer or a veto.
+
+`remuda.hook_list(event?)` returns copies of `{event, group, id, depth, src, errors, last_error}` in run order. Use it to inspect hooks.
+
+`remuda.hooks` is deprecated for reading, and will become read-only once no mod edits it by hand.
+
+```lua
+remuda.on("before_send", function(text) return text:gsub("%s+$", "") end,
+  { group = "tidy", id = "trim", depth = -10 })
+local text = remuda.emit_filter("before_send", "hi  ")  -- "hi"
+```
+
 ## Generated reference
 
 The reference below is extracted from the built Remuda runtime; it is not a
