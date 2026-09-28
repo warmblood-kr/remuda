@@ -748,6 +748,7 @@ mod tests {
     struct SocketTestServer {
         address: SocketAddr,
         responder_public: Vec<u8>,
+        responder_private: Vec<u8>,
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<io::Result<()>>>,
         state_dir: PathBuf,
@@ -763,6 +764,7 @@ mod tests {
             limits: ConnectionLimits,
         ) -> Self {
             use std::os::unix::fs::PermissionsExt;
+            let responder_private_for_test = responder_private.clone();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
@@ -804,6 +806,7 @@ mod tests {
             Self {
                 address,
                 responder_public,
+                responder_private: responder_private_for_test,
                 stop,
                 thread: Some(thread),
                 state_dir,
@@ -817,6 +820,7 @@ mod tests {
             dispatch: FrameDispatcher,
         ) -> Self {
             use std::os::unix::fs::PermissionsExt;
+            let responder_private_for_test = responder_private.clone();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let address = listener.local_addr().unwrap();
@@ -848,6 +852,7 @@ mod tests {
             Self {
                 address,
                 responder_public,
+                responder_private: responder_private_for_test,
                 stop,
                 thread: Some(thread),
                 state_dir,
@@ -1384,11 +1389,12 @@ mod tests {
             socket_test_timeout(),
             socket_test_timeout(),
         );
-        let mut low_order =
-            sealed_payload_request(&peer, &server, &serde_json::to_vec(&Request::List).unwrap())
-                .message;
+        let low_order = frame::request_with_low_order_key(&server.responder_public, false).unwrap();
         assert!(low_order.len() > 32);
-        low_order[..32].fill(0);
+        let error = frame::open_request(&server.responder_private, &low_order)
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "low-order Noise DH result");
         let content_length = format!("Content-Length: {}\r\n", low_order.len());
         let (status, body) = server
             .send_raw(&low_order, content_length.as_bytes())
