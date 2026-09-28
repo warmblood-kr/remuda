@@ -110,6 +110,22 @@ fn interpret(line: &str) -> Response {
     }
 }
 
+/// Read one protocol line without buffering beyond it. The attach client keeps
+/// this exact Windows pipe handle for the output pump so its detach wake can
+/// cancel the pending read on the same handle.
+fn read_protocol_line(stream: &mut impl Read) -> std::io::Result<String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read(&mut byte)? != 0 {
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0]);
+    }
+    String::from_utf8(line)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 /// Every daemon deployed before any handshake existed can never announce its own
 /// version, so the client's reaction to the failure is the only diagnosis that
 /// reaches those users. See [`tests::the_cure_survives_an_eighty_column_crop`].
@@ -137,7 +153,7 @@ pub enum Left {
 /// session ends. Leaving does not disturb the session: the process keeps
 /// running and this direct attach never changes its size.
 pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
-    let stream = ipc::connect(path)?;
+    let mut stream = ipc::connect(path)?;
     send(
         &stream,
         &Request::Attach {
@@ -148,9 +164,7 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
     // The acknowledgement is read before raw mode goes on. Failing here must
     // leave the terminal exactly as we found it, and a raw terminal printing an
     // error message is how a tool loses a user's trust in one keystroke.
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+    let line = read_protocol_line(&mut stream)?;
     match interpret(&line) {
         Response::Ok => {}
         Response::Error(reason) => {
@@ -161,6 +175,11 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
 
     let _raw = RawMode::enable()?;
 
+    // The Windows wake must cancel the same HANDLE that owns the blocked read;
+    // cloning a named-pipe stream creates a different HANDLE. Share this one
+    // between the output pump and the key thread that may need to wake it.
+    let reader_stream = std::sync::Arc::new(stream);
+
     // Only the key thread can tell the two exits apart: the reader below just
     // sees the stream end, which is true of a detach and of a death alike.
     let detached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -168,7 +187,8 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
 
     // Keystrokes out, on their own thread; the screen pump runs here.
     let keys = std::thread::spawn({
-        let mut stream = stream.try_clone()?;
+        let mut stream = reader_stream.as_ref().try_clone()?;
+        let reader_stream = std::sync::Arc::clone(&reader_stream);
         let detached = std::sync::Arc::clone(&detached);
         move || {
             let mut stdin = std::io::stdin().lock();
@@ -198,12 +218,13 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
             // Ends the screen pump below, which then returns from `attach` and
             // drops every handle on this connection — that hang-up is what the
             // daemon reads as "the human left".
-            ipc::wake(&stream);
+            ipc::wake(&reader_stream);
         }
     });
 
     let mut stdout = std::io::stdout();
     let mut buf = [0u8; 8192];
+    let mut reader = reader_stream.as_ref();
     while let Ok(n) = reader.read(&mut buf) {
         if n == 0 {
             break;
@@ -213,7 +234,7 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
         }
     }
 
-    ipc::wake(&stream);
+    ipc::wake(&reader_stream);
     let left = if detached.load(std::sync::atomic::Ordering::SeqCst) {
         Left::Detached
     } else {
@@ -371,9 +392,11 @@ mod tests {
     #[test]
     fn input_trace_records_a_timestamp_and_each_byte_as_hex() {
         let mut output = Vec::new();
-        let at = UNIX_EPOCH + Duration::new(7, 42);
+        // Windows SystemTime has 100 ns precision, so keep the fixture on that
+        // clock's representable grid as well.
+        let at = UNIX_EPOCH + Duration::new(7, 420_000_000);
         write_input_trace(&mut output, at, b"\x1b\xff").unwrap();
-        assert_eq!(output, b"7.000000042 1b ff\n");
+        assert_eq!(output, b"7.420000000 1b ff\n");
     }
 
     #[cfg(unix)]
