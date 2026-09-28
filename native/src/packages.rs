@@ -88,6 +88,21 @@ pub fn has_subcommand(name: &str) -> bool {
     subcommand(name).ok().flatten().is_some()
 }
 
+/// `mods/NAME/` exists but its manifest is missing or unreadable, typically
+/// mid-update (#134). The message names the mod and where it is, instead of
+/// the CLI falling through to its generic usage text.
+pub fn half_installed(name: &str) -> Option<String> {
+    let dir = mods_dir().ok()?.join(name);
+    if !dir.is_dir() {
+        return None;
+    }
+    let reason = read_manifest(&dir.join("extension.toml")).err()?;
+    Some(format!(
+        "mod '{name}' at {} has no manifest (partially installed or mid-update?): {reason}",
+        dir.display()
+    ))
+}
+
 /// Resolve only installed modules. Mods are deliberately independent from the
 /// Remuda binary; there is no embedded compatibility copy.
 pub fn resolve(name: &str) -> Result<Option<PackageSource>, String> {

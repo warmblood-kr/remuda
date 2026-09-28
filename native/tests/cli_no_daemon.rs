@@ -160,3 +160,43 @@ fn mod_reload_over_sun_path_names_the_length_not_a_daemon() {
     );
     assert!(said.contains("REMUDA_RUNTIME_DIR"), "no cure named: {said}");
 }
+
+/// #134: a mod directory without a readable manifest (half-swapped during an
+/// update) is named, not answered with the generic usage text.
+#[test]
+fn a_half_installed_mod_is_named_instead_of_generic_usage() {
+    for (tag, manifest) in [
+        ("nomanifest", None),
+        ("badmanifest", Some("this is not toml [")),
+    ] {
+        let dir = scratch(tag);
+        let mod_dir = dir.join("data/remuda/mods/butler");
+        std::fs::create_dir_all(mod_dir.join("packages/butler")).unwrap();
+        if let Some(text) = manifest {
+            std::fs::write(mod_dir.join("extension.toml"), text).unwrap();
+        }
+        let out = remuda(&dir, &["butler", "--headless"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{tag}: {stderr}");
+        assert!(stderr.contains("mod 'butler' at"), "{tag}: {stderr}");
+        assert!(
+            stderr.contains(&mod_dir.display().to_string()),
+            "{tag}: {stderr}"
+        );
+        assert!(
+            stderr.contains("partially installed or mid-update"),
+            "{tag}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("terminal orchestration"),
+            "{tag}: generic usage: {stderr}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A word that names no mod directory at all still gets the usage text.
+    let dir = scratch("unknown-word");
+    let out = remuda(&dir, &["nosuchverb"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("terminal orchestration"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
