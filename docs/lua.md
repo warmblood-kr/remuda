@@ -30,8 +30,14 @@ entry, lifecycle API, source, and installation status. `remuda mod info NAME`
 shows one manifest. Both use the same RST/Markdown/JSON format selector.
 
 `remuda mod install OWNER/REPO` accepts a GitHub shorthand or HTTPS URL,
-validates the repository's `extension.toml`, and atomically stores its Lua
-package under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/mods`. Add
+validates the repository's `extension.toml`, and atomically stores its package
+under `${XDG_DATA_HOME:-$HOME/.local/share}/remuda/mods`. The package contains
+Lua files and may include inert regular files listed in `assets`, an array of
+checkout-relative paths inside the package root (for example,
+`assets = ["packages/butler/matrix_relay.py"]`). Assets must not be symlinks
+or directories and are limited to 1 MiB each. Remuda copies their bytes and
+file mode but never loads or executes them. Other non-Lua package files remain
+rejected. Add
 `--ref REF` to select a branch, tag, or commit. Installation never changes a
 live Lua image by default. Add `--reload` to ask the running daemon to replace
 the installed lifecycle-managed mod in its existing Lua image. `remuda mod
@@ -64,8 +70,8 @@ A manifest can declare the mods it needs: `requires = { butler = ">=0.4, <0.5" }
 
 An extension repository declares `api = "remuda-lua-v1"` in its
 `extension.toml`. `remuda mod test PATH` is the deterministic local check: it
-validates the manifest, package paths, symlinks, Lua-only contents, and Lua
-syntax without installing or mutating a daemon. Integration tests should run
+validates the manifest, package paths, symlinks, Lua contents and syntax, and
+declared assets without installing or mutating a daemon. Integration tests should run
 the same mod in an isolated `XDG_DATA_HOME`, then use the real Remuda daemon
 and host bindings; unit tests can use fixture implementations of the small
 `remuda` API surface. Keep the API string pinned until a deliberate host
