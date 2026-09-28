@@ -13,7 +13,8 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc::Receiver;
 
-/// Terminal dimensions, clamped to the smallest usable interactive terminal.
+/// Terminal dimensions, normally clamped to the smallest usable interactive
+/// terminal. A pane may explicitly retain its narrower visible width.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Size {
     cols: u16,
@@ -32,6 +33,16 @@ impl Size {
     pub fn new(cols: u16, rows: u16) -> Self {
         Self {
             cols: cols.max(Self::MIN_COLS),
+            rows: rows.max(Self::MIN_ROWS),
+        }
+    }
+
+    /// A pane must tell its child the width the user can actually see. This
+    /// keeps the ordinary 80-column safety floor everywhere else while
+    /// allowing a constrained pane to opt into a narrower terminal.
+    pub fn for_pane(cols: u16, rows: u16) -> Self {
+        Self {
+            cols: cols.max(1),
             rows: rows.max(Self::MIN_ROWS),
         }
     }
