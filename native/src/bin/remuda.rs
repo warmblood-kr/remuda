@@ -204,8 +204,10 @@ remuda — a pty manager you can attach to
   remuda repl                   the same image, a line at a time
   remuda mcp                    serve the image as an MCP tool on stdin/stdout
   remuda upgrade [--channel C]  re-run the installer on stable or nightly
-  remuda stop [-f] [--yes]      stop the daemon; the next command starts a fresh
-                                  one. Its sessions and Lua image die with it,
+  remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon; the next command
+                                  starts a fresh one. A hosted session needs the
+                                  explicit --i-am-inside override.
+                                  Its sessions and Lua image die with it,
                                   so a live herd is named and confirmed first.
   remuda --version              the version this binary was built with
 
@@ -258,7 +260,7 @@ remuda — terminal orchestration for coding agents
                                  Ctrl-] toggles mouse; wheel scrolls history
                                  --mouse=false disables mouse handling (before or after NAME)
   remuda ls | send NAME TEXT     inspect or message sessions
-  remuda stop [-f] [--yes]       stop the daemon (sessions are lost)
+  remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon (sessions are lost)
 
   remuda mod install OWNER/REPO  install a mod from GitHub
   remuda mod list | info NAME    inspect installed mods
@@ -369,11 +371,13 @@ fn fate(path: &Path, name: &str) -> String {
 /// closes that gap.
 fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     let mut force = false;
+    let mut yes = false;
     let mut inside_override = false;
     for arg in args {
         match *arg {
             "-f" | "--force" if !force => force = true,
-            "--yes" | "--i-am-inside" if !inside_override => inside_override = true,
+            "--yes" if !yes => yes = true,
+            "--i-am-inside" if !inside_override => inside_override = true,
             _ => return fail("usage: remuda stop [-f] [--yes]"),
         }
     }
@@ -381,18 +385,18 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         eprintln!("remuda: no daemon running for {server:?} — the next command starts one");
         return ExitCode::SUCCESS;
     }
-    if !inside_override && caller_is_hosted_here(path) {
-        let name = std::env::var("REMUDA_SESSION_NAME").unwrap_or_else(|_| "this session".into());
-        return fail(format!(
-            "cannot stop this daemon from inside session {name:?}; pass --yes to confirm"
-        ));
-    }
-    if !inside_override && (!force || has_sessions(path)) {
+    if !yes && (!force || has_sessions(path)) {
         if let Err(refusal) = confirm_losses(path) {
             return fail(refusal);
         }
     }
-    match stop_daemon(path) {
+    let shutdown = Request::Shutdown {
+        requester_daemon_id: std::env::var("REMUDA_DAEMON_ID").ok(),
+        requester_session_id: std::env::var("REMUDA_SESSION_ID").ok(),
+        requester_session_name: std::env::var("REMUDA_SESSION_NAME").ok(),
+        override_hosted: inside_override,
+    };
+    match stop_daemon(path, shutdown) {
         Ok(()) => {
             eprintln!(
                 "remuda: stopped the daemon for {server:?} — the next command starts a fresh one"
@@ -401,22 +405,6 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         }
         Err(e) => fail(e),
     }
-}
-
-fn caller_is_hosted_here(path: &Path) -> bool {
-    let Ok(socket) = std::env::var("REMUDA_SOCKET_PATH") else {
-        return false;
-    };
-    let Ok(name) = std::env::var("REMUDA_SESSION_NAME") else {
-        return false;
-    };
-    if Path::new(&socket) != path {
-        return false;
-    }
-    matches!(
-        remuda_native::client::request(path, &Request::List),
-        Ok(Response::Sessions(sessions)) if sessions.iter().any(|session| session.name == name)
-    )
 }
 
 fn has_sessions(path: &Path) -> bool {
@@ -462,19 +450,13 @@ fn confirm_losses(path: &Path) -> Result<(), String> {
     }
 }
 
-/// `Shutdown` is the door. A daemon built before that variant existed refuses
-/// it, and its Lua image is the only lever those already-deployed ones leave —
-/// `os.exit` there ends the same process. Drop the fallback after one release.
-fn stop_daemon(path: &Path) -> Result<(), String> {
-    let asked = remuda_native::client::request(path, &Request::Shutdown);
-    if !matches!(asked, Ok(Response::Ok)) {
-        let _ = remuda_native::client::request(
-            path,
-            &Request::Eval {
-                code: "os.exit(0)".into(),
-                name: None,
-            },
-        );
+fn stop_daemon(path: &Path, shutdown: Request) -> Result<(), String> {
+    let asked = remuda_native::client::request(path, &shutdown);
+    if !matches!(&asked, Ok(Response::Ok)) {
+        return Err(match asked {
+            Ok(Response::Error(reason)) => reason,
+            other => format!("daemon refused shutdown: {}", describe(other)),
+        });
     }
     // The socket file outlives the process on unix, so "gone" is a connect that
     // is refused, never a path that disappeared. `ipc::listen` clears the file.

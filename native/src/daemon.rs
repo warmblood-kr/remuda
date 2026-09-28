@@ -191,16 +191,8 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
         let image = image.clone();
         let counters = Arc::clone(&counters);
         let socket_owner = Arc::clone(&socket_owner);
-        let socket_path = path.to_path_buf();
         std::thread::spawn(move || {
-            let _ = handle(
-                stream,
-                &registry,
-                &image,
-                &counters,
-                socket_owner,
-                &socket_path,
-            );
+            let _ = handle(stream, &registry, &image, &counters, socket_owner);
         });
     }
     socket_owner.cleanup();
@@ -520,7 +512,6 @@ fn handle(
     image: &Image,
     counters: &crate::tick::Counters,
     socket_owner: Arc<SocketOwnership>,
-    socket_path: &Path,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
@@ -550,7 +541,31 @@ fn handle(
 
         // Answer before going. A client left guessing from a hung-up socket
         // cannot tell "it stopped" from "it never heard me".
-        Request::Shutdown => {
+        Request::Shutdown {
+            requester_daemon_id,
+            requester_session_id,
+            requester_session_name,
+            override_hosted,
+        } => {
+            let own_daemon_id = std::process::id().to_string();
+            let known_session_name = requester_session_id
+                .as_deref()
+                .and_then(|id| registry.name_for_id(id));
+            let caller_claims_this_daemon = requester_daemon_id.as_deref()
+                == Some(own_daemon_id.as_str())
+                && (requester_session_id.is_some() || requester_session_name.is_some());
+            if !override_hosted && (known_session_name.is_some() || caller_claims_this_daemon) {
+                let identity = known_session_name
+                    .or(requester_session_name)
+                    .or(requester_session_id)
+                    .unwrap_or_else(|| "unknown".into());
+                return reply(
+                    &stream,
+                    &Response::error(format!(
+                        "cannot stop this daemon from one of its own sessions ({identity}); pass --i-am-inside to override"
+                    )),
+                );
+            }
             reply(&stream, &Response::Ok)?;
             reap_processes_before_exit(image);
             socket_owner.cleanup();
@@ -574,12 +589,18 @@ fn handle(
                 )),
             };
             let mut session_env = env.unwrap_or_default();
+            let session_id = Session::new_id();
+            session_env.insert("REMUDA_DAEMON_ID".into(), std::process::id().to_string());
+            session_env.insert("REMUDA_SESSION_ID".into(), session_id.clone());
             session_env.insert("REMUDA_SESSION_NAME".into(), name.clone());
-            session_env.insert(
-                "REMUDA_SOCKET_PATH".into(),
-                socket_path.to_string_lossy().into_owned(),
-            );
-            match spawn(&name, &command, size, cwd.as_deref(), Some(&session_env)) {
+            match spawn(
+                &name,
+                &session_id,
+                &command,
+                size,
+                cwd.as_deref(),
+                Some(&session_env),
+            ) {
                 Err(e) => reply(&stream, &Response::error(e)),
                 Ok(session) => match registry.register(session) {
                     Ok(_) => reply(&stream, &Response::Value(name)),
@@ -709,6 +730,7 @@ fn remove_dir_all(path: &str) -> Response {
 
 fn spawn(
     name: &str,
+    session_id: &str,
     command: &[String],
     size: Size,
     cwd: Option<&str>,
@@ -743,8 +765,9 @@ fn spawn(
     }
 
     let agent = PtyAgent::spawn(builder, size).map_err(|e| e.to_string())?;
-    Ok(Session::new(
+    Ok(Session::new_with_id(
         name,
+        session_id,
         Box::new(agent),
         Arc::new(SystemClock::new()),
     ))
