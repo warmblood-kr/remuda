@@ -53,6 +53,13 @@ assert(result.stdout:find("remuda-process-run-v5", 1, true), "process.run should
 assert(result.stderr == "", "process.run should capture stderr separately")
 assert(result.timed_out == false, "a completed process must not be marked timed out")
 
+local async_id = remuda.process({ argv = echo_argv })
+assert(type(async_id) == "number", "the callable process namespace must preserve process(spec)")
+if not windows then
+  local piped = remuda.process.run({ argv = { "/bin/cat" }, stdin = "process stdin v5", timeout = 3 })
+  assert(piped.stdout == "process stdin v5", "process.run should pass stdin to the child")
+end
+
 local slow_argv = windows
   and { "ping.exe", "-n", "30", "127.0.0.1" }
   or { "/bin/sleep", "10" }
