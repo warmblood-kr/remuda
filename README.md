@@ -55,8 +55,10 @@ Direct attach enables terminal mouse input by default. The wheel scrolls the
 session's retained history when its program has mouse reporting off; when the
 program tracks the mouse, reports go to that program. Press `Ctrl-]` to toggle
 mouse handling during an attach, or use `remuda attach NAME --mouse=false` to
-start with it off. The option can appear before or after `NAME`. Hold Option while dragging to select text in Terminal.app
-or iTerm2; most other terminals use Shift-drag.
+start with it off. The option can appear before or after `NAME`. On Windows,
+ConPTY may strip terminal mouse reports, so use PageUp and PageDown to scroll
+history if the wheel has no effect. Hold Option while dragging to select text
+in Terminal.app or iTerm2; most other terminals use Shift-drag.
 
 A session whose program exits closes itself and leaves the list. Set
 `REMUDA_KEEP_EXITED=1` in the daemon's environment to keep it listed as `dead`
