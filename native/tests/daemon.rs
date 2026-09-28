@@ -294,6 +294,45 @@ fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_vers
     );
 }
 
+#[test]
+fn input_batches_acknowledge_duplicates_and_check_instance_before_deduplication() {
+    let runtime = scratch_dir("input-dedup");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let session = listed_session(&socket);
+    let request = |instance_id: String| Request::Input {
+        name: "versioned".into(),
+        instance_id,
+        client_id: "01010101010101010101010101010101".into(),
+        seq: 1,
+        bytes: b"one batch\r".to_vec(),
+    };
+    let instance_id = session.instance_id.expect("instance identity");
+    assert_eq!(
+        client::request(&socket, &request(instance_id.clone())).expect("first input"),
+        Response::Ack { duplicate: false }
+    );
+    assert_eq!(
+        client::request(&socket, &request(instance_id)).expect("retry input"),
+        Response::Ack { duplicate: true }
+    );
+    assert_eq!(
+        client::request(&socket, &request("stale-instance".into())).expect("stale input"),
+        Response::WrongInstance
+    );
+    let _ = client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    assert!(running.left_on_its_own(), "daemon should stop cleanly");
+}
+
 fn start_shell_session(socket: &Path, script: &str) {
     let response = client::request(
         socket,
