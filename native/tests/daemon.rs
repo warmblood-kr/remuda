@@ -456,7 +456,7 @@ fn attached_keystrokes_survive_a_pty_write_timeout_without_detaching() {
             command: vec![
                 "sh".into(),
                 "-c".into(),
-                "stty -echo; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat >\"$CAPTURE_PATH\"".into(),
+                "stty raw -echo; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat >\"$CAPTURE_PATH\"".into(),
             ],
             size: Size::new(80, 24),
             cwd: None,
@@ -514,6 +514,113 @@ fn attached_keystrokes_survive_a_pty_write_timeout_without_detaching() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
+    let runtime = scratch_dir("probe-attach-send-stall");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&socket);
+    let marker = runtime.join("start-reader");
+    let capture_path = runtime.join("typed-bytes");
+    let mut env = std::collections::HashMap::new();
+    env.insert("READER_MARKER".into(), marker.display().to_string());
+    env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    assert!(matches!(
+        client::request(
+            &socket,
+            &Request::New {
+                name: Some("target".into()),
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "stty raw -echo; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat >\"$CAPTURE_PATH\"".into(),
+                ],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: Some(env),
+            },
+        )
+        .expect("start non-reading child"),
+        Response::Value(_)
+    ));
+
+    let mut send_bytes = vec![b'\n'; 1024 * 1024];
+    send_bytes.extend_from_slice(b"SEND-END\n");
+    let expected_send = send_bytes.clone();
+    let send_socket = socket.clone();
+    let started = Instant::now();
+    let sender = std::thread::spawn(move || {
+        client::request(
+            &send_socket,
+            &Request::Send {
+                name: "target".into(),
+                bytes: send_bytes,
+            },
+        )
+    });
+
+    // Let Send fill the PTY and hold the per-session writer before attaching.
+    std::thread::sleep(Duration::from_millis(400));
+    let mut stream = raw_attach(&socket, "target");
+    stream
+        .write_all(b"HUMAN-ONE\n")
+        .expect("type during blocked Send");
+    let send_result = sender
+        .join()
+        .expect("send client thread")
+        .expect("send request");
+    eprintln!(
+        "probe: send -> {send_result:?} after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(send_result, Response::WriteTimeout);
+
+    // The attach pump must retain input across the timeout without replaying
+    // or detaching; this second write arrives after the original call expired.
+    stream
+        .write_all(b"HUMAN-TWO\n")
+        .expect("type after Send timeout");
+    std::thread::sleep(Duration::from_millis(2500));
+    assert_eq!(
+        target_row(&socket, "r.attached"),
+        "true",
+        "detached during stall"
+    );
+    assert!(
+        !capture_path.exists(),
+        "child must stay unread until the test releases it"
+    );
+
+    std::fs::write(&marker, b"go").expect("allow child to drain input");
+    let mut expected = expected_send;
+    expected.extend_from_slice(b"HUMAN-ONE\nHUMAN-TWO\n");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let got = std::fs::read(&capture_path).unwrap_or_default();
+        if got == expected {
+            break;
+        }
+        if Instant::now() > deadline {
+            let tail = String::from_utf8_lossy(&got[got.len().saturating_sub(60)..]);
+            let position = |needle: &[u8]| {
+                got.windows(needle.len())
+                    .position(|window| window == needle)
+            };
+            panic!(
+                "mismatch: got {} want {}, SEND-END@{:?} ONE@{:?} TWO@{:?} tail {tail:?}",
+                got.len(),
+                expected.len(),
+                position(b"SEND-END"),
+                position(b"HUMAN-ONE"),
+                position(b"HUMAN-TWO"),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(target_row(&socket, "r.attached"), "true");
+    drop(stream);
 }
 
 #[cfg(unix)]
