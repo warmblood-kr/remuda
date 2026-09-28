@@ -5,7 +5,7 @@ use crate::session::Session;
 use std::time::Duration;
 
 /// Maximum time a Sync request can hold a daemon worker.
-pub const MAX_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_TIMEOUT_MS: u64 = 20_000;
 
 /// Clamp an untrusted wire timeout to the server-side Sync limit.
 pub fn bounded_timeout_ms(timeout_ms: u64) -> u64 {
@@ -27,9 +27,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sync_timeout_is_capped_at_30s() {
+    fn sync_timeout_is_capped_at_20s() {
         assert_eq!(bounded_timeout_ms(0), 0);
         assert_eq!(bounded_timeout_ms(150), 150);
-        assert_eq!(bounded_timeout_ms(u64::MAX), MAX_TIMEOUT_MS);
+        assert_eq!(bounded_timeout_ms(u64::MAX), 20_000);
     }
 }

@@ -117,6 +117,9 @@ impl Session {
                         output_changed.1.notify_all();
                     }
                 }
+                // EOF means the child exited or its output stream was closed.
+                // Wake Sync waiters so they can observe the final screen now.
+                Self::notify_output_changed(&output_changed);
             });
         }
         Self {
@@ -394,6 +397,18 @@ impl Session {
             if snapshot.output_version.unwrap_or(0) > since {
                 return Ok(snapshot);
             }
+            // Drop the wait lock while checking process liveness. A process
+            // exit is also signalled by the registry reaper and terminate().
+            drop(guard);
+            if !self.is_alive() {
+                return Err(AgentError::Exited);
+            }
+            guard = generation
+                .lock()
+                .map_err(|_| AgentError::Io("output wait lock poisoned".into()))?;
+            if *guard != observed {
+                continue;
+            }
             let remaining = deadline.saturating_sub(self.clock.now());
             if remaining.is_zero() {
                 return Ok(snapshot);
@@ -409,12 +424,23 @@ impl Session {
     }
 
     pub fn is_alive(&self) -> bool {
-        match self.agent.lock() {
+        let alive = match self.agent.lock() {
             Ok(mut agent) => agent.is_alive(),
             // A poisoned lock means a writer panicked mid-session. Reporting
             // "alive" would invite more writes into a session whose state is
             // unknown.
             Err(_) => false,
+        };
+        if !alive {
+            Self::notify_output_changed(&self.output_changed);
+        }
+        alive
+    }
+
+    fn notify_output_changed(output_changed: &Arc<(Mutex<u64>, Condvar)>) {
+        if let Ok(mut generation) = output_changed.0.lock() {
+            *generation = (*generation).wrapping_add(1);
+            output_changed.1.notify_all();
         }
     }
 
@@ -435,7 +461,12 @@ impl Session {
             .agent
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-        agent.terminate()
+        let result = agent.terminate();
+        drop(agent);
+        if result.is_ok() {
+            Self::notify_output_changed(&self.output_changed);
+        }
+        result
     }
 
     /// Take hold for a human at a terminal, displacing any current holder.

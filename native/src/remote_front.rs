@@ -234,7 +234,7 @@ mod tests {
                 since: 0,
                 timeout_ms: u64::MAX,
             }),
-            std::time::Duration::from_secs(35)
+            std::time::Duration::from_secs(25)
         );
         assert_eq!(request_timeout(&Request::List), CONNECTION_TIMEOUT);
     }

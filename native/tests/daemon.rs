@@ -465,6 +465,49 @@ fn sync_times_out_with_the_current_unchanged_frame() {
 }
 
 #[test]
+fn sync_waiter_wakes_when_child_exits() {
+    let runtime = scratch_dir("sync-child-exit");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let since = capture_version(&socket);
+    let request_socket = socket.clone();
+    let started = Instant::now();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: None,
+                since,
+                timeout_ms: 10_000,
+            },
+        )
+        .expect("sync response after child exit")
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        matches!(
+            client::request(
+                &socket,
+                &Request::Close {
+                    name: "versioned".into(),
+                },
+            ),
+            Ok(Response::Ok)
+        ),
+        "closing the child must succeed while Sync is waiting"
+    );
+    let response = request.join().expect("sync worker");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "child exit must wake the waiter before its Sync timeout"
+    );
+    assert!(matches!(response, Response::Error(message) if message.contains("exited")));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
 fn sync_rejects_a_wrong_instance_without_waiting() {
     let runtime = scratch_dir("sync-wrong-instance");
     let socket = daemon::socket_path_in(&runtime, "s");
