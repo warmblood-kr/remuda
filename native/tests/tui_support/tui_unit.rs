@@ -2556,9 +2556,12 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
 
-    let dir = std::env::temp_dir().join(format!("remuda-tui-busy-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("make private busy daemon directory");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("remuda-tui-busy-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).expect("create unique busy daemon directory");
     let socket = dir.join("s.sock");
     drop(UnixListener::bind(&socket).expect("bind private endpoint"));
     let lock_path = dir.join("s.sock.lock");
