@@ -3,6 +3,7 @@
 
 use crate::client::{self, RawMode};
 use remuda_core::agent::StyledCell;
+use remuda_core::clock::Clock;
 use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
 use std::io::{self, Write};
@@ -15,28 +16,42 @@ pub struct ClusterUi {
     selected: usize,
     active: usize,
     expanded: bool,
+    synced_at: Duration,
+    snapshot_at: Option<Duration>,
 }
 
 impl ClusterUi {
-    pub fn new(node: &str, sessions: Vec<SessionSummary>) -> Self {
+    pub fn new(node: &str, sessions: Vec<SessionSummary>, synced_at: Duration) -> Self {
         Self {
             node: node.into(),
             sessions,
             selected: 0,
             active: 0,
             expanded: true,
+            synced_at,
+            snapshot_at: None,
         }
     }
 
-    pub fn render(&self, cols: u16, rows: u16, screen: &str) -> String {
+    pub fn sync_completed(&mut self, at: Duration) {
+        self.synced_at = at;
+    }
+
+    pub fn capture_completed(&mut self, at: Duration) {
+        self.snapshot_at = Some(at);
+    }
+
+    pub fn render(&self, cols: u16, rows: u16, screen: &str, clock: &dyn Clock) -> String {
         let width = usize::from(cols.max(1));
         let height = usize::from(rows.max(1));
+        let now = clock.now();
         let mut frame = Vec::new();
         frame.push("remuda · cluster (1/1 reachable)".into());
         frame.push(format!(
-            "{} {}       local · reachable · sync 0s",
+            "{} {}       local · reachable · sync {}s",
             if self.expanded { "▼" } else { "▶" },
-            self.node
+            self.node,
+            age_seconds(now, self.synced_at)
         ));
         if self.expanded {
             for (index, session) in self.sessions.iter().enumerate() {
@@ -53,10 +68,11 @@ impl ClusterUi {
             || format!("{} · no sessions", self.node),
             |session| {
                 format!(
-                    "{} / {} · {} · snapshot 0s ago",
+                    "{} / {} · {} · snapshot {}s ago",
                     self.node,
                     session.name,
-                    if session.alive { "live" } else { "ended" }
+                    if session.alive { "live" } else { "ended" },
+                    age_seconds(now, self.snapshot_at.unwrap_or(now))
                 )
             },
         );
@@ -112,6 +128,10 @@ impl ClusterUi {
     }
 }
 
+fn age_seconds(now: Duration, since: Duration) -> u64 {
+    now.saturating_sub(since).as_secs()
+}
+
 fn truncate(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
 }
@@ -126,7 +146,7 @@ fn list(path: &Path) -> io::Result<Vec<SessionSummary>> {
     }
 }
 
-fn screen(path: &Path, name: &str) -> io::Result<String> {
+fn screen(path: &Path, name: &str, clock: &dyn Clock) -> io::Result<(String, Duration)> {
     let response = client::request(
         path,
         &Request::CaptureStyled {
@@ -135,18 +155,21 @@ fn screen(path: &Path, name: &str) -> io::Result<String> {
         },
     )
     .map_err(io::Error::other)?;
+    let captured_at = clock.now();
     match response {
-        Response::StyledScreen { rows, .. } => Ok(rows
-            .iter()
-            .map(|row| {
-                let cells = expand_runs(row);
-                cells
-                    .iter()
-                    .map(|cell: &StyledCell| cell.text.as_str())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")),
+        Response::StyledScreen { rows, .. } => Ok((
+            rows.iter()
+                .map(|row| {
+                    let cells = expand_runs(row);
+                    cells
+                        .iter()
+                        .map(|cell: &StyledCell| cell.text.as_str())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            captured_at,
+        )),
         Response::Error(error) => Err(io::Error::other(error)),
         other => Err(io::Error::other(format!(
             "unexpected CaptureStyled response: {other:?}"
@@ -155,8 +178,11 @@ fn screen(path: &Path, name: &str) -> io::Result<String> {
 }
 
 pub fn run(path: &Path, node: &str, target: Option<&str>) -> io::Result<()> {
-    let _raw = RawMode::enable()?;
-    run_loop(path, node, target)
+    let terminal_mode = RawMode::enable()?;
+    let clock = crate::SystemClock::new();
+    let result = run_loop(path, node, target, &clock);
+    drop(terminal_mode);
+    result
 }
 
 /// Read one local-only frame through the existing List and CaptureStyled IPC.
@@ -167,32 +193,42 @@ pub fn read_frame(
     cols: u16,
     rows: u16,
 ) -> io::Result<String> {
-    let mut ui = ClusterUi::new(node, list(path)?);
+    let clock = crate::SystemClock::new();
+    let mut ui = ClusterUi::new(node, list(path)?, clock.now());
     ui.select_target(target)?;
-    let body = ui
-        .sessions
-        .get(ui.active)
-        .map(|session| screen(path, &session.name))
-        .transpose()?
-        .unwrap_or_default();
-    Ok(ui.render(cols, rows, &body))
+    let body = match ui.sessions.get(ui.active) {
+        Some(session) => {
+            let (body, captured_at) = screen(path, &session.name, &clock)?;
+            ui.capture_completed(captured_at);
+            body
+        }
+        None => String::new(),
+    };
+    Ok(ui.render(cols, rows, &body, &clock))
 }
 
-fn run_loop(path: &Path, node: &str, target: Option<&str>) -> io::Result<()> {
-    let mut ui = ClusterUi::new(node, list(path)?);
+fn run_loop(path: &Path, node: &str, target: Option<&str>, clock: &dyn Clock) -> io::Result<()> {
+    let mut ui = ClusterUi::new(node, list(path)?, clock.now());
     ui.select_target(target)?;
     loop {
-        let current = list(path).unwrap_or_else(|_| ui.sessions.clone());
-        ui.sessions = current;
+        if let Ok(current) = list(path) {
+            ui.sessions = current;
+            ui.sync_completed(clock.now());
+        }
         ui.selected = ui.selected.min(ui.sessions.len().saturating_sub(1));
         ui.active = ui.active.min(ui.sessions.len().saturating_sub(1));
-        let body = ui
+        let captured = ui
             .sessions
             .get(ui.active)
-            .and_then(|s| screen(path, &s.name).ok())
-            .unwrap_or_default();
+            .and_then(|session| screen(path, &session.name, clock).ok());
+        let body = if let Some((captured, captured_at)) = captured {
+            ui.capture_completed(captured_at);
+            captured
+        } else {
+            String::new()
+        };
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let frame = ui.render(cols, rows, &body);
+        let frame = ui.render(cols, rows, &body, clock);
         crossterm::execute!(
             io::stdout(),
             crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
@@ -216,6 +252,7 @@ fn run_loop(path: &Path, node: &str, target: Option<&str>) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::ClusterUi;
+    use remuda_core::clock::{Clock, ManualClock};
     use remuda_core::{SessionSummary, Size};
     use std::time::Duration;
 
@@ -234,8 +271,10 @@ mod tests {
 
     #[test]
     fn local_node_is_expanded_and_tree_header_names_selected_target() {
-        let ui = ClusterUi::new("studio", sessions());
-        let frame = ui.render(80, 24, "snapshot");
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.capture_completed(clock.now());
+        let frame = ui.render(80, 24, "snapshot", &clock);
         assert!(frame.contains("▼ studio       local"));
         assert!(frame.contains("    dev          live"));
         assert!(frame.contains("studio / dev · live · snapshot 0s ago"));
@@ -254,10 +293,27 @@ mod tests {
             human_idle: None,
             mouse_tracking: false,
         });
-        let mut ui = ClusterUi::new("studio", sessions);
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions, clock.now());
         ui.key(crossterm::event::KeyCode::Down);
-        assert!(ui.render(80, 24, "").contains("studio / dev · live"));
+        assert!(ui
+            .render(80, 24, "", &clock)
+            .contains("studio / dev · live"));
         ui.key(crossterm::event::KeyCode::Enter);
-        assert!(ui.render(80, 24, "").contains("studio / shell · live"));
+        assert!(ui
+            .render(80, 24, "", &clock)
+            .contains("studio / shell · live"));
+    }
+
+    #[test]
+    fn snapshot_and_sync_ages_follow_the_injected_clock() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.capture_completed(clock.now());
+        ui.sync_completed(clock.now());
+        clock.advance(Duration::from_secs(5));
+        let frame = ui.render(80, 24, "snapshot", &clock);
+        assert!(frame.contains("local · reachable · sync 5s"));
+        assert!(frame.contains("studio / dev · live · snapshot 5s ago"));
     }
 }
