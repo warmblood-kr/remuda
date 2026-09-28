@@ -612,6 +612,66 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
 }
 
 #[test]
+fn any_key_after_attached_session_exit_restores_the_terminal() {
+    let dir = scratch_dir("attach-exit-any-key");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec!["sh".into(), "-c".into(), "sleep 1".into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start short-lived target");
+    assert_eq!(created, Response::Value("target".into()));
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach().expect("attach viewer");
+    let output = held.subscribe().expect("capture viewer output");
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let response = client::request(&path, &Request::List).expect("list after target exit");
+        let target_present = match response {
+            Response::Sessions(sessions) => sessions.iter().any(|s| s.name == "target"),
+            other => panic!("list: {other:?}"),
+        };
+        if !target_present {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "short-lived target was not reaped"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let ended = collect_until_bytes(&output, b"ended");
+    assert!(ended
+        .windows(b"press any key".len())
+        .any(|w| w == b"press any key"));
+
+    held.write_raw(b"k").expect("release attach with any key");
+    let restored = collect_until_bytes(
+        &output,
+        b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
+    );
+    assert!(
+        restored.contains(&0x1b),
+        "terminal reset sequence was not emitted"
+    );
+}
+
+#[test]
 fn session_listing_reports_the_child_mouse_tracking_mode() {
     let path = scratch("mouse-tracking-list");
     let _daemon = daemon_at(&path);
