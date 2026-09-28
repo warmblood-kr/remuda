@@ -5,7 +5,7 @@
 #   curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | sh
 #
 #   REMUDA_CHANNEL=stable|nightly   default: the channel already installed, else stable
-#   REMUDA_INSTALL_DIR=<dir>        default: ~/.local/bin
+#   REMUDA_INSTALL_DIR=<dir>        default: ~/.local/bin (Termux: $PREFIX/bin)
 #
 # Windows has its own installer, docs/install.ps1, because a `uname` case arm
 # cannot run there. The two hold disjoint halves of one platform list and
@@ -58,8 +58,22 @@ esac
 # fails the build when they drift.
 os=$(uname -s)
 arch=$(uname -m)
+# Termux runs on Android but normally reports Linux from `uname -s`. Its
+# package prefix or `uname -o` identifies the Android environment explicitly.
+termux=no
+case "${PREFIX:-}" in
+*com.termux*) termux=yes ;;
+esac
+if [ "$termux" != yes ]; then
+	os_type=$(uname -o 2>/dev/null || true)
+	[ "$os_type" = Android ] && termux=yes
+fi
+if [ "$termux" = yes ]; then
+	os=Android
+fi
 case "$os/$arch" in
 Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
+Android/aarch64|Android/arm64) target=aarch64-linux-android ;;
 Darwin/arm64) target=aarch64-apple-darwin ;;
 *) die "no prebuilt binary for $os/$arch — build from source: cargo install --git https://github.com/$REPO" ;;
 esac
@@ -115,7 +129,11 @@ sha256 -c expected >/dev/null || die "checksum mismatch on $asset — refusing t
 tar -xzf "$asset"
 [ -f remuda ] || die "$asset does not contain ./remuda"
 
-install_dir="${REMUDA_INSTALL_DIR:-$HOME/.local/bin}"
+install_dir_default="$HOME/.local/bin"
+if [ "$termux" = yes ] && [ -n "${PREFIX:-}" ]; then
+	install_dir_default="$PREFIX/bin"
+fi
+install_dir="${REMUDA_INSTALL_DIR:-$install_dir_default}"
 mkdir -p "$install_dir" "$data_dir"
 
 # Land it by rename, never by writing in place: `remuda upgrade` runs this while
