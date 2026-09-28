@@ -749,6 +749,7 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         cmd.env("REMUDA_EXIT_STATUS", &exit_status);
         cmd
     };
+    cmd.env("REMUDA_TRACE_ATTACH_EXIT", "1");
     cmd.env("REMUDA_RUNTIME_DIR", &dir);
     let viewer = Session::new(
         "viewer",
@@ -756,7 +757,7 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         Arc::new(SystemClock::new()),
     );
     let held = viewer.attach().expect("attach viewer");
-    let _output = held.subscribe().expect("capture viewer output");
+    let viewer_output = held.subscribe().expect("capture viewer output");
     let deadline = Instant::now() + PATIENCE;
     loop {
         let response = client::request(&path, &Request::List).expect("list after target exit");
@@ -783,7 +784,9 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
     while viewer.is_alive() {
         assert!(
             Instant::now() < deadline,
-            "attach client did not exit after one key"
+            "attach client did not exit after one key; terminal bytes:\n{}\nviewer screen:\n{}",
+            String::from_utf8_lossy(&viewer_output.try_iter().flatten().collect::<Vec<_>>()),
+            viewer.screen_text().expect("viewer screen on timeout"),
         );
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -795,9 +798,18 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
     );
     #[cfg(unix)]
     let _restored = collect_until_bytes(
-        &_output,
+        &viewer_output,
         b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
     );
+    if std::env::var_os("REMUDA_TRACE_ATTACH_EXIT").is_some() {
+        eprintln!(
+            "attach input trace terminal bytes:\n{}\nviewer screen:\n{}",
+            String::from_utf8_lossy(&_restored),
+            viewer
+                .screen_text()
+                .expect("viewer screen after attach exit"),
+        );
+    }
 }
 
 #[test]
