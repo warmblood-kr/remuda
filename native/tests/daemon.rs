@@ -188,12 +188,9 @@ fn assert_detach_restore(receiver: &Receiver<Vec<u8>>) {
         let received = collect_until_bytes(receiver, b"remuda: detached from target");
         assert_bytes_in_order(
             &received,
-            &[
-                b"echo $((6*7))-typed",
-                b"\x1b[?2004l",
-                b"42-typed",
-                b"remuda: detached from target",
-            ],
+            // ConPTY strips the mouse resets and reorders the shell's own
+            // ?2004l, so only the typed round trip and the detach are stable.
+            &[b"42-typed", b"remuda: detached from target"],
         );
     }
 }
