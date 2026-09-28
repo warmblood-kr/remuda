@@ -1088,7 +1088,19 @@ fn render_styled_of_the_session_list_moves_the_real_brand_to_the_footer() {
 
     let cells = vec![text_row(10); 23];
     let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
-
+    let first_line = out
+        .split("\x1b[1;1H\x1b[K")
+        .nth(1)
+        .and_then(|row| row.split("\x1b[2;1H").next())
+        .expect("first body row");
+    assert!(
+        first_line.contains("alpha"),
+        "first row has the first session: {first_line:?}"
+    );
+    assert!(
+        first_line.contains("xxxxxxxxxx"),
+        "preview starts on row one: {first_line:?}"
+    );
     assert!(
         !out.contains("remuda · default│"),
         "the server brand is no longer in the pane header"
@@ -1318,8 +1330,8 @@ fn the_status_dot_counts_as_one_column() {
 
 #[test]
 fn the_list_has_no_caret_column_at_any_depth() {
-    // Each row is exactly Lua's block row fitted to the list: no gutter, so
-    // every row is two columns narrower than with the old caret column.
+    // The dot column stays fixed while the tree indentation consumes name
+    // space, with no gutter or caret column.
     let path = scratch_socket("no-caret");
     daemon_at(&path);
     for name in ["alpha", "bravo", "charlie"] {
@@ -1341,8 +1353,16 @@ fn the_list_has_no_caret_column_at_any_depth() {
     apply_session_order(&mut ui, None, &order);
     ui.session_rows = rows;
     ui.sessions_text = lines.clone();
+    let mut dot_column = None;
     for (r, text) in lines.iter().enumerate() {
-        assert_eq!(list_row(&ui, r, width), fit(text, width), "row {r}");
+        let rendered = list_row(&ui, r, width);
+        if let Some(dot) = rendered.find('●') {
+            let column = visible_width(&rendered[..dot]);
+            assert_eq!(column, width as usize - 4, "row {r} dot column");
+            assert_eq!(dot_column.get_or_insert(column), &column);
+        } else {
+            assert_eq!(rendered, fit(text, width), "blank row {r}");
+        }
     }
 }
 
@@ -1464,7 +1484,7 @@ fn the_attached_marker_stays_on_the_name_row_at_narrow_widths() {
 }
 
 #[test]
-fn an_attached_horse_survives_long_name_cropping_at_16_and_40_cells() {
+fn long_names_keep_the_status_dot_aligned_and_attached_horse_visible() {
     const ATTACHED: &str = "attached-name-abcdefghijklmnopqrstuvwxyz-한글";
     const PLAIN: &str = "plain-name-abcdefghijklmnopqrstuvwxyz-한글";
     let path = scratch_socket("attached-marker-long-name");
@@ -1498,11 +1518,22 @@ fn an_attached_horse_survives_long_name_cropping_at_16_and_40_cells() {
         assert_eq!(visible_width(&attached), width as usize);
 
         let plain = list_row(&ui, rows, width);
-        assert_eq!(
-            plain,
-            fit(&lines[rows], width),
-            "unattached rows retain normal fitting"
+        assert!(
+            plain.contains('→'),
+            "the long name is ellipsized: {plain:?}"
         );
+        assert!(
+            plain.ends_with("\x1b[0m   "),
+            "dot column is reserved: {plain:?}"
+        );
+        assert_eq!(visible_width(&plain), width as usize);
+
+        let attached_dot = visible_width(&attached[..attached.find('●').unwrap()]);
+        let plain_dot = visible_width(&plain[..plain.find('●').unwrap()]);
+        assert_eq!(attached_dot, width as usize - 4, "attached dot column");
+        assert_eq!(plain_dot, attached_dot, "both rows align their dots");
+        assert!(attached.is_char_boundary(attached.find('●').unwrap()));
+        assert!(plain.is_char_boundary(plain.find('●').unwrap()));
     }
 }
 

@@ -1526,27 +1526,29 @@ fn list_row(ui: &Ui, row: usize, width: u16) -> String {
     fit_session_row(&content, width)
 }
 
-/// Keep the attached horse and live/dead dot visible when a name is longer
-/// than its row. Both suffixes are fixed-width Lua output; only the styled
-/// name is shortened, one Unicode scalar at a time, by `fit`.
+/// Keep the status dot in one shared column on every row. Attached rows use
+/// the horse in the final three cells; other rows reserve the same cells.
+/// Only the styled name is shortened, one Unicode scalar at a time, by `fit`.
 fn fit_session_row(content: &str, width: u16) -> String {
     const MARKER: &str = " 🏇";
-    let Some(without_marker) = content.strip_suffix(MARKER) else {
-        return fit(content, width);
-    };
-
+    const PLAIN_PAD: &str = "   ";
     for state in [" \x1b[32m●\x1b[0m", " \x1b[31m●\x1b[0m"] {
-        if let Some(name) = without_marker.strip_suffix(state) {
-            let reserved = (visible_width(state) + visible_width(MARKER)) as u16;
-            let name_width = width.saturating_sub(reserved);
-            return format!("{}{}{}", fit(name, name_width), state, MARKER);
+        if let Some(name) = content.strip_suffix(state) {
+            let suffix = format!("{state}{PLAIN_PAD}");
+            let name_width = width.saturating_sub(visible_width(&suffix) as u16);
+            return format!("{}{}", fit(name, name_width), suffix);
+        }
+        let attached = format!("{state}{MARKER}");
+        if let Some(name) = content.strip_suffix(&attached) {
+            let name_width = width.saturating_sub(visible_width(&attached) as u16);
+            return format!("{}{}", fit(name, name_width), attached);
         }
     }
-
-    // Preserve the horse even if an extension replaces the expected state
-    // dot styling; the normal Lua path above also reserves the dot.
-    let name_width = width.saturating_sub(visible_width(MARKER) as u16);
-    format!("{}{}", fit(without_marker, name_width), MARKER)
+    if let Some(name) = content.strip_suffix(MARKER) {
+        let name_width = width.saturating_sub(visible_width(MARKER) as u16);
+        return format!("{}{}", fit(name, name_width), MARKER);
+    }
+    fit(content, width)
 }
 
 /// The crop notice moved here when the preview lost its title band: a crop that
