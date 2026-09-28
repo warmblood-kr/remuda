@@ -204,8 +204,7 @@ fn identity_from_parts(bytes: &[u8]) -> io::Result<NodeIdentity> {
     })
 }
 
-#[cfg(not(windows))]
-fn node_name(fingerprint: &str) -> String {
+pub(super) fn node_name(fingerprint: &str) -> String {
     let suffix: String = fingerprint
         .strip_prefix("SHA256:")
         .unwrap_or(fingerprint)
