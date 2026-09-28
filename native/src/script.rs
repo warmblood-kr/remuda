@@ -28,7 +28,8 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 61] = [
+pub const BINDINGS: [&str; 66] = [
+    "_advice_reattach",
     "_call",
     "_descriptors",
     "_dispatch_extension_command",
@@ -44,6 +45,9 @@ pub const BINDINGS: [&str; 61] = [
     "_run_due_schedules",
     "_schedule_fire_counts",
     "_sync_window_shown",
+    "advice_list",
+    "advice_member",
+    "advise",
     "attach",
     "buffer",
     "buffers",
@@ -88,6 +92,7 @@ pub const BINDINGS: [&str; 61] = [
     "tool",
     "tools",
     "type_text",
+    "unadvise",
     "window",
     "windows",
 ];
@@ -505,6 +510,18 @@ fn exec_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
 /// A top-level mod first gets its `requires` checked as a whole, then its
 /// lifecycle hosts activated in order (exec leaves an active one alone).
 fn execute_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Result<()> {
+    let loaded = load_package(lua, name, require_lifecycle);
+    // A mod that redefined an advised function keeps its advice: the new
+    // definition becomes the base (hook-design §2). Even after a failed
+    // load, which may have redefined some before it stopped.
+    let remuda: Table = lua.globals().get("remuda")?;
+    if let Ok(reattach) = remuda.get::<mlua::Function>("_advice_reattach") {
+        reattach.call::<()>(())?;
+    }
+    loaded
+}
+
+fn load_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Result<()> {
     if !name.contains('/') {
         for host in crate::packages::requirement_order(name).map_err(mlua::Error::runtime)? {
             let lifecycle = crate::packages::resolve(&host)

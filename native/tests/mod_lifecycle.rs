@@ -694,3 +694,134 @@ fn registrations_made_in_a_mods_extent_are_owned_and_replaced_on_reload() {
         )
         .is_err());
 }
+
+/// Hook-design (c): a mod's advice (declared, or from its `start`) is owned
+/// like its hooks: reload replaces it, a failed reload keeps the old set, and
+/// dropping it all restores the original function. Outside advice stays.
+#[test]
+fn a_mods_advice_is_owned_and_replaced_on_reload() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let entry = home.entry();
+    write_entry(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return { calls = 0 } end,
+          start = function()
+            remuda.advise("remuda._adv_host", "around", function(orig, x) return "i(" .. orig(x) .. ")" end, { id = "imp", depth = 10 })
+          end,
+          advice = {{ path = "remuda._adv_host", how = "around", id = "decl", run = function(state, orig, x)
+            state.calls = state.calls + 1
+            return "d" .. state.calls .. "(" .. orig(x) .. ")"
+          end }},
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-advice.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "function remuda._adv_host(x) return x end");
+    read_value(&image, "remuda.advise('remuda._adv_host', 'around', function(orig, x) return 'o(' .. orig(x) .. ')' end, { id = 'outside', depth = -50 })");
+    read_value(
+        &image,
+        "remuda.exec('sample'); for _ = 1, 3 do remuda.reload('sample') end",
+    );
+    let listed = "local r = {} for _, a in ipairs(remuda.advice_list('remuda._adv_host')) do \
+                  r[#r + 1] = a.id .. '@' .. tostring(a.owner) end return table.concat(r, ',')";
+    assert_eq!(
+        read_value(&image, listed),
+        "outside@nil,decl@sample,imp@sample"
+    );
+    assert_eq!(
+        read_value(&image, "return remuda._adv_host('x')"),
+        "o(d1(i(x)))"
+    );
+
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function()
+            remuda.advise("remuda._adv_host", "override", function() return "v2" end, { id = "v2" })
+            error("v2 start fails")
+          end }"#,
+    );
+    assert!(image.eval("remuda.reload('sample')", None).is_err());
+    assert_eq!(
+        read_value(&image, listed),
+        "outside@nil,decl@sample,imp@sample"
+    );
+    assert_eq!(
+        read_value(&image, "return remuda._adv_host('x')"),
+        "o(d2(i(x)))"
+    );
+
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1, initialize = function() return {} end }"#,
+    );
+    read_value(&image, "remuda.reload('sample')");
+    assert_eq!(read_value(&image, listed), "outside@nil");
+    read_value(&image, "remuda.unadvise('remuda._adv_host', 'outside')");
+    assert_eq!(read_value(&image, "return remuda._adv_host('x')"), "x");
+}
+
+/// PR #144 / butler-qa advice144 row 4: when the mod's advice is all a path
+/// has, reload recreates that path's trampoline. A failing start must leave
+/// the LIVE function equal to the previous activation's, not merely
+/// `advice_list`.
+#[test]
+fn a_failed_start_leaves_the_live_advised_function_as_before() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let entry = home.entry();
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          advice = {{ path = "remuda._adv_only", how = "around", id = "v1",
+            run = function(state, orig, x) return "[" .. orig(x) .. "]" end }} }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-lifecycle-advice-live.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(&image, "function remuda._adv_only(x) return x end");
+    read_value(&image, "remuda.exec('sample')");
+    assert_eq!(read_value(&image, "return remuda._adv_only('x')"), "[x]");
+
+    write_entry(
+        &entry,
+        r#"return { api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          advice = {{ path = "remuda._adv_only", how = "around", id = "v2",
+            run = function(state, orig, x) return "<" .. orig(x) .. ">" end }},
+          start = function()
+            remuda.advise("remuda._adv_only", "filter_return", function(r) return r .. "!" end, { id = "late" })
+            error("v2 start fails")
+          end }"#,
+    );
+    assert!(image.eval("remuda.reload('sample')", None).is_err());
+    assert_eq!(read_value(&image, "return remuda._adv_only('x')"), "[x]");
+    assert_eq!(
+        read_value(&image, "local r = {} for _, a in ipairs(remuda.advice_list('remuda._adv_only')) do r[#r + 1] = a.id end return table.concat(r, ',')"),
+        "v1"
+    );
+}
