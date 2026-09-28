@@ -105,9 +105,117 @@ fn reject_low_order_dh(private_key: &[u8], public_key: &[u8]) -> io::Result<()> 
     let mut shared = Zeroizing::new([0; 32]);
     dh.dh(public_key, &mut shared[..]).map_err(frame_error)?;
     if shared.iter().all(|byte| *byte == 0) {
-        return Err(invalid_frame());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "low-order Noise DH result",
+        ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn request_with_low_order_key(
+    responder_static: &[u8],
+    low_order_static: bool,
+) -> io::Result<Vec<u8>> {
+    use snow::resolvers::{CryptoResolver, DefaultResolver};
+    use snow::types::{Cipher, Dh, Hash, Random};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct LowOrderResolver {
+        dh_instances: AtomicUsize,
+        zero_static: bool,
+    }
+
+    struct LowOrderDh {
+        inner: Box<dyn Dh>,
+        zero_public: bool,
+    }
+
+    impl Dh for LowOrderDh {
+        fn name(&self) -> &'static str {
+            self.inner.name()
+        }
+        fn pub_len(&self) -> usize {
+            self.inner.pub_len()
+        }
+        fn priv_len(&self) -> usize {
+            self.inner.priv_len()
+        }
+        fn set(&mut self, private: &[u8]) {
+            self.inner.set(private);
+        }
+        fn generate(&mut self, rng: &mut dyn Random) -> Result<(), snow::Error> {
+            self.inner.generate(rng)
+        }
+        fn pubkey(&self) -> &[u8] {
+            if self.zero_public {
+                &[0; 32]
+            } else {
+                self.inner.pubkey()
+            }
+        }
+        fn privkey(&self) -> &[u8] {
+            self.inner.privkey()
+        }
+        fn dh(&self, public: &[u8], out: &mut [u8]) -> Result<(), snow::Error> {
+            if self.zero_public {
+                out.fill(0);
+                Ok(())
+            } else {
+                self.inner.dh(public, out)
+            }
+        }
+    }
+
+    impl CryptoResolver for LowOrderResolver {
+        fn resolve_rng(&self) -> Option<Box<dyn Random>> {
+            DefaultResolver.resolve_rng()
+        }
+        fn resolve_dh(&self, choice: &snow::params::DHChoice) -> Option<Box<dyn Dh>> {
+            let instance = self.dh_instances.fetch_add(1, Ordering::Relaxed);
+            let zero_public = if instance == 0 {
+                self.zero_static
+            } else {
+                instance == 1 && !self.zero_static
+            };
+            Some(Box::new(LowOrderDh {
+                inner: DefaultResolver.resolve_dh(choice)?,
+                zero_public,
+            }))
+        }
+        fn resolve_hash(&self, choice: &snow::params::HashChoice) -> Option<Box<dyn Hash>> {
+            DefaultResolver.resolve_hash(choice)
+        }
+        fn resolve_cipher(&self, choice: &snow::params::CipherChoice) -> Option<Box<dyn Cipher>> {
+            DefaultResolver.resolve_cipher(choice)
+        }
+    }
+
+    let initiator = snow::Builder::new(parse_pattern()?)
+        .generate_keypair()
+        .map_err(frame_error)?;
+    let resolver = LowOrderResolver {
+        dh_instances: AtomicUsize::new(0),
+        zero_static: low_order_static,
+    };
+    let mut handshake = snow::Builder::with_resolver(parse_pattern()?, Box::new(resolver))
+        .prologue(NOISE_PROLOGUE)
+        .map_err(frame_error)?
+        .local_private_key(&initiator.private)
+        .map_err(frame_error)?
+        .remote_public_key(responder_static)
+        .map_err(frame_error)?
+        .build_initiator()
+        .map_err(frame_error)?;
+    let mut plaintext = 1_000_i64.to_be_bytes().to_vec();
+    plaintext.extend_from_slice(b"{}");
+    let mut message = vec![0; MAX_FRAME_SIZE];
+    let length = handshake
+        .write_message(&plaintext, &mut message)
+        .map_err(frame_error)?;
+    message.truncate(length);
+    Ok(message)
 }
 
 /// Encrypt a response as Noise IK message 2.
@@ -159,6 +267,19 @@ mod tests {
             .generate_keypair()
             .unwrap();
         assert!(reject_low_order_dh(&private, &peer.public).is_ok());
+    }
+
+    #[test]
+    fn open_request_identifies_low_order_ephemeral_and_static_keys() {
+        let responder = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        for low_order_static in [false, true] {
+            let message = request_with_low_order_key(&responder.public, low_order_static).unwrap();
+            assert!(message.len() > 32);
+            let error = open_request(&responder.private, &message).err().unwrap();
+            assert_eq!(error.to_string(), "low-order Noise DH result");
+        }
     }
 
     #[test]
