@@ -679,12 +679,32 @@ fn ui_layout(ui: &Ui, term_cols: u16) -> (u16, u16) {
         return (0, term_cols);
     }
     let usable = term_cols.saturating_sub(1);
-    let automatic = layout(term_cols, widest(ui)).0;
+    let automatic = content_list_width(ui, usable);
     let list = ui
         .list_width
         .unwrap_or(automatic)
         .clamp(16, usable.saturating_sub(16));
     (list, usable.saturating_sub(list))
+}
+
+/// Fit the automatic list pane to its longest rendered row, leaving a little
+/// room at the right edge. `sessions_text` is the Lua-owned rendered content;
+/// before its first refresh, session names give us a useful estimate instead.
+fn content_list_width(ui: &Ui, usable: u16) -> u16 {
+    let longest = ui
+        .sessions_text
+        .iter()
+        .map(|line| visible_width(line))
+        .max()
+        .unwrap_or_else(|| {
+            ui.sessions
+                .iter()
+                .map(|session| visible_width(&session.name) + 2)
+                .max()
+                .unwrap_or(0)
+        });
+    let wanted = longest.saturating_add(2).min(u16::MAX as usize) as u16;
+    wanted.clamp(16, 40).min(usable)
 }
 
 /// Display columns a unit of session content claims. `char`'s answer of 1
@@ -1448,6 +1468,7 @@ fn cells_with_selection(ui: &Ui, cells: &[Vec<StyledCell>]) -> Vec<Vec<StyledCel
 /// The widest session in the herd, which is what the preview column claims —
 /// from the herd rather than the cursor, so the divider does not jump. Zero
 /// when there is no herd: nothing to preview, so nothing to reserve.
+#[cfg(test)]
 fn widest(ui: &Ui) -> u16 {
     ui.sessions.iter().map(|s| s.size.cols()).max().unwrap_or(0)
 }
