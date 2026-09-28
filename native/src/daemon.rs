@@ -17,6 +17,7 @@ use crate::ipc::{self, Listener, Stream, TryClone};
 use crate::process_ancestry;
 use crate::pty::PtyAgent;
 use interprocess::local_socket::traits::ListenerExt;
+#[cfg(unix)]
 use interprocess::local_socket::traits::Stream as LocalStream;
 use remuda_core::agent::Result as AgentResult;
 use remuda_core::protocol::{collapse_runs, Request, Response};
@@ -652,24 +653,35 @@ fn handle(
 
 fn deferred_reply(
     stream: Stream,
-    mut reader: BufReader<Stream>,
+    reader: BufReader<Stream>,
     image: &Image,
     id: u64,
 ) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mut reader = reader;
+    #[cfg(unix)]
     if let Err(error) = stream.set_nonblocking(true) {
         image.pending_replies().abandon(id);
         return Err(error);
     }
     let result = image.pending_replies().wait(id, || {
-        let mut extra = [0u8; 1];
-        match reader.read(&mut extra) {
-            Ok(0) => true,
-            Ok(_) => false,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => false,
-            Err(_) => true,
+        #[cfg(unix)]
+        {
+            let mut extra = [0u8; 1];
+            match reader.read(&mut extra) {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => false,
+                Err(_) => true,
+            }
+        }
+        #[cfg(windows)]
+        {
+            crate::ipc::peer_disconnected(reader.get_ref()).unwrap_or(true)
         }
     });
+    #[cfg(unix)]
     let _ = stream.set_nonblocking(false);
     match result {
         Ok(result) => {
