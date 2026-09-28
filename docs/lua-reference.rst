@@ -186,6 +186,11 @@ extension_command
 
 ``extension_command(name, handler(args, caller)) -> nil`` — Register a handler for an installed mod command.
 
+fail
+----
+
+``fail(message, code?) -> never (default code 1; valid codes are 1..255)`` — Raise a deliberate CLI failure with a message and exit code.
+
 feed
 ----
 
