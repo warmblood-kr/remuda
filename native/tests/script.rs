@@ -22,6 +22,9 @@ fn scratch(tag: &str) -> PathBuf {
 
 /// Start a daemon and return once it actually answers, not once it was spawned.
 fn daemon_at(path: &Path) -> impl Drop {
+    // Deprecated flat API aliases are exercised by frozen compatibility
+    // fixtures; their notices are runtime behavior, not test output.
+    std::env::set_var("REMUDA_SUPPRESS_DEPRECATIONS", "1");
     let serving = path.to_path_buf();
     std::thread::spawn(move || {
         let _ = daemon::serve(&serving);
@@ -129,6 +132,14 @@ fn the_bound_surface_is_exactly_the_protocols() {
         local want = "{expected}"
         if got ~= want then
           error("bound surface is " .. got .. ", expected " .. want)
+        end
+        local session_names = {{}}
+        for key in pairs(remuda.session) do session_names[#session_names + 1] = key end
+        table.sort(session_names)
+        local session_got = table.concat(session_names, ",")
+        local session_want = "attach,close,list,new"
+        if session_got ~= session_want then
+          error("session namespace is " .. session_got .. ", expected " .. session_want)
         end
         "#
     );
