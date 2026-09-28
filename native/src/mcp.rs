@@ -185,7 +185,12 @@ fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> S
 
     match client::request(socket, &request) {
         Err(e) => ok_reply(id, tool_error(&format!("{e}"))),
-        Ok(Response::Error(reason)) => ok_reply(id, tool_error(&reason)),
+        Ok(Response::Error(reason)) => {
+            let reason = crate::image::typed_failure_message(&reason)
+                .map(|(_, message)| message.to_string())
+                .unwrap_or(reason);
+            ok_reply(id, tool_error(&reason))
+        }
         Ok(Response::Screen(screen)) => ok_reply(id, tool_text(&screen)),
         // No MCP tool asks for `CaptureStyled`, so this never arrives — spelled
         // out rather than a wildcard for the same reason as `Response::Value`
@@ -211,6 +216,9 @@ fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> S
         // the decision it left open was made rather than dropped. `steps/013`.
         Ok(Response::Value(value)) => ok_reply(id, tool_text(&value)),
         Ok(Response::Ok) => ok_reply(id, tool_text("ok")),
+        Ok(Response::AttachStarted { .. } | Response::AttachStatus { .. }) => {
+            ok_reply(id, tool_error("attach responses are not exposed over MCP"))
+        }
         Ok(Response::Sessions(sessions)) => {
             let rows: Vec<String> = sessions
                 .iter()

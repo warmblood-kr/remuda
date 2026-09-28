@@ -174,6 +174,15 @@ remuda.tool("review", "Review a session", function(name)
 end, "review(name) -> string")
 ```
 
+`remuda.fail(message, code?)` deliberately ends the current evaluation with a
+CLI failure. `message` is printed by itself to standard error; `code` defaults
+to 1 and must be between 1 and 255. The evaluation stops immediately, so this
+is useful for command handlers that need a clean error without a Lua traceback:
+
+```lua
+if not ready then remuda.fail("service is not ready") end
+```
+
 ## Hooks
 
 `remuda.on(event, fn, {group, id, depth})` registers a hook.

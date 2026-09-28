@@ -179,7 +179,7 @@ remuda — a pty manager you can attach to
 
   remuda                        open the herd (a terminal is required)
   remuda run [-n name] <argv…>  start a program and ride it, in one act
-  remuda attach <name> [--mouse=false] hand this terminal over; Ctrl-\\ detaches
+  remuda attach <name> [--mouse=false] hand this terminal over; Ctrl-\\ detaches (2 = attached elsewhere)
   remuda ls                     list sessions
   remuda send <name> <text>     deliver one instruction (body + Enter)
 
@@ -254,7 +254,7 @@ remuda — terminal orchestration for coding agents
 
   remuda                         open the session screen
   remuda run [-n NAME] COMMAND   start and enter a session
-  remuda attach NAME             enter a session; Ctrl-\\ detaches
+  remuda attach NAME             enter a session; Ctrl-\\ detaches (exit 2 if attached elsewhere)
                                  Ctrl-] toggles mouse; wheel scrolls history
                                  --mouse=false disables mouse handling (before or after NAME)
   remuda ls | send NAME TEXT     inspect or message sessions
@@ -347,6 +347,7 @@ fn ride_with_mouse(path: &Path, name: &str, mouse: bool) -> ExitCode {
             eprintln!("remuda: you are back in your own shell");
             ExitCode::SUCCESS
         }
+        Ok(Left::TakenOver) => ExitCode::from(2),
         Err(e) => fail(format!("attach: {e}")),
     }
 }
@@ -1362,6 +1363,11 @@ fn describe(response: std::io::Result<Response>) -> String {
 }
 
 fn fail(message: impl std::fmt::Display) -> ExitCode {
+    let message = message.to_string();
+    if let Some((code, text)) = remuda_native::image::typed_failure_message(&message) {
+        eprintln!("{text}");
+        return ExitCode::from(code);
+    }
     eprintln!("remuda: {message}");
     ExitCode::FAILURE
 }
