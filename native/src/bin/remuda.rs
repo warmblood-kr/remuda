@@ -529,25 +529,29 @@ fn split_server_flag(args: &[String]) -> (&str, &[String]) {
 
 /// Run `f`, starting the named daemon first if nothing is listening yet.
 fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> ExitCode {
+    match ensure_daemon(server, path) {
+        Ok(()) => f(path),
+        Err(e) => fail(e),
+    }
+}
+
+/// Connect, or start the daemon when nothing proves one is running. The one
+/// place a connect error is worded, so no caller blames a daemon that isn't.
+fn ensure_daemon(server: &str, path: &Path) -> Result<(), String> {
     match remuda_native::ipc::connect(path) {
-        Ok(_) => {}
+        Ok(_) => Ok(()),
         Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => {
-            if let Err(e) = start_daemon(server, path) {
-                return fail(e);
-            }
+            start_daemon(server, path)
         }
         // A path the transport cannot even name proves nothing about a daemon.
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-            return fail(format!("cannot use {}: {error}", path.display()));
+            Err(format!("cannot use {}: {error}", path.display()))
         }
-        Err(error) => {
-            return fail(format!(
-                "cannot connect to remuda daemon at {}: {error}; refusing to start a second daemon",
-                path.display()
-            ));
-        }
+        Err(error) => Err(format!(
+            "cannot connect to remuda daemon at {}: {error}; refusing to start a second daemon",
+            path.display()
+        )),
     }
-    f(path)
 }
 
 /// Run an installed mod's entry file in the daemon's image. Resolves through
@@ -853,18 +857,7 @@ fn doc_command(path: &Path, args: &[&str]) -> ExitCode {
 }
 
 fn reload_mod_in_daemon(server: &str, path: &Path, name: &str) -> Result<(), String> {
-    match remuda_native::ipc::connect(path) {
-        Ok(_) => {}
-        Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => {
-            start_daemon(server, path)?;
-        }
-        Err(error) => {
-            return Err(format!(
-                "cannot connect to remuda daemon at {}: {error}",
-                path.display()
-            ));
-        }
-    }
+    ensure_daemon(server, path)?;
     match remuda_native::client::request(
         path,
         &Request::Eval {
