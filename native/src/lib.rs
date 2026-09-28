@@ -7,6 +7,7 @@
 
 pub mod child_guard;
 pub mod client;
+pub mod cluster;
 pub mod daemon;
 pub mod dist;
 pub mod image;

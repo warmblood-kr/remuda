@@ -314,11 +314,28 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
 
 fn cluster_command(args: &[&str]) -> ExitCode {
     match parse_cluster_command(args) {
-        ClusterCommand::Status => {
-            println!("This node is not in a cluster; run `remuda cluster init`.");
-            ExitCode::SUCCESS
-        }
-        ClusterCommand::Init => fail("cluster init is not implemented yet"),
+        ClusterCommand::Status => match remuda_native::cluster::status() {
+            Ok(None) => {
+                println!("This node is not in a cluster; run `remuda cluster init`.");
+                ExitCode::SUCCESS
+            }
+            Ok(Some((identity, members))) => {
+                println!("Node: {}", identity.node_name);
+                println!("Fingerprint: {}", identity.node_fp);
+                println!("Members: {members}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("cluster status: {error}")),
+        },
+        ClusterCommand::Init => match remuda_native::cluster::init() {
+            Ok(identity) => {
+                println!("Cluster initialized");
+                println!("Node: {}", identity.node_name);
+                println!("Fingerprint: {}", identity.node_fp);
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("cluster init: {error}")),
+        },
         ClusterCommand::Invalid => fail("usage: remuda cluster [init]"),
     }
 }
