@@ -292,6 +292,55 @@ fn selected_session_stays_visible_when_the_list_exceeds_a_short_terminal() {
 }
 
 #[test]
+fn clicking_the_top_visible_session_keeps_the_list_under_the_pointer() {
+    let mut ui = make_ui(
+        (0..12)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect(),
+    );
+    for _ in 0..11 {
+        ui.on_key(press(KeyCode::Down));
+    }
+
+    let before = render(&ui, "", "test", 80, 24);
+    let before_top = before.split("\x1b[2;1H").next().expect("first row exists");
+    assert!(
+        before_top.contains("session-5"),
+        "top row before click: {before_top:?}"
+    );
+
+    assert_eq!(
+        ui.on_mouse(click(5, 0), 80, 24),
+        Action::Focus("session-5".into())
+    );
+    assert_eq!(ui.selected, 5);
+
+    let after = render(&ui, "", "test", 80, 24);
+    let after_top = after.split("\x1b[2;1H").next().expect("first row exists");
+    assert!(
+        after_top.contains("session-5"),
+        "clicking the first visible row must not move the list: {after_top:?}"
+    );
+    assert!(
+        !after_top.contains("session-0"),
+        "the list must not snap back to its first row: {after_top:?}"
+    );
+
+    ui.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+    ui.on_key(press(KeyCode::Up));
+    assert_eq!(ui.selected, 4);
+    let after_navigation = render(&ui, "", "test", 80, 24);
+    let navigation_top = after_navigation
+        .split("\x1b[2;1H")
+        .next()
+        .expect("first row exists");
+    assert!(
+        navigation_top.contains("session-4"),
+        "keyboard movement should scroll just enough to keep selection visible: {navigation_top:?}"
+    );
+}
+
+#[test]
 fn enter_points_the_keyboard_at_the_selected_session() {
     let mut ui = make_ui(vec![row("a", true, false), row("b", true, false)]);
     ui.on_key(press(KeyCode::Char('j')));
@@ -2334,9 +2383,37 @@ fn a_session_started_here_is_sized_to_the_pane_not_the_terminal() {
 }
 
 #[test]
-fn a_pane_below_the_floor_is_raised_rather_than_dropping_keystrokes() {
+fn a_narrow_pane_opts_out_of_the_default_size_floor() {
     let size = pane_size(&make_ui(vec![]), 80, 24);
-    assert_eq!((size.cols(), size.rows()), (80, 24), "Size::new's floor");
+    assert_eq!((size.cols(), size.rows()), (63, 24));
+    assert_eq!(
+        (Size::new(11, 3).cols(), Size::new(11, 3).rows()),
+        (Size::MIN_COLS, Size::MIN_ROWS),
+        "ordinary sizes keep the safety floor"
+    );
+}
+
+#[test]
+fn a_narrow_shown_list_pane_passes_its_visible_width_to_the_child() {
+    let mut ui = make_ui(vec![row("agent", true, false)]);
+    ui.set_list_width(24, 100);
+    assert_eq!(ui_layout(&ui, 100), (24, 75));
+
+    let size = pane_size(&ui, 100, 30);
+    assert_eq!(size.cols(), 75);
+    assert_eq!(size.rows(), 29);
+
+    let encoded = serde_json::to_vec(&size).expect("serialize pane size");
+    let decoded: Size = serde_json::from_slice(&encoded).expect("deserialize pane size");
+    assert_eq!(decoded, size, "the daemon must preserve the visible width");
+
+    let ordinary: Size =
+        serde_json::from_str(r#"{"cols":75,"rows":29}"#).expect("deserialize ordinary size");
+    assert_eq!(
+        ordinary.cols(),
+        Size::MIN_COLS,
+        "ordinary requests stay floored"
+    );
 }
 
 #[test]

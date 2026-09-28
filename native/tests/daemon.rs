@@ -102,6 +102,65 @@ fn daemon_at(path: &Path) -> impl Drop {
 
 #[cfg(unix)]
 #[test]
+fn autostart_reports_the_pid_and_recovery_for_a_held_socket_lock() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = scratch_dir("lock-holder");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create isolated runtime dir");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let mut lock_name = socket.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    std::fs::create_dir_all(lock_path.parent().unwrap()).expect("create socket directory");
+    let mut lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .expect("create socket lock");
+    let holder_pid = std::process::id();
+    writeln!(lock_file, "{holder_pid}").expect("write holder pid");
+    assert_eq!(
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "hold private socket lock"
+    );
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "-e", "return 1"])
+        .env("REMUDA_RUNTIME_DIR", &dir)
+        .env("HOME", dir.join("home"))
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .expect("run a client that autostarts the daemon");
+    let success = output.status.success();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let names_holder = stderr.contains(&format!("pid {holder_pid}"));
+    let explains_recovery = stderr.contains("kill -CONT")
+        && stderr.contains(&format!("kill {holder_pid}"))
+        && stderr.contains("retry");
+    let announced_wait =
+        stderr.contains("waiting for the socket lock held by another remuda daemon");
+
+    assert_eq!(
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) },
+        0
+    );
+    drop(lock_file);
+    std::fs::remove_dir_all(&dir).expect("remove private runtime dir");
+    assert!(!success, "autostart must fail while lock is held: {stderr}");
+    assert!(names_holder, "{stderr}");
+    assert!(explains_recovery, "{stderr}");
+    assert!(announced_wait, "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_lock_file_is_private() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -111,6 +170,12 @@ fn daemon_lock_file_is_private() {
     let lock = socket.with_extension("sock.lock");
     let metadata = std::fs::metadata(&lock).expect("daemon lock file exists");
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::read_to_string(&lock)
+            .expect("daemon lock holder is recorded")
+            .trim(),
+        daemon.0.id().to_string()
+    );
     assert_eq!(
         client::request(
             &socket,

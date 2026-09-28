@@ -46,10 +46,11 @@ sent to a connected client when timeout causes cancellation.
   cancelled because its client went away. A second `resolve` or `reject` is a
   programming error and returns an error without changing the first outcome.
 - A deferred result's combined stdout and stderr must be at most
-  `MAX_DEFERRED_OUTPUT_BYTES` (16 MiB). Oversized `resolve` calls raise a clear
+  `MAX_REPLY_BYTES` (16 MiB). Oversized `resolve` calls raise a clear
   size-limit error to Lua and fail the deferred request; they are not silently
-  cut off. This bound applies only to deferred results; today's synchronous
-  return path is unchanged.
+  cut off. The same logical content limit applies to synchronous string
+  replies. Serialized wire frames have a bounded allowance for JSON escaping
+  and base64 encoding.
 - An invalid timeout (non-number, non-positive, or above 300 seconds), an
   invalid exit code or output type, a missing result field, or completion after
   another terminal outcome is reported as a Lua API error. Command rejection,
