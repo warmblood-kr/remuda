@@ -224,24 +224,17 @@ fn attach_ack(line: &str) -> AttachAck {
     }
 }
 
-/// Give this terminal to a session until the user presses [`DETACH`] or the
-/// session ends. Leaving does not disturb the session: the process keeps
-/// running and this direct attach never changes its size.
-pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
+fn begin_attach(path: &Path, name: &str) -> std::io::Result<(Stream, Option<u64>)> {
     let mut stream = ipc::connect(path)?;
     send(&stream, &Request::AttachTracked { name: name.into() })?;
-
-    // The acknowledgement is read before raw mode goes on. Failing here must
-    // leave the terminal exactly as we found it, and a raw terminal printing an
-    // error message is how a tool loses a user's trust in one keystroke.
-    let generation = match attach_ack(&read_protocol_line(&mut stream)?) {
-        AttachAck::Tracked(generation) => Some(generation),
-        AttachAck::Legacy => None,
+    match attach_ack(&read_protocol_line(&mut stream)?) {
+        AttachAck::Tracked(generation) => Ok((stream, Some(generation))),
+        AttachAck::Legacy => Ok((stream, None)),
         AttachAck::Unsupported => {
             // Older daemons do not know AttachTracked. Reconnect with the
             // original request and preserve their existing attach behavior.
             drop(stream);
-            stream = ipc::connect(path)?;
+            let mut stream = ipc::connect(path)?;
             send(
                 &stream,
                 &Request::Attach {
@@ -249,23 +242,81 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
                 },
             )?;
             match interpret(&read_protocol_line(&mut stream)?) {
-                Response::Ok => None,
-                Response::Error(reason) => return Err(std::io::Error::other(reason)),
-                _ => return Err(std::io::Error::other("daemon did not acknowledge attach")),
+                Response::Ok => Ok((stream, None)),
+                Response::Error(reason) => Err(std::io::Error::other(reason)),
+                _ => Err(std::io::Error::other("daemon did not acknowledge attach")),
             }
         }
-        AttachAck::Refused(reason) => return Err(std::io::Error::other(reason)),
-    };
+        AttachAck::Refused(reason) => Err(std::io::Error::other(reason)),
+    }
+}
+
+fn was_taken_over(path: &Path, name: &str, generation: Option<u64>) -> bool {
+    generation.is_some_and(|generation| {
+        matches!(
+            request(
+                path,
+                &Request::AttachStatus {
+                    name: name.to_string(),
+                    generation,
+                }
+            ),
+            Ok(Response::AttachStatus { taken_over: true })
+        )
+    })
+}
+
+fn finish_output_pump(
+    stream: &Stream,
+    stop: &std::sync::atomic::AtomicBool,
+    done: &std::sync::atomic::AtomicBool,
+    taken_over: &std::sync::atomic::AtomicBool,
+    was_taken_over: bool,
+) {
+    taken_over.store(was_taken_over, std::sync::atomic::Ordering::SeqCst);
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    ipc::stop_reader(stream, stop, || {
+        done.load(std::sync::atomic::Ordering::SeqCst)
+    });
+}
+
+fn attach_left(name: &str, stdout: &mut impl Write, taken_over: bool, detached: bool) -> Left {
+    if taken_over {
+        Left::TakenOver
+    } else if detached {
+        Left::Detached
+    } else {
+        let _ = write!(stdout, "\r\n[remuda] {name} ended — press any key\r\n");
+        let _ = stdout.flush();
+        Left::Exited
+    }
+}
+
+fn pump_output(stream: &Stream, stop: &std::sync::atomic::AtomicBool) {
+    let mut stdout = std::io::stdout();
+    let mut buf = [0u8; 8192];
+    let mut reader = stream;
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        let Ok(n) = reader.read(&mut buf) else {
+            break;
+        };
+        if n == 0 || stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
+            break;
+        }
+    }
+}
+
+/// Give this terminal to a session until the user presses [`DETACH`] or the
+/// session ends. Leaving does not disturb the session: the process keeps
+/// running and this direct attach never changes its size.
+pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
+    let (stream, generation) = begin_attach(path, name)?;
 
     let _raw = RawMode::enable()?;
 
-    // The Windows wake must cancel the same HANDLE that owns the blocked read;
-    // cloning a named-pipe stream creates a different HANDLE. Share this one
-    // between the output pump and the key thread that may need to wake it.
+    // Both pumps share this handle so the Windows wake cancels the pending read.
     let reader_stream = std::sync::Arc::new(stream);
 
-    // Only the key thread can tell the two exits apart: the reader below just
-    // sees the stream end, which is true of a detach and of a death alike.
     let detached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let output_taken_over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let output_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -321,9 +372,7 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
                 }
                 trace_input_read(trace_input.as_deref(), &buf[..n]);
                 match buf[..n].iter().position(|&b| b == DETACH) {
-                    // Forward what was typed before the detach key, then stop.
-                    // Dropping those bytes would silently swallow input the
-                    // user believes they sent.
+                    // Preserve bytes typed before the detach key.
                     Some(at) => {
                         let _ = stream.write_all(&buf[..at]);
                         let _ = stream.flush();
@@ -337,60 +386,28 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
                     }
                 }
             }
-            // Ends the screen pump below, which then returns from `attach` and
-            // drops every handle on this connection — that hang-up is what the
-            // daemon reads as "the human left".
             ipc::stop_reader(&reader_stream, &output_stop, || {
                 output_done.load(std::sync::atomic::Ordering::SeqCst)
             });
         }
     });
 
-    let mut stdout = std::io::stdout();
-    let mut buf = [0u8; 8192];
-    let mut reader = reader_stream.as_ref();
-    while !output_stop.load(std::sync::atomic::Ordering::SeqCst) {
-        let Ok(n) = reader.read(&mut buf) else {
-            break;
-        };
-        if n == 0 {
-            break;
-        }
-        if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
-            break;
-        }
-    }
+    pump_output(reader_stream.as_ref(), &output_stop);
 
-    let was_taken_over = generation.is_some_and(|generation| {
-        matches!(
-            request(
-                path,
-                &Request::AttachStatus {
-                    name: name.to_string(),
-                    generation,
-                }
-            ),
-            Ok(Response::AttachStatus { taken_over: true })
-        )
-    });
-    output_taken_over.store(was_taken_over, std::sync::atomic::Ordering::SeqCst);
-    output_done.store(true, std::sync::atomic::Ordering::SeqCst);
-    ipc::stop_reader(&reader_stream, &output_stop, || {
-        output_done.load(std::sync::atomic::Ordering::SeqCst)
-    });
-    let left = if was_taken_over {
-        Left::TakenOver
-    } else if detached.load(std::sync::atomic::Ordering::SeqCst) {
-        Left::Detached
-    } else {
-        // The session ended while the key thread sits in a tty read, and a tty
-        // read cannot be interrupted portably — so `join` below returns only on
-        // the next keystroke, which it then swallows. Say so instead of
-        // freezing: a stated wait is not the same failure as a dead screen.
-        let _ = write!(stdout, "\r\n[remuda] {name} ended — press any key\r\n");
-        let _ = stdout.flush();
-        Left::Exited
-    };
+    let was_taken_over = was_taken_over(path, name, generation);
+    finish_output_pump(
+        &reader_stream,
+        &output_stop,
+        &output_done,
+        &output_taken_over,
+        was_taken_over,
+    );
+    let left = attach_left(
+        name,
+        &mut std::io::stdout(),
+        was_taken_over,
+        detached.load(std::sync::atomic::Ordering::SeqCst),
+    );
     let _ = keys.join();
     Ok(left)
 }
