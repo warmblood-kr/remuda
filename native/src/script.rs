@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 60] = [
+pub const BINDINGS: [&str; 61] = [
     "_call",
     "_descriptors",
     "_dispatch_extension_command",
@@ -49,6 +49,7 @@ pub const BINDINGS: [&str; 60] = [
     "buffers",
     "cancel",
     "capture",
+    "capture_styled",
     "clear_hooks",
     "click",
     "close",
@@ -133,6 +134,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "capture",
         "Read a session's current screen as plain text.",
         "capture(name) -> string",
+    ),
+    (
+        "capture_styled",
+        "Read a session's screen as rows of {text, dim} spans, plus its cursor.",
+        "capture_styled(name) -> {rows, cursor = {row, col, visible}}",
     ),
     (
         "attach",
@@ -416,6 +422,7 @@ pub fn bindings(
     exec_binding(lua, &table)?;
     function_source_binding(lua, &table)?;
 
+    capture_styled_binding(lua, &table, at())?;
     dir_bindings(lua, &table, &at)?;
     tick_bindings(lua, &table, counters.clone())?;
     request_count_bindings(lua, &table, counters)?;
@@ -559,6 +566,48 @@ pub(crate) fn hide_module_activator(lua: &Lua) -> mlua::Result<()> {
     let activate: mlua::Function = remuda.get("_activate_module")?;
     lua.set_named_registry_value("remuda.lifecycle.activate_module", activate)?;
     remuda.set("_activate_module", Value::Nil)
+}
+
+/// `remuda.capture_styled(name)` — split out of `bindings` for its line cap.
+/// Only what a script needs to tell a TUI's dim ghost text from typed text,
+/// and where the caret is (#137): not colours or the other attributes.
+fn capture_styled_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
+    table.set(
+        "capture_styled",
+        lua.create_function(move |lua, name: String| {
+            match ask(
+                &path,
+                Request::CaptureStyled {
+                    name,
+                    scrollback: 0,
+                },
+            )? {
+                Response::StyledScreen { rows, cursor, .. } => {
+                    let screen = lua.create_table()?;
+                    let out = lua.create_table()?;
+                    for (index, runs) in rows.into_iter().enumerate() {
+                        let row = lua.create_table()?;
+                        for (at, run) in runs.into_iter().enumerate() {
+                            let span = lua.create_table()?;
+                            span.set("text", run.text)?;
+                            span.set("dim", run.dim)?;
+                            row.set(at + 1, span)?;
+                        }
+                        out.set(index + 1, row)?;
+                    }
+                    screen.set("rows", out)?;
+                    // 1-based like the rows above, not the wire's 0-based.
+                    let caret = lua.create_table()?;
+                    caret.set("row", cursor.row + 1)?;
+                    caret.set("col", cursor.col + 1)?;
+                    caret.set("visible", cursor.visible)?;
+                    screen.set("cursor", caret)?;
+                    Ok(Value::Table(screen))
+                }
+                other => value(lua, other),
+            }
+        })?,
+    )
 }
 
 /// Plain filesystem primitives for topic directories, no session involved —
@@ -751,6 +800,14 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
                 // "*sessions*" buffer, `tools.lua`) can show the same
                 // attached state the list has always drawn.
                 row.set("attached", session.attached)?;
+                // Seconds since an attached human typed; math.huge if never, so
+                // the field is always present and nil means an older core.
+                row.set(
+                    "human_idle",
+                    session
+                        .human_idle
+                        .map_or(f64::INFINITY, |idle| idle.as_secs_f64()),
+                )?;
                 rows.set(index + 1, row)?;
             }
             Ok(Value::Table(rows))

@@ -216,6 +216,25 @@ fn idle_time_is_driven_by_the_injected_clock() {
     assert_eq!(session.idle_for(), Duration::ZERO);
 }
 
+/// #136: only an attached human's keystrokes set `human_idle_for`; a script's
+/// `send_line` does not, and before any keystroke there is none.
+#[test]
+fn human_idle_time_counts_only_attached_keystrokes() {
+    let (session, clock) = session_with(Box::new(ScriptedAgent::new(vec![])));
+    session.send_line("scripted").unwrap();
+    assert_eq!(session.human_idle_for(), None, "no human has typed yet");
+
+    let held = session.attach().expect("attach");
+    held.write_raw(b"co").unwrap();
+    clock.advance(Duration::from_secs(7));
+    assert_eq!(session.human_idle_for(), Some(Duration::from_secs(7)));
+
+    drop(held);
+    session.send_line("scripted again").unwrap();
+    assert_eq!(session.human_idle_for(), Some(Duration::from_secs(7)));
+    assert_eq!(session.idle_for(), Duration::ZERO);
+}
+
 #[test]
 fn a_dead_agent_reports_exited_rather_than_swallowing_input() {
     let mut agent = ScriptedAgent::new(vec![]);
@@ -355,6 +374,19 @@ fn many_handles_drive_one_session() {
     viewer.send_line("from the viewer").expect("viewer write");
     core.send_line("from the core").expect("core write");
     assert_eq!(writes.lock().unwrap().len(), 2, "one burst per send");
+}
+
+/// #136: the listing carries the human idle time, `None` until a keystroke.
+#[test]
+fn listing_reports_human_idle_time() {
+    let registry = Registry::new();
+    registry
+        .register(named("agent", Box::new(ScriptedAgent::new(vec![]))))
+        .expect("registration");
+    assert_eq!(registry.list()[0].human_idle, None);
+    let session = registry.get("agent").expect("registered");
+    session.attach().expect("attach").write_raw(b"x").unwrap();
+    assert_eq!(registry.list()[0].human_idle, Some(Duration::ZERO));
 }
 
 #[test]

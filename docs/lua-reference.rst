@@ -101,6 +101,11 @@ capture
 
 ``capture(name) -> string`` — Read a session's current screen as plain text.
 
+capture_styled
+--------------
+
+``capture_styled(name) -> {rows, cursor = {row, col, visible}}`` — Read a session's screen as rows of {text, dim} spans, plus its cursor.
+
 clear_hooks
 -----------
 

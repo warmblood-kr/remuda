@@ -11,6 +11,7 @@ fn ui() -> Ui {
             idle: Duration::ZERO,
             size: Size::new(80, 24),
             attached: false,
+            human_idle: None,
         }],
         "sh",
         None,
