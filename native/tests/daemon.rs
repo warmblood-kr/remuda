@@ -110,6 +110,34 @@ fn raw_attach(path: &Path, name: &str) -> ipc::Stream {
     stream
 }
 
+fn raw_attach_tracked(path: &Path, name: &str) -> (ipc::Stream, u64) {
+    let mut stream = ipc::connect(path).expect("connect tracked attach client");
+    let mut request = serde_json::to_vec(&Request::AttachTracked {
+        name: name.to_string(),
+    })
+    .expect("serialize tracked Attach");
+    request.push(b'\n');
+    stream.write_all(&request).expect("send tracked Attach");
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream
+        .read(&mut byte)
+        .expect("read tracked Attach response")
+        == 1
+    {
+        response.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    let Response::AttachStarted { generation } =
+        serde_json::from_slice(&response).expect("parse tracked Attach response")
+    else {
+        panic!("unexpected tracked attach response: {response:?}");
+    };
+    (stream, generation)
+}
+
 fn capture(path: &Path, name: &str) -> String {
     match client::request(
         path,
@@ -658,6 +686,103 @@ fn a_new_attach_takes_over_and_old_raw_clients_get_a_plain_notice() {
         assert!(Instant::now() < deadline, "all attaches should release");
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn an_agent_printing_the_takeover_notice_does_not_end_a_tracked_attach() {
+    let path = scratch("spoof-notice");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    let (stream, generation) = raw_attach_tracked(&path, "target");
+
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "printf '\\r\\n[remuda] attached elsewhere, detached\\r\\n'".into(),
+        },
+    )
+    .expect("print the exact courtesy notice from the session");
+    wait_for(&path, "target", "attached elsewhere, detached");
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::AttachStatus {
+                name: "target".into(),
+                generation,
+            },
+        )
+        .expect("query generation status"),
+        Response::AttachStatus { taken_over: false }
+    );
+    assert_eq!(target_row(&path, "r.attached"), "true");
+    drop(stream);
+}
+
+#[test]
+fn a_tracked_client_exits_on_takeover_without_waiting_for_another_key() {
+    let dir = scratch_dir("exit-on-takeover");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+
+    let pty = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open client pty");
+    let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "attach", "target"]);
+    command.env("REMUDA_RUNTIME_DIR", &dir);
+    let mut child = pty.slave.spawn_command(command).expect("spawn client A");
+    let mut reader = pty.master.try_clone_reader().expect("clone pty reader");
+    let (output_tx, output_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let _ = reader.read_to_end(&mut output);
+        let _ = output_tx.send(output);
+    });
+
+    let deadline = Instant::now() + PATIENCE;
+    while target_row(&path, "r.attached") != "true" {
+        assert!(Instant::now() < deadline, "client A never attached");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _current = raw_attach(&path, "target");
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll client A") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "client A waited for terminal input after takeover"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.exit_code(), 2);
+    let output = output_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("client output closed");
+    assert!(
+        output
+            .windows(b"attached elsewhere, detached".len())
+            .any(|window| window == b"attached elsewhere, detached"),
+        "takeover reason was not displayed: {output:?}"
+    );
+    assert!(
+        output
+            .windows(b"\x1b[?1000l".len())
+            .any(|w| w == b"\x1b[?1000l")
+            && output
+                .windows(b"\x1b[?2004l".len())
+                .any(|w| w == b"\x1b[?2004l"),
+        "the input modes were not reset before exit: {output:?}"
+    );
 }
 
 #[test]

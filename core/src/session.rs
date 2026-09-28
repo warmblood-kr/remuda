@@ -280,6 +280,16 @@ impl Session {
         self.attached.load(Ordering::SeqCst)
     }
 
+    /// Whether a live session has advanced beyond a tracked attachment.
+    pub fn was_attachment_taken_over(&self, generation: u64) -> bool {
+        self.is_alive()
+            && self
+                .next_attach_generation
+                .load(Ordering::SeqCst)
+                .saturating_sub(1)
+                > generation
+    }
+
     /// How long since input was last accepted — the fleet's "this one is parked"
     /// signal, read off the injected clock so a test can drive it.
     pub fn idle_for(&self) -> Duration {
@@ -310,6 +320,11 @@ pub struct Attached<'a> {
 }
 
 impl Attached<'_> {
+    /// The generation assigned when this client took the attachment.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Whether a newer client has taken this attachment over.
     pub fn is_displaced(&self) -> bool {
         self.displaced.load(Ordering::SeqCst)

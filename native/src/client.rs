@@ -126,6 +126,61 @@ fn read_protocol_line(stream: &mut impl Read) -> std::io::Result<String> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
+/// Read terminal input with a timeout so the output pump can release this
+/// thread after a tracked attachment is displaced.
+#[cfg(unix)]
+fn read_stdin_timeout(
+    stdin: &mut impl Read,
+    buf: &mut [u8],
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<usize>> {
+    use std::os::fd::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let millis = remaining.as_millis().min(i32::MAX as u128) as i32;
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+        if ready > 0 {
+            return stdin.read(buf).map(Some);
+        }
+        if ready == 0 {
+            return Ok(None);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn read_stdin_timeout(
+    stdin: &mut impl Read,
+    buf: &mut [u8],
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<usize>> {
+    use windows_sys::Win32::{
+        Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::{
+            Console::{GetStdHandle, STD_INPUT_HANDLE},
+            Threading::WaitForSingleObject,
+        },
+    };
+    let handle: HANDLE = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let millis = timeout.as_millis().min(u32::MAX as u128) as u32;
+    match unsafe { WaitForSingleObject(handle, millis) } {
+        WAIT_OBJECT_0 => stdin.read(buf).map(Some),
+        WAIT_TIMEOUT => Ok(None),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
 /// Every daemon deployed before any handshake existed can never announce its own
 /// version, so the client's reaction to the failure is the only diagnosis that
 /// reaches those users. See [`tests::the_cure_survives_an_eighty_column_crop`].
@@ -150,12 +205,23 @@ pub enum Left {
     TakenOver,
 }
 
-const TAKEN_OVER_NOTICE: &[u8] = b"\r\n[remuda] attached elsewhere, detached\r\n";
+enum AttachAck {
+    Tracked(u64),
+    Legacy,
+    Unsupported,
+    Refused(String),
+}
 
-fn takeover_notice_position(bytes: &[u8]) -> Option<usize> {
-    bytes
-        .windows(TAKEN_OVER_NOTICE.len())
-        .position(|window| window == TAKEN_OVER_NOTICE)
+fn attach_ack(line: &str) -> AttachAck {
+    match interpret(line) {
+        Response::AttachStarted { generation } => AttachAck::Tracked(generation),
+        Response::Ok => AttachAck::Legacy,
+        Response::Error(reason) if reason.starts_with("the daemon is not this build") => {
+            AttachAck::Unsupported
+        }
+        Response::Error(reason) => AttachAck::Refused(reason),
+        _ => AttachAck::Refused("daemon did not acknowledge attach".into()),
+    }
 }
 
 /// Give this terminal to a session until the user presses [`DETACH`] or the
@@ -163,24 +229,33 @@ fn takeover_notice_position(bytes: &[u8]) -> Option<usize> {
 /// running and this direct attach never changes its size.
 pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
     let mut stream = ipc::connect(path)?;
-    send(
-        &stream,
-        &Request::Attach {
-            name: name.to_string(),
-        },
-    )?;
+    send(&stream, &Request::AttachTracked { name: name.into() })?;
 
     // The acknowledgement is read before raw mode goes on. Failing here must
     // leave the terminal exactly as we found it, and a raw terminal printing an
     // error message is how a tool loses a user's trust in one keystroke.
-    let line = read_protocol_line(&mut stream)?;
-    match interpret(&line) {
-        Response::Ok => {}
-        Response::Error(reason) => {
-            return Err(std::io::Error::other(reason));
+    let generation = match attach_ack(&read_protocol_line(&mut stream)?) {
+        AttachAck::Tracked(generation) => Some(generation),
+        AttachAck::Legacy => None,
+        AttachAck::Unsupported => {
+            // Older daemons do not know AttachTracked. Reconnect with the
+            // original request and preserve their existing attach behavior.
+            drop(stream);
+            stream = ipc::connect(path)?;
+            send(
+                &stream,
+                &Request::Attach {
+                    name: name.to_string(),
+                },
+            )?;
+            match interpret(&read_protocol_line(&mut stream)?) {
+                Response::Ok => None,
+                Response::Error(reason) => return Err(std::io::Error::other(reason)),
+                _ => return Err(std::io::Error::other("daemon did not acknowledge attach")),
+            }
         }
-        _ => return Err(std::io::Error::other("daemon did not acknowledge attach")),
-    }
+        AttachAck::Refused(reason) => return Err(std::io::Error::other(reason)),
+    };
 
     let _raw = RawMode::enable()?;
 
@@ -192,7 +267,7 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
     // Only the key thread can tell the two exits apart: the reader below just
     // sees the stream end, which is true of a detach and of a death alike.
     let detached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let taken_over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output_taken_over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let output_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let output_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let trace_input = std::env::var_os("REMUDA_TRACE_INPUT").map(PathBuf::from);
@@ -202,12 +277,45 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
         let mut stream = reader_stream.as_ref().try_clone()?;
         let reader_stream = std::sync::Arc::clone(&reader_stream);
         let detached = std::sync::Arc::clone(&detached);
-        let output_stop = std::sync::Arc::clone(&output_stop);
+        let output_taken_over = std::sync::Arc::clone(&output_taken_over);
         let output_done = std::sync::Arc::clone(&output_done);
+        let output_stop = std::sync::Arc::clone(&output_stop);
         move || {
             let mut stdin = std::io::stdin().lock();
             let mut buf = [0u8; 1024];
-            while let Ok(n) = stdin.read(&mut buf) {
+            loop {
+                if output_done.load(std::sync::atomic::Ordering::SeqCst) {
+                    if output_taken_over.load(std::sync::atomic::Ordering::SeqCst) {
+                        break;
+                    }
+                    // Preserve the existing "press any key" behavior after a
+                    // natural session exit; takeover returns without input.
+                    if matches!(
+                        read_stdin_timeout(
+                            &mut stdin,
+                            &mut buf,
+                            std::time::Duration::from_secs(86_400)
+                        ),
+                        Ok(Some(_)) | Err(_)
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
+                let n = match read_stdin_timeout(
+                    &mut stdin,
+                    &mut buf,
+                    std::time::Duration::from_millis(25),
+                ) {
+                    Ok(Some(n)) => n,
+                    Ok(None) => continue,
+                    Err(_) => break,
+                };
+                if output_done.load(std::sync::atomic::Ordering::SeqCst)
+                    && output_taken_over.load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break;
+                }
                 if n == 0 {
                     break;
                 }
@@ -240,7 +348,6 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
 
     let mut stdout = std::io::stdout();
     let mut buf = [0u8; 8192];
-    let mut observed = Vec::new();
     let mut reader = reader_stream.as_ref();
     while !output_stop.load(std::sync::atomic::Ordering::SeqCst) {
         let Ok(n) = reader.read(&mut buf) else {
@@ -249,26 +356,29 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
         if n == 0 {
             break;
         }
-        observed.extend_from_slice(&buf[..n]);
-        let found = takeover_notice_position(&observed).is_some();
         if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
             break;
         }
-        if found {
-            taken_over.store(true, std::sync::atomic::Ordering::SeqCst);
-            break;
-        }
-        let keep = TAKEN_OVER_NOTICE.len().saturating_sub(1);
-        if observed.len() > keep {
-            observed.drain(..observed.len() - keep);
-        }
     }
 
+    let was_taken_over = generation.is_some_and(|generation| {
+        matches!(
+            request(
+                path,
+                &Request::AttachStatus {
+                    name: name.to_string(),
+                    generation,
+                }
+            ),
+            Ok(Response::AttachStatus { taken_over: true })
+        )
+    });
+    output_taken_over.store(was_taken_over, std::sync::atomic::Ordering::SeqCst);
     output_done.store(true, std::sync::atomic::Ordering::SeqCst);
     ipc::stop_reader(&reader_stream, &output_stop, || {
         output_done.load(std::sync::atomic::Ordering::SeqCst)
     });
-    let left = if taken_over.load(std::sync::atomic::Ordering::SeqCst) {
+    let left = if was_taken_over {
         Left::TakenOver
     } else if detached.load(std::sync::atomic::Ordering::SeqCst) {
         Left::Detached
@@ -416,8 +526,8 @@ impl Drop for RawMode {
 #[cfg(test)]
 mod tests {
     use super::{
-        interpret, reset_input_modes, takeover_notice_position, trace_input_read,
-        write_input_trace, RESET_INPUT_MODES, TAKEN_OVER_NOTICE,
+        attach_ack, interpret, reset_input_modes, trace_input_read, write_input_trace, AttachAck,
+        RESET_INPUT_MODES,
     };
     use remuda_core::protocol::Response;
     use std::time::{Duration, UNIX_EPOCH};
@@ -430,12 +540,19 @@ mod tests {
     }
 
     #[test]
-    fn takeover_notice_is_recognized_across_raw_output_chunks() {
-        let split = TAKEN_OVER_NOTICE.len() / 2;
-        let mut output = TAKEN_OVER_NOTICE[..split].to_vec();
-        assert_eq!(takeover_notice_position(&output), None);
-        output.extend_from_slice(&TAKEN_OVER_NOTICE[split..]);
-        assert_eq!(takeover_notice_position(&output), Some(0));
+    fn tracked_attach_ack_is_used_when_the_daemon_supports_it() {
+        assert!(matches!(
+            attach_ack(r#"{"AttachStarted":{"generation":7}}"#),
+            AttachAck::Tracked(7)
+        ));
+    }
+
+    #[test]
+    fn tracked_attach_falls_back_for_an_older_daemon() {
+        assert!(matches!(
+            attach_ack(r#"{"Error":"bad request: unknown variant `AttachTracked`"}"#),
+            AttachAck::Unsupported
+        ));
     }
 
     #[test]

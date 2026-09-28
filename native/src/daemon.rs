@@ -497,7 +497,17 @@ fn handle(
             capture_styled(&stream, registry, &name, scrollback)
         }
 
-        Request::Attach { name } => attach(stream, reader, registry, &name),
+        Request::Attach { name } => attach(stream, reader, registry, &name, false),
+        Request::AttachTracked { name } => attach(stream, reader, registry, &name, true),
+        Request::AttachStatus { name, generation } => {
+            let response = registry.get(&name).map_or_else(
+                || Response::error(format!("no such session: {name}")),
+                |session| Response::AttachStatus {
+                    taken_over: session.was_attachment_taken_over(generation),
+                },
+            );
+            reply(&stream, &response)
+        }
 
         Request::Close { name } => respond(&stream, &name, close(registry, image, &name), |()| {
             Response::Ok
@@ -610,6 +620,7 @@ fn attach(
     mut reader: BufReader<Stream>,
     registry: &Registry,
     name: &str,
+    tracked: bool,
 ) -> std::io::Result<()> {
     let Some(session) = registry.get(name) else {
         return reply(
@@ -618,7 +629,14 @@ fn attach(
         );
     };
     let held = session.attach();
-    reply(&stream, &Response::Ok)?;
+    let acknowledgement = if tracked {
+        Response::AttachStarted {
+            generation: held.generation(),
+        }
+    } else {
+        Response::Ok
+    };
+    reply(&stream, &acknowledgement)?;
 
     // Paint what is already on screen before streaming anything new, or the
     // viewer sees a blank terminal until the program next redraws.
