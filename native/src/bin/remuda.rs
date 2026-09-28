@@ -146,10 +146,18 @@ fn main() -> ExitCode {
         // way to print N lines with a controllable pace.
         ["_print_lines", n, delay_ms] => print_lines(n, delay_ms),
 
-        _ => {
-            eprint!("{}", USAGE);
-            ExitCode::FAILURE
-        }
+        // Not a known verb or mod command. A mod directory with no readable
+        // manifest is named rather than answered with usage (#134).
+        _ => match argv
+            .first()
+            .and_then(|word| remuda_native::packages::half_installed(word))
+        {
+            Some(message) => fail(message),
+            None => {
+                eprint!("{}", USAGE);
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 

@@ -101,6 +101,11 @@ capture
 
 ``capture(name) -> string`` — Read a session's current screen as plain text.
 
+capture_styled
+--------------
+
+``capture_styled(name) -> {rows, cursor = {row, col, visible}}`` — Read a session's screen as rows of {text, dim} spans, plus its cursor.
+
 clear_hooks
 -----------
 
@@ -115,6 +120,16 @@ close
 -----
 
 ``close(name) -> nil`` — End a session, live or already self-exited.
+
+contribute
+----------
+
+``contribute(point, id, entry) -> nil`` — Fill an extension point: the same point and id replaces. `entry.order` sorts (default 0).
+
+contributions
+-------------
+
+``contributions(point) -> {{id, owner, entry}...}`` — A point's entries as {id, owner, entry} rows, entry a shallow copy, by entry.order then id.
 
 emit
 ----
