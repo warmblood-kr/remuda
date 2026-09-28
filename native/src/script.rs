@@ -888,6 +888,9 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::StyledScreen { .. } => Err(mlua::Error::runtime(
             "styled capture is not exposed to scripts",
         )),
+        Response::MouseState(_) => Err(mlua::Error::runtime(
+            "mouse state is not exposed to scripts",
+        )),
     }
 }
 
