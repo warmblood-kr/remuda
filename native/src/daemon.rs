@@ -569,7 +569,21 @@ fn handle(
             })
         }
 
-        Request::Input { name, bytes } => input(&stream, registry, &name, &bytes),
+        Request::Input {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        } => input(
+            &stream,
+            registry,
+            &name,
+            &instance_id,
+            &client_id,
+            seq,
+            &bytes,
+        ),
 
         Request::Send { name, bytes } => {
             respond(&stream, &name, registry.send(&name, &bytes), |()| {
@@ -758,8 +772,47 @@ fn read_request(
     }
 }
 
-fn input(stream: &Stream, registry: &Registry, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-    respond(stream, name, registry.send(name, bytes), |()| Response::Ok)
+fn input(
+    stream: &Stream,
+    registry: &Registry,
+    name: &str,
+    instance_id: &str,
+    client_id: &str,
+    seq: u64,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    let client_id = match remuda_core::input::validate_batch(client_id, seq, bytes) {
+        Ok(client_id) => client_id,
+        Err(error) => return reply(stream, &Response::error(error)),
+    };
+    let result = registry.apply_input_batch(
+        name,
+        remuda_core::input::InputBatch {
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        },
+    );
+    match result {
+        None => reply(stream, &Response::error(format!("no such session: {name}"))),
+        Some(Err(remuda_core::input::InputError::RateLimited)) => {
+            reply(stream, &Response::RateLimited)
+        }
+        Some(Err(error)) => reply(stream, &Response::error(error.to_string())),
+        Some(Ok(remuda_core::input::InputOutcome::Ack { duplicate })) => {
+            reply(stream, &Response::Ack { duplicate })
+        }
+        Some(Ok(remuda_core::input::InputOutcome::Uncertain)) => {
+            reply(stream, &Response::Uncertain)
+        }
+        Some(Ok(remuda_core::input::InputOutcome::WrongInstance)) => {
+            reply(stream, &Response::WrongInstance)
+        }
+        Some(Ok(remuda_core::input::InputOutcome::Exited)) => {
+            reply(stream, &Response::error("session exited"))
+        }
+    }
 }
 
 fn mouse_state(stream: &Stream, registry: &Registry, name: &str) -> std::io::Result<()> {
