@@ -19,11 +19,46 @@
 use crate::script;
 use mlua::Lua;
 use std::cell::RefCell;
+use std::error::Error;
 use std::ffi::c_void;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
+
+// `Response::Error` remains a plain string on the wire. This reserved control
+// prefix carries typed failures to the CLI without changing ordinary errors.
+const TYPED_FAILURE_PREFIX: &str = "\u{1e}REMUDA_FAIL:";
+
+/// A deliberate CLI failure raised by Lua code with `remuda.fail`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypedFailure {
+    pub message: String,
+    pub code: u8,
+}
+
+impl TypedFailure {
+    fn wire_message(&self) -> String {
+        format!("{TYPED_FAILURE_PREFIX}{}\n{}", self.code, self.message)
+    }
+}
+
+impl fmt::Display for TypedFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for TypedFailure {}
+
+/// Read a typed failure encoded by the image, if the response carries one.
+pub fn typed_failure_message(value: &str) -> Option<(u8, &str)> {
+    let value = value.strip_prefix(TYPED_FAILURE_PREFIX)?;
+    let (code, message) = value.split_once('\n')?;
+    let code = code.parse::<u8>().ok()?;
+    (code != 0).then_some((code, message))
+}
 
 /// One unit of work for the image: source to evaluate, and where the answer
 /// goes. The reply channel is per-job rather than shared, so two callers
@@ -155,9 +190,12 @@ fn eval(lua: &Lua, code: &str, name: Option<&str>) -> Result<String, String> {
             .into_function()
             .map_err(|e| e.to_string())?,
     };
-    let values = function
-        .call::<mlua::MultiValue>(())
-        .map_err(|e| e.to_string())?;
+    let values = function.call::<mlua::MultiValue>(()).map_err(|error| {
+        error
+            .downcast_ref::<TypedFailure>()
+            .map(TypedFailure::wire_message)
+            .unwrap_or_else(|| error.to_string())
+    })?;
 
     let rendered: Vec<String> = values.iter().map(render).collect();
     Ok(rendered.join("\t"))

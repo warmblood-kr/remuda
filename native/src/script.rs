@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 66] = [
+pub const BINDINGS: [&str; 67] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -66,6 +66,7 @@ pub const BINDINGS: [&str; 66] = [
     "event_counts",
     "exec",
     "extension_command",
+    "fail",
     "feed",
     "hook_list",
     "hooks",
@@ -159,6 +160,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "exec",
         "Run an installed mod's entry source, by name, in this same image.",
         "exec(name) -> nil",
+    ),
+    (
+        "fail",
+        "Raise a deliberate CLI failure with a message and exit code.",
+        "fail(message, code?) -> never (default code 1; valid codes are 1..255)",
     ),
     (
         "reload",
@@ -306,6 +312,7 @@ pub fn bindings(
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
+    fail_binding(lua, &table)?;
 
     // In-process, not a loopback: the image always runs inside the same
     // daemon this `Registry` belongs to (image.rs), so asking over the wire
@@ -630,6 +637,26 @@ pub(crate) fn hide_module_activator(lua: &Lua) -> mlua::Result<()> {
 /// `remuda.capture_styled(name)` — split out of `bindings` for its line cap.
 /// Only what a script needs to tell a TUI's dim ghost text from typed text,
 /// and where the caret is (#137): not colours or the other attributes.
+fn fail_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
+    table.set(
+        "fail",
+        lua.create_function(
+            |_, (message, code): (String, Option<i64>)| -> mlua::Result<()> {
+                let code = code.unwrap_or(1);
+                if !(1..=255).contains(&code) {
+                    return Err(mlua::Error::runtime(
+                        "remuda.fail exit code must be an integer from 1 through 255",
+                    ));
+                }
+                Err(mlua::Error::external(crate::image::TypedFailure {
+                    message,
+                    code: code as u8,
+                }))
+            },
+        )?,
+    )
+}
+
 fn capture_styled_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
     table.set(
         "capture_styled",
@@ -885,7 +912,16 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
             }
             Ok(Value::Table(rows))
         }
-        Response::Error(reason) => Err(mlua::Error::runtime(reason)),
+        Response::Error(reason) => {
+            if let Some((code, message)) = crate::image::typed_failure_message(&reason) {
+                Err(mlua::Error::external(crate::image::TypedFailure {
+                    code,
+                    message: message.to_string(),
+                }))
+            } else {
+                Err(mlua::Error::runtime(reason))
+            }
+        }
         // No binding here asks for `CaptureStyled` either — same reasoning as
         // `Response::Value` above.
         Response::StyledScreen { .. } => Err(mlua::Error::runtime(
