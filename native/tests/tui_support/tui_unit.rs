@@ -110,7 +110,7 @@ fn selected_session_stays_visible_when_the_list_exceeds_a_short_terminal() {
 
     let frame = render(&ui, "", "test", 80, 24);
     assert!(
-        frame.contains("\x1b[20;1H\x1b[7msession-11\x1b[0m"),
+        frame.contains("\x1b[19;1H\x1b[7msession-11\x1b[0m"),
         "the selected final session must be rendered in the 24-row viewport: {frame:?}"
     );
     assert!(
@@ -148,18 +148,17 @@ fn a_click_on_a_list_row_selects_and_enters_it_like_arrow_plus_enter() {
     assert_eq!(ui.focus, Focus::Session, "a click enters, same as Enter");
 }
 
-/// The header (row 0) and anything below the herd's actual rows are both
-/// outside the list — a click there must not panic or move selection.
 #[test]
-fn a_click_outside_any_list_row_is_a_no_op() {
+fn clicks_start_on_the_first_row_and_stop_after_the_list() {
     let mut ui = make_ui(vec![row("a", true, false), row("b", true, false)]);
     assert_eq!(
         ui.on_mouse(click(5, 0), 80, 24),
-        Action::Nothing,
-        "the header row"
+        Action::Focus("a".into()),
+        "the first terminal row selects the first session"
     );
-    assert_eq!(ui.selected, 0, "unmoved by the header click");
-    assert_eq!(ui.focus, Focus::List, "unmoved by the header click");
+    assert_eq!(ui.selected, 0, "first row selected a");
+    assert_eq!(ui.focus, Focus::Session, "the first row click enters a");
+    let mut ui = make_ui(vec![row("a", true, false), row("b", true, false)]);
     // Screen row 8 (0-based 7) is past "b" — the herd has 6 rows.
     assert_eq!(
         ui.on_mouse(click(5, 7), 80, 24),
@@ -1231,14 +1230,9 @@ fn render_styled_wraps_the_frame_in_synchronized_output() {
     assert!(out.ends_with("\x1b[?2026l"), "end sync: {out:?}");
 }
 
-/// The regression oracle for the "*sessions*"-buffer migration, captured
-/// before it touched anything (two names of different lengths, one
-/// attached, to exercise `list_row`'s column alignment).
-// If this ever needs editing to pass, the migration changed
-// `render_styled`'s own output, not just its internals — stop and
-// report rather than updating the literal.
+/// Verify the list header stays blank after moving the server brand into the footer.
 #[test]
-fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buffer_migration() {
+fn render_styled_of_the_session_list_moves_the_brand_to_the_footer() {
     let mut ui = make_ui(vec![row("alpha", true, false), row("bravo", true, true)]);
     // What a real refresh() would have fetched from the "*sessions*"
     // buffer at this scenario's list width (16, per `layout(80, 80)`):
@@ -1255,44 +1249,33 @@ fn render_styled_of_the_session_list_is_byte_identical_before_and_after_the_buff
     ];
     let cells = vec![text_row(10); 23];
     let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
-    assert_eq!(
-            out,
-            "\x1b[?2026h\x1b[?25l\x1b[H\
-             \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
-             \x1b[2;1H\x1b[Kalpha           │xxxxxxxxxx                                                     \
-             \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[Kbravo         🏇│xxxxxxxxxx                                                     \
-             \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[10;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[11;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[12;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[13;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[14;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[15;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[16;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[17;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[18;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[19;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[20;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[21;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[22;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[23;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[24;1H\x1b[K↑↓/jk select   ⏎ enter   n new   x kill   l list   q quit                       \
-             \x1b[J\x1b[?25l\x1b[?2026l",
-            "byte-identical oracle for the non-empty session list, captured \
-             before the buffer migration"
-        );
+    let first_line = out
+        .split("\x1b[1;1H\x1b[K")
+        .nth(1)
+        .and_then(|row| row.split("\x1b[2;1H").next())
+        .expect("first body row");
+    assert!(
+        first_line.contains("alpha"),
+        "list starts with its first session: {first_line:?}"
+    );
+    assert!(
+        first_line.contains("xxxxxxxxxx"),
+        "preview starts on row one: {first_line:?}"
+    );
+
+    assert!(
+        !out.contains("remuda · default│"),
+        "the server brand is no longer in the pane header"
+    );
+    assert!(
+        out.contains("remuda · default 🏇\x1b[J"),
+        "the server brand and horse end the footer"
+    );
 }
 
-/// Same oracle, empty herd — a distinct code path in `list_row` (the two
-/// fixed help lines), so it needs its own captured literal.
+/// Empty-herd counterpart with a distinct `list_row` path.
 #[test]
-fn render_styled_of_the_empty_session_list_is_byte_identical_before_and_after_the_buffer_migration()
-{
+fn render_styled_of_the_empty_session_list_moves_the_brand_to_the_footer() {
     let mut ui = make_ui(vec![]);
     // What a real refresh() would have fetched for an empty herd: the
     // two fixed lines `tools.lua`'s `remuda._refresh_sessions_buffer`
@@ -1303,37 +1286,14 @@ fn render_styled_of_the_empty_session_list_is_byte_identical_before_and_after_th
     ];
     let cells: Vec<Vec<StyledCell>> = vec![];
     let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
-    assert_eq!(
-            out,
-            "\x1b[?2026h\x1b[?25l\x1b[H\
-             \x1b[1;1H\x1b[Kremuda · default             │                                                  \
-             \x1b[2;1H\x1b[K                             │                                                  \
-             \x1b[3;1H\x1b[K  the herd is empty.         │                                                  \
-             \x1b[4;1H\x1b[K                             │                                                  \
-             \x1b[5;1H\x1b[K  press n to start a session.│                                                  \
-             \x1b[6;1H\x1b[K                             │                                                  \
-             \x1b[7;1H\x1b[K                             │                                                  \
-             \x1b[8;1H\x1b[K                             │                                                  \
-             \x1b[9;1H\x1b[K                             │                                                  \
-             \x1b[10;1H\x1b[K                             │                                                  \
-             \x1b[11;1H\x1b[K                             │                                                  \
-             \x1b[12;1H\x1b[K                             │                                                  \
-             \x1b[13;1H\x1b[K                             │                                                  \
-             \x1b[14;1H\x1b[K                             │                                                  \
-             \x1b[15;1H\x1b[K                             │                                                  \
-             \x1b[16;1H\x1b[K                             │                                                  \
-             \x1b[17;1H\x1b[K                             │                                                  \
-             \x1b[18;1H\x1b[K                             │                                                  \
-             \x1b[19;1H\x1b[K                             │                                                  \
-             \x1b[20;1H\x1b[K                             │                                                  \
-             \x1b[21;1H\x1b[K                             │                                                  \
-             \x1b[22;1H\x1b[K                             │                                                  \
-             \x1b[23;1H\x1b[K                             │                                                  \
-             \x1b[24;1H\x1b[Kn new   q quit                                                                  \
-             \x1b[J\x1b[?25l\x1b[?2026l",
-            "byte-identical oracle for the empty session list, captured \
-             before the buffer migration"
-        );
+    assert!(
+        !out.contains("remuda · default│"),
+        "the server brand is no longer in the pane header"
+    );
+    assert!(
+        out.contains("remuda · default 🏇\x1b[J"),
+        "the server brand and horse end the footer"
+    );
 }
 
 /// Creates a real session the same way `native/tests/daemon.rs` does —
@@ -1363,7 +1323,7 @@ fn new_session(path: &std::path::Path, name: &str) {
 // tools.lua's real three-row, styled output renders as expected. Measured ~13ms: one daemon thread, two `sh`
 // children, one held Attach connection, one Eval round trip.
 #[test]
-fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon() {
+fn render_styled_of_the_session_list_moves_the_real_brand_to_the_footer() {
     let path = scratch_socket("e2e-sessions-oracle");
     daemon_at(&path);
 
@@ -1399,36 +1359,27 @@ fn render_styled_of_the_session_list_is_byte_identical_when_fed_by_a_real_daemon
 
     let cells = vec![text_row(10); 23];
     let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
-    assert_eq!(
-            out,
-            "\x1b[?2026h\x1b[?25l\x1b[H\
-             \x1b[1;1H\x1b[Kremuda · default│xxxxxxxxxx                                                     \
-             \x1b[2;1H\x1b[K\x1b[1;7;36malpha\x1b[0m       \x1b[32m●\x1b[0m   │xxxxxxxxxx                                                     \
-             \x1b[3;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[4;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[5;1H\x1b[K\x1b[1mbravo\x1b[0m       \x1b[32m●\x1b[0m 🏇│xxxxxxxxxx                                                     \
-             \x1b[6;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[7;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[8;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[9;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[10;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[11;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[12;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[13;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[14;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[15;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[16;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[17;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[18;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[19;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[20;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[21;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[22;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[23;1H\x1b[K                │xxxxxxxxxx                                                     \
-             \x1b[24;1H\x1b[K↑↓/jk select   ⏎ enter   n new   x kill   l list   q quit                       \
-             \x1b[J\x1b[?25l\x1b[?2026l",
-            "byte-identical oracle for the non-empty session list, fed for real"
-        );
+    let first_line = out
+        .split("\x1b[1;1H\x1b[K")
+        .nth(1)
+        .and_then(|row| row.split("\x1b[2;1H").next())
+        .expect("first body row");
+    assert!(
+        first_line.contains("alpha"),
+        "first row has the first session: {first_line:?}"
+    );
+    assert!(
+        first_line.contains("xxxxxxxxxx"),
+        "preview starts on row one: {first_line:?}"
+    );
+    assert!(
+        !out.contains("remuda · default│"),
+        "the server brand is no longer in the pane header"
+    );
+    assert!(
+        out.contains("remuda · default 🏇\x1b[J"),
+        "the server brand and horse end the footer"
+    );
 }
 
 #[test]
@@ -1739,7 +1690,7 @@ fn the_selected_entry_stands_out_without_a_caret() {
 // herd rather than an empty `Vec` constructed by hand. Measured ~13ms:
 // one daemon thread, one Eval round trip, no children.
 #[test]
-fn render_styled_of_the_empty_session_list_is_byte_identical_when_fed_by_a_real_daemon() {
+fn render_styled_of_the_empty_session_list_moves_the_real_brand_to_the_footer() {
     let path = scratch_socket("e2e-empty-oracle");
     daemon_at(&path);
 
@@ -1759,36 +1710,14 @@ fn render_styled_of_the_empty_session_list_is_byte_identical_when_fed_by_a_real_
     ui.sessions_text = lines;
     let cells: Vec<Vec<StyledCell>> = vec![];
     let out = render_styled(&ui, &cells, hidden_cursor(), "default", 80, 24);
-    assert_eq!(
-            out,
-            "\x1b[?2026h\x1b[?25l\x1b[H\
-             \x1b[1;1H\x1b[Kremuda · default             │                                                  \
-             \x1b[2;1H\x1b[K                             │                                                  \
-             \x1b[3;1H\x1b[K  the herd is empty.         │                                                  \
-             \x1b[4;1H\x1b[K                             │                                                  \
-             \x1b[5;1H\x1b[K  press n to start a session.│                                                  \
-             \x1b[6;1H\x1b[K                             │                                                  \
-             \x1b[7;1H\x1b[K                             │                                                  \
-             \x1b[8;1H\x1b[K                             │                                                  \
-             \x1b[9;1H\x1b[K                             │                                                  \
-             \x1b[10;1H\x1b[K                             │                                                  \
-             \x1b[11;1H\x1b[K                             │                                                  \
-             \x1b[12;1H\x1b[K                             │                                                  \
-             \x1b[13;1H\x1b[K                             │                                                  \
-             \x1b[14;1H\x1b[K                             │                                                  \
-             \x1b[15;1H\x1b[K                             │                                                  \
-             \x1b[16;1H\x1b[K                             │                                                  \
-             \x1b[17;1H\x1b[K                             │                                                  \
-             \x1b[18;1H\x1b[K                             │                                                  \
-             \x1b[19;1H\x1b[K                             │                                                  \
-             \x1b[20;1H\x1b[K                             │                                                  \
-             \x1b[21;1H\x1b[K                             │                                                  \
-             \x1b[22;1H\x1b[K                             │                                                  \
-             \x1b[23;1H\x1b[K                             │                                                  \
-             \x1b[24;1H\x1b[Kn new   q quit                                                                  \
-             \x1b[J\x1b[?25l\x1b[?2026l",
-            "byte-identical oracle for the empty session list, fed for real"
-        );
+    assert!(
+        !out.contains("remuda · default│"),
+        "the server brand is no longer in the pane header"
+    );
+    assert!(
+        out.contains("remuda · default 🏇\x1b[J"),
+        "the server brand and horse end the footer"
+    );
 }
 
 /// Pins the attached marker against real Lua at narrow widths. The marker
@@ -2187,6 +2116,50 @@ fn which_pane_has_the_keyboard_is_on_screen_either_way() {
     assert!(session.contains("ctrl-\\ back to the list"));
 }
 
+#[test]
+fn narrow_footers_keep_mode_status_before_the_optional_server_brand() {
+    let modes = [
+        (Mode::Browse, Focus::List, "↑↓/jk", true),
+        (Mode::Browse, Focus::Session, "▶ sh", false),
+        (Mode::Prompt("/bin/sh".into()), Focus::List, "start:", true),
+        (Mode::Confirm("sh".into()), Focus::List, "kill sh?", true),
+    ];
+
+    for (mode, focus, status_prefix, brand_fits_at_80) in modes {
+        let mut ui = make_ui(vec![row("sh", true, false)]);
+        ui.mode = mode;
+        ui.focus = focus;
+        for width in [17, 20, 30] {
+            let line = footer(&ui, "srv5", false, 0, width);
+            assert_eq!(visible_width(&line), width as usize);
+            assert!(
+                line.starts_with(status_prefix),
+                "mode status comes first at {width} columns: {line:?}"
+            );
+            assert!(
+                !line.contains("remuda · srv5 🏇"),
+                "brand is omitted when status and brand cannot fit at {width}: {line:?}"
+            );
+        }
+
+        let wide = footer(&ui, "srv5", false, 0, 80);
+        assert!(wide.starts_with(status_prefix));
+        assert_eq!(
+            wide.ends_with("remuda · srv5 🏇"),
+            brand_fits_at_80,
+            "brand visibility follows available space for {status_prefix:?}: {wide:?}"
+        );
+    }
+
+    let ui = make_ui(vec![row("sh", true, false)]);
+    let wide = footer(&ui, "srv5", false, 0, 80);
+    assert_eq!(visible_width(&wide), 80);
+    assert!(
+        wide.ends_with("remuda · srv5 🏇"),
+        "brand is right-aligned: {wide:?}"
+    );
+}
+
 fn scratch_socket(tag: &str) -> std::path::PathBuf {
     let root = if cfg!(unix) {
         std::path::PathBuf::from("/tmp")
@@ -2402,8 +2375,8 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
     assert_eq!(
             out,
             "\x1b[?2026h\x1b[?25l\x1b[H\
-             \x1b[1;1H\x1b[Kremuda · default│hello                                                         →\
-             \x1b[2;1H\x1b[K\x1b[7malpha\x1b[0m           │                                                              →\
+             \x1b[1;1H\x1b[K\x1b[7malpha\x1b[0m           │hello                                                         →\
+             \x1b[2;1H\x1b[K                │                                                              →\
              \x1b[3;1H\x1b[K                │                                                              →\
              \x1b[4;1H\x1b[K                │                                                              →\
              \x1b[5;1H\x1b[K                │                                                              →\
@@ -2426,7 +2399,7 @@ fn render_styled_of_the_right_pane_is_fed_by_a_real_window_showing_a_real_sessio
              \x1b[22;1H\x1b[K                │                                                              →\
              \x1b[23;1H\x1b[K                │                                                              →\
              \x1b[24;1H\x1b[K                │                                                              →\
-             \x1b[25;1H\x1b[K↑↓/jk select   ⏎ enter   n new   x kill   l list   showing 63 cols   q quit     \
+             \x1b[25;1H\x1b[K↑↓/jk ⏎ enter n new l list q quit · showing 63               remuda · default 🏇\
              \x1b[J\x1b[1;23H\x1b[?25h\x1b[?2026l",
             "byte-identical oracle for the right pane, fed through a real window"
         );

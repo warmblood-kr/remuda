@@ -139,6 +139,7 @@ fn load_user_config(image: &Image) {
 /// unconditional unlink displaces a *live* peer, which then keeps running
 /// unreachable and holds its pty children forever.
 pub fn serve(path: &Path) -> std::io::Result<()> {
+    let _socket_lock = SocketLock::acquire(path)?;
     if ipc::connect(path).is_ok() {
         return Err(std::io::Error::other(format!(
             "a daemon is already listening at {} — pick a different name (remuda -s <name>) \
@@ -152,6 +153,7 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     let signals = catch_signals()?;
     let listener: Listener = ipc::listen(path)?;
+    let socket_owner = Arc::new(SocketOwnership::capture(path)?);
 
     let registry = Arc::new(Registry::new());
     // The image starts with the daemon and lives exactly as long (step 007).
@@ -182,17 +184,124 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     }
     spawn_ticker(image.clone(), Arc::clone(&counters), Arc::clone(&registry));
     #[cfg(unix)]
-    stop_on_signals(signals, image.clone(), path.to_path_buf());
+    stop_on_signals(signals, image.clone(), Arc::clone(&socket_owner));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let registry = Arc::clone(&registry);
         let image = image.clone();
         let counters = Arc::clone(&counters);
+        let socket_owner = Arc::clone(&socket_owner);
         std::thread::spawn(move || {
-            let _ = handle(stream, &registry, &image, &counters);
+            let _ = handle(stream, &registry, &image, &counters, socket_owner);
         });
     }
+    socket_owner.cleanup();
     Ok(())
+}
+
+/// Serialize stale-socket removal and bind for one daemon name. The lock file
+/// stays in the runtime directory; unlinking it would let contenders lock
+/// different inodes while one daemon still owns the old file.
+struct SocketLock {
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
+impl SocketLock {
+    fn acquire(socket: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+            let parent = socket.parent().unwrap_or_else(|| Path::new("."));
+            std::fs::create_dir_all(parent)?;
+            let mut lock_name = socket.as_os_str().to_os_string();
+            lock_name.push(".lock");
+            let lock_path = PathBuf::from(lock_name);
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .open(&lock_path)?;
+            std::fs::set_permissions(lock_path, std::fs::Permissions::from_mode(0o600))?;
+            loop {
+                let result =
+                    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+                if result == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    if ipc::connect(socket).is_ok() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            "Remuda daemon is already listening",
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                } else if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+            Ok(Self { _file: file })
+        }
+        #[cfg(windows)]
+        {
+            let _ = socket;
+            Ok(Self {})
+        }
+    }
+}
+
+/// The socket inode this daemon actually bound. Cleanup is conditional so a
+/// replacement endpoint installed at the same pathname belongs to its creator.
+struct SocketOwnership {
+    path: PathBuf,
+    #[cfg(unix)]
+    identity: (u64, u64),
+}
+
+impl SocketOwnership {
+    fn capture(path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::symlink_metadata(path)?;
+            Ok(Self {
+                path: path.to_path_buf(),
+                identity: (metadata.dev(), metadata.ino()),
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                path: path.to_path_buf(),
+            })
+        }
+    }
+
+    fn cleanup(&self) {
+        #[cfg(windows)]
+        let _ = &self.path;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if std::fs::symlink_metadata(&self.path)
+                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.identity)
+            {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+impl Drop for SocketOwnership {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
 }
 
 /// A fixed period, not configurable yet. Fires every period whether or not
@@ -304,7 +413,7 @@ fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
 fn stop_on_signals(
     mut reader: std::os::unix::net::UnixStream,
     image: Image,
-    socket: std::path::PathBuf,
+    socket_owner: Arc<SocketOwnership>,
 ) {
     use std::io::Read;
     // Auto-started (#107), the daemon leads its own session and a HUP is a
@@ -332,7 +441,7 @@ fn stop_on_signals(
             };
             let _ = writeln!(std::io::stderr(), "remuda daemon: {name}, shutting down");
             reap_processes_before_exit(&image);
-            let _ = std::fs::remove_file(&socket);
+            socket_owner.cleanup();
             std::process::exit(0);
         }
     });
@@ -404,6 +513,7 @@ fn handle(
     registry: &Registry,
     image: &Image,
     counters: &crate::tick::Counters,
+    socket_owner: Arc<SocketOwnership>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
@@ -436,6 +546,7 @@ fn handle(
         Request::Shutdown => {
             reply(&stream, &Response::Ok)?;
             reap_processes_before_exit(image);
+            socket_owner.cleanup();
             std::process::exit(0);
         }
 
