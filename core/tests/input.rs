@@ -122,6 +122,57 @@ fn the_rate_cap_is_per_session_bytes_per_second() {
 }
 
 #[test]
+fn a_rate_limited_batch_does_not_enter_dedup_history() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let clock = Arc::new(ManualClock::new());
+    let session = Session::new(
+        "rate-batch-input",
+        Box::new(InputRecordingAgent {
+            writes: Arc::clone(&writes),
+            alive: true,
+            fail_write: false,
+            event_tx: None,
+        }),
+        clock.clone(),
+    );
+    let instance_id = session.instance_id().to_string();
+    let bytes = vec![b'x'; MAX_INPUT_BYTES];
+    for seq in 1..=4 {
+        assert_eq!(
+            session.apply_input_batch(InputBatch {
+                instance_id: &instance_id,
+                client_id: [11; 16],
+                seq,
+                bytes: &bytes,
+            }),
+            Ok(InputOutcome::Ack { duplicate: false })
+        );
+    }
+    assert_eq!(
+        session.apply_input_batch(InputBatch {
+            instance_id: &instance_id,
+            client_id: [11; 16],
+            seq: 5,
+            bytes: &bytes,
+        }),
+        Err(remuda_core::input::InputError::RateLimited)
+    );
+    assert_eq!(writes.lock().unwrap().len(), 4);
+
+    clock.advance(std::time::Duration::from_secs(1));
+    assert_eq!(
+        session.apply_input_batch(InputBatch {
+            instance_id: &instance_id,
+            client_id: [11; 16],
+            seq: 5,
+            bytes: &bytes,
+        }),
+        Ok(InputOutcome::Ack { duplicate: false })
+    );
+    assert_eq!(writes.lock().unwrap().len(), 5);
+}
+
+#[test]
 fn malformed_client_ids_and_oversize_batches_are_rejected() {
     assert!(validate_batch("not-an-id", 1, b"line").is_err());
     assert!(validate_batch(&"00".repeat(16), 0, b"line").is_err());
