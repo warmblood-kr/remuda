@@ -213,12 +213,13 @@ fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> S
                 .iter()
                 .map(|s| {
                     format!(
-                        "{}\t{}x{}\talive={}\tidle={:.0}s",
+                        "{}\t{}x{}\talive={}\tidle={:.0}s\toutput_idle={:.0}s",
                         s.name,
                         s.size.cols(),
                         s.size.rows(),
                         s.alive,
-                        s.idle.as_secs_f64()
+                        s.idle.as_secs_f64(),
+                        s.output_idle.unwrap_or(s.idle).as_secs_f64()
                     )
                 })
                 .collect();
@@ -273,7 +274,7 @@ fn frame() -> Vec<Value> {
         }),
         json!({
             "name": "ls",
-            "description": "Every session this node holds, with size, liveness and idle time.",
+            "description": "Every session this node holds, with size, liveness, since-input idle and since-output idle times.",
             "inputSchema": {"type": "object", "properties": {}},
         }),
         json!({
