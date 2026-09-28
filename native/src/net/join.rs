@@ -2,6 +2,7 @@
 
 use crate::cluster::join_line::JoinLine;
 use std::io::{self, Read, Write};
+use std::net::SocketAddr;
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -10,8 +11,14 @@ pub fn join(
     invitation: &JoinLine,
     initiator_private: &[u8],
     timestamp_seconds: i64,
+    endpoint: Option<SocketAddr>,
 ) -> io::Result<()> {
-    let payload = serde_json::json!({ "join": { "token": invitation.token.as_str() } });
+    let payload = serde_json::json!({
+        "join": {
+            "token": invitation.token.as_str(),
+            "endpoint": endpoint.map(|address| address.to_string()),
+        }
+    });
     let payload = serde_json::to_vec(&payload).map_err(io::Error::other)?;
     let sealed = super::frame::seal_request(
         initiator_private,

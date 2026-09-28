@@ -133,7 +133,7 @@ fn decode_canonical_key(value: &str, description: &str) -> io::Result<Vec<u8>> {
     Ok(decoded)
 }
 
-fn validate_endpoint(address: SocketAddr) -> io::Result<()> {
+pub fn validate_endpoint(address: SocketAddr) -> io::Result<()> {
     let ip = address.ip();
     let broadcast = ip == std::net::IpAddr::V4(std::net::Ipv4Addr::BROADCAST);
     let scoped = matches!(address, SocketAddr::V6(value) if value.scope_id() != 0);

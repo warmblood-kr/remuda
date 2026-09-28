@@ -62,12 +62,14 @@ pub struct Listener {
 
 type MemberAuthorizer = Arc<dyn Fn(&[u8]) -> io::Result<()> + Send + Sync>;
 type FrameDispatcher = Arc<dyn Fn(&[u8]) -> io::Result<Vec<u8>> + Send + Sync>;
+type JoinAdmitter = Arc<dyn Fn(&[u8], Option<&str>) -> io::Result<()> + Send + Sync>;
 
 struct ListenerState {
     responder_private: Zeroizing<Vec<u8>>,
     replay: Mutex<replay::ReplayWindow>,
     limiter: Arc<RequestLimiter>,
     join_tokens: JoinTokenStore,
+    admit_join: JoinAdmitter,
 }
 
 struct MemberRegistryCache {
@@ -156,6 +158,7 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
             replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
             limiter: Arc::new(RequestLimiter::default()),
             join_tokens,
+            admit_join: Arc::new(cluster::admit_join_locked),
         }),
         authorize,
         dispatch,
@@ -655,6 +658,8 @@ fn handle_connection_with(
         #[serde(deny_unknown_fields)]
         struct JoinToken {
             token: String,
+            #[serde(default)]
+            endpoint: Option<String>,
         }
         let request: JoinRequest = match serde_json::from_slice(&opened.payload) {
             Ok(request) => request,
@@ -665,7 +670,7 @@ fn handle_connection_with(
         let result = state
             .join_tokens
             .verify_consume_with(&request.join.token, || {
-                cluster::admit_join_locked(&opened.peer_static)
+                (state.admit_join)(&opened.peer_static, request.join.endpoint.as_deref())
             });
         let response = if result.is_ok() {
             b"{\"joined\":true}".as_slice()
@@ -790,6 +795,29 @@ mod tests {
             dispatch: FrameDispatcher,
             limits: ConnectionLimits,
         ) -> Self {
+            Self::start_with_admitter(
+                responder_private,
+                responder_public,
+                authorize,
+                dispatch,
+                limits,
+                Arc::new(|_, _| {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "admission refused",
+                    ))
+                }),
+            )
+        }
+
+        fn start_with_admitter(
+            responder_private: Vec<u8>,
+            responder_public: Vec<u8>,
+            authorize: MemberAuthorizer,
+            dispatch: FrameDispatcher,
+            limits: ConnectionLimits,
+            admit_join: JoinAdmitter,
+        ) -> Self {
             use std::os::unix::fs::PermissionsExt;
             let responder_private_for_test = responder_private.clone();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -810,6 +838,7 @@ mod tests {
                 replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
+                admit_join,
             });
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = stop.clone();
@@ -866,6 +895,7 @@ mod tests {
                 replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
+                admit_join: Arc::new(cluster::admit_join_locked),
             });
             let listener = Listener {
                 socket: listener,
@@ -987,6 +1017,7 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: crate::cluster::encoding::fingerprint(&peer.public),
                 static_pubkey: crate::cluster::encoding::encode_base64(&peer.public),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: "test".into(),
@@ -1290,6 +1321,7 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: fingerprint.clone(),
                 static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: fingerprint,
@@ -1399,6 +1431,66 @@ mod tests {
             .send_raw(&duplicate_body, content_length.as_bytes())
             .unwrap();
         assert_eq!(status, 409);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_admits_unknown_join_once_and_passes_optional_endpoint() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let admissions = Arc::new(Mutex::new(Vec::new()));
+        let recorded = admissions.clone();
+        let server = SocketTestServer::start_with_admitter(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "unknown"))),
+            Arc::new(|_| panic!("Join must not reach daemon dispatch")),
+            ConnectionLimits {
+                outer_hold: socket_test_timeout(),
+                post_dispatch_hold: socket_test_timeout(),
+                idle_read: socket_test_timeout(),
+                total_read: socket_test_timeout(),
+            },
+            Arc::new(move |key, endpoint| {
+                recorded.lock().unwrap().push((
+                    cluster::encoding::fingerprint(key),
+                    endpoint.map(str::to_owned),
+                ));
+                Ok(())
+            }),
+        );
+        let token_store =
+            JoinTokenStore::open_at(&server.state_dir, Arc::new(crate::SystemWallClock::new()))
+                .unwrap();
+        let minted = token_store.mint().unwrap();
+        let make_payload = || {
+            serde_json::to_vec(&serde_json::json!({
+                "join": {
+                    "token": minted.token.as_str(),
+                    "endpoint": "198.51.100.20:9443"
+                }
+            }))
+            .unwrap()
+        };
+        let first = sealed_payload_request(&peer, &server, &make_payload());
+        let (status, response) = server.exchange(first);
+        assert_eq!(status, 200);
+        assert_eq!(response, b"{\"joined\":true}");
+        let reused = sealed_payload_request(&peer, &server, &make_payload());
+        let (status, response) = server.exchange(reused);
+        assert_eq!(status, 200);
+        assert_eq!(response, b"{\"joined\":false}");
+        assert_eq!(
+            admissions.lock().unwrap().as_slice(),
+            &[(
+                cluster::encoding::fingerprint(&peer.public),
+                Some("198.51.100.20:9443".into())
+            )]
+        );
     }
 
     #[cfg(unix)]
@@ -1691,6 +1783,7 @@ mod tests {
         registry.authorized_nodes.push(AuthorizedNode {
             node_fp: fingerprint.clone(),
             static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+            endpoint: None,
             state: NodeState::Admitted,
             version: 1,
             by: fingerprint,
@@ -1711,6 +1804,7 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: fingerprint.clone(),
                 static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: fingerprint,
