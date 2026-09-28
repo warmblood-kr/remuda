@@ -5,7 +5,7 @@ use remuda_core::Size;
 fn anchor_capture_retries_when_history_advances_between_captures() {
     let captures = [(10_000, 10_044), (10_000, 10_050), (10_000, 10_050)];
     let mut requested_offsets = Vec::new();
-    let (_, _, total, offset) = capture_anchored(28, 10_038, |requested| {
+    let (_, _, total, offset, anchor_total) = capture_anchored(28, 10_038, |requested| {
         requested_offsets.push(requested);
         let (rows, total) = captures[requested_offsets.len() - 1];
         Ok(((), rows, total))
@@ -15,6 +15,26 @@ fn anchor_capture_retries_when_history_advances_between_captures() {
     assert_eq!(requested_offsets, [28, 34, 40]);
     assert_eq!(offset, 40);
     assert_eq!(total, 10_050);
+    assert_eq!(anchor_total, 10_050);
+}
+
+#[test]
+fn anchor_capture_stops_retrying_when_output_never_quiets() {
+    let mut calls = 0;
+    let (requested, rows, total, offset, anchor_total) =
+        capture_anchored(28, 10_038, |requested| {
+            calls += 1;
+            assert!(calls <= 3, "anchor capture exceeded its retry budget");
+            Ok((requested, 10_000, 10_038 + calls * 6))
+        })
+        .expect("bounded capture returns its final consistent snapshot");
+
+    assert_eq!(calls, 3);
+    assert_eq!(requested, 40);
+    assert_eq!(rows, 10_000);
+    assert_eq!(total, 10_056);
+    assert_eq!(offset, 40);
+    assert_eq!(anchor_total, 10_050);
 }
 
 /// The regression steps/017 guards: an idle *list*-focused herd must not

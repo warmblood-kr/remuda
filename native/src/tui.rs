@@ -40,6 +40,7 @@ const TICK: Duration = Duration::from_millis(250);
 /// also be the redraw cadence; see steps/017 for why that was the bug.
 const TICK_TYPING: Duration = Duration::from_millis(40);
 const SCROLL_DOWN_SETTLE: Duration = Duration::from_millis(1500);
+const MAX_ANCHOR_CAPTURES: usize = 3;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -131,6 +132,9 @@ struct ScrollState {
     offset: usize,
     history_rows: usize,
     history_total: usize,
+    /// Total corresponding to `offset`; can lag `history_total` when output
+    /// keeps arriving through the bounded capture retries.
+    anchor_total: usize,
     last_scroll_down: Option<Instant>,
     scroll_direction: i8,
     recent_up_output: usize,
@@ -1983,16 +1987,25 @@ fn capture_anchored<T>(
     base_offset: usize,
     previous_total: usize,
     mut capture: impl FnMut(usize) -> Result<(T, usize, usize), String>,
-) -> Result<(T, usize, usize, usize), String> {
+) -> Result<(T, usize, usize, usize, usize), String> {
     let mut requested = base_offset;
-    loop {
+    let mut requested_total = previous_total;
+    for attempt in 0..MAX_ANCHOR_CAPTURES {
         let (value, rows, total) = capture(requested)?;
         let anchored = anchor_offset_to_new_history(base_offset, previous_total, total, rows);
         if anchored == requested {
-            return Ok((value, rows, total, anchored));
+            return Ok((value, rows, total, anchored, total));
+        }
+        if attempt + 1 == MAX_ANCHOR_CAPTURES {
+            // Keep the actual captured offset paired with these cells. Carry
+            // forward the total at which that offset was requested so the
+            // next frame can account for output that arrived during retries.
+            return Ok((value, rows, total, requested, requested_total));
         }
         requested = anchored;
+        requested_total = total;
     }
+    unreachable!("the bounded anchor loop always returns a capture")
 }
 
 /// Keep a scrolled preview on the same history rows as output pushes new rows.
@@ -2001,18 +2014,19 @@ fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCaptur
     let scrolling_down = state
         .last_scroll_down
         .is_some_and(|last| last.elapsed() < SCROLL_DOWN_SETTLE);
-    let (cells, wrapped, cursor, history_rows, history_total, anchored) = if scrolling_down {
-        let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, state.offset)?;
-        (cells, wrapped, cursor, rows, total, state.offset)
-    } else {
-        let (capture, rows, total, anchored) =
-            capture_anchored(state.offset, state.history_total, |offset| {
-                let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, offset)?;
-                Ok(((cells, wrapped, cursor), rows, total))
-            })?;
-        let (cells, wrapped, cursor) = capture;
-        (cells, wrapped, cursor, rows, total, anchored)
-    };
+    let (cells, wrapped, cursor, history_rows, history_total, anchored, anchor_total) =
+        if scrolling_down {
+            let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, state.offset)?;
+            (cells, wrapped, cursor, rows, total, state.offset, total)
+        } else {
+            let (capture, rows, total, anchored, anchor_total) =
+                capture_anchored(state.offset, state.anchor_total, |offset| {
+                    let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, offset)?;
+                    Ok(((cells, wrapped, cursor), rows, total))
+                })?;
+            let (cells, wrapped, cursor) = capture;
+            (cells, wrapped, cursor, rows, total, anchored, anchor_total)
+        };
     state.offset = anchored;
     if state.scroll_direction == 1 {
         state.recent_up_output = state
@@ -2021,6 +2035,7 @@ fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCaptur
     }
     state.history_rows = history_rows;
     state.history_total = history_total;
+    state.anchor_total = anchor_total;
     Ok((cells, wrapped, cursor))
 }
 
