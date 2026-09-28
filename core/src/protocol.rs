@@ -71,6 +71,14 @@ pub enum Request {
         #[serde(default)]
         scrollback: usize,
     },
+    /// Wait for a newer styled screen, returning the current frame on timeout.
+    Sync {
+        name: String,
+        #[serde(default)]
+        instance_id: Option<String>,
+        since: u64,
+        timeout_ms: u64,
+    },
     /// Read the child's current mouse mode and encoding.
     MouseState { name: String },
     /// Take the session over for a human at a terminal. On `Ok`, this
@@ -145,6 +153,12 @@ pub enum Response {
     WrongInstance,
     /// The per-session input byte budget has been exhausted for this second.
     RateLimited,
+    /// A versioned screen, returned by [`Request::Sync`].
+    Sync {
+        instance_id: String,
+        output_version: u64,
+        snapshot: StyledScreen,
+    },
     /// A styled screen, answering [`Request::CaptureStyled`] — as runs, not
     /// cells; see [`StyledRun`]. `cursor` rides the same round trip, so the
     /// pane's caret and its content are always the same frame. See steps/027.
@@ -217,6 +231,19 @@ pub struct StyledRun {
     /// [`StyledCell::wide`]. Part of the grouping key: a run never mixes
     /// wide and narrow cells, so this one flag applies to the whole run.
     pub wide: bool,
+}
+
+/// A styled frame captured atomically with its output version for Sync.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct StyledScreen {
+    pub rows: Vec<Vec<StyledRun>>,
+    #[serde(default)]
+    pub wrapped: Vec<bool>,
+    #[serde(default)]
+    pub scrollback_len: usize,
+    #[serde(default)]
+    pub scrollback_total: usize,
+    pub cursor: Cursor,
 }
 
 /// Collapse adjacent cells sharing one style (wideness included) into runs.

@@ -380,6 +380,133 @@ fn capture_version(socket: &Path) -> u64 {
     }
 }
 
+#[test]
+fn sync_returns_immediately_when_since_is_older_than_current_output() {
+    let runtime = scratch_dir("sync-immediate");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "printf ready; sleep 30");
+    let current = wait_for_quiet_output_version(&socket);
+    assert!(current > 0, "fixture must produce a versioned frame");
+    let started = Instant::now();
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: None,
+            since: current - 1,
+            timeout_ms: 30_000,
+        },
+    )
+    .expect("sync response");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "new output must return immediately"
+    );
+    assert!(matches!(response, Response::Sync { output_version, .. } if output_version == current));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_waits_for_output_and_returns_the_new_snapshot() {
+    let runtime = scratch_dir("sync-output");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 0.2; printf after-sync; sleep 30");
+    let since = capture_version(&socket);
+    let request_socket = socket.clone();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: None,
+                since,
+                timeout_ms: 2_000,
+            },
+        )
+        .expect("sync response")
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !request.is_finished(),
+        "sync should wait while the version is unchanged"
+    );
+    let response = request.join().expect("sync worker");
+    assert!(
+        matches!(response, Response::Sync { output_version, snapshot, .. }
+        if output_version > since && snapshot.rows.iter().flatten().any(|run| run.text.contains("after-sync")))
+    );
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_times_out_with_the_current_unchanged_frame() {
+    let runtime = scratch_dir("sync-timeout");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let current = capture_version(&socket);
+    let started = Instant::now();
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: None,
+            since: current,
+            timeout_ms: 60,
+        },
+    )
+    .expect("sync timeout response");
+    assert!(started.elapsed() >= Duration::from_millis(40));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(response, Response::Sync { output_version, .. } if output_version == current));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_rejects_a_wrong_instance_without_waiting() {
+    let runtime = scratch_dir("sync-wrong-instance");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let started = Instant::now();
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: Some("old-session-instance".into()),
+            since: 0,
+            timeout_ms: 30_000,
+        },
+    )
+    .expect("wrong-instance response");
+    assert_eq!(response, Response::WrongInstance);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+fn stop_daemon(runtime: &Path, socket: &Path, running: &mut spawn::Daemon) {
+    assert_eq!(
+        socket,
+        daemon::socket_path_in(runtime, "s"),
+        "only stop the private daemon created under this test's scratch runtime"
+    );
+    let _ = client::request(
+        socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    assert!(
+        running.left_on_its_own(),
+        "private daemon should stop cleanly"
+    );
+}
+
 fn wait_for_output_version(socket: &Path, original: u64) {
     let deadline = Instant::now() + PATIENCE;
     while capture_version(socket) <= original {

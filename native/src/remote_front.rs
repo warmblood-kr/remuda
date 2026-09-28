@@ -13,8 +13,9 @@ pub const MAX_FRAME_BYTES: usize = 512 * 1024;
 pub const MAX_INPUT_BYTES: usize = remuda_core::input::MAX_INPUT_BYTES;
 /// Maximum simultaneous local front connections.
 pub const MAX_CONNECTIONS: usize = 8;
-/// A connection is closed if one request takes longer than this.
+/// Time allowed to submit a single request frame or complete an ordinary request.
 pub const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const SYNC_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Decode and authorize exactly one JSON frame. This is the front's trust
 /// boundary: callers must send the returned Request to the local daemon, never
@@ -33,7 +34,11 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, String> {
 /// typed response afresh. Request bytes are never copied to the daemon socket.
 pub fn forward_frame(path: &std::path::Path, frame: &[u8]) -> Result<Vec<u8>, String> {
     let request = decode_frame(frame)?;
-    let response = crate::client::request(path, &request).map_err(|error| error.to_string())?;
+    forward_request(path, &request)
+}
+
+fn forward_request(path: &std::path::Path, request: &Request) -> Result<Vec<u8>, String> {
+    let response = crate::client::request(path, request).map_err(|error| error.to_string())?;
     serde_json::to_vec(&response).map_err(|error| error.to_string())
 }
 
@@ -113,41 +118,78 @@ impl Drop for ConnectionSlot {
 }
 
 fn serve_connection(mut stream: crate::ipc::Stream, daemon_path: &Path) -> std::io::Result<()> {
+    let (read_done, read_timer) = timeout_timer(&stream, CONNECTION_TIMEOUT)?;
+    let mut frame = Vec::new();
+    let limited = (&mut stream).take((MAX_FRAME_BYTES + 1) as u64);
+    let mut reader = std::io::BufReader::new(limited);
+    let read_result = reader.read_until(b'\n', &mut frame);
+    let _ = read_done.send(());
+    let _ = read_timer.join();
+    read_result?;
+    if frame.last() == Some(&b'\n') {
+        frame.pop();
+    }
+    let request = match decode_frame(&frame) {
+        Ok(request) => request,
+        Err(reason) => {
+            return write_response(
+                &mut stream,
+                serde_json::to_vec(&remuda_core::protocol::Response::error(reason))
+                    .expect("response serializes"),
+            );
+        }
+    };
+    let timeout = request_timeout(&request);
+    let (done, timer) = timeout_timer(&stream, timeout)?;
+    let reply = match forward_request(daemon_path, &request) {
+        Ok(response) => response,
+        Err(reason) => serde_json::to_vec(&remuda_core::protocol::Response::error(reason))
+            .expect("response serializes"),
+    };
+    let result = write_response(&mut stream, reply);
+    let _ = done.send(());
+    let _ = timer.join();
+    result
+}
+
+fn request_timeout(request: &Request) -> std::time::Duration {
+    match request {
+        Request::Sync { timeout_ms, .. } => {
+            std::time::Duration::from_millis((*timeout_ms).min(remuda_core::sync::MAX_TIMEOUT_MS))
+                + SYNC_TIMEOUT_MARGIN
+        }
+        _ => CONNECTION_TIMEOUT,
+    }
+}
+
+fn timeout_timer(
+    stream: &crate::ipc::Stream,
+    timeout: std::time::Duration,
+) -> std::io::Result<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)> {
     let wake_stream = stream.try_clone()?;
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let timer = std::thread::spawn(move || {
-        if done_rx.recv_timeout(CONNECTION_TIMEOUT).is_err() {
+        if done_rx.recv_timeout(timeout).is_err() {
             crate::ipc::wake(&wake_stream);
         }
     });
-    let result = (|| {
-        let mut frame = Vec::new();
-        let limited = (&mut stream).take((MAX_FRAME_BYTES + 1) as u64);
-        let mut reader = std::io::BufReader::new(limited);
-        reader.read_until(b'\n', &mut frame)?;
-        if frame.last() == Some(&b'\n') {
-            frame.pop();
-        }
-        let reply = match forward_frame(daemon_path, &frame) {
-            Ok(response) => response,
-            Err(reason) => serde_json::to_vec(&remuda_core::protocol::Response::error(reason))
-                .expect("response serializes"),
-        };
-        stream.write_all(&reply)?;
-        stream.write_all(b"\n")?;
-        stream.flush()
-    })();
-    let _ = done_tx.send(());
-    let _ = timer.join();
-    result
+    Ok((done_tx, timer))
+}
+
+fn write_response(stream: &mut crate::ipc::Stream, reply: Vec<u8>) -> std::io::Result<()> {
+    stream.write_all(&reply)?;
+    stream.write_all(b"\n")?;
+    stream.flush()
 }
 
 /// Validate the deliberately small request surface. The explicit deny arms
 /// make the compiler require a policy decision for every new Request variant.
 /// Exhaustive on purpose: no wildcard arm, a new Request variant must be classified here.
+/// Threat model: Sync is read-only and bounded to one capped wait per request,
+/// with an overall daemon concurrency limit; it does not expose Eval or writes.
 pub fn authorize(request: &Request) -> Result<(), String> {
     match request {
-        Request::List | Request::CaptureStyled { .. } => Ok(()),
+        Request::List | Request::CaptureStyled { .. } | Request::Sync { .. } => Ok(()),
         Request::Input {
             client_id,
             seq,
@@ -184,8 +226,29 @@ mod tests {
     use remuda_core::protocol::Request;
 
     #[test]
+    fn sync_front_deadline_is_capped_and_allows_the_server_wait() {
+        assert_eq!(
+            request_timeout(&Request::Sync {
+                name: "dev".into(),
+                instance_id: None,
+                since: 0,
+                timeout_ms: u64::MAX,
+            }),
+            std::time::Duration::from_secs(35)
+        );
+        assert_eq!(request_timeout(&Request::List), CONNECTION_TIMEOUT);
+    }
+
+    #[test]
     fn permits_only_the_read_and_batched_input_surface() {
         assert!(authorize(&Request::List).is_ok());
+        assert!(authorize(&Request::Sync {
+            name: "dev".into(),
+            instance_id: None,
+            since: 4,
+            timeout_ms: 30_000,
+        })
+        .is_ok());
         assert!(authorize(&Request::CaptureStyled {
             name: "dev".into(),
             scrollback: 0
@@ -214,6 +277,26 @@ mod tests {
             steps: vec![]
         })
         .is_err());
+    }
+
+    #[test]
+    fn sync_is_allowlisted_but_eval_remains_refused() {
+        let sync = Request::Sync {
+            name: "dev".into(),
+            instance_id: Some("instance".into()),
+            since: 7,
+            timeout_ms: 30_000,
+        };
+        assert!(decode_frame(&serde_json::to_vec(&sync).unwrap()).is_ok());
+
+        let eval = Request::Eval {
+            code: "return secret".into(),
+            name: None,
+        };
+        assert_eq!(
+            decode_frame(&serde_json::to_vec(&eval).unwrap()).unwrap_err(),
+            "remote front refuses Eval"
+        );
     }
 
     #[test]

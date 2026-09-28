@@ -13,7 +13,7 @@ use crate::protocol::Step;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -31,6 +31,9 @@ pub struct Session {
     /// dedicated receiver keeps this current even when no caller polls the
     /// screen; `idle_for` remains the distinct since-input measure.
     last_output_at: Arc<Mutex<Duration>>,
+    /// Output waiters share this notification; screen/version reads remain
+    /// under the agent's own lock and never hold it across the wait.
+    output_changed: Arc<(Mutex<u64>, Condvar)>,
     instance_id: String,
     /// [`Clock::now`] at the last keystroke through an [`Attached`] guard —
     /// a human's, never a script's. `None` until one arrives (#136).
@@ -99,13 +102,19 @@ impl Session {
         let size = agent.size();
         let started = clock.now();
         let last_output_at = Arc::new(Mutex::new(started));
+        let output_changed = Arc::new((Mutex::new(0_u64), Condvar::new()));
         if let Some(output) = agent.subscribe() {
             let last_output_at = Arc::clone(&last_output_at);
+            let output_changed = Arc::clone(&output_changed);
             let clock = Arc::clone(&clock);
             std::thread::spawn(move || {
                 while output.recv().is_ok() {
                     if let Ok(mut at) = last_output_at.lock() {
                         *at = clock.now();
+                    }
+                    if let Ok(mut generation) = output_changed.0.lock() {
+                        *generation = (*generation).wrapping_add(1);
+                        output_changed.1.notify_all();
                     }
                 }
             });
@@ -118,6 +127,7 @@ impl Session {
             clock,
             last_input_at: Mutex::new(started),
             last_output_at,
+            output_changed,
             instance_id,
             last_human_input_at: Mutex::new(None),
             attached: AtomicBool::new(false),
@@ -363,6 +373,39 @@ impl Session {
         let mut snapshot = agent.screen_snapshot_at(scrollback)?;
         snapshot.instance_id = Some(self.instance_id.clone());
         Ok(snapshot)
+    }
+
+    /// Wait for a screen version newer than `since`, or return the current
+    /// atomic frame when the deadline expires. The condition lock is released
+    /// by `wait_timeout`; the agent/screen lock is held only for each snapshot.
+    pub fn wait_for_output_after(
+        &self,
+        since: u64,
+        timeout: Duration,
+    ) -> Result<VersionedSnapshot> {
+        let deadline = self.clock.now().saturating_add(timeout);
+        let (generation, wake) = &*self.output_changed;
+        let mut guard = generation
+            .lock()
+            .map_err(|_| AgentError::Io("output wait lock poisoned".into()))?;
+        loop {
+            let observed = *guard;
+            let snapshot = self.screen_snapshot_version_at(0)?;
+            if snapshot.output_version.unwrap_or(0) > since {
+                return Ok(snapshot);
+            }
+            let remaining = deadline.saturating_sub(self.clock.now());
+            if remaining.is_zero() {
+                return Ok(snapshot);
+            }
+            let (next_guard, result) = wake
+                .wait_timeout_while(guard, remaining, |current| *current == observed)
+                .map_err(|_| AgentError::Io("output wait lock poisoned".into()))?;
+            guard = next_guard;
+            if result.timed_out() {
+                return self.screen_snapshot_version_at(0);
+            }
+        }
     }
 
     pub fn is_alive(&self) -> bool {
