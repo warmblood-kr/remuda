@@ -75,7 +75,7 @@ fn exercise_session_exit_payload(path: &std::path::Path) {
     ];
     #[cfg(not(windows))]
     let long_lived = vec!["/bin/sleep".into(), "30".into()];
-    start_session(path, &close_name, long_lived);
+    start_session(path, &close_name, long_lived.clone());
     assert_eq!(
         client::request(
             path,
@@ -91,6 +91,21 @@ fn exercise_session_exit_payload(path: &std::path::Path) {
         path,
         &format!("remuda._api_v5_assert_exit({close_name:?}, 'closed')"),
     );
+
+    for iteration in 0..200 {
+        let name = format!("api-v5-close-race-{}-{iteration}", std::process::id());
+        start_session(path, &name, long_lived.clone());
+        assert_eq!(
+            client::request(path, &Request::Close { name: name.clone() },)
+                .expect("close race session"),
+            Response::Ok
+        );
+        wait_for_exit_event(path, &name);
+        eval(
+            path,
+            &format!("remuda._api_v5_assert_exit({name:?}, 'closed')"),
+        );
+    }
 
     let exit_name = format!("api-v5-exit-{}", std::process::id());
     #[cfg(windows)]

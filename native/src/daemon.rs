@@ -345,16 +345,18 @@ const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 /// notifying anywhere else would race it and silently drop the event.
 pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String> {
     let dead = registry.reap_with_exit_info();
-    for (name, exit_info) in &dead {
-        notify_exited(image, name, "exited", exit_info.as_ref());
+    for (name, reason, exit_info) in &dead {
+        notify_exited(image, name, reason, exit_info.as_ref());
     }
-    dead.into_iter().map(|(name, _)| name).collect()
+    dead.into_iter().map(|(name, _, _)| name).collect()
 }
 
 fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<()>> {
     let session = registry.get(name)?;
     let closed = registry.close(name)?;
     if let Ok(true) = closed {
+        // If the reaper removed it first, close returns false and the reaper
+        // owns the single notification using the marker's `closed` reason.
         notify_exited(image, name, "closed", session.exit_info().as_ref());
     }
     Some(closed.map(drop))

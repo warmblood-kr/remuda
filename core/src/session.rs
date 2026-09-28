@@ -37,6 +37,8 @@ pub struct Session {
     last_human_input_at: Mutex<Option<Duration>>,
     /// Set while the current [`Attached`] guard is alive.
     attached: AtomicBool,
+    /// Set under the registry lock before a close request terminates the child.
+    closing: AtomicBool,
     /// Current attachment generation and its takeover signal. The generation
     /// keeps an old guard's drop from clearing a newer attachment.
     attach_slot: Mutex<Option<(u64, Arc<AtomicBool>)>>,
@@ -121,6 +123,7 @@ impl Session {
             instance_id,
             last_human_input_at: Mutex::new(None),
             attached: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
             attach_slot: Mutex::new(None),
             next_attach_generation: AtomicU64::new(1),
             input_lock: Mutex::new(()),
@@ -373,6 +376,19 @@ impl Session {
             // unknown.
             Err(_) => false,
         }
+    }
+
+    /// Whether an explicit close request has claimed this session.
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn mark_closing(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn clear_closing(&self) {
+        self.closing.store(false, Ordering::SeqCst);
     }
 
     /// The process exit information observed by this session's backend, if known.

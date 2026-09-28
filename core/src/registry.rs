@@ -193,24 +193,34 @@ impl Registry {
     pub fn reap(&self) -> Vec<String> {
         self.reap_with_exit_info()
             .into_iter()
-            .map(|(name, _)| name)
+            .map(|(name, _, _)| name)
             .collect()
     }
 
     /// Drop exited sessions and retain any status their backend observed.
-    pub fn reap_with_exit_info(&self) -> Vec<(String, Option<ExitInfo>)> {
+    pub fn reap_with_exit_info(&self) -> Vec<(String, &'static str, Option<ExitInfo>)> {
         let mut sessions = self.lock();
         let dead: Vec<_> = sessions
             .iter()
             .filter(|(_, s)| !s.is_alive())
-            .map(|(name, session)| (name.clone(), Arc::clone(session)))
+            .map(|(name, session)| {
+                (
+                    name.clone(),
+                    if session.is_closing() {
+                        "closed"
+                    } else {
+                        "exited"
+                    },
+                    Arc::clone(session),
+                )
+            })
             .collect();
-        for (name, _) in &dead {
+        for (name, _, _) in &dead {
             sessions.remove(name);
         }
         drop(sessions);
         dead.into_iter()
-            .map(|(name, session)| (name, session.exit_info()))
+            .map(|(name, reason, session)| (name, reason, session.exit_info()))
             .collect()
     }
 
@@ -296,7 +306,16 @@ impl Registry {
     /// End and stop tracking a session; an attached one refuses and stays.
     /// `Ok(false)`: a concurrent `reap` removed it first and owns the notice.
     pub fn close(&self, name: &str) -> Option<Result<bool>> {
-        let session = self.get(name)?;
-        Some(session.terminate().map(|()| self.remove(name).is_some()))
+        let session = {
+            let sessions = self.lock();
+            let session = Arc::clone(sessions.get(name)?);
+            session.mark_closing();
+            session
+        };
+        if let Err(error) = session.terminate() {
+            session.clear_closing();
+            return Some(Err(error));
+        }
+        Some(Ok(self.remove(name).is_some()))
     }
 }
