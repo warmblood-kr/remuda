@@ -2743,14 +2743,21 @@ fn a_sigkilled_daemon_reaps_a_codex_app_server_in_its_session() {
     );
     let _ = daemon.0.wait();
     let deadline = Instant::now() + PATIENCE;
-    while pid_alive(app_server_pid) {
-        assert!(
-            Instant::now() < deadline,
-            "Codex app-server ({app_server_pid}) outlived the killed daemon"
-        );
+    while pid_alive(app_server_pid) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
+    let app_server_reaped = !pid_alive(app_server_pid);
+    if !app_server_reaped {
+        // Keep a regression failure from leaving the stub process behind.
+        unsafe {
+            libc::kill(app_server_pid, libc::SIGKILL);
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        app_server_reaped,
+        "Codex app-server ({app_server_pid}) outlived the killed daemon"
+    );
 }
 
 /// [MEASURED, unix] The one path that DOES reach a grandchild: a clean
