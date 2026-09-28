@@ -152,7 +152,19 @@ fi
 # control on `remuda ls` itself -- if `remuda ls` ever lied about a session's
 # presence, that test goes red. Weakening or deleting it re-enables a known
 # false-positive across all three consumers, not just loosens one test.
-if ! env -u PWD remuda ls | awk '$1 == "butler" { found = 1 } END { exit !found }'; then
+# Same bounded retry as after the restart below: butler registers its session
+# from a start hook / short fallback schedule, not before exec returns (#164).
+attempt=0
+found=0
+while [ "$attempt" -lt 20 ]; do
+	if env -u PWD remuda ls | awk '$1 == "butler" { found = 1 } END { exit !found }'; then
+		found=1
+		break
+	fi
+	attempt=$((attempt + 1))
+	sleep 0.5
+done
+if [ "$found" -ne 1 ]; then
 	die "remuda exec butler exited successfully but registered no session named 'butler' -- this remuda build is between the 'exec' verb landing and the real butler package landing (a real but narrow window); run 'remuda upgrade' and try again"
 fi
 status "butler registered for this run."
