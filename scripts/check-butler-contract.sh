@@ -16,10 +16,10 @@ set -euo pipefail
 CORE=$(cd "$(dirname "$0")/.." && pwd)
 BUTLER_URL=${BUTLER_URL:-https://github.com/warmblood-kr/remuda-butler.git}
 BUTLER_REF=${BUTLER_REF:-main}
-# The last legacy (pre-lifecycle) Butler. live_reload.sh replays the
-# legacy -> lifecycle upgrade, so its baseline must be a legacy install;
-# its own default (origin/main) is already a lifecycle Butler.
-OLD_REF=${OLD_REF:-8950e51^}
+# The Butler before lifecycle-owned registrations (remuda-butler #47).
+# live_reload.sh replays that upgrade; since #47 it no longer supports the
+# older legacy baseline (8950e51^), which would duplicate hooks on reload.
+OLD_REF=${OLD_REF:-2535f27}
 
 scratch=$(mktemp -d /tmp/butler-contract.XXXXXX)
 trap 'rm -rf "$scratch"' EXIT
