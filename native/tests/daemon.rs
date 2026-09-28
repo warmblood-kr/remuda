@@ -17,7 +17,7 @@ use remuda_native::{client, daemon, ipc, CommandBuilder, PtyAgent, SystemClock};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -638,12 +638,44 @@ fn target_row(path: &Path, expr: &str) -> String {
     }
 }
 
-fn target_is_attached(path: &Path) -> bool {
-    match client::request(path, &Request::List) {
-        Ok(Response::Sessions(sessions)) => sessions
-            .iter()
-            .any(|session| session.name == "target" && session.attached),
-        other => panic!("session list: {other:?}"),
+fn wait_for_target_attach(
+    path: &Path,
+    child: &mut dyn portable_pty::Child,
+    captured_output: &Mutex<Vec<u8>>,
+) {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let response = client::request(path, &Request::List)
+            .unwrap_or_else(|error| Response::error(format!("List request failed: {error}")));
+        let attached = matches!(
+            &response,
+            Response::Sessions(sessions)
+                if sessions.iter().any(|session| session.name == "target" && session.attached)
+        );
+        if attached {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("poll client A before takeover") {
+            let output = captured_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            panic!(
+                "client A exited before attaching ({status:?}); last List response: {response:?}; client A output: {:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        if Instant::now() >= deadline {
+            let captured = captured_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let output = String::from_utf8_lossy(&captured).into_owned();
+            drop(captured);
+            let _ = child.kill();
+            panic!(
+                "client A never attached; last List response: {response:?}; client A output: {output:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -961,17 +993,22 @@ fn a_tracked_client_exits_on_takeover_without_waiting_for_another_key() {
     // parent's slave handle open can prevent some PTY implementations from
     // reporting EOF after the child exits.
     drop(pty.slave);
-    #[cfg(unix)]
     let mut reader = pty.master.try_clone_reader().expect("clone pty reader");
+    let captured_output = Arc::new(Mutex::new(Vec::new()));
+    let thread_output = Arc::clone(&captured_output);
     #[cfg(unix)]
     let (output_tx, output_rx) = std::sync::mpsc::channel();
-    #[cfg(unix)]
     std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    thread_output
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extend_from_slice(&buf[..n]);
+                    #[cfg(unix)]
                     if output_tx.send(buf[..n].to_vec()).is_err() {
                         break;
                     }
@@ -980,11 +1017,7 @@ fn a_tracked_client_exits_on_takeover_without_waiting_for_another_key() {
         }
     });
 
-    let deadline = Instant::now() + PATIENCE;
-    while !target_is_attached(&path) {
-        assert!(Instant::now() < deadline, "client A never attached");
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_for_target_attach(&path, child.as_mut(), &captured_output);
     let _current = raw_attach(&path, "target");
 
     let deadline = Instant::now() + PATIENCE;
