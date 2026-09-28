@@ -15,10 +15,11 @@
 use crate::child_guard;
 use crate::image::Image;
 use std::collections::{HashMap, VecDeque};
-use std::io::BufRead;
+use std::io::{BufRead, Read, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 // ponytail: fixed cap, not adaptive — a helper that fills this before Lua
 // drains it just blocks on its own stdout write (the intended backpressure).
@@ -29,6 +30,318 @@ const BUFFER_CAP: usize = 4096;
 // drains in one job, small enough that one job can't hog the Image's FIFO
 // for long under a flood. Revisit if either edge is hit in practice.
 const DRAIN_BATCH: usize = 256;
+
+const RUN_OUTPUT_LIMIT: usize = 1024 * 1024;
+const RUN_OUTPUT_MARKER: &[u8] = b"\n[output truncated by remuda.process.run]";
+const RUN_READER_WORKER_LIMIT: usize = 16;
+static ACTIVE_RUN_READER_WORKERS: AtomicUsize = AtomicUsize::new(0);
+pub const RUN_DEFAULT_TIMEOUT: f64 = 5.0;
+pub const RUN_MAX_TIMEOUT: f64 = 30.0;
+pub const RUN_TIMEOUT_EXIT_CODE: i32 = 124;
+
+/// Result from the bounded synchronous `remuda.process.run` word. Output is
+/// raw bytes (Lua strings are byte strings); each stream is capped separately.
+pub struct RunOutput {
+    pub code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub timed_out: bool,
+    pub signal: Option<i32>,
+}
+
+/// Run one child with argv directly (never through a shell). This is a
+/// deliberately synchronous exception: its enforced deadline bounds how long
+/// it can hold the daemon's single Lua image.
+pub fn run_sync(
+    argv: Vec<String>,
+    stdin: Option<Vec<u8>>,
+    timeout_seconds: f64,
+) -> Result<RunOutput, String> {
+    validate_run(&argv, timeout_seconds)?;
+    let (stdout_permit, stderr_permit) = reserve_run_reader_workers()?;
+
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds);
+    let (program, args) = argv.split_first().expect("argv checked above");
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    child_guard::harden(&mut command);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let child_stdin = child.stdin.take().expect("stdin was piped");
+
+    let stdout_capture = Arc::new(Mutex::new(BoundedCapture::default()));
+    let stderr_capture = Arc::new(Mutex::new(BoundedCapture::default()));
+    let stdout_reader = ReaderState::new();
+    let stderr_reader = ReaderState::new();
+    let stdout_reader_thread = {
+        let capture = stdout_capture.clone();
+        let state = stdout_reader.clone();
+        std::thread::spawn(move || {
+            let _permit = stdout_permit;
+            capture_bounded(stdout, capture, state)
+        })
+    };
+    let stderr_reader_thread = {
+        let capture = stderr_capture.clone();
+        let state = stderr_reader.clone();
+        std::thread::spawn(move || {
+            let _permit = stderr_permit;
+            capture_bounded(stderr, capture, state)
+        })
+    };
+    let stdin_done = Arc::new(AtomicBool::new(false));
+    let stdin_writer = {
+        let done = stdin_done.clone();
+        std::thread::spawn(move || {
+            if let Some(input) = stdin {
+                let mut child_stdin = child_stdin;
+                let _ = child_stdin.write_all(&input);
+            }
+            // Dropping stdin signals EOF to children which read until end.
+            done.store(true, Ordering::Release);
+        })
+    };
+
+    let (child_status, timed_out) = wait_for_process_io(
+        &mut child,
+        deadline,
+        &stdout_reader,
+        &stderr_reader,
+        &stdin_done,
+    )?;
+
+    // All three workers are finished on the successful path. On timeout,
+    // dropping their handles detaches them so an escaped descendant holding
+    // a pipe cannot keep the Lua image blocked past the deadline.
+    drop((stdout_reader_thread, stderr_reader_thread, stdin_writer));
+    let stdout = stdout_capture.lock().unwrap().snapshot();
+    let stderr = stderr_capture.lock().unwrap().snapshot();
+
+    Ok(RunOutput {
+        code: if timed_out {
+            RUN_TIMEOUT_EXIT_CODE
+        } else {
+            child_status.code().unwrap_or(-1)
+        },
+        stdout,
+        stderr,
+        timed_out,
+        signal: exit_signal(&child_status),
+    })
+}
+
+fn validate_run(argv: &[String], timeout_seconds: f64) -> Result<(), String> {
+    if argv.is_empty() || argv[0].is_empty() {
+        return Err("a process.run call needs a non-empty argv[1]".into());
+    }
+    if !timeout_seconds.is_finite() || timeout_seconds <= 0.0 {
+        return Err("process.run timeout must be a positive finite number".into());
+    }
+    if timeout_seconds > RUN_MAX_TIMEOUT {
+        return Err(format!(
+            "process.run timeout cannot exceed {RUN_MAX_TIMEOUT} seconds"
+        ));
+    }
+    Ok(())
+}
+
+struct RunReaderPermit;
+
+impl Drop for RunReaderPermit {
+    fn drop(&mut self) {
+        ACTIVE_RUN_READER_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn reserve_run_reader_workers() -> Result<(RunReaderPermit, RunReaderPermit), String> {
+    let mut active = ACTIVE_RUN_READER_WORKERS.load(Ordering::Acquire);
+    loop {
+        if active + 2 > RUN_READER_WORKER_LIMIT {
+            return Err(format!(
+                "process.run refused: the limit of {RUN_READER_WORKER_LIMIT} output-reader workers is reached because timed-out descendants still hold pipes"
+            ));
+        }
+        match ACTIVE_RUN_READER_WORKERS.compare_exchange_weak(
+            active,
+            active + 2,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return Ok((RunReaderPermit, RunReaderPermit)),
+            Err(current) => active = current,
+        }
+    }
+}
+
+fn wait_for_process_io(
+    child: &mut Child,
+    deadline: Instant,
+    stdout_reader: &ReaderState,
+    stderr_reader: &ReaderState,
+    stdin_done: &AtomicBool,
+) -> Result<(std::process::ExitStatus, bool), String> {
+    let mut child_status = None;
+    loop {
+        if child_status.is_none() {
+            match child.try_wait() {
+                Ok(status) => child_status = status,
+                Err(error) => {
+                    kill_process_tree(child);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(error.to_string());
+                }
+            }
+        }
+        if let Some(error) = stdout_reader.error() {
+            terminate_child(child);
+            return Err(format!("read process.run stdout: {error}"));
+        }
+        if let Some(error) = stderr_reader.error() {
+            terminate_child(child);
+            return Err(format!("read process.run stderr: {error}"));
+        }
+        if stdout_reader.done() && stderr_reader.done() && stdin_done.load(Ordering::Acquire) {
+            if let Some(status) = child_status.take() {
+                return Ok((status, false));
+            }
+        }
+        if Instant::now() >= deadline {
+            // Only signal a process group while its direct leader is known to
+            // be alive. Once reaped, its pgid may have been reused.
+            let status = match child_status {
+                Some(status) => status,
+                None => match child.try_wait() {
+                    Ok(Some(status)) => status,
+                    Ok(None) => {
+                        kill_process_tree(child);
+                        let _ = child.kill();
+                        child.wait().map_err(|error| error.to_string())?
+                    }
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(error.to_string());
+                    }
+                },
+            };
+            return Ok((status, true));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn terminate_child(child: &mut Child) {
+    kill_process_tree(child);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[derive(Default)]
+struct BoundedCapture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl BoundedCapture {
+    fn push(&mut self, bytes: &[u8]) {
+        let retained_limit = RUN_OUTPUT_LIMIT - RUN_OUTPUT_MARKER.len();
+        let retain = retained_limit
+            .saturating_sub(self.bytes.len())
+            .min(bytes.len());
+        self.bytes.extend_from_slice(&bytes[..retain]);
+        self.truncated |= retain < bytes.len();
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        let mut output = self.bytes.clone();
+        if self.truncated {
+            output.extend_from_slice(RUN_OUTPUT_MARKER);
+        }
+        output
+    }
+}
+
+#[derive(Clone, Default)]
+struct ReaderState {
+    done: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
+}
+
+impl ReaderState {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    fn error(&self) -> Option<String> {
+        self.error.lock().unwrap().clone()
+    }
+}
+
+fn capture_bounded(mut reader: impl Read, capture: Arc<Mutex<BoundedCapture>>, state: ReaderState) {
+    let mut buffer = [0u8; 8192];
+    let result = loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => break Ok(()),
+            Ok(read) => capture.lock().unwrap().push(&buffer[..read]),
+            Err(error) => break Err(error.to_string()),
+        }
+    };
+    if let Err(error) = result {
+        *state.error.lock().unwrap() = Some(error);
+    }
+    state.done.store(true, Ordering::Release);
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
+    None
+}
+
+#[cfg(test)]
+mod run_tests {
+    use super::{BoundedCapture, RUN_OUTPUT_LIMIT, RUN_OUTPUT_MARKER};
+    use std::io::Cursor;
+
+    #[test]
+    fn synchronous_process_output_is_capped_with_a_marker() {
+        let capture = std::sync::Arc::new(std::sync::Mutex::new(BoundedCapture::default()));
+        super::capture_bounded(
+            Cursor::new(vec![b'x'; RUN_OUTPUT_LIMIT + 1]),
+            capture.clone(),
+            super::ReaderState::new(),
+        );
+        let output = capture.lock().unwrap().snapshot();
+        assert_eq!(output.len(), RUN_OUTPUT_LIMIT);
+        assert!(output.ends_with(RUN_OUTPUT_MARKER));
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_tree(child: &Child) {
+    let pid = child.id() as libc::pid_t;
+    // SAFETY: killpg receives only the child process-group id; child_guard
+    // creates that group before exec, so it cannot name the daemon's group.
+    let _ = unsafe { libc::killpg(pid, libc::SIGKILL) };
+}
+
+#[cfg(not(unix))]
+fn kill_process_tree(_child: &Child) {}
 
 struct ProcessState {
     lines: Mutex<VecDeque<String>>,

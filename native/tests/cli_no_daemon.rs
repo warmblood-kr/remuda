@@ -256,3 +256,43 @@ fn a_half_installed_sibling_does_not_hide_healthy_mods() {
         "{bad_err}"
     );
 }
+
+/// #150: a half-installed dependency manifest names its owner, dependency,
+/// and path instead of returning only the raw parse failure.
+#[test]
+fn a_corrupt_required_manifest_names_owner_dependency_and_path() {
+    let dir = scratch("bad-requirement");
+    let mods = dir.join("data/remuda/mods");
+    let owner = mods.join("A");
+    let dependency = mods.join("B");
+    std::fs::create_dir_all(owner.join("packages/A")).unwrap();
+    std::fs::write(
+        owner.join("extension.toml"),
+        "name = \"A\"\nversion = \"1.0.0\"\nentry = \"packages/A/init.lua\"\napi = \"remuda-lua-v1\"\nrequires = { B = \">=1.0\" }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        owner.join("packages/A/init.lua"),
+        "return { api = \"remuda-lua-v1\" }",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dependency.join("packages/B")).unwrap();
+    let dependency_manifest = dependency.join("extension.toml");
+    std::fs::write(&dependency_manifest, "version = \"1.0.0\"\n").unwrap();
+
+    let out = remuda(&dir, &["exec", "A"]);
+    let error = String::from_utf8_lossy(&out.stderr);
+    let _ = remuda(&dir, &["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !out.status.success(),
+        "executed despite a corrupt dependency manifest"
+    );
+    assert!(error.contains("A"), "owner is not named: {error}");
+    assert!(error.contains("B"), "dependency is not named: {error}");
+    assert!(
+        error.contains(&dependency_manifest.display().to_string()),
+        "manifest path is not named: {error}"
+    );
+}
