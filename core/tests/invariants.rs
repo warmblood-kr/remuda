@@ -225,6 +225,12 @@ fn size_is_clamped_to_the_floor_that_keeps_input_visible() {
 }
 
 #[test]
+fn narrow_pane_size_is_an_explicit_floor_exception() {
+    let pane = Size::for_pane(75, 29);
+    assert_eq!((pane.cols(), pane.rows()), (75, 29));
+}
+
+#[test]
 fn session_size_tracks_a_resize() {
     let agent = ScriptedAgent::new(vec![]).with_size(Size::new(120, 40));
     let (session, _clock) = session_with(Box::new(agent));

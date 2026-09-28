@@ -72,6 +72,22 @@ status() {
 	echo "install-butler.sh: $*" >&2
 }
 
+# `remuda ls` must contain an exact first-field match. Up to twenty probes,
+# with 500ms between them, give daemon.rs's roughly 10s PATIENCE window.
+butler_registered_within_10s() {
+	attempt=0
+	while [ "$attempt" -lt 20 ]; do
+		if env -u PWD remuda ls | awk '$1 == "butler" { found = 1 } END { exit !found }'; then
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		if [ "$attempt" -lt 20 ]; then
+			sleep 0.5
+		fi
+	done
+	return 1
+}
+
 os=$(uname -s)
 case "$os" in
 Linux | Darwin) ;;
@@ -152,7 +168,8 @@ fi
 # control on `remuda ls` itself -- if `remuda ls` ever lied about a session's
 # presence, that test goes red. Weakening or deleting it re-enables a known
 # false-positive across all three consumers, not just loosens one test.
-if ! env -u PWD remuda ls | awk '$1 == "butler" { found = 1 } END { exit !found }'; then
+# The package's start hook can finish just after `remuda exec` returns.
+if ! butler_registered_within_10s; then
 	die "remuda exec butler exited successfully but registered no session named 'butler' -- this remuda build is between the 'exec' verb landing and the real butler package landing (a real but narrow window); run 'remuda upgrade' and try again"
 fi
 status "butler registered for this run."
@@ -196,19 +213,8 @@ env -u PWD remuda -e 'return true' >/dev/null
 # real deadlock" section) -- so there is a real, if narrow, window right
 # after a fresh daemon starts accepting connections where `remuda ls` can
 # run before the loader's own `remuda.exec("butler")` call has finished.
-# 20 attempts * 500ms = 10s, matching native/tests/daemon.rs's own
-# PATIENCE deadline for the identical race.
-attempt=0
-found=0
-while [ "$attempt" -lt 20 ]; do
-	if env -u PWD remuda ls | awk '$1 == "butler" { found = 1 } END { exit !found }'; then
-		found=1
-		break
-	fi
-	attempt=$((attempt + 1))
-	sleep 0.5
-done
-if [ "$found" -ne 1 ]; then
+# The shared helper gives it the same PATIENCE window as the initial probe.
+if ! butler_registered_within_10s; then
 	die "butler did not come back on its own after a daemon restart -- the boot-time loader ($init_lua) did not work; this build may predate it (try 'remuda upgrade' and re-run this installer)"
 fi
 status "confirmed: butler came back automatically after a daemon restart, with no 'remuda exec butler' call."

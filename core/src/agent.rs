@@ -13,7 +13,8 @@ use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc::Receiver;
 
-/// Terminal dimensions, clamped to the smallest usable interactive terminal.
+/// Terminal dimensions, normally clamped to the smallest usable interactive
+/// terminal. A pane may explicitly retain its narrower visible width.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Size {
     cols: u16,
@@ -32,6 +33,16 @@ impl Size {
     pub fn new(cols: u16, rows: u16) -> Self {
         Self {
             cols: cols.max(Self::MIN_COLS),
+            rows: rows.max(Self::MIN_ROWS),
+        }
+    }
+
+    /// A pane must tell its child the width the user can actually see. This
+    /// keeps the ordinary 80-column safety floor everywhere else while
+    /// allowing a constrained pane to opt into a narrower terminal.
+    pub fn for_pane(cols: u16, rows: u16) -> Self {
+        Self {
+            cols: cols.max(1),
             rows: rows.max(Self::MIN_ROWS),
         }
     }
@@ -150,6 +161,14 @@ impl fmt::Display for AgentError {
 }
 
 pub type Result<T> = core::result::Result<T, AgentError>;
+
+/// Exit information retained by a process-backed agent after it is reaped.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExitInfo {
+    pub exit_code: Option<u32>,
+    pub signal: Option<i32>,
+    pub signal_name: Option<String>,
+}
 
 /// A styled screen and its scrollback measurements from one parser snapshot.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -284,6 +303,11 @@ pub trait AgentProcess: Send {
     fn cursor(&mut self) -> Result<Cursor>;
 
     fn is_alive(&mut self) -> bool;
+
+    /// The known exit status, if this backend has observed one.
+    fn exit_info(&mut self) -> Option<ExitInfo> {
+        None
+    }
 
     /// End the child. Idempotent: calling it on an already-exited process is
     /// not an error, because a caller that raced a self-exit (step 006) must
