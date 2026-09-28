@@ -19,7 +19,7 @@
 //! transport. Adding those here would put a socket in the policy layer, which
 //! `core/clippy.toml` denies outright.
 
-use crate::agent::{Cursor, Result, Size, StyledCell};
+use crate::agent::{Cursor, Result, ScreenSnapshot, Size, StyledCell};
 use crate::protocol::Step;
 use crate::session::Session;
 use core::time::Duration;
@@ -219,6 +219,14 @@ impl Registry {
 
     pub fn row_wrapped_at(&self, name: &str, scrollback: usize) -> Option<Result<Vec<bool>>> {
         self.get(name).map(|s| s.row_wrapped_at(scrollback))
+    }
+
+    pub fn screen_snapshot_at(
+        &self,
+        name: &str,
+        scrollback: usize,
+    ) -> Option<Result<ScreenSnapshot>> {
+        self.get(name).map(|s| s.screen_snapshot_at(scrollback))
     }
 
     pub fn cursor(&self, name: &str) -> Option<Result<Cursor>> {

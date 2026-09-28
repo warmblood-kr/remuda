@@ -20,8 +20,8 @@
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use remuda_core::agent::{
-    AgentError, AgentProcess, Color, Cursor, MouseEncoding, MouseMode, MouseState, Result, Size,
-    StyledCell,
+    AgentError, AgentProcess, Color, Cursor, MouseEncoding, MouseMode, MouseState, Result,
+    ScreenSnapshot, Size, StyledCell,
 };
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -356,6 +356,49 @@ impl AgentProcess for PtyAgent {
                 .map(|row| screen.row_wrapped(row))
                 .collect()
         }))
+    }
+
+    fn screen_snapshot_at(&mut self, scrollback: usize) -> Result<ScreenSnapshot> {
+        let mut parser = self.screen.lock().map_err(|_| io("screen lock poisoned"))?;
+        let size = self.size;
+        let screen = parser.screen_mut();
+        let previous = screen.scrollback();
+        screen.set_scrollback(usize::MAX);
+        let scrollback_len = screen.scrollback();
+        screen.set_scrollback(previous);
+
+        let (cells, wrapped, cursor) = with_scrollback(screen, scrollback, |screen| {
+            let cursor = if scrollback == 0 {
+                let (row, col) = display_cursor(screen);
+                Cursor {
+                    row,
+                    col,
+                    visible: !screen.hide_cursor(),
+                }
+            } else {
+                Cursor {
+                    row: 0,
+                    col: 0,
+                    visible: false,
+                }
+            };
+            (
+                styled_cells(screen, size),
+                (0..size.rows())
+                    .map(|row| screen.row_wrapped(row))
+                    .collect(),
+                cursor,
+            )
+        });
+        let scrollback_total = self.scrollback_total.load(Ordering::Relaxed);
+
+        Ok(ScreenSnapshot {
+            cells,
+            wrapped,
+            cursor,
+            scrollback_len,
+            scrollback_total,
+        })
     }
 
     fn subscribe(&mut self) -> Option<Receiver<Vec<u8>>> {

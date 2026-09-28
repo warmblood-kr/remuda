@@ -656,17 +656,9 @@ fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {
                 state.history_rows, 10_000,
                 "retained history remains capped"
             );
-            #[cfg(unix)]
             assert_eq!(
                 state.offset,
                 initial_offset + state.history_total - anchor_total
-            );
-            // ConPTY's row accounting can include transport-generated rows;
-            // still require the actual captured content to remain anchored.
-            #[cfg(windows)]
-            assert!(
-                state.offset >= initial_offset,
-                "the preview must not move toward live output while anchored"
             );
             assert_eq!(terminal_rows_text(&cells), anchor_text);
             break;

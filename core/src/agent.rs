@@ -151,6 +151,16 @@ impl fmt::Display for AgentError {
 
 pub type Result<T> = core::result::Result<T, AgentError>;
 
+/// A styled screen and its scrollback measurements from one parser snapshot.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ScreenSnapshot {
+    pub cells: Vec<Vec<StyledCell>>,
+    pub wrapped: Vec<bool>,
+    pub cursor: Cursor,
+    pub scrollback_len: usize,
+    pub scrollback_total: usize,
+}
+
 /// A live agent process: a screen we can read, a keyboard we can type on.
 /// Caution: every method is sync for correctness, not simplicity — awaiting a
 /// body write and its Enter separately lets a second writer land between them.
@@ -213,6 +223,32 @@ pub trait AgentProcess: Send {
 
     fn row_wrapped_at(&mut self, _scrollback: usize) -> Result<Vec<bool>> {
         Ok(Vec::new())
+    }
+
+    /// Capture the screen and its scrollback counters together when the
+    /// backend can provide an atomic snapshot. The default preserves support
+    /// for simpler agents that expose these values through separate calls.
+    fn screen_snapshot_at(&mut self, scrollback: usize) -> Result<ScreenSnapshot> {
+        let cells = self.screen_cells_at(scrollback)?;
+        let wrapped = self.row_wrapped_at(scrollback)?;
+        let scrollback_len = self.scrollback_len();
+        let scrollback_total = self.scrollback_total();
+        let cursor = if scrollback == 0 {
+            self.cursor()?
+        } else {
+            Cursor {
+                row: 0,
+                col: 0,
+                visible: false,
+            }
+        };
+        Ok(ScreenSnapshot {
+            cells,
+            wrapped,
+            cursor,
+            scrollback_len,
+            scrollback_total,
+        })
     }
 
     /// Subscribe to output as it arrives. Sessions track output activity and
