@@ -516,42 +516,6 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     }
 }
 
-fn resolve_target(
-    target: &str,
-    addr_override: Option<std::net::SocketAddr>,
-) -> Result<(std::net::SocketAddr, Vec<u8>), (u8, String)> {
-    use remuda_native::cluster::{encoding, NodeState};
-    let (_, registry) = remuda_native::cluster::nodes()
-        .map_err(|error| (1, format!("cluster call: {error}")))?
-        .ok_or_else(|| {
-            (
-                1,
-                "cluster call: cluster is not initialized; run `remuda cluster init`".into(),
-            )
-        })?;
-    let entry = remuda_native::cluster::resolve_node(&registry.authorized_nodes, target)
-        .map_err(|error| (4, format!("cluster call: {error}")))?;
-    if entry.state != NodeState::Admitted {
-        return Err((
-            4,
-            format!("cluster call: node {} is revoked", entry.node_fp),
-        ));
-    }
-    // PR9 adds an optional endpoint to AuthorizedNode. Until then, this
-    // explicit address is required; keep resolution centralized for that
-    // schema extension.
-    let address =
-        addr_override.ok_or_else(|| (2, "cluster call: supply --addr HOST:PORT".into()))?;
-    use base64::Engine;
-    let pinned_key = base64::engine::general_purpose::STANDARD
-        .decode(&entry.static_pubkey)
-        .map_err(|_| (5, "cluster call: invalid pinned key in registry".into()))?;
-    if pinned_key.len() != 32 || encoding::fingerprint(&pinned_key) != entry.node_fp {
-        return Err((5, "cluster call: invalid pinned key in registry".into()));
-    }
-    Ok((address, pinned_key))
-}
-
 fn cluster_call(
     target: &str,
     address: std::net::SocketAddr,
@@ -560,10 +524,16 @@ fn cluster_call(
 ) -> ExitCode {
     use remuda_core::protocol::{expand_runs, Response};
     use remuda_native::net::cluster_client::{ClientError, ClusterClient};
-    let (address, pinned_key) = match resolve_target(target, Some(address)) {
+    let resolved = match remuda_native::cluster::resolve_target(target, Some(address)) {
         Ok(resolved) => resolved,
-        Err((code, message)) => {
-            eprintln!("{message}");
+        Err(error) => {
+            let code = match error.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => 4,
+                std::io::ErrorKind::InvalidInput => 2,
+                std::io::ErrorKind::InvalidData => 5,
+                _ => 1,
+            };
+            eprintln!("cluster call: {error}");
             return ExitCode::from(code);
         }
     };
@@ -578,19 +548,23 @@ fn cluster_call(
             scrollback: 0,
         },
     };
-    let response =
-        match ClusterClient::system().request(address, &pinned_key, &private_key, &request) {
-            Ok(response) => response,
-            Err(error) => {
-                let code = match error {
-                    ClientError::Unreachable | ClientError::Timeout => 3,
-                    ClientError::Refused(_) => 4,
-                    ClientError::Crypto | ClientError::BadResponse => 5,
-                };
-                eprintln!("cluster call: {error}");
-                return ExitCode::from(code);
-            }
-        };
+    let response = match ClusterClient::system().request(
+        resolved.address,
+        &resolved.pinned_static_key,
+        &private_key,
+        &request,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            let code = match error {
+                ClientError::Unreachable | ClientError::Timeout => 3,
+                ClientError::Refused(_) => 4,
+                ClientError::Crypto | ClientError::BadResponse => 5,
+            };
+            eprintln!("cluster call: {error}");
+            return ExitCode::from(code);
+        }
+    };
     if let Response::Error(message) = &response {
         eprintln!("cluster call: {message}");
         return ExitCode::from(4);
