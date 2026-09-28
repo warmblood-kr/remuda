@@ -367,6 +367,87 @@ fn every_word_has_a_registry_entry() {
 }
 
 #[test]
+fn remuda_json_round_trips_values_and_rejects_bad_inputs() {
+    run_lua(
+        "json-surface",
+        r#"
+        assert(type(remuda.json) == "table")
+        assert(remuda.json.null ~= nil)
+        local decoded, err = remuda.json.decode('{"empty_array":[],"empty_object":{},"nil":null,"count":4,"ratio":1.25}')
+        assert(decoded and err == nil, tostring(err))
+        assert(remuda.json.encode(decoded) == '{"count":4,"empty_array":[],"empty_object":{},"nil":null,"ratio":1.25}')
+        assert(decoded.empty_array[1] == nil and decoded.empty_object.any == nil)
+        assert(decoded["nil"] == remuda.json.null)
+        assert(type(decoded.count) == "number" and decoded.count == 4)
+        assert(type(decoded.ratio) == "number" and decoded.ratio == 1.25)
+        local number_kinds = remuda.json.decode('[4,4.0]')
+        assert(math.type(number_kinds[1]) == "integer" and math.type(number_kinds[2]) == "float")
+        assert(remuda.json.encode(remuda.json.array{}) == "[]")
+        assert(remuda.json.encode(remuda.json.object{}) == "{}")
+        local foreign = setmetatable({}, { __index = function() return "foreign" end })
+        assert(not pcall(remuda.json.array, foreign), "array tagging refuses a foreign metatable")
+        assert(not pcall(remuda.json.object, foreign), "object tagging refuses a foreign metatable")
+        assert(not pcall(remuda.json.encode, {}), "an empty untagged table is ambiguous")
+        assert(not pcall(remuda.json.encode, { 1, name = "mixed" }), "mixed keys are refused")
+        local sparse_ok, sparse_error = pcall(remuda.json.encode, { [2] = "sparse" })
+        assert(not sparse_ok and tostring(sparse_error):find("sparse array", 1, true), tostring(sparse_error))
+        assert(not pcall(remuda.json.encode, 0/0), "NaN is refused")
+        assert(not pcall(remuda.json.encode, math.huge), "infinity is refused")
+        assert(not pcall(remuda.json.encode, function() end), "functions are refused")
+        assert(not pcall(remuda.json.encode, coroutine.create(function() end)), "threads are refused")
+        assert(not pcall(remuda.json.encode, nil), "nil must use the null sentinel")
+
+        local cycle = {}; cycle.self = cycle
+        assert(not pcall(remuda.json.encode, cycle), "cycles are refused")
+        local too_deep_value = 0
+        for _ = 1, 65 do too_deep_value = { too_deep_value } end
+        assert(not pcall(remuda.json.encode, too_deep_value), "deep Lua tables are refused")
+        assert(not pcall(remuda.json.encode, { [string.char(255)] = true }), "invalid UTF-8 keys are refused")
+
+        local duplicate, duplicate_error = remuda.json.decode('{"x":1,"x":2}')
+        assert(duplicate == nil and duplicate_error == "duplicate key", tostring(duplicate_error))
+        local truncated, truncated_error = remuda.json.decode('{"x":')
+        assert(truncated == nil and type(truncated_error) == "string")
+        local invalid, invalid_error = remuda.json.decode(string.char(255))
+        assert(invalid == nil and type(invalid_error) == "string")
+        local huge, huge_error = remuda.json.decode("1e9999")
+        assert(huge == nil and type(huge_error) == "string")
+        local wide_integer, wide_error = remuda.json.decode("18446744073709551615")
+        assert(wide_integer ~= nil and wide_error == nil and wide_integer > 1e18)
+        local deep = string.rep("[", 65) .. "0" .. string.rep("]", 65)
+        local too_deep, depth_error = remuda.json.decode(deep)
+        assert(too_deep == nil and type(depth_error) == "string")
+        local many_values = "[" .. string.rep("null,", 100000) .. "null]"
+        local too_many, count_error = remuda.json.decode(many_values)
+        assert(too_many == nil and count_error:find("maximum JSON value count exceeded", 1, true), tostring(count_error))
+        local too_large, size_error = remuda.json.decode(string.rep(" ", 8 * 1024 * 1024 + 1))
+        assert(too_large == nil and type(size_error) == "string")
+
+        local pretty = remuda.json.encode({ value = 1 }, { pretty = true })
+        assert(pretty:find("\n", 1, true), pretty)
+        local output_ok, output_error = pcall(remuda.json.encode, string.rep(string.char(0), 1500000))
+        assert(not output_ok and tostring(output_error):find("encoded output exceeds", 1, true), tostring(output_error))
+        local many = remuda.json.array{}
+        for i = 1, 100000 do many[i] = remuda.json.null end
+        local values_ok, values_error = pcall(remuda.json.encode, many)
+        assert(not values_ok and tostring(values_error):find("maximum JSON value count exceeded", 1, true), tostring(values_error))
+        "#,
+    );
+}
+
+#[test]
+fn remuda_json_nested_words_are_registered() {
+    run_lua(
+        "json-registry",
+        r#"
+        for _, name in ipairs({ "json", "json.decode", "json.encode", "json.null", "json.array", "json.object" }) do
+          assert(remuda._registry[name] ~= nil, "missing registry row for " .. name)
+        end
+        "#,
+    );
+}
+
+#[test]
 fn registry_documentation_formats_are_live_and_structured() {
     let dir = scratch("registry-docs");
     let path = daemon::socket_path_in(&dir, "s");
