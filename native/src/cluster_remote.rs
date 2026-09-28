@@ -25,7 +25,7 @@ pub struct RemoteSessionSnapshot {
     pub name: String,
     pub instance_id: String,
     pub alive: bool,
-    pub output_version: u64,
+    pub output_version: Option<u64>,
     pub screen: Option<ScreenSnapshot>,
 }
 
@@ -261,7 +261,7 @@ mod tests {
             name: name.into(),
             instance_id: "instance-1".into(),
             alive: true,
-            output_version: 4,
+            output_version: Some(4),
             screen: Some(screen(text)),
         }
     }
