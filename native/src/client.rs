@@ -382,6 +382,10 @@ impl Drop for RawMode {
             crossterm::terminal::LeaveAlternateScreen,
             crossterm::cursor::Show
         );
+        // Keep the protocol reset and alternate-screen exit ordered on the
+        // terminal before process shutdown, including on Windows where stdout
+        // may still have buffered writes at this point.
+        let _ = stdout.flush();
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
