@@ -1976,29 +1976,44 @@ fn anchor_offset_to_new_history(
     }
 }
 
+/// Capture at the offset computed from the history total in that capture.
+/// Output can arrive between a probe and its corrective capture; retry until
+/// the offset and the captured total describe the same screen state.
+fn capture_anchored<T>(
+    base_offset: usize,
+    previous_total: usize,
+    mut capture: impl FnMut(usize) -> Result<(T, usize, usize), String>,
+) -> Result<(T, usize, usize, usize), String> {
+    let mut requested = base_offset;
+    loop {
+        let (value, rows, total) = capture(requested)?;
+        let anchored = anchor_offset_to_new_history(base_offset, previous_total, total, rows);
+        if anchored == requested {
+            return Ok((value, rows, total, anchored));
+        }
+        requested = anchored;
+    }
+}
+
 /// Keep a scrolled preview on the same history rows as output pushes new rows.
 fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCapture, String> {
     let state = ui.scrollback.entry(name.to_string()).or_default();
-    let (mut cells, mut wrapped, mut cursor, mut history_rows, mut history_total) =
-        capture_styled(path, name, state.offset)?;
     let scrolling_down = state
         .last_scroll_down
         .is_some_and(|last| last.elapsed() < SCROLL_DOWN_SETTLE);
-    let anchored = if scrolling_down {
-        state.offset
+    let (cells, wrapped, cursor, history_rows, history_total, anchored) = if scrolling_down {
+        let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, state.offset)?;
+        (cells, wrapped, cursor, rows, total, state.offset)
     } else {
-        anchor_offset_to_new_history(
-            state.offset,
-            state.history_total,
-            history_total,
-            history_rows,
-        )
+        let (capture, rows, total, anchored) =
+            capture_anchored(state.offset, state.history_total, |offset| {
+                let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, offset)?;
+                Ok(((cells, wrapped, cursor), rows, total))
+            })?;
+        let (cells, wrapped, cursor) = capture;
+        (cells, wrapped, cursor, rows, total, anchored)
     };
-    if anchored != state.offset {
-        state.offset = anchored;
-        (cells, wrapped, cursor, history_rows, history_total) =
-            capture_styled(path, name, anchored)?;
-    }
+    state.offset = anchored;
     if state.scroll_direction == 1 {
         state.recent_up_output = state
             .recent_up_output

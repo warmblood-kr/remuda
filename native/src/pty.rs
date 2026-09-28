@@ -492,6 +492,17 @@ mod tests {
         assert_eq!(total.load(Ordering::Relaxed) - before, 3);
     }
 
+    #[test]
+    fn scrollback_counter_is_exact_when_crlf_is_split_across_output_chunks() {
+        let mut parser = vt100::Parser::new(2, 10, 20);
+        let total = AtomicUsize::new(0);
+        for part in [b"a\r".as_slice(), b"\n", b"b\r", b"\n", b"c\r", b"\n"] {
+            process_output(&mut parser, part, &total);
+        }
+        assert_eq!(total.load(Ordering::Relaxed), 2);
+        assert_eq!(retained_history_len(&mut parser), 2);
+    }
+
     fn retained_history_len(parser: &mut vt100::Parser) -> usize {
         let screen = parser.screen_mut();
         let previous = screen.scrollback();

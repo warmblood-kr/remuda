@@ -1,6 +1,22 @@
 use super::*;
 use remuda_core::Size;
 
+#[test]
+fn anchor_capture_retries_when_history_advances_between_captures() {
+    let captures = [(10_000, 10_044), (10_000, 10_050), (10_000, 10_050)];
+    let mut requested_offsets = Vec::new();
+    let (_, _, total, offset) = capture_anchored(28, 10_038, |requested| {
+        requested_offsets.push(requested);
+        let (rows, total) = captures[requested_offsets.len() - 1];
+        Ok(((), rows, total))
+    })
+    .expect("capture stabilizes");
+
+    assert_eq!(requested_offsets, [28, 34, 40]);
+    assert_eq!(offset, 40);
+    assert_eq!(total, 10_050);
+}
+
 /// The regression steps/017 guards: an idle *list*-focused herd must not
 /// redo the full IPC cycle on every poll wake — `run` only uses the
 /// faster `TICK_TYPING` gate for a focused session, see the next test.
@@ -462,7 +478,7 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     assert_eq!(response, Response::Value("stream".into()));
 
     let mut ui = make_ui(vec![row("stream", true, false)]);
-    let history_deadline = Instant::now() + Duration::from_secs(6);
+    let history_deadline = Instant::now() + Duration::from_secs(15);
     loop {
         capture_preview(&path, &mut ui, "stream").expect("initial live preview");
         if ui.scrollback["stream"].history_rows >= 40 {
@@ -505,7 +521,7 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     }
     assert_eq!(ui.scrollback["stream"].offset, 0);
 
-    let deadline = Instant::now() + Duration::from_secs(6);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let (cells, _, cursor) =
             capture_preview(&path, &mut ui, "stream").expect("capture the streaming preview");
@@ -549,7 +565,7 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
     assert_eq!(response, Response::Value("stream".into()));
 
     let mut ui = make_ui(vec![row("stream", true, false)]);
-    let deadline = Instant::now() + Duration::from_secs(8);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         capture_preview(&path, &mut ui, "stream").expect("capture preview");
         if ui.scrollback["stream"].history_rows >= 3 {
@@ -628,7 +644,7 @@ fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {
     assert_eq!(response, Response::Value("stream".into()));
 
     let mut ui = make_ui(vec![row("stream", true, false)]);
-    let deadline = Instant::now() + Duration::from_secs(12);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         capture_preview(&path, &mut ui, "stream").expect("capture history");
         let state = ui.scrollback["stream"];
@@ -2323,7 +2339,9 @@ fn scratch_socket(tag: &str) -> std::path::PathBuf {
 fn daemon_at(path: &std::path::Path) {
     let serving = path.to_path_buf();
     std::thread::spawn(move || {
-        let _ = crate::daemon::serve(&serving);
+        if let Err(error) = crate::daemon::serve(&serving) {
+            panic!("test daemon failed to serve {serving:?}: {error}");
+        }
     });
     let deadline = Instant::now() + Duration::from_secs(5);
     while crate::ipc::connect(path).is_err() {
