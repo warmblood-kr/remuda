@@ -239,6 +239,7 @@ fn call_response(id: Value, response: Response) -> String {
         Response::Uncertain => ok_reply(id, tool_error("input outcome is uncertain")),
         Response::WrongInstance => ok_reply(id, tool_error("session instance changed")),
         Response::RateLimited => ok_reply(id, tool_error("session input rate limit exceeded")),
+        Response::SyncAtCapacity => ok_reply(id, tool_error("Sync is at capacity; retry shortly")),
         Response::Sessions(sessions) => ok_reply(id, sessions_text(sessions)),
     }
 }

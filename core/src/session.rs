@@ -180,6 +180,9 @@ impl Session {
             .lock()
             .map_err(|_| AgentError::Io("session size lock poisoned".into()))?;
         *current = size;
+        drop(current);
+        drop(agent);
+        Self::notify_output_changed(&self.output_changed);
         Ok(())
     }
 

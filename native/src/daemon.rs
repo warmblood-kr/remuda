@@ -756,15 +756,9 @@ fn handle_sync(
         return reply(stream, &Response::WrongInstance);
     }
     let Some(_permit) = SyncPermit::acquire() else {
-        return reply(
-            stream,
-            &Response::error("Sync is at capacity; retry shortly"),
-        );
+        return reply(stream, &Response::SyncAtCapacity);
     };
-    let versioned = match remuda_core::sync::wait(&session, since, timeout_ms) {
-        Ok(snapshot) => snapshot,
-        Err(error) => return reply(stream, &Response::error(error)),
-    };
+    let result = remuda_core::sync::wait(&session, since, timeout_ms);
     if let Some(expected) = expected_instance.as_deref() {
         if registry
             .get(name)
@@ -773,6 +767,10 @@ fn handle_sync(
             return reply(stream, &Response::WrongInstance);
         }
     }
+    let versioned = match result {
+        Ok(snapshot) => snapshot,
+        Err(error) => return reply(stream, &Response::error(error)),
+    };
     let rows = versioned
         .snapshot
         .cells

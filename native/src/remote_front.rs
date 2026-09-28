@@ -16,6 +16,30 @@ pub const MAX_CONNECTIONS: usize = 8;
 /// Time allowed to submit a single request frame or complete an ordinary request.
 pub const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const SYNC_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
+/// Keep at least half of the daemon's 16 Sync slots available to local callers.
+const MAX_REMOTE_SYNCS: usize = 8;
+static ACTIVE_REMOTE_SYNCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct RemoteSyncPermit;
+
+impl RemoteSyncPermit {
+    fn acquire() -> Option<Self> {
+        ACTIVE_REMOTE_SYNCS
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |active| (active < MAX_REMOTE_SYNCS).then_some(active + 1),
+            )
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for RemoteSyncPermit {
+    fn drop(&mut self) {
+        ACTIVE_REMOTE_SYNCS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 /// Decode and authorize exactly one JSON frame. This is the front's trust
 /// boundary: callers must send the returned Request to the local daemon, never
@@ -38,6 +62,17 @@ pub fn forward_frame(path: &std::path::Path, frame: &[u8]) -> Result<Vec<u8>, St
 }
 
 fn forward_request(path: &std::path::Path, request: &Request) -> Result<Vec<u8>, String> {
+    // The front cannot cancel a daemon IPC request when its peer disconnects;
+    // retain this remote-only slot until the bounded daemon wait completes.
+    let _remote_sync_permit = if matches!(request, Request::Sync { .. }) {
+        let Some(permit) = RemoteSyncPermit::acquire() else {
+            return serde_json::to_vec(&remuda_core::protocol::Response::SyncAtCapacity)
+                .map_err(|error| error.to_string());
+        };
+        Some(permit)
+    } else {
+        None
+    };
     let response = crate::client::request(path, request).map_err(|error| error.to_string())?;
     serde_json::to_vec(&response).map_err(|error| error.to_string())
 }
@@ -224,6 +259,16 @@ fn refusal(variant: &str) -> String {
 mod tests {
     use super::*;
     use remuda_core::protocol::Request;
+
+    #[test]
+    fn remote_sync_subcap_reserves_half_the_daemon_slots() {
+        let permits: Vec<_> = (0..MAX_REMOTE_SYNCS)
+            .map(|_| RemoteSyncPermit::acquire().expect("permit within remote sub-cap"))
+            .collect();
+        assert!(RemoteSyncPermit::acquire().is_none());
+        drop(permits);
+        assert!(RemoteSyncPermit::acquire().is_some());
+    }
 
     #[test]
     fn sync_front_deadline_is_capped_and_allows_the_server_wait() {

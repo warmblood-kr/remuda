@@ -415,6 +415,7 @@ fn sync_waits_for_output_and_returns_the_new_snapshot() {
     start_shell_session(&socket, "sleep 0.2; printf after-sync; sleep 30");
     let since = capture_version(&socket);
     let request_socket = socket.clone();
+    let started = Instant::now();
     let request = std::thread::spawn(move || {
         client::request(
             &request_socket,
@@ -422,7 +423,7 @@ fn sync_waits_for_output_and_returns_the_new_snapshot() {
                 name: "versioned".into(),
                 instance_id: None,
                 since,
-                timeout_ms: 2_000,
+                timeout_ms: 5_000,
             },
         )
         .expect("sync response")
@@ -436,6 +437,51 @@ fn sync_waits_for_output_and_returns_the_new_snapshot() {
     assert!(
         matches!(response, Response::Sync { output_version, snapshot, .. }
         if output_version > since && snapshot.rows.iter().flatten().any(|run| run.text.contains("after-sync")))
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "output notification should wake Sync well before its 5s timeout"
+    );
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_waiter_wakes_when_session_is_resized() {
+    let runtime = scratch_dir("sync-resize");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let since = capture_version(&socket);
+    let request_socket = socket.clone();
+    let started = Instant::now();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: None,
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response after resize")
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(matches!(
+        client::request(
+            &socket,
+            &Request::Resize {
+                name: "versioned".into(),
+                size: Size::new(100, 30),
+            },
+        ),
+        Ok(Response::Ok)
+    ));
+    let response = request.join().expect("sync worker");
+    assert!(matches!(response, Response::Sync { output_version, .. } if output_version > since));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "resize notification should wake Sync well before its 5s timeout"
     );
     stop_daemon(&runtime, &socket, &mut running);
 }
@@ -480,7 +526,7 @@ fn sync_waiter_wakes_when_child_exits() {
                 name: "versioned".into(),
                 instance_id: None,
                 since,
-                timeout_ms: 10_000,
+                timeout_ms: 5_000,
             },
         )
         .expect("sync response after child exit")
@@ -500,10 +546,52 @@ fn sync_waiter_wakes_when_child_exits() {
     );
     let response = request.join().expect("sync worker");
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < Duration::from_secs(1),
         "child exit must wake the waiter before its Sync timeout"
     );
     assert!(matches!(response, Response::Error(message) if message.contains("exited")));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_rechecks_instance_after_close_and_relaunch_during_wait() {
+    let runtime = scratch_dir("sync-relaunch");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let old_instance = listed_session(&socket).instance_id.expect("instance id");
+    let since = capture_version(&socket);
+    let request_socket = socket.clone();
+    let started = Instant::now();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: Some(old_instance),
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response after relaunch")
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(matches!(
+        client::request(
+            &socket,
+            &Request::Close {
+                name: "versioned".into(),
+            },
+        ),
+        Ok(Response::Ok)
+    ));
+    start_shell_session(&socket, "sleep 30");
+    let response = request.join().expect("sync worker");
+    assert_eq!(response, Response::WrongInstance);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "post-wait instance check should return promptly"
+    );
     stop_daemon(&runtime, &socket, &mut running);
 }
 
