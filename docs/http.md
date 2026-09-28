@@ -15,7 +15,7 @@ local handle = remuda.http.request {
   connect_timeout = 10,                      -- optional; defaults to 10 seconds
   max_bytes = 20 * 1024 * 1024,              -- optional response-body cap
   ca_file = "/path/to/home-ca.pem",          -- optional custom trust CA
-  pin = "sha256/BASE64_SHA256_OF_LEAF_CERT", -- optional leaf certificate pin
+  pin = "sha256/BASE64_SHA256_OF_LEAF_SPKI", -- optional leaf certificate pin
   callback = function(result) ... end,       -- required
 }
 
@@ -35,17 +35,17 @@ Lua strings carry method-independent header values and request/response bodies a
 - Headers are capped at 64 KiB total per request/response, including names and values. Excess is an error.
 - Redirects are disabled (`max_redirects = 0`). A 3xx response is returned as-is; credentials or bodies are never replayed to another origin.
 - At most 32 requests may be in flight per daemon. A request over the limit completes asynchronously with an error rather than blocking or queueing without bound.
-- The request must use HTTPS for `ca_file` and `pin`. System trust roots are used by default. `ca_file` adds a caller-supplied CA for self-hosted homeservers. `pin` is the base64-encoded SHA-256 digest of the leaf certificate's DER bytes, prefixed `sha256/`. When configured, validate the certificate chain and pin during the TLS handshake, before sending any HTTP request bytes. A mismatch fails closed. CA and pin checks may both be configured.
+- The request must use HTTPS for `ca_file` and `pin`. System trust roots are used by default. `ca_file` selects a caller-supplied trust CA for that request (the default system roots are used when it is absent), for self-hosted homeservers. `pin` is the base64-encoded SHA-256 digest of the leaf certificate's SubjectPublicKeyInfo (SPKI), prefixed `sha256/`. When configured, validate the certificate chain and pin during the TLS handshake, before sending any HTTP request bytes. A mismatch fails closed. CA and pin checks may both be configured.
 - Never log request headers, response bodies, or request bodies. In particular, `Authorization` must never appear in logs, errors, traces, or diagnostics.
 
 The Matrix client uses this primitive for bearer-authenticated JSON `POST`/`PUT`, ordinary reads, and `/sync` long-polls. The long-poll timeout belongs to this asynchronous request's `timeout`; no tick or daemon thread may wait for it.
 
 ## TLS and socket boundary
 
-Use rustls with system roots by default, plus support for a custom CA and the leaf-certificate pin above. `cargo tree -i rustls` on this branch finds no rustls dependency (only `mio` is present in `Cargo.lock`), so the implementation will need to add the TLS crates and should choose versions compatible with the workspace MSRV and lockfile. Keep TLS verification and HTTP framing within the network boundary.
+Use rustls with system roots by default, plus support for a custom CA and the leaf-certificate pin above. The implementation uses rustls 0.23.43 and rustls-platform-verifier 0.7.0. `cargo tree -i rustls` showed no existing rustls dependency before this change. `ca_file` replaces system trust roots for that request, as in curl `--cacert`; it never silently falls back if the file is missing, empty, or invalid. No workspace MSRV is declared. Keep TLS verification and HTTP framing within the network boundary.
 
 The clippy configuration bans `std::net::TcpStream` and `TcpListener` in the policy layer (`core/clippy.toml`). Put all socket operations for this primitive in one `native/src/net/` module, which is also the designated home for cluster PR7's server socket code. Keep every narrowly scoped lint allowance in that module only; document the allowance and this `remuda.http` client alongside the existing server exception in the relevant clippy note/config. Coordinate shared module ownership with `remuda-dev-team-2-lead` before implementation.
 
 ## Local tests required before implementation is accepted
 
-Write the tests first (RED) and use only local stub HTTP and HTTPS servers; tests must not access the public network. Cover status, response headers and bytes; timeout; response `max_bytes`; trusted test CA success; leaf pin mismatch with proof no request bytes reached the stub; cancellation; the per-daemon concurrency bound; and daemon/tick responsiveness while a slow request is in flight. Also cover request bodies at the Matrix media size bound, redirect behavior, and that Authorization and bodies are absent from logs. Use a private daemon for daemon-level tests and stop it and remove its temporary resources afterward.
+Write the tests first (RED) and use only local stub HTTP and HTTPS servers; tests must not access the public network. Cover status, response headers and bytes; timeout; response `max_bytes`; trusted test CA success; leaf pin mismatch with proof no request bytes reached the stub; cancellation; the per-daemon concurrency bound; and daemon/tick responsiveness while a slow request is in flight. Also cover request bodies at the Matrix media size bound, redirect behavior, and that Authorization and bodies are absent from daemon logs. A reusable `remuda_native::net::testing::ScriptedHttpServer` is available to tests that enable the `http-test-support` feature; it serves queued JSON responses by path and keeps an in-memory request record. Use a private daemon for daemon-level tests and stop it and remove its temporary resources afterward.

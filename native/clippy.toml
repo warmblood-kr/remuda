@@ -1,0 +1,6 @@
+# Socket types are denied throughout remuda-native. The only exception is the
+# network boundary in src/net, shared by remuda.http and cluster PR7's listener.
+disallowed-types = [
+    { path = "std::net::TcpStream", reason = "socket code belongs only in native/src/net" },
+    { path = "std::net::TcpListener", reason = "socket code belongs only in native/src/net" },
+]
