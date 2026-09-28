@@ -58,7 +58,8 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, String> {
 /// Forward an authorized frame to the existing local daemon and encode its
 /// typed response afresh. Request bytes are never copied to the daemon socket.
 pub fn forward_frame(path: &std::path::Path, frame: &[u8]) -> Result<Vec<u8>, String> {
-    forward_frame_with_timeout(path, frame, std::time::Duration::from_secs(30))
+    let request = decode_frame(frame)?;
+    forward_request(path, &request)
 }
 
 /// Forward a frame with an explicit bound on the local daemon response wait.
@@ -68,10 +69,14 @@ pub fn forward_frame_with_timeout(
     timeout: std::time::Duration,
 ) -> Result<Vec<u8>, String> {
     let request = decode_frame(frame)?;
-    forward_request(path, &request, timeout)
+    forward_request_with_timeout(path, &request, timeout)
 }
 
-fn forward_request(
+fn forward_request(path: &Path, request: &Request) -> Result<Vec<u8>, String> {
+    forward_request_with_timeout(path, request, std::time::Duration::from_secs(30))
+}
+
+fn forward_request_with_timeout(
     path: &std::path::Path,
     request: &Request,
     timeout: std::time::Duration,
@@ -191,7 +196,7 @@ fn serve_connection(mut stream: crate::ipc::Stream, daemon_path: &Path) -> std::
     };
     let timeout = request_timeout(&request);
     let (done, timer) = timeout_timer(&stream, timeout)?;
-    let reply = match forward_request(daemon_path, &request, timeout) {
+    let reply = match forward_request_with_timeout(daemon_path, &request, timeout) {
         Ok(response) => response,
         Err(reason) => serde_json::to_vec(&remuda_core::protocol::Response::error(reason))
             .expect("response serializes"),
@@ -253,6 +258,11 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::Attach { .. } => Err(refusal("Attach")),
         Request::AttachTracked { .. } => Err(refusal("AttachTracked")),
         Request::AttachStatus { .. } => Err(refusal("AttachStatus")),
+        Request::Close {
+            instance_id: Some(_),
+            confirm: Some(true),
+            ..
+        } => Ok(()),
         Request::Close { .. } => Err(refusal("Close")),
         Request::ListDir { .. } => Err(refusal("ListDir")),
         Request::Mkdir { .. } => Err(refusal("Mkdir")),
@@ -305,6 +315,21 @@ mod tests {
             std::time::Duration::from_secs(25)
         );
         assert_eq!(request_timeout(&Request::List), CONNECTION_TIMEOUT);
+    }
+
+    #[test]
+    fn legacy_close_requests_deserialize_and_keep_the_old_wire_shape() {
+        let old_wire = br#"{"Close":{"name":"dev"}}"#;
+        let request: Request = serde_json::from_slice(old_wire).unwrap();
+        assert_eq!(
+            request,
+            Request::Close {
+                name: "dev".into(),
+                instance_id: None,
+                confirm: None,
+            }
+        );
+        assert_eq!(serde_json::to_vec(&request).unwrap(), old_wire);
     }
 
     #[test]
@@ -393,7 +418,11 @@ mod tests {
                 name: "dev".into(),
                 generation: 0,
             },
-            Request::Close { name: "dev".into() },
+            Request::Close {
+                name: "dev".into(),
+                instance_id: None,
+                confirm: None,
+            },
             Request::ListDir { path: "/".into() },
             Request::Mkdir { path: "/".into() },
             Request::RemoveDirAll { path: "/".into() },
@@ -470,6 +499,47 @@ mod tests {
         let error = authorize(&request).unwrap_err();
         assert!(!error.contains("secret-input-payload"));
         assert!(error.contains("client_id"));
+    }
+
+    #[test]
+    fn close_requires_explicit_confirmation_and_instance_without_echoing_fields() {
+        let request = Request::Close {
+            name: "secret-session-name".into(),
+            instance_id: Some("secret-instance-id".into()),
+            confirm: None,
+        };
+        let error = authorize(&request).unwrap_err();
+        assert_eq!(error, "remote front refuses Close");
+        assert!(!error.contains("secret-session-name"));
+        assert!(!error.contains("secret-instance-id"));
+
+        let request = Request::Close {
+            name: "dev".into(),
+            instance_id: None,
+            confirm: Some(true),
+        };
+        assert_eq!(
+            authorize(&request).unwrap_err(),
+            "remote front refuses Close"
+        );
+    }
+
+    #[test]
+    fn close_is_allowlisted_only_with_identity_and_confirmation() {
+        assert!(authorize(&Request::Close {
+            name: "dev".into(),
+            instance_id: Some("instance-1".into()),
+            confirm: Some(true),
+        })
+        .is_ok());
+        assert_eq!(
+            authorize(&Request::Eval {
+                code: "return 1".into(),
+                name: None
+            })
+            .unwrap_err(),
+            "remote front refuses Eval"
+        );
     }
 
     fn test_socket_path() -> std::path::PathBuf {

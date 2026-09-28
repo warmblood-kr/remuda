@@ -90,8 +90,20 @@ pub enum Request {
     AttachStatus { name: String, generation: u64 },
     /// End a session — live or already self-exited — and stop tracking it.
     /// Refused while a human is attached. A session that ended on its own is
-    /// dropped by `List`; this is for one still alive.
-    Close { name: String },
+    /// dropped by `List`; this is for one still alive. Local callers may omit
+    /// the optional fields to retain legacy behavior; the remote front accepts
+    /// only an explicit confirmation bound to an instance id.
+    Close {
+        name: String,
+        /// Session start the caller intends to close. Required by the remote
+        /// front; omitted by legacy local callers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance_id: Option<String>,
+        /// Explicit operator confirmation. Required by the remote front;
+        /// omitted local calls retain the established behavior.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confirm: Option<bool>,
+    },
     /// List a directory's immediate entries by name, sorted. No session
     /// involved — a plain filesystem primitive for managing topic directories.
     ListDir { path: String },

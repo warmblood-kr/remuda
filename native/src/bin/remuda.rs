@@ -474,12 +474,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         ClusterCommand::Revoke { target, yes } => cluster_revoke(&target, yes),
         ClusterCommand::Remote(target) => {
             let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into());
-            with_daemon(server, path, |path| {
-                match remuda_native::cluster_tui::run(path, &node, target.as_deref()) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(error) => fail(format!("cluster remote: {error}")),
-                }
-            })
+            cluster_remote(server, path, &node, target.as_deref())
         }
         ClusterCommand::Listen {
             bind_addr,
@@ -513,6 +508,44 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             eprintln!("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | remote [node/session] | listen --bind ADDR [--allow-public] | call NODE (list | capture SESSION) --addr HOST:PORT [--json]]");
             ExitCode::from(2)
         }
+    }
+}
+
+fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -> ExitCode {
+    match remuda_native::cluster::nodes() {
+        Ok(Some((identity, registry))) => {
+            let poller = match remuda_native::cluster_remote::RemotePoller::from_registry(
+                &registry,
+                &identity.node_fp,
+            ) {
+                Ok(poller) => poller,
+                Err(error) => return fail(format!("cluster remote: {error}")),
+            };
+            if let Err(error) = poller.start() {
+                return fail(format!("cluster remote: {error}"));
+            }
+            let source = poller.source();
+            let selection = poller.selection();
+            with_daemon(server, path, |path| {
+                match remuda_native::cluster_tui::run_with_remote_selection(
+                    path,
+                    node,
+                    target,
+                    source.as_ref(),
+                    &selection,
+                ) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => fail(format!("cluster remote: {error}")),
+                }
+            })
+        }
+        Ok(None) => with_daemon(server, path, |path| {
+            match remuda_native::cluster_tui::run(path, node, target) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(format!("cluster remote: {error}")),
+            }
+        }),
+        Err(error) => fail(format!("cluster remote: {error}")),
     }
 }
 

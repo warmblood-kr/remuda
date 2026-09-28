@@ -9,6 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Detach key: Ctrl-\ (0x1C). Chosen because almost nothing binds it, unlike
 /// Ctrl-C/D/Z, which the attached program needs. Consumed, never forwarded.
 pub const DETACH: u8 = 0x1C;
+pub const EMPTY_REPLY_ERROR: &str = "the daemon hung up without answering";
 
 const RESET_INPUT_MODES: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
@@ -70,37 +71,41 @@ pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
     read_response(&stream)
 }
 
-/// Send one request and stop waiting when the daemon exceeds the supplied
-/// response deadline.
+/// Send one request with a bounded wait for its local daemon reply. Waking the
+/// cloned stream interrupts the worker's pending read on Unix and Windows.
 pub fn request_with_timeout(
     path: &Path,
     request: &Request,
     timeout: std::time::Duration,
 ) -> std::io::Result<Response> {
     let stream = ipc::connect(path)?;
-    send(&stream, request)?;
     let wake_stream = stream.try_clone()?;
+    let request = request.clone();
     let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
-    let reader = std::thread::Builder::new()
-        .name("remuda-local-request-reader".into())
-        .spawn(move || {
-            let _ = reply_tx.send(read_response(&stream));
-        })?;
-    let result = match reply_rx.recv_timeout(timeout) {
-        Ok(result) => result,
+    let worker = std::thread::spawn(move || {
+        let result = send(&stream, &request).and_then(|()| read_response(&stream));
+        let _ = reply_tx.send(result);
+    });
+    match reply_rx.recv_timeout(timeout) {
+        Ok(result) => {
+            worker
+                .join()
+                .map_err(|_| std::io::Error::other("daemon request worker panicked"))?;
+            result
+        }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             ipc::wake(&wake_stream);
+            let _ = worker.join();
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "local daemon request timed out",
+                "daemon request timed out",
             ))
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other(
-            "local daemon request reader stopped unexpectedly",
-        )),
-    };
-    let _ = reader.join();
-    result
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = worker.join();
+            Err(std::io::Error::other("daemon request worker stopped"))
+        }
+    }
 }
 
 fn send(mut stream: &Stream, request: &Request) -> std::io::Result<()> {
@@ -126,7 +131,7 @@ const CANNOT_READ: &str = "bad request: ";
 /// a malformed request that is NOT skew must still say what it was.
 fn interpret(line: &str) -> Response {
     if line.trim().is_empty() {
-        return Response::error("the daemon hung up without answering");
+        return Response::error(EMPTY_REPLY_ERROR);
     }
     match serde_json::from_str::<Response>(line) {
         // We serialized that request from this binary's own `Request`, so a
@@ -924,40 +929,88 @@ mod tests {
     use super::{
         interpret, request_with_timeout, reset_input_modes, write_input_trace, RESET_INPUT_MODES,
     };
+    use crate::ipc;
+    use interprocess::local_socket::traits::ListenerExt;
     use remuda_core::protocol::{Request, Response};
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant, UNIX_EPOCH};
+
+    fn assert_request_timeout(request: Request) {
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+        const TIMEOUT: Duration = Duration::from_millis(300);
+        const TEST_DEADLINE: Duration = Duration::from_secs(2);
+        let path = std::env::temp_dir().join(format!(
+            "remuda-timeout-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = ipc::listen(&path).expect("bind raw local listener");
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let stream = listener
+                .incoming()
+                .next()
+                .expect("incoming connection")
+                .expect("accept");
+            accepted_tx.send(()).expect("notify accepted");
+            release_rx.recv().expect("release silent peer");
+            drop(stream);
+        });
+
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let client_path = path.clone();
+        let client = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = request_with_timeout(&client_path, &request, TIMEOUT);
+            result_tx
+                .send((result, started.elapsed()))
+                .expect("report timed request");
+        });
+        accepted_rx
+            .recv_timeout(TEST_DEADLINE)
+            .expect("client did not connect to raw listener");
+
+        let result = result_rx.recv_timeout(TEST_DEADLINE);
+        // Release the peer even on failure: this lets a broken implementation
+        // that forgot to wake its blocked read finish before the assertion.
+        release_tx.send(()).expect("release silent peer");
+        server.join().expect("silent listener thread");
+        client.join().expect("timed request thread");
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&path);
+
+        let (result, elapsed) = result.expect("request_with_timeout exceeded test deadline");
+        let error = result.expect_err("silent listener unexpectedly produced a reply");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed >= TIMEOUT && elapsed < TEST_DEADLINE,
+            "timeout returned outside the expected window: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn request_timeout_wakes_a_peer_that_never_replies() {
+        assert_request_timeout(Request::Version);
+    }
+
+    #[test]
+    fn request_timeout_bounds_a_large_input_to_a_peer_that_never_reads() {
+        assert_request_timeout(Request::Input {
+            name: "target".into(),
+            instance_id: "instance".into(),
+            client_id: "client".into(),
+            seq: 1,
+            bytes: vec![b'x'; 64 * 1024],
+        });
+    }
 
     #[test]
     fn detach_resets_mouse_and_bracketed_paste_modes() {
         let mut output = Vec::new();
         reset_input_modes(&mut output).unwrap();
         assert_eq!(output, RESET_INPUT_MODES);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn local_daemon_response_wait_has_a_timeout() {
-        use interprocess::local_socket::traits::ListenerExt as _;
-        let path = std::env::temp_dir().join(format!(
-            "remuda-client-timeout-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let listener = crate::ipc::listen(&path).unwrap();
-        let server = std::thread::spawn(move || {
-            let _stream = listener.incoming().next().unwrap().unwrap();
-            std::thread::sleep(Duration::from_millis(250));
-        });
-        let started = std::time::Instant::now();
-        let error =
-            request_with_timeout(&path, &Request::List, Duration::from_millis(40)).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_millis(200));
-        server.join().unwrap();
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]

@@ -1,10 +1,17 @@
 //! End-to-end coverage for the cluster tree's read-only local IPC path.
 
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use remuda_core::protocol::{Request, Response};
 use remuda_core::Size;
+use remuda_native::cluster_tui::composer::{ComposerAction, LineComposer};
+use remuda_native::cluster_tui::queue::{InputQueue, QueueEvent, QueueState, MAX_IO_RETRIES};
+use remuda_native::cluster_tui::sender::InputSender;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+static NEXT_DAEMON: AtomicU64 = AtomicU64::new(0);
 
 struct PrivateDaemon {
     child: Child,
@@ -15,7 +22,11 @@ struct PrivateDaemon {
 impl PrivateDaemon {
     fn start() -> Self {
         let root = PathBuf::from("/tmp");
-        let runtime = root.join(format!("cluster-tree-{}", std::process::id()));
+        let runtime = root.join(format!(
+            "cluster-tree-{}-{}",
+            std::process::id(),
+            NEXT_DAEMON.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&runtime);
         std::fs::create_dir_all(&runtime).unwrap();
         let home = runtime.join("home");
@@ -27,6 +38,7 @@ impl PrivateDaemon {
             .env("XDG_CONFIG_HOME", runtime.join("config"))
             .env("XDG_DATA_HOME", runtime.join("data"))
             .env("XDG_CACHE_HOME", runtime.join("cache"))
+            .env("XDG_STATE_HOME", runtime.join("state"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -94,4 +106,180 @@ fn local_tree_lists_and_captures_a_session_from_a_private_daemon() {
     .unwrap();
     assert!(frame.contains("studio / tree-session · live · snapshot 0s ago"));
     assert!(frame.contains("tree-session"));
+}
+
+#[test]
+fn local_daemon_composer_input_appears_once_in_capture() {
+    let mut daemon = PrivateDaemon::start();
+    daemon.wait_ready();
+    let response = remuda_native::client::request(
+        &daemon.path(),
+        &Request::New {
+            name: Some("composer-session".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                r#"stty -echo; IFS= read -r line; printf 'line:%s\n' "$line"; sleep 30"#.into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, Response::Value(name) if name == "composer-session"));
+    let instance_id = match remuda_native::client::request(&daemon.path(), &Request::List).unwrap()
+    {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "composer-session")
+            .and_then(|session| session.instance_id)
+            .expect("List must expose the running session instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+
+    let mut composer = LineComposer::default();
+    for character in "once only".chars() {
+        composer.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    let bytes = match composer.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
+        ComposerAction::Submit(bytes) => bytes,
+        other => panic!("expected composer submission, got {other:?}"),
+    };
+    let now = Instant::now();
+    let mut sender = InputSender::with_client_id([0x72; 16]);
+    let mut queue = InputQueue::default();
+    sender
+        .enqueue(&mut queue, "composer-session", &instance_id, bytes, now)
+        .unwrap();
+    let result = sender.attempt_due(&mut queue, now, |request| {
+        remuda_native::client::request(&daemon.path(), request)
+    });
+    assert!(matches!(result, Some(QueueEvent::Sent { seq: 1, .. })));
+    assert_eq!(queue.items().next().unwrap().state, QueueState::Sent);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let screen = loop {
+        let screen = match remuda_native::client::request(
+            &daemon.path(),
+            &Request::Capture {
+                name: "composer-session".into(),
+            },
+        )
+        .unwrap()
+        {
+            Response::Screen(screen) => screen,
+            other => panic!("unexpected Capture response: {other:?}"),
+        };
+        if screen.contains("line:once only") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "typed line never appeared in capture"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(screen.matches("line:once only").count(), 1);
+}
+
+#[test]
+fn lost_sequence_rotates_client_before_the_next_line() {
+    let mut daemon = PrivateDaemon::start();
+    daemon.wait_ready();
+    let response = remuda_native::client::request(
+        &daemon.path(),
+        &Request::New {
+            name: Some("recovery-session".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                r#"stty -echo; IFS= read -r line; printf 'line:%s\n' "$line"; sleep 30"#.into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, Response::Value(name) if name == "recovery-session"));
+    let instance_id = match remuda_native::client::request(&daemon.path(), &Request::List).unwrap()
+    {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "recovery-session")
+            .and_then(|session| session.instance_id)
+            .expect("List must expose the running session instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+
+    let now = Instant::now();
+    let mut sender = InputSender::with_client_id([0x31; 16]);
+    let mut queue = InputQueue::default();
+    sender
+        .enqueue(
+            &mut queue,
+            "recovery-session",
+            &instance_id,
+            b"lost\r".to_vec(),
+            now,
+        )
+        .unwrap();
+    let first_client = queue.items().next().unwrap().client_id.clone();
+    sender
+        .enqueue(
+            &mut queue,
+            "recovery-session",
+            &instance_id,
+            b"after loss\r".to_vec(),
+            now,
+        )
+        .unwrap();
+    for attempt in 0..=MAX_IO_RETRIES {
+        let at = now + Duration::from_secs(u64::from(attempt) + 1);
+        let result = sender.attempt_due(&mut queue, at, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "simulated lost sequence",
+            ))
+        });
+        if attempt == MAX_IO_RETRIES {
+            assert!(matches!(result, Some(QueueEvent::Uncertain { seq: 1, .. })));
+        } else {
+            assert!(matches!(
+                result,
+                Some(QueueEvent::RetryScheduled { seq: 1, .. })
+            ));
+        }
+    }
+
+    let next = queue.items().next_back().unwrap();
+    assert_eq!(next.seq, 1);
+    assert_ne!(next.client_id, first_client);
+    let result = sender.attempt_due(&mut queue, now + Duration::from_secs(11), |request| {
+        remuda_native::client::request(&daemon.path(), request)
+    });
+    assert!(matches!(result, Some(QueueEvent::Sent { seq: 1, .. })));
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let screen = loop {
+        let screen = match remuda_native::client::request(
+            &daemon.path(),
+            &Request::Capture {
+                name: "recovery-session".into(),
+            },
+        )
+        .unwrap()
+        {
+            Response::Screen(screen) => screen,
+            other => panic!("unexpected Capture response: {other:?}"),
+        };
+        if screen.contains("line:after loss") {
+            break screen;
+        }
+        assert!(Instant::now() < deadline, "recovered input never appeared");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(screen.matches("line:after loss").count(), 1);
+    assert!(!screen.contains("line:lost"));
 }

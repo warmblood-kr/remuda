@@ -388,6 +388,19 @@ fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<(
     Some(closed.map(drop))
 }
 
+fn close_instance(
+    registry: &Registry,
+    image: &Image,
+    name: &str,
+    instance_id: &str,
+) -> Option<AgentResult<()>> {
+    let closed = registry.close_instance(name, instance_id)?;
+    if let Ok(true) = closed {
+        notify_exited(image, name);
+    }
+    Some(closed.map(drop))
+}
+
 /// `close` stops tracking a session itself, so the reaper never sees it die:
 /// whichever of the two removes the entry fires the one `session_exited`.
 fn notify_exited(image: &Image, name: &str) {
@@ -596,11 +609,7 @@ fn handle(
             env,
         } => handle_new(stream, registry, name, command, size, cwd, env),
 
-        Request::SendLine { name, text } => {
-            respond(&stream, &name, registry.send_line(&name, &text), |()| {
-                Response::Ok
-            })
-        }
+        Request::SendLine { name, text } => send_line(&stream, registry, &name, &text),
 
         Request::Input {
             name,
@@ -668,9 +677,11 @@ fn handle(
             reply(&stream, &response)
         }
 
-        Request::Close { name } => respond(&stream, &name, close(registry, image, &name), |()| {
-            Response::Ok
-        }),
+        Request::Close {
+            name,
+            instance_id,
+            confirm,
+        } => handle_close(&stream, registry, image, &name, instance_id, confirm),
 
         Request::ListDir { path: dir } => reply(&stream, &list_dir(&dir)),
         Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
@@ -686,6 +697,24 @@ fn handle(
             Err(e) => reply(&stream, &Response::error(e)),
         },
     }
+}
+
+fn handle_close(
+    stream: &Stream,
+    registry: &Registry,
+    image: &Image,
+    name: &str,
+    instance_id: Option<String>,
+    confirm: Option<bool>,
+) -> std::io::Result<()> {
+    let result = match (instance_id, confirm) {
+        (None, None) => close(registry, image, name),
+        (Some(instance_id), Some(true)) => close_instance(registry, image, name, &instance_id),
+        _ => Some(Err(remuda_core::agent::AgentError::Io(
+            "confirmed close requires an instance id and confirmation".into(),
+        ))),
+    };
+    respond(stream, name, result, |()| Response::Ok)
 }
 
 fn deferred_reply(
@@ -967,6 +996,12 @@ fn input(
             reply(stream, &Response::error("session exited"))
         }
     }
+}
+
+fn send_line(stream: &Stream, registry: &Registry, name: &str, text: &str) -> std::io::Result<()> {
+    respond(stream, name, registry.send_line(name, text), |()| {
+        Response::Ok
+    })
 }
 
 fn mouse_state(stream: &Stream, registry: &Registry, name: &str) -> std::io::Result<()> {

@@ -183,7 +183,11 @@ impl RemoteNode {
         self.next_poll = now + retry_backoff(self.failure_count);
         self.polling = false;
         self.state = if self.last_sync.is_some() {
-            RemoteState::Stale
+            if self.failure_count >= 2 {
+                RemoteState::Unreachable
+            } else {
+                RemoteState::Stale
+            }
         } else {
             RemoteState::Unreachable
         };
@@ -262,9 +266,13 @@ impl RemoteSource for RemoteTreeState {
 
 /// Remote protocol implementation using the cluster's shared target resolver
 /// and pinned one-shot Noise client.
+type TargetResolver =
+    dyn Fn(&RemoteTarget) -> io::Result<crate::cluster::ResolvedTarget> + Send + Sync;
+
 pub struct ClusterRemoteTransport {
     client: crate::net::cluster_client::ClusterClient,
     local_static_private: zeroize::Zeroizing<Vec<u8>>,
+    resolve: Box<TargetResolver>,
 }
 
 impl ClusterRemoteTransport {
@@ -279,10 +287,26 @@ impl ClusterRemoteTransport {
                 total: timeout,
             },
         );
-        Ok(Self {
+        Ok(Self::with_client(local_static_private, client, |target| {
+            crate::cluster::resolve_target(&target.registry_key, target.addr_override)
+        }))
+    }
+
+    /// Construct with injected pinned identity resolution, primarily for
+    /// isolated two-node tests. Production uses [`Self::system`].
+    pub fn with_client(
+        local_static_private: zeroize::Zeroizing<Vec<u8>>,
+        client: crate::net::cluster_client::ClusterClient,
+        resolve: impl Fn(&RemoteTarget) -> io::Result<crate::cluster::ResolvedTarget>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
             client,
             local_static_private,
-        })
+            resolve: Box::new(resolve),
+        }
     }
 
     fn request(
@@ -299,6 +323,98 @@ impl ClusterRemoteTransport {
             )
             .map_err(io::Error::other)
     }
+
+    fn list_sessions(
+        &self,
+        target: &crate::cluster::ResolvedTarget,
+    ) -> io::Result<Vec<remuda_core::registry::SessionSummary>> {
+        match self.request(target, &Request::List)? {
+            Response::Sessions(sessions) => Ok(sessions),
+            Response::Error(error) => Err(io::Error::other(error)),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected remote List response: {other:?}"),
+            )),
+        }
+    }
+
+    fn selected_session_snapshot(
+        &self,
+        target: &crate::cluster::ResolvedTarget,
+        session: remuda_core::registry::SessionSummary,
+        prior: Option<&RemoteSessionSnapshot>,
+    ) -> io::Result<Option<RemoteSessionSnapshot>> {
+        let listed_instance_id = listed_instance_id(&session);
+        let response = if let Some(prior) = prior.filter(|old| old.output_version.is_some()) {
+            self.request(
+                target,
+                &Request::Sync {
+                    name: session.name.clone(),
+                    instance_id: Some(prior.instance_id.clone()),
+                    since: prior.output_version.unwrap_or_default(),
+                    timeout_ms: REMOTE_SYNC_TIMEOUT.as_millis() as u64,
+                },
+            )?
+        } else {
+            self.request(
+                target,
+                &Request::CaptureStyled {
+                    name: session.name.clone(),
+                    scrollback: 0,
+                },
+            )?
+        };
+
+        match response {
+            Response::Sync {
+                instance_id,
+                output_version,
+                snapshot,
+            } => Ok(Some(RemoteSessionSnapshot {
+                name: session.name,
+                instance_id,
+                alive: true,
+                output_version: Some(output_version),
+                screen: Some(to_screen_snapshot(snapshot)),
+            })),
+            Response::StyledScreen {
+                rows,
+                instance_id,
+                output_version,
+                wrapped,
+                scrollback_len,
+                scrollback_total,
+                cursor,
+            } => Ok(instance_id
+                .or(listed_instance_id)
+                .map(|instance_id| RemoteSessionSnapshot {
+                    name: session.name,
+                    instance_id,
+                    alive: true,
+                    output_version,
+                    screen: Some(to_screen_snapshot(remuda_core::protocol::StyledScreen {
+                        rows,
+                        wrapped,
+                        scrollback_len,
+                        scrollback_total,
+                        cursor,
+                    })),
+                })),
+            Response::WrongInstance => Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "remote session instance changed during poll",
+            )),
+            Response::SyncAtCapacity => Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "remote Sync is at capacity",
+            )),
+            Response::Error(error) => Err(io::Error::other(error)),
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unexpected remote screen response: {other:?}"),
+            )),
+        }
+    }
 }
 
 impl RemoteTransport for ClusterRemoteTransport {
@@ -308,126 +424,56 @@ impl RemoteTransport for ClusterRemoteTransport {
         selected_session: Option<&str>,
         previous: &[RemoteSessionSnapshot],
     ) -> io::Result<Vec<RemoteSessionSnapshot>> {
-        let resolved = crate::cluster::resolve_target(&target.registry_key, target.addr_override)?;
-        let sessions = match self.request(&resolved, &Request::List)? {
-            Response::Sessions(sessions) => sessions,
-            Response::Error(error) => return Err(io::Error::other(error)),
-            other => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unexpected remote List response: {other:?}"),
-                ));
-            }
-        };
-
+        let resolved = (self.resolve)(target)?;
+        let sessions = self.list_sessions(&resolved)?;
         let mut snapshots = Vec::with_capacity(sessions.len());
         for session in sessions {
-            let listed_instance_id = session
-                .instance_id
-                .clone()
-                .or_else(|| (!session.id.is_empty()).then(|| session.id.clone()));
-            let prior = previous.iter().find(|old| {
-                old.name == session.name && listed_instance_id.as_ref() == Some(&old.instance_id)
-            });
+            let prior = previous_session(&session, previous);
             if !session.alive || selected_session != Some(session.name.as_str()) {
-                let Some(instance_id) = prior
-                    .map(|old| old.instance_id.clone())
-                    .or(listed_instance_id)
-                else {
-                    continue;
-                };
-                snapshots.push(RemoteSessionSnapshot {
-                    name: session.name,
-                    instance_id,
-                    alive: session.alive,
-                    output_version: session.output_version,
-                    screen: prior.and_then(|old| old.screen.clone()),
-                });
+                if let Some(snapshot) = unpolled_session_snapshot(session, prior) {
+                    snapshots.push(snapshot);
+                }
                 continue;
             }
-
-            let response = if let Some(prior) = prior.filter(|old| old.output_version.is_some()) {
-                self.request(
-                    &resolved,
-                    &Request::Sync {
-                        name: session.name.clone(),
-                        instance_id: Some(prior.instance_id.clone()),
-                        since: prior.output_version.unwrap_or_default(),
-                        timeout_ms: REMOTE_SYNC_TIMEOUT.as_millis() as u64,
-                    },
-                )?
-            } else {
-                self.request(
-                    &resolved,
-                    &Request::CaptureStyled {
-                        name: session.name.clone(),
-                        scrollback: 0,
-                    },
-                )?
-            };
-
-            let snapshot = match response {
-                Response::Sync {
-                    instance_id,
-                    output_version,
-                    snapshot,
-                } => RemoteSessionSnapshot {
-                    name: session.name,
-                    instance_id,
-                    alive: true,
-                    output_version: Some(output_version),
-                    screen: Some(to_screen_snapshot(snapshot)),
-                },
-                Response::StyledScreen {
-                    rows,
-                    instance_id,
-                    output_version,
-                    wrapped,
-                    scrollback_len,
-                    scrollback_total,
-                    cursor,
-                } => {
-                    let Some(instance_id) = instance_id.or(listed_instance_id) else {
-                        continue;
-                    };
-                    RemoteSessionSnapshot {
-                        name: session.name,
-                        instance_id,
-                        alive: true,
-                        output_version,
-                        screen: Some(to_screen_snapshot(remuda_core::protocol::StyledScreen {
-                            rows,
-                            wrapped,
-                            scrollback_len,
-                            scrollback_total,
-                            cursor,
-                        })),
-                    }
-                }
-                Response::WrongInstance => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::Interrupted,
-                        "remote session instance changed during poll",
-                    ));
-                }
-                Response::SyncAtCapacity => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "remote Sync is at capacity",
-                    ));
-                }
-                Response::Error(error) => return Err(io::Error::other(error)),
-                other => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("unexpected remote screen response: {other:?}"),
-                    ));
-                }
-            };
-            snapshots.push(snapshot);
+            if let Some(snapshot) = self.selected_session_snapshot(&resolved, session, prior)? {
+                snapshots.push(snapshot);
+            }
         }
         Ok(snapshots)
     }
+}
+
+fn listed_instance_id(session: &remuda_core::registry::SessionSummary) -> Option<String> {
+    session
+        .instance_id
+        .clone()
+        .or_else(|| (!session.id.is_empty()).then(|| session.id.clone()))
+}
+
+fn previous_session<'a>(
+    session: &remuda_core::registry::SessionSummary,
+    previous: &'a [RemoteSessionSnapshot],
+) -> Option<&'a RemoteSessionSnapshot> {
+    let instance_id = listed_instance_id(session);
+    previous
+        .iter()
+        .find(|old| old.name == session.name && instance_id.as_ref() == Some(&old.instance_id))
+}
+
+fn unpolled_session_snapshot(
+    session: remuda_core::registry::SessionSummary,
+    prior: Option<&RemoteSessionSnapshot>,
+) -> Option<RemoteSessionSnapshot> {
+    let instance_id = prior
+        .map(|old| old.instance_id.clone())
+        .or_else(|| listed_instance_id(&session))?;
+    Some(RemoteSessionSnapshot {
+        name: session.name,
+        instance_id,
+        alive: session.alive,
+        output_version: session.output_version,
+        screen: prior.and_then(|old| old.screen.clone()),
+    })
 }
 
 fn to_screen_snapshot(screen: remuda_core::protocol::StyledScreen) -> ScreenSnapshot {

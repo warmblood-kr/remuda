@@ -1355,6 +1355,8 @@ mod tests {
         );
         let close = Request::Close {
             name: "session-to-protect".into(),
+            instance_id: None,
+            confirm: Some(true),
         };
         let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&close).unwrap());
         let duplicate_body = sealed.message.clone();
