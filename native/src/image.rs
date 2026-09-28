@@ -65,12 +65,21 @@ pub fn typed_failure_message(value: &str) -> Option<(u8, &str)> {
 /// waiting at once cannot receive each other's result.
 struct Job {
     kind: JobKind,
-    reply: Sender<Result<String, String>>,
+    reply: Option<Sender<Result<String, String>>>,
 }
 
 enum JobKind {
-    Eval { code: String, name: Option<String> },
+    Eval {
+        code: String,
+        name: Option<String>,
+    },
     StopModules,
+    HttpComplete {
+        id: u64,
+        result: Result<crate::net::HttpResponse, String>,
+    },
+    #[cfg(test)]
+    StopImage,
 }
 
 /// A handle to the daemon's Lua image. Cloneable and `Send`; the interpreter
@@ -78,6 +87,7 @@ enum JobKind {
 #[derive(Clone)]
 pub struct Image {
     jobs: Sender<Job>,
+    http: crate::net::HttpClient,
 }
 
 impl Image {
@@ -94,7 +104,10 @@ impl Image {
     ) -> Self {
         let (jobs, inbox) = channel::<Job>();
         let socket: PathBuf = socket.to_path_buf();
-        let image = Self { jobs };
+        let image = Self {
+            jobs,
+            http: crate::net::HttpClient::default(),
+        };
         let handle = image.clone();
 
         std::thread::spawn(move || {
@@ -131,12 +144,26 @@ impl Image {
                         JobKind::StopModules => script::stop_modules(&lua)
                             .map(|()| String::new())
                             .map_err(|error| error.to_string()),
+                        JobKind::HttpComplete { id, result } => {
+                            if let Err(error) = deliver_http(&lua, *id, result.clone()) {
+                                eprintln!("remuda: HTTP callback delivery failed: {error}");
+                            }
+                            Ok(String::new())
+                        }
+                        #[cfg(test)]
+                        JobKind::StopImage => Ok(String::new()),
                     },
                 };
                 // A caller that gave up and dropped its receiver is not an
                 // error: `remuda -e` can be Ctrl-C'd mid-evaluation, and the
                 // work still ran.
-                let _ = job.reply.send(answer);
+                if let Some(reply) = job.reply {
+                    let _ = reply.send(answer);
+                }
+                #[cfg(test)]
+                if matches!(job.kind, JobKind::StopImage) {
+                    break;
+                }
             }
         });
 
@@ -157,10 +184,35 @@ impl Image {
                     code: code.to_string(),
                     name: name.map(str::to_string),
                 },
-                reply,
+                reply: Some(reply),
             })
             .map_err(|_| "the image is not running".to_string())?;
         Ok(answer)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(&self) {
+        let (reply, answer) = channel();
+        if self
+            .jobs
+            .send(Job {
+                kind: JobKind::StopImage,
+                reply: Some(reply),
+            })
+            .is_ok()
+        {
+            let _ = answer.recv_timeout(std::time::Duration::from_secs(2));
+        }
+    }
+
+    pub fn start_http(&self, request: crate::net::HttpRequest) -> crate::net::HttpTask {
+        let jobs = self.jobs.clone();
+        self.http.start(request, move |id, result| {
+            let _ = jobs.send(Job {
+                kind: JobKind::HttpComplete { id, result },
+                reply: None,
+            });
+        })
     }
 
     /// Evaluate `code` in the image and wait for the result. State persists
@@ -181,13 +233,45 @@ impl Image {
             .jobs
             .send(Job {
                 kind: JobKind::StopModules,
-                reply,
+                reply: Some(reply),
             })
             .is_ok()
         {
             let _ = answer.recv_timeout(STOP_TIMEOUT);
         }
     }
+}
+
+fn deliver_http(
+    lua: &Lua,
+    id: u64,
+    result: Result<crate::net::HttpResponse, String>,
+) -> mlua::Result<()> {
+    let key = format!("remuda.http.callback.{id}");
+    let callback: mlua::Function = lua.named_registry_value(&key)?;
+    lua.set_named_registry_value(&key, mlua::Value::Nil)?;
+    let value = lua.create_table()?;
+    match result {
+        Ok(response) => {
+            value.set("status", response.status)?;
+            let headers = lua.create_table()?;
+            for (name, values) in response.headers {
+                if values.len() == 1 {
+                    headers.set(name, lua.create_string(&values[0])?)?;
+                } else {
+                    let array = lua.create_table()?;
+                    for (i, entry) in values.iter().enumerate() {
+                        array.set(i + 1, lua.create_string(entry)?)?;
+                    }
+                    headers.set(name, array)?;
+                }
+            }
+            value.set("headers", headers)?;
+            value.set("body", lua.create_string(&response.body)?)?;
+        }
+        Err(error) => value.set("error", error)?,
+    }
+    callback.call::<()>(value)
 }
 
 /// Evaluate one chunk, expression-first: `return <code>` is tried before plain
