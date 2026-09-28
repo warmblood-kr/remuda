@@ -943,6 +943,7 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::Uncertain => Err(mlua::Error::runtime("input outcome is uncertain")),
         Response::WrongInstance => Err(mlua::Error::runtime("session instance changed")),
         Response::RateLimited => Err(mlua::Error::runtime("session input rate limit exceeded")),
+        Response::SyncAtCapacity => Err(mlua::Error::runtime("Sync is at capacity; retry shortly")),
         Response::AttachStarted { .. } | Response::AttachStatus { .. } => Err(
             mlua::Error::runtime("attach responses are not exposed to scripts"),
         ),
@@ -1008,6 +1009,7 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::StyledScreen { .. } => Err(mlua::Error::runtime(
             "styled capture is not exposed to scripts",
         )),
+        Response::Sync { .. } => Err(mlua::Error::runtime("Sync is not exposed to scripts")),
         Response::MouseState(_) => Err(mlua::Error::runtime(
             "mouse state is not exposed to scripts",
         )),

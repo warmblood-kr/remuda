@@ -20,15 +20,44 @@ use interprocess::local_socket::traits::ListenerExt;
 #[cfg(unix)]
 use interprocess::local_socket::traits::Stream as LocalStream;
 use remuda_core::agent::Result as AgentResult;
-use remuda_core::protocol::{collapse_runs, Request, Response};
+use remuda_core::protocol::{collapse_runs, Request, Response, StyledScreen};
 use remuda_core::{Clock, Registry, Session, Size};
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::SystemClock;
 use portable_pty::CommandBuilder;
+
+/// Each protocol connection carries one request; cap all simultaneous long
+/// polls so they cannot consume an unbounded number of daemon worker threads.
+pub(crate) const MAX_CONCURRENT_SYNCS: usize = 16;
+static ACTIVE_SYNCS: AtomicUsize = AtomicUsize::new(0);
+
+struct SyncPermit;
+
+impl SyncPermit {
+    fn acquire() -> Option<Self> {
+        ACTIVE_SYNCS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                (active < MAX_CONCURRENT_SYNCS).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+fn acquire_sync_permit() -> Result<SyncPermit, Response> {
+    SyncPermit::acquire().ok_or(Response::SyncAtCapacity)
+}
+
+impl Drop for SyncPermit {
+    fn drop(&mut self) {
+        ACTIVE_SYNCS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// Where a node's socket lives. Prefer `$XDG_RUNTIME_DIR`; Android falls back
 /// to its process temp directory, while other Unix systems keep their old path.
@@ -401,6 +430,7 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
         Request::List => counters.counter("request_list").record_hit(),
         Request::Eval { .. } => counters.counter("request_eval").record_hit(),
         Request::CaptureStyled { .. } => counters.counter("request_capture_styled").record_hit(),
+        Request::Sync { .. } => counters.counter("request_sync").record_hit(),
         _ => {}
     }
 }
@@ -617,6 +647,13 @@ fn handle(
             capture_styled(&stream, registry, &name, scrollback)
         }
 
+        Request::Sync {
+            name,
+            instance_id,
+            since,
+            timeout_ms,
+        } => handle_sync(&stream, registry, &name, instance_id, since, timeout_ms),
+
         Request::MouseState { name } => mouse_state(&stream, registry, &name),
 
         Request::Attach { name } => attach(stream, reader, registry, &name, false),
@@ -703,6 +740,62 @@ fn deferred_reply(
         }
         Err(error) => reply(&stream, &Response::error(error)),
     }
+}
+
+fn handle_sync(
+    stream: &Stream,
+    registry: &Registry,
+    name: &str,
+    expected_instance: Option<String>,
+    since: u64,
+    timeout_ms: u64,
+) -> std::io::Result<()> {
+    let Some(session) = registry.get(name) else {
+        return reply(stream, &Response::error(format!("no such session: {name}")));
+    };
+    if expected_instance
+        .as_deref()
+        .is_some_and(|expected| expected != session.instance_id())
+    {
+        return reply(stream, &Response::WrongInstance);
+    }
+    let _permit = match acquire_sync_permit() {
+        Ok(permit) => permit,
+        Err(response) => return reply(stream, &response),
+    };
+    let result = remuda_core::sync::wait(&session, since, timeout_ms);
+    if let Some(expected) = expected_instance.as_deref() {
+        if registry
+            .get(name)
+            .is_none_or(|current| current.instance_id() != expected)
+        {
+            return reply(stream, &Response::WrongInstance);
+        }
+    }
+    let versioned = match result {
+        Ok(snapshot) => snapshot,
+        Err(error) => return reply(stream, &Response::error(error)),
+    };
+    let rows = versioned
+        .snapshot
+        .cells
+        .iter()
+        .map(|row| collapse_runs(row))
+        .collect();
+    reply(
+        stream,
+        &Response::Sync {
+            instance_id: session.instance_id().to_owned(),
+            output_version: versioned.output_version.unwrap_or(0),
+            snapshot: StyledScreen {
+                rows,
+                wrapped: versioned.snapshot.wrapped,
+                scrollback_len: versioned.snapshot.scrollback_len,
+                scrollback_total: versioned.snapshot.scrollback_total,
+                cursor: versioned.snapshot.cursor,
+            },
+        },
+    )
 }
 
 fn handle_shutdown(
@@ -1090,11 +1183,52 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{runtime_base_for, shell_or_default};
+    use super::{
+        acquire_sync_permit, runtime_base_for, shell_or_default, SyncPermit, MAX_CONCURRENT_SYNCS,
+    };
     use remuda_core::agent::{Color, StyledCell};
     use remuda_core::protocol::collapse_runs;
+    use remuda_core::protocol::Response;
     use std::ffi::OsStr;
     use std::path::Path;
+    use std::sync::Mutex;
+
+    static SYNC_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn sync_concurrency_is_bounded() {
+        let _lock = SYNC_PERMIT_TEST_LOCK.lock().unwrap();
+        let mut permits: Vec<_> = (0..MAX_CONCURRENT_SYNCS)
+            .map(|_| SyncPermit::acquire().expect("permit within sync capacity"))
+            .collect();
+        assert!(
+            SyncPermit::acquire().is_none(),
+            "excess Sync must be refused"
+        );
+        drop(permits.pop());
+        let reusable = SyncPermit::acquire().expect("a released slot must be reusable");
+        drop(reusable);
+        drop(permits);
+    }
+
+    #[test]
+    fn daemon_sync_capacity_refusal_is_typed_on_wire() {
+        let _lock = SYNC_PERMIT_TEST_LOCK.lock().unwrap();
+        let permits: Vec<_> = (0..MAX_CONCURRENT_SYNCS)
+            .map(|_| SyncPermit::acquire().expect("fill daemon Sync capacity"))
+            .collect();
+        let response = match acquire_sync_permit() {
+            Ok(_) => panic!("over-cap Sync must be refused"),
+            Err(response) => response,
+        };
+        assert_eq!(response, Response::SyncAtCapacity);
+        let mut wire = serde_json::to_vec(&response).expect("serialize protocol response");
+        wire.push(b'\n');
+        let decoded: Response =
+            serde_json::from_slice(&wire[..wire.len() - 1]).expect("decode daemon response frame");
+        assert_eq!(decoded, Response::SyncAtCapacity);
+        drop(permits);
+    }
 
     #[test]
     fn android_runtime_base_uses_termux_temp_dir_when_xdg_is_unset() {

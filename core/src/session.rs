@@ -13,7 +13,7 @@ use crate::protocol::Step;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -31,6 +31,9 @@ pub struct Session {
     /// dedicated receiver keeps this current even when no caller polls the
     /// screen; `idle_for` remains the distinct since-input measure.
     last_output_at: Arc<Mutex<Duration>>,
+    /// Output waiters share this notification; screen/version reads remain
+    /// under the agent's own lock and never hold it across the wait.
+    output_changed: Arc<(Mutex<u64>, Condvar)>,
     instance_id: String,
     /// [`Clock::now`] at the last keystroke through an [`Attached`] guard —
     /// a human's, never a script's. `None` until one arrives (#136).
@@ -99,15 +102,24 @@ impl Session {
         let size = agent.size();
         let started = clock.now();
         let last_output_at = Arc::new(Mutex::new(started));
+        let output_changed = Arc::new((Mutex::new(0_u64), Condvar::new()));
         if let Some(output) = agent.subscribe() {
             let last_output_at = Arc::clone(&last_output_at);
+            let output_changed = Arc::clone(&output_changed);
             let clock = Arc::clone(&clock);
             std::thread::spawn(move || {
                 while output.recv().is_ok() {
                     if let Ok(mut at) = last_output_at.lock() {
                         *at = clock.now();
                     }
+                    if let Ok(mut generation) = output_changed.0.lock() {
+                        *generation = (*generation).wrapping_add(1);
+                        output_changed.1.notify_all();
+                    }
                 }
+                // EOF means the child exited or its output stream was closed.
+                // Wake Sync waiters so they can observe the final screen now.
+                Self::notify_output_changed(&output_changed);
             });
         }
         Self {
@@ -118,6 +130,7 @@ impl Session {
             clock,
             last_input_at: Mutex::new(started),
             last_output_at,
+            output_changed,
             instance_id,
             last_human_input_at: Mutex::new(None),
             attached: AtomicBool::new(false),
@@ -167,6 +180,9 @@ impl Session {
             .lock()
             .map_err(|_| AgentError::Io("session size lock poisoned".into()))?;
         *current = size;
+        drop(current);
+        drop(agent);
+        Self::notify_output_changed(&self.output_changed);
         Ok(())
     }
 
@@ -365,13 +381,69 @@ impl Session {
         Ok(snapshot)
     }
 
+    /// Wait for a screen version newer than `since`, or return the current
+    /// atomic frame when the deadline expires. The condition lock is released
+    /// by `wait_timeout`; the agent/screen lock is held only for each snapshot.
+    pub fn wait_for_output_after(
+        &self,
+        since: u64,
+        timeout: Duration,
+    ) -> Result<VersionedSnapshot> {
+        let deadline = self.clock.now().saturating_add(timeout);
+        let (generation, wake) = &*self.output_changed;
+        let mut guard = generation
+            .lock()
+            .map_err(|_| AgentError::Io("output wait lock poisoned".into()))?;
+        loop {
+            let observed = *guard;
+            let snapshot = self.screen_snapshot_version_at(0)?;
+            if snapshot.output_version.unwrap_or(0) > since {
+                return Ok(snapshot);
+            }
+            // Drop the wait lock while checking process liveness. A process
+            // exit is also signalled by the registry reaper and terminate().
+            drop(guard);
+            if !self.is_alive() {
+                return Err(AgentError::Exited);
+            }
+            guard = generation
+                .lock()
+                .map_err(|_| AgentError::Io("output wait lock poisoned".into()))?;
+            if *guard != observed {
+                continue;
+            }
+            let remaining = deadline.saturating_sub(self.clock.now());
+            if remaining.is_zero() {
+                return Ok(snapshot);
+            }
+            let (next_guard, result) = wake
+                .wait_timeout_while(guard, remaining, |current| *current == observed)
+                .map_err(|_| AgentError::Io("output wait lock poisoned".into()))?;
+            guard = next_guard;
+            if result.timed_out() {
+                return self.screen_snapshot_version_at(0);
+            }
+        }
+    }
+
     pub fn is_alive(&self) -> bool {
-        match self.agent.lock() {
+        let alive = match self.agent.lock() {
             Ok(mut agent) => agent.is_alive(),
             // A poisoned lock means a writer panicked mid-session. Reporting
             // "alive" would invite more writes into a session whose state is
             // unknown.
             Err(_) => false,
+        };
+        if !alive {
+            Self::notify_output_changed(&self.output_changed);
+        }
+        alive
+    }
+
+    fn notify_output_changed(output_changed: &Arc<(Mutex<u64>, Condvar)>) {
+        if let Ok(mut generation) = output_changed.0.lock() {
+            *generation = (*generation).wrapping_add(1);
+            output_changed.1.notify_all();
         }
     }
 
@@ -385,6 +457,14 @@ impl Session {
     /// already-dead agent. Does not remove the session from a registry — the
     /// last screen survives; [`crate::Registry::close`] does both.
     pub fn terminate(&self) -> Result<()> {
+        self.terminate_inner(true)
+    }
+
+    pub(crate) fn terminate_for_close(&self) -> Result<()> {
+        self.terminate_inner(false)
+    }
+
+    fn terminate_inner(&self, wake_waiters: bool) -> Result<()> {
         if self.attached.load(Ordering::SeqCst) {
             return Err(AgentError::Attached);
         }
@@ -392,7 +472,16 @@ impl Session {
             .agent
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-        agent.terminate()
+        let result = agent.terminate();
+        drop(agent);
+        if result.is_ok() && wake_waiters {
+            Self::notify_output_changed(&self.output_changed);
+        }
+        result
+    }
+
+    pub(crate) fn wake_sync_waiters(&self) {
+        Self::notify_output_changed(&self.output_changed);
     }
 
     /// Take hold for a human at a terminal, displacing any current holder.

@@ -286,6 +286,13 @@ impl Registry {
     /// `Ok(false)`: a concurrent `reap` removed it first and owns the notice.
     pub fn close(&self, name: &str) -> Option<Result<bool>> {
         let session = self.get(name)?;
-        Some(session.terminate().map(|()| self.remove(name).is_some()))
+        Some(match session.terminate_for_close() {
+            Ok(()) => {
+                let removed = self.remove(name).is_some();
+                session.wake_sync_waiters();
+                Ok(removed)
+            }
+            Err(error) => Err(error),
+        })
     }
 }
