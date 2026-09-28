@@ -818,6 +818,15 @@ register("contributions", "A point's entries as {id, owner, entry} rows, entry a
 -- before replacing the mod's hook group and tools.
 local modules = {}
 
+local function stop_module_activation(name, module)
+  if not module or not module.stop or module.stopped then return end
+  module.stopped = true
+  local ok, err = pcall(module.stop, module.state)
+  if not ok then
+    io.stderr:write("remuda module stop error for " .. name .. ": " .. tostring(err) .. "\n")
+  end
+end
+
 -- #145: a lifecycle mod sees `remuda` through a proxy, so its assignments
 -- come here. It may create new top-level fields, which it then owns; core's
 -- (named in `core_fields` once this file has loaded) and another mod's are
@@ -1030,12 +1039,7 @@ function remuda._activate_module(name, candidate, reactivate)
   -- Stop the previous activation while it still owns its registrations and
   -- before the replacement's start can run. A cleanup error is diagnostic,
   -- not a reason to prevent reload.
-  if previous and previous.stop then
-    local ok, err = pcall(with_owner, name, previous.stop, previous.state)
-    if not ok then
-      io.stderr:write("remuda module stop error for " .. name .. ": " .. tostring(err) .. "\n")
-    end
-  end
+  stop_module_activation(name, previous)
 
   -- Snapshot what this activation replaces, so a failing `start` can put the
   -- previous activation back (#129). State mutated by that `start` stays.
@@ -1148,9 +1152,22 @@ function remuda._activate_module(name, candidate, reactivate)
   local stop = candidate.stop and function(stopped_state)
     return with_owner(name, candidate.stop, stopped_state)
   end
-  modules[name] = { version = version, state = state, tools = tool_names, schedules = schedule_handles, stop = stop }
+  local start = candidate.start and function(started_state)
+    return with_owner(name, candidate.start, started_state)
+  end
+  local activation = {
+    version = version,
+    state = state,
+    tools = tool_names,
+    schedules = schedule_handles,
+    stop = stop,
+    start = start,
+    stopped = false,
+  }
+  modules[name] = activation
 
   local function rollback()
+    stop_module_activation(name, activation)
     for event, registered in pairs(remuda.hooks) do
       local restored = saved_hooks[event] or {}
       local known = {}
@@ -1202,9 +1219,45 @@ function remuda._activate_module(name, candidate, reactivate)
       contributions[point] = restored
     end
     modules[name] = previous
-  end
-  local start = candidate.start and function(started_state)
-    return with_owner(name, candidate.start, started_state)
+    if previous and previous.stopped and previous.start then
+      local was_active = remuda._lifecycle_start_active
+      remuda._lifecycle_start_active = true
+      local ok, err = pcall(previous.start, previous.state)
+      remuda._lifecycle_start_active = was_active
+      if ok then
+        previous.stopped = false
+      else
+        io.stderr:write("remuda module restart error for " .. name .. ": " .. tostring(err) .. "\n")
+        for event, registered in pairs(remuda.hooks) do
+          local kept = {}
+          for _, hook in ipairs(registered) do
+            if not owned(hook) then kept[#kept + 1] = hook end
+          end
+          remuda.hooks[event] = kept
+        end
+        for _, tool_name in ipairs(previous.tools) do
+          if module_tool_owners[tool_name] == name then
+            remuda.tools[tool_name], remuda._registry[tool_name], module_tool_owners[tool_name] = nil, nil, nil
+          end
+        end
+        for _, handle in ipairs(previous.schedules) do remuda.cancel(handle) end
+        for command, owner in pairs(extension_command_owners) do
+          if owner == name then
+            remuda._extension_commands[command], extension_command_owners[command] = nil, nil
+          end
+        end
+        for key, owner in pairs(field_owners) do
+          if owner == name then remuda[key], field_owners[key] = nil, nil end
+        end
+        drop_owned_advice(name)
+        for _, items in pairs(contributions) do
+          for id, item in pairs(items) do
+            if item.owner == name then items[id] = nil end
+          end
+        end
+        modules[name] = nil
+      end
+    end
   end
   return true, state, start, rollback
 end
@@ -1216,12 +1269,7 @@ function remuda._stop_modules()
   for name, module in pairs(modules) do active[#active + 1] = { name, module } end
   for _, pair in ipairs(active) do
     local name, module = pair[1], pair[2]
-    if module.stop then
-      local ok, err = pcall(module.stop, module.state)
-      if not ok then
-        io.stderr:write("remuda module stop error for " .. name .. ": " .. tostring(err) .. "\n")
-      end
-    end
+    stop_module_activation(name, module)
   end
 end
 
