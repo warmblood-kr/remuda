@@ -93,6 +93,23 @@ fn capture(path: &Path, name: &str) -> String {
     }
 }
 
+fn capture_styled(path: &Path, name: &str, scrollback: usize) -> String {
+    match client::request(
+        path,
+        &Request::CaptureStyled {
+            name: name.to_string(),
+            scrollback,
+        },
+    ) {
+        Ok(Response::StyledScreen { rows, .. }) => rows
+            .into_iter()
+            .flat_map(|row| row.into_iter().map(|run| run.text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => panic!("styled capture failed: {other:?}"),
+    }
+}
+
 fn wait_for(path: &Path, name: &str, needle: &str) -> String {
     let deadline = Instant::now() + PATIENCE;
     loop {
@@ -619,6 +636,229 @@ fn session_listing_reports_the_child_mouse_tracking_mode() {
     .expect("enable mouse tracking");
     wait_for(&path, "target", "ready-mode");
     assert!(listed().mouse_tracking);
+}
+
+#[test]
+fn direct_attach_mouse_scrolls_the_full_history_and_returns_to_live_output() {
+    let dir = scratch_dir("attach-mouse-scroll");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "i=0; while [ $i -lt 10000 ]; do printf 'history-%05d\\n' \"$i\"; i=$((i+1)); done; printf 'history-end\\n'".into(),
+        },
+    )
+    .expect("write retained history");
+    // `history-end` appears in the echoed shell command before execution; wait
+    // for a generated row that is not present in the command text.
+    wait_for(&path, "target", "history-09999");
+    wait_for(&path, "target", "history-end");
+    let oldest = capture_styled(&path, "target", 10_000);
+    assert!(
+        oldest.contains("history-00014"),
+        "the 10,000-row capture should reach old output; capture tail: {}",
+        &oldest[oldest.len().saturating_sub(500)..]
+    );
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach().expect("attach viewer");
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "history-end");
+
+    held.write_raw(b"\x1b[<64;10;10M").expect("wheel up");
+    let near_history = collect_until_bytes(&output, b"[scrollback: 3 rows");
+    assert!(near_history
+        .windows(b"history-end".len())
+        .any(|w| w == b"history-end"));
+
+    held.write_raw(b"\x1b[<65;10;10M")
+        .expect("wheel down to live");
+    collect_until_bytes(&output, b"history-end");
+
+    held.write_raw(b"\x1b[5~")
+        .expect("PageUp enters scrollback");
+    collect_until_bytes(&output, b"[scrollback: 24 rows");
+    held.write_raw(b"\x1b[6~")
+        .expect("PageDown returns to live");
+    collect_until_bytes(&output, b"history-end");
+
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "printf 'resume-%s\\n' $((17*23))".into(),
+        },
+    )
+    .expect("write after scroll mode");
+    wait_for(&path, "target", "resume-391");
+    let resumed = collect_until_bytes(&output, b"resume-391");
+    assert!(
+        resumed
+            .windows(b"resume-391".len())
+            .filter(|w| *w == b"resume-391")
+            .count()
+            == 1,
+        "live output should resume exactly once after the historical repaint"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
+    use remuda_core::agent::{MouseEncoding, MouseMode, MouseState};
+
+    let dir = scratch_dir("attach-mouse-forward");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006h'; dd bs=1 count=12 2>/dev/null | od -An -tx1; printf '\\nmouse-forwarded\\n'";
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec!["sh".into(), "-c".into(), script.into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start mouse-reporting child");
+    assert_eq!(created, Response::Value("target".into()));
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match client::request(
+            &path,
+            &Request::MouseState {
+                name: "target".into(),
+            },
+        ) {
+            Ok(Response::MouseState(MouseState {
+                mode: MouseMode::PressRelease,
+                encoding: MouseEncoding::Sgr,
+            })) => break,
+            other => {
+                assert!(
+                    Instant::now() < deadline,
+                    "child mouse mode not observed: {other:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach().expect("attach viewer");
+    let output = held.subscribe().expect("capture viewer output");
+    held.write_raw(b"\x1b[<64;10;10M")
+        .expect("deliver host wheel report");
+    wait_for(&path, "target", "mouse-forwarded");
+    let screen = capture(&path, "target").replace([' ', '\n'], "");
+    assert!(
+        screen.contains("1b5b3c36343b31303b31304d"),
+        "child did not receive the SGR mouse report: {screen}"
+    );
+
+    held.write_raw(&[client::DETACH]).expect("detach");
+    drop(held);
+    let _ = collect_until_bytes(
+        &output,
+        b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mouse_off_knob_and_toggle_pass_reports_to_the_child_and_restore_host_modes() {
+    let dir = scratch_dir("attach-mouse-toggle");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let script = "stty raw -echo; printf 'child-ready\\n'; cat";
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec!["sh".into(), "-c".into(), script.into()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start raw child");
+    assert_eq!(created, Response::Value("target".into()));
+    wait_for(&path, "target", "child-ready");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target", "--mouse=false"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach().expect("attach viewer");
+    let output = held.subscribe().expect("capture viewer output");
+    let initial = collect_until_bytes(&output, b"\x1b[?25");
+    assert!(!initial
+        .windows(b"\x1b[?1000h".len())
+        .any(|w| w == b"\x1b[?1000h"));
+    assert!(!initial
+        .windows(b"\x1b[?1006h".len())
+        .any(|w| w == b"\x1b[?1006h"));
+
+    let wheel = b"\x1b[<64;10;10M";
+    held.write_raw(wheel)
+        .expect("wheel reaches child while disabled");
+    let received = collect_until_bytes(&output, wheel);
+    assert!(received.windows(wheel.len()).any(|w| w == wheel));
+
+    held.write_raw(&[0x1d]).expect("Ctrl-] enables host mouse");
+    let enabled = collect_until_bytes(&output, b"\x1b[?1000h\x1b[?1006h");
+    assert!(
+        !enabled.contains(&0x1d),
+        "toggle key must not reach the child"
+    );
+    held.write_raw(&[0x1d]).expect("Ctrl-] disables host mouse");
+    let disabled = collect_until_bytes(&output, b"\x1b[?1000l\x1b[?1006l");
+    assert!(
+        !disabled.contains(&0x1d),
+        "toggle key must not reach the child"
+    );
+
+    held.write_raw(wheel)
+        .expect("wheel reaches child after toggle off");
+    let received = collect_until_bytes(&output, wheel);
+    assert!(received.windows(wheel.len()).any(|w| w == wheel));
+
+    held.write_raw(&[client::DETACH]).expect("detach");
+    drop(held);
+    let restored = collect_until_bytes(
+        &output,
+        b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
+    );
+    assert!(restored
+        .windows(b"\x1b[?1000l".len())
+        .any(|w| w == b"\x1b[?1000l"));
+    assert!(restored
+        .windows(b"\x1b[?1006l".len())
+        .any(|w| w == b"\x1b[?1006l"));
 }
 
 #[test]
