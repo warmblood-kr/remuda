@@ -1353,7 +1353,7 @@ setmetatable(remuda.session, {
   __call = function(_, name) return session_handle(name) end,
 })
 register("session", "Callable namespace for session handles and session operations.",
-  "session(name) -> handle; session.list/new/close/attach(...)")
+  "table")
 register("session.list", "List every session in the registry.", "session.list() -> {session...}")
 register("session.new", "Start a session, defaulting the command to the user's shell.",
   "session.new(name?, argv?, cwd?, env?) -> string")

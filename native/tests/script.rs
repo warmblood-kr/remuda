@@ -3,8 +3,12 @@
 use remuda_core::protocol::{Request, Response};
 use remuda_native::{client, daemon, script};
 use serde_json::Value;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+#[path = "daemon_support/spawn.rs"]
+mod spawn;
 
 const PATIENCE: Duration = Duration::from_secs(10);
 
@@ -21,27 +25,42 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 /// Start a daemon and return once it actually answers, not once it was spawned.
-fn daemon_at(path: &Path) -> impl Drop {
-    // Deprecated flat API aliases are exercised by frozen compatibility
-    // fixtures; their notices are runtime behavior, not test output.
-    std::env::set_var("REMUDA_SUPPRESS_DEPRECATIONS", "1");
-    let serving = path.to_path_buf();
-    std::thread::spawn(move || {
-        let _ = daemon::serve(&serving);
-    });
-    let deadline = Instant::now() + PATIENCE;
-    while remuda_native::ipc::connect(path).is_err() {
-        assert!(Instant::now() < deadline, "daemon never bound {path:?}");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    Cleanup(path.to_path_buf())
+fn daemon_at(path: &Path, dir: &Path) -> spawn::Daemon {
+    debug_assert_eq!(path, daemon::socket_path_in(dir, "s"));
+    let mut command = spawn::base_command(dir);
+    command.env("REMUDA_SUPPRESS_DEPRECATIONS", "1");
+    spawn::spawn_and_wait(command, dir)
 }
 
-struct Cleanup(PathBuf);
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+#[test]
+fn deprecated_flat_session_alias_warns_once_per_process() {
+    let dir = scratch("deprecation-once");
+    let path = daemon::socket_path_in(&dir, "s");
+    let mut command = spawn::base_command(&dir);
+    command
+        .env_remove("REMUDA_SUPPRESS_DEPRECATIONS")
+        .stderr(std::process::Stdio::piped());
+    let mut daemon = spawn::spawn_and_wait(command, &dir);
+
+    script::run_source(&path, "=deprecation-once", "remuda.ls(); remuda.ls()")
+        .expect("deprecated aliases should remain callable");
+    let _ = daemon.0.kill();
+    let _ = daemon.0.wait();
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .expect("stderr is piped")
+        .read_to_string(&mut stderr)
+        .expect("read daemon stderr");
+
+    let notice = "deprecated: remuda.ls; use remuda.session.list";
+    assert_eq!(
+        stderr.lines().filter(|line| *line == notice).count(),
+        1,
+        "expected one deprecation notice, got stderr: {stderr}"
+    );
 }
 
 fn write(dir: &Path, name: &str, source: &str) -> PathBuf {
@@ -92,7 +111,7 @@ fn daemon_request_counts_reflect_real_requests_seen_at_dispatch() {
     // the deltas below are exact, not approximate.
     let dir = scratch("request-counts");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let before = request_counts(&path); // itself one Eval
     client::request(&path, &Request::List).expect("list");
@@ -120,7 +139,7 @@ fn the_bound_surface_is_exactly_the_protocols() {
     // in BINDINGS but never bound fails too.
     let dir = scratch("surface");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let expected = script::BINDINGS.join(",");
     let source = format!(
@@ -163,7 +182,7 @@ fn the_bound_surface_is_exactly_the_protocols() {
 fn run_lua(tag: &str, source: &str) {
     let dir = scratch(tag);
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
     script::run(&path, &write(&dir, &format!("{tag}.lua"), source)).expect(tag);
 }
 
@@ -293,7 +312,7 @@ fn every_word_has_a_registry_entry() {
     // name) — the two categories the reference manual has to cover.
     let dir = scratch("registry-completeness");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let names = script::BINDINGS.join(",");
     let source = format!(
@@ -319,7 +338,7 @@ fn every_word_has_a_registry_entry() {
 fn registry_documentation_formats_are_live_and_structured() {
     let dir = scratch("registry-docs");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let eval = |code: &str| match client::request(
         &path,
@@ -363,7 +382,7 @@ fn every_frozen_api_version_still_runs() {
     // required now fails the build instead of someone's plugin.
     let dir = scratch("compat");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let api = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/api");
     let mut versions: Vec<PathBuf> = std::fs::read_dir(&api)
@@ -397,7 +416,7 @@ fn a_script_reacts_to_what_a_session_shows() {
     // that the echo happened.
     let dir = scratch("react");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let source = r#"
         remuda.new("driven", {"sh"})
@@ -448,7 +467,7 @@ fn a_refusal_stops_the_script_instead_of_being_returned() {
     // receives the marker.
     let dir = scratch("refusal");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let source = r#"
         remuda.new("witness", {"sh"})
@@ -479,7 +498,7 @@ fn remuda_new_can_set_cwd_and_env_on_the_launched_process() {
     // just echo back (PRINCIPLES.md §4): `command` runs immediately as argv.
     let dir = scratch("new-cwd-env");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let target = scratch("new-cwd-env-target");
     // Escaped, not interpolated raw: on Windows this path contains `\`, which
@@ -530,7 +549,7 @@ fn a_session_handle_is_not_a_buffer() {
     // second, since a buffer is inert text with no notion of "working".
     let dir = scratch("session-buffer");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let source = r#"
         remuda.new("driven", {"sh"})
@@ -557,7 +576,7 @@ fn a_session_handle_is_not_a_buffer() {
 fn is_busy_tracks_streaming_output_then_goes_idle() {
     let dir = scratch("busy-from-output");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let source = r#"
         remuda.new("streaming", {"sh", "-c", "i=0; while [ $i -lt 20 ]; do printf x; sleep 0.1; i=$((i + 1)); done; sleep 30"})
@@ -589,7 +608,7 @@ fn clearing_one_group_leaves_the_others_hooks_firing() {
     // same event.
     let dir = scratch("hooks");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let source = r#"
         remuda.fired_a, remuda.fired_b = 0, 0
@@ -620,7 +639,7 @@ fn clearing_one_group_leaves_the_others_hooks_firing() {
 fn capture_styled_marks_dim_spans_and_reports_the_cursor() {
     let dir = scratch("styled");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
     let code = r#"
         -- Wait on what the screen shows, never on timing: first the shell's
         -- prompt (so the command is not typed before sh reads), then the
