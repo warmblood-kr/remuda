@@ -990,6 +990,7 @@ fn wait_for_target_attach(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     // The binary derives its socket as $REMUDA_RUNTIME_DIR/remuda/default.sock,
     // so the daemon must listen exactly there. Pointing the test somewhere else

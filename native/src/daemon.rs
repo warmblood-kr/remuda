@@ -648,18 +648,7 @@ fn handle(
             name,
             instance_id,
             confirm,
-        } => {
-            let result = match (instance_id, confirm) {
-                (None, None) => close(registry, image, &name),
-                (Some(instance_id), Some(true)) => {
-                    close_instance(registry, image, &name, &instance_id)
-                }
-                _ => Some(Err(remuda_core::agent::AgentError::Io(
-                    "confirmed close requires an instance id and confirmation".into(),
-                ))),
-            };
-            respond(&stream, &name, result, |()| Response::Ok)
-        }
+        } => handle_close(&stream, registry, image, &name, instance_id, confirm),
 
         Request::ListDir { path: dir } => reply(&stream, &list_dir(&dir)),
         Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
@@ -675,6 +664,24 @@ fn handle(
             Err(e) => reply(&stream, &Response::error(e)),
         },
     }
+}
+
+fn handle_close(
+    stream: &Stream,
+    registry: &Registry,
+    image: &Image,
+    name: &str,
+    instance_id: Option<String>,
+    confirm: Option<bool>,
+) -> std::io::Result<()> {
+    let result = match (instance_id, confirm) {
+        (None, None) => close(registry, image, name),
+        (Some(instance_id), Some(true)) => close_instance(registry, image, name, &instance_id),
+        _ => Some(Err(remuda_core::agent::AgentError::Io(
+            "confirmed close requires an instance id and confirmation".into(),
+        ))),
+    };
+    respond(stream, name, result, |()| Response::Ok)
 }
 
 fn deferred_reply(

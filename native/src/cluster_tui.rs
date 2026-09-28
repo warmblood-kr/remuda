@@ -764,11 +764,7 @@ fn run_loop(path: &Path, node: &str, target: Option<&str>, clock: &dyn Clock) ->
                     None
                 }
             });
-        let body = if let Some(captured) = captured {
-            captured
-        } else {
-            String::new()
-        };
+        let body = captured.unwrap_or_default();
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         let frame = ui.render(cols, rows, &body, clock);
         crossterm::execute!(

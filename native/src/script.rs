@@ -442,26 +442,7 @@ pub fn bindings(
         })?,
     )?;
 
-    // End a session — live, or already self-exited (step 006). A dead session
-    // stays listed with its last screen intact until this is called; nothing
-    // reaps it on its own, on purpose (`steps/006-lifetime.md`).
-    let path = at();
-    table.set(
-        "close",
-        lua.create_function(move |lua, name: String| {
-            value(
-                lua,
-                ask(
-                    &path,
-                    Request::Close {
-                        name,
-                        instance_id: None,
-                        confirm: None,
-                    },
-                )?,
-            )
-        })?,
-    )?;
+    close_binding(lua, &table, at())?;
 
     exec_binding(lua, &table)?;
     function_source_binding(lua, &table)?;
@@ -481,6 +462,28 @@ pub fn bindings(
     sleep_binding(lua, &table)?;
 
     Ok(table)
+}
+
+fn close_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
+    // End a session — live, or already self-exited (step 006). A dead session
+    // stays listed with its last screen intact until this is called; nothing
+    // reaps it on its own, on purpose (`steps/006-lifetime.md`).
+    table.set(
+        "close",
+        lua.create_function(move |lua, name: String| {
+            value(
+                lua,
+                ask(
+                    &path,
+                    Request::Close {
+                        name,
+                        instance_id: None,
+                        confirm: None,
+                    },
+                )?,
+            )
+        })?,
+    )
 }
 
 fn sleep_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
