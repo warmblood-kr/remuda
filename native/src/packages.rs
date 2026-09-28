@@ -1326,7 +1326,11 @@ fn set_installed_directory_mode(path: &Path) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        fs::set_permissions(path, fs::Permissions::from_readonly(false)).map_err(|error| {
+        let mut permissions = fs::metadata(path)
+            .map_err(|error| format!("cannot inspect {}: {error}", path.display()))?
+            .permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(path, permissions).map_err(|error| {
             format!(
                 "cannot make installed directory writable {}: {error}",
                 path.display()
@@ -1382,10 +1386,14 @@ fn valid_package_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::{
-        cleanup_tree, copy_tree, create_dir_all_secure, parse_manifest, parse_repository,
-        remove_tree, resolve_mods_root, satisfies, stage_package_tree, test_path, update_all_with,
-        validate_reference, InstallReport, Manifest, MOD_LIFECYCLE_API,
+        cleanup_tree, copy_tree, create_dir_all_secure, remove_tree, resolve_mods_root,
+        stage_package_tree, test_path,
+    };
+    use super::{
+        parse_manifest, parse_repository, satisfies, update_all_with, validate_reference,
+        InstallReport, Manifest, MOD_LIFECYCLE_API,
     };
     use std::path::Path;
 
