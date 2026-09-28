@@ -68,6 +68,24 @@ fn validate_entry(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
             "registry fingerprint does not match public key",
         ));
     }
+    let valid_by = entry
+        .by
+        .strip_prefix("SHA256:")
+        .and_then(|encoded| {
+            encoding::decode_base64(encoded)
+                .ok()
+                .map(|decoded| (encoded, decoded))
+        })
+        .is_some_and(|(encoded, decoded)| {
+            decoded.len() == 32
+                && encoding::encode_base64(&decoded).trim_end_matches('=') == encoded
+        });
+    if !valid_by {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "registry by is not a valid SHA256 fingerprint",
+        ));
+    }
     Ok(public_key)
 }
 
@@ -185,8 +203,16 @@ mod tests {
             static_pubkey: encoding::encode_base64(&key),
             state,
             version,
-            by: by.into(),
+            by: origin(by),
         }
+    }
+
+    fn origin(label: &str) -> String {
+        let byte = label.as_bytes()[0];
+        format!(
+            "SHA256:{}",
+            encoding::encode_base64(&[byte; 32]).trim_end_matches('=')
+        )
     }
 
     #[test]
@@ -231,6 +257,38 @@ mod tests {
     }
 
     #[test]
+    fn load_rejects_control_characters_in_by_fingerprint() {
+        let dir = temp_dir();
+        let mut invalid = entry("fp-a", NodeState::Admitted, 1, "a");
+        invalid.by = format!("{}\x1b\n", invalid.by);
+        let bytes = serde_json::to_vec(&Registry {
+            authorized_nodes: vec![invalid],
+        })
+        .unwrap();
+        storage::atomic_write(&dir.join(REGISTRY_FILE), &bytes).unwrap();
+        assert_eq!(
+            load_registry_at(&dir).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn merge_rejects_malformed_by_fingerprint() {
+        let mut invalid = entry("fp-a", NodeState::Admitted, 1, "a");
+        invalid.by = "SHA256:not a fingerprint".into();
+        let mut registry = Registry::default();
+        assert_eq!(
+            registry
+                .merge(&Registry {
+                    authorized_nodes: vec![invalid],
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn load_rejects_registry_with_loose_permissions() {
         let dir = temp_dir();
         storage::atomic_write(&dir.join(REGISTRY_FILE), b"{}").unwrap();
@@ -254,7 +312,7 @@ mod tests {
             static_pubkey: encoding::encode_base64(&short_key),
             state: NodeState::Admitted,
             version: 1,
-            by: "node".into(),
+            by: origin("node"),
         };
         let mut registry = Registry::default();
         assert_eq!(
@@ -347,7 +405,7 @@ mod tests {
                 authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 3, "z")],
             })
             .unwrap();
-        assert_eq!(registry.authorized_nodes[0].by, "z");
+        assert_eq!(registry.authorized_nodes[0].by, origin("z"));
     }
 
     #[test]
