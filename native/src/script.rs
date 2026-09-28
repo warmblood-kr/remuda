@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 74] = [
+pub const BINDINGS: [&str; 75] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -77,6 +77,7 @@ pub const BINDINGS: [&str; 74] = [
     "hooks",
     "http",
     "insert",
+    "json",
     "key",
     "kill",
     "list_dir",
@@ -142,6 +143,36 @@ const WORDS: &[(&str, &str, &str)] = &[
         "insert",
         "Insert raw bytes into a session with nothing appended.",
         "insert(name, text) -> nil",
+    ),
+    (
+        "json",
+        "Bounded JSON conversion for Lua values and UTF-8 JSON text.",
+        "table",
+    ),
+    (
+        "json.decode",
+        "Decode strict UTF-8 JSON; repeated object keys and over-limit input return nil, error.",
+        "json.decode(text) -> value, nil | nil, error",
+    ),
+    (
+        "json.encode",
+        "Encode a Lua value as bounded JSON; unsupported values raise a clear error.",
+        "json.encode(value, options?) -> string",
+    ),
+    (
+        "json.null",
+        "The sentinel that represents JSON null in Lua tables.",
+        "value",
+    ),
+    (
+        "json.array",
+        "Tag a dense Lua table as a JSON array, including an empty table.",
+        "json.array(table) -> table",
+    ),
+    (
+        "json.object",
+        "Tag a string-keyed Lua table as a JSON object, including an empty table.",
+        "json.object(table) -> table",
     ),
     (
         "key",
@@ -278,6 +309,7 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
         row.set("signature", *signature)?;
         registry.set(*name, row)?;
     }
+    table.set("json", crate::json::bindings(lua)?)?;
     table.set("_registry", registry)
 }
 

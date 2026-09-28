@@ -19,7 +19,7 @@
 //! transport. Adding those here would put a socket in the policy layer, which
 //! `core/clippy.toml` denies outright.
 
-use crate::agent::{Cursor, Result, ScreenSnapshot, Size, StyledCell};
+use crate::agent::{Cursor, ExitInfo, Result, ScreenSnapshot, Size, StyledCell};
 use crate::input::{InputBatch, InputError, InputOutcome};
 use crate::protocol::Step;
 use crate::session::Session;
@@ -191,16 +191,37 @@ impl Registry {
 
     /// Drop every session whose process has exited, returning their names.
     pub fn reap(&self) -> Vec<String> {
+        self.reap_with_exit_info()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect()
+    }
+
+    /// Drop exited sessions and retain any status their backend observed.
+    pub fn reap_with_exit_info(&self) -> Vec<(String, &'static str, Option<ExitInfo>)> {
         let mut sessions = self.lock();
-        let dead: Vec<String> = sessions
+        let dead: Vec<_> = sessions
             .iter()
             .filter(|(_, s)| !s.is_alive())
-            .map(|(n, _)| n.clone())
+            .map(|(name, session)| {
+                (
+                    name.clone(),
+                    if session.is_closing() {
+                        "closed"
+                    } else {
+                        "exited"
+                    },
+                    Arc::clone(session),
+                )
+            })
             .collect();
-        for name in &dead {
+        for (name, _, _) in &dead {
             sessions.remove(name);
         }
-        dead
+        drop(sessions);
+        dead.into_iter()
+            .map(|(name, reason, session)| (name, reason, session.exit_info()))
+            .collect()
     }
 
     /// A panic under this lock cannot leave the map half-updated — an entry is
@@ -285,7 +306,16 @@ impl Registry {
     /// End and stop tracking a session; an attached one refuses and stays.
     /// `Ok(false)`: a concurrent `reap` removed it first and owns the notice.
     pub fn close(&self, name: &str) -> Option<Result<bool>> {
-        let session = self.get(name)?;
-        Some(session.terminate().map(|()| self.remove(name).is_some()))
+        let session = {
+            let sessions = self.lock();
+            let session = Arc::clone(sessions.get(name)?);
+            session.mark_closing();
+            session
+        };
+        if let Err(error) = session.terminate() {
+            session.clear_closing();
+            return Some(Err(error));
+        }
+        Some(Ok(self.remove(name).is_some()))
     }
 }
