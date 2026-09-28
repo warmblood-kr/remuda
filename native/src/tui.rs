@@ -187,9 +187,8 @@ impl Ui {
         }
         let (list_w, preview_w) = ui_layout(self, cols);
         let body = rows.saturating_sub(1);
-        // crossterm's column/row are 0-based; the frame's own rows are
-        // 1-based (row 1 is the header, row `body+1` is the footer — see
-        // `render`/`render_styled`), so both get +1 before comparing.
+        // crossterm's column/row are 0-based; frame rows are 1-based, so both
+        // get +1 before comparing.
         let col = event.column + 1;
         let row = event.row + 1;
 
@@ -320,10 +319,10 @@ impl Ui {
         if !matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
             return Action::Nothing;
         }
-        if row < 2 || row > body {
+        if row < 1 || row > body {
             return Action::Nothing;
         }
-        let index = ((row - 2) as usize / self.session_rows) + list_viewport(self, body);
+        let index = ((row - 1) as usize / self.session_rows) + list_viewport(self, body);
         if index >= self.sessions.len() {
             return Action::Nothing;
         }
@@ -1151,19 +1150,13 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
     let mut out = String::from("\x1b[H\x1b[2J");
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H", row + 1));
-        // The left column has a header; the preview deliberately has none, so
-        // its first row is the session's own first row — the same thing a ride
-        // shows, at the same place on the screen.
+        // Start list rows at the top now that the pane header moved to the footer.
         if ui.list_visible {
-            let left = if row == 0 {
-                format!("remuda · {server}")
-            } else {
-                list_row(
-                    ui,
-                    row as usize - 1 + list_viewport(ui, body) * ui.session_rows,
-                    list_w,
-                )
-            };
+            let left = list_row(
+                ui,
+                row as usize + list_viewport(ui, body) * ui.session_rows,
+                list_w,
+            );
             out.push_str(&fit(&left, list_w));
         }
         out.push_str(divider);
@@ -1172,7 +1165,7 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
     }
 
     out.push_str(&format!("\x1b[{};1H", rows));
-    out.push_str(&fit(&footer(ui, cut, preview_w), cols));
+    out.push_str(&footer(ui, server, cut, preview_w, cols));
     out
 }
 
@@ -1349,8 +1342,8 @@ fn locate_cursor(
     let viewport = Viewport::bottom_anchored(cells.len(), pan, preview_w, body);
     let (panel_row, panel_col) =
         viewport.map_cursor(cells, cursor.row as usize, cursor.col as usize)?;
-    // +1 for the header row above row 0 of the pane; list_w + divider + 1 for
-    // the preview pane's own left edge; both again for 1-based addressing.
+    // Convert pane-local coordinates to 1-based terminal coordinates, adding
+    // the list and divider widths when the preview shares the screen.
     Some((
         panel_row + 1,
         if list_w == 0 {
@@ -1392,15 +1385,11 @@ pub fn render_styled(
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H\x1b[K", row + 1));
         if ui.list_visible {
-            let left = if row == 0 {
-                format!("remuda · {server}")
-            } else {
-                list_row(
-                    ui,
-                    row as usize - 1 + list_viewport(ui, body) * ui.session_rows,
-                    list_w,
-                )
-            };
+            let left = list_row(
+                ui,
+                row as usize + list_viewport(ui, body) * ui.session_rows,
+                list_w,
+            );
             out.push_str(&fit(&left, list_w));
         }
         out.push_str(divider);
@@ -1409,7 +1398,7 @@ pub fn render_styled(
     }
 
     out.push_str(&format!("\x1b[{};1H\x1b[K", rows));
-    out.push_str(&fit(&footer(ui, cut, preview_w), cols));
+    out.push_str(&footer(ui, server, cut, preview_w, cols));
     // Erase anything a previous, taller frame left below this one — a resize
     // to fewer rows is the only way stale content can survive past here. Must
     // happen BEFORE the caret move below, or `\x1b[J` erases from the caret's
@@ -1479,7 +1468,7 @@ fn widest(ui: &Ui) -> u16 {
 /// The first session shown in the list, based on Lua's rows-per-session
 /// contract rather than a native presentation policy.
 fn list_viewport(ui: &Ui, body: u16) -> usize {
-    let visible = body.saturating_sub(1) as usize / ui.session_rows;
+    let visible = body as usize / ui.session_rows;
     if visible == 0 {
         return 0;
     }
@@ -1556,8 +1545,8 @@ fn fit_session_row(content: &str, width: u16) -> String {
 /// The crop notice moved here when the preview lost its title band: a crop that
 /// reads as absence is the failure this repo keeps re-discovering, and the
 /// footer is the only band left that is not the session's own screen.
-fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
-    match &ui.mode {
+fn footer(ui: &Ui, server: &str, cut: bool, preview_w: u16, cols: u16) -> String {
+    let status = match &ui.mode {
         Mode::Prompt(buffer) => format!("start: {buffer}▏   ⏎ run · esc cancel"),
         Mode::Confirm(name) => format!("kill {name}? it is running — y / n"),
         // Focus is named in words as well as drawn, because the one thing a
@@ -1565,7 +1554,11 @@ fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
         Mode::Browse if ui.focus == Focus::Session => format!(
             "▶ {} — every key goes to the session{}   ctrl-\\ back to the list",
             ui.selected().map_or("", |s| s.name.as_str()),
-            if cut { format!("   showing {preview_w} cols") } else { String::new() },
+            if cut {
+                format!("   showing {preview_w} cols")
+            } else {
+                String::new()
+            },
         ),
         Mode::Browse if ui.visual => {
             if ui.anchored() {
@@ -1577,11 +1570,21 @@ fn footer(ui: &Ui, cut: bool, preview_w: u16) -> String {
         Mode::Browse => match &ui.notice {
             Some(notice) => format!("remuda: {notice}"),
             None if ui.sessions.is_empty() => "n new   q quit".into(),
-            None if cut => format!(
-                "↑↓/jk select   ⏎ enter   n new   x kill   l list   showing {preview_w} cols   q quit"
-            ),
+            None if cut => format!("↑↓/jk ⏎ enter n new l list q quit · showing {preview_w}"),
             None => "↑↓/jk select   ⏎ enter   n new   x kill   l list   q quit".into(),
         },
+    };
+    let brand = format!("remuda · {server} 🏇");
+    let status_width = visible_width(&status);
+    let brand_width = visible_width(&brand);
+    if status_width + 3 + brand_width <= cols as usize {
+        format!(
+            "{status}{}{}",
+            " ".repeat(cols as usize - status_width - brand_width),
+            brand
+        )
+    } else {
+        fit(&status, cols)
     }
 }
 
