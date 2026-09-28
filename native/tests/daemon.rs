@@ -14,9 +14,10 @@
 use remuda_core::protocol::{Request, Response};
 use remuda_core::{Session, Size};
 use remuda_native::{client, daemon, ipc, CommandBuilder, PtyAgent, SystemClock};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -24,6 +25,39 @@ const PATIENCE: Duration = Duration::from_secs(10);
 #[path = "daemon_support/spawn.rs"]
 mod spawn;
 use spawn::Daemon;
+#[cfg(windows)]
+#[path = "daemon_support/conpty.rs"]
+mod conpty;
+
+#[cfg(windows)]
+struct AttachedInputWriter<'a, 'session>(&'a remuda_core::session::Attached<'session>);
+
+#[cfg(windows)]
+impl std::io::Write for AttachedInputWriter<'_, '_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .write_raw(bytes)
+            .map(|()| bytes.len())
+            .map_err(|_| std::io::Error::other("ConPTY input write failed"))
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn answer_pending_conpty_queries(
+    receiver: &Receiver<Vec<u8>>,
+    writer: &mut impl std::io::Write,
+    pending: &mut Vec<u8>,
+    captured: &mut Vec<u8>,
+) {
+    for chunk in receiver.try_iter() {
+        conpty::answer_conpty_cursor_queries(writer, pending, &chunk);
+        captured.extend_from_slice(&chunk);
+    }
+}
 
 /// A runtime directory of our own. Short enough for `sun_path` (~108 bytes) —
 /// a long path fails at bind with a message no caller would guess from a
@@ -44,7 +78,9 @@ fn scratch(tag: &str) -> PathBuf {
 fn daemon_at(path: &Path) -> impl Drop {
     let serving = path.to_path_buf();
     std::thread::spawn(move || {
-        let _ = daemon::serve(&serving);
+        if let Err(error) = daemon::serve(&serving) {
+            eprintln!("test daemon failed at {serving:?}: {error}");
+        }
     });
 
     let deadline = Instant::now() + PATIENCE;
@@ -175,6 +211,60 @@ fn new_session(path: &Path, name: &str) {
         Response::Value(name.to_string()),
         "New answers with the name it gave the session"
     );
+}
+
+/// Connect using the original attach wire shape and leave the connection in
+/// raw mode. Reading the acknowledgement one byte at a time keeps any initial
+/// screen bytes in the socket for the caller.
+fn raw_attach(path: &Path, name: &str) -> ipc::Stream {
+    let mut stream = ipc::connect(path).expect("connect attach client");
+    let mut request = serde_json::to_vec(&Request::Attach {
+        name: name.to_string(),
+    })
+    .expect("serialize Attach");
+    request.push(b'\n');
+    stream.write_all(&request).expect("send Attach");
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read(&mut byte).expect("read Attach response") == 1 {
+        response.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    assert_eq!(
+        serde_json::from_slice::<Response>(&response).expect("parse Attach response"),
+        Response::Ok
+    );
+    stream
+}
+
+fn raw_attach_tracked(path: &Path, name: &str) -> (ipc::Stream, u64) {
+    let mut stream = ipc::connect(path).expect("connect tracked attach client");
+    let mut request = serde_json::to_vec(&Request::AttachTracked {
+        name: name.to_string(),
+    })
+    .expect("serialize tracked Attach");
+    request.push(b'\n');
+    stream.write_all(&request).expect("send tracked Attach");
+    let mut response = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream
+        .read(&mut byte)
+        .expect("read tracked Attach response")
+        == 1
+    {
+        response.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    let Response::AttachStarted { generation } =
+        serde_json::from_slice(&response).expect("parse tracked Attach response")
+    else {
+        panic!("unexpected tracked attach response: {response:?}");
+    };
+    (stream, generation)
 }
 
 fn capture(path: &Path, name: &str) -> String {
@@ -581,6 +671,47 @@ fn target_row(path: &Path, expr: &str) -> String {
     }
 }
 
+fn wait_for_target_attach(
+    path: &Path,
+    child: &mut dyn portable_pty::Child,
+    captured_output: &Mutex<Vec<u8>>,
+) {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let response = client::request(path, &Request::List)
+            .unwrap_or_else(|error| Response::error(format!("List request failed: {error}")));
+        let attached = matches!(
+            &response,
+            Response::Sessions(sessions)
+                if sessions.iter().any(|session| session.name == "target" && session.attached)
+        );
+        if attached {
+            return;
+        }
+        if let Some(status) = child.try_wait().expect("poll client A before takeover") {
+            let output = captured_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            panic!(
+                "client A exited before attaching ({status:?}); last List response: {response:?}; client A output: {:?}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        if Instant::now() >= deadline {
+            let captured = captured_output
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let output = String::from_utf8_lossy(&captured).into_owned();
+            drop(captured);
+            let _ = child.kill();
+            panic!(
+                "client A never attached; last List response: {response:?}; client A output: {output:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     // The binary derives its socket as $REMUDA_RUNTIME_DIR/remuda/default.sock,
@@ -617,7 +748,7 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach().expect("drive the viewer");
+    let held = viewer.attach();
     let viewer_output = held.subscribe().expect("capture raw terminal output");
 
     // 1. Repaint: what was already there arrives without the program redrawing.
@@ -707,6 +838,7 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn any_key_after_attached_session_exit_restores_the_terminal() {
     let dir = scratch_dir("attach-exit-any-key");
     let path = daemon::socket_path_in(&dir, "default");
@@ -756,10 +888,23 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach().expect("attach viewer");
+    let held = viewer.attach();
     let viewer_output = held.subscribe().expect("capture viewer output");
+    #[cfg(windows)]
+    let mut conpty_pending = Vec::new();
+    #[cfg(windows)]
+    let mut terminal_output = Vec::new();
+    #[cfg(windows)]
+    let mut terminal_writer = AttachedInputWriter(&held);
     let deadline = Instant::now() + PATIENCE;
     loop {
+        #[cfg(windows)]
+        answer_pending_conpty_queries(
+            &viewer_output,
+            &mut terminal_writer,
+            &mut conpty_pending,
+            &mut terminal_output,
+        );
         let response = client::request(&path, &Request::List).expect("list after target exit");
         let target_present = match response {
             Response::Sessions(sessions) => sessions.iter().any(|s| s.name == "target"),
@@ -782,8 +927,18 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
     held.write_raw(b"k").expect("release attach with any key");
     let deadline = Instant::now() + PATIENCE;
     while viewer.is_alive() {
+        #[cfg(windows)]
+        answer_pending_conpty_queries(
+            &viewer_output,
+            &mut terminal_writer,
+            &mut conpty_pending,
+            &mut terminal_output,
+        );
         if Instant::now() >= deadline {
+            #[cfg(unix)]
             let output = viewer_output.try_iter().flatten().collect::<Vec<_>>();
+            #[cfg(windows)]
+            let output = terminal_output.clone();
             let saw_dsr = output.windows(4).any(|window| window == b"\x1b[6n");
             panic!(
                 "attach client did not exit after one key; saw ESC[6n DSR query: {saw_dsr}\nterminal bytes:\n{}\nviewer screen:\n{}",
@@ -805,7 +960,7 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
         b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
     );
     #[cfg(windows)]
-    let restored = viewer_output.try_iter().flatten().collect::<Vec<_>>();
+    let restored = terminal_output;
     if std::env::var_os("REMUDA_TRACE_ATTACH_EXIT").is_some() {
         let saw_dsr = restored.windows(4).any(|window| window == b"\x1b[6n");
         eprintln!(
@@ -816,6 +971,173 @@ fn any_key_after_attached_session_exit_restores_the_terminal() {
                 .expect("viewer screen after attach exit"),
         );
     }
+}
+
+#[test]
+fn a_new_attach_takes_over_and_old_raw_clients_get_a_plain_notice() {
+    let path = scratch("takeover");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+
+    // This connection models a pre-upgrade client: it knows only the existing
+    // Attach request followed by a raw byte stream, and treats EOF as ordinary.
+    let mut old = raw_attach(&path, "target");
+    let mut current = raw_attach(&path, "target");
+    let mut old_output = Vec::new();
+    old.read_to_end(&mut old_output)
+        .expect("displaced connection closes cleanly");
+    assert!(
+        old_output
+            .windows(b"[remuda] attached elsewhere, detached".len())
+            .any(|window| window == b"[remuda] attached elsewhere, detached"),
+        "older clients receive a printable explanation before EOF: {old_output:?}"
+    );
+
+    current
+        .write_all(b"echo takeover-input\r")
+        .expect("current client input");
+    wait_for(&path, "target", "takeover-input");
+    assert_eq!(target_row(&path, "r.attached"), "true");
+
+    // A third attach is accepted immediately, even while the second daemon
+    // handler is still unwinding its raw connection.
+    let third = raw_attach(&path, "target");
+    drop(current);
+    drop(third);
+    let deadline = Instant::now() + PATIENCE;
+    while target_row(&path, "r.attached") == "true" {
+        assert!(Instant::now() < deadline, "all attaches should release");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn an_agent_printing_the_takeover_notice_does_not_end_a_tracked_attach() {
+    let path = scratch("spoof-notice");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    let (stream, generation) = raw_attach_tracked(&path, "target");
+
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "printf '\\r\\n[remuda] attached elsewhere, detached\\r\\n'".into(),
+        },
+    )
+    .expect("print the exact courtesy notice from the session");
+    wait_for(&path, "target", "attached elsewhere, detached");
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::AttachStatus {
+                name: "target".into(),
+                generation,
+            },
+        )
+        .expect("query generation status"),
+        Response::AttachStatus { taken_over: false }
+    );
+    assert_eq!(target_row(&path, "r.attached"), "true");
+    drop(stream);
+}
+
+#[test]
+fn a_tracked_client_exits_on_takeover_without_waiting_for_another_key() {
+    let dir = scratch_dir("exit-on-takeover");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+
+    let pty = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open client pty");
+    let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "attach", "target"]);
+    command.env("REMUDA_RUNTIME_DIR", &dir);
+    let mut child = pty.slave.spawn_command(command).expect("spawn client A");
+    // The test only uses the master side after spawning the child. Keeping the
+    // parent's slave handle open can prevent some PTY implementations from
+    // reporting EOF after the child exits.
+    drop(pty.slave);
+    #[cfg(windows)]
+    let mut input_writer = pty.master.take_writer().expect("take client PTY writer");
+    let mut reader = pty.master.try_clone_reader().expect("clone pty reader");
+    let captured_output = Arc::new(Mutex::new(Vec::new()));
+    let thread_output = Arc::clone(&captured_output);
+    #[cfg(unix)]
+    let (output_tx, output_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        #[cfg(windows)]
+        let mut pending = Vec::new();
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    #[cfg(windows)]
+                    conpty::answer_conpty_cursor_queries(
+                        &mut input_writer,
+                        &mut pending,
+                        &buf[..n],
+                    );
+                    thread_output
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .extend_from_slice(&buf[..n]);
+                    #[cfg(unix)]
+                    if output_tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    wait_for_target_attach(&path, child.as_mut(), &captured_output);
+    let _current = raw_attach(&path, "target");
+
+    let deadline = Instant::now() + PATIENCE;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll client A") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "client A waited for terminal input after takeover"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(status.exit_code(), 2);
+    #[cfg(unix)]
+    {
+        // Do not wait for PTY EOF here. Some platforms keep a reader open
+        // after the child exits; the notice and mode resets are the evidence
+        // this test needs, and arrive before EOF.
+        let output = collect_until_bytes(&output_rx, b"\x1b[?1000l");
+        assert!(
+            output
+                .windows(b"attached elsewhere, detached".len())
+                .any(|window| window == b"attached elsewhere, detached"),
+            "takeover reason was not displayed: {output:?}"
+        );
+        assert!(
+            output
+                .windows(b"\x1b[?1000l".len())
+                .any(|w| w == b"\x1b[?1000l")
+                && output
+                    .windows(b"\x1b[?2004l".len())
+                    .any(|w| w == b"\x1b[?2004l"),
+            "the input modes were not reset before exit: {output:?}"
+        );
+    }
+    // ConPTY does not provide stable screen bytes for assertions. On Windows,
+    // the process exit and takeover exit code above prove client A detached.
 }
 
 #[test]
@@ -880,7 +1202,7 @@ fn direct_attach_mouse_scrolls_the_full_history_and_returns_to_live_output() {
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach().expect("attach viewer");
+    let held = viewer.attach();
     let output = held.subscribe().expect("capture viewer output");
     wait_for_session_screen(&viewer, "history-end");
 
@@ -973,7 +1295,7 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach().expect("attach viewer");
+    let held = viewer.attach();
     let output = held.subscribe().expect("capture viewer output");
     held.write_raw(b"\x1b[<64;10;10M")
         .expect("deliver host wheel report");
@@ -1021,7 +1343,7 @@ fn mouse_off_knob_and_toggle_pass_reports_to_the_child_and_restore_host_modes() 
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
-    let held = viewer.attach().expect("attach viewer");
+    let held = viewer.attach();
     let output = held.subscribe().expect("capture viewer output");
     let initial = collect_until_bytes(&output, b"\x1b[?25");
     assert!(!initial

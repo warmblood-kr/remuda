@@ -7,7 +7,7 @@ use crate::agent::{AgentError, AgentProcess, Cursor, MouseState, Result, Size, S
 use crate::clock::Clock;
 use crate::protocol::Step;
 use core::time::Duration;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
@@ -27,8 +27,12 @@ pub struct Session {
     /// [`Clock::now`] at the last keystroke through an [`Attached`] guard —
     /// a human's, never a script's. `None` until one arrives (#136).
     last_human_input_at: Mutex<Option<Duration>>,
-    /// Set while an [`Attached`] guard is alive.
+    /// Set while the current [`Attached`] guard is alive.
     attached: AtomicBool,
+    /// Current attachment generation and its takeover signal. The generation
+    /// keeps an old guard's drop from clearing a newer attachment.
+    attach_slot: Mutex<Option<(u64, Arc<AtomicBool>)>>,
+    next_attach_generation: AtomicU64,
     /// Held for the whole of one input act — every `Burst` **and** every
     /// `Pause` between them — so a second sender cannot land a write during a
     /// pause, when the `agent` lock is briefly free. See [`Self::feed`].
@@ -76,6 +80,8 @@ impl Session {
             last_output_at,
             last_human_input_at: Mutex::new(None),
             attached: AtomicBool::new(false),
+            attach_slot: Mutex::new(None),
+            next_attach_generation: AtomicU64::new(1),
             input_lock: Mutex::new(()),
         }
     }
@@ -260,18 +266,35 @@ impl Session {
         agent.terminate()
     }
 
-    /// Take exclusive hold for a human at a terminal. `None` means someone is
-    /// already attached; the second attacher is refused, never merged in.
-    pub fn attach(&self) -> Option<Attached<'_>> {
-        self.attached
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .ok()
-            .map(|_| Attached { session: self })
+    /// Take hold for a human at a terminal, displacing any current holder.
+    pub fn attach(&self) -> Attached<'_> {
+        let mut slot = self.attach_slot.lock().unwrap_or_else(|p| p.into_inner());
+        let generation = self.next_attach_generation.fetch_add(1, Ordering::SeqCst);
+        let displaced = Arc::new(AtomicBool::new(false));
+        if let Some((_, old)) = slot.replace((generation, Arc::clone(&displaced))) {
+            old.store(true, Ordering::SeqCst);
+        }
+        self.attached.store(true, Ordering::SeqCst);
+        Attached {
+            session: self,
+            generation,
+            displaced,
+        }
     }
 
     /// Whether a human currently holds this session.
     pub fn is_attached(&self) -> bool {
         self.attached.load(Ordering::SeqCst)
+    }
+
+    /// Whether a live session has advanced beyond a tracked attachment.
+    pub fn was_attachment_taken_over(&self, generation: u64) -> bool {
+        self.is_alive()
+            && self
+                .next_attach_generation
+                .load(Ordering::SeqCst)
+                .saturating_sub(1)
+                > generation
     }
 
     /// How long since input was last accepted — the fleet's "this one is parked"
@@ -295,17 +318,40 @@ impl Session {
     }
 }
 
-/// Exclusive hold on a session by one attached viewer. Caution: this guard is
-/// the *only* place raw bytes can be written (invariant 3). Dropping it
-/// detaches and re-enables `send_line`; the agent and its pty are undisturbed.
+/// Current viewer's hold: the only guard that can write raw bytes. A displaced
+/// guard cannot write or release its successor.
 pub struct Attached<'a> {
     session: &'a Session,
+    generation: u64,
+    displaced: Arc<AtomicBool>,
 }
 
 impl Attached<'_> {
+    /// The generation assigned when this client took the attachment.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Whether a newer client has taken this attachment over.
+    pub fn is_displaced(&self) -> bool {
+        self.displaced.load(Ordering::SeqCst)
+    }
+
     /// Type exactly these bytes. No Enter is appended: the human sends their
     /// own, and inventing one here would submit a half-typed line.
     pub fn write_raw(&self, bytes: &[u8]) -> Result<()> {
+        let slot = self
+            .session
+            .attach_slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if self.is_displaced()
+            || !slot
+                .as_ref()
+                .is_some_and(|(generation, _)| *generation == self.generation)
+        {
+            return Err(AgentError::Attached);
+        }
         let mut agent = self
             .session
             .agent
@@ -344,6 +390,17 @@ impl Attached<'_> {
 
 impl Drop for Attached<'_> {
     fn drop(&mut self) {
-        self.session.attached.store(false, Ordering::SeqCst);
+        let mut slot = self
+            .session
+            .attach_slot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if slot
+            .as_ref()
+            .is_some_and(|(generation, _)| *generation == self.generation)
+        {
+            *slot = None;
+            self.session.attached.store(false, Ordering::SeqCst);
+        }
     }
 }

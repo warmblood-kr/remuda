@@ -63,7 +63,7 @@ fn a_summary_says_whether_a_human_holds_it() {
     let handle = registry.register(session("ridden")).expect("registered");
     assert!(!registry.list()[0].attached, "nobody is attached yet");
 
-    let held = handle.attach().expect("attach");
+    let held = handle.attach();
     assert!(
         registry.list()[0].attached,
         "the TUI draws its flag from this"
