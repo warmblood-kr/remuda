@@ -411,8 +411,20 @@ end
 function remuda.expect_option(screen, matches)
   if type(screen) ~= "string" or type(matches) ~= "function" then return nil end
   local found
+  local markers = { "│", "┃", "❯", "›", ">" }
   for line in (screen .. "\n"):gmatch("(.-)\n") do
-    line = line:gsub("^%s*[│┃]%s*", ""):gsub("^%s*[❯›>]%s*", "")
+    line = line:gsub("^%s+", "")
+    for _ = 1, #markers do
+      local stripped = false
+      for _, marker in ipairs(markers) do
+        if line:sub(1, #marker) == marker then
+          line = line:sub(#marker + 1):gsub("^%s+", "")
+          stripped = true
+          break
+        end
+      end
+      if not stripped then break end
+    end
     local number, label = line:match("^%s*(%d+)[%.)]%s*(.-)%s*$")
     if number and matches(label) then
       if found then return nil end
@@ -1451,6 +1463,40 @@ end
 remuda.buffers = {}
 register("buffers", "The `remuda.buffer` registry table, keyed by buffer name.", "table")
 
+-- Deprecated flat spellings keep resolving dynamically through this table.
+-- That matters for API v1-v4 callers which wrap/replace a flat function path:
+-- namespace words still pass through the old slot during the compatibility
+-- window. The alias itself calls the captured primitive, avoiding a cycle.
+local deprecated_notices = {}
+local through_namespace = {}
+local function call_flat(name, ...)
+  local prior = through_namespace[name]
+  through_namespace[name] = true
+  local result = table.pack(pcall(remuda[name], ...))
+  through_namespace[name] = prior
+  if not result[1] then error(result[2], 0) end
+  return table.unpack(result, 2, result.n)
+end
+
+local function deprecated_alias(name, replacement, primitive)
+  return function(...)
+    if not through_namespace[name]
+      and os.getenv("REMUDA_SUPPRESS_DEPRECATIONS") ~= "1"
+      and not deprecated_notices[name] then
+      deprecated_notices[name] = true
+      io.stderr:write("deprecated: remuda." .. name .. "; use remuda.session." .. replacement .. "\n")
+    end
+    return primitive(...)
+  end
+end
+
+local flat_session_words = {
+  ls = remuda.ls,
+  new = remuda.new,
+  close = remuda.close,
+  attach = remuda.attach,
+}
+
 local Buffer = {}
 Buffer.__index = Buffer
 
@@ -1497,13 +1543,13 @@ end
 -- session ≠ buffer: a session is a live process this daemon runs, a buffer
 -- is Lua-owned text. `session.buffer` is the buffer named after the session
 -- (create-if-absent, same as `buffer.new`) — a convenience, never the session
--- itself, so nothing here duplicates what `remuda.ls()` already reports.
+-- itself, so nothing here duplicates what `remuda.session.list()` reports.
 local Session = {}
 Session.__index = function(self, key)
   if key == "buffer" then
     return remuda.buffer.new(self.name)
   elseif key == "is_busy" then
-    for _, row in ipairs(remuda.ls()) do
+    for _, row in ipairs(remuda.session.list()) do
       if row.name == self.name then
         -- No output for a couple of seconds is a useful working/idle heuristic.
         -- `row.idle` remains since-input for callers that use that measure.
@@ -1520,13 +1566,38 @@ end
 -- of busy or of a context budget, whichever session's content it happens to
 -- hold. (`context_left` is not implemented: a generic pty has no channel a
 -- caller's token budget would arrive on. Named so a future one lands here.)
-function remuda.session(name)
+local function session_handle(name)
   if type(name) ~= "string" or name == "" then
     error("a session needs a name", 2)
   end
   return setmetatable({ name = name }, Session)
 end
-register("session", "A handle onto an existing session, by name.", "session(name) -> session")
+
+remuda.session = {
+  list = function(...) return call_flat("ls", ...) end,
+  new = function(...) return call_flat("new", ...) end,
+  close = function(...) return call_flat("close", ...) end,
+  attach = function(...) return call_flat("attach", ...) end,
+}
+setmetatable(remuda.session, {
+  __call = function(_, name) return session_handle(name) end,
+})
+register("session", "Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close and attach.",
+  "session(name) -> handle; table {list, new, close, attach}")
+register("session.list", "List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.", "session.list() -> {session...}")
+register("session.new", "Start a session, defaulting the command to the user's shell.",
+  "session.new(name?, argv?, cwd?, env?) -> string")
+register("session.close", "End a session, live or already self-exited.", "session.close(name) -> nil")
+register("session.attach", "Enter raw mode on a session.", "session.attach(name) -> nil")
+
+remuda.ls = deprecated_alias("ls", "list", flat_session_words.ls)
+remuda.new = deprecated_alias("new", "new", flat_session_words.new)
+remuda.close = deprecated_alias("close", "close", flat_session_words.close)
+remuda.attach = deprecated_alias("attach", "attach", flat_session_words.attach)
+register("ls", "Deprecated alias for `remuda.session.list`.", "ls() -> {session...}")
+register("new", "Deprecated alias for `remuda.session.new`.", "new(name?, argv?, cwd?, env?) -> string")
+register("close", "Deprecated alias for `remuda.session.close`.", "close(name) -> nil")
+register("attach", "Deprecated alias for `remuda.session.attach`.", "attach(name) -> nil")
 
 -- window: a screen rectangle showing exactly one buffer or attached session,
 -- owning the lifetime of neither — closing one kills nothing it showed
@@ -1695,7 +1766,7 @@ register(
 -- WIDTH travels with the bridge call so any budget-aware row detail can be
 -- chosen here; Rust still fits the resulting rows to the caller's pane.
 function remuda._refresh_sessions_buffer(width, selected, selected_name)
-  local sessions = remuda.ls()
+  local sessions = remuda.session.list()
   local ordered = sessions
   local has_order = false
   -- The private order line is tab-delimited. A daemon normally receives names

@@ -40,10 +40,15 @@ pub enum Request {
     /// Deliver one instruction as an indivisible act. An attached terminal is
     /// a viewer, not a delivery lock.
     SendLine { name: String, text: String },
-    /// Submit a whole user-authored line as one indivisible input batch.
-    /// Unlike raw `Send`/`Feed`, this is the only input primitive exposed by
-    /// the restricted remote front.
-    Input { name: String, bytes: Vec<u8> },
+    /// Submit an idempotent input batch. Client IDs are 32 hex digits and
+    /// sequence numbers start at one and increase for each batch.
+    Input {
+        name: String,
+        instance_id: String,
+        client_id: String,
+        seq: u64,
+        bytes: Vec<u8>,
+    },
     /// Deliver a burst of input bytes as an indivisible act, appending nothing —
     /// the primitive [`Request::SendLine`] is made of. Indivisible is the
     /// load-bearing word; an attached terminal does not block it.
@@ -130,6 +135,16 @@ pub enum Step {
 pub enum Response {
     Sessions(Vec<SessionSummary>),
     Screen(String),
+    /// An input batch was applied, or was already applied.
+    Ack {
+        duplicate: bool,
+    },
+    /// The daemon cannot prove whether an unknown or evicted batch was applied.
+    Uncertain,
+    /// The target name now refers to a different session start.
+    WrongInstance,
+    /// The per-session input byte budget has been exhausted for this second.
+    RateLimited,
     /// A styled screen, answering [`Request::CaptureStyled`] — as runs, not
     /// cells; see [`StyledRun`]. `cursor` rides the same round trip, so the
     /// pane's caret and its content are always the same frame. See steps/027.

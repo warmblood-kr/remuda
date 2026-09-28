@@ -225,10 +225,7 @@ fn revoke_locked_at(
         .expect("resolved registry entry");
     let entry = &mut registry.authorized_nodes[index];
     entry.state = NodeState::Revoked;
-    entry.version = entry
-        .version
-        .checked_add(1)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "registry version overflow"))?;
+    entry.version = entry.version.saturating_add(1);
     entry.by = self_node.node_fp.clone();
     registry::save_registry_at(dir, &registry)?;
     Ok(RevokeOutcome::Revoked)
@@ -321,6 +318,69 @@ mod nodes_revoke_tests {
         assert_eq!(revoked.state, NodeState::Revoked);
         assert_eq!(revoked.version, 8);
         assert_eq!(revoked.by, self_node.node_fp);
+    }
+
+    #[test]
+    fn local_revoke_succeeds_after_max_version_admission_and_tombstone_wins() {
+        let dir = temp_dir();
+        let (self_node, _) = identity::init_identity_at(&dir).unwrap();
+        let (sender, _) = identity::init_identity_at(&dir.join("sender")).unwrap();
+        let (target, _) = identity::init_identity_at(&dir.join("target")).unwrap();
+        registry::save_registry_at(
+            &dir,
+            &Registry {
+                authorized_nodes: vec![
+                    AuthorizedNode {
+                        node_fp: self_node.node_fp.clone(),
+                        static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+                        state: NodeState::Admitted,
+                        version: 1,
+                        by: self_node.node_fp.clone(),
+                    },
+                    AuthorizedNode {
+                        node_fp: sender.node_fp.clone(),
+                        static_pubkey: encoding::encode_base64(&sender.static_pubkey),
+                        state: NodeState::Admitted,
+                        version: 1,
+                        by: self_node.node_fp.clone(),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let mut admitted_at_max = Registry {
+            authorized_nodes: vec![AuthorizedNode {
+                node_fp: target.node_fp.clone(),
+                static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                state: NodeState::Admitted,
+                version: u64::MAX,
+                by: sender.node_fp.clone(),
+            }],
+        };
+        let mut registry = registry::load_registry_at(&dir).unwrap();
+        registry::apply_update(
+            &mut registry,
+            &registry::RegistryUpdate {
+                sender_fp: sender.node_fp.clone(),
+                entries: std::mem::take(&mut admitted_at_max.authorized_nodes),
+            },
+            &sender.static_pubkey,
+            &self_node.node_fp,
+        )
+        .unwrap();
+        registry::save_registry_at(&dir, &registry).unwrap();
+        assert_eq!(
+            revoke_at(&dir, &target.node_fp).unwrap(),
+            RevokeOutcome::Revoked
+        );
+        let revoked = registry::load_registry_at(&dir)
+            .unwrap()
+            .authorized_nodes
+            .into_iter()
+            .find(|entry| entry.node_fp == target.node_fp)
+            .unwrap();
+        assert_eq!(revoked.state, NodeState::Revoked);
+        assert_eq!(revoked.version, u64::MAX);
     }
 
     #[test]

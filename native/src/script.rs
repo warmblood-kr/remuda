@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 72] = [
+pub const BINDINGS: [&str; 73] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -74,6 +74,7 @@ pub const BINDINGS: [&str; 72] = [
     "feed",
     "hook_list",
     "hooks",
+    "http",
     "insert",
     "key",
     "kill",
@@ -115,6 +116,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_pending_events",
         "Drain deferred-reply completion and cancellation notifications for the Lua tick.",
         "_pending_events() -> {{id, reason?}...}",
+    ),
+    (
+        "http",
+        "Start an asynchronous bounded HTTP request; completion is delivered on the Lua image queue.",
+        "http.request(options) -> {cancel()}",
     ),
     (
         "ls",
@@ -327,7 +333,7 @@ pub fn bindings(
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
-    fail_binding(lua, &table)?;
+    fail_binding(lua, &table, image.clone())?;
     pending_bindings(lua, &table, image.pending_replies())?;
 
     // In-process, not a loopback: the image always runs inside the same
@@ -704,7 +710,7 @@ pub(crate) fn stop_modules(lua: &Lua) -> mlua::Result<()> {
 /// `remuda.capture_styled(name)` — split out of `bindings` for its line cap.
 /// Only what a script needs to tell a TUI's dim ghost text from typed text,
 /// and where the caret is (#137): not colours or the other attributes.
-fn fail_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
+fn fail_binding(lua: &Lua, table: &Table, image: crate::image::Image) -> mlua::Result<()> {
     table.set(
         "fail",
         lua.create_function(
@@ -721,7 +727,8 @@ fn fail_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
                 }))
             },
         )?,
-    )
+    )?;
+    crate::net::http_client::install(lua, table, image)
 }
 
 fn capture_styled_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
@@ -932,6 +939,10 @@ fn lua_env_to_wire(env: Table) -> mlua::Result<std::collections::HashMap<String,
 fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
     match response {
         Response::Ok => Ok(Value::Nil),
+        Response::Ack { .. } => Ok(Value::Nil),
+        Response::Uncertain => Err(mlua::Error::runtime("input outcome is uncertain")),
+        Response::WrongInstance => Err(mlua::Error::runtime("session instance changed")),
+        Response::RateLimited => Err(mlua::Error::runtime("session input rate limit exceeded")),
         Response::AttachStarted { .. } | Response::AttachStatus { .. } => Err(
             mlua::Error::runtime("attach responses are not exposed to scripts"),
         ),

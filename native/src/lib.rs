@@ -15,6 +15,8 @@ pub mod image;
 pub mod ipc;
 pub mod mcp;
 pub mod mouse;
+#[allow(clippy::disallowed_types)]
+pub mod net;
 pub mod packages;
 pub mod pending;
 pub mod process;
