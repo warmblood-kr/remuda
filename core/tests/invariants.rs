@@ -305,7 +305,7 @@ fn human_idle_time_counts_only_attached_keystrokes() {
     session.send_line("scripted").unwrap();
     assert_eq!(session.human_idle_for(), None, "no human has typed yet");
 
-    let held = session.attach().expect("attach");
+    let held = session.attach();
     held.write_raw(b"co").unwrap();
     clock.advance(Duration::from_secs(7));
     assert_eq!(session.human_idle_for(), Some(Duration::from_secs(7)));
@@ -466,7 +466,7 @@ fn listing_reports_human_idle_time() {
         .expect("registration");
     assert_eq!(registry.list()[0].human_idle, None);
     let session = registry.get("agent").expect("registered");
-    session.attach().expect("attach").write_raw(b"x").unwrap();
+    session.attach().write_raw(b"x").unwrap();
     assert_eq!(registry.list()[0].human_idle, Some(Duration::ZERO));
 }
 
@@ -596,7 +596,7 @@ fn close_is_refused_while_attached_and_the_session_survives() {
         .expect("registration");
 
     let session = registry.get("worker").expect("handle");
-    let held = session.attach().expect("attach");
+    let held = session.attach();
 
     assert!(
         matches!(registry.close("worker"), Some(Err(AgentError::Attached))),
@@ -635,7 +635,7 @@ fn orchestrated_input_reaches_a_session_while_a_human_is_attached() {
     session.send_line("before").expect("core drives when free");
     assert_eq!(writes.lock().unwrap().len(), 1, "one indivisible burst");
 
-    let held = session.attach().expect("first attach");
+    let held = session.attach();
     assert!(session.is_attached());
     session
         .send_line("during")
@@ -658,22 +658,24 @@ fn orchestrated_input_reaches_a_session_while_a_human_is_attached() {
 }
 
 #[test]
-fn a_second_viewer_cannot_attach() {
+fn a_second_viewer_takes_over_and_old_drop_does_not_release_new_hold() {
     let (session, _clock) = session_with(Box::new(ScriptedAgent::new(vec![])));
-    let first = session.attach().expect("first attach");
-    assert!(
-        session.attach().is_none(),
-        "two people on one keyboard is the same defect as core-plus-human"
-    );
+    let first = session.attach();
+    let second = session.attach();
+    assert!(first.is_displaced());
+    assert!(session.is_attached());
+    assert!(first.write_raw(b"stale input").is_err());
     drop(first);
-    assert!(session.attach().is_some(), "detaching frees the seat");
+    assert!(session.is_attached(), "old drop must not free the new hold");
+    drop(second);
+    assert!(!session.is_attached(), "dropping the current hold frees it");
 }
 
 #[test]
 fn a_raw_keystroke_carries_no_invented_enter() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
-    let held = session.attach().expect("attach");
+    let held = session.attach();
 
     held.write_raw(b"ls").expect("raw write");
 
@@ -869,9 +871,7 @@ fn attaching_during_a_feed_pause_does_not_block_the_remaining_bursts() {
 
     // `attach` takes neither lock a feed act holds, so it must succeed right
     // away — proving there is no deadlock behind an act sitting in a pause.
-    let held = session
-        .attach()
-        .expect("attach must not wait on a paused feed");
+    let held = session.attach();
 
     advance_until_finished(&clock, Duration::from_secs(1), &feeder);
     let result = feeder.join().unwrap();
@@ -933,7 +933,7 @@ fn attaching_and_detaching_inside_a_pause_does_not_block_the_next_burst() {
     }
 
     // Attach AND detach again, fully, before the second burst ever runs.
-    let held = session.attach().expect("attach during the pause");
+    let held = session.attach();
     drop(held);
     assert!(
         !session.is_attached(),
