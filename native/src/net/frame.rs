@@ -93,7 +93,7 @@ pub fn open_request(responder_private: &[u8], message: &[u8]) -> io::Result<Open
     })
 }
 
-fn reject_low_order_dh(private_key: &[u8], public_key: &[u8]) -> io::Result<()> {
+pub(super) fn reject_low_order_dh(private_key: &[u8], public_key: &[u8]) -> io::Result<()> {
     if private_key.len() != 32 || public_key.len() != 32 {
         return Err(invalid_frame());
     }
