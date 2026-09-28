@@ -50,9 +50,20 @@ run() {
 }
 
 status=0
+# A concurrent live_reload.sh's stand-in, born mid-run, must survive this
+# script's cleanup (#148): it once killed every new `sleep NNNNN[12]`.
+(sleep 2; exec sleep 987651) &
+decoy=$!
 echo "=== explicit daemon"
 run "$BUTLER_REPO/tests/live_reload.sh" "$OLD_REF"
 echo "=== AUTOSTART=1"
 run env AUTOSTART=1 "$BUTLER_REPO/tests/live_reload.sh" "$OLD_REF"
+if pgrep -fx 'sleep 987651' >/dev/null; then
+  pkill -fx 'sleep 987651' || true
+else
+  echo "cleanup killed another run's stand-in (#148)" >&2
+  status=1
+fi
+kill "$decoy" 2>/dev/null || true
 if [[ $status -eq 0 ]]; then echo "butler contract: PASS"; else echo "butler contract: FAIL" >&2; fi
 exit "$status"
