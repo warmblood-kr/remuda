@@ -69,6 +69,60 @@ fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
+#[cfg(unix)]
+fn wait_for_send_writer_busy(socket: &Path, send_finished: &Receiver<()>) {
+    let busy_deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        match client::request(
+            socket,
+            &Request::Send {
+                name: "target".into(),
+                bytes: Vec::new(),
+            },
+        )
+        .expect("probe whether the large Send owns the writer")
+        {
+            Response::Busy => return,
+            Response::Ok => {
+                assert!(
+                    send_finished.try_recv().is_err(),
+                    "large Send ended before the writer became busy"
+                );
+            }
+            other => panic!("unexpected empty Send probe response: {other:?}"),
+        }
+        assert!(
+            Instant::now() < busy_deadline,
+            "large Send never occupied the session writer"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn spawn_stalled_send(
+    socket: PathBuf,
+    bytes: Vec<u8>,
+    send_finished: std::sync::mpsc::Sender<()>,
+) -> std::thread::JoinHandle<std::io::Result<Response>> {
+    std::thread::spawn(move || {
+        let result = loop {
+            match client::request(
+                &socket,
+                &Request::Send {
+                    name: "target".into(),
+                    bytes: bytes.clone(),
+                },
+            ) {
+                Ok(Response::Busy) => std::thread::sleep(Duration::from_millis(10)),
+                result => break result,
+            }
+        };
+        let _ = send_finished.send(());
+        result
+    })
+}
+
 fn unique_scratch_dir(tag: &str) -> PathBuf {
     static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(1);
     let run = NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed);
@@ -623,54 +677,13 @@ fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
     let mut send_bytes = vec![b'\n'; 1024 * 1024];
     send_bytes.extend_from_slice(b"SEND-END\n");
     let expected_send = send_bytes.clone();
-    let send_socket = socket.clone();
     let started = Instant::now();
     let (send_finished_tx, send_finished_rx) = std::sync::mpsc::channel();
-    let sender = std::thread::spawn(move || {
-        let result = loop {
-            match client::request(
-                &send_socket,
-                &Request::Send {
-                    name: "target".into(),
-                    bytes: send_bytes.clone(),
-                },
-            ) {
-                Ok(Response::Busy) => std::thread::sleep(Duration::from_millis(10)),
-                result => break result,
-            }
-        };
-        let _ = send_finished_tx.send(());
-        result
-    });
+    let sender = spawn_stalled_send(socket.clone(), send_bytes, send_finished_tx);
 
     // Empty sends make safe probes: they cannot affect the captured bytes.
-    // Wait until a probe sees the large Send occupying the writer before
-    // attaching, rather than assuming that a fixed delay was enough.
-    let busy_deadline = Instant::now() + Duration::from_secs(4);
-    loop {
-        match client::request(
-            &socket,
-            &Request::Send {
-                name: "target".into(),
-                bytes: Vec::new(),
-            },
-        )
-        .expect("probe whether the large Send owns the writer")
-        {
-            Response::Busy => break,
-            Response::Ok => {
-                if send_finished_rx.try_recv().is_ok() {
-                    panic!("large Send ended before the writer became busy");
-                }
-            }
-            other => panic!("unexpected empty Send probe response: {other:?}"),
-        }
-        assert!(
-            Instant::now() < busy_deadline,
-            "large Send never occupied the session writer"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    // Observe Busy before attaching, rather than assuming a fixed delay.
+    wait_for_send_writer_busy(&socket, &send_finished_rx);
     let mut stream = raw_attach(&socket, "target");
     stream
         .write_all(b"HUMAN-ONE\n")
