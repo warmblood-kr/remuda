@@ -47,6 +47,11 @@ jobs:
         # for the required files, line 134 for the exec-and-register step).
         run: |
           set -eu
+          # The runner has no claude; butler's session spawns one (#164).
+          # A stub that stays alive is enough: the install path is under test.
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\nexec sleep 86400\n' >"$HOME/.local/bin/claude"
+          chmod +x "$HOME/.local/bin/claude"
           mkdir -p "$HOME/.config/remuda/butler"
           printf 'ci-smoke-test-fake-token\n' >"$HOME/.config/remuda/butler/token"
           printf 'http://127.0.0.1:1\n!fakeroom:example.org\n@butler:example.org\n@allowed:example.org\n' >"$HOME/.config/remuda/butler/config"
