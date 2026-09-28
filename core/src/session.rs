@@ -190,6 +190,13 @@ impl Session {
         agent.screen_text()
     }
 
+    pub fn mouse_tracking(&self) -> bool {
+        self.agent
+            .lock()
+            .map(|mut agent| agent.mouse_tracking())
+            .unwrap_or(false)
+    }
+
     pub fn cursor(&self) -> Result<Cursor> {
         let mut agent = self
             .agent

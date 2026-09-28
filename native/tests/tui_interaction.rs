@@ -3,7 +3,7 @@ use remuda_core::{SessionSummary, Size};
 use remuda_native::tui::{pane_size, render, Action, Ui};
 use std::time::Duration;
 
-fn ui() -> Ui {
+fn ui_with_mouse_tracking(mouse_tracking: bool) -> Ui {
     Ui::new(
         vec![SessionSummary {
             name: "agent".into(),
@@ -13,10 +13,15 @@ fn ui() -> Ui {
             size: Size::new(80, 24),
             attached: false,
             human_idle: None,
+            mouse_tracking,
         }],
         "sh",
         None,
     )
+}
+
+fn ui() -> Ui {
+    ui_with_mouse_tracking(false)
 }
 
 fn key(ch: char) -> KeyEvent {
@@ -83,15 +88,22 @@ fn wheel_reaches_a_focused_agent_but_scrolls_remuda_history_in_browse_mode() {
         row: 4,
         modifiers: KeyModifiers::NONE,
     };
-    let mut ui = ui();
+    let mut ui = ui_with_mouse_tracking(false);
     assert_eq!(ui.on_mouse(wheel, 80, 24), Action::Scroll(-3));
 
     assert_eq!(
         ui.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         Action::Focus("agent".into())
     );
+    assert_eq!(ui.on_mouse(wheel, 80, 24), Action::Nothing);
+
+    let mut tracking = ui_with_mouse_tracking(true);
     assert_eq!(
-        ui.on_mouse(wheel, 80, 24),
+        tracking.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        Action::Focus("agent".into())
+    );
+    assert_eq!(
+        tracking.on_mouse(wheel, 80, 24),
         Action::Type(remuda_core::keys::mouse("wheel-down", 3, 5).unwrap())
     );
 }

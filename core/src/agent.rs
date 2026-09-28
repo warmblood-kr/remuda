@@ -143,6 +143,12 @@ pub trait AgentProcess: Send {
         self.screen_text().map(String::into_bytes)
     }
 
+    /// Whether the child has enabled terminal mouse reporting. Backends that
+    /// cannot know return false so callers do not inject unsolicited input.
+    fn mouse_tracking(&mut self) -> bool {
+        false
+    }
+
     /// The visible screen as styled cells, for a croppable colour pane.
     /// Default: every cell plain, from the same text `screen_text` gives —
     /// a backend that hasn't implemented styling degrades to colourless.

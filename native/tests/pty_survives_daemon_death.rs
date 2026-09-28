@@ -16,14 +16,21 @@
 //! more machinery than this round's scope. A real green run today is the
 //! deliverable.
 
+#[cfg(target_os = "linux")]
 use remuda_core::protocol::{Request, Response};
+#[cfg(target_os = "linux")]
 use remuda_core::Size;
+#[cfg(target_os = "linux")]
 use remuda_native::{client, daemon};
+#[cfg(target_os = "linux")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
 const PATIENCE: Duration = Duration::from_secs(10);
 
+#[cfg(target_os = "linux")]
 fn scratch_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("remuda-pty-death-{}-{tag}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -32,8 +39,10 @@ fn scratch_dir(tag: &str) -> PathBuf {
 
 /// A daemon as its own PROCESS, with a real pid to SIGKILL — an in-thread
 /// `daemon::serve` would die with the test harness itself, proving nothing.
+#[cfg(target_os = "linux")]
 struct Daemon(std::process::Child);
 
+#[cfg(target_os = "linux")]
 impl Daemon {
     fn spawn(dir: &Path) -> Self {
         let child = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
@@ -54,6 +63,7 @@ impl Daemon {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl Drop for Daemon {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -61,6 +71,7 @@ impl Drop for Daemon {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn new_session(path: &Path, name: &str) {
     let response = client::request(
         path,
@@ -80,6 +91,7 @@ fn new_session(path: &Path, name: &str) {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn capture(path: &Path, name: &str) -> String {
     match client::request(
         path,
@@ -92,6 +104,7 @@ fn capture(path: &Path, name: &str) -> String {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn wait_for(path: &Path, name: &str, needle: &str) -> String {
     let deadline = Instant::now() + PATIENCE;
     loop {

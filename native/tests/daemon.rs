@@ -15,6 +15,7 @@ use remuda_core::protocol::{Request, Response};
 use remuda_core::{Session, Size};
 use remuda_native::{client, daemon, ipc, CommandBuilder, PtyAgent, SystemClock};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -105,6 +106,106 @@ fn wait_for(path: &Path, name: &str, needle: &str) -> String {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn wait_for_session_screen(session: &Session, needle: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let screen = session.screen_text().expect("viewer screen");
+        if screen.contains(needle) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attach did not repaint {needle:?}. viewer saw:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn collect_until_bytes(receiver: &Receiver<Vec<u8>>, needle: &[u8]) -> Vec<u8> {
+    let deadline = Instant::now() + PATIENCE;
+    let mut output = Vec::new();
+    while !output.windows(needle.len()).any(|window| window == needle) {
+        if Instant::now() >= deadline {
+            panic!(
+                "terminal output omitted {needle:?}; received {} bytes, tail: {}",
+                output.len(),
+                escaped_tail(&output)
+            );
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match receiver.recv_timeout(remaining.min(Duration::from_millis(500))) {
+            Ok(chunk) => output.extend_from_slice(&chunk),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                panic!(
+                    "attach client exited before writing {needle:?}; received {} bytes, tail: {}",
+                    output.len(),
+                    escaped_tail(&output)
+                )
+            }
+        }
+    }
+    output
+}
+
+fn escaped_tail(output: &[u8]) -> String {
+    let start = output.len().saturating_sub(400);
+    output[start..]
+        .iter()
+        .flat_map(|byte| std::ascii::escape_default(*byte))
+        .map(char::from)
+        .collect()
+}
+
+#[cfg(windows)]
+fn assert_bytes_in_order(output: &[u8], needles: &[&[u8]]) {
+    let mut cursor = 0;
+    for needle in needles {
+        let Some(offset) = output[cursor..]
+            .windows(needle.len())
+            .position(|window| window == *needle)
+        else {
+            panic!(
+                "terminal output omitted ordered bytes {needle:?}; received {} bytes, tail: {}",
+                output.len(),
+                escaped_tail(output)
+            );
+        };
+        cursor += offset + needle.len();
+    }
+}
+
+fn assert_detach_restore(receiver: &Receiver<Vec<u8>>) {
+    #[cfg(unix)]
+    let _received_restore = collect_until_bytes(
+        receiver,
+        b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l",
+    );
+    #[cfg(windows)]
+    {
+        let received = collect_until_bytes(receiver, b"remuda: detached from target");
+        assert_bytes_in_order(
+            &received,
+            &[
+                b"echo $((6*7))-typed",
+                b"\x1b[?2004l",
+                b"42-typed",
+                b"remuda: detached from target",
+            ],
+        );
+    }
+}
+
+fn traced_input(path: &Path) -> Vec<u8> {
+    std::fs::read_to_string(path)
+        .expect("input trace file")
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .flat_map(|(_, bytes)| bytes.split_ascii_whitespace())
+        .map(|byte| u8::from_str_radix(byte, 16).expect("hex byte"))
+        .collect()
 }
 
 #[test]
@@ -392,29 +493,23 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     wait_for(&path, "target", "121-before");
 
     // The real binary, on a real pty, so raw mode is actually entered.
+    let trace_path = scratch_dir("attach-input-trace").join("input.hex");
+    let _ = std::fs::remove_file(&trace_path);
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
     cmd.arg("attach");
     cmd.arg("target");
     cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    cmd.env("REMUDA_TRACE_INPUT", &trace_path);
     let viewer = Session::new(
         "viewer",
         Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
+    let held = viewer.attach().expect("drive the viewer");
+    let viewer_output = held.subscribe().expect("capture raw terminal output");
 
     // 1. Repaint: what was already there arrives without the program redrawing.
-    let deadline = Instant::now() + PATIENCE;
-    loop {
-        let screen = viewer.screen_text().expect("viewer screen");
-        if screen.contains("121-before") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "attach did not repaint the existing screen. viewer saw:\n{screen}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for_session_screen(&viewer, "121-before");
 
     // #136: a scripted SendLine is not a human keystroke.
     let human_idle = || match client::request(&path, &Request::List) {
@@ -430,7 +525,6 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     assert_eq!(target_row(&path, "r.human_idle == math.huge"), "true");
 
     // 2. Keystrokes reach the far session, and its output comes back.
-    let held = viewer.attach().expect("drive the viewer");
     held.write_raw(b"echo $((6*7))-typed\r").expect("type");
     wait_for(&path, "target", "42-typed");
     // ...and the attached human's keystrokes are what `human_idle` counts,
@@ -461,6 +555,19 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     held.write_raw(&[client::DETACH]).expect("Ctrl-\\");
     drop(held);
 
+    assert_detach_restore(&viewer_output);
+    let traced = traced_input(&trace_path);
+    assert!(
+        traced
+            .windows(b"echo $((6*7))-typed\r".len())
+            .any(|window| { window == b"echo $((6*7))-typed\r" }),
+        "input trace omitted the typed bytes: {traced:?}"
+    );
+    assert!(
+        traced.contains(&client::DETACH),
+        "input trace omitted Ctrl-\\: {traced:?}"
+    );
+
     let resumed = client::request(
         &path,
         &Request::SendLine {
@@ -485,6 +592,33 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn session_listing_reports_the_child_mouse_tracking_mode() {
+    let path = scratch("mouse-tracking-list");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+
+    let listed = || match client::request(&path, &Request::List) {
+        Ok(Response::Sessions(sessions)) => sessions
+            .into_iter()
+            .find(|session| session.name == "target")
+            .expect("target is listed"),
+        other => panic!("list: {other:?}"),
+    };
+    assert!(!listed().mouse_tracking);
+
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "printf '\\033[?1000h'; printf 'ready-%s\\n' mode".into(),
+        },
+    )
+    .expect("enable mouse tracking");
+    wait_for(&path, "target", "ready-mode");
+    assert!(listed().mouse_tracking);
 }
 
 #[test]

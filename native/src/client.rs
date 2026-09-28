@@ -3,11 +3,65 @@
 use crate::ipc::{self, Stream, TryClone};
 use remuda_core::protocol::{Request, Response};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Detach key: Ctrl-\ (0x1C). Chosen because almost nothing binds it, unlike
 /// Ctrl-C/D/Z, which the attached program needs. Consumed, never forwarded.
 pub const DETACH: u8 = 0x1C;
+
+const RESET_INPUT_MODES: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
+
+fn reset_input_modes(output: &mut impl Write) -> std::io::Result<()> {
+    output.write_all(RESET_INPUT_MODES)
+}
+
+fn write_input_trace(output: &mut impl Write, at: SystemTime, bytes: &[u8]) -> std::io::Result<()> {
+    let elapsed = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    write!(
+        output,
+        "{}.{:09} ",
+        elapsed.as_secs(),
+        elapsed.subsec_nanos()
+    )?;
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            output.write_all(b" ")?;
+        }
+        write!(output, "{byte:02x}")?;
+    }
+    output.write_all(b"\n")
+}
+
+fn trace_input_read(path: Option<&Path>, bytes: &[u8]) {
+    let Some(path) = path else { return };
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let Ok(mut output) = options.open(path) else {
+        return;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = output.metadata() else {
+            return;
+        };
+        if metadata.permissions().mode() & 0o077 != 0
+            && output
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .is_err()
+        {
+            return;
+        }
+    }
+    let _ = write_input_trace(&mut output, SystemTime::now(), bytes);
+}
 
 /// Send one request and read one response.
 pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
@@ -56,6 +110,22 @@ fn interpret(line: &str) -> Response {
     }
 }
 
+/// Read one protocol line without buffering beyond it. The attach client keeps
+/// this exact Windows pipe handle for the output pump so its detach wake can
+/// cancel the pending read on the same handle.
+fn read_protocol_line(stream: &mut impl Read) -> std::io::Result<String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    while stream.read(&mut byte)? != 0 {
+        if byte[0] == b'\n' {
+            break;
+        }
+        line.push(byte[0]);
+    }
+    String::from_utf8(line)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 /// Every daemon deployed before any handshake existed can never announce its own
 /// version, so the client's reaction to the failure is the only diagnosis that
 /// reaches those users. See [`tests::the_cure_survives_an_eighty_column_crop`].
@@ -83,7 +153,7 @@ pub enum Left {
 /// session ends. Leaving does not disturb the session: the process keeps
 /// running and this direct attach never changes its size.
 pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
-    let stream = ipc::connect(path)?;
+    let mut stream = ipc::connect(path)?;
     send(
         &stream,
         &Request::Attach {
@@ -94,9 +164,7 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
     // The acknowledgement is read before raw mode goes on. Failing here must
     // leave the terminal exactly as we found it, and a raw terminal printing an
     // error message is how a tool loses a user's trust in one keystroke.
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+    let line = read_protocol_line(&mut stream)?;
     match interpret(&line) {
         Response::Ok => {}
         Response::Error(reason) => {
@@ -107,14 +175,25 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
 
     let _raw = RawMode::enable()?;
 
+    // The Windows wake must cancel the same HANDLE that owns the blocked read;
+    // cloning a named-pipe stream creates a different HANDLE. Share this one
+    // between the output pump and the key thread that may need to wake it.
+    let reader_stream = std::sync::Arc::new(stream);
+
     // Only the key thread can tell the two exits apart: the reader below just
     // sees the stream end, which is true of a detach and of a death alike.
     let detached = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let output_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let trace_input = std::env::var_os("REMUDA_TRACE_INPUT").map(PathBuf::from);
 
     // Keystrokes out, on their own thread; the screen pump runs here.
     let keys = std::thread::spawn({
-        let mut stream = stream.try_clone()?;
+        let mut stream = reader_stream.as_ref().try_clone()?;
+        let reader_stream = std::sync::Arc::clone(&reader_stream);
         let detached = std::sync::Arc::clone(&detached);
+        let output_stop = std::sync::Arc::clone(&output_stop);
+        let output_done = std::sync::Arc::clone(&output_done);
         move || {
             let mut stdin = std::io::stdin().lock();
             let mut buf = [0u8; 1024];
@@ -122,6 +201,7 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
                 if n == 0 {
                     break;
                 }
+                trace_input_read(trace_input.as_deref(), &buf[..n]);
                 match buf[..n].iter().position(|&b| b == DETACH) {
                     // Forward what was typed before the detach key, then stop.
                     // Dropping those bytes would silently swallow input the
@@ -142,13 +222,19 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
             // Ends the screen pump below, which then returns from `attach` and
             // drops every handle on this connection — that hang-up is what the
             // daemon reads as "the human left".
-            ipc::wake(&stream);
+            ipc::stop_reader(&reader_stream, &output_stop, || {
+                output_done.load(std::sync::atomic::Ordering::SeqCst)
+            });
         }
     });
 
     let mut stdout = std::io::stdout();
     let mut buf = [0u8; 8192];
-    while let Ok(n) = reader.read(&mut buf) {
+    let mut reader = reader_stream.as_ref();
+    while !output_stop.load(std::sync::atomic::Ordering::SeqCst) {
+        let Ok(n) = reader.read(&mut buf) else {
+            break;
+        };
         if n == 0 {
             break;
         }
@@ -157,7 +243,10 @@ pub fn attach(path: &Path, name: &str) -> std::io::Result<Left> {
         }
     }
 
-    ipc::wake(&stream);
+    output_done.store(true, std::sync::atomic::Ordering::SeqCst);
+    ipc::stop_reader(&reader_stream, &output_stop, || {
+        output_done.load(std::sync::atomic::Ordering::SeqCst)
+    });
     let left = if detached.load(std::sync::atomic::Ordering::SeqCst) {
         Left::Detached
     } else {
@@ -285,20 +374,71 @@ impl Drop for RawMode {
     /// Leave the alternate screen *before* termios goes back, so the last thing
     /// the terminal does in raw mode is the buffer switch.
     fn drop(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = reset_input_modes(&mut stdout);
         let _ = crossterm::execute!(
-            std::io::stdout(),
+            stdout,
             crossterm::cursor::Show,
             crossterm::terminal::LeaveAlternateScreen,
             crossterm::cursor::Show
         );
+        // Keep the protocol reset and alternate-screen exit ordered on the
+        // terminal before process shutdown, including on Windows where stdout
+        // may still have buffered writes at this point.
+        let _ = stdout.flush();
         let _ = crossterm::terminal::disable_raw_mode();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::interpret;
+    use super::{
+        interpret, reset_input_modes, trace_input_read, write_input_trace, RESET_INPUT_MODES,
+    };
     use remuda_core::protocol::Response;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn detach_resets_mouse_and_bracketed_paste_modes() {
+        let mut output = Vec::new();
+        reset_input_modes(&mut output).unwrap();
+        assert_eq!(output, RESET_INPUT_MODES);
+    }
+
+    #[test]
+    fn input_trace_records_a_timestamp_and_each_byte_as_hex() {
+        let mut output = Vec::new();
+        // Windows SystemTime has 100 ns precision, so keep the fixture on that
+        // clock's representable grid as well.
+        let at = UNIX_EPOCH + Duration::new(7, 420_000_000);
+        write_input_trace(&mut output, at, b"\x1b\xff").unwrap();
+        assert_eq!(output, b"7.420000000 1b ff\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_trace_is_private_when_created_and_when_reusing_a_loose_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "remuda-input-trace-mode-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        trace_input_read(Some(&path), b"secret");
+        let private_mode = || std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(private_mode() & 0o077, 0, "new trace file must be private");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        trace_input_read(Some(&path), b"secret again");
+        assert_eq!(
+            private_mode() & 0o077,
+            0,
+            "existing trace file must be made private"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 
     /// The line the daemon at 618cda4^ actually sent, byte for byte.
     const STALE: &str =

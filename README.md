@@ -58,6 +58,11 @@ instead — its last screen is the evidence for why it died.
 remuda enters the alternate screen, so **leaving looks like leaving**: your own
 scrollback and prompt come back, and a line says how to get back.
 
+To record the bytes your terminal sends while attached, set
+`REMUDA_TRACE_INPUT=/tmp/remuda-input.hex` before `remuda attach NAME`. Remuda
+appends one line per input read, with a Unix timestamp and the bytes in
+lowercase hexadecimal. This helps diagnose terminal-specific wheel behavior.
+
 ## Install
 
 No stable release has been published yet (see [Channels](#channels) below),

@@ -71,6 +71,7 @@ fn row(name: &str, alive: bool, attached: bool) -> SessionSummary {
         size: Size::new(80, 24),
         attached,
         human_idle: None,
+        mouse_tracking: false,
     }
 }
 
@@ -289,7 +290,9 @@ fn a_click_in_the_pane_region_with_nothing_attached_is_a_no_op() {
 
 #[test]
 fn shift_wheel_is_forwarded_to_the_child_tui() {
-    let mut ui = make_ui(vec![row("a", true, false)]);
+    let mut session = row("a", true, false);
+    session.mouse_tracking = true;
+    let mut ui = make_ui(vec![session]);
     ui.on_key(press(KeyCode::Enter));
     let wheel = MouseEvent {
         kind: MouseEventKind::ScrollDown,
