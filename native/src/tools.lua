@@ -199,10 +199,189 @@ function remuda.cancel(handle)
 end
 register("cancel", "Cancel a schedule by the handle `schedule()` returned.", "cancel(handle) -> nil")
 
+local pending_expects = {}
+local expect_clock_now
+local function branch_matches(branch, screen)
+  local matcher = branch.match
+  if type(matcher) == "function" then return not not matcher(screen) end
+  if type(matcher) == "string" then return screen:find(matcher) ~= nil end
+  return false
+end
+local function run_expect_action(branch, screen, handle)
+  local action = branch.action
+  if type(action) == "function" then return action(screen, handle) end
+  if type(action) == "string" then action = { action } end
+  if type(action) == "table" then
+    for _, key in ipairs(action) do remuda.key(handle.session, key) end
+    return
+  end
+  if action ~= nil then error("expect branch action must be a function or key list", 0) end
+end
+
+-- One step is kept separate from the wake-up source: the current driver is
+-- the one-second clock below, and a future PTY output event can call this same
+-- function without changing remuda.expect's API.
+local function expect_step(handle, now)
+  local state, options = handle.state, handle.options
+  if state.status ~= "pending" then return state.status, state.branch, state.screen end
+  state.last_result = nil
+  if now == nil and options.now then
+    local ok, value = pcall(options.now)
+    if not ok then
+      state.status, state.error = "error", value
+      if options.on_error then pcall(options.on_error, value, handle) end
+      return state.status, nil, nil
+    end
+    now = value
+  end
+  now = now or expect_clock_now or 0
+  if not state.deadline then
+    state.deadline = now + handle.timeout
+    state.next_at = now + (tonumber(options.interval) or 1)
+    return "waiting"
+  end
+  if now < state.next_at then return "waiting" end
+  local capture = options.capture or remuda.capture
+  local captured, screen = pcall(capture, handle.session)
+  if not captured then
+    state.status, state.error = "error", screen
+    if options.on_error then pcall(options.on_error, screen, handle) end
+    return state.status, nil, nil
+  end
+  if type(screen) ~= "string" then
+    state.status, state.error = "error", "capture did not return a screen string"
+    if options.on_error then pcall(options.on_error, state.error, handle) end
+    return state.status, nil, nil
+  end
+  local matched_disarmed = false
+  for index, branch in ipairs(handle.branches) do
+    local ok, matched = pcall(branch_matches, branch, screen)
+    if not ok then
+      state.status, state.error = "error", matched
+      if options.on_error then pcall(options.on_error, matched, handle) end
+      return state.status, nil, screen
+    end
+    if not matched and state.disarmed then
+      state.disarmed[index] = nil
+    elseif matched then
+      if branch.continue and state.disarmed and state.disarmed[index] then
+        matched_disarmed = true
+      else
+        local ran, err = pcall(run_expect_action, branch, screen, handle)
+        if not ran then
+          state.status, state.error = "error", err
+          if options.on_error then pcall(options.on_error, err, handle) end
+          return state.status, nil, screen
+        end
+        state.screen, state.branch, state.last_screen = screen, branch.id or index, screen
+        if branch.continue then
+          state.disarmed = state.disarmed or {}
+          state.disarmed[index] = true
+          state.next_at = now + (tonumber(options.interval) or 1)
+          state.last_result = "continue"
+          return "continue", state.branch, screen
+        end
+        state.status = "matched"
+        return state.status, state.branch, screen
+      end
+    end
+  end
+  if not matched_disarmed then
+    local unknown = options.unknown
+    local unknown_ok, is_unknown = pcall(function()
+      return (type(unknown) == "function" and unknown(screen))
+        or (type(unknown) == "string" and screen:find(unknown) ~= nil)
+    end)
+    if not unknown_ok then
+      state.status, state.error = "error", is_unknown
+      if options.on_error then pcall(options.on_error, is_unknown, handle) end
+      return state.status, nil, screen
+    end
+    if is_unknown then
+      state.status, state.screen, state.last_screen = "unknown", screen, screen
+      if options.on_unknown then
+        local ok, err = pcall(options.on_unknown, screen, handle)
+        if not ok then state.error = err end
+      end
+      return state.status, nil, screen
+    end
+    state.last_screen = screen
+  end
+  if now >= state.deadline then
+    state.status, state.screen = "timeout", screen
+    if options.on_timeout then
+      local ok, err = pcall(options.on_timeout, screen, handle)
+      if not ok then state.error = err end
+    end
+    return state.status, nil, screen
+  end
+  state.next_at = now + (tonumber(options.interval) or 1)
+  return "waiting", nil, screen
+end
+function remuda.expect(session, branches, options)
+  if type(session) ~= "string" or session == "" then error("expect needs a session name", 2) end
+  if type(branches) ~= "table" or #branches == 0 then error("expect needs at least one branch", 2) end
+  options = options or {}
+  if type(options) ~= "table" then error("expect options must be a table", 2) end
+  local timeout = tonumber(options.timeout) or 30
+  local interval = tonumber(options.interval) or 1
+  if timeout <= 0 or interval <= 0 then error("expect timeout and interval must be positive", 2) end
+  local handle = {
+    session = session,
+    branches = branches,
+    options = options,
+    timeout = timeout,
+    state = { status = "pending" },
+  }
+  function handle:cancel()
+    if self.state.status == "pending" then self.state.status = "cancelled" end
+  end
+  pending_expects[#pending_expects + 1] = handle
+  return handle
+end
+register("expect", "Watch a session asynchronously. Branches match a Lua pattern or predicate and run a key list or callback; `continue` keeps watching. Options accept a bounded timeout and unknown-screen matcher/callback.", "expect(session, branches, options?) -> handle")
+
+local function expect_tick(now)
+  expect_clock_now = now or expect_clock_now or 0
+  local keep = {}
+  for _, handle in ipairs(pending_expects) do
+    if handle.state.status == "pending" then
+      local ok, err = pcall(expect_step, handle, now)
+      if not ok then
+        handle.state.status, handle.state.error = "error", err
+        if handle.options.on_error then pcall(handle.options.on_error, err, handle) end
+      end
+      if handle.state.status == "pending" then keep[#keep + 1] = handle end
+    end
+  end
+  pending_expects = keep
+end
+function remuda.expect_option(screen, matches)
+  if type(screen) ~= "string" or type(matches) ~= "function" then return nil end
+  local found
+  for line in (screen .. "\n"):gmatch("(.-)\n") do
+    line = line:gsub("^%s*[│┃]%s*", ""):gsub("^%s*[❯›>]%s*", "")
+    local number, label = line:match("^%s*(%d+)[%.)]%s*(.-)%s*$")
+    if number and matches(label) then
+      if found then return nil end
+      found = number
+    end
+  end
+  return found
+end
+register("expect_option", "Pick a unique numbered menu option by its label.", "expect_option(screen, label_predicate) -> number|nil")
+
 -- Called once per native tick with the current time (seconds, native's
 -- clock). Fires every schedule whose own interval has elapsed since ITS OWN
 -- last run — native never sees or compares an individual interval itself.
 function remuda._run_due_schedules(now)
+  -- Expectations are advanced from the same native one-second clock. A
+  -- future PTY output event may call this local directly to reduce latency.
+  local expect_ok, expect_err = pcall(expect_tick, now)
+  if not expect_ok and io and io.stderr then
+    io.stderr:write("remuda.expect tick failed: " .. tostring(expect_err) .. "\n")
+  end
+  local schedule_now = now or expect_clock_now or 0
   -- Snapshot the handles, as `emit` does: a run() that schedules must not add
   -- keys mid-`pairs` (undefined in Lua). A cancel mid-tick still takes effect.
   local handles = {}
@@ -211,8 +390,8 @@ function remuda._run_due_schedules(now)
   end
   for _, handle in ipairs(handles) do
     local schedule = remuda.schedules[handle]
-    if schedule and now - schedule.last_run >= schedule.every then
-      schedule.last_run = now
+    if schedule and schedule_now - schedule.last_run >= schedule.every then
+      schedule.last_run = schedule_now
       if schedule.name then
         remuda._schedule_fire_counts[schedule.name] = (remuda._schedule_fire_counts[schedule.name] or 0) + 1
       end
@@ -1485,7 +1664,7 @@ remuda.tool({
     local screen
     for _ = 1, math.max(1, math.ceil(seconds / 0.1)) do
       screen = remuda.capture(a.session)
-      if screen:find(a.pattern) then
+      if branch_matches({ match = a.pattern }, screen) then
         return screen
       end
       remuda.sleep(0.1)
