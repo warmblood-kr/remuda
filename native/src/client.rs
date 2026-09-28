@@ -36,13 +36,30 @@ fn write_input_trace(output: &mut impl Write, at: SystemTime, bytes: &[u8]) -> s
 
 fn trace_input_read(path: Option<&Path>, bytes: &[u8]) {
     let Some(path) = path else { return };
-    let Ok(mut output) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    else {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let Ok(mut output) = options.open(path) else {
         return;
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = output.metadata() else {
+            return;
+        };
+        if metadata.permissions().mode() & 0o077 != 0
+            && output
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .is_err()
+        {
+            return;
+        }
+    }
     let _ = write_input_trace(&mut output, SystemTime::now(), bytes);
 }
 
@@ -338,7 +355,9 @@ impl Drop for RawMode {
 
 #[cfg(test)]
 mod tests {
-    use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
+    use super::{
+        interpret, reset_input_modes, trace_input_read, write_input_trace, RESET_INPUT_MODES,
+    };
     use remuda_core::protocol::Response;
     use std::time::{Duration, UNIX_EPOCH};
 
@@ -355,6 +374,31 @@ mod tests {
         let at = UNIX_EPOCH + Duration::new(7, 42);
         write_input_trace(&mut output, at, b"\x1b\xff").unwrap();
         assert_eq!(output, b"7.000000042 1b ff\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn input_trace_is_private_when_created_and_when_reusing_a_loose_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "remuda-input-trace-mode-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        trace_input_read(Some(&path), b"secret");
+        let private_mode = || std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(private_mode() & 0o077, 0, "new trace file must be private");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        trace_input_read(Some(&path), b"secret again");
+        assert_eq!(
+            private_mode() & 0o077,
+            0,
+            "existing trace file must be made private"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     /// The line the daemon at 618cda4^ actually sent, byte for byte.
