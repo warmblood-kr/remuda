@@ -1049,7 +1049,12 @@ fn attach(
                         // or fails. Busy means no write was queued; every other
                         // error may follow a partial write and ends this pump.
                         match forward_attach_input(
-                            || held.write_raw(&buf[..n]),
+                            || {
+                                held.write_raw_while(&buf[..n], &|| {
+                                    stop.load(std::sync::atomic::Ordering::SeqCst)
+                                        || held.is_displaced()
+                                })
+                            },
                             || {
                                 stop.load(std::sync::atomic::Ordering::SeqCst)
                                     || held.is_displaced()

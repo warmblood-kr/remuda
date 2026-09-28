@@ -367,14 +367,23 @@ impl Session {
     /// The one place that touches the backend. PTY handles wait without the
     /// process mutex; callers hold `input_lock` except an attachment writer.
     fn write_one_burst(&self, bytes: &[u8]) -> Result<()> {
-        self.write_one_burst_with(bytes, false)
+        self.write_one_burst_with(bytes, false, &|| false)
     }
 
-    fn write_one_burst_to_completion(&self, bytes: &[u8]) -> Result<()> {
-        self.write_one_burst_with(bytes, true)
+    fn write_one_burst_to_completion_while(
+        &self,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.write_one_burst_with(bytes, true, cancelled)
     }
 
-    fn write_one_burst_with(&self, bytes: &[u8], wait_to_completion: bool) -> Result<()> {
+    fn write_one_burst_with(
+        &self,
+        bytes: &[u8],
+        wait_to_completion: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
         let writer = {
             let mut agent = self
                 .agent
@@ -387,7 +396,7 @@ impl Session {
         };
         let result = if let Some(writer) = writer {
             if wait_to_completion {
-                writer.write_to_completion(bytes)
+                writer.write_to_completion_while(bytes, cancelled)
             } else {
                 writer.write_bounded(bytes)
             }
@@ -645,19 +654,29 @@ impl Attached<'_> {
     /// Type exactly these bytes. No Enter is appended: the human sends their
     /// own, and inventing one here would submit a half-typed line.
     pub fn write_raw(&self, bytes: &[u8]) -> Result<()> {
-        let slot = self
-            .session
-            .attach_slot
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if self.is_displaced()
-            || !slot
-                .as_ref()
-                .is_some_and(|(generation, _)| *generation == self.generation)
+        self.write_raw_while(bytes, &|| false)
+    }
+
+    /// Type these bytes unless this attachment is displaced or the caller
+    /// stops waiting. The attachment slot is held only for generation
+    /// validation, never across a potentially stalled PTY write.
+    pub fn write_raw_while(&self, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
         {
-            return Err(AgentError::Attached);
+            let slot = self
+                .session
+                .attach_slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if self.is_displaced()
+                || !slot
+                    .as_ref()
+                    .is_some_and(|(generation, _)| *generation == self.generation)
+            {
+                return Err(AgentError::Attached);
+            }
         }
-        self.session.write_one_burst_to_completion(bytes)?;
+        self.session
+            .write_one_burst_to_completion_while(bytes, &|| self.is_displaced() || cancelled())?;
         // Only after the write lands, as `last_input_at` is.
         if let Ok(mut at) = self.session.last_human_input_at.lock() {
             *at = Some(self.session.clock.now());

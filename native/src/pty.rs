@@ -129,13 +129,27 @@ impl AgentWriter for PtyInputWriter {
     }
 
     fn write_to_completion(&self, bytes: &[u8]) -> Result<()> {
+        self.write_to_completion_while(bytes, &|| false)
+    }
+
+    fn write_to_completion_while(&self, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
         loop {
+            if cancelled() {
+                return Err(AgentError::Attached);
+            }
             match self.submit(bytes) {
-                Ok(receiver) => {
-                    return receiver
-                        .recv()
-                        .map_err(|_| AgentError::Io("pty writer worker stopped".into()))?;
-                }
+                Ok(receiver) => loop {
+                    if cancelled() {
+                        return Err(AgentError::Attached);
+                    }
+                    match receiver.recv_timeout(Duration::from_millis(10)) {
+                        Ok(result) => return result,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            return Err(AgentError::Io("pty writer worker stopped".into()));
+                        }
+                    }
+                },
                 Err(AgentError::Busy) => std::thread::sleep(Duration::from_millis(10)),
                 Err(error) => return Err(error),
             }
