@@ -9,24 +9,34 @@ use std::fmt;
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DEPTH: usize = 64;
+const MAX_VALUES: usize = 100_000;
 
-struct JsonSeed {
+struct JsonSeed<'a> {
     depth: usize,
+    values: &'a mut usize,
 }
 
-struct JsonVisitor {
+struct JsonVisitor<'a> {
     depth: usize,
+    values: &'a mut usize,
 }
 
-impl<'de> DeserializeSeed<'de> for JsonSeed {
+impl<'de> DeserializeSeed<'de> for JsonSeed<'_> {
     type Value = Json;
 
     fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Json, D::Error> {
-        deserializer.deserialize_any(JsonVisitor { depth: self.depth })
+        if *self.values >= MAX_VALUES {
+            return Err(D::Error::custom("maximum JSON value count exceeded"));
+        }
+        *self.values += 1;
+        deserializer.deserialize_any(JsonVisitor {
+            depth: self.depth,
+            values: self.values,
+        })
     }
 }
 
-impl<'de> Visitor<'de> for JsonVisitor {
+impl<'de> Visitor<'de> for JsonVisitor<'_> {
     type Value = Json;
 
     fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -72,6 +82,7 @@ impl<'de> Visitor<'de> for JsonVisitor {
         let mut values = Vec::new();
         while let Some(value) = access.next_element_seed(JsonSeed {
             depth: self.depth + 1,
+            values: &mut *self.values,
         })? {
             values.push(value);
         }
@@ -88,6 +99,7 @@ impl<'de> Visitor<'de> for JsonVisitor {
             }
             let value = access.next_value_seed(JsonSeed {
                 depth: self.depth + 1,
+                values: &mut *self.values,
             })?;
             values.insert(key, value);
         }
@@ -95,7 +107,7 @@ impl<'de> Visitor<'de> for JsonVisitor {
     }
 }
 
-impl JsonVisitor {
+impl JsonVisitor<'_> {
     fn check_depth<E: de::Error>(&self) -> Result<(), E> {
         if self.depth >= MAX_DEPTH {
             Err(E::custom("maximum nesting depth exceeded"))
@@ -110,15 +122,19 @@ fn parse(bytes: &[u8]) -> Result<Json, String> {
         return Err(format!("input exceeds {MAX_BYTES} bytes"));
     }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let value = JsonSeed { depth: 0 }
-        .deserialize(&mut deserializer)
-        .map_err(|error| {
-            if error.to_string().contains("duplicate key") {
-                "duplicate key".to_string()
-            } else {
-                error.to_string()
-            }
-        })?;
+    let mut values = 0;
+    let value = JsonSeed {
+        depth: 0,
+        values: &mut values,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|error| {
+        if error.to_string().contains("duplicate key") {
+            "duplicate key".to_string()
+        } else {
+            error.to_string()
+        }
+    })?;
     deserializer.end().map_err(|error| error.to_string())?;
     Ok(value)
 }
@@ -222,6 +238,17 @@ fn table_kind(
     }
 }
 
+fn ensure_taggable(table: &Table, array_mt: &Table, object_mt: &Table) -> mlua::Result<()> {
+    if let Some(metatable) = table.metatable() {
+        if metatable != *array_mt && metatable != *object_mt {
+            return Err(runtime_error(
+                "cannot replace a table's existing non-JSON metatable",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn to_json(
     value: Value,
     depth: usize,
@@ -278,7 +305,17 @@ fn table_to_json(
     if kind == Some(TableKind::Array) || (kind.is_none() && is_dense_array(&entries)) {
         return encode_array(entries, depth, array_mt, object_mt, state);
     }
+    if kind.is_none() && has_only_positive_integer_keys(&entries) {
+        return Err(runtime_error("sparse arrays cannot be encoded as JSON"));
+    }
     encode_object(entries, kind, depth, array_mt, object_mt, state)
+}
+
+fn has_only_positive_integer_keys(entries: &[(Value, Value)]) -> bool {
+    !entries.is_empty()
+        && entries
+            .iter()
+            .all(|(key, _)| matches!(key, Value::Integer(index) if *index > 0))
 }
 
 fn is_dense_array(entries: &[(Value, Value)]) -> bool {
@@ -377,16 +414,20 @@ pub fn bindings(lua: &Lua) -> mlua::Result<Table> {
     let array_tag = array_mt.clone();
     let object_tag = object_mt.clone();
     namespace.set("null", Value::NULL)?;
+    let object_tag_for_array = object_mt.clone();
     namespace.set(
         "array",
         lua.create_function(move |_, table: Table| {
+            ensure_taggable(&table, &array_tag, &object_tag_for_array)?;
             table.set_metatable(Some(array_tag.clone()))?;
             Ok(table)
         })?,
     )?;
+    let array_tag_for_object = array_mt.clone();
     namespace.set(
         "object",
         lua.create_function(move |_, table: Table| {
+            ensure_taggable(&table, &array_tag_for_object, &object_tag)?;
             table.set_metatable(Some(object_tag.clone()))?;
             Ok(table)
         })?,
