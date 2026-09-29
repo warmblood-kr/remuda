@@ -1579,8 +1579,9 @@ fn attach(
         out.flush()?;
     }
 
-    // The socket reader and PTY writer are separate pumps. A blocked PTY write
-    // must not keep the socket reader from observing EOF and ending this guard.
+    // The socket reader and PTY writer are separate pumps. The bounded handoff
+    // preserves buffers under backpressure; ordinary EOF closes the channel so
+    // the writer drains those buffers before ending the guard.
     //
     // Measured, not foreseen: without this, detaching left the output pump
     // parked on recv() from an idle shell, the scope never closed, the guard

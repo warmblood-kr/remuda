@@ -1184,8 +1184,10 @@ fn attached_slow_reader_accepts_a_paste_larger_than_the_input_queue() {
     let socket = daemon::socket_path_in(&runtime, "s");
     let _daemon = daemon_at(&socket);
     let capture_path = runtime.join("typed-bytes");
+    let ready_path = runtime.join("reader-ready");
     let mut env = std::collections::HashMap::new();
     env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    env.insert("READY_PATH".into(), ready_path.display().to_string());
     let response = client::request(
         &socket,
         &Request::New {
@@ -1193,7 +1195,7 @@ fn attached_slow_reader_accepts_a_paste_larger_than_the_input_queue() {
             command: vec![
                 "sh".into(),
                 "-c".into(),
-                "stty raw -echo; i=0; while [ \"$i\" -lt 192 ]; do head -c 64 >>\"$CAPTURE_PATH\"; i=$((i+1)); sleep 0.05; done".into(),
+                "stty raw -echo; : >\"$READY_PATH\"; i=0; while [ \"$i\" -lt 192 ]; do dd bs=64 count=1 2>/dev/null >>\"$CAPTURE_PATH\"; i=$((i+1)); sleep 0.05; done; while :; do sleep 1; done".into(),
             ],
             size: Size::new(80, 24),
             cwd: None,
@@ -1202,6 +1204,14 @@ fn attached_slow_reader_accepts_a_paste_larger_than_the_input_queue() {
     )
     .expect("start slow raw reader");
     assert!(matches!(response, Response::Value(_)));
+    let ready_deadline = Instant::now() + PATIENCE;
+    while !ready_path.exists() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "slow reader did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     let mut stream = raw_attach(&socket, "target");
     let expected = vec![b'x'; 12_288];
@@ -1222,7 +1232,9 @@ fn attached_slow_reader_accepts_a_paste_larger_than_the_input_queue() {
         );
         assert!(
             Instant::now() < deadline,
-            "slow reader did not receive the paste"
+            "slow reader did not receive the paste (captured {} of {} bytes)",
+            std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+            expected.len()
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -1249,8 +1261,10 @@ fn attach_eof_drains_input_already_read_by_the_key_pump() {
     let socket = daemon::socket_path_in(&runtime, "s");
     let _daemon = daemon_at(&socket);
     let capture_path = runtime.join("typed-bytes");
+    let ready_path = runtime.join("reader-ready");
     let mut env = std::collections::HashMap::new();
     env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    env.insert("READY_PATH".into(), ready_path.display().to_string());
     let response = client::request(
         &socket,
         &Request::New {
@@ -1258,7 +1272,7 @@ fn attach_eof_drains_input_already_read_by_the_key_pump() {
             command: vec![
                 "sh".into(),
                 "-c".into(),
-                "stty raw -echo; sleep 0.1; head -c 12288 >\"$CAPTURE_PATH\"".into(),
+                "stty raw -echo; : >\"$READY_PATH\"; sleep 0.1; head -c 12288 >\"$CAPTURE_PATH\"; while :; do sleep 1; done".into(),
             ],
             size: Size::new(80, 24),
             cwd: None,
@@ -1267,6 +1281,14 @@ fn attach_eof_drains_input_already_read_by_the_key_pump() {
     )
     .expect("start gated raw reader");
     assert!(matches!(response, Response::Value(_)));
+    let ready_deadline = Instant::now() + PATIENCE;
+    while !ready_path.exists() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "gated reader did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     let mut stream = raw_attach(&socket, "target");
     let expected = vec![b'y'; 12_288];
