@@ -38,6 +38,11 @@ fn main() -> ExitCode {
         Err(error) => return fail(error),
     };
     let argv: Vec<&str> = rest.iter().map(String::as_str).collect();
+
+    if let Some(exit) = run_internal_command(&argv) {
+        return exit;
+    }
+
     let path = daemon::socket_path(server);
 
     let skew = match prepare_command(&argv, &path) {
@@ -86,19 +91,11 @@ fn main() -> ExitCode {
         ["stop", rest @ ..] => stop(server, &path, rest),
 
         ["ls"] => with_existing_daemon(server, &path, list_sessions),
+        ["resize", rest @ ..] => resize_command(server, &path, rest),
 
         ["run", rest @ ..] => run_session(server, &path, rest),
 
-        ["send", name, text @ ..] => {
-            let text = text.join(" ");
-            with_daemon(server, &path, |path| {
-                let request = Request::SendLine {
-                    name: name.to_string(),
-                    text: text.clone(),
-                };
-                simple_request(path, request)
-            })
-        }
+        ["send", name, text @ ..] => send_command(server, &path, name, text),
 
         ["attach", name] => with_daemon(server, &path, |path| ride(path, name)),
         ["attach", name, "--mouse=false"] => {
@@ -284,6 +281,7 @@ remuda — terminal orchestration for coding agents
                                  Ctrl-] toggles mouse; wheel scrolls history
                                  --mouse=false disables mouse handling (before or after NAME)
   remuda ls | send NAME TEXT     inspect or message sessions
+  remuda resize NAME COLS ROWS   resize a session (cols 20..1000, rows 24..500)
   remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon (sessions are lost)
 
   remuda mod install OWNER/REPO  install a mod from GitHub
@@ -1456,6 +1454,86 @@ fn run_upgrade(args: &[&str]) -> ExitCode {
     }
 }
 
+fn send_command(server: &str, path: &Path, name: &str, text: &[&str]) -> ExitCode {
+    let text = text.join(" ");
+    with_daemon(server, path, |path| {
+        let request = Request::SendLine {
+            name: name.to_string(),
+            text: text.clone(),
+        };
+        simple_request(path, request)
+    })
+}
+
+/// Commands used by release automation must not start a daemon or run update checks.
+fn run_internal_command(argv: &[&str]) -> Option<ExitCode> {
+    match argv {
+        ["_latest-index", args @ ..] => Some(run_latest_index(args)),
+        _ => None,
+    }
+}
+
+/// Internal release-workflow command. Reuse dist::is_newer so publication and
+/// update notices order channel versions identically.
+fn run_latest_index(args: &[&str]) -> ExitCode {
+    let [file, channel, version, updated] = args else {
+        return fail("usage: remuda _latest-index FILE CHANNEL VERSION UPDATED");
+    };
+    let (file, channel, version, updated) = (*file, *channel, *version, *updated);
+    if !dist::is_channel(channel) {
+        return fail(format!("unknown channel {channel:?} — stable or nightly"));
+    }
+
+    let result = (|| -> Result<&'static str, String> {
+        let path = Path::new(file);
+        let text = fs::read_to_string(path)
+            .map_err(|error| format!("cannot read latest index {}: {error}", path.display()))?;
+        let mut index: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| format!("cannot parse latest index {}: {error}", path.display()))?;
+        let object = index
+            .as_object_mut()
+            .ok_or_else(|| "latest index must be a JSON object".to_string())?;
+        let current = object
+            .get(channel)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        if version == current {
+            eprintln!("remuda: latest.json {channel} already points to {version}");
+            return Ok("publish=already");
+        }
+        if !dist::is_newer(version, current) {
+            eprintln!(
+                "remuda: latest.json {channel} is already {current}; skipping stale candidate {version}"
+            );
+            return Ok("publish=false");
+        }
+
+        object.insert(
+            channel.to_string(),
+            serde_json::Value::String(version.to_string()),
+        );
+        object.insert(
+            "updated".to_string(),
+            serde_json::Value::String(updated.to_string()),
+        );
+        let mut output = serde_json::to_vec_pretty(&index)
+            .map_err(|error| format!("cannot encode latest index: {error}"))?;
+        output.push(b'\n');
+        fs::write(path, output)
+            .map_err(|error| format!("cannot write latest index {}: {error}", path.display()))?;
+        Ok("publish=true")
+    })();
+
+    match result {
+        Ok(status) => {
+            println!("{status}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error),
+    }
+}
+
 /// `--channel <name>` or nothing, in which case the installed channel file
 /// decides. An unknown flag is refused rather than ignored.
 fn upgrade_channel<'a>(args: &[&'a str]) -> Result<Option<&'a str>, String> {
@@ -1488,6 +1566,14 @@ fn split_stdin_flag(args: &[String]) -> Result<(bool, &[String]), &'static str> 
         }
         [flag, ..] if flag == "--stdin" => {
             Err("--stdin is only valid before an installed mod command")
+        }
+        [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
+            let options = rest.split(|arg| arg == "--").next().unwrap_or(rest);
+            if options.iter().any(|arg| arg == "--stdin") {
+                Err("usage: remuda --stdin MOD [ARGS…] (put --stdin before the mod command)")
+            } else {
+                Ok((false, args))
+            }
         }
         _ => Ok((false, args)),
     }
@@ -1692,7 +1778,11 @@ fn extension_command(
         .collect::<Vec<_>>()
         .join(", ");
     let env = caller_env(std::env::vars());
-    let stdin_opted_in = stdin_enabled || args.contains(&"-");
+    let stdin_opted_in = stdin_enabled
+        || args
+            .iter()
+            .take_while(|argument| **argument != "--")
+            .any(|argument| *argument == "-");
     let stdin = if stdin_opted_in {
         const MAX_CALLER_STDIN: usize = 1024 * 1024;
         let mut bytes = Vec::new();
@@ -1965,6 +2055,50 @@ fn list_sessions(path: &Path) -> ExitCode {
         }
         other => fail(describe(other)),
     }
+}
+
+fn resize_session(path: &Path, name: &str, cols: &str, rows: &str) -> ExitCode {
+    use remuda_core::Size;
+    let parsed = cols
+        .parse::<u16>()
+        .ok()
+        .zip(rows.parse::<u16>().ok())
+        .filter(|(cols, rows)| {
+            (Size::MIN_RESIZE_COLS..=Size::MAX_RESIZE_COLS).contains(cols)
+                && (Size::MIN_ROWS..=Size::MAX_RESIZE_ROWS).contains(rows)
+        });
+    let Some((cols, rows)) = parsed else {
+        eprintln!(
+            "resize dimensions must be integers: cols {}..{}, rows {}..{}",
+            Size::MIN_RESIZE_COLS,
+            Size::MAX_RESIZE_COLS,
+            Size::MIN_ROWS,
+            Size::MAX_RESIZE_ROWS
+        );
+        return ExitCode::from(2);
+    };
+    let size = if cols < Size::MIN_COLS {
+        Size::for_pane(cols, rows)
+    } else {
+        Size::new(cols, rows)
+    };
+    let request = Request::Resize {
+        name: name.to_string(),
+        size,
+    };
+    match remuda_native::client::request(path, &request) {
+        Ok(Response::Ok) => ExitCode::SUCCESS,
+        Ok(Response::Error(error)) => fail(error),
+        other => fail(format!("resize failed: {}", describe(other))),
+    }
+}
+
+fn resize_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let [name, cols, rows] = args else {
+        eprintln!("usage: remuda resize NAME COLS ROWS (cols 20..1000, rows 24..500)");
+        return ExitCode::from(2);
+    };
+    with_existing_daemon(server, path, |path| resize_session(path, name, cols, rows))
 }
 
 /// Evaluate one chunk in the daemon's image and print what it came to. Nothing
@@ -2622,6 +2756,10 @@ fn simple_request(path: &Path, request: Request) -> ExitCode {
 fn describe(response: std::io::Result<Response>) -> String {
     match response {
         Ok(Response::Error(reason)) => reason,
+        Ok(Response::Busy) => "session input is busy".into(),
+        Ok(Response::WriteTimeout) => {
+            "session PTY write timed out; delivery may be partial or late".into()
+        }
         Ok(other) => format!("unexpected response: {other:?}"),
         Err(e) => e.to_string(),
     }
@@ -2662,6 +2800,15 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_timeout_has_a_user_facing_diagnostic() {
+        assert_eq!(
+            describe(Ok(Response::WriteTimeout)),
+            "session PTY write timed out; delivery may be partial or late"
+        );
+        assert_eq!(describe(Ok(Response::Busy)), "session input is busy");
+    }
 
     #[test]
     fn a_failed_daemon_start_includes_its_stderr() {

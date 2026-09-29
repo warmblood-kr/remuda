@@ -1856,23 +1856,11 @@ fn attach(
     } else {
         Response::Ok
     };
-    reply(&stream, &acknowledgement)?;
+    let mut out = attach_output(&stream, &acknowledgement, &held)?;
 
-    // Paint what is already on screen before streaming anything new, or the
-    // viewer sees a blank terminal until the program next redraws.
-    let mut out = stream.try_clone()?;
-    if let Ok(painted) = held.screen_bytes() {
-        out.write_all(&painted)?;
-        out.flush()?;
-    }
-
-    // Scoped threads, so the single exclusive guard can be shared with the
-    // input pump rather than cloned or re-taken. There is still exactly one
-    // `Attached` in existence, which is the invariant that makes raw writes
-    // safe in the first place.
-    // The two pumps block on *different* things — one on the socket, one on the
-    // pty — so neither can be woken by the other's end-of-stream. A shared flag
-    // plus a bounded wait is what lets either side end the attachment.
+    // The socket reader and PTY writer are separate pumps. The bounded handoff
+    // preserves buffers under backpressure; ordinary EOF closes the channel so
+    // the writer drains those buffers before ending the guard.
     //
     // Measured, not foreseen: without this, detaching left the output pump
     // parked on recv() from an idle shell, the scope never closed, the guard
@@ -1880,6 +1868,8 @@ fn attach(
     // already gone. The core got "a human is attached" forever.
     let done = std::sync::atomic::AtomicBool::new(false);
     let done = &done;
+    let reader_eof = std::sync::atomic::AtomicBool::new(false);
+    let reader_eof = &reader_eof;
     let input_failed = std::sync::atomic::AtomicBool::new(false);
     let input_failed = &input_failed;
     // Checked before every read of the key pump below, not just its first —
@@ -1890,49 +1880,48 @@ fn attach(
     let stop = &stop;
 
     std::thread::scope(|scope| {
-        // Keystrokes in, on their own thread: reading a socket blocks, and the
-        // output pump must not wait on the human to type.
-        let held = &held;
+        let (keys_tx, keys_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
         let key_thread = scope.spawn(move || {
             let mut buf = [0u8; 4096];
-            'keys: while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            'keys: while !stop.load(std::sync::atomic::Ordering::SeqCst)
+                && !done.load(std::sync::atomic::Ordering::SeqCst)
+            {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) | Err(_) => {
+                        reader_eof.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
                     Ok(n) => {
-                        // Preserve this exact read buffer until the session
-                        // or fails. Busy means no write was queued; every other
-                        // error may follow a partial write and ends this pump.
-                        match forward_attach_input(
-                            || {
-                                held.write_raw_while(&buf[..n], &|| {
-                                    stop.load(std::sync::atomic::Ordering::SeqCst)
-                                        || held.is_displaced()
-                                })
-                            },
-                            || {
-                                stop.load(std::sync::atomic::Ordering::SeqCst)
-                                    || held.is_displaced()
-                            },
-                        ) {
-                            Ok(()) => {}
-                            Err(remuda_core::AgentError::Exited) => break 'keys,
-                            Err(remuda_core::AgentError::Attached)
-                                if stop.load(std::sync::atomic::Ordering::SeqCst)
-                                    || held.is_displaced() =>
+                        let mut bytes = buf[..n].to_vec();
+                        loop {
+                            if stop.load(std::sync::atomic::Ordering::SeqCst)
+                                || done.load(std::sync::atomic::Ordering::SeqCst)
                             {
                                 break 'keys;
                             }
-                            Err(_) => {
-                                input_failed.store(true, std::sync::atomic::Ordering::SeqCst);
-                                break 'keys;
+                            match keys_tx.try_send(bytes) {
+                                Ok(()) => break,
+                                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                                    bytes = returned;
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                }
+                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                    break 'keys;
+                                }
                             }
                         }
                     }
                 }
             }
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
         });
 
+        // One writer preserves read-buffer order. A failed write ends the pump:
+        // only Busy means no write was submitted and is safe to retry.
+        let held = &held;
+        let write_thread = scope
+            .spawn(move || pump_attach_input(keys_rx, held, done, stop, reader_eof, input_failed));
+
+        let mut process_gone = false;
         if let Some(rx) = held.subscribe() {
             while !done.load(std::sync::atomic::Ordering::SeqCst) {
                 if held.is_displaced() {
@@ -1950,7 +1939,10 @@ fn attach(
                         continue;
                     }
                     // The sender is gone: the process exited.
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        process_gone = true;
+                        break;
+                    }
                 }
             }
         }
@@ -1963,15 +1955,75 @@ fn attach(
         if input_failed.load(std::sync::atomic::Ordering::SeqCst) {
             let _ = report_attach_input_failure(&mut out);
         }
+        // A failed output write can simply mean the client detached after
+        // sending keys. Let the socket reader observe EOF and the PTY pump
+        // drain its queue before stopping it. Takeover and process exit still
+        // cancel input immediately because there is nowhere safe to deliver it.
+        if held.is_displaced() || process_gone || !held.session().is_alive() {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            ipc::stop_reader(&stream, stop, || key_thread.is_finished());
+        }
+        let _ = write_thread.join();
         done.store(true, std::sync::atomic::Ordering::SeqCst);
-        // Unblocks the key thread's read so the scope can close.
+        // Unblocks the key thread if the input pump ended without socket EOF.
         ipc::stop_reader(&stream, stop, || key_thread.is_finished());
     });
     Ok(())
 }
 
+/// Start the output side before the input pumps. A failed write must not drop
+/// input the client sent before detaching.
+fn attach_output(
+    stream: &Stream,
+    acknowledgement: &Response,
+    held: &remuda_core::session::Attached<'_>,
+) -> std::io::Result<Stream> {
+    // A client can detach immediately after sending input. A failed response
+    // write must not discard those bytes before the input pump starts.
+    let _ = reply(stream, acknowledgement);
+
+    // Paint what is already on screen before streaming anything new, or the
+    // viewer sees a blank terminal until the program next redraws.
+    let mut out = stream.try_clone()?;
+    if let Ok(painted) = held.screen_bytes() {
+        // The initial paint is best-effort for the same reason as the
+        // acknowledgement: output failure does not make queued input unsafe.
+        let _ = out.write_all(&painted).and_then(|()| out.flush());
+    }
+    Ok(out)
+}
+
 const ATTACH_INPUT_FAILURE_NOTICE: &str =
-    "\r\n[remuda] input stopped after a PTY write error; some bytes may have been delivered partially or lost\r\n";
+    "\r\n[remuda] input stopped because the PTY writer failed or stalled; some bytes may have been delivered partially or lost\r\n";
+
+fn pump_attach_input(
+    keys: std::sync::mpsc::Receiver<Vec<u8>>,
+    held: &remuda_core::session::Attached<'_>,
+    done: &std::sync::atomic::AtomicBool,
+    stop: &std::sync::atomic::AtomicBool,
+    reader_eof: &std::sync::atomic::AtomicBool,
+    input_failed: &std::sync::atomic::AtomicBool,
+) {
+    while let Ok(bytes) = keys.recv() {
+        let stopping = || {
+            stop.load(std::sync::atomic::Ordering::SeqCst)
+                || held.is_displaced()
+                || (reader_eof.load(std::sync::atomic::Ordering::SeqCst)
+                    && held.is_writer_timed_out())
+        };
+        match forward_attach_input(|| held.write_raw_while(&bytes, &stopping), &stopping) {
+            Ok(()) => {}
+            Err(remuda_core::AgentError::Exited) => break,
+            Err(remuda_core::AgentError::Attached) if stopping() => break,
+            Err(_) => {
+                input_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+                break;
+            }
+        }
+    }
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+}
 
 fn report_attach_input_failure(output: &mut impl Write) -> std::io::Result<()> {
     output.write_all(ATTACH_INPUT_FAILURE_NOTICE.as_bytes())?;
