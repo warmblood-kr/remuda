@@ -36,6 +36,7 @@ fn extension_opt_out_reports_missing_daemon_without_starting_one() {
         .args(["-s", "s", "--stdin", "probe", "statusline"])
         .env("REMUDA_RUNTIME_DIR", &dir)
         .env("REMUDA_NO_AUTOSTART", "1")
+        .env("REMUDA_NO_UPDATE_CHECK", "1")
         .env("XDG_DATA_HOME", data_home)
         .env("HOME", &dir)
         .stdin(Stdio::piped())
