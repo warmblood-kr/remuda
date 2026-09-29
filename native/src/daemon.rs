@@ -42,6 +42,28 @@ use portable_pty::CommandBuilder;
 /// polls so they cannot consume an unbounded number of daemon worker threads.
 pub(crate) const MAX_CONCURRENT_SYNCS: usize = 16;
 static ACTIVE_SYNCS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_NEW_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+struct NewRequestInFlight;
+
+impl NewRequestInFlight {
+    fn start() -> Self {
+        ACTIVE_NEW_REQUESTS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for NewRequestInFlight {
+    fn drop(&mut self) {
+        ACTIVE_NEW_REQUESTS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn wait_for_new_requests() {
+    while ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) != 0 {
+        std::thread::yield_now();
+    }
+}
 
 struct SyncPermit;
 
@@ -1349,6 +1371,10 @@ fn handle_shutdown(
     }
     image.shutdown_pending_replies();
     reply(&stream, &Response::Ok)?;
+    // A session can request this shutdown as soon as its process starts. Let
+    // every already-running New handler flush its response before the daemon
+    // exits and tears down their client connections.
+    wait_for_new_requests();
     reap_processes_before_exit(image);
     socket_owner.cleanup();
     std::process::exit(0);
@@ -1377,6 +1403,7 @@ fn handle_new(
     image: &Image,
     request: NewSessionRequest,
 ) -> std::io::Result<()> {
+    let _in_flight = NewRequestInFlight::start();
     let NewSessionRequest {
         name,
         command,
