@@ -466,23 +466,25 @@ pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
     let timeout = match request {
         // Deferred extension replies are capped at 300 seconds by
         // remuda.pending; leave five seconds for delivery and scheduling.
-        Request::Eval { .. } => eval_timeout(),
+        Request::Eval { .. } => Duration::from_secs(305),
         _ => Duration::from_secs(10),
     };
-    read_response_with_timeout(path, stream, timeout)
+    read_response_with_timeout(path, stream, client_timeout(timeout))
 }
 
-/// Extension launchers can impose a shorter best-effort deadline on Eval.
-/// Ignore invalid, zero, or excessive values and retain the normal budget.
-fn eval_timeout() -> Duration {
-    eval_timeout_from(std::env::var("REMUDA_CLIENT_TIMEOUT_MS").ok().as_deref())
+/// Extension launchers can cap any local round trip, including the version
+/// probe that runs before extension command dispatch. Ignore invalid values.
+fn client_timeout(default: Duration) -> Duration {
+    client_timeout_from(
+        default,
+        std::env::var("REMUDA_CLIENT_TIMEOUT_MS").ok().as_deref(),
+    )
 }
 
-fn eval_timeout_from(value: Option<&str>) -> Duration {
-    const DEFAULT: Duration = Duration::from_secs(305);
+fn client_timeout_from(default: Duration, value: Option<&str>) -> Duration {
     match value.and_then(|value| value.parse::<u64>().ok()) {
-        Some(milliseconds @ 1..=305_000) => Duration::from_millis(milliseconds),
-        _ => DEFAULT,
+        Some(milliseconds @ 1..=305_000) => default.min(Duration::from_millis(milliseconds)),
+        _ => default,
     }
 }
 
@@ -2855,7 +2857,7 @@ mod tests {
     #[cfg(unix)]
     use super::trace_input_read;
     use super::{
-        detach_offset, eval_timeout_from, interpret, report_attach_input_dropped, reset_input_modes, route_tokens,
+        client_timeout_from, detach_offset, interpret, report_attach_input_dropped, reset_input_modes, route_tokens,
         truncate_terminal_text, write_input_trace, AttachInputQueue, AttachRoute, Hold,
         HoldInputWriter, SecretPromptMode, SecretPromptTerminal, ATTACH_INPUT_STALL, DETACH,
         RESET_INPUT_MODES,
@@ -2880,11 +2882,31 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
-    fn extension_eval_deadline_accepts_a_short_environment_budget() {
-        assert_eq!(eval_timeout_from(Some("500")), Duration::from_millis(500));
-        assert_eq!(eval_timeout_from(None), Duration::from_secs(305));
-        assert_eq!(eval_timeout_from(Some("0")), Duration::from_secs(305));
-        assert_eq!(eval_timeout_from(Some("305001")), Duration::from_secs(305));
+    fn extension_deadline_caps_version_and_eval_round_trips() {
+        assert_eq!(
+            client_timeout_from(Duration::from_secs(10), Some("500")),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            client_timeout_from(Duration::from_secs(305), Some("500")),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            client_timeout_from(Duration::from_secs(10), Some("20000")),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            client_timeout_from(Duration::from_secs(305), None),
+            Duration::from_secs(305)
+        );
+        assert_eq!(
+            client_timeout_from(Duration::from_secs(305), Some("0")),
+            Duration::from_secs(305)
+        );
+        assert_eq!(
+            client_timeout_from(Duration::from_secs(305), Some("305001")),
+            Duration::from_secs(305)
+        );
     }
 
     #[derive(Clone, Default)]
