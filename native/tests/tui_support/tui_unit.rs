@@ -4,6 +4,15 @@ use remuda_core::Size;
 const REAL_OUTPUT_WAIT: Duration = Duration::from_secs(60);
 const REAL_OUTPUT_POLL: Duration = Duration::from_millis(50);
 
+#[test]
+fn paste_input_strips_escape_and_wraps_only_when_child_mode_is_enabled() {
+    assert_eq!(
+        paste_input("first\n\x1b[201~second", true),
+        b"\x1b[200~first\n[201~second\x1b[201~"
+    );
+    assert_eq!(paste_input("first\nsecond", false), b"first\nsecond");
+}
+
 fn wait_for_output<T>(
     mut check: impl FnMut() -> Option<T>,
     timeout_message: impl FnMut() -> String,
