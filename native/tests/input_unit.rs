@@ -87,6 +87,10 @@ while True:
     except queue.Empty:
         continue
     i = 0
+    if transcript and data.startswith(b'\x1b[200~'):
+        # Real interactive TUIs can take several frames to repaint a pasted
+        # composer. Leave the prior transcript visible while this paste lands.
+        time.sleep(0.3)
     while i < len(data):
         if data.startswith(b'\x1b[200~', i):
             paste = True
@@ -100,7 +104,7 @@ while True:
         now = arrived
         if b == 13:
             returns += 1
-            if paste or (last and now - last < 0.15):
+            if paste or (last and now - last < 0.5):
                 buf.extend(b'\n')
                 redraw()
             else:
@@ -113,8 +117,6 @@ while True:
         else:
             buf.append(b)
             redraw()
-            if transcript:
-                time.sleep(0.02)
         last = now
         i += 1
 "#,
