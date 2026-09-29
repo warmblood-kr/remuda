@@ -1,30 +1,20 @@
 //! Hash-only, single-use join tokens with persistent expiry.
 
-#[cfg(not(windows))]
 use super::encoding;
-#[cfg(not(windows))]
 use super::storage;
 use remuda_core::WallClock;
-#[cfg(not(windows))]
 use serde::{Deserialize, Serialize};
 use std::io;
-#[cfg(not(windows))]
 use std::io::Read;
 use std::path::Path;
-#[cfg(not(windows))]
 use std::path::PathBuf;
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
-#[cfg(not(windows))]
 const TOKEN_FILE: &str = "join_tokens.json";
-#[cfg(not(windows))]
 const TOKEN_LIFETIME_SECONDS: u64 = 10 * 60;
-#[cfg(not(windows))]
 const MAX_OUTSTANDING_TOKENS: usize = 16;
-#[cfg(not(windows))]
 const MAX_TOKEN_FILE_SIZE: usize = 8 * 1024;
-#[cfg(not(windows))]
 const NOISE_PATTERN: &str = "Noise_NN_25519_ChaChaPoly_SHA256";
 
 /// A newly minted bearer token. Keep `token` secret; the state file stores only its hash.
@@ -35,13 +25,10 @@ pub struct MintedJoinToken {
 
 /// Persistent token state rooted in the local cluster directory.
 pub struct JoinTokenStore {
-    #[cfg(not(windows))]
     directory: PathBuf,
-    #[cfg(not(windows))]
     clock: Arc<dyn WallClock>,
 }
 
-#[cfg(not(windows))]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TokenState {
@@ -50,7 +37,6 @@ struct TokenState {
     tokens: Vec<TokenRecord>,
 }
 
-#[cfg(not(windows))]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TokenRecord {
@@ -61,23 +47,11 @@ struct TokenRecord {
 impl JoinTokenStore {
     /// Open token state in the local initialized cluster directory.
     pub fn open(clock: Arc<dyn WallClock>) -> io::Result<Self> {
-        #[cfg(windows)]
-        {
-            let _ = clock;
-            Err(unsupported_storage())
-        }
-        #[cfg(not(windows))]
         Self::open_at(&storage::cluster_state_dir()?.join("cluster"), clock)
     }
 
     /// Open token state in an existing private cluster directory.
     pub fn open_at(directory: &Path, clock: Arc<dyn WallClock>) -> io::Result<Self> {
-        #[cfg(windows)]
-        {
-            let _ = (directory, clock);
-            Err(unsupported_storage())
-        }
-        #[cfg(not(windows))]
         {
             storage::verify_directory(directory)?;
             Ok(Self {
@@ -89,9 +63,6 @@ impl JoinTokenStore {
 
     /// Mint a 256-bit token, storing only its SHA-256 digest and 10-minute expiry.
     pub fn mint(&self) -> io::Result<MintedJoinToken> {
-        #[cfg(windows)]
-        return Err(unsupported_storage());
-        #[cfg(not(windows))]
         {
             let _guard = storage::StateLock::acquire(&self.directory)?;
             let now = self.clock.unix_seconds();
@@ -123,12 +94,6 @@ impl JoinTokenStore {
 
     /// Verify and durably consume a token; all later uses are refused.
     pub fn verify_and_consume(&self, token: &str) -> io::Result<()> {
-        #[cfg(windows)]
-        {
-            let _ = token;
-            Err(unsupported_storage())
-        }
-        #[cfg(not(windows))]
         {
             let hash = token_hash(token)?;
             let _guard = storage::StateLock::acquire(&self.directory)?;
@@ -152,9 +117,6 @@ impl JoinTokenStore {
     /// Persist a periodic wall-clock observation so serving closes token expiry
     /// state promptly after a system clock rollback.
     pub fn observe(&self) -> io::Result<()> {
-        #[cfg(windows)]
-        return Err(unsupported_storage());
-        #[cfg(not(windows))]
         {
             let _guard = storage::StateLock::acquire(&self.directory)?;
             let now = self.clock.unix_seconds();
@@ -165,7 +127,6 @@ impl JoinTokenStore {
     }
 }
 
-#[cfg(not(windows))]
 impl TokenState {
     fn new(now: u64) -> Self {
         Self {
@@ -186,9 +147,8 @@ impl TokenState {
     }
 }
 
-#[cfg(not(windows))]
 fn load_state(directory: &Path, now: u64) -> io::Result<TokenState> {
-    use std::fs::{self, OpenOptions};
+    use std::fs;
     let path = directory.join(TOKEN_FILE);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -207,14 +167,19 @@ fn load_state(directory: &Path, now: u64) -> io::Result<TokenState> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(TokenState::new(now)),
         Err(error) => return Err(error),
     }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = options.open(&path)?;
+    #[cfg(not(windows))]
+    let mut file = {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        options.open(&path)?
+    };
+    #[cfg(windows)]
+    let mut file = super::windows_security::open_for_check(&path, false, true)?;
     storage::check_private_file(&file, "join token state", &path)?;
     let mut bytes = Vec::new();
     file.by_ref()
@@ -231,13 +196,11 @@ fn load_state(directory: &Path, now: u64) -> io::Result<TokenState> {
     Ok(state)
 }
 
-#[cfg(not(windows))]
 fn save_state(directory: &Path, state: &TokenState) -> io::Result<()> {
     let bytes = serde_json::to_vec(state).map_err(io::Error::other)?;
     storage::atomic_write(&directory.join(TOKEN_FILE), &bytes)
 }
 
-#[cfg(not(windows))]
 fn validate_state(state: &TokenState) -> io::Result<()> {
     if state.version != 1 || state.tokens.len() > MAX_OUTSTANDING_TOKENS {
         return Err(io::Error::new(
@@ -256,7 +219,6 @@ fn validate_state(state: &TokenState) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 fn random_token() -> io::Result<Zeroizing<String>> {
     let mut bytes = Zeroizing::new([0; 32]);
     getrandom::fill(&mut *bytes).map_err(|error| {
@@ -265,7 +227,6 @@ fn random_token() -> io::Result<Zeroizing<String>> {
     Ok(Zeroizing::new(encoding::encode_base64(&bytes[..])))
 }
 
-#[cfg(not(windows))]
 fn token_hash(token: &str) -> io::Result<String> {
     let bytes = Zeroizing::new(encoding::decode_base64(token).map_err(|_| refused_token())?);
     if bytes.len() != 32 || encoding::encode_base64(&bytes) != token {
@@ -274,7 +235,6 @@ fn token_hash(token: &str) -> io::Result<String> {
     hash_bytes(&bytes)
 }
 
-#[cfg(not(windows))]
 fn hash_bytes(bytes: &[u8]) -> io::Result<String> {
     use snow::resolvers::CryptoResolver;
     let params: snow::params::NoiseParams = NOISE_PATTERN
@@ -290,7 +250,6 @@ fn hash_bytes(bytes: &[u8]) -> io::Result<String> {
     Ok(encoding::encode_base64(&digest))
 }
 
-#[cfg(not(windows))]
 fn decode_hash(value: &str) -> io::Result<Vec<u8>> {
     let decoded = encoding::decode_base64(value)?;
     if decoded.len() != 32 || encoding::encode_base64(&decoded) != value {
@@ -302,7 +261,6 @@ fn decode_hash(value: &str) -> io::Result<Vec<u8>> {
     Ok(decoded)
 }
 
-#[cfg(not(windows))]
 fn hashes_equal(first: &str, second: &str) -> bool {
     match (decode_hash(first), decode_hash(second)) {
         (Ok(first), Ok(second)) if first.len() == second.len() => {
@@ -316,18 +274,9 @@ fn hashes_equal(first: &str, second: &str) -> bool {
     }
 }
 
-#[cfg(not(windows))]
 fn refused_token() -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
         "join token is expired, unknown, or already used",
-    )
-}
-
-#[cfg(windows)]
-fn unsupported_storage() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
     )
 }

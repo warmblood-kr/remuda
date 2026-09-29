@@ -3,15 +3,11 @@
 use std::io;
 use std::path::Path;
 
-#[cfg(not(windows))]
 use serde::{Deserialize, Serialize};
 
-#[cfg(not(windows))]
 const SETTINGS_FILE: &str = "settings.json";
-#[cfg(not(windows))]
 const SETTINGS_MAX_BYTES: u64 = 4096;
 
-#[cfg(not(windows))]
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Settings {
@@ -21,31 +17,21 @@ struct Settings {
 /// Return whether this node accepts remote control requests. Missing settings
 /// use the owner-approved default: enabled.
 pub fn enabled() -> io::Result<bool> {
-    #[cfg(windows)]
-    return Err(unsupported_windows());
-    #[cfg(not(windows))]
     enabled_at(&super::storage::cluster_state_dir()?.join("cluster"))
 }
 
 /// Set whether this node accepts remote control requests.
 pub fn set_enabled(value: bool) -> io::Result<()> {
-    #[cfg(windows)]
-    {
-        let _ = value;
-        return Err(unsupported_windows());
-    }
-    #[cfg(not(windows))]
-    {
-        let dir = super::storage::cluster_state_dir()?.join("cluster");
-        super::identity::load_identity_at(&dir)?;
-        set_enabled_at(&dir, value)
-    }
+    let dir = super::storage::cluster_state_dir()?.join("cluster");
+    super::identity::load_identity_at(&dir)?;
+    set_enabled_at(&dir, value)
 }
 
 /// Read the setting from one cluster state directory.
-#[cfg(not(windows))]
 pub fn enabled_at(dir: &Path) -> io::Result<bool> {
-    use std::fs::{self, OpenOptions};
+    use std::fs;
+    #[cfg(not(windows))]
+    use std::fs::OpenOptions;
     use std::io::Read;
 
     match fs::symlink_metadata(dir) {
@@ -54,14 +40,23 @@ pub fn enabled_at(dir: &Path) -> io::Result<bool> {
         Err(error) => return Err(error),
     }
     let path = dir.join(SETTINGS_FILE);
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = match options.open(&path) {
+    #[cfg(not(windows))]
+    let file = {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+            Err(error) => return Err(error),
+        }
+    };
+    #[cfg(windows)]
+    let file = match super::windows_security::open_for_check(&path, false, true) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error),
@@ -86,13 +81,7 @@ pub fn enabled_at(dir: &Path) -> io::Result<bool> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-#[cfg(windows)]
-pub fn enabled_at(_dir: &Path) -> io::Result<bool> {
-    Err(unsupported_windows())
-}
-
 /// Persist the setting in one cluster state directory.
-#[cfg(not(windows))]
 pub fn set_enabled_at(dir: &Path, value: bool) -> io::Result<()> {
     use std::fs;
 
@@ -116,19 +105,6 @@ pub fn set_enabled_at(dir: &Path, value: bool) -> io::Result<()> {
     .map_err(io::Error::other)?;
     bytes.push(b'\n');
     super::storage::atomic_write(&path, &bytes)
-}
-
-#[cfg(windows)]
-pub fn set_enabled_at(_dir: &Path, _value: bool) -> io::Result<()> {
-    Err(unsupported_windows())
-}
-
-#[cfg(windows)]
-fn unsupported_windows() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
-    )
 }
 
 #[cfg(all(test, not(windows)))]

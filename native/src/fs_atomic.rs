@@ -81,6 +81,12 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<(
     Ok(())
 }
 
+/// Cluster state replacement using a Windows security descriptor at temp-file creation.
+#[cfg(windows)]
+pub(crate) fn write_atomic_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    crate::cluster::windows_security::write_atomic(path, bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::write_atomic;
