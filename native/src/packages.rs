@@ -1034,19 +1034,39 @@ fn resolve_mods_root(path: &Path) -> Result<PathBuf, String> {
     if !path.exists() {
         return Ok(path.to_path_buf());
     }
-    let resolved = fs::canonicalize(path)
-        .map_err(|error| format!("cannot resolve mods directory {}: {error}", path.display()))?;
+    let Some(resolved) = canonicalize_mods_root(path)? else {
+        return Ok(path.to_path_buf());
+    };
     validate_mods_root(&resolved)?;
     Ok(resolved)
 }
 
-fn validate_data_dir(path: &Path) -> Result<(), String> {
-    let metadata = fs::metadata(path).map_err(|error| {
-        format!(
-            "cannot inspect Remuda data directory {}: {error}",
+fn canonicalize_mods_root(path: &Path) -> Result<Option<PathBuf>, String> {
+    match fs::canonicalize(path) {
+        Ok(resolved) => Ok(Some(resolved)),
+        // The directory may disappear after resolve_mods_root's exists check.
+        // Treat that the same as a directory that was already absent.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "cannot resolve mods directory {}: {error}",
             path.display()
-        )
-    })?;
+        )),
+    }
+}
+
+fn validate_data_dir(path: &Path) -> Result<(), String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        // Its caller checks existence first, so a missing path here means it
+        // disappeared in between and should be treated as absent.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect Remuda data directory {}: {error}",
+                path.display()
+            ));
+        }
+    };
     if !metadata.is_dir() {
         return Err(format!(
             "Remuda data path {} is not a directory",
@@ -1391,13 +1411,14 @@ fn valid_package_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        canonicalize_mods_root, parse_manifest, parse_repository, satisfies, stage_package_tree,
+        update_all_with, validate_data_dir, validate_reference, InstallReport, Manifest,
+        MOD_LIFECYCLE_API,
+    };
     #[cfg(unix)]
     use super::{
         cleanup_tree, copy_tree, create_dir_all_secure, remove_tree, resolve_mods_root, test_path,
-    };
-    use super::{
-        parse_manifest, parse_repository, satisfies, stage_package_tree, update_all_with,
-        validate_reference, InstallReport, Manifest, MOD_LIFECYCLE_API,
     };
     use std::path::Path;
 
@@ -1405,6 +1426,22 @@ mod tests {
         parse_manifest(&format!(
             "name = \"guest\"\nentry = \"packages/guest/init.lua\"\napi = \"remuda-lua-v1\"\n{line}\n"
         ))
+    }
+
+    #[test]
+    fn vanished_data_directory_is_tolerated() {
+        let path =
+            std::env::temp_dir().join(format!("remuda-data-not-found-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        assert!(validate_data_dir(&path).is_ok());
+    }
+
+    #[test]
+    fn mods_directory_removed_before_canonicalize_is_tolerated() {
+        let path =
+            std::env::temp_dir().join(format!("remuda-mods-not-found-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        assert_eq!(canonicalize_mods_root(&path).unwrap(), None);
     }
 
     #[cfg(unix)]
