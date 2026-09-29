@@ -243,8 +243,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     {
         serve_unix(
             listener,
-            path,
-            runtime,
+            (path, runtime),
             signals,
             registry,
             image,
@@ -265,8 +264,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
 #[cfg(unix)]
 fn serve_unix(
     mut listener: Listener,
-    path: &Path,
-    runtime: Option<&Path>,
+    socket: (&Path, Option<&Path>),
     mut signals: std::os::unix::net::UnixStream,
     registry: Arc<Registry>,
     image: Image,
@@ -316,7 +314,7 @@ fn serve_unix(
                     for byte in &signal_bytes[..count] {
                         let signal = libc::c_int::from(*byte);
                         if signal == libc::SIGUSR1 {
-                            rebind_after_sigusr1(&mut listener, path, runtime, &socket_owner);
+                            rebind_after_sigusr1(&mut listener, socket.0, socket.1, &socket_owner);
                             // The old listener's readiness bits cannot describe
                             // the replacement listener. Poll both fds again.
                             continue 'poll_loop;
