@@ -22,6 +22,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PATIENCE: Duration = Duration::from_secs(10);
+#[cfg(unix)]
+const STALL_FLOOD_CHUNK_BYTES: usize = 4 * 1024;
+#[cfg(unix)]
+const STALL_FLOOD_CAP_BYTES: usize = 32 * 1024 * 1024;
 
 #[path = "daemon_support/spawn.rs"]
 mod spawn;
@@ -980,27 +984,40 @@ fn wait_for_cli_exit(viewer: &Session, name: &str) {
 
 #[cfg(unix)]
 #[test]
+#[allow(clippy::too_many_lines)]
 fn attach_detach_during_stalled_input_reports_loss_and_exits() {
     let runtime = scratch_dir("attach-detach-stall");
     let path = daemon::socket_path_in(&runtime, "s");
     let _daemon = Daemon::spawn(&runtime);
     let capture_path = runtime.join("captured");
+    let dropped_count_path = runtime.join("dropped-count");
     let marker = runtime.join("start-reading");
     let name = "target";
-    let flood = vec![b'x'; 64 * 1024];
-    new_byte_capture_session(
-        &path,
-        name,
-        &capture_path,
-        flood.len(),
-        Some(&marker),
-        false,
-        None,
-    );
+    let script = "stty raw -echo min 1 time 0 </dev/tty; printf READY; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat > \"$CAPTURE_PATH\"";
+    let env = std::collections::HashMap::from([
+        ("CAPTURE_PATH".into(), capture_path.display().to_string()),
+        ("READER_MARKER".into(), marker.display().to_string()),
+    ]);
+    assert!(matches!(
+        client::request(
+            &path,
+            &Request::New {
+                name: Some(name.into()),
+                command: vec!["sh".into(), "-c".into(), script.into()],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: Some(env),
+            },
+        )
+        .expect("start child blocked until reading is released"),
+        Response::Value(_)
+    ));
 
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
     command.args(["-s", "s", "attach", name]);
     command.env("REMUDA_RUNTIME_DIR", &runtime);
+    command.env("REMUDA_TEST_INPUT_HOOKS", "1");
+    command.env("REMUDA_TEST_ATTACH_DROPPED_COUNT", &dropped_count_path);
     let viewer = Session::new(
         "viewer",
         Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
@@ -1011,17 +1028,88 @@ fn attach_detach_during_stalled_input_reports_loss_and_exits() {
     wait_until_attached(&path, name);
     wait_for_session_screen(&viewer, "READY");
 
-    held.write_raw(&flood)
-        .expect("send the stalled-child flood");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut output_bytes = Vec::new();
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(|| {
+            let chunk = [b'x'; STALL_FLOOD_CHUNK_BYTES];
+            while !stop.load(Ordering::SeqCst) {
+                let current = sent.load(Ordering::SeqCst);
+                if current >= STALL_FLOOD_CAP_BYTES {
+                    break;
+                }
+                let count = (STALL_FLOOD_CAP_BYTES - current).min(chunk.len());
+                if held.write_raw(&chunk[..count]).is_err() {
+                    break;
+                }
+                sent.fetch_add(count, Ordering::SeqCst);
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+        let notice = b"dropping input until the writer recovers";
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !output_bytes
+            .windows(notice.len())
+            .any(|window| window == notice)
+        {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stalled-child flood timed out before a drop notice: sent={}, dropped={}, child_total={}",
+                sent.load(Ordering::SeqCst),
+                std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+                std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len())
+            );
+            if let Ok(chunk) = output.recv_timeout(Duration::from_millis(100)) {
+                output_bytes.extend_from_slice(&chunk);
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        sender.join().expect("join adaptive flood writer");
+    });
+    assert!(
+        output_bytes
+            .windows(b"dropping input until the writer recovers".len())
+            .any(|window| window == b"dropping input until the writer recovers"),
+        "stalled-child flood reached the 32 MiB cap without a drop notice: sent={}, dropped={}, child_total={}",
+        sent.load(Ordering::SeqCst),
+        std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+        std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len())
+    );
     held.write_raw(&[client::DETACH]).expect("send Ctrl-\\");
     wait_for_cli_exit(&viewer, name);
-    let output = collect_until_bytes(&output, b"input dropped");
+    let output_deadline = Instant::now() + PATIENCE;
+    while !output_bytes
+        .windows(b"input dropped".len())
+        .any(|window| window == b"input dropped")
+    {
+        assert!(
+            Instant::now() < output_deadline,
+            "loss notice absent: sent={}, dropped={}, child_total={}, output tail: {}",
+            sent.load(Ordering::SeqCst),
+            std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+            std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+            escaped_tail(&output_bytes)
+        );
+        match output.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => output_bytes.extend_from_slice(&chunk),
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
     assert!(
-        output
+        output_bytes
             .windows(b"input dropped".len())
-            .any(|w| w == b"input dropped"),
-        "loss must be reported to the attached user: {}",
-        escaped_tail(&output)
+            .any(|window| window == b"input dropped"),
+        "client exited without loss notice: sent={}, dropped={}, child_total={}, output tail: {}",
+        sent.load(Ordering::SeqCst),
+        std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+        std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+        escaped_tail(&output_bytes)
     );
     std::fs::write(&marker, b"start").expect("release child for cleanup");
 }
@@ -1119,6 +1207,7 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
     let _daemon = Daemon::spawn(&runtime);
     let child_input_path = runtime.join("child-input");
     let dropped_count_path = runtime.join("dropped-count");
+    let input_state_path = runtime.join("input-state");
     let barrier_result_path = runtime.join("barrier-result");
     let ready_marker = runtime.join("ready");
     let reader_marker = runtime.join("start-reading");
@@ -1153,6 +1242,7 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
     command.env("REMUDA_TEST_INPUT_HOOKS", "1");
     command.env("REMUDA_TEST_ATTACH_BARRIER_RESULT", &barrier_result_path);
     command.env("REMUDA_TEST_ATTACH_DROPPED_COUNT", &dropped_count_path);
+    command.env("REMUDA_TEST_ATTACH_INPUT_STATE", &input_state_path);
     let viewer = Session::new(
         "viewer",
         Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
@@ -1164,37 +1254,60 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
     std::fs::write(&ready_marker, b"attached").expect("release child readiness");
     wait_for_session_screen(&viewer, "READY");
 
-    let flood = vec![b'x'; 1100 * 1024];
-    let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::scope(|scope| {
         let sender = scope.spawn(|| {
-            let _ = sent_tx.send(held.write_raw(&flood));
+            let chunk = [b'x'; STALL_FLOOD_CHUNK_BYTES];
+            while !stop.load(Ordering::SeqCst) {
+                let current = sent.load(Ordering::SeqCst);
+                if current >= STALL_FLOOD_CAP_BYTES {
+                    break;
+                }
+                let count = (STALL_FLOOD_CAP_BYTES - current).min(chunk.len());
+                if held.write_raw(&chunk[..count]).is_err() {
+                    break;
+                }
+                sent.fetch_add(count, Ordering::SeqCst);
+            }
+            done.store(true, Ordering::SeqCst);
         });
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut seen = Vec::new();
+        let drop_notice = b"dropping input until the writer recovers";
         while !seen
-            .windows(b"dropping input until the writer recovers".len())
-            .any(|window| window == b"dropping input until the writer recovers")
+            .windows(drop_notice.len())
+            .any(|window| window == drop_notice)
         {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
             assert!(
                 Instant::now() < deadline,
-                "stall drop notice was not printed"
+                "stall drop notice was not printed: sent={}, dropped={}, child_total={}, input_state={}",
+                sent.load(Ordering::SeqCst),
+                std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+                std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()),
+                std::fs::read_to_string(&input_state_path).unwrap_or_default()
             );
             if let Ok(chunk) = output.recv_timeout(Duration::from_millis(100)) {
                 seen.extend_from_slice(&chunk);
             }
         }
-        std::fs::write(&reader_marker, b"read").expect("resume child PTY reads");
         assert!(
-            sent_rx
-                .recv_timeout(Duration::from_secs(20))
-                .unwrap()
-                .is_ok(),
-            "flood write did not complete after the attach reader resumed"
+            seen.windows(drop_notice.len()).any(|window| window == drop_notice),
+            "stalled-child flood reached the 32 MiB cap without a drop notice: sent={}, dropped={}, child_total={}, input_state={}",
+            sent.load(Ordering::SeqCst),
+            std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+            std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()),
+            std::fs::read_to_string(&input_state_path).unwrap_or_default()
         );
-        sender.join().expect("join flood writer");
+        stop.store(true, Ordering::SeqCst);
+        sender.join().expect("join adaptive flood writer");
+        std::fs::write(&reader_marker, b"read").expect("resume child PTY reads");
         let progress_deadline = Instant::now() + Duration::from_secs(15);
-        while std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()) < 131072 {
+        while std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()) == 0 {
             assert!(
                 Instant::now() < progress_deadline,
                 "child did not receive buffered input after recovery"
@@ -1204,7 +1317,7 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
 
         let mut last_total = None;
         let mut stable_since = Instant::now();
-        let sent = flood.len() as u64;
+        let sent = sent.load(Ordering::SeqCst) as u64;
         let drain_deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(

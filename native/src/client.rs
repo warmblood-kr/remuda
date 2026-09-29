@@ -383,6 +383,20 @@ fn report_test_attach_dropped_count(queue: &AttachInputQueue) {
                 let _ = std::fs::rename(temporary, path);
             }
         }
+        if let Some(path) = std::env::var_os("REMUDA_TEST_ATTACH_INPUT_STATE") {
+            let queued = queue.queued_bytes.load(std::sync::atomic::Ordering::SeqCst);
+            let status = queue.status.lock().unwrap_or_else(|p| p.into_inner());
+            let state = format!(
+                "queued={queued} delivered={} dropping={}",
+                status.delivered_bytes, status.dropping
+            );
+            drop(status);
+            let path = PathBuf::from(path);
+            let temporary = path.with_extension("tmp");
+            if std::fs::write(&temporary, state).is_ok() {
+                let _ = std::fs::rename(temporary, path);
+            }
+        }
     }
 }
 
