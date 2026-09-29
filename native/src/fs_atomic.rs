@@ -184,7 +184,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn private_write_is_atomic_and_stays_owner_only_under_umask_022() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::fs::PermissionsExt;
 
         const CHILD: &str = "REMUDA_PRIVATE_WRITE_UMASK_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -205,20 +205,20 @@ mod tests {
         let target = scratch.0.join("private-state");
         unsafe { libc::umask(0o022) };
         super::write_atomic_lua_private(&target, b"first").unwrap();
-        let first = fs::metadata(&target).unwrap();
-        assert_eq!(first.permissions().mode() & 0o777, 0o600);
+        let old_link = scratch.0.join("private-state.old");
+        fs::hard_link(&target, &old_link).unwrap();
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
 
         fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
         super::write_atomic_lua_private(&target, b"replacement").unwrap();
         let replacement = fs::metadata(&target).unwrap();
         assert_eq!(replacement.permissions().mode() & 0o777, 0o600);
-        assert_ne!(
-            replacement.ino(),
-            first.ino(),
-            "private write replaces by rename"
-        );
         assert_eq!(fs::read(&target).unwrap(), b"replacement");
-        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 1);
+        assert_eq!(fs::read(&old_link).unwrap(), b"first");
+        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 2);
     }
 
     #[cfg(unix)]

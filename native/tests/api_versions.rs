@@ -302,33 +302,26 @@ fn frozen_api_fixtures_v1_through_v4_and_new_v5_surface_run() {
             );
             #[cfg(unix)]
             {
-                use std::os::unix::fs::MetadataExt;
-                let original_inode = std::fs::metadata(&private_path).unwrap().ino();
-                std::fs::write(
-                    dir.join("private-atomic-write.ino"),
-                    original_inode.to_string(),
-                )
-                .unwrap();
+                std::fs::hard_link(&private_path, dir.join("private-atomic-write.old")).unwrap();
             }
         }
         std::fs::write(&fixture, source).unwrap();
         script::run(&path, &fixture).unwrap_or_else(|error| panic!("{version} fixture: {error}"));
         if version == "v5" {
-            let _private_path = dir.join("private-atomic-write");
             #[cfg(unix)]
             {
-                use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                let original_inode: u64 =
-                    std::fs::read_to_string(dir.join("private-atomic-write.ino"))
-                        .unwrap()
-                        .parse()
-                        .unwrap();
-                let metadata = std::fs::metadata(&_private_path).unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                let private_path = dir.join("private-atomic-write");
+                let metadata = std::fs::metadata(&private_path).unwrap();
                 assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-                assert_ne!(
-                    metadata.ino(),
-                    original_inode,
-                    "private write replaces by rename"
+                assert_eq!(
+                    std::fs::read(&private_path).unwrap(),
+                    b"private replacement"
+                );
+                assert_eq!(
+                    std::fs::read(dir.join("private-atomic-write.old")).unwrap(),
+                    b"old contents",
+                    "atomic rename leaves the prior hard link unchanged"
                 );
             }
         }
