@@ -630,7 +630,7 @@ impl Session {
 
     fn ensure_writer_idle(&self) -> core::result::Result<(), InputError> {
         if self
-            .input_writer_busy()
+            .input_writer_timed_out()
             .map_err(|_| InputError::Unavailable)?
         {
             Err(InputError::Busy)
@@ -742,7 +742,7 @@ impl Session {
                 *locked = true;
                 return Ok(InputActGuard { session: self });
             }
-            if self.input_writer_busy()? {
+            if self.input_writer_timed_out()? {
                 return Err(AgentError::Busy);
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
@@ -757,12 +757,14 @@ impl Session {
         }
     }
 
-    fn input_writer_busy(&self) -> Result<bool> {
+    fn input_writer_timed_out(&self) -> Result<bool> {
         let mut agent = self
             .agent
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-        Ok(agent.input_writer().is_some_and(|writer| writer.is_busy()))
+        Ok(agent
+            .input_writer()
+            .is_some_and(|writer| writer.is_timed_out()))
     }
 
     pub fn screen_text(&self) -> Result<String> {
@@ -1054,6 +1056,16 @@ impl Attached<'_> {
     /// Whether a newer client has taken this attachment over.
     pub fn is_displaced(&self) -> bool {
         self.displaced.load(Ordering::SeqCst)
+    }
+
+    /// Whether the active PTY input write has exceeded its bounded deadline.
+    pub fn is_writer_timed_out(&self) -> bool {
+        self.session
+            .agent
+            .lock()
+            .ok()
+            .and_then(|mut agent| agent.input_writer())
+            .is_some_and(|writer| writer.is_timed_out())
     }
 
     /// Type exactly these bytes. No Enter is appended: the human sends their
