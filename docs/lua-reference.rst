@@ -134,7 +134,7 @@ fs
 fs.write_atomic
 ---------------
 
-``fs.write_atomic(path, bytes) -> true, nil | nil, error`` — Write bytes through a same-directory temporary file and atomically replace the target.
+``fs.write_atomic(path, bytes, options?) -> true, nil | nil, error`` — Write bytes through a same-directory temporary file and atomically replace the target; private mode uses owner-only permissions on Unix.
 
 hook_list
 ---------

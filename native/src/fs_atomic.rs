@@ -8,9 +8,24 @@ use std::path::Path;
 /// Existing regular-file permissions are preserved; `mode` is applied to new
 /// files at creation on Unix and is ignored on Windows.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    write_atomic_inner(path, bytes, mode, true)
+}
+
+/// Write an owner-only Lua state file on Unix. Windows uses its normal
+/// inherited ACL for this public Lua option.
+pub(crate) fn write_atomic_lua_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_inner(path, bytes, 0o600, false)
+}
+
+fn write_atomic_inner(
+    path: &Path,
+    bytes: &[u8],
+    mode: u32,
+    preserve_existing_mode: bool,
+) -> io::Result<()> {
     use std::fmt::Write as _;
     #[cfg(not(unix))]
-    let _ = mode;
+    let _ = (mode, preserve_existing_mode);
 
     let parent = path
         .parent()
@@ -26,13 +41,17 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<(
     #[cfg(unix)]
     let existing_mode = {
         use std::os::unix::fs::PermissionsExt;
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_file() => {
-                Some(metadata.permissions().mode() & 0o777)
+        if !preserve_existing_mode {
+            None
+        } else {
+            match fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    Some(metadata.permissions().mode() & 0o777)
+                }
+                Ok(_) => None,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
             }
-            Ok(_) => None,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
         }
     };
 
@@ -59,9 +78,11 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<(
     let mut file = options.open(&temporary)?;
     let written = file.write_all(bytes).and_then(|()| {
         #[cfg(unix)]
-        if let Some(existing_mode) = existing_mode {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(existing_mode))?;
+        if preserve_existing_mode {
+            if let Some(existing_mode) = existing_mode {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(existing_mode))?;
+            }
         }
         file.sync_all()
     });
@@ -158,6 +179,37 @@ mod tests {
             fs::metadata(target).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_write_is_atomic_and_stays_owner_only_under_umask_022() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let scratch = Scratch::new();
+        let target = scratch.0.join("private-state");
+        struct UmaskGuard(libc::mode_t);
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                unsafe { libc::umask(self.0) };
+            }
+        }
+        let _umask = UmaskGuard(unsafe { libc::umask(0o022) });
+        super::write_atomic_lua_private(&target, b"first").unwrap();
+        let first = fs::metadata(&target).unwrap();
+        assert_eq!(first.permissions().mode() & 0o777, 0o600);
+
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        super::write_atomic_lua_private(&target, b"replacement").unwrap();
+        let replacement = fs::metadata(&target).unwrap();
+        assert_eq!(replacement.permissions().mode() & 0o777, 0o600);
+        assert_ne!(
+            replacement.ino(),
+            first.ino(),
+            "private write replaces by rename"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"replacement");
+        assert_eq!(fs::read_dir(&scratch.0).unwrap().count(), 1);
     }
 
     #[cfg(unix)]

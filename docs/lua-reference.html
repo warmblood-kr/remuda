@@ -52,7 +52,7 @@
 <h2 id="fs">fs</h2>
 <p><code>table</code> — Atomic replacement of files for trusted Lua callers.</p>
 <h2 id="fs.write_atomic">fs.write_atomic</h2>
-<p><code>fs.write_atomic(path, bytes) -&gt; true, nil | nil, error</code> — Write bytes through a same-directory temporary file and atomically replace the target.</p>
+<p><code>fs.write_atomic(path, bytes, options?) -&gt; true, nil | nil, error</code> — Write bytes through a same-directory temporary file and atomically replace the target; private mode uses owner-only permissions on Unix.</p>
 <h2 id="hook_list">hook_list</h2>
 <p><code>hook_list(event?) -&gt; {{event, group, id, depth, owner, src, errors, last_error}...}</code> — Copies of the registered hooks, for one event or all, in run order.</p>
 <h2 id="hooks">hooks</h2>

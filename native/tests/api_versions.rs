@@ -11,12 +11,7 @@ use std::time::{Duration, Instant};
 mod spawn;
 
 fn scratch(version: &str) -> PathBuf {
-    let root = if cfg!(target_os = "macos") {
-        PathBuf::from("/private/tmp")
-    } else {
-        std::env::temp_dir()
-    };
-    let dir = root.join(format!("r-api-{}-{version}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("r-api-{}-{version}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -289,8 +284,54 @@ fn frozen_api_fixtures_v1_through_v4_and_new_v5_surface_run() {
         let path = daemon::socket_path_in(&dir, "s");
         let mut private_daemon = spawn::Daemon::spawn(&dir);
         let fixture = dir.join(format!("{version}.lua"));
+        if version == "v5" {
+            let _private_path = dir.join("private-atomic-write");
+            std::fs::write(&_private_path, b"old contents").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&_private_path, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            }
+            eval(
+                &path,
+                &format!(
+                    "remuda._api_v5_private_write_path = {:?}",
+                    _private_path.to_string_lossy()
+                ),
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let original_inode = std::fs::metadata(&_private_path).unwrap().ino();
+                std::fs::write(
+                    dir.join("private-atomic-write.ino"),
+                    original_inode.to_string(),
+                )
+                .unwrap();
+            }
+        }
         std::fs::write(&fixture, source).unwrap();
         script::run(&path, &fixture).unwrap_or_else(|error| panic!("{version} fixture: {error}"));
+        if version == "v5" {
+            let _private_path = dir.join("private-atomic-write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                let original_inode: u64 =
+                    std::fs::read_to_string(dir.join("private-atomic-write.ino"))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                let metadata = std::fs::metadata(&_private_path).unwrap();
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+                assert_ne!(
+                    metadata.ino(),
+                    original_inode,
+                    "private write replaces by rename"
+                );
+            }
+        }
         if version == "v5" {
             exercise_session_exit_payload(&path);
             exercise_session_output_payload(&path);
