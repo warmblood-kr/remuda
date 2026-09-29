@@ -1379,6 +1379,8 @@ fn session_output_wakes_coalesce_while_lua_is_busy_and_list_stays_responsive() {
             &path,
             &Request::Close {
                 name: "chatty".into(),
+                instance_id: None,
+                confirm: None,
             },
         )
         .expect("close chatty session"),
@@ -1663,6 +1665,8 @@ fn sync_waiter_wakes_when_child_exits() {
                 &socket,
                 &Request::Close {
                     name: "versioned".into(),
+                    instance_id: None,
+                    confirm: None,
                 },
             ),
             Ok(Response::Ok)
@@ -1706,6 +1710,8 @@ fn sync_rechecks_instance_after_close_and_relaunch_during_wait() {
             &socket,
             &Request::Close {
                 name: "versioned".into(),
+                instance_id: None,
+                confirm: None,
             },
         ),
         Ok(Response::Ok)
@@ -2398,6 +2404,7 @@ fn wait_for_target_attach(
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     // The binary derives its socket as $REMUDA_RUNTIME_DIR/remuda/default.sock,
     // so the daemon must listen exactly there. Pointing the test somewhere else
@@ -2407,6 +2414,14 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
     new_session(&path, "target");
+    let target_instance = match client::request(&path, &Request::List).expect("list target") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "target")
+            .and_then(|session| session.instance_id)
+            .expect("target instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
 
     // Put something on screen BEFORE attaching, so the repaint has something to
     // prove. A viewer that only streams would show a blank terminal here.
@@ -2472,6 +2487,8 @@ fn a_human_attaches_through_a_real_terminal_and_detaches_with_ctrl_backslash() {
             &path,
             &Request::Close {
                 name: "target".into(),
+                instance_id: Some(target_instance.clone()),
+                confirm: Some(true),
             },
         )
     };
@@ -3297,6 +3314,8 @@ fn a_session_exited_hook_fires_once_when_a_session_is_closed() {
         &path,
         &Request::Close {
             name: "closed".into(),
+            instance_id: None,
+            confirm: None,
         },
     )
     .expect("close");
@@ -3318,6 +3337,96 @@ fn a_session_exited_hook_fires_once_when_a_session_is_closed() {
         1,
         "a closed session must fire exactly once"
     );
+}
+
+#[test]
+fn confirmed_close_refuses_a_mismatched_instance_and_keeps_the_session() {
+    let path = scratch("close-wrong-instance");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    let instance_id = match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "target")
+            .and_then(|session| session.instance_id)
+            .expect("session instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+    let response = client::request(
+        &path,
+        &Request::Close {
+            name: "target".into(),
+            instance_id: Some(format!("wrong-{instance_id}")),
+            confirm: Some(true),
+        },
+    )
+    .expect("close response");
+    assert!(matches!(response, Response::Error(_)), "{response:?}");
+    assert!(matches!(
+        client::request(&path, &Request::List),
+        Ok(Response::Sessions(sessions)) if sessions.iter().any(|session| session.name == "target")
+    ));
+}
+
+#[test]
+fn confirmed_close_requires_true_confirmation_and_keeps_the_session() {
+    let path = scratch("close-unconfirmed-instance");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    let instance_id = match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "target")
+            .and_then(|session| session.instance_id)
+            .expect("session instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+
+    for confirm in [Some(false), None] {
+        let response = client::request(
+            &path,
+            &Request::Close {
+                name: "target".into(),
+                instance_id: Some(instance_id.clone()),
+                confirm,
+            },
+        )
+        .expect("close response");
+        assert!(matches!(response, Response::Error(_)), "{response:?}");
+        assert!(matches!(
+            client::request(&path, &Request::List),
+            Ok(Response::Sessions(sessions)) if sessions.iter().any(|session| session.name == "target")
+        ));
+    }
+}
+
+#[test]
+fn confirmed_close_ends_the_matching_instance() {
+    let path = scratch("close-confirmed-instance");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    let instance_id = match client::request(&path, &Request::List).expect("list") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "target")
+            .and_then(|session| session.instance_id)
+            .expect("session instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+    let response = client::request(
+        &path,
+        &Request::Close {
+            name: "target".into(),
+            instance_id: Some(instance_id),
+            confirm: Some(true),
+        },
+    )
+    .expect("confirmed close");
+    assert_eq!(response, Response::Ok);
+    assert!(matches!(
+        client::request(&path, &Request::List),
+        Ok(Response::Sessions(sessions)) if sessions.iter().all(|session| session.name != "target")
+    ));
 }
 
 #[test]

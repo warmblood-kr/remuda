@@ -1606,7 +1606,14 @@ mod visual_mode_tests {
         press(&mut ui, "vb");
         assert_eq!(at(&ui), TextPoint { row: 0, col: 15 });
 
-        let _ = crate::client::request(&path, &Request::Close { name: name.into() });
+        let _ = crate::client::request(
+            &path,
+            &Request::Close {
+                name: name.into(),
+                instance_id: None,
+                confirm: None,
+            },
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3337,6 +3344,8 @@ fn resize(path: &Path, name: &str, size: Size) -> Result<(), String> {
 fn kill(path: &Path, name: &str) -> Result<(), String> {
     let request = Request::Close {
         name: name.to_string(),
+        instance_id: None,
+        confirm: None,
     };
     match client::request(path, &request) {
         Ok(Response::Ok) => Ok(()),
