@@ -932,6 +932,85 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
 }
 
 #[test]
+fn real_preview_keeps_content_anchored_after_wheel_down_enters_settle() {
+    let path = scratch_socket("preview-settle-content-anchor");
+    daemon_at(&path);
+    let command = streaming_command(
+        "i=0; while [ $i -lt 90 ]; do printf 'settle-%03d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 2",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 90; $i++) { Write-Output ('settle-{0:D3}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 2",
+    );
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("stream".into()),
+            command,
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new streaming session");
+    assert_eq!(response, Response::Value("stream".into()));
+
+    let mut ui = make_ui(vec![row("stream", true, false)]);
+    wait_for_output(
+        || {
+            capture_preview(&path, &mut ui, "stream").expect("capture preview");
+            (ui.scrollback["stream"].history_rows >= 40).then_some(())
+        },
+        || "output did not reach scrollback".into(),
+    );
+    let wheel = |kind| MouseEvent {
+        kind,
+        column: 19,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    };
+    for _ in 0..5 {
+        assert_eq!(
+            ui.on_mouse(wheel(MouseEventKind::ScrollUp), 80, 24),
+            Action::Scroll(3)
+        );
+        scroll_selected(&mut ui, 3);
+        capture_preview(&path, &mut ui, "stream").expect("capture scroll-up");
+    }
+    assert_eq!(
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
+        Action::Scroll(-3)
+    );
+    scroll_selected(&mut ui, -3);
+    let (anchor_cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("enter settle");
+    let anchor_text = terminal_rows_text(&anchor_cells);
+    let anchor_history = ui.scrollback["stream"].history_rows;
+
+    wait_for_output(
+        || {
+            let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture output");
+            let state = ui.scrollback["stream"];
+            if state.history_rows >= anchor_history + 3 {
+                assert_eq!(
+                    terminal_rows_text(&cells),
+                    anchor_text,
+                    "wheel-down settle must preserve the visible history rows"
+                );
+                Some(())
+            } else {
+                None
+            }
+        },
+        || "history did not grow while in wheel-down settle".into(),
+    );
+    let _ = client::request(
+        &path,
+        &Request::Close {
+            name: "stream".into(),
+            instance_id: None,
+            confirm: None,
+        },
+    );
+}
+
+#[test]
 // Windows drifts at the 10k cap under ConPTY: #201.
 #[cfg(unix)]
 fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {

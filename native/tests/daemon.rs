@@ -3277,6 +3277,91 @@ fn direct_attach_keeps_scrolled_content_anchored_as_output_arrives() {
 
 #[cfg(unix)]
 #[test]
+fn direct_attach_clears_stale_scrollback_indicator_when_history_is_clamped_to_zero() {
+    let dir = scratch_dir("a-clamp");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "i=0; while [ $i -lt 40 ]; do printf 'clearseed-%03d\\n' \"$i\"; i=$((i+1)); done; sleep 2; printf '\\033[?1049h'; sleep 2".into(),
+        },
+    )
+    .expect("start history then enter alternate screen");
+    wait_for(&path, "target", "clearseed-039");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "clearseed-039");
+    held.write_raw(b"\x1b[<64;10;10M").expect("wheel up");
+    collect_until_bytes(&output, b"[scrollback: 3 rows");
+    let (_, before_rows, before_total) = capture_styled_snapshot(&path, "target", 0);
+    assert!(before_rows > 0, "test requires retained history");
+
+    // The running child enters the alternate screen without adding any
+    // history rows, clamping retained history to zero while total stays fixed.
+    std::thread::sleep(Duration::from_millis(2200));
+    let alternate_screen = capture(&path, "target");
+    let (_, after_rows, after_total) = capture_styled_snapshot(&path, "target", 0);
+    assert_eq!(
+        after_total, before_total,
+        "alternate screen adds no history"
+    );
+    assert_eq!(
+        after_rows, 0,
+        "alternate screen should clamp history to zero"
+    );
+    assert!(before_rows > after_rows);
+    let screen = viewer
+        .screen_text()
+        .expect("viewer screen after history clear");
+    assert!(
+        !screen.contains("[scrollback:"),
+        "the stale scrollback indicator should be repainted away: {screen:?}; target={alternate_screen:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_wheel_up_with_no_history_does_not_enter_scrollback() {
+    let dir = scratch_dir("a-empty");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    collect_until_bytes(&output, b"$ ");
+    held.write_raw(b"\x1b[<64;10;10M")
+        .expect("wheel up with no history");
+    std::thread::sleep(Duration::from_millis(200));
+    let screen = viewer.screen_text().expect("viewer screen");
+    assert!(
+        !screen.contains("[scrollback:"),
+        "empty history must not enter a scrollback frame: {screen:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
     use remuda_core::agent::{MouseEncoding, MouseMode, MouseState};
 
