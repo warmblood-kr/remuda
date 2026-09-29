@@ -52,10 +52,15 @@ fn type_text_submits_paste_once_and_preserves_embedded_newline() {
         r#"import os, select, sys, termios, tty, time
 fd = sys.stdin.fileno()
 tty.setraw(fd)
+os.write(1, b'READY\r\n')
 buf = bytearray()
 last = 0.0
 paste = False
 submitted = 0
+
+def redraw():
+    os.write(1, b'\r\x1b[2K> ' + bytes(buf))
+
 while True:
     ready, _, _ = select.select([fd], [], [], 5)
     if not ready:
@@ -78,12 +83,14 @@ while True:
         if b == 13:
             if paste or (last and now - last < 0.15):
                 buf.extend(b'\n')
+                redraw()
             else:
                 submitted += 1
                 os.write(1, b'\r\nSUBMITTED:' + bytes(buf) + b'\r\nCOUNT:' + str(submitted).encode() + b'\r\n')
                 buf.clear()
         else:
             buf.append(b)
+            redraw()
         last = now
         i += 1
 "#,
@@ -101,6 +108,7 @@ while True:
         },
     )
     .expect("start fake paste agent");
+    wait_screen(&socket, "paste-agent", "READY");
 
     script::run_source(
         &socket,
