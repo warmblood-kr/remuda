@@ -1713,18 +1713,7 @@ fn attach(
     } else {
         Response::Ok
     };
-    // A client can detach immediately after sending input. A failed response
-    // write must not discard those bytes before the input pump starts.
-    let _ = reply(&stream, &acknowledgement);
-
-    // Paint what is already on screen before streaming anything new, or the
-    // viewer sees a blank terminal until the program next redraws.
-    let mut out = stream.try_clone()?;
-    if let Ok(painted) = held.screen_bytes() {
-        // The initial paint is best-effort for the same reason as the
-        // acknowledgement: output failure does not make queued input unsafe.
-        let _ = out.write_all(&painted).and_then(|()| out.flush());
-    }
+    let mut out = attach_output(&stream, &acknowledgement, &held)?;
 
     // The socket reader and PTY writer are separate pumps. The bounded handoff
     // preserves buffers under backpressure; ordinary EOF closes the channel so
@@ -1837,6 +1826,28 @@ fn attach(
         ipc::stop_reader(&stream, stop, || key_thread.is_finished());
     });
     Ok(())
+}
+
+/// Start the output side before the input pumps. A failed write must not drop
+/// input the client sent before detaching.
+fn attach_output(
+    stream: &Stream,
+    acknowledgement: &Response,
+    held: &remuda_core::session::Attached<'_>,
+) -> std::io::Result<Stream> {
+    // A client can detach immediately after sending input. A failed response
+    // write must not discard those bytes before the input pump starts.
+    let _ = reply(stream, acknowledgement);
+
+    // Paint what is already on screen before streaming anything new, or the
+    // viewer sees a blank terminal until the program next redraws.
+    let mut out = stream.try_clone()?;
+    if let Ok(painted) = held.screen_bytes() {
+        // The initial paint is best-effort for the same reason as the
+        // acknowledgement: output failure does not make queued input unsafe.
+        let _ = out.write_all(&painted).and_then(|()| out.flush());
+    }
+    Ok(out)
 }
 
 const ATTACH_INPUT_FAILURE_NOTICE: &str =
