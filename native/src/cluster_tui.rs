@@ -575,7 +575,7 @@ impl ClusterUi {
                 if is_selected { ">" } else { " " },
                 if is_expanded { "▼" } else { "▶" },
                 node.name,
-                remote_state_label(node.state, node.last_sync_age)
+                remote_state_label(node.state, node.last_sync_age, node.last_error.as_deref())
             ));
             if is_expanded {
                 for session in visible_sessions {
@@ -589,7 +589,11 @@ impl ClusterUi {
                         "{}    {:<12} {}",
                         if is_selected { ">" } else { " " },
                         session.name,
-                        if session.alive { "live" } else { "ended" }
+                        format!(
+                            "{}{}",
+                            if session.alive { "live" } else { "ended" },
+                            session_error_suffix(session.last_error.as_deref())
+                        )
                     ));
                 }
             }
@@ -605,8 +609,12 @@ impl ClusterUi {
                         node.name,
                         session.name,
                         if session.alive { "live" } else { "ended" },
-                        remote_state_label(node.state, node.last_sync_age)
-                    ),
+                        remote_state_label(
+                            node.state,
+                            node.last_sync_age,
+                            node.last_error.as_deref()
+                        )
+                    ) + &session_error_suffix(session.last_error.as_deref()),
                     session
                         .screen
                         .as_ref()
@@ -1010,19 +1018,64 @@ fn age_seconds(now: Duration, since: Duration) -> u64 {
     now.saturating_sub(since).as_secs()
 }
 
-fn remote_state_label(state: RemoteState, last_sync_age: Option<Duration>) -> String {
+fn remote_state_label(
+    state: RemoteState,
+    last_sync_age: Option<Duration>,
+    last_error: Option<&str>,
+) -> String {
+    let reason = last_error.map(|error| {
+        if error.contains("supply --addr") {
+            "no address known".to_owned()
+        } else {
+            crate::text::strip_terminal_controls(error)
+                .chars()
+                .take(80)
+                .collect()
+        }
+    });
     match state {
         RemoteState::Reachable => "reachable".into(),
         RemoteState::Stale => last_sync_age.map_or_else(
-            || "stale · sync age unknown".into(),
-            |age| format!("stale · sync {}s ago", age.as_secs()),
+            || {
+                format!(
+                    "stale · sync age unknown{}",
+                    reason_suffix(reason.as_deref())
+                )
+            },
+            |age| {
+                format!(
+                    "stale · sync {}s ago{}",
+                    age.as_secs(),
+                    reason_suffix(reason.as_deref())
+                )
+            },
         ),
         RemoteState::Reconnecting => last_sync_age.map_or_else(
-            || "reconnecting".into(),
-            |age| format!("reconnecting · last sync {}s ago", age.as_secs()),
+            || format!("reconnecting{}", reason_suffix(reason.as_deref())),
+            |age| {
+                format!(
+                    "reconnecting · last sync {}s ago{}",
+                    age.as_secs(),
+                    reason_suffix(reason.as_deref())
+                )
+            },
         ),
-        RemoteState::Unreachable => "unreachable".into(),
+        RemoteState::Unreachable => format!("unreachable{}", reason_suffix(reason.as_deref())),
     }
+}
+
+fn reason_suffix(reason: Option<&str>) -> String {
+    reason.map_or_else(String::new, |reason| format!(" · {reason}"))
+}
+
+fn session_error_suffix(error: Option<&str>) -> String {
+    error.map_or_else(String::new, |error| {
+        let safe: String = crate::text::strip_terminal_controls(error)
+            .chars()
+            .take(80)
+            .collect();
+        format!(" · {safe}")
+    })
 }
 
 fn remote_screen_text(screen: &remuda_core::agent::ScreenSnapshot) -> String {
@@ -1177,7 +1230,7 @@ fn run_loop(
 ) -> io::Result<()> {
     let mut ui = ClusterUi::with_sender(node, list(path)?, clock.now(), InputSender::random()?);
     ui.remote_synced(remote_source);
-    ui.select_target(target)?;
+    select_target_with_remote_wait(&mut ui, target, remote_source, Duration::from_secs(5))?;
     loop {
         if let Ok(current) = list(path) {
             ui.sessions_synced(current, clock.now());
@@ -1240,10 +1293,40 @@ fn run_loop(
     }
 }
 
+fn select_target_with_remote_wait(
+    ui: &mut ClusterUi,
+    target: Option<&str>,
+    source: &dyn RemoteSource,
+    timeout: Duration,
+) -> io::Result<()> {
+    let Some(target) = target else { return Ok(()) };
+    let Some((node, _)) = target.split_once('/') else {
+        return ui.select_target(Some(target));
+    };
+    match ui.select_target(Some(target)) {
+        Ok(()) => return Ok(()),
+        Err(error) if node != ui.node => {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                ui.remote_synced(source);
+                if ui.select_target(Some(target)).is_ok() {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::queue::QueueState;
-    use super::{is_attention, render_badge, AttentionSignals, Badge, ClusterUi, RemoteSource};
+    use super::{
+        is_attention, remote_state_label, render_badge, select_target_with_remote_wait,
+        AttentionSignals, Badge, ClusterUi, RemoteSelection, RemoteSource,
+    };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
     };
@@ -1302,12 +1385,15 @@ mod tests {
                 name: "laptop".into(),
                 state,
                 last_sync_age: Some(age),
+                last_error: None,
                 sessions: vec![RemoteSessionSnapshot {
                     name: "build".into(),
+                    wire_name: "build".into(),
                     instance_id: "remote-instance".into(),
                     alive: true,
                     output_version: Some(7),
                     screen,
+                    last_error: None,
                 }],
             }],
         }
@@ -1576,6 +1662,45 @@ mod tests {
         assert!(frame.contains("last good screen"));
         assert!(frame.contains("Remote session is read-only"));
         assert!(!frame.contains("kill build?"));
+    }
+
+    #[test]
+    fn remote_target_waits_for_first_session_list() {
+        let source = std::sync::Arc::new(FakeRemoteSource(Mutex::new(RemoteSnapshot::default())));
+        let producer = std::sync::Arc::clone(&source);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            producer.replace(remote_snapshot(
+                RemoteState::Reachable,
+                Duration::ZERO,
+                Some(remote_screen("ready")),
+            ));
+        });
+        let mut ui = ClusterUi::new("studio", Vec::new(), Duration::ZERO);
+        ui.remote_synced(source.as_ref());
+        select_target_with_remote_wait(
+            &mut ui,
+            Some("laptop/build"),
+            source.as_ref(),
+            Duration::from_millis(250),
+        )
+        .unwrap();
+        assert!(matches!(
+            ui.remote_active,
+            Some(RemoteSelection::Session { .. })
+        ));
+    }
+
+    #[test]
+    fn unreachable_remote_label_explains_missing_registry_address() {
+        assert_eq!(
+            remote_state_label(
+                RemoteState::Unreachable,
+                None,
+                Some("supply --addr HOST:PORT"),
+            ),
+            "unreachable · no address known"
+        );
     }
 
     #[test]

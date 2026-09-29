@@ -87,8 +87,13 @@ impl Node {
     }
 
     fn start_session(&self, script: &str) {
+        self.start_named_session("proof", script);
+    }
+
+    fn start_named_session(&self, name: &str, script: &str) {
         let lua = format!(
-            "remuda.new('proof', {{'/bin/sh', '-c', {}}})",
+            "remuda.new({}, {{'/bin/sh', '-c', {}}})",
+            serde_json::to_string(name).unwrap(),
             serde_json::to_string(script).unwrap()
         );
         let start = self.command().args(["-e", &lua]).output().unwrap();
@@ -295,6 +300,7 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
         marker_after_reconnect.display(),
     );
     server_node.start_session(&shell);
+    server_node.start_named_session("unselected", "printf SHOULD_NOT_CAPTURE; sleep 30");
 
     let server_public = server_node.public.clone();
     let address = listener.address;
@@ -332,6 +338,14 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
     wait_for(Duration::from_secs(10), || {
         snapshot_text(source.as_ref()).is_some_and(|text| text.contains("REMOTE_START"))
     });
+    let first_list = source.snapshot();
+    let listed_sessions = &first_list.nodes[0].sessions;
+    assert!(listed_sessions
+        .iter()
+        .any(|session| { session.name == "proof" && session.screen.is_some() }));
+    assert!(listed_sessions
+        .iter()
+        .any(|session| { session.name == "unselected" && session.screen.is_none() }));
     fs::write(&marker_before_down, b"go").unwrap();
     wait_for(Duration::from_secs(10), || {
         snapshot_text(source.as_ref()).is_some_and(|text| text.contains(BEFORE_DOWN))

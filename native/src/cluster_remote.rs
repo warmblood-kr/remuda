@@ -24,11 +24,15 @@ pub enum RemoteState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteSessionSnapshot {
+    /// Sanitized label used only for display and UI selection.
     pub name: String,
+    /// Original protocol name used for authenticated read requests.
+    pub wire_name: String,
     pub instance_id: String,
     pub alive: bool,
     pub output_version: Option<u64>,
     pub screen: Option<ScreenSnapshot>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +40,7 @@ pub struct RemoteNodeSnapshot {
     pub name: String,
     pub state: RemoteState,
     pub last_sync_age: Option<Duration>,
+    pub last_error: Option<String>,
     pub sessions: Vec<RemoteSessionSnapshot>,
 }
 
@@ -99,8 +104,8 @@ impl RemoteSelection {
     }
 }
 
-/// Build poll targets from the cluster registry. Addresses stay owned by the
-/// shared resolver, with a per-call override available for older entries.
+/// Build poll targets from the cluster registry. PR9 adds the registry endpoint
+/// field; until then these targets have no route and the TUI reports that fact.
 pub fn registry_targets(
     registry: &crate::cluster::Registry,
     local_fingerprint: &str,
@@ -137,6 +142,7 @@ pub struct RemoteNode {
     sessions: Vec<RemoteSessionSnapshot>,
     last_sync: Option<Instant>,
     failure_count: u32,
+    last_error: Option<String>,
     next_poll: Instant,
     polling: bool,
 }
@@ -155,6 +161,7 @@ impl RemoteNode {
             sessions: Vec::new(),
             last_sync: None,
             failure_count: 0,
+            last_error: None,
             next_poll: now,
             polling: false,
         }
@@ -165,7 +172,9 @@ impl RemoteNode {
             return false;
         }
         self.polling = true;
-        self.state = RemoteState::Reconnecting;
+        if self.last_sync.is_none() {
+            self.state = RemoteState::Reconnecting;
+        }
         true
     }
 
@@ -173,13 +182,19 @@ impl RemoteNode {
         self.sessions = sessions;
         self.last_sync = Some(now);
         self.failure_count = 0;
+        self.last_error = None;
         self.next_poll = now + POLL_INTERVAL;
         self.polling = false;
         self.state = RemoteState::Reachable;
     }
 
     pub fn poll_failed(&mut self, now: Instant) {
+        self.poll_failed_with_reason(now, None);
+    }
+
+    pub fn poll_failed_with_reason(&mut self, now: Instant, reason: Option<String>) {
         self.failure_count = self.failure_count.saturating_add(1);
+        self.last_error = reason;
         self.next_poll = now + retry_backoff(self.failure_count);
         self.polling = false;
         self.state = if self.last_sync.is_some() {
@@ -208,6 +223,7 @@ impl RemoteNode {
             last_sync_age: self
                 .last_sync
                 .map(|last| now.saturating_duration_since(last)),
+            last_error: self.last_error.clone(),
             sessions: self.sessions.clone(),
         }
     }
@@ -345,11 +361,12 @@ impl ClusterRemoteTransport {
         prior: Option<&RemoteSessionSnapshot>,
     ) -> io::Result<Option<RemoteSessionSnapshot>> {
         let listed_instance_id = listed_instance_id(&session);
-        let response = if let Some(prior) = prior.filter(|old| old.output_version.is_some()) {
+        let response = if should_sync(prior) {
+            let prior = prior.expect("should_sync requires a prior screen");
             self.request(
                 target,
                 &Request::Sync {
-                    name: session.name.clone(),
+                    name: prior.wire_name.clone(),
                     instance_id: Some(prior.instance_id.clone()),
                     since: prior.output_version.unwrap_or_default(),
                     timeout_ms: REMOTE_SYNC_TIMEOUT.as_millis() as u64,
@@ -371,11 +388,13 @@ impl ClusterRemoteTransport {
                 output_version,
                 snapshot,
             } => Ok(Some(RemoteSessionSnapshot {
-                name: session.name,
+                name: display_name(&session.name),
+                wire_name: session.name,
                 instance_id,
                 alive: true,
                 output_version: Some(output_version),
                 screen: Some(to_screen_snapshot(snapshot)),
+                last_error: None,
             })),
             Response::StyledScreen {
                 rows,
@@ -388,7 +407,8 @@ impl ClusterRemoteTransport {
             } => Ok(instance_id
                 .or(listed_instance_id)
                 .map(|instance_id| RemoteSessionSnapshot {
-                    name: session.name,
+                    name: display_name(&session.name),
+                    wire_name: session.name,
                     instance_id,
                     alive: true,
                     output_version,
@@ -399,6 +419,7 @@ impl ClusterRemoteTransport {
                         scrollback_total,
                         cursor,
                     })),
+                    last_error: None,
                 })),
             Response::WrongInstance => Err(io::Error::new(
                 io::ErrorKind::Interrupted,
@@ -429,14 +450,20 @@ impl RemoteTransport for ClusterRemoteTransport {
         let mut snapshots = Vec::with_capacity(sessions.len());
         for session in sessions {
             let prior = previous_session(&session, previous);
-            if !session.alive || selected_session != Some(session.name.as_str()) {
+            if !session.alive || selected_session != Some(display_name(&session.name).as_str()) {
                 if let Some(snapshot) = unpolled_session_snapshot(session, prior) {
                     snapshots.push(snapshot);
                 }
                 continue;
             }
-            if let Some(snapshot) = self.selected_session_snapshot(&resolved, session, prior)? {
-                snapshots.push(snapshot);
+            match self.selected_session_snapshot(&resolved, session.clone(), prior) {
+                Ok(Some(snapshot)) => snapshots.push(snapshot),
+                Ok(None) => {}
+                Err(error) => {
+                    if let Some(snapshot) = session_after_poll_error(session, prior, error) {
+                        snapshots.push(snapshot);
+                    }
+                }
             }
         }
         Ok(snapshots)
@@ -450,35 +477,68 @@ fn listed_instance_id(session: &remuda_core::registry::SessionSummary) -> Option
         .or_else(|| (!session.id.is_empty()).then(|| session.id.clone()))
 }
 
+fn display_name(name: &str) -> String {
+    crate::text::strip_terminal_controls(name).into_owned()
+}
+
 fn previous_session<'a>(
     session: &remuda_core::registry::SessionSummary,
     previous: &'a [RemoteSessionSnapshot],
 ) -> Option<&'a RemoteSessionSnapshot> {
     let instance_id = listed_instance_id(session);
-    previous
-        .iter()
-        .find(|old| old.name == session.name && instance_id.as_ref() == Some(&old.instance_id))
+    previous.iter().find(|old| {
+        old.name == display_name(&session.name) && instance_id.as_ref() == Some(&old.instance_id)
+    })
+}
+
+fn should_sync(prior: Option<&RemoteSessionSnapshot>) -> bool {
+    prior.is_some_and(|old| old.screen.is_some() && old.output_version.is_some())
 }
 
 fn unpolled_session_snapshot(
     session: remuda_core::registry::SessionSummary,
     prior: Option<&RemoteSessionSnapshot>,
 ) -> Option<RemoteSessionSnapshot> {
+    let wire_name = session.name.clone();
     let instance_id = prior
         .map(|old| old.instance_id.clone())
         .or_else(|| listed_instance_id(&session))?;
     Some(RemoteSessionSnapshot {
-        name: session.name,
+        name: display_name(&session.name),
+        wire_name,
         instance_id,
         alive: session.alive,
         output_version: session.output_version,
         screen: prior.and_then(|old| old.screen.clone()),
+        last_error: prior.and_then(|old| old.last_error.clone()),
     })
+}
+
+fn session_after_poll_error(
+    session: remuda_core::registry::SessionSummary,
+    prior: Option<&RemoteSessionSnapshot>,
+    error: io::Error,
+) -> Option<RemoteSessionSnapshot> {
+    let mut snapshot = unpolled_session_snapshot(session, prior)?;
+    snapshot.last_error = Some(error.to_string());
+    Some(snapshot)
 }
 
 fn to_screen_snapshot(screen: remuda_core::protocol::StyledScreen) -> ScreenSnapshot {
     ScreenSnapshot {
-        cells: screen.rows.iter().map(|row| expand_runs(row)).collect(),
+        cells: screen
+            .rows
+            .iter()
+            .map(|row| {
+                expand_runs(row)
+                    .into_iter()
+                    .map(|mut cell| {
+                        cell.text = crate::text::strip_terminal_controls(&cell.text).into_owned();
+                        cell
+                    })
+                    .collect()
+            })
+            .collect(),
         wrapped: screen.wrapped,
         cursor: screen.cursor,
         scrollback_len: screen.scrollback_len,
@@ -493,9 +553,23 @@ pub struct RemotePoller {
     transport: Arc<dyn RemoteTransport>,
     workers: Arc<RemoteWorkerCap>,
     targets: Vec<RemoteTarget>,
+    registry_fingerprint: Option<String>,
     selection: RemoteSelection,
     stop: Arc<std::sync::atomic::AtomicBool>,
     scheduler: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+struct UnavailableRemoteTransport(String);
+
+impl RemoteTransport for UnavailableRemoteTransport {
+    fn poll_node(
+        &self,
+        _target: &RemoteTarget,
+        _selected_session: Option<&str>,
+        _previous: &[RemoteSessionSnapshot],
+    ) -> io::Result<Vec<RemoteSessionSnapshot>> {
+        Err(io::Error::other(self.0.clone()))
+    }
 }
 
 impl RemotePoller {
@@ -505,6 +579,7 @@ impl RemotePoller {
             transport,
             workers: Arc::new(RemoteWorkerCap::default()),
             targets,
+            registry_fingerprint: None,
             selection: RemoteSelection::default(),
             stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             scheduler: Mutex::new(None),
@@ -520,8 +595,15 @@ impl RemotePoller {
         local_fingerprint: &str,
     ) -> io::Result<Self> {
         let targets = registry_targets(registry, local_fingerprint);
-        let transport = Arc::new(ClusterRemoteTransport::system()?);
-        Ok(Self::new(targets, transport))
+        let transport: Arc<dyn RemoteTransport> = match ClusterRemoteTransport::system() {
+            Ok(transport) => Arc::new(transport),
+            Err(error) => Arc::new(UnavailableRemoteTransport(format!(
+                "remote transport unavailable: {error}"
+            ))),
+        };
+        let mut poller = Self::new(targets, transport);
+        poller.registry_fingerprint = Some(local_fingerprint.to_owned());
+        Ok(poller)
     }
 
     pub fn source(&self) -> Arc<RemoteTreeState> {
@@ -541,7 +623,8 @@ impl RemotePoller {
         if scheduler.is_some() {
             return Ok(());
         }
-        let targets = self.targets.clone();
+        let mut targets = self.targets.clone();
+        let registry_fingerprint = self.registry_fingerprint.clone();
         let state = Arc::clone(&self.state);
         let transport = Arc::clone(&self.transport);
         let workers = Arc::clone(&self.workers);
@@ -551,11 +634,29 @@ impl RemotePoller {
             std::thread::Builder::new()
                 .name("cluster-remote-scheduler".into())
                 .spawn(move || {
-                    if targets.is_empty() {
+                    if targets.is_empty() && registry_fingerprint.is_none() {
                         return;
                     }
                     let mut cursor = 0;
+                    let mut last_registry_refresh = Instant::now();
                     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        if let Some(local_fingerprint) = &registry_fingerprint {
+                            if last_registry_refresh.elapsed() >= Duration::from_secs(1) {
+                                if let Ok(Some((_, registry))) = crate::cluster::nodes() {
+                                    reconcile_registry_targets(
+                                        &state,
+                                        &mut targets,
+                                        registry_targets(&registry, local_fingerprint),
+                                    );
+                                    cursor = cursor.min(targets.len().saturating_sub(1));
+                                }
+                                last_registry_refresh = Instant::now();
+                            }
+                        }
+                        if targets.is_empty() {
+                            std::thread::sleep(Duration::from_millis(100));
+                            continue;
+                        }
                         let len = targets.len();
                         let start = cursor;
                         cursor = (cursor + 1) % len;
@@ -609,6 +710,32 @@ impl RemotePoller {
     }
 }
 
+fn reconcile_registry_targets(
+    state: &RemoteTreeState,
+    current: &mut Vec<RemoteTarget>,
+    refreshed: Vec<RemoteTarget>,
+) {
+    let refreshed_keys: HashSet<_> = refreshed
+        .iter()
+        .map(|target| target.registry_key.clone())
+        .collect();
+    let mut nodes = state
+        .nodes
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    nodes.retain(|key, _| refreshed_keys.contains(key));
+    for target in &refreshed {
+        nodes.entry(target.registry_key.clone()).or_insert_with(|| {
+            RemoteNode::with_key(
+                target.registry_key.clone(),
+                target.name.clone(),
+                Instant::now(),
+            )
+        });
+    }
+    *current = refreshed;
+}
+
 impl Drop for RemotePoller {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -654,12 +781,14 @@ fn schedule_remote_poll(
             let now = Instant::now();
             let _ = state.with_node(&target.registry_key, |node| match result {
                 Ok(sessions) => node.poll_succeeded(sessions, now),
-                Err(_) => node.poll_failed(now),
+                Err(error) => node.poll_failed_with_reason(now, Some(error.to_string())),
             });
         });
     if let Err(error) = worker {
         let now = Instant::now();
-        let _ = failed_state.with_node(&failed_name, |node| node.poll_failed(now));
+        let _ = failed_state.with_node(&failed_name, |node| {
+            node.poll_failed_with_reason(now, Some(error.to_string()))
+        });
         return Err(error);
     }
     Ok(true)
@@ -690,23 +819,6 @@ impl RemoteWorkerCap {
             cap: Arc::clone(self),
             node,
         })
-    }
-
-    pub fn spawn(
-        self: &Arc<Self>,
-        node: impl Into<String>,
-        work: impl FnOnce() + Send + 'static,
-    ) -> io::Result<bool> {
-        let Some(permit) = self.acquire(node) else {
-            return Ok(false);
-        };
-        std::thread::Builder::new()
-            .name("cluster-remote-poll".into())
-            .spawn(move || {
-                let _permit = permit;
-                work();
-            })?;
-        Ok(true)
     }
 }
 
@@ -758,11 +870,163 @@ mod tests {
     fn session(name: &str, text: &str) -> RemoteSessionSnapshot {
         RemoteSessionSnapshot {
             name: name.into(),
+            wire_name: name.into(),
             instance_id: "instance-1".into(),
             alive: true,
             output_version: Some(4),
             screen: Some(screen(text)),
+            last_error: None,
         }
+    }
+
+    #[test]
+    fn remote_names_and_screen_cells_strip_terminal_injection_controls() {
+        let hostile_name = "x\u{1b}]0;pwn\u{7}";
+        assert_eq!(display_name(hostile_name), "x]0;pwn");
+
+        let snapshot = to_screen_snapshot(remuda_core::protocol::StyledScreen {
+            rows: vec![vec![remuda_core::protocol::StyledRun {
+                text: "\u{1b}]52;c;aGk=\u{7}safe\u{009b}31m".into(),
+                fg: Color::Default,
+                bg: Color::Default,
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                inverse: false,
+                wide: false,
+            }]],
+            wrapped: vec![false],
+            scrollback_len: 0,
+            scrollback_total: 0,
+            cursor: Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+        });
+        let text: String = snapshot.cells[0]
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect();
+        assert_eq!(text, "]52;c;aGk=safe31m");
+    }
+
+    #[test]
+    fn selected_session_without_a_fetched_screen_uses_capture_first() {
+        let listed = session("build", "");
+        let listed_only = RemoteSessionSnapshot {
+            output_version: Some(12),
+            screen: None,
+            ..listed
+        };
+        assert!(!should_sync(Some(&listed_only)));
+        let captured = session("build", "screen");
+        assert!(should_sync(Some(&captured)));
+    }
+
+    #[test]
+    fn same_name_new_instance_does_not_inherit_the_old_screen() {
+        let old = session("build", "old frame");
+        let listed = remuda_core::registry::SessionSummary {
+            id: "new-id".into(),
+            name: "build".into(),
+            instance_id: Some("new-instance".into()),
+            output_version: Some(8),
+            alive: true,
+            idle: Duration::ZERO,
+            output_idle: None,
+            size: remuda_core::Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+        };
+        assert!(previous_session(&listed, &[old.clone()]).is_none());
+        let fresh = unpolled_session_snapshot(listed, None).unwrap();
+        assert!(fresh.screen.is_none());
+        assert_eq!(fresh.output_version, Some(8));
+        assert!(!should_sync(Some(&fresh)));
+    }
+
+    #[test]
+    fn selected_sync_error_keeps_the_fresh_list_and_marks_only_that_session() {
+        let prior = session("build", "last good frame");
+        let listed = remuda_core::registry::SessionSummary {
+            id: "session-build".into(),
+            name: "build".into(),
+            instance_id: Some(prior.instance_id.clone()),
+            output_version: Some(5),
+            alive: true,
+            idle: Duration::ZERO,
+            output_idle: None,
+            size: remuda_core::Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+        };
+        let retained =
+            session_after_poll_error(listed, Some(&prior), io::Error::other("sync failed"))
+                .unwrap();
+        assert_eq!(retained.screen, prior.screen);
+        assert_eq!(retained.output_version, Some(5));
+        assert_eq!(retained.last_error.as_deref(), Some("sync failed"));
+    }
+
+    #[test]
+    fn registry_targets_exclude_revoked_members() {
+        let registry = crate::cluster::Registry {
+            authorized_nodes: vec![
+                crate::cluster::AuthorizedNode {
+                    node_fp: "admitted-fingerprint".into(),
+                    static_pubkey: String::new(),
+                    state: crate::cluster::NodeState::Admitted,
+                    version: 1,
+                    by: "local".into(),
+                },
+                crate::cluster::AuthorizedNode {
+                    node_fp: "revoked-fingerprint".into(),
+                    static_pubkey: String::new(),
+                    state: crate::cluster::NodeState::Revoked,
+                    version: 1,
+                    by: "local".into(),
+                },
+            ],
+        };
+        let targets = registry_targets(&registry, "local");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].registry_key, "admitted-fingerprint");
+    }
+
+    #[test]
+    fn registry_refresh_drops_revoked_nodes_and_adds_new_members() {
+        let now = Instant::now();
+        let state = RemoteTreeState::default();
+        let mut targets = vec![RemoteTarget {
+            name: "laptop".into(),
+            registry_key: "revoked-fingerprint".into(),
+            addr_override: None,
+        }];
+        state.insert_node(RemoteNode::with_key(
+            "revoked-fingerprint".into(),
+            "laptop".into(),
+            now,
+        ));
+        reconcile_registry_targets(&state, &mut targets, Vec::new());
+        assert!(targets.is_empty());
+        assert!(state.snapshot_at(now).nodes.is_empty());
+
+        reconcile_registry_targets(
+            &state,
+            &mut targets,
+            vec![RemoteTarget {
+                name: "tablet".into(),
+                registry_key: "new-fingerprint".into(),
+                addr_override: None,
+            }],
+        );
+        let snapshot = state.snapshot_at(now);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(snapshot.nodes[0].name, "tablet");
     }
 
     #[test]
@@ -782,7 +1046,7 @@ mod tests {
         assert_eq!(node.retry_at(), failed_at + BACKOFF_BASE);
         assert!(!node.begin_poll(failed_at + Duration::from_millis(999)));
         assert!(node.begin_poll(node.retry_at()));
-        assert_eq!(node.snapshot_at(failed_at).state, RemoteState::Reconnecting);
+        assert_eq!(node.snapshot_at(failed_at).state, RemoteState::Stale);
         node.poll_failed(node.retry_at());
         let mut retry_at = node.retry_at();
         let mut last_backoff = Duration::ZERO;
