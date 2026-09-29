@@ -372,6 +372,75 @@ fn daemon_tightens_a_preexisting_socket_directory() {
 
 #[cfg(unix)]
 #[test]
+fn a_custom_absolute_socket_path_does_not_change_its_parent_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runtime = scratch_dir("custom-absolute-socket");
+    let custom = runtime.join("chosen");
+    std::fs::create_dir(&custom).expect("create user-selected socket directory");
+    std::fs::set_permissions(&custom, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let custom_server = custom.join("X").to_string_lossy().into_owned();
+    let output = remuda_timed(&runtime, &["-s", &custom_server, "-e", "return true"]);
+
+    assert!(
+        output.status.success(),
+        "custom socket path failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(&custom).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    let _ = remuda_timed(&runtime, &["-s", &custom_server, "stop"]);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_nested_socket_name_keeps_the_runtime_directory_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runtime = scratch_dir("nested-socket-name");
+    let output = remuda_timed(&runtime, &["-s", "sub/X", "-e", "return true"]);
+
+    assert!(
+        output.status.success(),
+        "nested socket path failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(runtime.join("remuda"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let _ = remuda_timed(&runtime, &["-s", "sub/X", "stop"]);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_runtime_directory_is_rejected_before_a_startup_log_is_created() {
+    let runtime = scratch_dir("symlink-runtime");
+    let target = runtime.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, runtime.join("remuda")).unwrap();
+
+    let output = remuda_timed(&runtime, &["-s", "s", "-e", "return true"]);
+
+    assert!(!output.status.success());
+    assert!(
+        !target.join("s.log").exists(),
+        "must not create log through symlink"
+    );
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_signal_cleanup_preserves_a_replacement_socket_path() {
     use std::os::unix::fs::FileTypeExt;
 
