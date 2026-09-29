@@ -3,8 +3,12 @@
 use remuda_core::protocol::{Request, Response};
 use remuda_native::{client, daemon, script};
 use serde_json::Value;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+#[path = "daemon_support/spawn.rs"]
+mod spawn;
 
 const PATIENCE: Duration = Duration::from_secs(10);
 
@@ -21,24 +25,42 @@ fn scratch(tag: &str) -> PathBuf {
 }
 
 /// Start a daemon and return once it actually answers, not once it was spawned.
-fn daemon_at(path: &Path) -> impl Drop {
-    let serving = path.to_path_buf();
-    std::thread::spawn(move || {
-        let _ = daemon::serve(&serving);
-    });
-    let deadline = Instant::now() + PATIENCE;
-    while remuda_native::ipc::connect(path).is_err() {
-        assert!(Instant::now() < deadline, "daemon never bound {path:?}");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    Cleanup(path.to_path_buf())
+fn daemon_at(path: &Path, dir: &Path) -> spawn::Daemon {
+    debug_assert_eq!(path, daemon::socket_path_in(dir, "s"));
+    let mut command = spawn::base_command(dir);
+    command.env("REMUDA_SUPPRESS_DEPRECATIONS", "1");
+    spawn::spawn_and_wait(command, dir)
 }
 
-struct Cleanup(PathBuf);
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+#[test]
+fn deprecated_flat_session_alias_warns_once_per_process() {
+    let dir = scratch("deprecation-once");
+    let path = daemon::socket_path_in(&dir, "s");
+    let mut command = spawn::base_command(&dir);
+    command
+        .env_remove("REMUDA_SUPPRESS_DEPRECATIONS")
+        .stderr(std::process::Stdio::piped());
+    let mut daemon = spawn::spawn_and_wait(command, &dir);
+
+    script::run_source(&path, "=deprecation-once", "remuda.ls(); remuda.ls()")
+        .expect("deprecated aliases should remain callable");
+    let _ = daemon.0.kill();
+    let _ = daemon.0.wait();
+    let mut stderr = String::new();
+    daemon
+        .0
+        .stderr
+        .take()
+        .expect("stderr is piped")
+        .read_to_string(&mut stderr)
+        .expect("read daemon stderr");
+
+    let notice = "deprecated: remuda.ls; use remuda.session.list";
+    assert_eq!(
+        stderr.lines().filter(|line| *line == notice).count(),
+        1,
+        "expected one deprecation notice, got stderr: {stderr}"
+    );
 }
 
 fn write(dir: &Path, name: &str, source: &str) -> PathBuf {
@@ -84,7 +106,7 @@ fn request_counts(path: &Path) -> (u64, u64, u64) {
 fn expect_option_strips_whole_utf8_selection_markers() {
     let dir = scratch("expect-option-utf8");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
     let code = r#"
         local highlighted = remuda.expect_option(
             "  Update available\n› 1. Update now\n  2. Skip\n",
@@ -121,7 +143,7 @@ fn daemon_request_counts_reflect_real_requests_seen_at_dispatch() {
     // the deltas below are exact, not approximate.
     let dir = scratch("request-counts");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let before = request_counts(&path); // itself one Eval
     client::request(&path, &Request::List).expect("list");
@@ -149,7 +171,7 @@ fn the_bound_surface_is_exactly_the_protocols() {
     // in BINDINGS but never bound fails too.
     let dir = scratch("surface");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let expected = script::BINDINGS.join(",");
     let source = format!(
@@ -162,6 +184,19 @@ fn the_bound_surface_is_exactly_the_protocols() {
         if got ~= want then
           error("bound surface is " .. got .. ", expected " .. want)
         end
+        local session_names = {{}}
+        for key in pairs(remuda.session) do session_names[#session_names + 1] = key end
+        table.sort(session_names)
+        local session_got = table.concat(session_names, ",")
+        local session_want = "attach,close,list,new"
+        if session_got ~= session_want then
+          error("session namespace is " .. session_got .. ", expected " .. session_want)
+        end
+        assert(type(remuda.process) == "table", "process namespace is a table")
+        local process_words = {{}}
+        for key in pairs(remuda.process) do process_words[#process_words + 1] = key end
+        table.sort(process_words)
+        assert(table.concat(process_words, ",") == "run", "process namespace surface must be exactly run")
         "#
     );
 
@@ -184,7 +219,7 @@ fn the_bound_surface_is_exactly_the_protocols() {
 fn run_lua(tag: &str, source: &str) {
     let dir = scratch(tag);
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
     script::run(&path, &write(&dir, &format!("{tag}.lua"), source)).expect(tag);
 }
 
@@ -314,7 +349,7 @@ fn every_word_has_a_registry_entry() {
     // name) — the two categories the reference manual has to cover.
     let dir = scratch("registry-completeness");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let names = script::BINDINGS.join(",");
     let source = format!(
@@ -337,10 +372,91 @@ fn every_word_has_a_registry_entry() {
 }
 
 #[test]
+fn remuda_json_round_trips_values_and_rejects_bad_inputs() {
+    run_lua(
+        "json-surface",
+        r#"
+        assert(type(remuda.json) == "table")
+        assert(remuda.json.null ~= nil)
+        local decoded, err = remuda.json.decode('{"empty_array":[],"empty_object":{},"nil":null,"count":4,"ratio":1.25}')
+        assert(decoded and err == nil, tostring(err))
+        assert(remuda.json.encode(decoded) == '{"count":4,"empty_array":[],"empty_object":{},"nil":null,"ratio":1.25}')
+        assert(decoded.empty_array[1] == nil and decoded.empty_object.any == nil)
+        assert(decoded["nil"] == remuda.json.null)
+        assert(type(decoded.count) == "number" and decoded.count == 4)
+        assert(type(decoded.ratio) == "number" and decoded.ratio == 1.25)
+        local number_kinds = remuda.json.decode('[4,4.0]')
+        assert(math.type(number_kinds[1]) == "integer" and math.type(number_kinds[2]) == "float")
+        assert(remuda.json.encode(remuda.json.array{}) == "[]")
+        assert(remuda.json.encode(remuda.json.object{}) == "{}")
+        local foreign = setmetatable({}, { __index = function() return "foreign" end })
+        assert(not pcall(remuda.json.array, foreign), "array tagging refuses a foreign metatable")
+        assert(not pcall(remuda.json.object, foreign), "object tagging refuses a foreign metatable")
+        assert(not pcall(remuda.json.encode, {}), "an empty untagged table is ambiguous")
+        assert(not pcall(remuda.json.encode, { 1, name = "mixed" }), "mixed keys are refused")
+        local sparse_ok, sparse_error = pcall(remuda.json.encode, { [2] = "sparse" })
+        assert(not sparse_ok and tostring(sparse_error):find("sparse array", 1, true), tostring(sparse_error))
+        assert(not pcall(remuda.json.encode, 0/0), "NaN is refused")
+        assert(not pcall(remuda.json.encode, math.huge), "infinity is refused")
+        assert(not pcall(remuda.json.encode, function() end), "functions are refused")
+        assert(not pcall(remuda.json.encode, coroutine.create(function() end)), "threads are refused")
+        assert(not pcall(remuda.json.encode, nil), "nil must use the null sentinel")
+
+        local cycle = {}; cycle.self = cycle
+        assert(not pcall(remuda.json.encode, cycle), "cycles are refused")
+        local too_deep_value = 0
+        for _ = 1, 65 do too_deep_value = { too_deep_value } end
+        assert(not pcall(remuda.json.encode, too_deep_value), "deep Lua tables are refused")
+        assert(not pcall(remuda.json.encode, { [string.char(255)] = true }), "invalid UTF-8 keys are refused")
+
+        local duplicate, duplicate_error = remuda.json.decode('{"x":1,"x":2}')
+        assert(duplicate == nil and duplicate_error == "duplicate key", tostring(duplicate_error))
+        local truncated, truncated_error = remuda.json.decode('{"x":')
+        assert(truncated == nil and type(truncated_error) == "string")
+        local invalid, invalid_error = remuda.json.decode(string.char(255))
+        assert(invalid == nil and type(invalid_error) == "string")
+        local huge, huge_error = remuda.json.decode("1e9999")
+        assert(huge == nil and type(huge_error) == "string")
+        local wide_integer, wide_error = remuda.json.decode("18446744073709551615")
+        assert(wide_integer ~= nil and wide_error == nil and wide_integer > 1e18)
+        local deep = string.rep("[", 65) .. "0" .. string.rep("]", 65)
+        local too_deep, depth_error = remuda.json.decode(deep)
+        assert(too_deep == nil and type(depth_error) == "string")
+        local many_values = "[" .. string.rep("null,", 100000) .. "null]"
+        local too_many, count_error = remuda.json.decode(many_values)
+        assert(too_many == nil and count_error:find("maximum JSON value count exceeded", 1, true), tostring(count_error))
+        local too_large, size_error = remuda.json.decode(string.rep(" ", 8 * 1024 * 1024 + 1))
+        assert(too_large == nil and type(size_error) == "string")
+
+        local pretty = remuda.json.encode({ value = 1 }, { pretty = true })
+        assert(pretty:find("\n", 1, true), pretty)
+        local output_ok, output_error = pcall(remuda.json.encode, string.rep(string.char(0), 1500000))
+        assert(not output_ok and tostring(output_error):find("encoded output exceeds", 1, true), tostring(output_error))
+        local many = remuda.json.array{}
+        for i = 1, 100000 do many[i] = remuda.json.null end
+        local values_ok, values_error = pcall(remuda.json.encode, many)
+        assert(not values_ok and tostring(values_error):find("maximum JSON value count exceeded", 1, true), tostring(values_error))
+        "#,
+    );
+}
+
+#[test]
+fn remuda_json_nested_words_are_registered() {
+    run_lua(
+        "json-registry",
+        r#"
+        for _, name in ipairs({ "json", "json.decode", "json.encode", "json.null", "json.array", "json.object" }) do
+          assert(remuda._registry[name] ~= nil, "missing registry row for " .. name)
+        end
+        "#,
+    );
+}
+
+#[test]
 fn registry_documentation_formats_are_live_and_structured() {
     let dir = scratch("registry-docs");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let eval = |code: &str| match client::request(
         &path,
@@ -384,7 +500,7 @@ fn every_frozen_api_version_still_runs() {
     // required now fails the build instead of someone's plugin.
     let dir = scratch("compat");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let api = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/api");
     let mut versions: Vec<PathBuf> = std::fs::read_dir(&api)
@@ -418,7 +534,7 @@ fn a_script_reacts_to_what_a_session_shows() {
     // that the echo happened.
     let dir = scratch("react");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let source = r#"
         remuda.new("driven", {"sh"})
@@ -469,7 +585,7 @@ fn a_refusal_stops_the_script_instead_of_being_returned() {
     // receives the marker.
     let dir = scratch("refusal");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let source = r#"
         remuda.new("witness", {"sh"})
@@ -500,7 +616,7 @@ fn remuda_new_can_set_cwd_and_env_on_the_launched_process() {
     // just echo back (PRINCIPLES.md §4): `command` runs immediately as argv.
     let dir = scratch("new-cwd-env");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let target = scratch("new-cwd-env-target");
     // Escaped, not interpolated raw: on Windows this path contains `\`, which
@@ -551,7 +667,7 @@ fn a_session_handle_is_not_a_buffer() {
     // second, since a buffer is inert text with no notion of "working".
     let dir = scratch("session-buffer");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let source = r#"
         remuda.new("driven", {"sh"})
@@ -578,7 +694,7 @@ fn a_session_handle_is_not_a_buffer() {
 fn is_busy_tracks_streaming_output_then_goes_idle() {
     let dir = scratch("busy-from-output");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let source = r#"
         remuda.new("streaming", {"sh", "-c", "i=0; while [ $i -lt 20 ]; do printf x; sleep 0.1; i=$((i + 1)); done; sleep 30"})
@@ -610,7 +726,7 @@ fn clearing_one_group_leaves_the_others_hooks_firing() {
     // same event.
     let dir = scratch("hooks");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
 
     let source = r#"
         remuda.fired_a, remuda.fired_b = 0, 0
@@ -641,7 +757,7 @@ fn clearing_one_group_leaves_the_others_hooks_firing() {
 fn capture_styled_marks_dim_spans_and_reports_the_cursor() {
     let dir = scratch("styled");
     let path = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = daemon_at(&path, &dir);
     let code = r#"
         -- Wait on what the screen shows, never on timing: first the shell's
         -- prompt (so the command is not typed before sh reads), then the

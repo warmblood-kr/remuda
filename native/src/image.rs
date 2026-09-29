@@ -16,6 +16,7 @@
 //! output pump may never *call into* Lua. If `on_output(session, fn)` is ever
 //! added, the pump must post a job to this loop, not run the callback itself.
 
+use crate::reply_limit::MAX_REPLY_BYTES;
 use crate::script;
 use mlua::Lua;
 use std::cell::RefCell;
@@ -52,6 +53,24 @@ impl fmt::Display for TypedFailure {
 
 impl Error for TypedFailure {}
 
+#[derive(Debug)]
+struct CapturedPrintLimit {
+    size: usize,
+}
+
+impl fmt::Display for CapturedPrintLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "captured print output exceeds the {} MiB output limit (at least {} bytes)",
+            MAX_REPLY_BYTES / (1024 * 1024),
+            self.size
+        )
+    }
+}
+
+impl Error for CapturedPrintLimit {}
+
 /// Read a typed failure encoded by the image, if the response carries one.
 pub fn typed_failure_message(value: &str) -> Option<(u8, &str)> {
     let value = value.strip_prefix(TYPED_FAILURE_PREFIX)?;
@@ -72,6 +91,7 @@ enum JobKind {
     Eval {
         code: String,
         name: Option<String>,
+        allow_pending: bool,
     },
     StopModules,
     HttpComplete {
@@ -87,6 +107,7 @@ enum JobKind {
 #[derive(Clone)]
 pub struct Image {
     jobs: Sender<Job>,
+    pending: crate::pending::PendingReplies,
     http: crate::net::HttpClient,
 }
 
@@ -106,6 +127,7 @@ impl Image {
         let socket: PathBuf = socket.to_path_buf();
         let image = Self {
             jobs,
+            pending: crate::pending::PendingReplies::default(),
             http: crate::net::HttpClient::default(),
         };
         let handle = image.clone();
@@ -120,7 +142,7 @@ impl Image {
 
             // A failure here means no image at all, so every eval must say so
             // rather than the thread dying quietly and every caller hanging.
-            let ready = script::bindings(&lua, &socket, registry, counters, handle)
+            let ready = script::bindings(&lua, &socket, registry, counters, handle.clone())
                 .and_then(|table| lua.globals().set("remuda", table))
                 // The tool frame is Lua over those bindings, not a second set of
                 // them. It must load *after* the table exists and *before* any
@@ -139,8 +161,32 @@ impl Image {
                 let answer = match &ready {
                     Err(why) => Err(format!("image failed to start: {why}")),
                     Ok(()) => match &job.kind {
-                        JobKind::Eval { code, name } => eval(&lua, code, name.as_deref())
-                            .map(|value| join_output(&printed.borrow(), &value)),
+                        JobKind::Eval {
+                            code,
+                            name,
+                            allow_pending,
+                        } => {
+                            handle.pending.begin_eval();
+                            let answer = eval(&lua, code, name.as_deref()).and_then(|value| {
+                                if handle.pending.pending_id(&value).is_some() {
+                                    Ok(value)
+                                } else {
+                                    join_output(&printed.borrow(), value)
+                                }
+                            });
+                            let pending_id = answer
+                                .as_ref()
+                                .ok()
+                                .and_then(|value| handle.pending.pending_id(value));
+                            if pending_id.is_some() && !*allow_pending {
+                                handle.pending.finish_eval(None);
+                                Err("pending replies may only be returned from a daemon request"
+                                    .into())
+                            } else {
+                                handle.pending.finish_eval(pending_id);
+                                answer
+                            }
+                        }
                         JobKind::StopModules => script::stop_modules(&lua)
                             .map(|()| String::new())
                             .map_err(|error| error.to_string()),
@@ -183,11 +229,26 @@ impl Image {
                 kind: JobKind::Eval {
                     code: code.to_string(),
                     name: name.map(str::to_string),
+                    allow_pending: false,
                 },
                 reply: Some(reply),
             })
             .map_err(|_| "the image is not running".to_string())?;
         Ok(answer)
+    }
+
+    pub fn pending_replies(&self) -> crate::pending::PendingReplies {
+        self.pending.clone()
+    }
+
+    /// Notify every deferred caller before modules and the Lua runtime stop.
+    pub fn shutdown_pending_replies(&self) {
+        self.pending.shutdown();
+        const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Ok(answer) = self.submit("__remuda_pending_tick()", Some("@remuda/pending-shutdown"))
+        {
+            let _ = answer.recv_timeout(DRAIN_TIMEOUT);
+        }
     }
 
     #[cfg(test)]
@@ -220,6 +281,23 @@ impl Image {
     /// interpreter, and a variable set by any of them outlives the call.
     pub fn eval(&self, code: &str, name: Option<&str>) -> Result<String, String> {
         self.submit(code, name)?
+            .recv()
+            .map_err(|_| "the image stopped without answering".to_string())?
+    }
+
+    pub fn eval_request(&self, code: &str, name: Option<&str>) -> Result<String, String> {
+        let (reply, answer) = channel();
+        self.jobs
+            .send(Job {
+                kind: JobKind::Eval {
+                    code: code.to_string(),
+                    name: name.map(str::to_string),
+                    allow_pending: true,
+                },
+                reply: Some(reply),
+            })
+            .map_err(|_| "the image is not running".to_string())?;
+        answer
             .recv()
             .map_err(|_| "the image stopped without answering".to_string())?
     }
@@ -304,13 +382,34 @@ fn eval(lua: &Lua, code: &str, name: Option<&str>) -> Result<String, String> {
     };
     let values = function.call::<mlua::MultiValue>(()).map_err(|error| {
         error
-            .downcast_ref::<TypedFailure>()
-            .map(TypedFailure::wire_message)
+            .downcast_ref::<CapturedPrintLimit>()
+            .map(ToString::to_string)
+            .or_else(|| {
+                error
+                    .downcast_ref::<TypedFailure>()
+                    .map(TypedFailure::wire_message)
+            })
             .unwrap_or_else(|| error.to_string())
     })?;
 
-    let rendered: Vec<String> = values.iter().map(render).collect();
-    Ok(rendered.join("\t"))
+    if values.len() == 1 {
+        if let Some(mlua::Value::UserData(data)) = values.iter().next() {
+            if let Ok(handle) = data.borrow::<crate::pending::PendingHandle>() {
+                return Ok(handle.marker().to_string());
+            }
+        }
+    }
+
+    let mut rendered = String::new();
+    for (index, value) in values.iter().enumerate() {
+        if index != 0 {
+            ensure_reply_size(rendered.len().saturating_add(1))?;
+            rendered.push('\t');
+        }
+        let remaining = MAX_REPLY_BYTES.saturating_sub(rendered.len());
+        rendered.push_str(&render_for_reply(value, remaining)?);
+    }
+    Ok(rendered)
 }
 
 /// Point `print` at a buffer instead of the daemon's stdout, which is
@@ -318,23 +417,103 @@ fn eval(lua: &Lua, code: &str, name: Option<&str>) -> Result<String, String> {
 /// sees nothing. Lua semantics kept: `tostring`ed, tab-separated, newline.
 fn capture_print(lua: &Lua, into: Rc<RefCell<String>>) -> mlua::Result<()> {
     let print = lua.create_function(move |_, values: mlua::MultiValue| {
-        let line: Vec<String> = values.iter().map(render).collect();
         let mut buffer = into.borrow_mut();
-        buffer.push_str(&line.join("\t"));
+        let mut line = String::new();
+        for (index, value) in values.iter().enumerate() {
+            if index != 0 {
+                let next = buffer.len().saturating_add(line.len()).saturating_add(2);
+                ensure_print_reply_size(next)?;
+                line.push('\t');
+            }
+            let used = buffer.len().saturating_add(line.len()).saturating_add(1);
+            let remaining = MAX_REPLY_BYTES.saturating_sub(used);
+            match render_for_reply(value, remaining) {
+                Ok(rendered) => line.push_str(&rendered),
+                Err(_) => {
+                    let value_len = match value {
+                        mlua::Value::String(value) => value.to_string_lossy().len(),
+                        _ => render(value).len(),
+                    };
+                    return Err(mlua::Error::external(CapturedPrintLimit {
+                        size: buffer
+                            .len()
+                            .saturating_add(line.len())
+                            .saturating_add(value_len)
+                            .saturating_add(1),
+                    }));
+                }
+            }
+        }
+        let next = buffer.len().saturating_add(line.len()).saturating_add(1);
+        ensure_print_reply_size(next)?;
+        buffer.push_str(&line);
         buffer.push('\n');
         Ok(())
     })?;
     lua.globals().set("print", print)
 }
 
+fn ensure_print_reply_size(size: usize) -> mlua::Result<()> {
+    if size > MAX_REPLY_BYTES {
+        Err(mlua::Error::external(CapturedPrintLimit { size }))
+    } else {
+        Ok(())
+    }
+}
+
 /// What the caller sees: anything printed, then whatever the chunk came to.
 /// Either half may be empty, and neither leaves a stray blank line behind.
-fn join_output(printed: &str, value: &str) -> String {
+fn join_output(printed: &str, value: String) -> Result<String, String> {
     match (printed.trim_end_matches('\n'), value) {
-        ("", value) => value.to_string(),
-        (printed, "") => printed.to_string(),
-        (printed, value) => format!("{printed}\n{value}"),
+        ("", value) => Ok(value),
+        (printed, value) if value.is_empty() => {
+            ensure_reply_size(printed.len())?;
+            Ok(printed.to_string())
+        }
+        (printed, value) => {
+            let size = printed.len().saturating_add(value.len()).saturating_add(1);
+            ensure_reply_size(size)?;
+            Ok(format!("{printed}\n{value}"))
+        }
     }
+}
+
+fn render_for_reply(value: &mlua::Value, remaining: usize) -> Result<String, String> {
+    if let mlua::Value::String(string) = value {
+        let bytes = string.as_bytes();
+        ensure_reply_size(bytes.len())?;
+        if bytes.len() > remaining {
+            return Err(reply_limit_error(bytes.len()));
+        }
+        let rendered = string.to_string_lossy();
+        ensure_reply_size(rendered.len())?;
+        if rendered.len() > remaining {
+            return Err(reply_limit_error(rendered.len()));
+        }
+        return Ok(rendered);
+    }
+
+    let rendered = render(value);
+    ensure_reply_size(rendered.len())?;
+    if rendered.len() > remaining {
+        return Err(reply_limit_error(rendered.len()));
+    }
+    Ok(rendered)
+}
+
+fn ensure_reply_size(size: usize) -> Result<(), String> {
+    if size > MAX_REPLY_BYTES {
+        Err(reply_limit_error(size))
+    } else {
+        Ok(())
+    }
+}
+
+fn reply_limit_error(size: usize) -> String {
+    format!(
+        "synchronous reply exceeds the {} MiB output limit (at least {size} bytes)",
+        MAX_REPLY_BYTES / (1024 * 1024)
+    )
 }
 
 /// Deliberately small: a table printed at a REPL is for reading, and anything
@@ -445,8 +624,12 @@ fn key(k: &mlua::Value, depth: usize, seen: &mut Vec<*const c_void>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render;
+    use super::{capture_print, eval, render};
     use mlua::Lua;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use crate::reply_limit::MAX_REPLY_BYTES;
 
     fn lifecycle_lua() -> Lua {
         let lua = Lua::new();
@@ -464,6 +647,44 @@ mod tests {
         let lua = Lua::new();
         let value: mlua::Value = lua.load(format!("return {code}")).eval().unwrap();
         render(&value)
+    }
+
+    #[test]
+    fn oversized_returned_lua_string_is_rejected() {
+        let lua = Lua::new();
+        let result = eval(
+            &lua,
+            &format!("string.rep('x', {})", MAX_REPLY_BYTES + 1),
+            None,
+        );
+        assert!(matches!(result, Err(error) if error.contains("16 MiB output limit")));
+    }
+
+    #[test]
+    fn oversized_print_is_rejected_without_growing_the_print_buffer() {
+        let lua = Lua::new();
+        let printed = Rc::new(RefCell::new(String::new()));
+        capture_print(&lua, Rc::clone(&printed)).unwrap();
+        let result = eval(
+            &lua,
+            &format!(
+                "print(string.rep('x', {})); print('y')",
+                MAX_REPLY_BYTES - 1
+            ),
+            None,
+        );
+
+        let error = result.unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "captured print output exceeds the 16 MiB output limit (at least {} bytes)",
+                MAX_REPLY_BYTES + 2
+            )
+        );
+        assert!(!error.contains("runtime error:"));
+        assert!(!error.contains("stack traceback:"));
+        assert_eq!(printed.borrow().len(), MAX_REPLY_BYTES);
     }
 
     #[test]

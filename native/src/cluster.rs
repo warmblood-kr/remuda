@@ -1,5 +1,6 @@
 //! Cluster vocabulary composed from identity and membership registry units.
 
+pub mod control;
 pub mod encoding;
 pub mod identity;
 pub mod join_line;
@@ -12,6 +13,7 @@ pub use identity::NodeIdentity;
 pub use registry::{load_registry, save_registry, AuthorizedNode, NodeState, Registry};
 
 use std::io;
+use std::net::SocketAddr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RevokeOutcome {
@@ -197,6 +199,67 @@ pub fn resolve_node<'a>(
         ));
     }
     Ok(entry)
+}
+
+/// A node's authenticated transport target, resolved from local membership.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedTarget {
+    pub address: SocketAddr,
+    pub pinned_static_key: Vec<u8>,
+}
+
+/// Resolve a node label to its admitted pin and routing address.
+/// An address override controls routing only; authentication always uses
+/// the key pinned in the local registry.
+pub fn resolve_target(
+    target: &str,
+    addr_override: Option<SocketAddr>,
+) -> io::Result<ResolvedTarget> {
+    let (_, registry) = nodes()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "cluster is not initialized; run `remuda cluster init`",
+        )
+    })?;
+    let entry = resolve_node(&registry.authorized_nodes, target)?;
+    if entry.state != NodeState::Admitted {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("node {} is revoked", entry.node_fp),
+        ));
+    }
+    let address = match addr_override {
+        Some(address) => address,
+        None => {
+            let endpoint = entry.endpoint.as_deref().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "supply --addr HOST:PORT")
+            })?;
+            let address: SocketAddr = endpoint.parse().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid endpoint in cluster registry",
+                )
+            })?;
+            join_line::validate_endpoint(address).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid endpoint in cluster registry",
+                )
+            })?;
+            address
+        }
+    };
+    let pinned_static_key = encoding::decode_base64(&entry.static_pubkey)?;
+    if pinned_static_key.len() != 32 || encoding::fingerprint(&pinned_static_key) != entry.node_fp {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid pinned key in registry",
+        ));
+    }
+    Ok(ResolvedTarget {
+        address,
+        pinned_static_key,
+    })
 }
 
 /// Format the local registry with an asterisk on this node's row.

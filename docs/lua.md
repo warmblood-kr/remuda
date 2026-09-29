@@ -6,6 +6,16 @@ Every installed mod and registered tool writes metadata to the same runtime
 registry; the reference output is generated from that registry at request
 time.
 
+The session API is available under `remuda.session`. Calling
+`remuda.session(name)` returns a handle onto the named session; the namespace
+also provides `list`, `new`, `close`, and `attach`. `remuda.session.list()`
+reaps exited sessions unless `REMUDA_KEEP_EXITED=1` is set in the daemon's
+environment. The older top-level `remuda.new`, `remuda.close`, `remuda.ls`,
+and `remuda.attach` names are deprecated aliases. To suppress their deprecation
+notices, set `REMUDA_SUPPRESS_DEPRECATIONS=1` in the daemon's environment when
+the daemon starts; setting it only on a CLI process cannot change the
+environment of a running daemon.
+
 ## Generate the reference
 
 ```sh
@@ -55,6 +65,48 @@ convenient.
 `remuda mod remove NAME` removes an installed mod directory. It does not
 restart a daemon or stop sessions; already-loaded Lua definitions remain live
 until the next daemon restart.
+
+## Atomic file writes
+
+`remuda.fs.write_atomic(path, bytes)` replaces one file from trusted Lua code.
+It writes a unique temporary file beside the target, syncs the bytes, and
+renames the temporary file over the target. Unix also syncs the parent
+directory. The target path is replaced as a directory entry, so a symlink at
+that path is not followed. The parent directory must already exist.
+
+On success the function returns `true, nil`; on an I/O error it returns
+`nil, error`. New files use mode `0644` filtered through the process umask.
+This word does not restrict paths: the Lua runtime already provides trusted
+scripts with `io.open` and `os.rename`.
+
+## JSON values
+
+`remuda.json.decode(text)` reads at most 8 MiB of UTF-8 JSON and returns
+`value, nil` on success or `nil, error` on bad input. Objects become Lua tables
+with string keys; arrays become 1-based Lua tables; integers that fit a Lua
+integer stay integers, and other finite JSON numbers become Lua numbers.
+JSON `null` becomes the sentinel `remuda.json.null`, so it can appear as a
+table value without disappearing like Lua `nil`.
+
+Decoded tables carry hidden array/object tags, so even empty arrays and objects
+keep their JSON kind when encoded again. For new Lua tables, use
+`remuda.json.array(table)` or `remuda.json.object(table)` to tag empty or
+ambiguous tables. Nonempty contiguous `1..n` tables encode as arrays; nonempty
+string-keyed tables encode as objects. Empty untagged tables, mixed keys,
+sparse numeric keys, and tables that cannot be classified as one shape are
+rejected. Tagging refuses a table that already has a non-JSON metatable.
+
+`remuda.json.encode(value, { pretty = true })` returns formatted JSON when
+requested; the default is compact JSON. It refuses nil, non-finite numbers,
+invalid UTF-8 strings or keys, cycles, functions, threads, userdata, and values
+that do not form a valid array or object. Decode and encode cap nesting at 64
+containers, JSON text/output at 8 MiB, and each document at 100,000 JSON values
+to bound memory use. Object key order is not preserved; encoded keys are
+sorted. Decode rejects duplicate object keys with
+`nil, "duplicate key"` instead of choosing one value. Integer JSON numbers
+outside Lua's signed integer range are represented as finite Lua numbers when
+possible. Very small non-integer values can underflow to `0.0`, and negative
+zero remains the floating-point value `-0.0`.
 
 A manifest can declare the mods it needs: `requires = { butler = ">=0.4, <0.5" }`.
 - **Constraints:** each is a comma-separated list of `>=`, `>`, `<=`, `<` and `=`, all of which must hold. `*` means any version. An installed version is compared on its numeric core, so `0.1.0-nightly.X` counts as `0.1.0`.

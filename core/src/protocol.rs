@@ -57,8 +57,9 @@ pub enum Request {
     /// `SendLine` are its one-`Burst` case. An attached terminal does not
     /// block it.
     Feed { name: String, steps: Vec<Step> },
-    /// Resize a session's terminal to its viewer panel. The size is clamped
-    /// during deserialization just like `New`.
+    /// Resize a session's terminal to its viewer panel. Ordinary sizes are
+    /// clamped during deserialization; an explicitly pane-sized value can
+    /// retain its narrower visible width.
     Resize { name: String, size: Size },
     /// Move a session's retained terminal history; positive means older.
     /// Read the screen as text without taking the session over. Needs no
@@ -70,6 +71,14 @@ pub enum Request {
         name: String,
         #[serde(default)]
         scrollback: usize,
+    },
+    /// Wait for a newer styled screen, returning the current frame on timeout.
+    Sync {
+        name: String,
+        #[serde(default)]
+        instance_id: Option<String>,
+        since: u64,
+        timeout_ms: u64,
     },
     /// Read the child's current mouse mode and encoding.
     MouseState { name: String },
@@ -145,6 +154,22 @@ pub enum Response {
     WrongInstance,
     /// The per-session input byte budget has been exhausted for this second.
     RateLimited,
+    /// A versioned screen, returned by [`Request::Sync`]. A disconnected
+    /// client cannot cancel its daemon request, so its Sync slot remains held
+    /// until the bounded wait ends.
+    Sync {
+        instance_id: String,
+        output_version: u64,
+        snapshot: StyledScreen,
+    },
+    /// A Sync request was refused because the daemon or remote-front limit is full.
+    SyncAtCapacity,
+    /// Another write is already in flight; this request was not queued.
+    Busy,
+    /// The bounded PTY write deadline elapsed; delivery may be partial or late.
+    WriteTimeout,
+    /// The receiving cluster node has disabled remote Input locally.
+    RemoteControlDisabled,
     /// A styled screen, answering [`Request::CaptureStyled`] — as runs, not
     /// cells; see [`StyledRun`]. `cursor` rides the same round trip, so the
     /// pane's caret and its content are always the same frame. See steps/027.
@@ -170,6 +195,12 @@ pub enum Response {
     /// distinct from `Screen` so a client can tell "the session printed
     /// nothing" from "the expression returned nothing".
     Value(String),
+    /// A command result completed through a bounded pending reply handle.
+    CommandResult {
+        exit_code: u8,
+        stdout_base64: String,
+        stderr_base64: String,
+    },
     Ok,
     /// A tracked attachment was accepted and its generation is returned.
     AttachStarted {
@@ -211,6 +242,19 @@ pub struct StyledRun {
     /// [`StyledCell::wide`]. Part of the grouping key: a run never mixes
     /// wide and narrow cells, so this one flag applies to the whole run.
     pub wide: bool,
+}
+
+/// A styled frame captured atomically with its output version for Sync.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct StyledScreen {
+    pub rows: Vec<Vec<StyledRun>>,
+    #[serde(default)]
+    pub wrapped: Vec<bool>,
+    #[serde(default)]
+    pub scrollback_len: usize,
+    #[serde(default)]
+    pub scrollback_total: usize,
+    pub cursor: Cursor,
 }
 
 /// Collapse adjacent cells sharing one style (wideness included) into runs.
@@ -269,14 +313,20 @@ pub fn expand_runs(runs: &[StyledRun]) -> Vec<StyledCell> {
         .collect()
 }
 
-// `Size` clamps to a floor below which real TUIs silently drop keystrokes, and
-// a wire format is the obvious way to smuggle a violation past a constructor.
-// Serializing is safe as-is; deserializing routes through `Size::new` so a
-// peer — or a corrupted line — cannot hand us an 11-column terminal.
+// `Size::new` clamps to a floor below which real TUIs silently drop
+// keystrokes. Ordinary wire sizes take that same path. Pane sizes carry an
+// explicit opt-in because their child must lay out at the width actually
+// visible beside the list.
 #[derive(Serialize, Deserialize)]
 struct SizeWire {
     cols: u16,
     rows: u16,
+    #[serde(default, skip_serializing_if = "is_false")]
+    allow_narrow: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 impl Serialize for Size {
@@ -284,6 +334,7 @@ impl Serialize for Size {
         SizeWire {
             cols: self.cols(),
             rows: self.rows(),
+            allow_narrow: self.cols() < Size::MIN_COLS,
         }
         .serialize(s)
     }
@@ -292,7 +343,11 @@ impl Serialize for Size {
 impl<'de> Deserialize<'de> for Size {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let wire = SizeWire::deserialize(d)?;
-        Ok(Size::new(wire.cols, wire.rows))
+        Ok(if wire.allow_narrow {
+            Size::for_pane(wire.cols, wire.rows)
+        } else {
+            Size::new(wire.cols, wire.rows)
+        })
     }
 }
 

@@ -13,10 +13,16 @@
 <p><code>table</code> — Handlers registered for installed mod commands.</p>
 <h2 id="function_source">_function_source</h2>
 <p><code>_function_source(fn) -&gt; string</code> — Where a Lua function was defined, as <span class="title-ref">source:line</span>; internal, for <span class="title-ref">hook_list</span>, since scripts get no <span class="title-ref">debug</span> library.</p>
+<h2 id="pending_create">_pending_create</h2>
+<p><code>_pending_create(timeout?) -&gt; id, handle</code> — Create a private pending reply handle.</p>
+<h2 id="pending_events">_pending_events</h2>
+<p><code>_pending_events() -&gt; {{id, reason?}...}</code> — Drain pending completion and cancellation notifications.</p>
 <h2 id="process_drain">_process_drain</h2>
 <p><code>_process_drain(id) -&gt; nil</code> — Deliver buffered process output as emit events; internal, an Image job only.</p>
 <h2 id="process_killpg">_process_killpg</h2>
 <p><code>_process_killpg(id) -&gt; nil</code> — Reap a process's whole process group (Linux only); internal, called by the daemon's own clean-shutdown sweep, not meant for scripts.</p>
+<h2 id="process_run">_process_run</h2>
+<p><code>_process_run(argv, stdin?, timeout) -&gt; result</code> — Run an argv process synchronously with a bounded timeout and captured output; internal, called by <span class="title-ref">remuda.process.run</span>.</p>
 <h2 id="process_spawn">_process_spawn</h2>
 <p><code>_process_spawn(argv, on_line?, on_exit?) -&gt; id</code> — Spawn a plain-pipe child process; internal, wrapped by <span class="title-ref">remuda.process</span>.</p>
 <h2 id="refresh_sessions_buffer">_refresh_sessions_buffer</h2>
@@ -38,7 +44,7 @@
 <h2 id="advise">advise</h2>
 <p><code>advise(path, how, fn, opts) -&gt; nil</code> — Wrap the function at a <span class="title-ref">remuda.*</span> path. `how`: aroundafterfilter_argsbefore_while|before_until. `opts`: <span class="title-ref">id</span> (required; same id replaces), <span class="title-ref">depth</span> (-100 outermost).</p>
 <h2 id="attach">attach</h2>
-<p><code>attach(name) -&gt; nil</code> — Enter raw mode on a session (a no-op inside the daemon's own image).</p>
+<p><code>attach(name) -&gt; nil</code> — Deprecated alias for <span class="title-ref">remuda.session.attach</span>.</p>
 <h2 id="buffer">buffer</h2>
 <p><code>table</code> — Namespace for creating and listing named text buffers.</p>
 <h2 id="buffers">buffers</h2>
@@ -54,7 +60,7 @@
 <h2 id="click">click</h2>
 <p><code>click(name, col, row, button?) -&gt; nil</code> — Send a mouse click at a terminal cell.</p>
 <h2 id="close">close</h2>
-<p><code>close(name) -&gt; nil</code> — End a session, live or already self-exited.</p>
+<p><code>close(name) -&gt; nil</code> — Deprecated alias for <span class="title-ref">remuda.session.close</span>.</p>
 <h2 id="contribute">contribute</h2>
 <p><code>contribute(point, id, entry) -&gt; nil</code> — Fill an extension point: the same owner can replace its entry; another mod cannot. <span class="title-ref">entry.order</span> sorts (default 0).</p>
 <h2 id="contributions">contributions</h2>
@@ -71,18 +77,40 @@
 <p><code>event_counts() -&gt; {[event]=n}</code> — How many times each event has been emitted.</p>
 <h2 id="exec">exec</h2>
 <p><code>exec(name) -&gt; nil</code> — Run an installed mod's entry source, by name, in this same image.</p>
+<h2 id="expect">expect</h2>
+<p><code>expect(session, branches, options?) -&gt; handle</code> — Watch a session asynchronously. Branches match a Lua pattern or predicate and run a key list or callback; <span class="title-ref">continue</span> keeps watching. Options accept a bounded timeout and unknown-screen matcher/callback.</p>
+<h2 id="expect_option">expect_option</h2>
+<p><code>expect_option(screen, label_predicate) -&gt; number|nil</code> — Pick a unique numbered menu option by its label.</p>
 <h2 id="extension_command">extension_command</h2>
 <p><code>extension_command(name, handler(args, caller)) -&gt; nil</code> — Register a handler for an installed mod command.</p>
 <h2 id="fail">fail</h2>
 <p><code>fail(message, code?) -&gt; never (default code 1; valid codes are 1..255)</code> — Raise a deliberate CLI failure with a message and exit code.</p>
 <h2 id="feed">feed</h2>
 <p><code>feed(name, steps) -&gt; nil</code> — Deliver a sequence of bursts and pauses as one indivisible act.</p>
+<h2 id="fs">fs</h2>
+<p><code>table</code> — Atomic replacement of files for trusted Lua callers.</p>
+<h2 id="fs.write_atomic">fs.write_atomic</h2>
+<p><code>fs.write_atomic(path, bytes) -&gt; true, nil | nil, error</code> — Write bytes through a same-directory temporary file and atomically replace the target.</p>
 <h2 id="hook_list">hook_list</h2>
 <p><code>hook_list(event?) -&gt; {{event, group, id, depth, owner, src, errors, last_error}...}</code> — Copies of the registered hooks, for one event or all, in run order.</p>
 <h2 id="hooks">hooks</h2>
 <p><code>table</code> — Deprecated for reading: use <span class="title-ref">hook_list</span>. The <span class="title-ref">remuda.on</span> table, keyed by event name; it becomes read-only once no mod edits it by hand.</p>
+<h2 id="http">http</h2>
+<p><code>http.request(options) -&gt; {cancel()}</code> — Start an asynchronous bounded HTTP request; completion is delivered on the Lua image queue.</p>
 <h2 id="insert">insert</h2>
 <p><code>insert(name, text) -&gt; nil</code> — Insert raw bytes into a session with nothing appended.</p>
+<h2 id="json">json</h2>
+<p><code>table</code> — Bounded JSON conversion for Lua values and UTF-8 JSON text.</p>
+<h2 id="json.array">json.array</h2>
+<p><code>json.array(table) -&gt; table</code> — Tag a dense Lua table as a JSON array, including an empty table.</p>
+<h2 id="json.decode">json.decode</h2>
+<p><code>json.decode(text) -&gt; value, nil | nil, error</code> — Decode strict UTF-8 JSON; repeated object keys and over-limit input return nil, error.</p>
+<h2 id="json.encode">json.encode</h2>
+<p><code>json.encode(value, options?) -&gt; string</code> — Encode a Lua value as bounded JSON; unsupported values raise a clear error.</p>
+<h2 id="json.null">json.null</h2>
+<p><code>value</code> — The sentinel that represents JSON null in Lua tables.</p>
+<h2 id="json.object">json.object</h2>
+<p><code>json.object(table) -&gt; table</code> — Tag a string-keyed Lua table as a JSON object, including an empty table.</p>
 <h2 id="key">key</h2>
 <p><code>key(name, spec) -&gt; nil</code> — Press a named key, in Emacs kbd notation.</p>
 <h2 id="kill">kill</h2>
@@ -90,15 +118,19 @@
 <h2 id="list_dir">list_dir</h2>
 <p><code>list_dir(dir) -&gt; {string...}</code> — List a directory's entries.</p>
 <h2 id="ls">ls</h2>
-<p><code>ls() -&gt; {session...}</code> — List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.</p>
+<p><code>ls() -&gt; {session...}</code> — Deprecated alias for <span class="title-ref">remuda.session.list</span>.</p>
 <h2 id="mkdir">mkdir</h2>
 <p><code>mkdir(dir) -&gt; nil</code> — Create a directory, including its parents.</p>
 <h2 id="new">new</h2>
-<p><code>new(name?, argv?, cwd?, env?) -&gt; string</code> — Start a new session, defaulting the command to the user's shell.</p>
+<p><code>new(name?, argv?, cwd?, env?) -&gt; string</code> — Deprecated alias for <span class="title-ref">remuda.session.new</span>.</p>
 <h2 id="on">on</h2>
 <p><code>on(event, fn, opts?) -&gt; nil</code> — Register a callback to run when an event fires. `opts`: <span class="title-ref">group</span>, <span class="title-ref">id</span> (same group+id replaces), <span class="title-ref">depth</span> (-100..100, lower first).</p>
+<h2 id="pending">pending</h2>
+<p><code>pending({timeout?, on_cancel?}) -&gt; handle</code> — Return a bounded handle for an extension command's deferred result.</p>
 <h2 id="process">process</h2>
-<p><code>process(spec) -&gt; id</code> — Spawn a plain-pipe child process; its stdout lines and exit arrive as emit events.</p>
+<p><code>process(spec) -&gt; id; process.run(spec) -&gt; {code, stdout, stderr, timed_out}</code> — Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output.</p>
+<h2 id="process.run">process.run</h2>
+<p><code>process.run{argv, stdin?, timeout?} -&gt; {code, stdout, stderr, timed_out, signal?}</code> — Run argv directly without a shell; inherits the daemon's environment and working directory. Blocks the Lua image until exit or timeout (default 5s, max 30s), captures each stream up to 1 MiB. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.</p>
 <h2 id="processes">processes</h2>
 <p><code>processes() -&gt; {id...}</code> — List the ids of every process started with <span class="title-ref">remuda.process</span> that is still running.</p>
 <h2 id="reload">reload</h2>
@@ -118,7 +150,15 @@
 <h2 id="send">send</h2>
 <p><code>send(name, text) -&gt; nil</code> — Deliver a line of text to a session, with Enter appended.</p>
 <h2 id="session">session</h2>
-<p><code>session(name) -&gt; session</code> — A handle onto an existing session, by name.</p>
+<p><code>session(name) -&gt; handle; table {list, new, close, attach}</code> — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close and attach.</p>
+<h2 id="session.attach">session.attach</h2>
+<p><code>session.attach(name) -&gt; nil</code> — Enter raw mode on a session.</p>
+<h2 id="session.close">session.close</h2>
+<p><code>session.close(name) -&gt; nil</code> — End a session, live or already self-exited.</p>
+<h2 id="session.list">session.list</h2>
+<p><code>session.list() -&gt; {session...}</code> — List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.</p>
+<h2 id="session.new">session.new</h2>
+<p><code>session.new(name?, argv?, cwd?, env?) -&gt; string</code> — Start a session, defaulting the command to the user's shell.</p>
 <h2 id="sleep">sleep</h2>
 <p><code>sleep(seconds) -&gt; nil</code> — Block the calling image for a number of seconds.</p>
 <h2 id="tool">tool</h2>

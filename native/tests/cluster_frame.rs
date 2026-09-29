@@ -8,13 +8,6 @@ fn keypair() -> snow::Keypair {
 }
 
 #[test]
-fn static_public_key_validation_rejects_a_known_low_order_point() {
-    let mut low_order = [0u8; 32];
-    low_order[0] = 1;
-    assert!(frame::validate_static_public_key(&low_order).is_err());
-}
-
-#[test]
 fn frame_noise_ik_round_trip_authenticates_and_protects_payloads() {
     let initiator = keypair();
     let responder = keypair();
@@ -64,4 +57,14 @@ fn oversized_response_payload_cannot_fit_a_noise_frame() {
     let opened = frame::open_request(&responder.private, &sealed.message).unwrap();
     let oversized = vec![0; frame::MAX_RESPONSE_PAYLOAD + 1];
     assert!(frame::seal_response(opened, &oversized).is_err());
+}
+
+#[test]
+fn static_key_validation_rejects_low_order_public_keys() {
+    assert!(frame::validate_static_public_key(&[0; 32]).is_err());
+    let mut low_order = [0; 32];
+    low_order[0] = 1;
+    assert!(frame::validate_static_public_key(&low_order).is_err());
+    let valid = keypair();
+    assert!(frame::validate_static_public_key(&valid.public).is_ok());
 }
