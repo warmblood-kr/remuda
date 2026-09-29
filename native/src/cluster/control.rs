@@ -191,9 +191,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn settings_symlink_is_refused() {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
         let dir = cluster_dir();
         let outside = dir.with_extension("outside");
-        std::fs::write(&outside, br#"{"allow_remote_control":false}"#).unwrap();
+        let mut target = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&outside)
+            .unwrap();
+        target
+            .write_all(br#"{"allow_remote_control":false}"#)
+            .unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("settings.json")).unwrap();
         assert!(enabled_at(&dir).is_err());
         assert!(set_enabled_at(&dir, true).is_err());

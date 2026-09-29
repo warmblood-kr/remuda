@@ -44,6 +44,13 @@ its reviewed protocol lands; once enabled, it will use this same local setting.
 Turning remote control off refuses remote Input and, when confirmed Close is
 enabled, Close requests.
 
+A batch already in dispatch may still be delivered if the setting changes to
+off while that batch is in flight. A revoke during dispatch may likewise allow
+the Input write before the listener returns an Error; clients should treat that
+outcome as possibly delivered. The fixed one-second budget window can allow up
+to 2×256 KiB across a window boundary. Identical retries are charged again at
+the listener, while the daemon deduplicates them to prevent repeated writes.
+
 ## Threat model
 
 An admitted peer can submit bounded Input batches to any session while remote

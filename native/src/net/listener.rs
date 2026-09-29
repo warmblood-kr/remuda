@@ -849,6 +849,32 @@ mod tests {
     use std::sync::{mpsc, Arc};
 
     #[cfg(unix)]
+    static STATE_HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    struct StateHomeGuard(Option<std::ffi::OsString>, PathBuf);
+
+    #[cfg(unix)]
+    impl StateHomeGuard {
+        fn set(path: PathBuf) -> Self {
+            let previous = std::env::var_os("XDG_STATE_HOME");
+            std::env::set_var("XDG_STATE_HOME", &path);
+            Self(previous, path)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for StateHomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(previous) => std::env::set_var("XDG_STATE_HOME", previous),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.1);
+        }
+    }
+
+    #[cfg(unix)]
     struct SocketTestServer {
         address: SocketAddr,
         responder_public: Vec<u8>,
@@ -1190,6 +1216,16 @@ mod tests {
             1,
             now + REMOTE_INPUT_WINDOW + Duration::from_millis(1)
         ));
+    }
+
+    #[test]
+    fn remote_input_rate_limit_accepts_exact_budget_deterministically() {
+        let mut limiter = RemoteInputRateLimiter::default();
+        let now = Instant::now();
+        for _ in 0..4 {
+            assert!(limiter.check("peer", 64 * 1024, now));
+        }
+        assert!(!limiter.check("peer", 1, now));
     }
 
     #[test]
@@ -1666,8 +1702,35 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn socket_peer_input_budget_is_charged_before_dispatch() {
+    fn production_socket_uses_persisted_remote_control_settings(
+        setting: &[u8],
+        expected: Response,
+    ) {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let _lock = STATE_HOME_LOCK.lock().unwrap();
+        let state_home = std::env::temp_dir().join(format!(
+            "remuda-listener-settings-{}-{}",
+            std::process::id(),
+            LISTENER_ERROR_COUNT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let cluster_dir = state_home.join("remuda/cluster");
+        std::fs::create_dir_all(&cluster_dir).unwrap();
+        std::fs::set_permissions(
+            state_home.join("remuda"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        std::fs::set_permissions(&cluster_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut settings = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(cluster_dir.join("settings.json"))
+            .unwrap();
+        settings.write_all(setting).unwrap();
+        drop(settings);
+        let _state_home_guard = StateHomeGuard::set(state_home);
+
         let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
             .generate_keypair()
             .unwrap();
@@ -1686,26 +1749,39 @@ mod tests {
                 Ok(serde_json::to_vec(&Response::Ack { duplicate: false }).unwrap())
             }),
         );
-        let mut responses = Vec::new();
-        for index in 0..22 {
-            let request = Request::Input {
-                name: format!("session-{index}"),
-                instance_id: "instance".into(),
-                client_id: format!("{:032x}", index + 1),
-                seq: 1,
-                bytes: vec![b'x'; 12_000],
-            };
-            let sealed =
-                sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
-            let (status, response) = server.exchange(sealed);
-            assert_eq!(status, 200);
-            responses.push(serde_json::from_slice::<Response>(&response).unwrap());
-        }
-        assert!(responses[..21]
-            .iter()
-            .all(|response| *response == Response::Ack { duplicate: false }));
-        assert_eq!(responses[21], Response::RateLimited);
-        assert_eq!(dispatched.load(Ordering::SeqCst), 21);
+        let request = Request::Input {
+            name: "session".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
+            bytes: b"hello".to_vec(),
+        };
+        let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
+        let (status, response) = server.exchange(sealed);
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Response>(&response).unwrap(),
+            expected
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_setting_off_returns_disabled_without_dispatch() {
+        production_socket_uses_persisted_remote_control_settings(
+            br#"{"allow_remote_control":false}"#,
+            Response::RemoteControlDisabled,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_malformed_setting_errors_without_dispatch() {
+        production_socket_uses_persisted_remote_control_settings(
+            br#"{"allow_remote_control":no}"#,
+            Response::Error("remote control setting unavailable; refusing Input".into()),
+        );
     }
 
     #[cfg(unix)]
