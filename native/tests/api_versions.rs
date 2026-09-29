@@ -52,6 +52,17 @@ fn start_session(path: &std::path::Path, name: &str, command: Vec<String>) {
     assert_eq!(response, Response::Value(name.to_string()));
 }
 
+fn session_output_version(path: &std::path::Path, name: &str) -> u64 {
+    match client::request(path, &Request::List).expect("list sessions") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == name)
+            .and_then(|session| session.output_version)
+            .expect("session output version"),
+        other => panic!("unexpected list response: {other:?}"),
+    }
+}
+
 fn wait_for_exit_event(path: &std::path::Path, name: &str) {
     let probe = format!("return tostring(remuda._api_v5_exit_seen({name:?}))");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -62,6 +73,111 @@ fn wait_for_exit_event(path: &std::path::Path, name: &str) {
         );
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn wait_for_output_event(path: &std::path::Path, name: &str) {
+    let probe = format!("return tostring(remuda._api_v5_output_seen({name:?}))");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while eval(path, &probe) != "true" {
+        assert!(
+            Instant::now() < deadline,
+            "no session_output event for {name}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn exercise_session_output_payload(path: &std::path::Path) {
+    let name = format!("api-v5-output-{}", std::process::id());
+    #[cfg(windows)]
+    let command = vec![
+        "cmd.exe".into(),
+        "/d".into(),
+        "/c".into(),
+        "echo session-output-ready & ping -n 3 127.0.0.1 >nul".into(),
+    ];
+    #[cfg(not(windows))]
+    let command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf session-output-ready; sleep 2".into(),
+    ];
+    start_session(path, &name, command);
+    wait_for_output_event(path, &name);
+    eval(path, &format!("remuda._api_v5_assert_output({name:?})"));
+    client::request(path, &Request::Close { name }).expect("close output fixture session");
+}
+
+fn exercise_expect_wakes_on_session_output(path: &std::path::Path) {
+    let name = format!("api-v5-expect-output-{}", std::process::id());
+    let marker = format!("EXPECTOUTPUTREADY{}", std::process::id());
+    eval(
+        path,
+        &format!(
+            "remuda._api_v5_expect_handle = remuda.expect({name:?}, {{{{ match = {marker:?} }}}}, {{timeout=5, interval=1}})"
+        ),
+    );
+    #[cfg(windows)]
+    let command = vec![
+        "cmd.exe".into(),
+        "/d".into(),
+        "/c".into(),
+        format!("ping -n 3 127.0.0.1 >nul & echo {marker} & ping -n 6 127.0.0.1 >nul"),
+    ];
+    #[cfg(not(windows))]
+    let command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!("sleep 1.5; printf {marker}; sleep 5"),
+    ];
+    start_session(path, &name, command);
+    let marker_visible =
+        format!("return tostring(remuda.capture({name:?}):find({marker:?}, 1, true) ~= nil)");
+    let mut startup_wake_checked = false;
+    let marker_deadline = Instant::now() + Duration::from_secs(5);
+    let marker_seen_at = loop {
+        let version = session_output_version(path, &name);
+        if version > 0 && !startup_wake_checked {
+            startup_wake_checked = true;
+            let wake_deadline = Instant::now() + Duration::from_millis(750);
+            while eval(
+                path,
+                "return tostring(remuda._api_v5_expect_handle.state.last_screen ~= nil)",
+            ) != "true"
+            {
+                assert!(
+                    Instant::now() < wake_deadline,
+                    "session output before the marker did not wake the pre-registered expect"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        if eval(path, &marker_visible) == "true" {
+            break Instant::now();
+        }
+        assert!(
+            Instant::now() < marker_deadline,
+            "session output marker did not become visible"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    let wake_deadline = marker_seen_at + Duration::from_millis(750);
+    loop {
+        if eval(path, "return remuda._api_v5_expect_handle.state.status") == "matched" {
+            break;
+        }
+        if Instant::now() >= wake_deadline {
+            panic!(
+                "remuda.expect did not wake promptly; state: {}",
+                eval(
+                    path,
+                    "local h=remuda._api_v5_expect_handle; return tostring(h.state.status)..'|'..tostring(h.branches[1].match)..'|'..tostring(h.state.last_screen:find(h.branches[1].match))..'|'..tostring(h.state.last_screen)"
+                )
+            );
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    client::request(path, &Request::Close { name }).expect("close expect fixture session");
 }
 
 fn exercise_session_exit_payload(path: &std::path::Path) {
@@ -161,6 +277,8 @@ fn frozen_api_fixtures_v1_through_v4_and_new_v5_surface_run() {
         script::run(&path, &fixture).unwrap_or_else(|error| panic!("{version} fixture: {error}"));
         if version == "v5" {
             exercise_session_exit_payload(&path);
+            exercise_session_output_payload(&path);
+            exercise_expect_wakes_on_session_output(&path);
         }
         assert_eq!(
             remuda_native::client::request(

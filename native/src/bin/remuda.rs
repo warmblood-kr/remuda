@@ -24,6 +24,8 @@ use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
@@ -1357,10 +1359,87 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
         // The wrapper gets its own chunk name; the mod's frames keep theirs.
         Ok(Some(_)) => {
             let code = format!("remuda.exec({})", remuda_native::mcp::lua_string(name));
-            match remuda_native::script::run_source(path, "=remuda exec", &code) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(e),
+            if let Err(error) = remuda_native::script::run_source(path, "=remuda exec", &code) {
+                return fail_exec(error);
             }
+            wait_for_module_ready(path, name)
+        }
+    }
+}
+
+/// Declaration mistakes are user-facing exec failures, not useful Lua
+/// tracebacks. Keep their messages stable and single-line at the CLI boundary.
+fn fail_exec(error: String) -> ExitCode {
+    const CLEAN_DECLARATION_ERRORS: [&str; 2] = [
+        "module timeout_ms must be an integer from 1 through 240000",
+        "module timeout_ms requires a ready function",
+    ];
+    if let Some(message) = CLEAN_DECLARATION_ERRORS
+        .iter()
+        .find(|message| error.contains(**message))
+    {
+        eprintln!("{message}");
+        ExitCode::FAILURE
+    } else {
+        fail(error)
+    }
+}
+
+fn wait_for_module_ready(path: &Path, name: &str) -> ExitCode {
+    let source = format!(
+        "return remuda.json.encode(remuda._module_readiness({}))",
+        remuda_native::mcp::lua_string(name)
+    );
+    let mut deadline = None;
+    loop {
+        let checked_at = Instant::now();
+        let output =
+            match remuda_native::script::eval_source(path, "=remuda exec readiness", &source) {
+                Ok(output) => output,
+                Err(error) => return fail(error),
+            };
+        let json = output
+            .trim_end_matches('\n')
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default();
+        let result: serde_json::Value = match serde_json::from_str(json) {
+            Ok(result) => result,
+            Err(error) => {
+                return fail(format!(
+                    "remuda exec readiness probe returned invalid data ({error}): {output}"
+                ));
+            }
+        };
+        match result.get("status").and_then(serde_json::Value::as_str) {
+            Some("ready") => return ExitCode::SUCCESS,
+            Some("failed") => {
+                let message = result
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("readiness callback failed");
+                eprintln!("mod {name} failed to become ready: {message}");
+                return ExitCode::FAILURE;
+            }
+            Some("pending") => {
+                let timeout_ms = match result.get("timeout_ms").and_then(serde_json::Value::as_u64)
+                {
+                    Some(timeout_ms @ 1..=240_000) => timeout_ms,
+                    _ => return fail("module readiness returned an invalid timeout_ms"),
+                };
+                let wait_until =
+                    *deadline.get_or_insert_with(|| checked_at + Duration::from_millis(timeout_ms));
+                let now = Instant::now();
+                if now >= wait_until {
+                    eprintln!(
+                        "mod {name} did not become ready within {}s",
+                        timeout_ms as f64 / 1000.0
+                    );
+                    return ExitCode::from(124);
+                }
+                thread::sleep(Duration::from_millis(250).min(wait_until - now));
+            }
+            _ => return fail("module readiness returned an unknown status"),
         }
     }
 }
