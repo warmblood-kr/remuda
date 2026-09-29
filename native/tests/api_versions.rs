@@ -105,7 +105,15 @@ fn exercise_session_output_payload(path: &std::path::Path) {
     start_session(path, &name, command);
     wait_for_output_event(path, &name);
     eval(path, &format!("remuda._api_v5_assert_output({name:?})"));
-    client::request(path, &Request::Close { name }).expect("close output fixture session");
+    client::request(
+        path,
+        &Request::Close {
+            name,
+            instance_id: None,
+            confirm: None,
+        },
+    )
+    .expect("close output fixture session");
 }
 
 fn exercise_expect_wakes_on_session_output(path: &std::path::Path) {
@@ -177,7 +185,15 @@ fn exercise_expect_wakes_on_session_output(path: &std::path::Path) {
         }
         thread::sleep(Duration::from_millis(5));
     }
-    client::request(path, &Request::Close { name }).expect("close expect fixture session");
+    client::request(
+        path,
+        &Request::Close {
+            name,
+            instance_id: None,
+            confirm: None,
+        },
+    )
+    .expect("close expect fixture session");
 }
 
 fn exercise_session_exit_payload(path: &std::path::Path) {

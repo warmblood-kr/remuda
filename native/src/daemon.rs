@@ -905,7 +905,13 @@ fn close_instance(
     let session = registry.get(name)?;
     let closed = registry.close_instance(name, instance_id)?;
     if let Ok(true) = closed {
-        notify_exited(image, name, "closed", session.exit_info().as_ref());
+        notify_exited(
+            image,
+            name,
+            session.id(),
+            "closed",
+            session.exit_info().as_ref(),
+        );
     }
     Some(closed.map(drop))
 }

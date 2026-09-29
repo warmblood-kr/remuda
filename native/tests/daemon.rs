@@ -1379,6 +1379,8 @@ fn session_output_wakes_coalesce_while_lua_is_busy_and_list_stays_responsive() {
             &path,
             &Request::Close {
                 name: "chatty".into(),
+                instance_id: None,
+                confirm: None,
             },
         )
         .expect("close chatty session"),
