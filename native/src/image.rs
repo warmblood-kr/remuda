@@ -7,10 +7,9 @@
 //! thread that owns it outright, and every other thread reaches it by posting a
 //! job and waiting for the answer. A thread serving a queue is an event loop.
 //!
-//! Unlike Emacs, a long-running script freezes nothing else: sessions here are
-//! not Lua objects but Rust structs behind their own locks, pumped by threads
-//! that never touch Lua. A script that loops forever makes only the *next Lua
-//! caller* wait — pty output keeps being read, `remuda ls` keeps answering.
+//! A Lua instruction hook bounds each callback by a deadline. An overlong
+//! script returns an error, while sessions remain Rust structs behind their
+//! own locks, pumped by threads that never touch Lua.
 //!
 //! ⚠ The corollary, named now so it is not discovered as a deadlock later: an
 //! output pump may never *call into* Lua. If `on_output(session, fn)` is ever
@@ -18,8 +17,8 @@
 
 use crate::reply_limit::MAX_REPLY_BYTES;
 use crate::script;
-use mlua::Lua;
-use std::cell::RefCell;
+use mlua::{HookTriggers, Lua, VmState};
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::c_void;
@@ -29,10 +28,71 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 // `Response::Error` remains a plain string on the wire. This reserved control
 // prefix carries typed failures to the CLI without changing ordinary errors.
 const TYPED_FAILURE_PREFIX: &str = "\u{1e}REMUDA_FAIL:";
+const LUA_EXECUTION_LIMIT: Duration = Duration::from_secs(2);
+const LUA_HOOK_INTERVAL: u32 = 10_000;
+const LUA_EXECUTION_LIMIT_MESSAGE: &str = "Lua execution limit exceeded";
+
+#[derive(Default)]
+struct LuaExecutionBudget {
+    depth: Rc<Cell<usize>>,
+    deadline: Rc<Cell<Option<Instant>>>,
+}
+
+struct LuaExecutionGuard<'lua> {
+    lua: &'lua Lua,
+    depth: Rc<Cell<usize>>,
+    deadline: Rc<Cell<Option<Instant>>>,
+}
+
+impl Drop for LuaExecutionGuard<'_> {
+    fn drop(&mut self) {
+        let depth = self.depth.get().saturating_sub(1);
+        self.depth.set(depth);
+        if depth == 0 {
+            self.deadline.set(None);
+            self.lua.remove_hook();
+        }
+    }
+}
+
+impl LuaExecutionBudget {
+    /// One outer hook covers nested Lua execution. Its guard clears the hook
+    /// after both successful returns and errors, including unwinding.
+    fn run<T>(&self, lua: &Lua, operation: impl FnOnce() -> mlua::Result<T>) -> mlua::Result<T> {
+        let outermost = self.depth.get() == 0;
+        if outermost {
+            self.deadline
+                .set(Some(Instant::now() + LUA_EXECUTION_LIMIT));
+            let deadline = Rc::clone(&self.deadline);
+            if let Err(error) = lua.set_hook(
+                HookTriggers::new().every_nth_instruction(LUA_HOOK_INTERVAL),
+                move |_, _| {
+                    if deadline.get().is_some_and(|at| Instant::now() >= at) {
+                        return Err(mlua::Error::RuntimeError(
+                            LUA_EXECUTION_LIMIT_MESSAGE.into(),
+                        ));
+                    }
+                    Ok(VmState::Continue)
+                },
+            ) {
+                self.deadline.set(None);
+                return Err(error);
+            }
+        }
+        self.depth.set(self.depth.get() + 1);
+        let _guard = LuaExecutionGuard {
+            lua,
+            depth: Rc::clone(&self.depth),
+            deadline: Rc::clone(&self.deadline),
+        };
+        operation()
+    }
+}
 
 /// A deliberate CLI failure raised by Lua code with `remuda.fail`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,6 +310,7 @@ impl Image {
 
         std::thread::spawn(move || {
             let lua = Lua::new();
+            let budget = LuaExecutionBudget::default();
             // Everything `print` writes during one job, so it can travel back
             // to whoever asked instead of vanishing. `Rc` rather than `Arc`
             // because this never leaves the thread — the whole reason the
@@ -258,75 +319,26 @@ impl Image {
 
             // A failure here means no image at all, so every eval must say so
             // rather than the thread dying quietly and every caller hanging.
-            let ready = script::bindings(&lua, &socket, registry, counters, handle.clone())
-                .and_then(|table| lua.globals().set("remuda", table))
-                // The tool frame is Lua over those bindings, not a second set of
-                // them. It must load *after* the table exists and *before* any
-                // caller, so a `tools/list` on a fresh daemon is already true.
-                .and_then(|()| {
-                    lua.load(include_str!("tools.lua"))
-                        .set_name("@remuda/tools.lua")
-                        .exec()
+            let ready = budget
+                .run(&lua, || {
+                    script::bindings(&lua, &socket, registry, counters, handle.clone())
+                        .and_then(|table| lua.globals().set("remuda", table))
+                        // The tool frame is Lua over those bindings, not a second set of
+                        // them. It must load *after* the table exists and *before* any
+                        // caller, so a `tools/list` on a fresh daemon is already true.
+                        .and_then(|()| {
+                            lua.load(include_str!("tools.lua"))
+                                .set_name("@remuda/tools.lua")
+                                .exec()
+                        })
+                        .and_then(|()| script::hide_module_activator(&lua))
+                        .and_then(|()| capture_print(&lua, Rc::clone(&printed)))
                 })
-                .and_then(|()| script::hide_module_activator(&lua))
-                .and_then(|()| capture_print(&lua, Rc::clone(&printed)))
                 .map_err(|e| e.to_string());
 
             for job in inbox {
                 printed.borrow_mut().clear();
-                let answer = match &ready {
-                    Err(why) => Err(format!("image failed to start: {why}")),
-                    Ok(()) => match &job.kind {
-                        JobKind::Eval {
-                            code,
-                            name,
-                            allow_pending,
-                        } => {
-                            handle.pending.begin_eval();
-                            let answer = eval(&lua, code, name.as_deref()).and_then(|value| {
-                                if handle.pending.pending_id(&value).is_some() {
-                                    Ok(value)
-                                } else {
-                                    join_output(&printed.borrow(), value)
-                                }
-                            });
-                            let pending_id = answer
-                                .as_ref()
-                                .ok()
-                                .and_then(|value| handle.pending.pending_id(value));
-                            if pending_id.is_some() && !*allow_pending {
-                                handle.pending.finish_eval(None);
-                                Err("pending replies may only be returned from a daemon request"
-                                    .into())
-                            } else {
-                                handle.pending.finish_eval(pending_id);
-                                answer
-                            }
-                        }
-                        JobKind::StopModules => script::stop_modules(&lua)
-                            .map(|()| String::new())
-                            .map_err(|error| error.to_string()),
-                        JobKind::HttpComplete { id, result } => {
-                            if let Err(error) = deliver_http(&lua, *id, result.clone()) {
-                                eprintln!("remuda: HTTP callback delivery failed: {error}");
-                            }
-                            Ok(String::new())
-                        }
-                        JobKind::SessionOutput(notifier) => {
-                            let version = notifier.state.latest_version.load(Ordering::Acquire);
-                            deliver_session_output(&lua, notifier, version);
-                            notifier.finish(version);
-                            Ok(String::new())
-                        }
-                        JobKind::SessionOutputFlush(notifier) => {
-                            let version = notifier.state.latest_version.load(Ordering::Acquire);
-                            deliver_session_output(&lua, notifier, version);
-                            Ok(String::new())
-                        }
-                        #[cfg(test)]
-                        JobKind::StopImage => Ok(String::new()),
-                    },
-                };
+                let answer = process_job(&lua, &budget, &handle, &printed, &ready, &job);
                 // A caller that gave up and dropped its receiver is not an
                 // error: `remuda -e` can be Ctrl-C'd mid-evaluation, and the
                 // work still ran.
@@ -497,6 +509,79 @@ impl Image {
         {
             let _ = answer.recv_timeout(STOP_TIMEOUT);
         }
+    }
+}
+
+fn process_job(
+    lua: &Lua,
+    budget: &LuaExecutionBudget,
+    handle: &Image,
+    printed: &Rc<RefCell<String>>,
+    ready: &Result<(), String>,
+    job: &Job,
+) -> Result<String, String> {
+    match ready {
+        Err(why) => Err(format!("image failed to start: {why}")),
+        Ok(()) => match &job.kind {
+            JobKind::Eval {
+                code,
+                name,
+                allow_pending,
+            } => {
+                handle.pending.begin_eval();
+                let answer = budget
+                    .run(lua, || {
+                        eval(lua, code, name.as_deref()).map_err(mlua::Error::RuntimeError)
+                    })
+                    .map_err(|error| error.to_string())
+                    .and_then(|value| {
+                        if handle.pending.pending_id(&value).is_some() {
+                            Ok(value)
+                        } else {
+                            join_output(&printed.borrow(), value)
+                        }
+                    });
+                let pending_id = answer
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| handle.pending.pending_id(value));
+                if pending_id.is_some() && !allow_pending {
+                    handle.pending.finish_eval(None);
+                    Err("pending replies may only be returned from a daemon request".into())
+                } else {
+                    handle.pending.finish_eval(pending_id);
+                    answer
+                }
+            }
+            JobKind::StopModules => budget
+                .run(lua, || script::stop_modules(lua).map(|()| String::new()))
+                .map_err(|error| error.to_string()),
+            JobKind::HttpComplete { id, result } => {
+                if let Err(error) = budget.run(lua, || deliver_http(lua, *id, result.clone())) {
+                    eprintln!("remuda: HTTP callback delivery failed: {error}");
+                }
+                Ok(String::new())
+            }
+            JobKind::SessionOutput(notifier) => {
+                let version = notifier.state.latest_version.load(Ordering::Acquire);
+                let _ = budget.run(lua, || {
+                    deliver_session_output(lua, notifier, version);
+                    Ok(())
+                });
+                notifier.finish(version);
+                Ok(String::new())
+            }
+            JobKind::SessionOutputFlush(notifier) => {
+                let version = notifier.state.latest_version.load(Ordering::Acquire);
+                let _ = budget.run(lua, || {
+                    deliver_session_output(lua, notifier, version);
+                    Ok(())
+                });
+                Ok(String::new())
+            }
+            #[cfg(test)]
+            JobKind::StopImage => Ok(String::new()),
+        },
     }
 }
 
