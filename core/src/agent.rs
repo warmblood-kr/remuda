@@ -97,6 +97,9 @@ impl Size {
     /// split spawned a session at 11 columns and input vanished with no error.
     pub const MIN_COLS: u16 = 80;
     pub const MIN_ROWS: u16 = 24;
+    pub const MIN_RESIZE_COLS: u16 = 20;
+    pub const MAX_RESIZE_COLS: u16 = 1000;
+    pub const MAX_RESIZE_ROWS: u16 = 500;
 
     /// Clamps up to the floor. A caller cannot construct a size that drops
     /// keystrokes, so no downstream code has to remember to check.
