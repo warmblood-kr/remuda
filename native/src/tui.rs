@@ -2513,14 +2513,7 @@ fn refresh(
     if !skip_list && ui.daemon_gone.is_none() {
         sync_shown_session(path, ui, shown, selection_moved);
     }
-    resize_shown_session(
-        path,
-        ui,
-        shown,
-        held.as_ref().map(|(name, _)| name.as_str()),
-        cols,
-        rows,
-    );
+    resize_held_shown_session(path, ui, shown, held, cols, rows);
     let (cells, wrapped, cursor) = if ui.daemon_gone.is_some() {
         (Vec::new(), Vec::new(), hidden)
     } else {
@@ -2609,6 +2602,24 @@ fn resize_shown_session(
     resize_shown_session_with(ui, shown, held_name, cols, rows, |name, target| {
         resize(path, name, target)
     });
+}
+
+fn resize_held_shown_session(
+    path: &Path,
+    ui: &mut Ui,
+    shown: &Option<ShownTarget>,
+    held: &Option<(String, Hold)>,
+    cols: u16,
+    rows: u16,
+) {
+    resize_shown_session(
+        path,
+        ui,
+        shown,
+        held.as_ref().map(|(name, _)| name.as_str()),
+        cols,
+        rows,
+    );
 }
 
 fn resize_shown_session_with(
