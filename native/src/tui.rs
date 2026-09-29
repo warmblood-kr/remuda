@@ -465,7 +465,11 @@ impl Ui {
             return Action::Nothing;
         };
         if !session.mouse_tracking {
-            return Action::Nothing;
+            return match button {
+                "wheel-up" => Action::Scroll(3),
+                "wheel-down" => Action::Scroll(-3),
+                _ => Action::Nothing,
+            };
         }
         let row_offset = if self.visual_screen.is_empty() {
             (session.size.rows() as usize).saturating_sub(body as usize)
@@ -482,17 +486,15 @@ impl Ui {
     /// first and unconditionally, so no remuda command can be typed by accident
     /// into a shell — the whole reason focus exists rather than modeless keys.
     fn session_key(&mut self, key: KeyEvent) -> Action {
+        if let Some(name) = self.selected().map(|session| session.name.clone()) {
+            self.scrollback.entry(name).or_default().offset = 0;
+        }
         if is_detach(key) {
             self.focus = Focus::List;
             self.notice = None;
             return Action::Nothing;
         }
         let bytes = to_bytes(key);
-        if bytes.is_some() {
-            if let Some(name) = self.selected().map(|session| session.name.clone()) {
-                self.scrollback.entry(name).or_default().offset = 0;
-            }
-        }
         bytes.map_or(Action::Nothing, Action::Type)
     }
 
@@ -1881,7 +1883,12 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
         ""
     };
 
-    let (lines, cut) = crop(screen, preview_w, body, ui.pan);
+    let (mut lines, cut) = crop(screen, preview_w, body, ui.pan);
+    if let Some(indicator) = scrollback_indicator(ui) {
+        if let Some(first) = lines.first_mut() {
+            *first = indicator;
+        }
+    }
     let mut out = String::from("\x1b[H\x1b[2J");
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H", row + 1));
@@ -2083,6 +2090,14 @@ fn ui_preview_row_offset(ui: &Ui, height: u16) -> usize {
     )
 }
 
+fn scrollback_indicator(ui: &Ui) -> Option<String> {
+    let offset = ui
+        .selected()
+        .and_then(|session| ui.scrollback.get(&session.name))
+        .map_or(0, |state| state.offset);
+    (offset > 0).then(|| format!("[scrollback: {offset} rows — any key returns]"))
+}
+
 /// The one text-width rule the list renderer uses. Ambiguous-width
 /// characters (East Asian Width A, e.g. the status dot) count as narrow.
 fn char_width(c: char) -> usize {
@@ -2185,7 +2200,12 @@ pub fn render_styled(
         .and_then(|session| ui.scrollback.get(&session.name))
         .is_some_and(|state| state.offset > 0);
     let row_offset = preview_row_offset(cells, cursor, body, preserve_history);
-    let (lines, cut) = crop_styled_at_offset(&selected, preview_w, body, ui.pan, row_offset);
+    let (mut lines, cut) = crop_styled_at_offset(&selected, preview_w, body, ui.pan, row_offset);
+    if let Some(indicator) = scrollback_indicator(ui) {
+        if let Some(first) = lines.first_mut() {
+            *first = indicator;
+        }
+    }
     let caret = locate_cursor(
         cells,
         cursor,
