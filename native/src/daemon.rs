@@ -218,12 +218,26 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     stop_on_signals(signals, image.clone(), Arc::clone(&socket_owner));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
+        // Socket credentials are tied to the accepted connection. Capture
+        // them here, before the handler runs on another thread, so neither
+        // request JSON nor caller-controlled environment can supply identity.
+        let peer_pid = process_ancestry::peer_pid(&stream).ok().flatten();
+        let caller =
+            process_ancestry::identify_caller(peer_pid, &registry.live_session_processes());
         let registry = Arc::clone(&registry);
         let image = image.clone();
         let counters = Arc::clone(&counters);
         let socket_owner = Arc::clone(&socket_owner);
         std::thread::spawn(move || {
-            let _ = handle(stream, &registry, &image, &counters, socket_owner);
+            let _ = handle(
+                stream,
+                &registry,
+                &image,
+                &counters,
+                socket_owner,
+                peer_pid,
+                caller,
+            );
         });
     }
     socket_owner.cleanup();
@@ -608,6 +622,8 @@ fn handle(
     image: &Image,
     counters: &crate::tick::Counters,
     socket_owner: Arc<SocketOwnership>,
+    peer_pid: Option<u32>,
+    caller: process_ancestry::CallerIdentity,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let Some(request) = read_request(&stream, &mut reader)? else {
@@ -632,7 +648,7 @@ fn handle(
         // Answer before going. A client left guessing from a hung-up socket
         // cannot tell "it stopped" from "it never heard me".
         request @ Request::Shutdown { .. } => {
-            handle_shutdown(stream, registry, image, socket_owner, request)
+            handle_shutdown(stream, registry, image, socket_owner, request, peer_pid)
         }
 
         Request::New {
@@ -716,7 +732,9 @@ fn handle(
         Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
         Request::RemoveDirAll { path: dir } => reply(&stream, &remove_dir_all(&dir)),
 
-        Request::Eval { code, name } => handle_eval(stream, reader, image, &code, name.as_deref()),
+        Request::Eval { code, name } => {
+            handle_eval(stream, reader, image, &code, name.as_deref(), caller)
+        }
     }
 }
 
@@ -726,8 +744,9 @@ fn handle_eval(
     image: &Image,
     code: &str,
     name: Option<&str>,
+    caller: process_ancestry::CallerIdentity,
 ) -> std::io::Result<()> {
-    match image.eval_request(code, name) {
+    match image.eval_request_with_caller(code, name, caller) {
         Ok(value) => match image.pending_replies().pending_id(&value) {
             Some(id) => deferred_reply(stream, reader, image, id),
             None if value.len() > crate::reply_limit::MAX_REPLY_BYTES => reply(
@@ -806,6 +825,7 @@ fn handle_shutdown(
     image: &Image,
     socket_owner: Arc<SocketOwnership>,
     request: Request,
+    peer_pid: Option<u32>,
 ) -> std::io::Result<()> {
     let Request::Shutdown {
         requester_daemon_id,
@@ -830,12 +850,12 @@ fn handle_shutdown(
         return refuse_hosted_shutdown(&stream, &identity);
     }
     if !override_hosted {
-        match process_ancestry::peer_pid(&stream) {
-            Ok(Some(peer_pid)) => match process_ancestry::is_self_or_descendant(
+        match peer_pid {
+            Some(peer_pid) => match process_ancestry::is_self_or_descendant(
                 peer_pid,
                 &registry.live_process_ids(),
             ) {
-                process_ancestry::Ancestry::Inside => {
+                process_ancestry::Ancestry::Inside { .. } => {
                     return refuse_hosted_shutdown(&stream, "session process ancestry")
                 }
                 process_ancestry::Ancestry::Outside => {}
@@ -843,16 +863,11 @@ fn handle_shutdown(
                     "remuda: shutdown ancestry stopped at unreadable pid {pid} ({error}); treating requester as outside"
                 ),
             },
-            Ok(None) | Err(_)
-                if process_ancestry::missing_peer_requires_refusal(caller_claims_this_daemon) =>
-            {
+            None if process_ancestry::missing_peer_requires_refusal(caller_claims_this_daemon) => {
                 return refuse_hosted_shutdown(&stream, "self-reported session identity")
             }
-            Ok(None) => eprintln!(
+            None => eprintln!(
                 "remuda: shutdown peer process ID unavailable; treating requester as outside"
-            ),
-            Err(error) => eprintln!(
-                "remuda: shutdown peer process ID unavailable ({error}); treating requester as outside"
             ),
         }
     }

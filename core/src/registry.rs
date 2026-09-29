@@ -158,6 +158,19 @@ impl Registry {
             .collect()
     }
 
+    /// Names and process IDs for live sessions, used to identify a local
+    /// socket peer from its kernel-supplied PID and process ancestry.
+    pub fn live_session_processes(&self) -> Vec<(u32, String)> {
+        self.lock()
+            .values()
+            .filter_map(|session| {
+                session
+                    .process_id_if_alive()
+                    .map(|pid| (pid, session.name().to_string()))
+            })
+            .collect()
+    }
+
     /// A snapshot of every session, sorted by name so callers can diff two
     /// listings without sorting first.
     pub fn list(&self) -> Vec<SessionSummary> {

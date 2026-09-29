@@ -91,6 +91,7 @@ enum JobKind {
     Eval {
         code: String,
         name: Option<String>,
+        caller: crate::process_ancestry::CallerIdentity,
         allow_pending: bool,
     },
     StopModules,
@@ -134,6 +135,11 @@ impl Image {
 
         std::thread::spawn(move || {
             let lua = Lua::new();
+            // The Lua image is single-threaded. This value is set only around
+            // the current Eval job and reset before the next queued request.
+            let active_caller = Rc::new(RefCell::new(
+                crate::process_ancestry::CallerIdentity::unknown(),
+            ));
             // Everything `print` writes during one job, so it can travel back
             // to whoever asked instead of vanishing. `Rc` rather than `Arc`
             // because this never leaves the thread — the whole reason the
@@ -142,19 +148,26 @@ impl Image {
 
             // A failure here means no image at all, so every eval must say so
             // rather than the thread dying quietly and every caller hanging.
-            let ready = script::bindings(&lua, &socket, registry, counters, handle.clone())
-                .and_then(|table| lua.globals().set("remuda", table))
-                // The tool frame is Lua over those bindings, not a second set of
-                // them. It must load *after* the table exists and *before* any
-                // caller, so a `tools/list` on a fresh daemon is already true.
-                .and_then(|()| {
-                    lua.load(include_str!("tools.lua"))
-                        .set_name("@remuda/tools.lua")
-                        .exec()
-                })
-                .and_then(|()| script::hide_module_activator(&lua))
-                .and_then(|()| capture_print(&lua, Rc::clone(&printed)))
-                .map_err(|e| e.to_string());
+            let ready = script::bindings_with_caller(
+                &lua,
+                &socket,
+                registry,
+                counters,
+                handle.clone(),
+                Rc::clone(&active_caller),
+            )
+            .and_then(|table| lua.globals().set("remuda", table))
+            // The tool frame is Lua over those bindings, not a second set of
+            // them. It must load *after* the table exists and *before* any
+            // caller, so a `tools/list` on a fresh daemon is already true.
+            .and_then(|()| {
+                lua.load(include_str!("tools.lua"))
+                    .set_name("@remuda/tools.lua")
+                    .exec()
+            })
+            .and_then(|()| script::hide_module_activator(&lua))
+            .and_then(|()| capture_print(&lua, Rc::clone(&printed)))
+            .map_err(|e| e.to_string());
 
             for job in inbox {
                 printed.borrow_mut().clear();
@@ -164,8 +177,10 @@ impl Image {
                         JobKind::Eval {
                             code,
                             name,
+                            caller,
                             allow_pending,
                         } => {
+                            *active_caller.borrow_mut() = caller.clone();
                             handle.pending.begin_eval();
                             let answer = eval(&lua, code, name.as_deref()).and_then(|value| {
                                 if handle.pending.pending_id(&value).is_some() {
@@ -200,6 +215,10 @@ impl Image {
                         JobKind::StopImage => Ok(String::new()),
                     },
                 };
+                if matches!(&job.kind, JobKind::Eval { .. }) {
+                    *active_caller.borrow_mut() =
+                        crate::process_ancestry::CallerIdentity::unknown();
+                }
                 // A caller that gave up and dropped its receiver is not an
                 // error: `remuda -e` can be Ctrl-C'd mid-evaluation, and the
                 // work still ran.
@@ -229,6 +248,7 @@ impl Image {
                 kind: JobKind::Eval {
                     code: code.to_string(),
                     name: name.map(str::to_string),
+                    caller: crate::process_ancestry::CallerIdentity::unknown(),
                     allow_pending: false,
                 },
                 reply: Some(reply),
@@ -286,12 +306,26 @@ impl Image {
     }
 
     pub fn eval_request(&self, code: &str, name: Option<&str>) -> Result<String, String> {
+        self.eval_request_with_caller(
+            code,
+            name,
+            crate::process_ancestry::CallerIdentity::unknown(),
+        )
+    }
+
+    pub(crate) fn eval_request_with_caller(
+        &self,
+        code: &str,
+        name: Option<&str>,
+        caller: crate::process_ancestry::CallerIdentity,
+    ) -> Result<String, String> {
         let (reply, answer) = channel();
         self.jobs
             .send(Job {
                 kind: JobKind::Eval {
                     code: code.to_string(),
                     name: name.map(str::to_string),
+                    caller,
                     allow_pending: true,
                 },
                 reply: Some(reply),

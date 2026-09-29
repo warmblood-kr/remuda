@@ -211,6 +211,33 @@ Failures are logged and cleanup continues; shutdown waits at most two seconds
 for the whole stop pass. A forced daemon termination cannot run Lua stop
 callbacks.
 
+## Local caller identity
+
+`remuda.caller()` returns `{known, inside, session}` for the local socket peer
+that submitted the current daemon evaluation. The daemon takes the peer PID
+from kernel socket credentials when it accepts the connection, then compares
+the peer's process ancestry with its live session processes. An operator
+outside a managed session gets `{known = true, inside = false, session = nil}`;
+a process in a managed session gets its session name and `inside = true`.
+
+If the peer PID or any required ancestry step cannot be read, `known` is
+`false`, `inside` is `false`, and `session` is nil. Operator-only gates must
+deny when `not caller.known` or `caller.inside`. Environment variables,
+command arguments, and request JSON do not set these fields. The ancestry walk
+is a point-in-time process snapshot: a process can exit or be reparented while
+the walk runs, so this identity is useful for local policy gates and is not a
+durable capability or proof against a concurrent process-tree change.
+
+```lua
+remuda.extension_command("operator-action", function(args)
+  local caller = remuda.caller()
+  if not caller.known or caller.inside then
+    return "operator-only command"
+  end
+  return "allowed"
+end)
+```
+
 The runtime registry also covers words added with `remuda.tool`, so an
 extension can document itself when it registers its function:
 

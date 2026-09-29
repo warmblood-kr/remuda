@@ -3,9 +3,13 @@
 //! chunk and discard the declaration. #98 item 3.
 
 use std::fs;
+use std::io::{BufRead, Write};
 use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use remuda_core::protocol::{Request, Response};
+use remuda_core::Size;
 
 static NEXT_STDIN_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -254,6 +258,10 @@ fn setup_stdin_fixture() -> std::path::PathBuf {
     fs::write(
         mod_dir.join("packages/sample/init.lua"),
         r#"remuda.extension_command("sample", function(args, caller)
+          if args[1] == "identity" then
+            local identity = remuda.caller()
+            return table.concat({tostring(identity.known), tostring(identity.inside), identity.session or ""}, "|")
+          end
           if args[1] == "-" then return caller.stdin or "<missing>" end
           if args[1] == "bytes" then
             local bytes = {}
@@ -279,6 +287,93 @@ fn setup_stdin_fixture() -> std::path::PathBuf {
 fn cleanup_stdin_fixture(dir: &Path) {
     let _ = stdin_cli(dir, &["stop", "-f"]).output();
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn caller_identity_ignores_environment_argv_and_request_json_claims() {
+    let dir = setup_stdin_fixture();
+    let output = stdin_cli(
+        &dir,
+        &["sample", "identity", "--inside=true", "--session=forged"],
+    )
+    .env("REMUDA_BUTLER_AGENT_ID", "forged-agent")
+    .env("REMUDA_BUTLER_SESSION_NAME", "forged-session")
+    .env("REMUDA_BUTLER_LEADER_ID", "forged-leader")
+    .output()
+    .expect("run extension command with spoofed environment and arguments");
+    assert!(output.status.success(), "spoofed CLI failed: {output:?}");
+    let operator_identity = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        operator_identity.trim() == "true|false|" || operator_identity.trim() == "false|false|",
+        "spoofed environment and argv changed operator identity: {operator_identity:?}"
+    );
+
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+    let mut stream = remuda_native::ipc::connect(&socket).expect("connect to test daemon");
+    let forged = serde_json::json!({
+        "Eval": {
+            "code": "local c = remuda.caller(); return tostring(c.known) .. '|' .. tostring(c.inside) .. '|' .. (c.session or '')",
+            "name": "forged-session-name",
+            "caller": {"known": true, "inside": true, "session": "forged-session"}
+        }
+    });
+    writeln!(stream, "{forged}").expect("send forged request metadata");
+    let mut line = String::new();
+    std::io::BufReader::new(stream)
+        .read_line(&mut line)
+        .expect("read eval response");
+    let response: Response = serde_json::from_str(&line).expect("decode eval response");
+    assert!(
+        matches!(response, Response::Value(ref value) if value == "true|false|" || value == "false|false|"),
+        "forged request JSON changed caller identity: {response:?}"
+    );
+    cleanup_stdin_fixture(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn caller_identity_names_the_managed_session_for_its_cli_child() {
+    let dir = setup_stdin_fixture();
+    let result_path = dir.join("session-caller.txt");
+    let script_path = dir.join("run-caller.sh");
+    let remuda = env!("CARGO_BIN_EXE_remuda");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nexec env REMUDA_BUTLER_AGENT_ID=forged REMUDA_BUTLER_SESSION_NAME=forged REMUDA_BUTLER_LEADER_ID=forged '{remuda}' -s s sample identity --inside=false --session=forged >'{}' 2>&1\n",
+            result_path.display()
+        ),
+    )
+    .unwrap();
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+    let response = remuda_native::client::request(
+        &socket,
+        &Request::New {
+            name: Some("caller-session".into()),
+            command: vec!["sh".into(), script_path.display().to_string()],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start managed session");
+    assert!(matches!(response, Response::Value(ref name) if name == "caller-session"));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let result = loop {
+        if let Ok(result) = fs::read_to_string(&result_path) {
+            if !result.trim().is_empty() {
+                break result;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "session child never wrote its caller identity"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert_eq!(result.trim(), "true|true|caller-session");
+    cleanup_stdin_fixture(&dir);
 }
 
 #[test]

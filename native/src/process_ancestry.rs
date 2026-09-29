@@ -1,10 +1,10 @@
-//! Process identities for the daemon's local shutdown guard.
+//! Process identities for the daemon's local shutdown guard and caller API.
 //!
 //! A shutdown request may come from a shell or tool several processes below a
 //! session's PTY child. The kernel supplies the socket peer PID; this module
 //! follows parent PIDs until it reaches one of the daemon's session children.
-//! A caller is hosted only when its ancestry reaches one of the daemon's
-//! session children before the chain leaves processes we can inspect.
+//! An unreadable or incomplete parent chain stays unknown so operator gates can
+//! fail closed.
 
 #[cfg(any(windows, all(unix, not(target_os = "macos"))))]
 use interprocess::local_socket::traits::StreamCommon as _;
@@ -57,13 +57,62 @@ pub(crate) fn peer_pid(stream: &crate::ipc::Stream) -> io::Result<Option<u32>> {
 
 #[derive(Debug)]
 pub(crate) enum Ancestry {
-    Inside,
+    Inside { ancestor_pid: u32 },
     Outside,
     Unreadable { pid: u32, error: io::Error },
 }
 
 pub(crate) fn missing_peer_requires_refusal(self_reported_identity: bool) -> bool {
     self_reported_identity
+}
+
+/// Kernel-derived identity for the connection currently being evaluated.
+/// `known` is false when we could not obtain the peer PID or walk its ancestry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CallerIdentity {
+    pub(crate) known: bool,
+    pub(crate) inside: bool,
+    pub(crate) session: Option<String>,
+}
+
+impl CallerIdentity {
+    pub(crate) fn unknown() -> Self {
+        Self {
+            known: false,
+            inside: false,
+            session: None,
+        }
+    }
+}
+
+/// Resolve a peer PID against a snapshot of this daemon's live session PIDs.
+/// A readable chain that reaches neither a session nor an unreadable process
+/// is a known outside caller. An unreadable chain fails closed as unknown.
+pub(crate) fn identify_caller(peer_pid: Option<u32>, sessions: &[(u32, String)]) -> CallerIdentity {
+    let Some(peer_pid) = peer_pid.filter(|pid| *pid > 0) else {
+        return CallerIdentity::unknown();
+    };
+    let session_pids: Vec<_> = sessions.iter().map(|(pid, _)| *pid).collect();
+    caller_for_ancestry(is_self_or_descendant(peer_pid, &session_pids), sessions)
+}
+
+fn caller_for_ancestry(ancestry: Ancestry, sessions: &[(u32, String)]) -> CallerIdentity {
+    match ancestry {
+        Ancestry::Inside { ancestor_pid } => CallerIdentity {
+            known: true,
+            inside: true,
+            session: sessions
+                .iter()
+                .find(|(pid, _)| *pid == ancestor_pid)
+                .map(|(_, name)| name.clone()),
+        },
+        Ancestry::Outside => CallerIdentity {
+            known: true,
+            inside: false,
+            session: None,
+        },
+        Ancestry::Unreadable { .. } => CallerIdentity::unknown(),
+    }
 }
 
 pub(crate) fn is_self_or_descendant(pid: u32, ancestors: &[u32]) -> Ancestry {
@@ -77,10 +126,10 @@ where
     let mut visited = std::collections::HashSet::new();
     loop {
         if ancestors.contains(&pid) {
-            return Ancestry::Inside;
+            return Ancestry::Inside { ancestor_pid: pid };
         }
-        // Session children belong to this daemon. Once the walk reaches the
-        // daemon, init, or an unreadable process, it has left that tree.
+        // Session children belong to this daemon. Reaching the daemon or init
+        // proves the caller is outside every managed session tree.
         if pid == daemon_pid || pid <= 1 {
             return Ancestry::Outside;
         }
@@ -95,10 +144,19 @@ where
             Err(error) => return Ancestry::Unreadable { pid, error },
         };
         let Some(next) = next else {
-            return Ancestry::Outside;
+            return Ancestry::Unreadable {
+                pid,
+                error: io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "process parent could not be resolved",
+                ),
+            };
         };
         if next == pid {
-            return Ancestry::Outside;
+            return Ancestry::Unreadable {
+                pid,
+                error: io::Error::new(io::ErrorKind::InvalidData, "process is its own parent"),
+            };
         }
         pid = next;
     }
@@ -193,7 +251,7 @@ mod tests {
     fn current_process_is_its_own_ancestor() {
         assert!(matches!(
             is_self_or_descendant(std::process::id(), &[std::process::id()]),
-            Ancestry::Inside
+            Ancestry::Inside { .. }
         ));
     }
 
@@ -224,7 +282,7 @@ mod tests {
         };
         assert!(matches!(
             walk_ancestry(40, &[25], 1, parent),
-            Ancestry::Inside
+            Ancestry::Inside { .. }
         ));
     }
 
@@ -232,5 +290,55 @@ mod tests {
     fn missing_peer_pid_refuses_only_with_self_reported_identity() {
         assert!(missing_peer_requires_refusal(true));
         assert!(!missing_peer_requires_refusal(false));
+    }
+
+    #[test]
+    fn caller_resolution_names_managed_session_and_known_operator() {
+        let sessions = vec![(25, "worker".to_string())];
+        let inside = caller_for_ancestry(
+            walk_ancestry(40, &[25], 1, |pid| match pid {
+                40 => Ok(Some(25)),
+                _ => unreachable!(),
+            }),
+            &sessions,
+        );
+        assert_eq!(
+            inside,
+            CallerIdentity {
+                known: true,
+                inside: true,
+                session: Some("worker".into()),
+            }
+        );
+
+        let outside = caller_for_ancestry(Ancestry::Outside, &sessions);
+        assert_eq!(
+            outside,
+            CallerIdentity {
+                known: true,
+                inside: false,
+                session: None,
+            }
+        );
+    }
+
+    #[test]
+    fn caller_resolution_fails_closed_when_peer_or_ancestry_is_unavailable() {
+        assert_eq!(identify_caller(None, &[]), CallerIdentity::unknown());
+        assert_eq!(identify_caller(Some(0), &[]), CallerIdentity::unknown());
+        let unreadable = caller_for_ancestry(
+            Ancestry::Unreadable {
+                pid: 40,
+                error: io::Error::new(io::ErrorKind::PermissionDenied, "hidden"),
+            },
+            &[],
+        );
+        assert_eq!(unreadable, CallerIdentity::unknown());
+
+        let missing_parent = walk_ancestry(40, &[], 1, |_| Ok(None));
+        assert!(matches!(
+            missing_parent,
+            Ancestry::Unreadable { pid: 40, .. }
+        ));
     }
 }

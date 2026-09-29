@@ -126,6 +126,11 @@ buffers
 
 ``table`` — The `remuda.buffer` registry table, keyed by buffer name.
 
+caller
+------
+
+``caller() -> {known, inside, session?}`` — Identify the local daemon-socket caller from peer credentials and process ancestry.
+
 cancel
 ------
 

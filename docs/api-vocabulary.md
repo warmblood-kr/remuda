@@ -12,7 +12,7 @@ The proposal does not change behavior. Owner approval #206 fixes the first imple
 
 ### Core Lua surface
 
-The inventory below covers every name in `native/src/script.rs` `BINDINGS` (69 names), including the names added by `native/src/tools.lua`. Purely local Lua functions are implementation details and are outside the public `remuda.*` surface. The public table and registry should eventually be derived from these classifications.
+The inventory below covers every name in `native/src/script.rs` `BINDINGS` (76 names), including the names added by `native/src/tools.lua`. Purely local Lua functions are implementation details and are outside the public `remuda.*` surface. The public table and registry should eventually be derived from these classifications.
 
 | Current name(s) | Class | What it does / proposal |
 |---|---|---|
@@ -35,6 +35,7 @@ The inventory below covers every name in `native/src/script.rs` `BINDINGS` (69 n
 | `advise`, `unadvise`, `advice_member`, `advice_list` | Composite | Wrap/unwrap a function at a named path and inspect advice. Promote to `remuda.advice.add/remove/member/list`. |
 | `contribute`, `contributions` | Composite + registry | Add and read named entries at extension points. Promote to `remuda.extension.contribute/contributions`. |
 | `extension_command` | Composite | Register a command exposed by a mod. Promote to `remuda.extension.command`. |
+| `caller` | Primitive identity query | Read the accepted local socket peer's ancestry-derived `{known, inside, session}` identity. Environment, argv, and request JSON are not identity sources. |
 | `process`, `processes`, `kill` | Composite + query | Start a managed child process, list running process ids, and terminate one. Promote to `remuda.process.start/list/kill`. The low-level `_process_spawn` binding exists but is internal; the public composite validates the spec and wraps it. |
 | `request_counts`, `schedule_fires`, `schedule_skips` | Diagnostic composites | Read daemon request counts, schedule firing counts, and ticker skips. Promote to `remuda.diagnostics.request_counts/schedule_fires/schedule_skips`; document these as diagnostics, not control primitives. |
 

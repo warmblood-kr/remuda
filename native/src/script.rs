@@ -20,7 +20,7 @@ use crate::client;
 use mlua::{Lua, Table, Value};
 use remuda_core::keys;
 use remuda_core::protocol::{Request, Response, Step};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 75] = [
+pub const BINDINGS: [&str; 76] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -54,6 +54,7 @@ pub const BINDINGS: [&str; 75] = [
     "attach",
     "buffer",
     "buffers",
+    "caller",
     "cancel",
     "capture",
     "capture_styled",
@@ -198,6 +199,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "capture_styled",
         "Read a session's screen as rows of {text, dim} spans, plus its cursor.",
         "capture_styled(name) -> {rows, cursor = {row, col, visible}}",
+    ),
+    (
+        "caller",
+        "Identify the local daemon-socket caller from peer credentials and process ancestry.",
+        "caller() -> {known, inside, session?}",
     ),
     (
         "attach",
@@ -369,9 +375,30 @@ pub fn bindings(
     counters: std::sync::Arc<crate::tick::Counters>,
     image: crate::image::Image,
 ) -> mlua::Result<Table> {
+    bindings_with_caller(
+        lua,
+        socket,
+        registry,
+        counters,
+        image,
+        Rc::new(RefCell::new(
+            crate::process_ancestry::CallerIdentity::unknown(),
+        )),
+    )
+}
+
+pub(crate) fn bindings_with_caller(
+    lua: &Lua,
+    socket: &Path,
+    registry: std::sync::Arc<remuda_core::Registry>,
+    counters: std::sync::Arc<crate::tick::Counters>,
+    image: crate::image::Image,
+    active_caller: Rc<RefCell<crate::process_ancestry::CallerIdentity>>,
+) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
     fail_binding(lua, &table, image.clone())?;
+    caller_binding(lua, &table, active_caller)?;
     pending_bindings(lua, &table, image.pending_replies())?;
 
     // In-process, not a loopback: the image always runs inside the same
@@ -509,6 +536,24 @@ pub fn bindings(
     sleep_binding(lua, &table)?;
 
     Ok(table)
+}
+
+fn caller_binding(
+    lua: &Lua,
+    table: &Table,
+    active_caller: Rc<RefCell<crate::process_ancestry::CallerIdentity>>,
+) -> mlua::Result<()> {
+    table.set(
+        "caller",
+        lua.create_function(move |lua, ()| {
+            let caller = active_caller.borrow().clone();
+            let result = lua.create_table()?;
+            result.set("known", caller.known)?;
+            result.set("inside", caller.inside)?;
+            result.set("session", caller.session)?;
+            Ok(result)
+        })?,
+    )
 }
 
 fn sleep_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
