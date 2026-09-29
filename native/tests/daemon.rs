@@ -308,6 +308,179 @@ fn daemon_lock_file_is_private() {
 
 #[cfg(unix)]
 #[test]
+fn daemon_socket_and_directory_are_private_on_first_start() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("private-socket-fresh");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create isolated runtime directory");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let daemon = Daemon::spawn(&dir);
+    let directory_mode = std::fs::metadata(socket.parent().unwrap())
+        .expect("socket directory exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    let socket_mode = std::fs::metadata(&socket)
+        .expect("daemon socket exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    drop(daemon);
+    std::fs::remove_dir_all(&dir).expect("remove isolated runtime directory");
+
+    assert_eq!(directory_mode, 0o700, "socket directory must be private");
+    assert_eq!(socket_mode, 0o600, "daemon socket must be private");
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_tightens_a_preexisting_socket_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("private-socket-existing");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create isolated runtime directory");
+    let socket = daemon::socket_path_in(&dir, "s");
+    std::fs::create_dir_all(socket.parent().unwrap()).expect("create socket directory");
+    std::fs::set_permissions(
+        socket.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("make a permissive preexisting socket directory");
+
+    let daemon = Daemon::spawn(&dir);
+    let directory_mode = std::fs::metadata(socket.parent().unwrap())
+        .expect("socket directory exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    let socket_mode = std::fs::metadata(&socket)
+        .expect("daemon socket exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    drop(daemon);
+    std::fs::remove_dir_all(&dir).expect("remove isolated runtime directory");
+
+    assert_eq!(
+        directory_mode, 0o700,
+        "existing directory must be tightened"
+    );
+    assert_eq!(socket_mode, 0o600, "daemon socket must be private");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_custom_absolute_socket_path_does_not_change_its_parent_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runtime = scratch_dir("custom-absolute-socket");
+    let custom = runtime.join("chosen");
+    std::fs::create_dir(&custom).expect("create user-selected socket directory");
+    std::fs::set_permissions(&custom, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let custom_server = custom.join("X").to_string_lossy().into_owned();
+    let output = remuda_timed(&runtime, &["-s", &custom_server, "-e", "return true"]);
+
+    assert!(
+        output.status.success(),
+        "custom socket path failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(&custom).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    let _ = remuda_timed(&runtime, &["-s", &custom_server, "stop"]);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_nested_socket_name_keeps_the_runtime_directory_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runtime = scratch_dir("nested-socket-name");
+    let output = remuda_timed(&runtime, &["-s", "sub/X", "-e", "return true"]);
+
+    assert!(
+        output.status.success(),
+        "nested socket path failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(runtime.join("remuda"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let _ = remuda_timed(&runtime, &["-s", "sub/X", "stop"]);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_runtime_directory_is_rejected_before_a_startup_log_is_created() {
+    let runtime = scratch_dir("symlink-runtime");
+    let target = runtime.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, runtime.join("remuda")).unwrap();
+
+    let output = remuda_timed(&runtime, &["-s", "s", "-e", "return true"]);
+
+    assert!(!output.status.success());
+    assert!(
+        !target.join("s.log").exists(),
+        "must not create log through symlink"
+    );
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_runtime_base_is_rejected_with_trailing_separators_and_dot() {
+    let root = scratch_dir("symlink-runtime-base");
+    let target = root.join("target");
+    let link = root.join("link");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    for runtime in [link.clone(), root.join("link/"), root.join("link/.")] {
+        let socket = runtime.join("remuda").join("s.sock");
+        let result = daemon::prepare_socket_path(&socket, Some(&runtime));
+        assert!(result.is_err(), "accepted symlink runtime {runtime:?}");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_custom_socket_parents_are_rejected_after_path_normalization() {
+    let root = scratch_dir("symlink-custom-parent");
+    let target = root.join("target");
+    let link = root.join("link");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    for parent in [
+        link.clone(),
+        PathBuf::from(format!("{}/", link.display())),
+        PathBuf::from(format!("{}/.", link.display())),
+    ] {
+        let socket = parent.join("s.sock");
+        let result = daemon::prepare_socket_path(&socket, Some(&root.join("runtime")));
+        assert!(result.is_err(), "accepted symlink socket parent {parent:?}");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_signal_cleanup_preserves_a_replacement_socket_path() {
     use std::os::unix::fs::FileTypeExt;
 
@@ -329,6 +502,312 @@ fn daemon_signal_cleanup_preserves_a_replacement_socket_path() {
         std::fs::read(&socket).expect("replacement remains after cleanup"),
         b"replacement owned by another process"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigusr1_rebinds_a_deleted_socket() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("daemon-sigusr1-rebind");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    let result = (|| {
+        for cycle in 1..=20 {
+            signal_rebind_and_wait(&daemon, &socket)
+                .map_err(|error| format!("rebind cycle {cycle}/20: {error}"))?;
+            let socket_mode = std::fs::metadata(&socket)
+                .map_err(|error| error.to_string())?
+                .permissions()
+                .mode()
+                & 0o777;
+            let directory_mode = std::fs::metadata(socket.parent().unwrap())
+                .map_err(|error| error.to_string())?
+                .permissions()
+                .mode()
+                & 0o777;
+            if socket_mode != 0o600 || directory_mode != 0o700 {
+                return Err(format!(
+                    "rebind cycle {cycle}/20 modes were socket {socket_mode:04o}, directory {directory_mode:04o}"
+                ));
+            }
+        }
+        Ok::<(), String>(())
+    })();
+
+    let socket_removed = stop_and_clean(&mut daemon, &dir, &socket);
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+    assert!(socket_removed, "shutdown removes the rebound socket");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigusr1_rebind_refreshes_cleanup_identity() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let dir = scratch_dir("daemon-sigusr1-owner");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    let original = std::fs::symlink_metadata(&socket).expect("original socket");
+    let result = signal_rebind_and_wait(&daemon, &socket).and_then(|()| {
+        let rebound = std::fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
+        if !rebound.file_type().is_socket() {
+            return Err("rebound path is not a socket".into());
+        }
+        if (original.dev(), original.ino()) == (rebound.dev(), rebound.ino()) {
+            return Err("rebind kept the old socket inode".into());
+        }
+        std::fs::remove_file(&socket).map_err(|error| error.to_string())?;
+        std::fs::write(&socket, b"replacement after rebind").map_err(|error| error.to_string())?;
+        Ok(())
+    });
+
+    let _ = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    let stopped = daemon.left_on_its_own();
+    let preserved = std::fs::read(&socket).ok().as_deref() == Some(b"replacement after rebind");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+    assert!(stopped, "daemon handles SIGTERM after rebinding");
+    assert!(preserved, "cleanup preserves a replacement path inode");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigusr1_on_the_owned_socket_is_silent() {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd;
+
+    let dir = scratch_dir("daemon-sigusr1-owned");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let mut command = spawn::base_command(&dir);
+    command.stderr(std::process::Stdio::piped());
+    let mut daemon = spawn::spawn_and_wait(command, &dir);
+
+    let signalled = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGUSR1) };
+    assert_eq!(signalled, 0, "send SIGUSR1");
+    assert!(matches!(
+        client::request(&socket, &Request::Version),
+        Ok(Response::Value(_))
+    ));
+
+    // If SIGUSR1 takes the erroneous ipc::listen path, it writes its failure
+    // promptly. Wait on the captured pipe for that output without relying on
+    // whether a subsequent request happened to race the signal thread.
+    let mut stderr = daemon.0.stderr.take().expect("captured daemon stderr");
+    let mut pending = libc::pollfd {
+        fd: stderr.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let readable = unsafe { libc::poll(&mut pending, 1, 200) };
+
+    let stopped = stop_and_clean(&mut daemon, &dir, &socket);
+    let mut output = String::new();
+    stderr
+        .read_to_string(&mut output)
+        .expect("read daemon stderr");
+    assert_eq!(
+        readable, 0,
+        "SIGUSR1 wrote stderr before shutdown: {output}"
+    );
+    assert!(stopped, "daemon stops and removes its socket");
+    assert!(
+        !output.contains("could not rebind socket"),
+        "a signal on the daemon's own live socket is a no-op: {output}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigusr1_with_a_queued_old_listener_client_does_not_strand_shutdown() {
+    use interprocess::local_socket::traits::Stream as _;
+
+    let dir = scratch_dir("daemon-sigusr1-queued");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    let pid = daemon.0.id() as libc::pid_t;
+
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0, "stop daemon");
+    let mut stopped_status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut stopped_status, libc::WUNTRACED) },
+        pid,
+        "wait until daemon is stopped"
+    );
+    assert!(libc::WIFSTOPPED(stopped_status), "daemon reached SIGSTOP");
+
+    let mut queued = ipc::connect(&socket).expect("queue a client on the old listener");
+    let mut request = serde_json::to_vec(&Request::Version).expect("serialize version request");
+    request.push(b'\n');
+    queued.write_all(&request).expect("write queued request");
+    queued
+        .set_nonblocking(true)
+        .expect("make queued client nonblocking");
+    std::fs::remove_file(&socket).expect("remove old listener path");
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGUSR1) },
+        0,
+        "send rebind signal"
+    );
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGCONT) },
+        0,
+        "resume daemon"
+    );
+
+    let rebind_deadline = Instant::now() + Duration::from_secs(2);
+    while std::fs::symlink_metadata(&socket).is_err() {
+        assert!(Instant::now() < rebind_deadline, "socket was not rebound");
+        std::thread::yield_now();
+    }
+
+    let signalled_at = Instant::now();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0, "send SIGTERM");
+    let exit_deadline = signalled_at + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = daemon.0.try_wait().expect("poll daemon exit") {
+            break status;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "SIGTERM was stranded behind stale listener readiness"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    let mut response = Vec::new();
+    let read_deadline = Instant::now() + Duration::from_secs(2);
+    let client_closed_cleanly = loop {
+        let mut bytes = [0u8; 256];
+        match queued.read(&mut bytes) {
+            Ok(0) => break true,
+            Ok(count) => {
+                response.extend_from_slice(&bytes[..count]);
+                if response.contains(&b'\n') {
+                    break serde_json::from_slice::<Response>(
+                        response
+                            .split(|byte| *byte == b'\n')
+                            .next()
+                            .unwrap_or_default(),
+                    )
+                    .is_ok();
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= read_deadline {
+                    break false;
+                }
+                std::thread::yield_now();
+            }
+            Err(_) => break true,
+        }
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(status.success(), "SIGTERM exits successfully: {status}");
+    assert!(
+        signalled_at.elapsed() < Duration::from_secs(2),
+        "SIGTERM exits within two seconds"
+    );
+    assert!(
+        client_closed_cleanly,
+        "queued old-listener client gets a response or a clean connection close"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sigusr1_refuses_to_displace_a_live_replacement_socket() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::net::UnixListener;
+
+    let dir = scratch_dir("sigusr1-live");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    std::fs::remove_file(&socket).expect("remove original socket");
+    let replacement = UnixListener::bind(&socket).expect("bind live replacement");
+    replacement
+        .set_nonblocking(true)
+        .expect("make replacement accept nonblocking");
+    let replacement_id = std::fs::symlink_metadata(&socket).expect("replacement metadata");
+    let result = (|| -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        // The second accepted probe proves the first refused bind completed
+        // before the test asks the daemon to stop.
+        for _ in 0..2 {
+            let signalled = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGUSR1) };
+            if signalled != 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            loop {
+                match replacement.accept() {
+                    Ok((_stream, _address)) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return Err("daemon did not probe the live replacement".into());
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => return Err(error.to_string()),
+                }
+            }
+        }
+
+        let after = std::fs::symlink_metadata(&socket).map_err(|error| error.to_string())?;
+        if (after.dev(), after.ino()) != (replacement_id.dev(), replacement_id.ino()) {
+            return Err("live replacement socket inode changed".into());
+        }
+        if daemon
+            .0
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("daemon exited while handling SIGUSR1".into());
+        }
+        Ok(())
+    })();
+
+    let _ = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    let stopped = daemon.left_on_its_own();
+    let after_shutdown = std::fs::symlink_metadata(&socket).expect("replacement remains");
+    let remains = (after_shutdown.dev(), after_shutdown.ino())
+        == (replacement_id.dev(), replacement_id.ino());
+    drop(replacement);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(result.is_ok(), "{}", result.unwrap_err());
+    assert!(stopped, "daemon handles SIGTERM after failed rebind");
+    assert!(remains, "shutdown preserves the live replacement socket");
+}
+
+#[cfg(unix)]
+fn signal_rebind_and_wait(daemon: &Daemon, socket: &Path) -> Result<(), String> {
+    std::fs::remove_file(socket).map_err(|error| error.to_string())?;
+    let signalled = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGUSR1) };
+    if signalled != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while ipc::connect(socket).is_err() {
+        if Instant::now() >= deadline {
+            return Err(format!("daemon did not rebind {socket:?} after SIGUSR1"));
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    match client::request(socket, &Request::List) {
+        Ok(Response::Sessions(_)) => Ok(()),
+        Ok(response) => Err(format!("unexpected response: {response:?}")),
+        Err(error) => Err(format!("rebound socket did not serve requests: {error}")),
+    }
+}
+
+#[cfg(unix)]
+fn stop_and_clean(daemon: &mut Daemon, dir: &Path, socket: &Path) -> bool {
+    let _ = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGTERM) };
+    let stopped = daemon.left_on_its_own();
+    let socket_removed = !socket.exists();
+    let _ = std::fs::remove_dir_all(dir);
+    stopped && socket_removed
 }
 
 #[cfg(unix)]
@@ -841,6 +1320,155 @@ fn start_shell_session(socket: &Path, script: &str) {
     assert!(matches!(response, Response::Value(_)));
 }
 
+#[cfg(unix)]
+#[test]
+fn session_output_wakes_coalesce_while_lua_is_busy_and_list_stays_responsive() {
+    let path = scratch("session-output-coalescing");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda._session_output_test_calls = 0
+            remuda.on("session_output", function(name)
+                if name == "chatty" then
+                    remuda._session_output_test_calls = remuda._session_output_test_calls + 1
+                    if remuda._session_output_test_calls == 1 then remuda.sleep(0.5) end
+                end
+            end, { group = "session-output-test", id = "coalesce" })
+        "#,
+    );
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("chatty".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "yes x & writer=$!; sleep 0.4; kill $writer 2>/dev/null; wait $writer 2>/dev/null; sleep 5".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start chatty session");
+    assert_eq!(response, Response::Value("chatty".into()));
+
+    let until = Instant::now() + Duration::from_millis(750);
+    let mut max_list_latency = Duration::ZERO;
+    while Instant::now() < until {
+        let started = Instant::now();
+        let response = client::request(&path, &Request::List).expect("list during output hook");
+        max_list_latency = max_list_latency.max(started.elapsed());
+        assert!(matches!(response, Response::Sessions(_)));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        max_list_latency < Duration::from_millis(100),
+        "session list stalled behind output hook: {max_list_latency:?}"
+    );
+    let calls: u32 = eval(&path, "return remuda._session_output_test_calls")
+        .parse()
+        .expect("output hook call count");
+    assert!(
+        (1..=2).contains(&calls),
+        "chatty output queued redundant Lua wakes: {calls} calls"
+    );
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::Close {
+                name: "chatty".into(),
+            },
+        )
+        .expect("close chatty session"),
+        Response::Ok
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn final_session_output_is_notified_once_before_session_exit() {
+    let path = scratch("session-output-before-exit");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda._final_output_order = {}
+            remuda.on("session_output", function(name, details)
+                if name == "last-before-exit" then
+                    table.insert(remuda._final_output_order, "output:" .. tostring(details.version))
+                end
+            end, { group = "final-output-test", id = "output" })
+            remuda.on("session_exited", function(name)
+                if name == "last-before-exit" then
+                    table.insert(remuda._final_output_order, "exit")
+                end
+            end, { group = "final-output-test", id = "exit" })
+        "#,
+    );
+
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::New {
+                name: Some("last-before-exit".into()),
+                command: vec!["sh".into(), "-c".into(), "sleep 0.1; printf BYE".into()],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            },
+        )
+        .expect("start short output session"),
+        Response::Value("last-before-exit".into())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let sessions = match client::request(&path, &Request::List).expect("reap short session") {
+            Response::Sessions(sessions) => sessions,
+            other => panic!("unexpected list response: {other:?}"),
+        };
+        if !sessions
+            .iter()
+            .any(|session| session.name == "last-before-exit")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "short output session did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let order = eval(
+        &path,
+        "return table.concat(remuda._final_output_order, ',')",
+    );
+    let events: Vec<_> = order.split(',').collect();
+    assert_eq!(
+        events.len(),
+        2,
+        "expected one final output and one exit: {order:?}"
+    );
+    assert!(
+        events[0].starts_with("output:"),
+        "final output event came after exit: {order:?}"
+    );
+    let version: u64 = events[0]["output:".len()..]
+        .parse()
+        .expect("final output version");
+    assert!(
+        version > 0,
+        "final output version must include BYE: {order:?}"
+    );
+    assert_eq!(
+        events[1], "exit",
+        "session_exited must follow final output: {order:?}"
+    );
+}
+
 fn listed_session(socket: &Path) -> remuda_core::SessionSummary {
     match client::request(socket, &Request::List).expect("list session") {
         Response::Sessions(sessions) => sessions
@@ -873,6 +1501,269 @@ fn capture_version(socket: &Path) -> u64 {
     }
 }
 
+#[test]
+fn sync_returns_immediately_when_since_is_older_than_current_output() {
+    let runtime = scratch_dir("sync-immediate");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "printf ready; sleep 30");
+    let current = wait_for_quiet_output_version(&socket);
+    assert!(current > 0, "fixture must produce a versioned frame");
+    let started = Instant::now();
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: None,
+            since: current - 1,
+            timeout_ms: 30_000,
+        },
+    )
+    .expect("sync response");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "new output must return immediately"
+    );
+    assert!(matches!(response, Response::Sync { output_version, .. } if output_version == current));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_waits_for_output_and_returns_the_new_snapshot() {
+    let runtime = scratch_dir("sync-output");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let trigger = runtime.join("release-sync-output");
+    let trigger_arg = shell_test_path(&trigger);
+    let script =
+        format!("while [ ! -e {trigger_arg} ]; do sleep 0.02; done; printf after-sync; sleep 30");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, &script);
+    let since = wait_for_quiet_output_version(&socket);
+    let request_socket = socket.clone();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: None,
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response")
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !request.is_finished(),
+        "sync should wait while the version is unchanged"
+    );
+    let triggered_at = Instant::now();
+    std::fs::write(&trigger, b"go").expect("release shell output");
+    let response = request.join().expect("sync worker");
+    assert!(
+        matches!(response, Response::Sync { output_version, snapshot, .. }
+        if output_version > since && snapshot.rows.iter().flatten().any(|run| run.text.contains("after-sync")))
+    );
+    assert!(
+        triggered_at.elapsed() < Duration::from_secs(1),
+        "output notification should wake Sync well before its 5s timeout"
+    );
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_waiter_wakes_when_session_is_resized() {
+    let runtime = scratch_dir("sync-resize");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let since = wait_for_quiet_output_version(&socket);
+    let request_socket = socket.clone();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: None,
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response after resize")
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(matches!(
+        client::request(
+            &socket,
+            &Request::Resize {
+                name: "versioned".into(),
+                size: Size::new(100, 30),
+            },
+        ),
+        Ok(Response::Ok)
+    ));
+    let triggered_at = Instant::now();
+    let response = request.join().expect("sync worker");
+    assert!(matches!(response, Response::Sync { output_version, .. } if output_version > since));
+    assert!(
+        triggered_at.elapsed() < Duration::from_secs(1),
+        "resize notification should wake Sync well before its 5s timeout"
+    );
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_times_out_with_the_current_unchanged_frame() {
+    let runtime = scratch_dir("sync-timeout");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let current = wait_for_quiet_output_version(&socket);
+    let started = Instant::now();
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: None,
+            since: current,
+            timeout_ms: 60,
+        },
+    )
+    .expect("sync timeout response");
+    assert!(started.elapsed() >= Duration::from_millis(40));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(response, Response::Sync { output_version, .. } if output_version == current));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_waiter_wakes_when_child_exits() {
+    let runtime = scratch_dir("sync-child-exit");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let since = wait_for_quiet_output_version(&socket);
+    let request_socket = socket.clone();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: None,
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response after child exit")
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        matches!(
+            client::request(
+                &socket,
+                &Request::Close {
+                    name: "versioned".into(),
+                },
+            ),
+            Ok(Response::Ok)
+        ),
+        "closing the child must succeed while Sync is waiting"
+    );
+    let triggered_at = Instant::now();
+    let response = request.join().expect("sync worker");
+    assert!(
+        triggered_at.elapsed() < Duration::from_secs(1),
+        "child exit must wake the waiter before its Sync timeout"
+    );
+    assert!(matches!(response, Response::Error(message) if message.contains("exited")));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_rechecks_instance_after_close_and_relaunch_during_wait() {
+    let runtime = scratch_dir("sync-relaunch");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let old_instance = listed_session(&socket).instance_id.expect("instance id");
+    let since = wait_for_quiet_output_version(&socket);
+    let request_socket = socket.clone();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: Some(old_instance),
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response after relaunch")
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(matches!(
+        client::request(
+            &socket,
+            &Request::Close {
+                name: "versioned".into(),
+            },
+        ),
+        Ok(Response::Ok)
+    ));
+    start_shell_session(&socket, "sleep 30");
+    let triggered_at = Instant::now();
+    let response = request.join().expect("sync worker");
+    assert_eq!(response, Response::WrongInstance);
+    assert!(
+        triggered_at.elapsed() < Duration::from_secs(1),
+        "post-wait instance check should return promptly"
+    );
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_rejects_a_wrong_instance_without_waiting() {
+    let runtime = scratch_dir("sync-wrong-instance");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let started = Instant::now();
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: Some("old-session-instance".into()),
+            since: 0,
+            timeout_ms: 30_000,
+        },
+    )
+    .expect("wrong-instance response");
+    assert_eq!(response, Response::WrongInstance);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+fn stop_daemon(runtime: &Path, socket: &Path, running: &mut spawn::Daemon) {
+    assert_eq!(
+        socket,
+        daemon::socket_path_in(runtime, "s"),
+        "only stop the private daemon created under this test's scratch runtime"
+    );
+    let _ = client::request(
+        socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    assert!(
+        running.left_on_its_own(),
+        "private daemon should stop cleanly"
+    );
+}
+
 fn wait_for_output_version(socket: &Path, original: u64) {
     let deadline = Instant::now() + PATIENCE;
     while capture_version(socket) <= original {
@@ -883,17 +1774,41 @@ fn wait_for_output_version(socket: &Path, original: u64) {
 
 fn wait_for_quiet_output_version(socket: &Path) -> u64 {
     let deadline = Instant::now() + PATIENCE;
+    let mut version = capture_version(socket);
+    let mut quiet_since = Instant::now();
     loop {
-        let version = capture_version(socket);
         assert!(
             Instant::now() < deadline,
             "output version did not become quiet"
         );
-        std::thread::sleep(Duration::from_millis(100));
-        if capture_version(socket) == version {
+        std::thread::sleep(Duration::from_millis(200));
+        let next = capture_version(socket);
+        if next != version {
+            version = next;
+            quiet_since = Instant::now();
+        } else if quiet_since.elapsed() >= Duration::from_millis(400) {
             return version;
         }
     }
+}
+
+fn shell_test_path(path: &Path) -> String {
+    #[cfg(windows)]
+    let value = {
+        let value = path.to_string_lossy().replace('\\', "/");
+        if let Some((drive, rest)) = value.split_once(':') {
+            format!(
+                "/{}/{}",
+                drive.to_ascii_lowercase(),
+                rest.trim_start_matches('/')
+            )
+        } else {
+            value
+        }
+    };
+    #[cfg(not(windows))]
+    let value = path.to_string_lossy().into_owned();
+    format!("\"{}\"", value.replace('"', "\\\""))
 }
 
 #[test]
@@ -2831,6 +3746,30 @@ fn the_daemon_names_the_build_it_was_started_from() {
         Response::Value(said) => assert_eq!(said, remuda_native::dist::BUILD_VERSION),
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn idle_daemon_version_requests_do_not_wait_for_a_poll_interval() {
+    let dir = scratch_dir("version-latency");
+    let path = daemon::socket_path_in(&dir, "s");
+    let daemon = Daemon::spawn(&dir);
+    let mut samples = Vec::with_capacity(50);
+
+    for _ in 0..50 {
+        let started = Instant::now();
+        match client::request(&path, &Request::Version).expect("version") {
+            Response::Value(said) => assert_eq!(said, remuda_native::dist::BUILD_VERSION),
+            other => panic!("unexpected: {other:?}"),
+        }
+        samples.push(started.elapsed());
+    }
+
+    samples.sort_unstable();
+    let p50 = samples[samples.len() / 2];
+    assert!(p50 < Duration::from_millis(5), "Version p50 was {p50:?}");
+    drop(daemon);
+    std::fs::remove_dir_all(dir).expect("remove isolated runtime directory");
 }
 
 // Unix only: the regression is SIGPIPE, and `true` is not a Windows command.

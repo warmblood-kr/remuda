@@ -2,12 +2,45 @@
 -- v1-v4 remain frozen; v5 remains open until the next tagged release.
 remuda._api_v5_exit_events = {}
 remuda._api_v5_legacy_exit_names = {}
+remuda._api_v5_output_events = {}
+remuda._api_v5_legacy_output_names = {}
 remuda.on("session_exited", function(name, details)
   table.insert(remuda._api_v5_exit_events, { name = name, details = details })
 end)
 remuda.on("session_exited", function(name)
   table.insert(remuda._api_v5_legacy_exit_names, name)
 end)
+remuda.on("session_output", function(name, details)
+  table.insert(remuda._api_v5_output_events, { name = name, details = details })
+end)
+remuda.on("session_output", function(name)
+  table.insert(remuda._api_v5_legacy_output_names, name)
+end)
+
+function remuda._api_v5_output_seen(name)
+  for _, event in ipairs(remuda._api_v5_output_events) do
+    if event.name == name then return true end
+  end
+  return false
+end
+
+function remuda._api_v5_assert_output(name)
+  local event
+  for _, candidate in ipairs(remuda._api_v5_output_events) do
+    if candidate.name == name then event = candidate; break end
+  end
+  assert(event, "session_output did not include " .. name)
+  assert(type(event.name) == "string" and event.name == name,
+    "session_output's first argument must be the session name")
+  assert(type(event.details) == "table", "session_output must provide a details table")
+  assert(type(event.details.version) == "number" and event.details.version > 0,
+    "session_output details.version must be a positive number")
+  local legacy_received_name = false
+  for _, legacy_name in ipairs(remuda._api_v5_legacy_output_names) do
+    if legacy_name == name then legacy_received_name = true; break end
+  end
+  assert(legacy_received_name, "one-argument session_output handlers must receive the name")
+end
 
 function remuda._api_v5_exit_seen(name)
   for _, event in ipairs(remuda._api_v5_exit_events) do
@@ -214,6 +247,9 @@ local bad_timeout = pcall(function()
   remuda.process.run({ argv = echo_argv, timeout = 31 })
 end)
 assert(not bad_timeout, "process.run must reject a timeout above the 30-second hard cap")
+local absent_readiness = remuda._module_readiness("api-v5-no-ready-declaration")
+assert(absent_readiness.status == "ready",
+  "a missing readiness declaration must preserve immediate completion")
 local json = remuda.json
 assert(type(json) == "table", "remuda.json is missing from the v5 surface")
 local decoded, decode_error = json.decode('{"values":[true,null]}')
@@ -224,5 +260,21 @@ assert(duplicate == nil and duplicate_error == "duplicate key", "duplicate JSON 
 local too_deep = string.rep("[", 65) .. "0" .. string.rep("]", 65)
 local limited, limit_error = json.decode(too_deep)
 assert(limited == nil and type(limit_error) == "string", "JSON depth limit must be enforced")
+
+local fs = remuda.fs
+assert(type(fs) == "table", "remuda.fs is missing")
+assert(type(fs.write_atomic) == "function", "remuda.fs.write_atomic is missing")
+local write_path = os.tmpname()
+os.remove(write_path)
+local wrote, write_error = fs.write_atomic(write_path, "first\0record")
+assert(wrote == true and write_error == nil, tostring(write_error))
+wrote, write_error = fs.write_atomic(write_path, "replacement")
+assert(wrote == true and write_error == nil, tostring(write_error))
+local written = assert(io.open(write_path, "rb"))
+assert(written:read("*a") == "replacement", "atomic write must replace an existing file")
+written:close()
+os.remove(write_path)
+local failed, file_error = fs.write_atomic(write_path .. ".missing/child", "unwritable")
+assert(failed == nil and type(file_error) == "string", "write errors must return nil, error")
 
 print("v5 ok")

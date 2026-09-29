@@ -66,6 +66,19 @@ convenient.
 restart a daemon or stop sessions; already-loaded Lua definitions remain live
 until the next daemon restart.
 
+## Atomic file writes
+
+`remuda.fs.write_atomic(path, bytes)` replaces one file from trusted Lua code.
+It writes a unique temporary file beside the target, syncs the bytes, and
+renames the temporary file over the target. Unix also syncs the parent
+directory. The target path is replaced as a directory entry, so a symlink at
+that path is not followed. The parent directory must already exist.
+
+On success the function returns `true, nil`; on an I/O error it returns
+`nil, error`. New files use mode `0644` filtered through the process umask.
+This word does not restrict paths: the Lua runtime already provides trusted
+scripts with `io.open` and `os.rename`.
+
 ## JSON values
 
 `remuda.json.decode(text)` reads at most 8 MiB of UTF-8 JSON and returns
@@ -204,6 +217,35 @@ recreate keeps its advice. Other imperative effects
 (`remuda.schedule`, `remuda.process`, `remuda.new`, and so on) are not owned
 and survive reload; the mod must find and reuse or cancel them itself.
 
+An optional `ready(state)` lets the CLI's `remuda exec NAME` wait for an
+asynchronous start to finish. It returns `true` when ready, `nil` while it is
+still working, or `nil, "message"` when startup failed. A Lua error from the
+callback is also a failure. `timeout_ms` on the same declaration sets the
+readiness deadline; it defaults to 30000 and must be an integer from 1 through
+240000. The CLI checks every 250 ms, issuing a separate short Eval each time.
+Failure exits 1 and prints `mod NAME failed to become ready: message`; timeout
+exits 124 and prints `mod NAME did not become ready within Ns`. Keep the
+callback quick: each Eval still has the daemon's 305-second client deadline.
+Ctrl-C during this wait abandons only the CLI wait; it does not cancel startup
+or deactivate the module. `start` has already run once, and a later
+`remuda exec NAME` resumes checking readiness without running `start` again.
+Mods without `ready` keep today's immediate-success behavior. This is a
+declaration field alongside `start` and `stop`, not another `remuda.*` word:
+
+```lua
+return {
+  api = "remuda-module-v1",
+  state_version = 1,
+  initialize = function() return { connected = false } end,
+  start = function(state) connect_async(state) end,
+  ready = function(state)
+    if state.error then return nil, state.error end
+    return state.connected or nil
+  end,
+  timeout_ms = 45000,
+}
+```
+
 An optional `stop(state)` runs for the old activation before a reload starts
 its replacement, while the old activation still owns its registrations. It
 also runs for each active lifecycle mod during a clean daemon shutdown.
@@ -248,6 +290,13 @@ Four ways to fire an event:
 A hook that raises an error is logged with its group and id, and counted on that hook. It never counts as an answer or a veto.
 
 `remuda.hook_list(event?)` returns copies of `{event, group, id, depth, owner, src, errors, last_error}` in run order. Use it to inspect hooks.
+
+The daemon emits `session_output(name, details)` after terminal output changes.
+`details.version` is the session's output version. Notifications are coalesced
+for up to 50 ms per active session, and a busy Lua image keeps only the latest
+pending wake for each session. `remuda.expect` uses this event to check matching
+sessions promptly; its periodic tick remains the fallback for deadlines and
+sessions whose backend cannot stream output.
 
 `remuda.hooks` is deprecated for reading, and will become read-only once no mod edits it by hand.
 
