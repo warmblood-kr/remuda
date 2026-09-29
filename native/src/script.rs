@@ -20,7 +20,7 @@ use crate::client;
 use mlua::{Lua, Table, Value};
 use remuda_core::keys;
 use remuda_core::protocol::{Request, Response, Step};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 78] = [
+pub const BINDINGS: [&str; 79] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -56,6 +56,7 @@ pub const BINDINGS: [&str; 78] = [
     "attach",
     "buffer",
     "buffers",
+    "caller",
     "cancel",
     "capture",
     "capture_styled",
@@ -112,6 +113,11 @@ pub const BINDINGS: [&str; 78] = [
 /// name, about, signature — one row per Rust-bound word. `tools.lua` adds its
 /// own rows for the words it defines in pure Lua, into the same table.
 const WORDS: &[(&str, &str, &str)] = &[
+    (
+        "caller",
+        "Return the daemon's peer-credential-derived caller session and whether the caller is inside a managed session.",
+        "caller() -> {session: string|nil, inside: boolean}",
+    ),
     (
         "_module_readiness",
         "Internal readiness poll for remuda exec.",
@@ -388,17 +394,29 @@ fn new_request(
     }
 }
 
-pub fn bindings(
+pub(crate) fn bindings(
     lua: &Lua,
     socket: &Path,
     registry: std::sync::Arc<remuda_core::Registry>,
     counters: std::sync::Arc<crate::tick::Counters>,
     image: crate::image::Image,
+    caller: Rc<RefCell<crate::image::CallerContext>>,
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
     fail_binding(lua, &table, image.clone())?;
     pending_bindings(lua, &table, image.pending_replies())?;
+
+    table.set(
+        "caller",
+        lua.create_function(move |lua, ()| {
+            let caller = caller.borrow().clone();
+            let value = lua.create_table()?;
+            value.set("session", caller.session)?;
+            value.set("inside", caller.inside)?;
+            Ok(value)
+        })?,
+    )?;
 
     // In-process, not a loopback: the image always runs inside the same
     // daemon this `Registry` belongs to (image.rs), so asking over the wire

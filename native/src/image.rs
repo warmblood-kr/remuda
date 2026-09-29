@@ -94,6 +94,7 @@ enum JobKind {
         code: String,
         name: Option<String>,
         allow_pending: bool,
+        caller: CallerContext,
     },
     StopModules,
     HttpComplete {
@@ -104,6 +105,13 @@ enum JobKind {
     SessionOutputFlush(SessionOutputNotifier),
     #[cfg(test)]
     StopImage,
+}
+
+/// Kernel-derived origin of one daemon Eval request.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CallerContext {
+    pub session: Option<String>,
+    pub inside: bool,
 }
 
 struct SessionOutputState {
@@ -250,6 +258,7 @@ impl Image {
 
         std::thread::spawn(move || {
             let lua = Lua::new();
+            let caller = Rc::new(RefCell::new(CallerContext::default()));
             // Everything `print` writes during one job, so it can travel back
             // to whoever asked instead of vanishing. `Rc` rather than `Arc`
             // because this never leaves the thread — the whole reason the
@@ -258,19 +267,26 @@ impl Image {
 
             // A failure here means no image at all, so every eval must say so
             // rather than the thread dying quietly and every caller hanging.
-            let ready = script::bindings(&lua, &socket, registry, counters, handle.clone())
-                .and_then(|table| lua.globals().set("remuda", table))
-                // The tool frame is Lua over those bindings, not a second set of
-                // them. It must load *after* the table exists and *before* any
-                // caller, so a `tools/list` on a fresh daemon is already true.
-                .and_then(|()| {
-                    lua.load(include_str!("tools.lua"))
-                        .set_name("@remuda/tools.lua")
-                        .exec()
-                })
-                .and_then(|()| script::hide_module_activator(&lua))
-                .and_then(|()| capture_print(&lua, Rc::clone(&printed)))
-                .map_err(|e| e.to_string());
+            let ready = script::bindings(
+                &lua,
+                &socket,
+                registry,
+                counters,
+                handle.clone(),
+                Rc::clone(&caller),
+            )
+            .and_then(|table| lua.globals().set("remuda", table))
+            // The tool frame is Lua over those bindings, not a second set of
+            // them. It must load *after* the table exists and *before* any
+            // caller, so a `tools/list` on a fresh daemon is already true.
+            .and_then(|()| {
+                lua.load(include_str!("tools.lua"))
+                    .set_name("@remuda/tools.lua")
+                    .exec()
+            })
+            .and_then(|()| script::hide_module_activator(&lua))
+            .and_then(|()| capture_print(&lua, Rc::clone(&printed)))
+            .map_err(|e| e.to_string());
 
             for job in inbox {
                 printed.borrow_mut().clear();
@@ -281,7 +297,9 @@ impl Image {
                             code,
                             name,
                             allow_pending,
+                            caller: request_caller,
                         } => {
+                            *caller.borrow_mut() = request_caller.clone();
                             handle.pending.begin_eval();
                             let answer = eval(&lua, code, name.as_deref()).and_then(|value| {
                                 if handle.pending.pending_id(&value).is_some() {
@@ -294,6 +312,7 @@ impl Image {
                                 .as_ref()
                                 .ok()
                                 .and_then(|value| handle.pending.pending_id(value));
+                            *caller.borrow_mut() = CallerContext::default();
                             if pending_id.is_some() && !*allow_pending {
                                 handle.pending.finish_eval(None);
                                 Err("pending replies may only be returned from a daemon request"
@@ -357,6 +376,7 @@ impl Image {
                     code: code.to_string(),
                     name: name.map(str::to_string),
                     allow_pending: false,
+                    caller: CallerContext::default(),
                 },
                 reply: Some(reply),
             })
@@ -465,7 +485,12 @@ impl Image {
             .map_err(|_| "the image stopped without answering".to_string())?
     }
 
-    pub fn eval_request(&self, code: &str, name: Option<&str>) -> Result<String, String> {
+    pub(crate) fn eval_request(
+        &self,
+        code: &str,
+        name: Option<&str>,
+        caller: CallerContext,
+    ) -> Result<String, String> {
         let (reply, answer) = channel();
         self.jobs
             .send(Job {
@@ -473,6 +498,7 @@ impl Image {
                     code: code.to_string(),
                     name: name.map(str::to_string),
                     allow_pending: true,
+                    caller,
                 },
                 reply: Some(reply),
             })

@@ -12,12 +12,13 @@ Owner approval #206 fixes the first implementation scope: the `remuda.session` t
 
 ### Core Lua surface
 
-The inventory below covers every name in `native/src/script.rs` `BINDINGS` (78 names), including the names added by `native/src/tools.lua`. Purely local Lua functions are implementation details and are outside the public `remuda.*` surface. The public table and registry should eventually be derived from these classifications.
+The inventory below covers every name in `native/src/script.rs` `BINDINGS` (79 names), including the names added by `native/src/tools.lua`. Purely local Lua functions are implementation details and are outside the public `remuda.*` surface. The public table and registry should eventually be derived from these classifications.
 
 | Current name(s) | Class | What it does / proposal |
 |---|---|---|
 | `ls`, `new`, `close` | Primitive | List, create, and end sessions. Promote to `remuda.session.list/new/close`; keep `ls` as a short deprecated alias if the owner values shell-like convenience. |
 | `send`, `insert`, `key`, `click`, `feed` | Primitive | Deliver line, bytes, key, pointer, or timed input steps. Promote to `remuda.input.line/insert/key/click/feed`; `send` remains a deprecated alias for `input.line`. |
+| `caller` | Primitive/query | Return `{session = name|nil, inside = boolean}` from the daemon's socket peer PID and managed-session ancestry; extension commands can use it to gate operator-only actions without trusting forwarded environment values. Missing or unreadable peer identity fails closed as `inside = true, session = nil`. |
 | `capture`, `capture_styled` | Primitive | Read plain or styled terminal content. Promote to `remuda.screen.capture/styled`; styled capture includes cursor and style runs. |
 | `attach` | Primitive | Give a human the terminal connection. Promote to `remuda.session.attach`. |
 | `list_dir`, `mkdir`, `remove_dir_all`, `fs.write_atomic` | Primitive | List, create, remove filesystem directories, and atomically replace a file. Promote to `remuda.fs.list_dir/mkdir/remove_tree/write_atomic`; retain `remove_dir_all` alias to preserve its explicit destructive meaning. |

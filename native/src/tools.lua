@@ -42,8 +42,9 @@ function remuda.extension_command(name, handler)
   remuda._extension_commands[name] = handler
   extension_command_owners[name] = current_owner
 end
--- `caller` is what the CLI knows and the daemon does not: `caller.env` holds
--- the caller's `REMUDA_*` variables (`os.getenv` here reads the daemon's).
+-- The handler's `caller.env` holds forwarded CLI environment values and must
+-- not be used for authorization. `remuda.caller()` reports daemon-derived
+-- session ancestry for operator-versus-agent decisions.
 function remuda._dispatch_extension_command(name, args, caller)
   local handler = remuda._extension_commands[name]
   if not handler then

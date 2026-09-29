@@ -1207,7 +1207,10 @@ fn handle_request(
         Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
         Request::RemoveDirAll { path: dir } => reply(&stream, &remove_dir_all(&dir)),
 
-        Request::Eval { code, name } => handle_eval(stream, reader, image, &code, name.as_deref()),
+        Request::Eval { code, name } => {
+            let caller = caller_context(&stream, registry);
+            handle_eval(stream, reader, image, &code, name.as_deref(), caller)
+        }
     }
 }
 
@@ -1217,8 +1220,9 @@ fn handle_eval(
     image: &Image,
     code: &str,
     name: Option<&str>,
+    caller: crate::image::CallerContext,
 ) -> std::io::Result<()> {
-    match image.eval_request(code, name) {
+    match image.eval_request(code, name, caller) {
         Ok(value) => match image.pending_replies().pending_id(&value) {
             Some(id) => deferred_reply(stream, reader, image, id),
             None if value.len() > crate::reply_limit::MAX_REPLY_BYTES => reply(
@@ -1234,6 +1238,35 @@ fn handle_eval(
         // Lua's own message, which already carries the line and a traceback —
         // the same treatment `remuda run` gives a script file.
         Err(error) => reply(&stream, &Response::error(error)),
+    }
+}
+
+fn caller_context(stream: &Stream, registry: &Registry) -> crate::image::CallerContext {
+    let peer_pid = match process_ancestry::peer_pid(stream) {
+        Ok(Some(pid)) => pid,
+        Ok(None) | Err(_) => {
+            return crate::image::CallerContext {
+                session: None,
+                inside: true,
+            };
+        }
+    };
+    let mut unreadable = false;
+    for (name, session_pid) in registry.live_processes() {
+        match process_ancestry::is_self_or_descendant(peer_pid, &[session_pid]) {
+            process_ancestry::Ancestry::Inside => {
+                return crate::image::CallerContext {
+                    session: Some(name),
+                    inside: true,
+                };
+            }
+            process_ancestry::Ancestry::Outside => {}
+            process_ancestry::Ancestry::Unreadable { .. } => unreadable = true,
+        }
+    }
+    crate::image::CallerContext {
+        session: None,
+        inside: unreadable,
     }
 }
 

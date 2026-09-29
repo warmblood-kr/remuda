@@ -150,11 +150,23 @@ impl Registry {
     }
 
     /// Process IDs for the live session children. Exited sessions remain
-    /// listed, but cannot be parents of an active shutdown requester.
+    /// listed, but cannot identify an active caller.
     pub fn live_process_ids(&self) -> Vec<u32> {
+        self.live_processes()
+            .into_iter()
+            .map(|(_, pid)| pid)
+            .collect()
+    }
+
+    /// Names paired with the process IDs used to identify session ancestry.
+    pub fn live_processes(&self) -> Vec<(String, u32)> {
         self.lock()
             .values()
-            .filter_map(|session| session.process_id_if_alive())
+            .filter_map(|session| {
+                session
+                    .process_id_if_alive()
+                    .map(|pid| (session.name().to_string(), pid))
+            })
             .collect()
     }
 
