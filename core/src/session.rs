@@ -4,8 +4,8 @@
 //! attachment at a time.
 
 use crate::agent::{
-    AgentError, AgentProcess, Cursor, ExitInfo, MouseState, Result, ScreenSnapshot, Size,
-    StyledCell, VersionedSnapshot,
+    AgentError, AgentProcess, Cursor, ExitInfo, MouseState, OutputWakeup, Result, ScreenSnapshot,
+    Size, StyledCell, VersionedSnapshot,
 };
 use crate::clock::Clock;
 use crate::input::{InputBatch, InputDeduplicator, InputError, InputOutcome, InputRateLimiter};
@@ -106,7 +106,26 @@ impl Session {
         let started = clock.now();
         let last_output_at = Arc::new(Mutex::new(started));
         let output_changed = Arc::new((Mutex::new(0_u64), Condvar::new()));
-        if let Some(output) = agent.subscribe() {
+        if let Some(output) = agent.subscribe_output_wakeup() {
+            let last_output_at = Arc::clone(&last_output_at);
+            let output_changed = Arc::clone(&output_changed);
+            let clock = Arc::clone(&clock);
+            std::thread::spawn(move || {
+                while output.recv().is_ok() {
+                    output.version_after_wake();
+                    if let Ok(mut at) = last_output_at.lock() {
+                        *at = clock.now();
+                    }
+                    if let Ok(mut generation) = output_changed.0.lock() {
+                        *generation = (*generation).wrapping_add(1);
+                        output_changed.1.notify_all();
+                    }
+                }
+                // EOF means the child exited or its output stream was closed.
+                // Wake Sync waiters so they can observe the final screen now.
+                Self::notify_output_changed(&output_changed);
+            });
+        } else if let Some(output) = agent.subscribe() {
             let last_output_at = Arc::clone(&last_output_at);
             let output_changed = Arc::clone(&output_changed);
             let clock = Arc::clone(&clock);
@@ -164,6 +183,16 @@ impl Session {
             .lock()
             .ok()
             .and_then(|mut agent| agent.output_version())
+    }
+
+    /// Subscribe to the agent's output stream, when this backend supports it.
+    pub fn subscribe(&self) -> Option<Receiver<Vec<u8>>> {
+        self.agent.lock().ok()?.subscribe()
+    }
+
+    /// Subscribe to coalesced output-version changes without copying PTY data.
+    pub fn subscribe_output_wakeup(&self) -> Option<OutputWakeup> {
+        self.agent.lock().ok()?.subscribe_output_wakeup()
     }
 
     /// The current terminal size.

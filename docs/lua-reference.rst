@@ -36,6 +36,11 @@ _function_source
 
 ``_function_source(fn) -> string`` — Where a Lua function was defined, as `source:line`; internal, for `hook_list`, since scripts get no `debug` library.
 
+_module_readiness
+-----------------
+
+``_module_readiness(name) -> {status, timeout_ms?, message?}`` — Internal readiness poll for remuda exec.
+
 _pending_create
 ---------------
 

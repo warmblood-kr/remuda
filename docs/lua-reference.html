@@ -13,6 +13,8 @@
 <p><code>table</code> — Handlers registered for installed mod commands.</p>
 <h2 id="function_source">_function_source</h2>
 <p><code>_function_source(fn) -&gt; string</code> — Where a Lua function was defined, as <span class="title-ref">source:line</span>; internal, for <span class="title-ref">hook_list</span>, since scripts get no <span class="title-ref">debug</span> library.</p>
+<h2 id="module_readiness">_module_readiness</h2>
+<p><code>_module_readiness(name) -&gt; {status, timeout_ms?, message?}</code> — Internal readiness poll for remuda exec.</p>
 <h2 id="pending_create">_pending_create</h2>
 <p><code>_pending_create(timeout?) -&gt; id, handle</code> — Create a private pending reply handle.</p>
 <h2 id="pending_events">_pending_events</h2>

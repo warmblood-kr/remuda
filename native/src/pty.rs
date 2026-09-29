@@ -21,7 +21,8 @@
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use remuda_core::agent::{
     AgentError, AgentProcess, AgentWriter, Color, Cursor, ExitInfo, MouseEncoding, MouseMode,
-    MouseState, Result, ScreenSnapshot, Size, StyledCell, VersionedSnapshot,
+    MouseState, OutputSignal, OutputWakeup, Result, ScreenSnapshot, Size, StyledCell,
+    VersionedSnapshot,
 };
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -31,7 +32,12 @@ use std::time::{Duration, Instant};
 
 /// Live viewers of one pty's output. Shared with the reader thread, which is
 /// the only producer; every consumer holds the other end of a channel.
-type Watchers = Arc<Mutex<Vec<Sender<Vec<u8>>>>>;
+enum Watcher {
+    Bytes(Sender<Vec<u8>>),
+    Wake(OutputSignal),
+}
+
+type Watchers = Arc<Mutex<Vec<Watcher>>>;
 
 /// The pty's input end. Shared, because the reader thread must answer the
 /// terminal's own questions — see [`DSR_CURSOR`].
@@ -245,6 +251,7 @@ pub struct PtyAgent {
     input_writer: Arc<PtyInputWriter>,
     child: Box<dyn Child + Send + Sync>,
     watchers: Watchers,
+    reader_closed: Arc<AtomicBool>,
     scrollback_total: Arc<AtomicUsize>,
     output_version: Arc<AtomicU64>,
     exit_info: Option<ExitInfo>,
@@ -281,12 +288,14 @@ impl PtyAgent {
             SCROLLBACK_ROWS,
         )));
         let watchers: Watchers = Arc::new(Mutex::new(Vec::new()));
+        let reader_closed = Arc::new(AtomicBool::new(false));
         let scrollback_total = Arc::new(AtomicUsize::new(0));
         let output_version = Arc::new(AtomicU64::new(0));
         spawn_reader(
             reader,
             Arc::clone(&screen),
             Arc::clone(&watchers),
+            Arc::clone(&reader_closed),
             Arc::clone(&writer),
             Arc::clone(&scrollback_total),
             Arc::clone(&output_version),
@@ -298,6 +307,7 @@ impl PtyAgent {
             input_writer,
             child,
             watchers,
+            reader_closed,
             scrollback_total,
             output_version,
             exit_info: None,
@@ -313,6 +323,7 @@ fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     screen: Arc<Mutex<vt100::Parser>>,
     watchers: Watchers,
+    reader_closed: Arc<AtomicBool>,
     writer: SharedWriter,
     scrollback_total: Arc<AtomicUsize>,
     output_version: Arc<AtomicU64>,
@@ -337,13 +348,19 @@ fn spawn_reader(
                 answer_cursor_query(&writer, at);
             }
             if let Ok(mut watchers) = watchers.lock() {
-                watchers.retain(|w| w.send(buf[..n].to_vec()).is_ok());
+                watchers.retain(|watcher| match watcher {
+                    Watcher::Bytes(sender) => sender.send(buf[..n].to_vec()).is_ok(),
+                    Watcher::Wake(signal) => signal.wake(),
+                });
             }
         }
         // EOF: drop every sender so each attached viewer's recv() ends instead
         // of blocking forever on a process that is gone.
         if let Ok(mut watchers) = watchers.lock() {
             watchers.clear();
+            reader_closed.store(true, Ordering::Release);
+        } else {
+            reader_closed.store(true, Ordering::Release);
         }
     });
 }
@@ -545,8 +562,20 @@ impl AgentProcess for PtyAgent {
 
     fn subscribe(&mut self) -> Option<Receiver<Vec<u8>>> {
         let (tx, rx) = channel();
-        self.watchers.lock().ok()?.push(tx);
+        let mut watchers = self.watchers.lock().ok()?;
+        if !self.reader_closed.load(Ordering::Acquire) {
+            watchers.push(Watcher::Bytes(tx));
+        }
         Some(rx)
+    }
+
+    fn subscribe_output_wakeup(&mut self) -> Option<OutputWakeup> {
+        let (signal, wakeup) = OutputWakeup::pair(Arc::clone(&self.output_version));
+        let mut watchers = self.watchers.lock().ok()?;
+        if !self.reader_closed.load(Ordering::Acquire) {
+            watchers.push(Watcher::Wake(signal));
+        }
+        Some(wakeup)
     }
 
     fn cursor(&mut self) -> Result<Cursor> {
@@ -592,6 +621,10 @@ impl AgentProcess for PtyAgent {
         self.child.kill().map_err(io)?;
         let status = self.child.wait().map_err(io)?;
         self.record_exit_status(status);
+        // ConPTY can keep the output reader alive after the child exits until
+        // ClosePseudoConsole runs. Close the master here so output monitors
+        // can flush before the caller waits for their final notification.
+        self.master.take();
         Ok(())
     }
 
