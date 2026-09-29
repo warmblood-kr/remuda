@@ -330,10 +330,11 @@ impl Registry {
                 "session restarted; close was refused".into(),
             )));
         }
-        Some(
-            session
-                .terminate()
-                .map(|()| sessions.remove(name).is_some()),
-        )
+        session.mark_closing();
+        if let Err(error) = session.terminate() {
+            session.clear_closing();
+            return Some(Err(error));
+        }
+        Some(Ok(sessions.remove(name).is_some()))
     }
 }
