@@ -86,7 +86,8 @@ pub struct ClusterUi {
     remote_expanded: HashSet<String>,
     remote_selected: Option<RemoteSelection>,
     remote_active: Option<RemoteSelection>,
-    remote_composer_target: Option<(String, String, String)>,
+    // (registry fingerprint, display label, session name, instance id)
+    remote_composer_target: Option<(String, String, String, String)>,
     remote_input_enabled: bool,
     remote_control_disabled: HashSet<String>,
 }
@@ -167,12 +168,12 @@ impl ClusterUi {
         let active = self.remote_active.clone();
         self.remote_snapshot = source.snapshot();
         self.remote_selected = selected.and_then(|selection| match selection {
-            RemoteSelection::Node(name) => self
+            RemoteSelection::Node(registry_key) => self
                 .remote_snapshot
                 .nodes
                 .iter()
-                .any(|node| node.name == name)
-                .then_some(RemoteSelection::Node(name)),
+                .any(|node| node.registry_key == registry_key)
+                .then_some(RemoteSelection::Node(registry_key)),
             RemoteSelection::Session {
                 node,
                 name,
@@ -188,7 +189,7 @@ impl ClusterUi {
                     .remote_snapshot
                     .nodes
                     .iter()
-                    .any(|snapshot| snapshot.name == node)
+                    .any(|snapshot| snapshot.registry_key == node)
                 {
                     Some(RemoteSelection::Node(node))
                 } else {
@@ -210,7 +211,7 @@ impl ClusterUi {
         self.remote_snapshot
             .nodes
             .iter()
-            .find(|snapshot| snapshot.name == node)
+            .find(|snapshot| snapshot.registry_key == node)
             .is_some_and(|snapshot| {
                 snapshot
                     .sessions
@@ -235,7 +236,7 @@ impl ClusterUi {
             .remote_snapshot
             .nodes
             .iter()
-            .find(|snapshot| &snapshot.name == node)?;
+            .find(|snapshot| &snapshot.registry_key == node)?;
         let session = snapshot
             .sessions
             .iter()
@@ -305,11 +306,11 @@ impl ClusterUi {
             if !node_visible {
                 continue;
             }
-            rows.push(TreeSelection::RemoteNode(node.name.clone()));
-            if self.remote_expanded.contains(&node.name) {
+            rows.push(TreeSelection::RemoteNode(node.registry_key.clone()));
+            if self.remote_expanded.contains(&node.registry_key) {
                 rows.extend(visible_sessions.into_iter().map(|session| {
                     TreeSelection::RemoteSession {
-                        node: node.name.clone(),
+                        node: node.registry_key.clone(),
                         name: session.name.clone(),
                         instance_id: session.instance_id.clone(),
                     }
@@ -588,9 +589,9 @@ impl ClusterUi {
             {
                 continue;
             }
-            let is_expanded = self.remote_expanded.contains(&node.name);
+            let is_expanded = self.remote_expanded.contains(&node.registry_key);
             let is_selected =
-                self.remote_selected == Some(RemoteSelection::Node(node.name.clone()));
+                self.remote_selected == Some(RemoteSelection::Node(node.registry_key.clone()));
             frame.push(format!(
                 "{}{} {} · {}",
                 if is_selected { ">" } else { " " },
@@ -602,7 +603,7 @@ impl ClusterUi {
                 for session in visible_sessions {
                     let is_selected = self.remote_selected
                         == Some(RemoteSelection::Session {
-                            node: node.name.clone(),
+                            node: node.registry_key.clone(),
                             name: session.name.clone(),
                             instance_id: session.instance_id.clone(),
                         });
@@ -786,7 +787,18 @@ impl ClusterUi {
                     instance_id: instance_id.clone(),
                 });
                 self.composer_focused = can_send;
-                self.set_remote_composer_target(can_send.then_some((node, name, instance_id)), now);
+                let display_label = self
+                    .remote_session(&RemoteSelection::Session {
+                        node: node.clone(),
+                        name: name.clone(),
+                        instance_id: instance_id.clone(),
+                    })
+                    .map(|(snapshot, _)| snapshot.name.clone())
+                    .unwrap_or_else(|| node.clone());
+                self.set_remote_composer_target(
+                    can_send.then_some((node, display_label, name, instance_id)),
+                    now,
+                );
             }
             TreeSelection::LocalSession(selected) => {
                 if self
@@ -832,18 +844,18 @@ impl ClusterUi {
 
     fn set_remote_composer_target(
         &mut self,
-        target: Option<(String, String, String)>,
+        target: Option<(String, String, String, String)>,
         now: Duration,
     ) -> bool {
         if self.remote_composer_target == target {
             return false;
         }
-        let discarded = if let Some((node, name, _)) = &self.remote_composer_target {
+        let discarded = if let Some((_, node_label, name, _)) = &self.remote_composer_target {
             if self.composer.text().is_empty() {
                 false
             } else {
                 self.composer.clear();
-                self.notice = Some((format!("draft for {node}/{name} discarded"), now));
+                self.notice = Some((format!("draft for {node_label}/{name} discarded"), now));
                 true
             }
         } else {
@@ -905,23 +917,24 @@ impl ClusterUi {
     }
 
     fn enqueue_remote_draft(&mut self, bytes: Vec<u8>, now: Duration) {
-        let Some((node, name, instance_id)) = self.remote_composer_target.clone() else {
+        let Some((node_key, node_label, name, instance_id)) = self.remote_composer_target.clone()
+        else {
             return;
         };
-        if self.remote_control_disabled.contains(&node) {
+        if self.remote_control_disabled.contains(&node_key) {
             self.restore_draft(&bytes);
-            self.notice = Some((format!("remote control disabled on {node}"), now));
+            self.notice = Some((format!("remote control disabled on {node_label}"), now));
             return;
         }
         let selection = RemoteSelection::Session {
-            node: node.clone(),
+            node: node_key.clone(),
             name: name.clone(),
             instance_id: instance_id.clone(),
         };
         let Some((_, session)) = self.remote_session(&selection) else {
             self.restore_draft(&bytes);
             self.notice = Some((
-                format!("remote input unavailable: {node}/{name} is no longer listed"),
+                format!("remote input unavailable: {node_label}/{name} is no longer listed"),
                 now,
             ));
             return;
@@ -930,14 +943,14 @@ impl ClusterUi {
         if !session.alive {
             self.restore_draft(&bytes);
             self.notice = Some((
-                format!("remote input disabled: {node}/{name} has ended"),
+                format!("remote input disabled: {node_label}/{name} has ended"),
                 now,
             ));
             return;
         }
         match self.input_sender.enqueue_remote(
             &mut self.input_queue,
-            &node,
+            &node_key,
             &wire_name,
             &instance_id,
             bytes.clone(),
@@ -1019,7 +1032,14 @@ impl ClusterUi {
             }
             Some(QueueEvent::RemoteControlDisabled { node, .. }) => {
                 self.remote_control_disabled.insert(node.clone());
-                self.notice = Some((format!("remote control disabled on {node}"), now));
+                let label = self
+                    .remote_snapshot
+                    .nodes
+                    .iter()
+                    .find(|snapshot| snapshot.registry_key == node)
+                    .map(|snapshot| snapshot.name.as_str())
+                    .unwrap_or(&node);
+                self.notice = Some((format!("remote control disabled on {label}"), now));
             }
             Some(QueueEvent::RetryScheduled { .. }) | None => {}
         }
@@ -1121,7 +1141,7 @@ impl ClusterUi {
         self.input_queue
             .items()
             .filter(|batch| {
-                batch.remote_node.as_deref() == Some(node.name.as_str())
+                batch.remote_node.as_deref() == Some(node.registry_key.as_str())
                     && batch.name == session.wire_name
                     && batch.instance_id == session.instance_id
                     && matches!(batch.state, QueueState::Waiting | QueueState::Sending)
@@ -1145,7 +1165,9 @@ impl ClusterUi {
             || {
                 self.remote_composer_target
                     .as_ref()
-                    .map_or_else(String::new, |(node, name, _)| format!("{node}/{name}> "))
+                    .map_or_else(String::new, |(_, node_label, name, _)| {
+                        format!("{node_label}/{name}> ")
+                    })
             },
             |(name, _)| format!("{name}> "),
         );
@@ -1158,12 +1180,30 @@ impl ClusterUi {
             return Err(io::Error::other("target must be node/session"));
         };
         if node != self.node {
-            let remote = self
+            let exact = self
                 .remote_snapshot
                 .nodes
                 .iter()
-                .find(|snapshot| snapshot.name == node)
-                .ok_or_else(|| io::Error::other(format!("node {node} was not found")))?;
+                .find(|snapshot| snapshot.registry_key == node);
+            let remote = if let Some(exact) = exact {
+                exact
+            } else {
+                let mut matches = self
+                    .remote_snapshot
+                    .nodes
+                    .iter()
+                    .filter(|snapshot| snapshot.name == node);
+                let remote = matches
+                    .next()
+                    .ok_or_else(|| io::Error::other(format!("node {node} was not found")))?;
+                if matches.next().is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("node label {node} is ambiguous; use the fingerprint"),
+                    ));
+                }
+                remote
+            };
             let session = remote
                 .sessions
                 .iter()
@@ -1172,11 +1212,11 @@ impl ClusterUi {
                     io::Error::other(format!("session {session} was not found on {node}"))
                 })?;
             let selection = RemoteSelection::Session {
-                node: node.into(),
+                node: remote.registry_key.clone(),
                 name: session.name.clone(),
                 instance_id: session.instance_id.clone(),
             };
-            self.remote_expanded.insert(node.into());
+            self.remote_expanded.insert(remote.registry_key.clone());
             self.remote_selected = Some(selection.clone());
             self.remote_active = Some(selection);
             return Ok(());
@@ -1491,7 +1531,18 @@ fn run_loop(
             instance_id,
         }) = ui.remote_active.clone()
         {
-            ui.set_remote_composer_target(Some((node, name, instance_id)), clock.now());
+            let display_label = ui
+                .remote_session(&RemoteSelection::Session {
+                    node: node.clone(),
+                    name: name.clone(),
+                    instance_id: instance_id.clone(),
+                })
+                .map(|(snapshot, _)| snapshot.name.clone())
+                .unwrap_or_else(|| node.clone());
+            ui.set_remote_composer_target(
+                Some((node, display_label, name, instance_id)),
+                clock.now(),
+            );
             ui.composer_focused = true;
         }
     }
@@ -1569,6 +1620,7 @@ fn select_target_with_remote_wait(
     };
     match ui.select_target(Some(target)) {
         Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::InvalidInput => Err(error),
         Err(error) if node != ui.node => {
             let deadline = Instant::now() + timeout;
             while Instant::now() < deadline {
@@ -1670,6 +1722,7 @@ mod tests {
     ) -> RemoteSnapshot {
         RemoteSnapshot {
             nodes: vec![RemoteNodeSnapshot {
+                registry_key: "fp-laptop".into(),
                 name: "laptop".into(),
                 state,
                 last_sync_age: Some(age),
@@ -2008,6 +2061,23 @@ mod tests {
     }
 
     #[test]
+    fn user_target_with_an_ambiguous_remote_label_is_refused() {
+        let mut ui = ClusterUi::new("studio", Vec::new(), Duration::ZERO);
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("ready")),
+        );
+        let mut colliding = snapshot.nodes[0].clone();
+        colliding.registry_key = "fp-other".into();
+        snapshot.nodes.push(colliding);
+        ui.remote_snapshot = snapshot;
+
+        let error = ui.select_target(Some("laptop/build")).unwrap_err();
+        assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
     fn unreachable_remote_label_explains_missing_registry_address() {
         assert_eq!(
             remote_state_label(
@@ -2020,7 +2090,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_composer_sends_a_chunk_through_the_remote_input_transport() {
+    fn fingerprint_target_sends_input_when_remote_labels_collide() {
         let clock = ManualClock::new();
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
         let mut snapshot = remote_snapshot(
@@ -2028,15 +2098,14 @@ mod tests {
             Duration::ZERO,
             Some(remote_screen("remote")),
         );
+        let mut colliding = snapshot.nodes[0].clone();
+        colliding.registry_key = "fp-other".into();
+        colliding.sessions[0].instance_id = "other-instance".into();
+        snapshot.nodes.push(colliding);
         snapshot.nodes[0].sessions[0].wire_name = "wire-build".into();
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
         ui.remote_input_enabled = true;
-        ui.remote_expanded.insert("laptop".into());
-        ui.remote_selected = Some(RemoteSelection::Session {
-            node: "laptop".into(),
-            name: "build".into(),
-            instance_id: "remote-instance".into(),
-        });
+        ui.select_target(Some("fp-laptop/build")).unwrap();
         ui.enter_selected(clock.now());
         assert!(ui.composer_focused);
         ui.enqueue_remote_draft(b"echo hi\r".to_vec(), clock.now());
@@ -2051,7 +2120,7 @@ mod tests {
 
         let sent = transport.requests.lock().unwrap();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].0, "laptop");
+        assert_eq!(sent[0].0, "fp-laptop");
         assert!(matches!(
             &sent[0].1,
             Request::Input { name, instance_id, bytes, .. }
@@ -2080,9 +2149,9 @@ mod tests {
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
         ui.remote_input_enabled = true;
-        ui.remote_expanded.insert("laptop".into());
+        ui.remote_expanded.insert("fp-laptop".into());
         ui.remote_selected = Some(RemoteSelection::Session {
-            node: "laptop".into(),
+            node: "fp-laptop".into(),
             name: "build".into(),
             instance_id: "remote-instance".into(),
         });
@@ -2099,7 +2168,7 @@ mod tests {
         assert_eq!(ui.composer.text(), "dr");
 
         ui.set_tree_selection(super::TreeSelection::RemoteSession {
-            node: "laptop".into(),
+            node: "fp-laptop".into(),
             name: "shell".into(),
             instance_id: "shell-instance".into(),
         });
@@ -2111,7 +2180,7 @@ mod tests {
             Some("draft for laptop/build discarded")
         );
         assert_eq!(ui.input_queue.items().count(), 0);
-        assert_eq!(ui.remote_composer_target.as_ref().unwrap().1, "shell");
+        assert_eq!(ui.remote_composer_target.as_ref().unwrap().2, "shell");
     }
 
     #[test]
@@ -2125,9 +2194,9 @@ mod tests {
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
         ui.remote_synced(&source);
         ui.remote_input_enabled = true;
-        ui.remote_expanded.insert("laptop".into());
+        ui.remote_expanded.insert("fp-laptop".into());
         ui.remote_selected = Some(RemoteSelection::Session {
-            node: "laptop".into(),
+            node: "fp-laptop".into(),
             name: "build".into(),
             instance_id: "remote-instance".into(),
         });
@@ -2173,11 +2242,11 @@ mod tests {
         let source = FakeRemoteSource(Mutex::new(snapshot));
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
         ui.remote_synced(&source);
-        ui.remote_expanded.insert("laptop".into());
+        ui.remote_expanded.insert("fp-laptop".into());
         ui.input_sender
             .enqueue_remote(
                 &mut ui.input_queue,
-                "laptop",
+                "fp-laptop",
                 "wire-build",
                 "remote-instance",
                 b"queued\r".to_vec(),
@@ -2211,9 +2280,9 @@ mod tests {
             Some(remote_screen("remote")),
         ))));
         ui.remote_input_enabled = true;
-        ui.remote_expanded.insert("laptop".into());
+        ui.remote_expanded.insert("fp-laptop".into());
         ui.remote_selected = Some(RemoteSelection::Session {
-            node: "laptop".into(),
+            node: "fp-laptop".into(),
             name: "build".into(),
             instance_id: "remote-instance".into(),
         });

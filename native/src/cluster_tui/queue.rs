@@ -23,7 +23,7 @@ pub struct PendingBatch {
     pub status: String,
     retry_at: Instant,
     io_retries: u8,
-    rate_retries: u32,
+    rate_retries: u8,
 }
 
 pub struct InputTarget {
@@ -54,6 +54,8 @@ pub enum QueueEvent {
 }
 
 pub const MAX_IO_RETRIES: u8 = 3;
+pub const MAX_RATE_LIMIT_RETRIES: u8 = 3;
+pub const MAX_QUEUED_BATCHES: usize = 128;
 
 #[derive(Default)]
 pub struct InputQueue {
@@ -69,7 +71,7 @@ impl InputQueue {
         seq: u64,
         bytes: Vec<u8>,
         now: Instant,
-    ) {
+    ) -> bool {
         self.enqueue_target(
             InputTarget {
                 remote_node: None,
@@ -80,7 +82,7 @@ impl InputQueue {
             seq,
             bytes,
             now,
-        );
+        )
     }
 
     pub fn enqueue_target(
@@ -90,7 +92,10 @@ impl InputQueue {
         seq: u64,
         bytes: Vec<u8>,
         now: Instant,
-    ) {
+    ) -> bool {
+        if !self.can_enqueue(1) {
+            return false;
+        }
         self.batches.push_back(PendingBatch {
             remote_node: target.remote_node,
             name: target.name,
@@ -104,6 +109,11 @@ impl InputQueue {
             io_retries: 0,
             rate_retries: 0,
         });
+        true
+    }
+
+    pub fn can_enqueue(&self, count: usize) -> bool {
+        self.batches.len().saturating_add(count) <= MAX_QUEUED_BATCHES
     }
 
     pub fn items(&self) -> impl DoubleEndedIterator<Item = &PendingBatch> {
@@ -210,8 +220,17 @@ impl InputQueue {
                     })
                 }
                 SendOutcome::RateLimited => {
-                    batch.rate_retries = batch.rate_retries.saturating_add(1);
-                    schedule_retry(batch, now, "rate limited; retrying")
+                    if batch.rate_retries < MAX_RATE_LIMIT_RETRIES {
+                        batch.rate_retries += 1;
+                        schedule_retry(batch, now, "rate limited; retrying")
+                    } else {
+                        let reason = format!(
+                            "rate limited after {MAX_RATE_LIMIT_RETRIES} retries; input failed"
+                        );
+                        batch.state = QueueState::Failed;
+                        batch.status = reason.clone();
+                        Some(QueueEvent::Failed { seq, reason })
+                    }
                 }
                 SendOutcome::RemoteControlDisabled => {
                     batch.state = QueueState::Failed;
@@ -266,7 +285,7 @@ impl InputQueue {
 }
 
 fn schedule_retry(batch: &mut PendingBatch, now: Instant, status: &str) -> Option<QueueEvent> {
-    let retry_count = batch.io_retries as u32 + batch.rate_retries;
+    let retry_count = batch.io_retries as u32 + u32::from(batch.rate_retries);
     batch.retry_at = now + retry_delay(retry_count);
     batch.state = QueueState::Waiting;
     batch.status = status.into();
@@ -288,7 +307,7 @@ fn mark_uncertain(batch: &mut PendingBatch, reason: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputQueue, QueueState, SendOutcome};
+    use super::{InputQueue, QueueState, SendOutcome, MAX_QUEUED_BATCHES, MAX_RATE_LIMIT_RETRIES};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -327,6 +346,51 @@ mod tests {
         assert!(matches!(retry, super::QueueEvent::RetryScheduled { .. }));
         assert!(queue.begin_due(now + Duration::from_millis(1)).is_none());
         assert!(queue.begin_due(now + Duration::from_secs(1)).is_some());
+    }
+
+    #[test]
+    fn rate_limited_batches_fail_after_the_retry_budget() {
+        let mut queue = InputQueue::default();
+        let mut now = Instant::now();
+        queue.enqueue(
+            "dev".into(),
+            "instance-a".into(),
+            "client".into(),
+            1,
+            b"hi\r".to_vec(),
+            now,
+        );
+
+        for retry in 0..=MAX_RATE_LIMIT_RETRIES {
+            assert!(queue.begin_due(now).is_some());
+            let event = queue.finish(1, SendOutcome::RateLimited, now).unwrap();
+            if retry < MAX_RATE_LIMIT_RETRIES {
+                let super::QueueEvent::RetryScheduled { retry_at, .. } = event else {
+                    panic!("expected retry {retry} to be scheduled, got {event:?}");
+                };
+                now = retry_at;
+            } else {
+                assert!(matches!(event, super::QueueEvent::Failed { seq: 1, .. }));
+            }
+        }
+        assert_eq!(queue.items().next().unwrap().state, QueueState::Failed);
+    }
+
+    #[test]
+    fn queue_rejects_batches_after_the_global_limit() {
+        let now = Instant::now();
+        let mut queue = InputQueue::default();
+        for seq in 1..=MAX_QUEUED_BATCHES + 1 {
+            queue.enqueue(
+                "dev".into(),
+                "instance-a".into(),
+                "client".into(),
+                seq as u64,
+                vec![seq as u8],
+                now,
+            );
+        }
+        assert_eq!(queue.items().count(), MAX_QUEUED_BATCHES);
     }
 
     #[test]
