@@ -312,6 +312,103 @@ fn sigusr1_on_the_owned_socket_is_silent() {
 
 #[cfg(unix)]
 #[test]
+fn sigusr1_with_a_queued_old_listener_client_does_not_strand_shutdown() {
+    use interprocess::local_socket::traits::Stream as _;
+
+    let dir = scratch_dir("daemon-sigusr1-queued");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    let pid = daemon.0.id() as libc::pid_t;
+
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0, "stop daemon");
+    let mut stopped_status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut stopped_status, libc::WUNTRACED) },
+        pid,
+        "wait until daemon is stopped"
+    );
+    assert!(libc::WIFSTOPPED(stopped_status), "daemon reached SIGSTOP");
+
+    let mut queued = ipc::connect(&socket).expect("queue a client on the old listener");
+    let mut request = serde_json::to_vec(&Request::Version).expect("serialize version request");
+    request.push(b'\n');
+    queued.write_all(&request).expect("write queued request");
+    queued
+        .set_nonblocking(true)
+        .expect("make queued client nonblocking");
+    std::fs::remove_file(&socket).expect("remove old listener path");
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGUSR1) },
+        0,
+        "send rebind signal"
+    );
+    assert_eq!(
+        unsafe { libc::kill(pid, libc::SIGCONT) },
+        0,
+        "resume daemon"
+    );
+
+    let rebind_deadline = Instant::now() + Duration::from_secs(2);
+    while std::fs::symlink_metadata(&socket).is_err() {
+        assert!(Instant::now() < rebind_deadline, "socket was not rebound");
+        std::thread::yield_now();
+    }
+
+    let signalled_at = Instant::now();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0, "send SIGTERM");
+    let exit_deadline = signalled_at + Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = daemon.0.try_wait().expect("poll daemon exit") {
+            break status;
+        }
+        assert!(
+            Instant::now() < exit_deadline,
+            "SIGTERM was stranded behind stale listener readiness"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    };
+
+    let mut response = Vec::new();
+    let read_deadline = Instant::now() + Duration::from_secs(2);
+    let client_closed_cleanly = loop {
+        let mut bytes = [0u8; 256];
+        match queued.read(&mut bytes) {
+            Ok(0) => break true,
+            Ok(count) => {
+                response.extend_from_slice(&bytes[..count]);
+                if response.contains(&b'\n') {
+                    break serde_json::from_slice::<Response>(
+                        response
+                            .split(|byte| *byte == b'\n')
+                            .next()
+                            .unwrap_or_default(),
+                    )
+                    .is_ok();
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= read_deadline {
+                    break false;
+                }
+                std::thread::yield_now();
+            }
+            Err(_) => break true,
+        }
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(status.success(), "SIGTERM exits successfully: {status}");
+    assert!(
+        signalled_at.elapsed() < Duration::from_secs(2),
+        "SIGTERM exits within two seconds"
+    );
+    assert!(
+        client_closed_cleanly,
+        "queued old-listener client gets a response or a clean connection close"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn idle_daemon_accepts_local_connections_without_polling_delay() {
     let dir = scratch_dir("daemon-accept-latency");
     let mut daemon = Daemon::spawn(&dir);

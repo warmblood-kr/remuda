@@ -22,6 +22,8 @@ use interprocess::local_socket::traits::Listener as _;
 use interprocess::local_socket::traits::ListenerExt;
 #[cfg(unix)]
 use interprocess::local_socket::traits::Stream as LocalStream;
+#[cfg(unix)]
+use interprocess::local_socket::ListenerNonblockingMode;
 use remuda_core::agent::Result as AgentResult;
 use remuda_core::protocol::{collapse_runs, Request, Response};
 use remuda_core::{Clock, Registry, Session, Size};
@@ -190,7 +192,7 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     let signals = catch_signals()?;
     let listener: Listener = ipc::listen(path)?;
     #[cfg(unix)]
-    let listener = prepare_unix_listener(listener);
+    let listener = prepare_unix_listener(listener)?;
     #[cfg(windows)]
     let listener = listener;
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
@@ -263,8 +265,8 @@ fn serve_unix(
     // terminal really hung up — stop in order rather than write to a dead tty.
     // SAFETY: getsid/getpid only read this process's ids.
     let detached = unsafe { libc::getsid(0) == libc::getpid() };
-    let mut signal_bytes = [0u8; 64];
-    loop {
+    let mut signal_bytes = [0u8; 1];
+    'poll_loop: loop {
         let mut watched = [
             libc::pollfd {
                 fd: unix_listener_fd(&listener),
@@ -299,7 +301,9 @@ fn serve_unix(
                         let signal = libc::c_int::from(*byte);
                         if signal == libc::SIGUSR1 {
                             rebind_after_sigusr1(&mut listener, path, &socket_owner);
-                            continue;
+                            // The old listener's readiness bits cannot describe
+                            // the replacement listener. Poll both fds again.
+                            continue 'poll_loop;
                         }
                         let name = match signal {
                             libc::SIGTERM => "SIGTERM",
@@ -329,8 +333,20 @@ fn serve_unix(
 
         if watched[0].revents & libc::POLLIN != 0 {
             match listener.accept() {
-                Ok(stream) => spawn_connection(stream, &registry, &image, &counters, &socket_owner),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Ok(stream) => {
+                    if let Err(error) = stream.set_nonblocking(false) {
+                        eprintln!("remuda daemon: could not restore blocking client mode: {error}");
+                        continue;
+                    }
+                    spawn_connection(stream, &registry, &image, &counters, &socket_owner);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
                 Err(error) => eprintln!("remuda daemon: accept failed: {error}"),
             }
         }
@@ -338,11 +354,12 @@ fn serve_unix(
 }
 
 #[cfg(unix)]
-fn prepare_unix_listener(mut listener: Listener) -> Listener {
+fn prepare_unix_listener(mut listener: Listener) -> std::io::Result<Listener> {
     // SocketOwnership performs inode-conditional cleanup, so an old listener
     // must never unlink a replacement path when it is dropped.
     listener.do_not_reclaim_name_on_drop();
-    listener
+    listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+    Ok(listener)
 }
 
 #[cfg(unix)]
@@ -362,7 +379,16 @@ fn rebind_after_sigusr1(listener: &mut Listener, path: &Path, socket_owner: &Soc
     }
     match ipc::listen(path) {
         Ok(replacement) => {
-            let replacement = prepare_unix_listener(replacement);
+            let replacement = match prepare_unix_listener(replacement) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    eprintln!(
+                        "remuda daemon: could not prepare rebound socket at {}: {error}",
+                        path.display()
+                    );
+                    return;
+                }
+            };
             let refreshed = socket_owner.refresh();
             *listener = replacement;
             match refreshed {
@@ -676,10 +702,8 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
     }
 }
 
-/// SIGTERM/SIGINT: log, reap like `Shutdown`, remove the socket, exit 0. SIGHUP: ignored
-/// when detached (#106), else the same. SIGUSR1 asks the accept loop to rebind its socket.
-/// Caught, never SIG_IGN (pty children would inherit it); the handler only writes the signal
-/// number to a socketpair.
+/// The handler writes signal numbers to a socketpair polled with the listener.
+/// Catching signals preserves default dispositions in pty children.
 #[cfg(unix)]
 fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::os::fd::AsRawFd;
