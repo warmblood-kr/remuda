@@ -218,7 +218,8 @@ remuda — a pty manager you can attach to
   remuda cluster init             create this node's cluster identity
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
-  remuda cluster remote [node/session] open the read-only cluster tree
+  remuda cluster control on|off   allow or refuse remote control
+  remuda cluster remote [node/session] open the cluster session tree
   remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
   remuda cluster call NODE list --addr HOST:PORT [--json]  list a remote node's sessions
   remuda cluster call NODE capture SESSION --addr HOST:PORT [--json]  capture a remote screen
@@ -296,7 +297,8 @@ remuda — terminal orchestration for coding agents
   remuda cluster init            create this node's cluster identity
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
-  remuda cluster remote [node/session] open the read-only cluster tree
+  remuda cluster control on|off   allow or refuse remote control
+  remuda cluster remote [node/session] open the cluster session tree
   remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
   remuda cluster call NODE list --addr HOST:PORT [--json]  list a remote node's sessions
   remuda cluster call NODE capture SESSION --addr HOST:PORT [--json]  capture a remote screen
@@ -337,6 +339,7 @@ enum ClusterCommand {
     Status,
     Init,
     Nodes,
+    Control(bool),
     Revoke {
         target: String,
         yes: bool,
@@ -366,6 +369,8 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
         [] => ClusterCommand::Status,
         ["init"] => ClusterCommand::Init,
         ["nodes"] => ClusterCommand::Nodes,
+        ["control", "on"] => ClusterCommand::Control(true),
+        ["control", "off"] => ClusterCommand::Control(false),
         ["revoke", target] => ClusterCommand::Revoke {
             target: (*target).to_string(),
             yes: false,
@@ -452,7 +457,15 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                 println!("Node: {}", identity.node_name);
                 println!("Fingerprint: {}", identity.node_fp);
                 println!("Members: {members}");
-                ExitCode::SUCCESS
+                match remuda_native::cluster::control::enabled() {
+                    Ok(enabled) => {
+                        let (setting, trust) = remote_control_status_lines(enabled);
+                        println!("{setting}");
+                        println!("{trust}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => fail(format!("cluster status: {error}")),
+                }
             }
             Err(error) => fail(format!("cluster status: {error}")),
         },
@@ -477,6 +490,15 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             Err(error) => fail(format!("cluster nodes: {error}")),
         },
         ClusterCommand::Revoke { target, yes } => cluster_revoke(&target, yes),
+        ClusterCommand::Control(enabled) => {
+            match remuda_native::cluster::control::set_enabled(enabled) {
+                Ok(()) => {
+                    println!("Remote control {}.", remote_control_label(enabled));
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(format!("cluster control: {error}")),
+            }
+        }
         ClusterCommand::Remote(target) => {
             let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into());
             with_daemon(server, path, |path| {
@@ -515,10 +537,30 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             json,
         } => cluster_call(&target, address, action, json),
         ClusterCommand::Invalid => {
-            eprintln!("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | remote [node/session] | listen --bind ADDR [--allow-public] | call NODE (list | capture SESSION) --addr HOST:PORT [--json]]");
+            eprintln!("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | control on|off | remote [node/session] | listen --bind ADDR [--allow-public] | call NODE (list | capture SESSION) --addr HOST:PORT [--json]]");
             ExitCode::from(2)
         }
     }
+}
+
+fn remote_control_label(enabled: bool) -> &'static str {
+    if enabled {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
+
+fn remote_control_status_lines(enabled: bool) -> (&'static str, &'static str) {
+    let setting = if enabled {
+        "Remote control: enabled"
+    } else {
+        "Remote control: disabled"
+    };
+    (
+        setting,
+        "Trust if enabled: a compromised admitted node can type into and close every session.",
+    )
 }
 
 fn cluster_call(
@@ -763,7 +805,7 @@ fn cluster_init_message(created: bool) -> &'static str {
 mod cluster_cli_tests {
     use super::{
         cluster_init_message, confirmation_answer_is_yes, parse_cluster_command,
-        revoke_confirmation, write_nodes_table, ClusterCommand,
+        remote_control_status_lines, revoke_confirmation, write_nodes_table, ClusterCommand,
     };
 
     #[test]
@@ -815,6 +857,34 @@ mod cluster_cli_tests {
     #[test]
     fn cluster_nodes_is_recognized() {
         assert_eq!(parse_cluster_command(&["nodes"]), ClusterCommand::Nodes);
+    }
+
+    #[test]
+    fn cluster_control_requires_an_explicit_on_or_off_value() {
+        assert_eq!(
+            parse_cluster_command(&["control", "on"]),
+            ClusterCommand::Control(true)
+        );
+        assert_eq!(
+            parse_cluster_command(&["control", "off"]),
+            ClusterCommand::Control(false)
+        );
+        assert_eq!(
+            parse_cluster_command(&["control", "yes"]),
+            ClusterCommand::Invalid
+        );
+    }
+
+    #[test]
+    fn cluster_status_explains_remote_control_trust() {
+        let (setting, trust) = remote_control_status_lines(true);
+        assert_eq!(setting, "Remote control: enabled");
+        assert!(trust.contains("compromised admitted node"));
+        assert!(trust.contains("close every session"));
+        assert_eq!(
+            remote_control_status_lines(false).0,
+            "Remote control: disabled"
+        );
     }
 
     #[test]
