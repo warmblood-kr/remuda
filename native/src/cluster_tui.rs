@@ -325,7 +325,9 @@ impl ClusterUi {
         session: &RemoteSessionSnapshot,
         query: &str,
     ) -> bool {
-        let attention = node.state != RemoteState::Reachable || !session.alive;
+        let attention = node.state != RemoteState::Reachable
+            || !session.alive
+            || self.remote_pending_count(node, session) > 0;
         let name_matches = query.is_empty()
             || matches_query(query, &node.name)
             || matches_query(query, &session.name);
@@ -604,7 +606,10 @@ impl ClusterUi {
                         "{}    {:<12} {}{}",
                         if is_selected { ">" } else { " " },
                         session.name,
-                        if session.alive { "live" } else { "ended" },
+                        session_status(
+                            if session.alive { "live" } else { "ended" },
+                            self.remote_pending_count(node, session),
+                        ),
                         session_error_suffix(session.last_error.as_deref())
                     ));
                 }
@@ -722,7 +727,7 @@ impl ClusterUi {
             Down => self.move_selection(true),
             Left => self.collapse_tree_selection(),
             Right => self.expand_tree_selection(),
-            Enter => self.enter_selected(),
+            Enter => self.enter_selected(now),
             _ => {}
         }
         false
@@ -747,11 +752,12 @@ impl ClusterUi {
         }
     }
 
-    fn enter_selected(&mut self) {
+    fn enter_selected(&mut self, now: Duration) {
         let selection = self.current_tree_selection();
         if !self.visible_tree_rows().contains(&selection) {
             return;
         }
+        self.discard_remote_draft_if_switching(&selection, now);
         match selection {
             TreeSelection::RemoteNode(name) => {
                 self.remote_expanded.insert(name);
@@ -818,6 +824,30 @@ impl ClusterUi {
                     self.enqueue_draft(bytes, now);
                 }
             }
+        }
+    }
+
+    fn discard_remote_draft_if_switching(&mut self, selection: &TreeSelection, now: Duration) {
+        if matches!(selection, TreeSelection::RemoteNode(_)) {
+            return;
+        }
+        let Some((node, name, instance_id)) = self.remote_composer_target.clone() else {
+            return;
+        };
+        if self.composer.text().is_empty() {
+            return;
+        }
+        let same_target = matches!(selection,
+            TreeSelection::RemoteSession {
+                node: selected_node,
+                name: selected_name,
+                instance_id: selected_instance,
+            } if selected_node == &node && selected_name == &name && selected_instance == &instance_id
+        );
+        if !same_target {
+            self.composer.clear();
+            self.remote_composer_target = None;
+            self.notice = Some((format!("draft for {node}/{name} discarded"), now));
         }
     }
 
@@ -1073,6 +1103,22 @@ impl ClusterUi {
             .items()
             .filter(|batch| {
                 batch.name == session.name
+                    && matches!(batch.state, QueueState::Waiting | QueueState::Sending)
+            })
+            .count()
+    }
+
+    fn remote_pending_count(
+        &self,
+        node: &RemoteNodeSnapshot,
+        session: &RemoteSessionSnapshot,
+    ) -> usize {
+        self.input_queue
+            .items()
+            .filter(|batch| {
+                batch.remote_node.as_deref() == Some(node.name.as_str())
+                    && batch.name == session.wire_name
+                    && batch.instance_id == session.instance_id
                     && matches!(batch.state, QueueState::Waiting | QueueState::Sending)
             })
             .count()
@@ -1962,7 +2008,7 @@ mod tests {
             name: "build".into(),
             instance_id: "remote-instance".into(),
         });
-        ui.enter_selected();
+        ui.enter_selected(clock.now());
         assert!(ui.composer_focused);
         ui.enqueue_remote_draft(b"echo hi\r".to_vec(), clock.now());
         ui.start_pending(clock.now());
@@ -1989,6 +2035,97 @@ mod tests {
     }
 
     #[test]
+    fn switching_remote_target_discards_unsaved_draft_with_original_target_notice() {
+        let clock = ManualClock::new();
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        let mut second = snapshot.nodes[0].sessions[0].clone();
+        second.name = "shell".into();
+        second.wire_name = "shell".into();
+        second.instance_id = "shell-instance".into();
+        snapshot.nodes[0].sessions.push(second);
+
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_input_enabled = true;
+        ui.remote_expanded.insert("laptop".into());
+        ui.remote_selected = Some(RemoteSelection::Session {
+            node: "laptop".into(),
+            name: "build".into(),
+            instance_id: "remote-instance".into(),
+        });
+        ui.enter_selected(clock.now());
+        ui.key(crossterm::event::KeyCode::Char('d'));
+        ui.key(crossterm::event::KeyCode::Char('r'));
+        ui.key_event(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('\\'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+            clock.now(),
+        );
+        assert_eq!(ui.composer.text(), "dr");
+
+        ui.set_tree_selection(super::TreeSelection::RemoteSession {
+            node: "laptop".into(),
+            name: "shell".into(),
+            instance_id: "shell-instance".into(),
+        });
+        ui.enter_selected(clock.now());
+
+        assert_eq!(ui.composer.text(), "");
+        assert_eq!(
+            ui.notice.as_ref().map(|(notice, _)| notice.as_str()),
+            Some("draft for laptop/build discarded")
+        );
+        assert_eq!(ui.input_queue.items().count(), 0);
+        assert_eq!(ui.remote_composer_target.as_ref().unwrap().1, "shell");
+    }
+
+    #[test]
+    fn remote_pending_input_marks_rows_and_attention_filter() {
+        let clock = ManualClock::new();
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        snapshot.nodes[0].sessions[0].wire_name = "wire-build".into();
+        let source = FakeRemoteSource(Mutex::new(snapshot));
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&source);
+        ui.remote_expanded.insert("laptop".into());
+        ui.input_sender
+            .enqueue_remote(
+                &mut ui.input_queue,
+                "laptop",
+                "wire-build",
+                "remote-instance",
+                b"queued\r".to_vec(),
+                Instant::now(),
+            )
+            .unwrap();
+
+        let frame = ui.render(100, 24, "", &clock);
+        assert!(
+            frame.contains("live · pending input 1"),
+            "remote pending marker missing from frame:\n{frame}"
+        );
+
+        ui.start_pending(clock.now());
+        let sending_frame = ui.render(100, 24, "", &clock);
+        assert!(sending_frame.contains("live · pending input 1"));
+
+        ui.key(crossterm::event::KeyCode::Char('!'));
+        let attention_frame = ui.render(100, 24, "", &clock);
+        assert!(attention_frame.contains("build"));
+        assert!(attention_frame.contains("pending input 1"));
+    }
+
+    #[test]
     fn remote_control_disabled_is_shown_and_stops_future_target_sends() {
         let clock = ManualClock::new();
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
@@ -2004,7 +2141,7 @@ mod tests {
             name: "build".into(),
             instance_id: "remote-instance".into(),
         });
-        ui.enter_selected();
+        ui.enter_selected(clock.now());
         ui.enqueue_remote_draft(b"first\r".to_vec(), clock.now());
         ui.start_pending(clock.now());
         let transport = FakeRemoteInput::new(Response::RemoteControlDisabled);
