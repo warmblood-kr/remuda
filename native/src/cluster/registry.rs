@@ -4,6 +4,7 @@ use super::encoding;
 #[cfg(not(windows))]
 use super::storage;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::BTreeMap;
 #[cfg(not(windows))]
 use std::fs::{self, OpenOptions};
@@ -17,12 +18,30 @@ pub const MAX_UPDATE_BYTES: usize = 1024 * 1024;
 pub const MAX_UPDATE_ENTRIES: usize = 1024;
 pub const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
 pub const MAX_REGISTRY_ENTRIES: usize = 1024;
+pub const REGISTRY_FORMAT_MAJOR: u16 = 1;
+pub const REGISTRY_FORMAT_MINOR: u16 = 0;
+const MAX_OPTIONAL_FIELDS: usize = 8;
+const MAX_OPTIONAL_FIELDS_BYTES: usize = 1024;
+const RESERVED_ENTRY_FIELDS: [&str; 9] = [
+    "node_fp",
+    "static_pubkey",
+    "format_major",
+    "format_minor",
+    "endpoint",
+    "state",
+    "version",
+    "by",
+    "delivered_by",
+];
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AuthorizedNode {
     pub node_fp: String,
     pub static_pubkey: String,
+    #[serde(default = "current_format_major")]
+    pub format_major: u16,
+    #[serde(default = "current_format_minor")]
+    pub format_minor: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     /// Receiver-local audit metadata. This field is never present on the wire
@@ -32,6 +51,16 @@ pub struct AuthorizedNode {
     pub state: NodeState,
     pub version: u64,
     pub by: String,
+    #[serde(flatten)]
+    pub optional_fields: BTreeMap<String, Value>,
+}
+
+fn current_format_major() -> u16 {
+    REGISTRY_FORMAT_MAJOR
+}
+
+fn current_format_minor() -> u16 {
+    REGISTRY_FORMAT_MINOR
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -54,15 +83,20 @@ pub struct RegistryUpdate {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 struct WireAuthorizedNode {
     node_fp: String,
     static_pubkey: String,
+    #[serde(default = "current_format_major")]
+    format_major: u16,
+    #[serde(default = "current_format_minor")]
+    format_minor: u16,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     endpoint: Option<String>,
     state: NodeState,
     version: u64,
     by: String,
+    #[serde(flatten)]
+    optional_fields: BTreeMap<String, Value>,
 }
 
 impl From<&AuthorizedNode> for WireAuthorizedNode {
@@ -70,10 +104,13 @@ impl From<&AuthorizedNode> for WireAuthorizedNode {
         Self {
             node_fp: entry.node_fp.clone(),
             static_pubkey: entry.static_pubkey.clone(),
+            format_major: entry.format_major,
+            format_minor: entry.format_minor,
             endpoint: entry.endpoint.clone(),
             state: entry.state,
             version: entry.version,
             by: entry.by.clone(),
+            optional_fields: entry.optional_fields.clone(),
         }
     }
 }
@@ -83,11 +120,14 @@ impl From<WireAuthorizedNode> for AuthorizedNode {
         Self {
             node_fp: entry.node_fp,
             static_pubkey: entry.static_pubkey,
+            format_major: entry.format_major,
+            format_minor: entry.format_minor,
             endpoint: entry.endpoint,
             delivered_by: None,
             state: entry.state,
             version: entry.version,
             by: entry.by,
+            optional_fields: entry.optional_fields,
         }
     }
 }
@@ -95,15 +135,39 @@ impl From<WireAuthorizedNode> for AuthorizedNode {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WireRegistryUpdate {
+    #[serde(default = "current_format_major")]
+    format_major: u16,
+    #[serde(default = "current_format_minor")]
+    format_minor: u16,
     sender_fp: String,
     entries: Vec<WireAuthorizedNode>,
 }
+
+#[derive(Debug)]
+pub struct UnsupportedRegistryMajor {
+    kind: &'static str,
+    major: u16,
+}
+
+impl std::fmt::Display for UnsupportedRegistryMajor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "unsupported {} format major {}",
+            self.kind, self.major
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedRegistryMajor {}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UpdateOutcome {
     pub applied: Vec<AuthorizedNode>,
     pub alerts: Vec<String>,
     pub local_metadata_changed: bool,
+    pub dropped_origin_entries: usize,
+    pub dropped_invalid_entries: usize,
 }
 
 impl RegistryUpdate {
@@ -111,6 +175,8 @@ impl RegistryUpdate {
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         validate_update(self)?;
         let encoded = serde_json::to_vec(&WireRegistryUpdate {
+            format_major: REGISTRY_FORMAT_MAJOR,
+            format_minor: REGISTRY_FORMAT_MINOR,
             sender_fp: self.sender_fp.clone(),
             entries: self.entries.iter().map(WireAuthorizedNode::from).collect(),
         })
@@ -121,18 +187,26 @@ impl RegistryUpdate {
         Ok(encoded)
     }
 
-    /// Decode bounded strict JSON and validate all registry fingerprints.
+    /// Decode bounded JSON, rejecting unsupported majors before merge filters
+    /// individual invalid entries.
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() > MAX_UPDATE_BYTES {
             return Err(invalid_update("registry update exceeds byte cap"));
         }
         let wire: WireRegistryUpdate = serde_json::from_slice(bytes)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if wire.format_major != REGISTRY_FORMAT_MAJOR {
+            return Err(unsupported_major("update", wire.format_major));
+        }
+        let _format_minor = wire.format_minor;
         let update = Self {
             sender_fp: wire.sender_fp,
             entries: wire.entries.into_iter().map(AuthorizedNode::from).collect(),
         };
-        validate_update(&update)?;
+        validate_update_header(&update)?;
+        for entry in &update.entries {
+            ensure_supported_entry_major(entry)?;
+        }
         Ok(update)
     }
 
@@ -151,7 +225,14 @@ impl RegistryUpdate {
     pub fn decode_entries_json(json: &str) -> io::Result<Vec<AuthorizedNode>> {
         let entries: Vec<WireAuthorizedNode> = serde_json::from_str(json)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        Ok(entries.into_iter().map(AuthorizedNode::from).collect())
+        let entries = entries
+            .into_iter()
+            .map(AuthorizedNode::from)
+            .collect::<Vec<_>>();
+        for entry in &entries {
+            ensure_supported_entry_major(entry)?;
+        }
+        Ok(entries)
     }
 }
 
@@ -166,9 +247,7 @@ impl Registry {
             let key = validate_entry(entry)?;
             match merged.get(&key) {
                 Some(current) => {
-                    if prefer(entry, current) {
-                        merged.insert(key, entry.clone());
-                    }
+                    merged.insert(key, merge_known_entry(entry, current));
                 }
                 None => {
                     merged.insert(key, entry.clone());
@@ -186,17 +265,84 @@ impl Registry {
     pub fn digest(&self) -> io::Result<String> {
         let mut canonical = Registry::default();
         canonical.merge(self)?;
-        for entry in &mut canonical.authorized_nodes {
-            let public_key = encoding::decode_base64(&entry.static_pubkey)?;
-            entry.static_pubkey = encoding::encode_base64(&public_key);
-            entry.delivered_by = None;
-        }
-        let encoded = serde_json::to_vec(&canonical.authorized_nodes).map_err(io::Error::other)?;
+        Self::digest_replication_snapshot(&canonical.authorized_nodes)
+    }
+
+    /// Digest a received full wire snapshot before invalid individual entries
+    /// are filtered during merge.
+    pub fn digest_replication_snapshot(entries: &[AuthorizedNode]) -> io::Result<String> {
+        let mut wire = entries
+            .iter()
+            .map(|entry| {
+                let mut wire = WireAuthorizedNode::from(entry);
+                if let Ok(public_key) = encoding::decode_base64(&wire.static_pubkey) {
+                    wire.static_pubkey = encoding::encode_base64(&public_key);
+                }
+                let encoded = serde_json::to_vec(&wire).map_err(io::Error::other)?;
+                Ok((entry.node_fp.clone(), encoded, wire))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        wire.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+        let encoded = serde_json::to_vec(
+            &wire
+                .into_iter()
+                .map(|(_, _, entry)| entry)
+                .collect::<Vec<_>>(),
+        )
+        .map_err(io::Error::other)?;
         Ok(encoding::fingerprint(&encoded))
     }
 }
 
+fn merge_known_entry(incoming: &AuthorizedNode, current: &AuthorizedNode) -> AuthorizedNode {
+    let state_changed = incoming.state != current.state;
+    let incoming_wins = prefer(incoming, current);
+    let mut winner = if incoming_wins {
+        incoming.clone()
+    } else {
+        current.clone()
+    };
+    if state_changed {
+        winner.optional_fields.clear();
+        return winner;
+    }
+    winner.format_minor = incoming.format_minor.max(current.format_minor);
+    let other = if incoming_wins { current } else { incoming };
+    for (key, value) in &other.optional_fields {
+        match winner.optional_fields.get(key) {
+            Some(existing)
+                if incoming.version == current.version
+                    && incoming.by == current.by
+                    && optional_field_value_wins(value, existing) =>
+            {
+                winner.optional_fields.insert(key.clone(), value.clone());
+            }
+            Some(_) => {}
+            None => {
+                winner.optional_fields.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    winner
+}
+
+fn optional_field_value_wins(candidate: &Value, current: &Value) -> bool {
+    let mut candidate_bytes = Vec::new();
+    let mut current_bytes = Vec::new();
+    serde_json::to_writer(&mut candidate_bytes, candidate).expect("JSON values always serialize");
+    serde_json::to_writer(&mut current_bytes, current).expect("JSON values always serialize");
+    candidate_bytes > current_bytes
+}
+
 fn validate_update(update: &RegistryUpdate) -> io::Result<()> {
+    validate_update_header(update)?;
+    for entry in &update.entries {
+        validate_entry(entry)?;
+    }
+    Ok(())
+}
+
+fn validate_update_header(update: &RegistryUpdate) -> io::Result<()> {
     if !valid_fingerprint(&update.sender_fp) {
         return Err(invalid_update(
             "registry update sender is not a SHA256 fingerprint",
@@ -204,9 +350,6 @@ fn validate_update(update: &RegistryUpdate) -> io::Result<()> {
     }
     if update.entries.len() > MAX_UPDATE_ENTRIES {
         return Err(invalid_update("registry update exceeds entry cap"));
-    }
-    for entry in &update.entries {
-        validate_entry(entry)?;
     }
     Ok(())
 }
@@ -216,6 +359,33 @@ fn invalid_update(message: &str) -> io::Error {
 }
 
 fn validate_entry(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
+    if entry.format_major != REGISTRY_FORMAT_MAJOR {
+        return Err(unsupported_major("entry", entry.format_major));
+    }
+    let optional_bytes = serde_json::to_vec(&entry.optional_fields).map_err(io::Error::other)?;
+    if entry.optional_fields.len() > MAX_OPTIONAL_FIELDS
+        || optional_bytes.len() > MAX_OPTIONAL_FIELDS_BYTES
+        || entry
+            .optional_fields
+            .keys()
+            .any(|key| RESERVED_ENTRY_FIELDS.contains(&key.as_str()))
+        || entry.optional_fields.contains_key("optional_fields")
+    {
+        return Err(invalid_update(
+            "registry entry optional fields are reserved or exceed cap",
+        ));
+    }
+    validate_entry_core(entry)
+}
+
+fn ensure_supported_entry_major(entry: &AuthorizedNode) -> io::Result<()> {
+    if entry.format_major != REGISTRY_FORMAT_MAJOR {
+        return Err(unsupported_major("entry", entry.format_major));
+    }
+    Ok(())
+}
+
+fn validate_entry_core(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
     let public_key = encoding::decode_base64(&entry.static_pubkey)?;
     if public_key.len() != 32 || encoding::fingerprint(&public_key) != entry.node_fp {
         return Err(io::Error::new(
@@ -262,6 +432,13 @@ fn validate_entry(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
     Ok(public_key)
 }
 
+fn unsupported_major(kind: &'static str, major: u16) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        UnsupportedRegistryMajor { kind, major },
+    )
+}
+
 fn valid_fingerprint(value: &str) -> bool {
     value
         .strip_prefix("SHA256:")
@@ -295,7 +472,7 @@ fn authenticated_registry(
     update: &RegistryUpdate,
     authenticated_sender_pubkey: &[u8],
 ) -> io::Result<Registry> {
-    validate_update(update)?;
+    validate_update_header(update)?;
     if authenticated_sender_pubkey.len() != 32
         || encoding::fingerprint(authenticated_sender_pubkey) != update.sender_fp
     {
@@ -340,6 +517,10 @@ fn merge_update(
     let mut outcome = UpdateOutcome::default();
     let mut accepted = Vec::with_capacity(update.entries.len());
     for entry in &update.entries {
+        if validate_entry(entry).is_err() {
+            outcome.dropped_invalid_entries += 1;
+            continue;
+        }
         if entry.node_fp == receiver_fp && entry.state == NodeState::Revoked {
             outcome.alerts.push(format!(
                 "dropped peer tombstone for receiver own key {}",
@@ -347,23 +528,20 @@ fn merge_update(
             ));
             continue;
         }
-        let origin = current
-            .authorized_nodes
-            .iter()
-            .find(|known| known.node_fp == entry.by);
-        if origin.is_none_or(|known| known.state == NodeState::Revoked) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "registry entry origin {} for node {} is unknown or revoked",
-                    entry.by, entry.node_fp
-                ),
-            ));
-        }
         let known = current
             .authorized_nodes
             .iter()
             .find(|known| known.node_fp == entry.node_fp);
+        if !known.is_some_and(|known| same_replicated_entry(known, entry)) {
+            let origin = current
+                .authorized_nodes
+                .iter()
+                .find(|known| known.node_fp == entry.by);
+            if origin.is_none_or(|known| known.state == NodeState::Revoked) {
+                outcome.dropped_origin_entries += 1;
+                continue;
+            }
+        }
         let mut accepted_entry = entry.clone();
         if let Some(known) = known {
             let endpoint_changed = known.endpoint != entry.endpoint;
@@ -392,7 +570,7 @@ fn merge_update(
             .iter_mut()
             .find(|known| known.node_fp == incoming.node_fp)
         {
-            if same_replicated_entry(merged, incoming) {
+            if same_replicated_core(merged, incoming) {
                 outcome.local_metadata_changed |=
                     merged.delivered_by.as_deref() != Some(update.sender_fp.as_str());
                 merged.delivered_by = Some(update.sender_fp.clone());
@@ -419,6 +597,14 @@ fn same_replicated_entry(left: &AuthorizedNode, right: &AuthorizedNode) -> bool 
     left.delivered_by = None;
     right.delivered_by = None;
     left == right
+}
+
+fn same_replicated_core(left: &AuthorizedNode, right: &AuthorizedNode) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.optional_fields.clear();
+    right.optional_fields.clear();
+    same_replicated_entry(&left, &right)
 }
 
 /// Apply an update to the local persisted registry under one state lock.
@@ -469,6 +655,18 @@ fn apply_update_at(
     }
     for alert in &outcome.alerts {
         eprintln!("remuda: cluster replication alert: {alert}");
+    }
+    if outcome.dropped_origin_entries > 0 {
+        eprintln!(
+            "remuda: cluster replication dropped {} entries with unknown or revoked origins",
+            outcome.dropped_origin_entries
+        );
+    }
+    if outcome.dropped_invalid_entries > 0 {
+        eprintln!(
+            "remuda: cluster replication dropped {} invalid or over-cap entries",
+            outcome.dropped_invalid_entries
+        );
     }
     drop(guard);
     if !outcome.applied.is_empty() {
@@ -619,6 +817,9 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[path = "pr95_probes2.rs"]
+    mod pr95_probes2;
+
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
     fn temp_dir() -> PathBuf {
@@ -642,6 +843,9 @@ mod tests {
             node_fp: actual_fp,
             static_pubkey: encoding::encode_base64(&key),
             delivered_by: None,
+            format_major: 1,
+            format_minor: 0,
+            optional_fields: std::collections::BTreeMap::new(),
             endpoint: None,
             state,
             version,
@@ -742,12 +946,8 @@ mod tests {
             "\"state\":\"admitted\"",
             "\"state\":\"admitted\",\"extra\":true",
         );
-        assert_eq!(
-            RegistryUpdate::decode(nested_unknown.as_bytes())
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::InvalidData
-        );
+        let decoded = RegistryUpdate::decode(nested_unknown.as_bytes()).unwrap();
+        assert_eq!(decoded.entries[0].optional_fields["extra"], true);
     }
 
     #[test]
@@ -766,6 +966,203 @@ mod tests {
     }
 
     #[test]
+    fn optional_entry_fields_survive_codec_merge_relay_and_affect_digest() {
+        let sender = admitted_sender();
+        let mut target = entry("future-field-target", NodeState::Admitted, 1, "sender");
+        target.by = sender.node_fp.clone();
+        target.optional_fields.insert(
+            "future_signature".into(),
+            serde_json::json!({"key_id": "k1", "signature": "opaque"}),
+        );
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![target.clone()],
+        };
+        let wire = update.encode().unwrap();
+        let decoded = RegistryUpdate::decode(&wire).unwrap();
+        assert_eq!(decoded.entries[0].optional_fields, target.optional_fields);
+        let baseline_digest = Registry {
+            authorized_nodes: vec![sender.clone(), {
+                let mut entry = target.clone();
+                entry.optional_fields.clear();
+                entry
+            }],
+        }
+        .digest()
+        .unwrap();
+        let mut known_target = target.clone();
+        known_target.optional_fields.clear();
+        let mut receiver = registry_with_sender(&sender);
+        receiver.authorized_nodes.push(known_target);
+        apply_as_sender(&mut receiver, &decoded, &public_key(&sender)).unwrap();
+        let received = receiver
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == target.node_fp)
+            .unwrap();
+        assert_eq!(received.optional_fields, target.optional_fields);
+        assert_ne!(receiver.digest().unwrap(), baseline_digest);
+        let relayed = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: receiver.authorized_nodes.clone(),
+        }
+        .encode()
+        .unwrap();
+        let relay_entries = RegistryUpdate::decode(&relayed).unwrap().entries;
+        assert_eq!(
+            relay_entries
+                .iter()
+                .find(|entry| entry.node_fp == target.node_fp)
+                .unwrap()
+                .optional_fields,
+            target.optional_fields
+        );
+    }
+
+    #[test]
+    fn unknown_format_majors_return_a_typed_error() {
+        let sender = admitted_sender();
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp,
+            entries: vec![entry("versioned-entry", NodeState::Admitted, 1, "sender")],
+        };
+        let encoded = update.encode().unwrap();
+        let mut update_value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        update_value["format_major"] = serde_json::json!(99);
+        let error =
+            RegistryUpdate::decode(&serde_json::to_vec(&update_value).unwrap()).unwrap_err();
+        assert!(error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<UnsupportedRegistryMajor>())
+            .is_some());
+
+        update_value["format_major"] = serde_json::json!(REGISTRY_FORMAT_MAJOR);
+        update_value["entries"][0]["format_major"] = serde_json::json!(99);
+        let error =
+            RegistryUpdate::decode(&serde_json::to_vec(&update_value).unwrap()).unwrap_err();
+        assert!(error
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<UnsupportedRegistryMajor>())
+            .is_some());
+    }
+
+    #[test]
+    fn state_transition_clears_unknown_optional_fields() {
+        let mut admitted = entry("future-signed", NodeState::Admitted, 1, "owner");
+        admitted.optional_fields.insert(
+            "future_signature".into(),
+            serde_json::json!("signature-over-admission"),
+        );
+        let mut revoked = admitted.clone();
+        revoked.state = NodeState::Revoked;
+        revoked.version = 2;
+        let mut registry = Registry {
+            authorized_nodes: vec![admitted],
+        };
+        registry
+            .merge(&Registry {
+                authorized_nodes: vec![revoked],
+            })
+            .unwrap();
+        assert!(registry.authorized_nodes[0].optional_fields.is_empty());
+    }
+
+    #[test]
+    fn bad_optional_field_entry_is_counted_and_does_not_block_valid_entry() {
+        let sender = admitted_sender();
+        let mut oversized = entry("oversized-optionals", NodeState::Admitted, 1, "sender");
+        oversized.by = sender.node_fp.clone();
+        for index in 0..MAX_OPTIONAL_FIELDS + 1 {
+            oversized
+                .optional_fields
+                .insert(format!("future_{index}"), serde_json::json!(index));
+        }
+        let mut oversized_bytes =
+            entry("oversized-optional-bytes", NodeState::Admitted, 1, "sender");
+        oversized_bytes.by = sender.node_fp.clone();
+        oversized_bytes.optional_fields.insert(
+            "future_signature".into(),
+            serde_json::json!("x".repeat(MAX_OPTIONAL_FIELDS_BYTES + 1)),
+        );
+        let mut valid = entry("valid-next-to-oversized", NodeState::Admitted, 1, "sender");
+        valid.by = sender.node_fp.clone();
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![oversized, oversized_bytes, valid.clone()],
+        };
+        let wire = serde_json::to_vec(&WireRegistryUpdate {
+            format_major: REGISTRY_FORMAT_MAJOR,
+            format_minor: REGISTRY_FORMAT_MINOR,
+            sender_fp: update.sender_fp.clone(),
+            entries: update
+                .entries
+                .iter()
+                .map(WireAuthorizedNode::from)
+                .collect(),
+        })
+        .unwrap();
+        let update = RegistryUpdate::decode(&wire).unwrap();
+        let mut registry = registry_with_sender(&sender);
+        let outcome = apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+        assert_eq!(outcome.dropped_invalid_entries, 2);
+        assert!(registry
+            .authorized_nodes
+            .iter()
+            .any(|entry| entry.node_fp == valid.node_fp));
+    }
+
+    #[test]
+    fn receiver_local_metadata_cannot_be_smuggled_as_an_optional_field() {
+        let sender = admitted_sender();
+        let mut bad = entry("spoofed-delivery", NodeState::Admitted, 1, "sender");
+        bad.by = sender.node_fp.clone();
+        bad.optional_fields
+            .insert("delivered_by".into(), serde_json::json!(sender.node_fp));
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![bad],
+        };
+        let mut registry = registry_with_sender(&sender);
+        let outcome = apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+        assert_eq!(outcome.dropped_invalid_entries, 1);
+        assert_eq!(registry.authorized_nodes, vec![sender]);
+    }
+
+    #[test]
+    fn revoked_origin_rows_do_not_block_a_new_valid_entry() {
+        let sender = admitted_sender();
+        let mut revoked_origin = entry("revoked-origin", NodeState::Revoked, 2, "seed");
+        revoked_origin.by = sender.node_fp.clone();
+        let mut old_admission = entry("old-origin-admission", NodeState::Admitted, 1, "origin");
+        old_admission.by = revoked_origin.node_fp.clone();
+        let mut registry = Registry {
+            authorized_nodes: vec![
+                sender.clone(),
+                revoked_origin.clone(),
+                old_admission.clone(),
+            ],
+        };
+        let mut new_entry = entry("new-valid-admission", NodeState::Admitted, 1, "sender");
+        new_entry.by = sender.node_fp.clone();
+        let mut changed_old = old_admission.clone();
+        changed_old.version += 1;
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![old_admission.clone(), changed_old, new_entry.clone()],
+        };
+        let outcome = apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+        assert_eq!(outcome.dropped_origin_entries, 1);
+        assert!(registry
+            .authorized_nodes
+            .iter()
+            .any(|entry| entry.node_fp == old_admission.node_fp && entry.version == 1));
+        assert!(registry
+            .authorized_nodes
+            .iter()
+            .any(|entry| entry.node_fp == new_entry.node_fp));
+    }
+
+    #[test]
     fn registry_update_enforces_byte_and_entry_caps() {
         let sender = admitted_sender();
         let too_many = RegistryUpdate {
@@ -778,6 +1175,8 @@ mod tests {
         assert!(too_many.encode().is_err());
         assert!(RegistryUpdate::decode(&vec![b' '; MAX_UPDATE_BYTES + 1]).is_err());
         let too_many_json = serde_json::to_vec(&WireRegistryUpdate {
+            format_major: REGISTRY_FORMAT_MAJOR,
+            format_minor: REGISTRY_FORMAT_MINOR,
             sender_fp: too_many.sender_fp.clone(),
             entries: too_many
                 .entries
@@ -994,7 +1393,12 @@ mod tests {
                 sender_fp: sender.node_fp.clone(),
                 entries: vec![new_member],
             };
-            assert!(apply_as_sender(&mut registry, &update, &public_key(&sender)).is_err());
+            let outcome = apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+            assert_eq!(outcome.dropped_origin_entries, 1);
+            assert_eq!(
+                registry.authorized_nodes.len(),
+                if origin_state.is_some() { 2 } else { 1 }
+            );
         }
     }
 
@@ -1082,13 +1486,16 @@ mod tests {
             sender_fp: sender.node_fp.clone(),
             entries: vec![target],
         };
-        assert!(apply_update(
-            &mut registry.clone(),
+        let mut unchanged = registry.clone();
+        let outcome = apply_update(
+            &mut unchanged,
             &update,
             &public_key(&sender),
-            &receiver.node_fp
+            &receiver.node_fp,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(outcome.dropped_origin_entries, 1);
+        assert_eq!(unchanged.digest().unwrap(), registry.digest().unwrap());
 
         revoked_voucher.state = NodeState::Admitted;
         registry
@@ -1202,7 +1609,8 @@ mod tests {
             sender_fp: sender.node_fp.clone(),
             entries: vec![swapped],
         };
-        assert!(apply_as_sender(&mut registry, &swap_update, &public_key(&sender)).is_err());
+        let outcome = apply_as_sender(&mut registry, &swap_update, &public_key(&sender)).unwrap();
+        assert_eq!(outcome.dropped_invalid_entries, 1);
 
         let mut alternate = original;
         alternate.node_fp = entry("alternate", NodeState::Admitted, 1, "sender").node_fp;
@@ -1210,7 +1618,9 @@ mod tests {
             sender_fp: sender.node_fp.clone(),
             entries: vec![alternate],
         };
-        assert!(apply_as_sender(&mut registry, &alternate_update, &public_key(&sender)).is_err());
+        let outcome =
+            apply_as_sender(&mut registry, &alternate_update, &public_key(&sender)).unwrap();
+        assert_eq!(outcome.dropped_invalid_entries, 1);
         assert_eq!(registry, registry_with_sender(&sender));
     }
 
@@ -1250,6 +1660,9 @@ mod tests {
             node_fp: receiver.node_fp.clone(),
             static_pubkey: encoding::encode_base64(&receiver.static_pubkey),
             delivered_by: None,
+            format_major: 1,
+            format_minor: 0,
+            optional_fields: std::collections::BTreeMap::new(),
             endpoint: None,
             state: NodeState::Admitted,
             version: 1,
@@ -1342,6 +1755,9 @@ mod tests {
             node_fp: encoding::fingerprint(&low_order),
             static_pubkey: encoding::encode_base64(&low_order),
             delivered_by: None,
+            format_major: 1,
+            format_minor: 0,
+            optional_fields: std::collections::BTreeMap::new(),
             endpoint: None,
             state: NodeState::Admitted,
             version: 1,
@@ -1545,6 +1961,9 @@ mod tests {
             node_fp: encoding::fingerprint(&short_key),
             static_pubkey: encoding::encode_base64(&short_key),
             delivered_by: None,
+            format_major: 1,
+            format_minor: 0,
+            optional_fields: std::collections::BTreeMap::new(),
             endpoint: None,
             state: NodeState::Admitted,
             version: 1,

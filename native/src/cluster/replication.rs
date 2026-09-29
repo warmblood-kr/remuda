@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 const WORKERS: usize = 4;
 const MAX_FETCH_PAGES: usize =
     registry::MAX_REGISTRY_ENTRIES.div_ceil(crate::net::REGISTRY_REPLICATION_PAGE_ENTRIES) + 8;
-const REPLICATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
+const REPLICATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Default)]
 struct WorkState {
@@ -370,10 +370,9 @@ impl FetchAccumulator {
                 "sync offset does not match page length",
             )),
             None => {
-                let snapshot = Registry {
-                    authorized_nodes: self.entries.clone(),
-                };
-                if Some(snapshot.digest()?) != self.snapshot_digest {
+                if Some(Registry::digest_replication_snapshot(&self.entries)?)
+                    != self.snapshot_digest
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "registry sync digest did not match its pages",
@@ -498,6 +497,9 @@ mod tests {
                 node_fp: "SHA256:entry-a".into(),
                 static_pubkey: "key-a".into(),
                 delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 3,
@@ -507,6 +509,9 @@ mod tests {
                 node_fp: "SHA256:entry-b".into(),
                 static_pubkey: "key-b".into(),
                 delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Revoked,
                 version: 1,
@@ -522,6 +527,44 @@ mod tests {
         assert_eq!(relayed[0].delivered_by, None);
         assert_eq!(relayed[0].state, NodeState::Admitted);
         assert_eq!(relayed[1].state, NodeState::Revoked);
+    }
+
+    #[test]
+    fn push_wire_codec_preserves_original_by_attribution() {
+        let public_key = [42u8; 32];
+        let relay_key = [43u8; 32];
+        let origin_key = [44u8; 32];
+        let mut entry = AuthorizedNode {
+            node_fp: super::super::encoding::fingerprint(&public_key),
+            static_pubkey: super::super::encoding::encode_base64(&public_key),
+            endpoint: None,
+            delivered_by: Some("SHA256:prior-relay".into()),
+            format_major: registry::REGISTRY_FORMAT_MAJOR,
+            format_minor: registry::REGISTRY_FORMAT_MINOR,
+            optional_fields: std::collections::BTreeMap::new(),
+            state: NodeState::Admitted,
+            version: 1,
+            by: super::super::encoding::fingerprint(&origin_key),
+        };
+        entry.optional_fields.insert(
+            "future_signature".into(),
+            serde_json::json!("opaque-signature"),
+        );
+        let wire = registry::RegistryUpdate {
+            sender_fp: super::super::encoding::fingerprint(&relay_key),
+            entries: snapshot_for_wire(&[entry]).to_vec(),
+        }
+        .encode()
+        .unwrap();
+        let decoded = registry::RegistryUpdate::decode(&wire).unwrap();
+        assert_eq!(
+            decoded.entries[0].by,
+            super::super::encoding::fingerprint(&origin_key)
+        );
+        assert!(decoded.entries[0].delivered_by.is_none());
+        assert!(decoded.entries[0]
+            .optional_fields
+            .contains_key("future_signature"));
     }
 
     #[test]
@@ -549,14 +592,19 @@ mod tests {
     #[test]
     fn fetch_accumulator_stops_at_its_page_cap() {
         let mut fetched = FetchAccumulator::new("digest".into());
+        let public_key = [51u8; 32];
+        let origin_key = [52u8; 32];
         let entry = AuthorizedNode {
-            node_fp: "SHA256:entry".into(),
-            static_pubkey: "key".into(),
+            node_fp: super::super::encoding::fingerprint(&public_key),
+            static_pubkey: super::super::encoding::encode_base64(&public_key),
             endpoint: None,
             delivered_by: None,
+            format_major: 1,
+            format_minor: 0,
+            optional_fields: std::collections::BTreeMap::new(),
             state: NodeState::Admitted,
             version: 1,
-            by: "SHA256:origin".into(),
+            by: super::super::encoding::fingerprint(&origin_key),
         };
         for offset in 0..MAX_FETCH_PAGES {
             let response = Response::ClusterRegistryPage {
@@ -580,7 +628,42 @@ mod tests {
             next_offset: None,
             unchanged: false,
         };
-        assert!(fetched.accept(extra, "peer").is_err());
+        let error = fetched.accept(extra, "peer").unwrap_err();
+        assert!(error.to_string().contains("page limit"));
+    }
+
+    #[test]
+    fn fetched_snapshot_digest_is_checked_before_over_cap_entries_are_dropped() {
+        let public_key = [61u8; 32];
+        let origin_key = [62u8; 32];
+        let mut entry = AuthorizedNode {
+            node_fp: super::super::encoding::fingerprint(&public_key),
+            static_pubkey: super::super::encoding::encode_base64(&public_key),
+            endpoint: None,
+            delivered_by: None,
+            format_major: registry::REGISTRY_FORMAT_MAJOR,
+            format_minor: registry::REGISTRY_FORMAT_MINOR,
+            optional_fields: std::collections::BTreeMap::new(),
+            state: NodeState::Admitted,
+            version: 1,
+            by: super::super::encoding::fingerprint(&origin_key),
+        };
+        for index in 0..9 {
+            entry
+                .optional_fields
+                .insert(format!("future_{index}"), serde_json::json!(index));
+        }
+        let digest = Registry::digest_replication_snapshot(std::slice::from_ref(&entry)).unwrap();
+        let mut fetched = FetchAccumulator::new("old-digest".into());
+        let response = Response::ClusterRegistryPage {
+            sender_fp: "peer".into(),
+            digest,
+            offset: 0,
+            entries_json: registry::RegistryUpdate::encode_entries_json(&[entry]).unwrap(),
+            next_offset: None,
+            unchanged: false,
+        };
+        assert!(fetched.accept(response, "peer").unwrap());
     }
 
     #[test]

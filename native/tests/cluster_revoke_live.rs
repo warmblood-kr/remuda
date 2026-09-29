@@ -231,6 +231,9 @@ fn authorized_node(
         static_pubkey: remuda_native::cluster::encoding::encode_base64(public),
         endpoint: endpoint.map(str::to_owned),
         delivered_by: None,
+        format_major: 1,
+        format_minor: 0,
+        optional_fields: std::collections::BTreeMap::new(),
         state: remuda_native::cluster::NodeState::Admitted,
         version: 1,
         by: by.to_owned(),
@@ -466,6 +469,35 @@ fn wait_for_revocation_on(receiver: &PrivateNode, member_fp: &str) {
 }
 
 #[test]
+fn revoke_then_new_admission_converges_across_three_daemons() {
+    let a = PrivateNode::start("origin-a");
+    let b = PrivateNode::start("origin-b");
+    let y = PrivateNode::start("origin-y");
+    for node in [&a, &b, &y] {
+        successful(node.run(&["cluster", "init"]), "initialize private node");
+    }
+    let a_id = a.identity();
+    let b_id = b.identity();
+    let b_fp = identity_fingerprint(&b_id);
+    let a_listener = ListenerProcess::start(&a);
+    let b_listener = ListenerProcess::start(&b);
+    let y_listener = ListenerProcess::start(&y);
+
+    join_member(&a, &b, &a_id, a_listener.address, b_listener.address);
+    successful(
+        a.run(&["cluster", "revoke", &b_fp, "--yes"]),
+        "revoke old origin B",
+    );
+
+    join_member(&a, &y, &a_id, a_listener.address, y_listener.address);
+    let y_fp = identity_fingerprint(&y.identity());
+    let a_fp = identity_fingerprint(&a_id);
+    wait_for_member_and_probe(&a, &y_fp, &y.identity(), &a_id, a_listener.address);
+    wait_for_member_and_probe(&y, &a_fp, &a_id, &y.identity(), y_listener.address);
+    wait_for_revocation_on(&y, &b_fp);
+}
+
+#[test]
 fn admission_on_a_pushes_to_an_existing_peer() {
     let a = PrivateNode::start("push-a");
     let b = PrivateNode::start("push-b");
@@ -473,6 +505,9 @@ fn admission_on_a_pushes_to_an_existing_peer() {
     successful(a.run(&["cluster", "init"]), "initialize node A");
     successful(b.run(&["cluster", "init"]), "initialize node B");
     successful(c.run(&["cluster", "init"]), "initialize node C");
+    let status = a.run(&["cluster"]);
+    assert!(String::from_utf8_lossy(&status.stdout)
+        .contains("Any admitted member can admit new keys and revoke any member cluster-wide."));
     let a_identity = a.identity();
     let a_fingerprint = identity_fingerprint(&a_identity);
     let a_listener = ListenerProcess::start(&a);

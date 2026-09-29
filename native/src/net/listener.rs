@@ -39,10 +39,8 @@ const ACCEPT_RESOURCE_BACKOFF: Duration = Duration::from_millis(250);
 const REPLAY_CAPACITY: usize = 65_536;
 static LISTENER_ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Explicit listener address and opt-in for wildcard binding.
-///
-/// On operating systems with dual-stack IPv6 sockets, an opted-in `[::]` bind
-/// may also accept IPv4 connections.
+/// Listener address and opt-in for wildcard binding.
+/// An opted-in IPv6 wildcard may accept IPv4 on dual-stack systems.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListenerConfig {
     pub bind_addr: SocketAddr,
@@ -1215,6 +1213,9 @@ mod tests {
                 node_fp: crate::cluster::encoding::fingerprint(&peer.public),
                 static_pubkey: crate::cluster::encoding::encode_base64(&peer.public),
                 delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -1520,6 +1521,9 @@ mod tests {
                 node_fp: fingerprint.clone(),
                 static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
                 delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -2076,6 +2080,9 @@ mod tests {
             node_fp: fingerprint.clone(),
             static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
             delivered_by: None,
+            format_major: 1,
+            format_minor: 0,
+            optional_fields: std::collections::BTreeMap::new(),
             endpoint: None,
             state: NodeState::Admitted,
             version: 1,
@@ -2098,6 +2105,9 @@ mod tests {
                 node_fp: fingerprint.clone(),
                 static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
                 delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
