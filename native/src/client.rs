@@ -1,6 +1,7 @@
 //! Talking to a daemon, including handing your terminal over to one.
 
 use crate::ipc::{self, Stream, TryClone};
+use crate::reply_limit::max_reply_wire_bytes;
 use remuda_core::protocol::{Request, Response};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -78,9 +79,48 @@ fn send(mut stream: &Stream, request: &Request) -> std::io::Result<()> {
 }
 
 fn read_response(stream: &Stream) -> std::io::Result<Response> {
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
+    let limit = max_reply_wire_bytes();
+    let mut reader = BufReader::new(stream.take(limit.saturating_add(1) as u64));
+    let mut bytes = Vec::with_capacity(8192);
+    reader.read_until(b'\n', &mut bytes)?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "daemon reply exceeds the {} MiB wire limit",
+                limit / (1024 * 1024)
+            ),
+        ));
+    }
+    let line = String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     Ok(interpret(&line))
+}
+
+/// Read one bounded protocol line without buffering bytes beyond its newline.
+fn read_bounded_line(stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
+    let limit = max_reply_wire_bytes();
+    let mut line = Vec::with_capacity(limit.min(8192));
+    let mut byte = [0u8; 1];
+    while line.len() <= limit {
+        if stream.read(&mut byte)? == 0 {
+            break;
+        }
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    if line.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "daemon reply exceeds the {} MiB wire limit",
+                limit / (1024 * 1024)
+            ),
+        ));
+    }
+    Ok(line)
 }
 
 /// What a daemon says when it cannot READ what we sent. Only the deserializer
@@ -114,13 +154,9 @@ fn interpret(line: &str) -> Response {
 /// this exact Windows pipe handle for the output pump so its detach wake can
 /// cancel the pending read on the same handle.
 fn read_protocol_line(stream: &mut impl Read) -> std::io::Result<String> {
-    let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-    while stream.read(&mut byte)? != 0 {
-        if byte[0] == b'\n' {
-            break;
-        }
-        line.push(byte[0]);
+    let mut line = read_bounded_line(stream)?;
+    if line.last() == Some(&b'\n') {
+        line.pop();
     }
     String::from_utf8(line)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
@@ -791,9 +827,9 @@ fn hold_inner(path: &Path, name: &str, drain_delay: std::time::Duration) -> std:
             name: name.to_string(),
         },
     )?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+    let mut reader = stream.try_clone()?;
+    let line = String::from_utf8(read_bounded_line(&mut reader)?)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     match interpret(&line) {
         Response::Ok => {}
         Response::Error(reason) => return Err(std::io::Error::other(reason)),
@@ -891,6 +927,40 @@ mod tests {
     use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
     use remuda_core::protocol::Response;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[cfg(unix)]
+    #[test]
+    fn reply_reader_rejects_a_line_over_the_shared_reply_limit() {
+        use super::read_response;
+        use crate::ipc;
+        use crate::reply_limit::max_reply_wire_bytes;
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::Write;
+
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/r-reply-{}-{}.sock",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = ipc::listen(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = listener.accept().unwrap();
+            let mut line = vec![b'x'; max_reply_wire_bytes() + 1];
+            line.push(b'\n');
+            let _ = stream.write_all(&line);
+        });
+        let stream = ipc::connect(&path).unwrap();
+        let result = read_response(&stream);
+        drop(stream);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert!(
+            result.is_err(),
+            "the client must reject an oversized reply line before parsing it"
+        );
+    }
 
     #[test]
     fn detach_resets_mouse_and_bracketed_paste_modes() {

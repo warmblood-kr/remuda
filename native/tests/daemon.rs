@@ -16,6 +16,7 @@ use remuda_core::{Session, Size};
 use remuda_native::{client, daemon, ipc, CommandBuilder, PtyAgent, SystemClock};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -68,6 +69,68 @@ fn scratch_dir(tag: &str) -> PathBuf {
     dir
 }
 
+#[cfg(unix)]
+fn wait_for_send_writer_busy(socket: &Path, send_finished: &Receiver<()>) {
+    let busy_deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        match client::request(
+            socket,
+            &Request::Send {
+                name: "target".into(),
+                bytes: Vec::new(),
+            },
+        )
+        .expect("probe whether the large Send owns the writer")
+        {
+            Response::Busy => return,
+            Response::Ok => {
+                assert!(
+                    send_finished.try_recv().is_err(),
+                    "large Send ended before the writer became busy"
+                );
+            }
+            other => panic!("unexpected empty Send probe response: {other:?}"),
+        }
+        assert!(
+            Instant::now() < busy_deadline,
+            "large Send never occupied the session writer"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn spawn_stalled_send(
+    socket: PathBuf,
+    bytes: Vec<u8>,
+    send_finished: std::sync::mpsc::Sender<()>,
+) -> std::thread::JoinHandle<std::io::Result<Response>> {
+    std::thread::spawn(move || {
+        let result = loop {
+            match client::request(
+                &socket,
+                &Request::Send {
+                    name: "target".into(),
+                    bytes: bytes.clone(),
+                },
+            ) {
+                Ok(Response::Busy) => std::thread::sleep(Duration::from_millis(10)),
+                result => break result,
+            }
+        };
+        let _ = send_finished.send(());
+        result
+    })
+}
+
+fn unique_scratch_dir(tag: &str) -> PathBuf {
+    static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(1);
+    let run = NEXT_RUNTIME.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("remuda-u{}-{run}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create unique test runtime directory");
+    dir
+}
+
 /// The address, derived the way the shipped binary derives it. Hand-building
 /// one that merely resembles it is what made the attach test fail first time.
 fn scratch(tag: &str) -> PathBuf {
@@ -93,6 +156,65 @@ fn daemon_at(path: &Path) -> impl Drop {
 
 #[cfg(unix)]
 #[test]
+fn autostart_reports_the_pid_and_recovery_for_a_held_socket_lock() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = scratch_dir("lock-holder");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create isolated runtime dir");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let mut lock_name = socket.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    std::fs::create_dir_all(lock_path.parent().unwrap()).expect("create socket directory");
+    let mut lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .expect("create socket lock");
+    let holder_pid = std::process::id();
+    writeln!(lock_file, "{holder_pid}").expect("write holder pid");
+    assert_eq!(
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0,
+        "hold private socket lock"
+    );
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "-e", "return 1"])
+        .env("REMUDA_RUNTIME_DIR", &dir)
+        .env("HOME", dir.join("home"))
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .expect("run a client that autostarts the daemon");
+    let success = output.status.success();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let names_holder = stderr.contains(&format!("pid {holder_pid}"));
+    let explains_recovery = stderr.contains("kill -CONT")
+        && stderr.contains(&format!("kill {holder_pid}"))
+        && stderr.contains("retry");
+    let announced_wait =
+        stderr.contains("waiting for the socket lock held by another remuda daemon");
+
+    assert_eq!(
+        unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN) },
+        0
+    );
+    drop(lock_file);
+    std::fs::remove_dir_all(&dir).expect("remove private runtime dir");
+    assert!(!success, "autostart must fail while lock is held: {stderr}");
+    assert!(names_holder, "{stderr}");
+    assert!(explains_recovery, "{stderr}");
+    assert!(announced_wait, "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_lock_file_is_private() {
     use std::os::unix::fs::PermissionsExt;
 
@@ -102,6 +224,12 @@ fn daemon_lock_file_is_private() {
     let lock = socket.with_extension("sock.lock");
     let metadata = std::fs::metadata(&lock).expect("daemon lock file exists");
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        std::fs::read_to_string(&lock)
+            .expect("daemon lock holder is recorded")
+            .trim(),
+        daemon.0.id().to_string()
+    );
     assert_eq!(
         client::request(
             &socket,
@@ -519,7 +647,7 @@ fn attached_keystrokes_survive_a_pty_write_timeout_without_detaching() {
 #[cfg(unix)]
 #[test]
 fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
-    let runtime = scratch_dir("probe-attach-send-stall");
+    let runtime = unique_scratch_dir("probe-attach-stall");
     let socket = daemon::socket_path_in(&runtime, "s");
     let _daemon = daemon_at(&socket);
     let marker = runtime.join("start-reader");
@@ -549,20 +677,13 @@ fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
     let mut send_bytes = vec![b'\n'; 1024 * 1024];
     send_bytes.extend_from_slice(b"SEND-END\n");
     let expected_send = send_bytes.clone();
-    let send_socket = socket.clone();
     let started = Instant::now();
-    let sender = std::thread::spawn(move || {
-        client::request(
-            &send_socket,
-            &Request::Send {
-                name: "target".into(),
-                bytes: send_bytes,
-            },
-        )
-    });
+    let (send_finished_tx, send_finished_rx) = std::sync::mpsc::channel();
+    let sender = spawn_stalled_send(socket.clone(), send_bytes, send_finished_tx);
 
-    // Let Send fill the PTY and hold the per-session writer before attaching.
-    std::thread::sleep(Duration::from_millis(400));
+    // Empty sends make safe probes: they cannot affect the captured bytes.
+    // Observe Busy before attaching, rather than assuming a fixed delay.
+    wait_for_send_writer_busy(&socket, &send_finished_rx);
     let mut stream = raw_attach(&socket, "target");
     stream
         .write_all(b"HUMAN-ONE\n")
