@@ -885,22 +885,7 @@ fn route_tokens(
                 }
             }
             InputToken::Bytes(bytes) => {
-                if *mouse_on && (bytes == b"\x1b[5~" || bytes == b"\x1b[6~") {
-                    let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    sync_scrollback_anchor(path, name, scrollback);
-                    let old = scrollback.offset.load(Ordering::SeqCst);
-                    let history_rows = history_metadata(path, name).map_or(0, |(rows, _)| rows);
-                    let next = if bytes == b"\x1b[5~" {
-                        old.saturating_add(24).min(history_rows)
-                    } else {
-                        old.saturating_sub(24)
-                    };
-                    if next != old {
-                        scrollback.offset.store(next, Ordering::SeqCst);
-                        if let Some((_, total)) = paint_history(path, name, next) {
-                            scrollback.history_total.store(total, Ordering::SeqCst);
-                        }
-                    }
+                if route_scrollback_page(path, name, &bytes, *mouse_on, scrollback, output_lock) {
                     continue;
                 }
                 let mut start = 0;
@@ -946,6 +931,48 @@ fn route_tokens(
             }
         }
     }
+}
+
+/// Handle PageUp/PageDown locally only when the child has not enabled mouse
+/// reporting. At live offset zero, leave the key for the child.
+fn route_scrollback_page(
+    path: &Path,
+    name: &str,
+    bytes: &[u8],
+    mouse_on: bool,
+    scrollback: &AttachScrollback,
+    output_lock: &std::sync::Mutex<()>,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    if !mouse_on || (bytes != b"\x1b[5~" && bytes != b"\x1b[6~") {
+        return false;
+    }
+    let child_tracks_mouse = matches!(
+        request(path, &Request::MouseState { name: name.into() }),
+        Ok(Response::MouseState(state)) if state.mode != remuda_core::agent::MouseMode::None
+    );
+    if child_tracks_mouse {
+        return false;
+    }
+
+    let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
+    sync_scrollback_anchor(path, name, scrollback);
+    let old = scrollback.offset.load(Ordering::SeqCst);
+    let history_rows = history_metadata(path, name).map_or(0, |(rows, _)| rows);
+    let next = if bytes == b"\x1b[5~" {
+        old.saturating_add(24).min(history_rows)
+    } else {
+        old.saturating_sub(24)
+    };
+    if next != old {
+        scrollback.offset.store(next, Ordering::SeqCst);
+        if let Some((_, total)) = paint_history(path, name, next) {
+            scrollback.history_total.store(total, Ordering::SeqCst);
+        }
+        return true;
+    }
+    old != 0
 }
 
 fn route_scrollback_wheel(
@@ -1088,7 +1115,7 @@ fn paint_history(path: &Path, name: &str, offset: usize) -> Option<(usize, usize
     if offset != 0 {
         let _ = write!(
             stdout,
-            "\x1b[{};1H\x1b[2K[scrollback: {offset} rows — PgUp/PgDn, q/Esc returns]",
+            "\x1b[{};1H\x1b[2K[scrollback: {offset} rows — PgUp/PgDn scroll; q/Esc exits, other keys return live and pass through]",
             rows.len().max(1)
         );
     }

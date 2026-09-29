@@ -3362,6 +3362,186 @@ fn direct_attach_wheel_up_with_no_history_does_not_enter_scrollback() {
 
 #[cfg(unix)]
 #[test]
+fn direct_attach_forwards_pagedown_at_live_bottom_to_the_child() {
+    let dir = scratch_dir("a-pgdn-live");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw -echo; printf 'pgdn-ready\\n'; dd bs=1 count=4 2>/dev/null | od -An -tx1; printf '\\npgdn-forwarded\\n'; sleep 1".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start raw child");
+    assert_eq!(created, Response::Value("target".into()));
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "pgdn-ready");
+    held.write_raw(b"\x1b[6~").expect("PageDown at live bottom");
+    let received = collect_until_bytes(&output, b"pgdn-forwarded");
+    let received_hex: String = String::from_utf8_lossy(&received)
+        .split_whitespace()
+        .collect();
+    assert!(
+        received_hex.contains("1b5b367e"),
+        "the live PageDown bytes did not reach the child: {received:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_forwards_paging_keys_when_the_child_tracks_mouse() {
+    use remuda_core::agent::{MouseEncoding, MouseMode, MouseState};
+
+    let dir = scratch_dir("a-pg-mouse");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw -echo; printf '\\033[?1000h\\033[?1006h'; printf 'mouse-page-ready\\n'; dd bs=1 count=4 2>/dev/null | od -An -tx1; printf '\\nmouse-page-forwarded\\n'; sleep 1".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start mouse-reporting child");
+    assert_eq!(created, Response::Value("target".into()));
+    wait_for(&path, "target", "mouse-page-ready");
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match client::request(
+            &path,
+            &Request::MouseState {
+                name: "target".into(),
+            },
+        ) {
+            Ok(Response::MouseState(MouseState {
+                mode: MouseMode::PressRelease,
+                encoding: MouseEncoding::Sgr,
+                ..
+            })) => break,
+            other => {
+                assert!(
+                    Instant::now() < deadline,
+                    "child mouse mode not observed: {other:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "mouse-page-ready");
+    held.write_raw(b"\x1b[5~")
+        .expect("PageUp with child mouse mode");
+    let received = collect_until_bytes(&output, b"mouse-page-forwarded");
+    let received_hex: String = String::from_utf8_lossy(&received)
+        .split_whitespace()
+        .collect();
+    assert!(
+        received_hex.contains("1b5b357e"),
+        "the child did not receive PageUp: {received:?}"
+    );
+    assert!(!viewer.screen_text().unwrap().contains("[scrollback:"));
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_history_exit_keys_are_swallowed_and_other_keys_pass_through() {
+    let dir = scratch_dir("a-history-keys");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "i=0; while [ $i -lt 80 ]; do printf 'keyhistory-%03d\\n' \"$i\"; i=$((i+1)); done; stty raw -echo; printf 'history-key-ready\\n'; dd bs=1 count=1 2>/dev/null | od -An -tx1; printf '\\nforwarded-key\\n'; sleep 1".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start history child");
+    assert_eq!(created, Response::Value("target".into()));
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "history-key-ready");
+    let _ = collect_until_bytes(&output, b"history-key-ready");
+
+    held.write_raw(b"\x1b[5~").expect("PageUp into history");
+    let _ = collect_until_bytes(&output, b"[scrollback: 24 rows");
+    let indicator = viewer.screen_text().expect("history indicator");
+    assert!(
+        indicator.contains("q/Esc exits, other keys return live and pass through"),
+        "indicator must explain exit and key routing: {indicator:?}"
+    );
+
+    held.write_raw(b"q").expect("exit history with q");
+    let _ = collect_until_bytes(&output, b"history-key-ready");
+    assert!(!viewer.screen_text().unwrap().contains("[scrollback:"));
+    held.write_raw(b"\x1b[5~")
+        .expect("PageUp into history again");
+    let _ = collect_until_bytes(&output, b"[scrollback: 24 rows");
+    held.write_raw(b"\x1b").expect("exit history with Escape");
+    let _ = collect_until_bytes(&output, b"history-key-ready");
+    assert!(!viewer.screen_text().unwrap().contains("[scrollback:"));
+
+    held.write_raw(b"x")
+        .expect("send ordinary key after exiting history");
+    let received = collect_until_bytes(&output, b"forwarded-key");
+    assert!(
+        received.windows(b"78".len()).any(|w| w == b"78"),
+        "ordinary key was not passed to the child: {received:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
     use remuda_core::agent::{MouseEncoding, MouseMode, MouseState};
 
