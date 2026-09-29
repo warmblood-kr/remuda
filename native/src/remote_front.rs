@@ -76,12 +76,10 @@ pub fn forward_frame_with_timeout(
 }
 
 fn forward_request_with_timeout(
-    path: &std::path::Path,
+    path: &Path,
     request: &Request,
     timeout: std::time::Duration,
 ) -> Result<Vec<u8>, String> {
-    // The front cannot cancel a daemon IPC request when its peer disconnects;
-    // retain this remote-only slot until the bounded daemon wait completes.
     let _remote_sync_permit = if matches!(request, Request::Sync { .. }) {
         let Some(permit) = RemoteSyncPermit::acquire() else {
             return serde_json::to_vec(&remuda_core::protocol::Response::SyncAtCapacity)
@@ -274,6 +272,8 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::Mkdir { .. } => Err(refusal("Mkdir")),
         Request::RemoveDirAll { .. } => Err(refusal("RemoveDirAll")),
         Request::Version => Err(refusal("Version")),
+        Request::ClusterRegistrySync { .. } => Err(refusal("ClusterRegistrySync")),
+        Request::ClusterRegistryUpdate { .. } => Err(refusal("ClusterRegistryUpdate")),
         Request::Shutdown { .. } => Err(refusal("Shutdown")),
         Request::Eval { .. } => Err(refusal("Eval")),
     }
@@ -434,6 +434,13 @@ mod tests {
             Request::Mkdir { path: "/".into() },
             Request::RemoveDirAll { path: "/".into() },
             Request::Version,
+            Request::ClusterRegistrySync {
+                digest: None,
+                offset: 0,
+            },
+            Request::ClusterRegistryUpdate {
+                update_json: "private-registry-update".into(),
+            },
             Request::Shutdown {
                 requester_daemon_id: None,
                 requester_session_id: None,
@@ -465,6 +472,22 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error, "remote front refuses Send");
+
+        assert_eq!(
+            authorize(&Request::ClusterRegistrySync {
+                digest: Some("private-digest".into()),
+                offset: 12,
+            })
+            .unwrap_err(),
+            "remote front refuses ClusterRegistrySync"
+        );
+        assert_eq!(
+            authorize(&Request::ClusterRegistryUpdate {
+                update_json: "private-registry-update".into(),
+            })
+            .unwrap_err(),
+            "remote front refuses ClusterRegistryUpdate"
+        );
     }
 
     #[test]

@@ -572,15 +572,21 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                 let n = match read {
                     Ok(Some(n)) => n,
                     Ok(None) => {
-                        route_tokens(
-                            &path,
-                            &name,
-                            &mut stream,
-                            parser.flush_expired(),
-                            &mut mouse_on,
-                            &scrollback,
-                            &output_lock,
-                        );
+                        if mouse {
+                            route_tokens(
+                                &path,
+                                &name,
+                                &mut stream,
+                                parser.flush_expired(),
+                                &mut mouse_on,
+                                &scrollback,
+                                &output_lock,
+                            );
+                        } else {
+                            let paste_was_open = parser.paste_open();
+                            let _ = parser.flush_expired();
+                            let _ = close_raw_paste_if_needed(paste_was_open, &parser, &mut stream);
+                        }
                         continue;
                     }
                     Err(_) => break,
@@ -592,7 +598,8 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     break;
                 }
                 trace_input_read(trace_input.as_deref(), &buf[..n]);
-                match buf[..n].iter().position(|&b| b == DETACH) {
+                let detach_at = detach_offset(&parser, &buf[..n]);
+                match detach_at {
                     // Forward what was typed before the detach key, then stop.
                     // Dropping those bytes would silently swallow input the
                     // user believes they sent.
@@ -608,18 +615,25 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                                 &output_lock,
                             );
                         } else if at > 0 {
+                            let _ = parser.feed(&buf[..at]);
                             let _ = stream.write_all(&buf[..at]);
                             let _ = stream.flush();
                         }
-                        route_tokens(
-                            &path,
-                            &name,
-                            &mut stream,
-                            parser.finish(),
-                            &mut mouse_on,
-                            &scrollback,
-                            &output_lock,
-                        );
+                        if mouse {
+                            route_tokens(
+                                &path,
+                                &name,
+                                &mut stream,
+                                parser.finish(),
+                                &mut mouse_on,
+                                &scrollback,
+                                &output_lock,
+                            );
+                        } else {
+                            let paste_was_open = parser.paste_open();
+                            let _ = parser.finish();
+                            let _ = close_raw_paste_if_needed(paste_was_open, &parser, &mut stream);
+                        }
                         detached.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
@@ -635,10 +649,30 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                                 &output_lock,
                             );
                         } else {
+                            let _ = parser.feed(&buf[..n]);
                             let _ = stream.write_all(&buf[..n]);
                             let _ = stream.flush();
                         }
                     }
+                }
+            }
+            // stdin EOF/errors and child exit can end this thread mid-paste.
+            // Always restore the child parser before dropping its input pipe.
+            if parser.paste_open() {
+                if mouse {
+                    route_tokens(
+                        &path,
+                        &name,
+                        &mut stream,
+                        parser.finish(),
+                        &mut mouse_on,
+                        &scrollback,
+                        &output_lock,
+                    );
+                } else {
+                    let paste_was_open = parser.paste_open();
+                    let _ = parser.finish();
+                    let _ = close_raw_paste_if_needed(paste_was_open, &parser, &mut stream);
                 }
             }
             // Ends the screen pump below, which then returns from `attach` and
@@ -895,6 +929,31 @@ fn route_tokens(
     }
 }
 
+fn detach_offset(parser: &crate::mouse::SgrParser, bytes: &[u8]) -> Option<usize> {
+    if parser.paste_open()
+        && bytes == [DETACH]
+        && parser.paste_idle_at_least(std::time::Duration::from_secs(1))
+    {
+        // While a bracketed paste is live, Ctrl-\\ is data unless it arrives
+        // alone after the paste has gone idle.
+        Some(0)
+    } else {
+        parser.first_byte_outside_paste(bytes, DETACH)
+    }
+}
+
+fn close_raw_paste_if_needed<W: std::io::Write>(
+    was_open: bool,
+    parser: &crate::mouse::SgrParser,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    if was_open && !parser.paste_open() {
+        writer.write_all(b"\x1b[201~")?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
 fn exit_history_if_needed(
     path: &Path,
     name: &str,
@@ -1122,17 +1181,16 @@ impl Drop for RawMode {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use super::request_with_timeout;
-    #[cfg(unix)]
     use super::trace_input_read;
-    use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
+    use super::{
+        close_raw_paste_if_needed, detach_offset, interpret, read_response_with_timeout,
+        request_with_timeout, reset_input_modes, write_input_trace, DETACH, RESET_INPUT_MODES,
+    };
     #[cfg(unix)]
     use crate::ipc;
     #[cfg(unix)]
-    use interprocess::local_socket::traits::ListenerExt;
-    #[cfg(unix)]
-    use remuda_core::protocol::Request;
-    use remuda_core::protocol::Response;
+    use interprocess::local_socket::traits::Listener as _;
+    use remuda_core::protocol::{Request, Response};
     #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(unix)]
@@ -1140,6 +1198,59 @@ mod tests {
     #[cfg(unix)]
     use std::time::Instant;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn detach_inside_paste_requires_a_lone_ctrl_backslash_after_idle() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[200~payload").is_empty());
+        assert_eq!(detach_offset(&parser, &[DETACH]), None);
+        assert_eq!(detach_offset(&parser, &[b'x', DETACH]), None);
+        std::thread::sleep(Duration::from_millis(1010));
+        assert_eq!(detach_offset(&parser, &[DETACH]), Some(0));
+        assert!(
+            matches!(parser.finish().last(), Some(crate::mouse::InputToken::Paste(bytes)) if bytes.ends_with(b"\x1b[201~"))
+        );
+    }
+
+    #[test]
+    fn detach_byte_inside_single_read_paste_is_data() {
+        let parser = crate::mouse::SgrParser::default();
+        let paste = b"\x1b[200~ab\x1ccd\x1b[201~";
+        assert_eq!(detach_offset(&parser, paste), None);
+    }
+
+    #[test]
+    fn detach_byte_inside_paste_after_split_start_marker_is_data() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[20").is_empty());
+        let tail = b"0~ab\x1ccd\x1b[201~";
+        assert_eq!(detach_offset(&parser, tail), None);
+        assert!(parser
+            .feed(tail)
+            .iter()
+            .all(|token| matches!(token, crate::mouse::InputToken::Paste(_))));
+    }
+
+    #[test]
+    fn detach_after_paste_end_in_the_same_read_is_still_a_hotkey() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[200~body").is_empty());
+        let input = b"tail\x1b[201~x\x1c";
+        assert_eq!(detach_offset(&parser, input), Some(input.len() - 1));
+    }
+
+    #[test]
+    fn raw_mouse_disabled_recovery_closes_child_paste_after_timeout() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[200~raw bytes").is_empty());
+        let was_open = parser.paste_open();
+        // A timeout or detach transitions the parser to closed; raw mode has
+        // already forwarded its buffered content, so it only writes the end.
+        let _ = parser.finish();
+        let mut child_input = Vec::new();
+        close_raw_paste_if_needed(was_open, &parser, &mut child_input).unwrap();
+        assert_eq!(child_input, b"\x1b[201~");
+    }
 
     #[cfg(unix)]
     fn assert_request_timeout(request: Request) {
@@ -1155,11 +1266,7 @@ mod tests {
         let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
-            let stream = listener
-                .incoming()
-                .next()
-                .expect("incoming connection")
-                .expect("accept");
+            let stream = listener.accept().expect("accept");
             accepted_tx.send(()).expect("notify accepted");
             release_rx.recv().expect("release silent peer");
             drop(stream);
@@ -1216,32 +1323,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn local_daemon_response_wait_has_a_timeout() {
-        use interprocess::local_socket::traits::ListenerExt as _;
-        let path = std::env::temp_dir().join(format!(
-            "remuda-client-timeout-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let listener = crate::ipc::listen(&path).unwrap();
-        let server = std::thread::spawn(move || {
-            let _stream = listener.incoming().next().unwrap().unwrap();
-            std::thread::sleep(Duration::from_millis(250));
-        });
-        let started = std::time::Instant::now();
-        let error =
-            request_with_timeout(&path, &Request::List, Duration::from_millis(40)).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_millis(200));
-        server.join().unwrap();
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn reply_reader_rejects_a_line_over_the_shared_reply_limit() {
         use super::read_response;
         use crate::ipc;
@@ -1274,19 +1355,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn detach_resets_mouse_and_bracketed_paste_modes() {
-        let mut output = Vec::new();
-        reset_input_modes(&mut output).unwrap();
-        assert_eq!(output, RESET_INPUT_MODES);
-    }
-
     #[cfg(unix)]
     #[test]
     fn response_is_read_when_peer_closes_before_timeout_is_set() {
-        use super::read_response_with_timeout;
         use crate::ipc;
-        use interprocess::local_socket::traits::Listener as _;
         use std::io::Write;
 
         let path = std::env::temp_dir().join(format!(
@@ -1311,6 +1383,39 @@ mod tests {
         let response = read_response_with_timeout(&path, stream, Duration::from_secs(1)).unwrap();
 
         assert_eq!(response, expected);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn detach_resets_mouse_and_bracketed_paste_modes() {
+        let mut output = Vec::new();
+        reset_input_modes(&mut output).unwrap();
+        assert_eq!(output, RESET_INPUT_MODES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_daemon_response_wait_has_a_timeout() {
+        use interprocess::local_socket::traits::ListenerExt as _;
+        let path = std::env::temp_dir().join(format!(
+            "remuda-client-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = crate::ipc::listen(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let _stream = listener.incoming().next().unwrap().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let started = std::time::Instant::now();
+        let error =
+            request_with_timeout(&path, &Request::List, Duration::from_millis(40)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.join().unwrap();
         let _ = std::fs::remove_file(path);
     }
 

@@ -118,6 +118,11 @@ pub(super) fn reject_low_order_dh(private_key: &[u8], public_key: &[u8]) -> io::
     Ok(())
 }
 
+/// Refuse a static X25519 public key that produces the all-zero DH result.
+pub fn validate_static_public_key(public_key: &[u8]) -> io::Result<()> {
+    reject_low_order_dh(&[0x42; 32], public_key)
+}
+
 #[cfg(test)]
 pub(super) fn request_with_low_order_key(
     responder_static: &[u8],
@@ -276,19 +281,6 @@ mod tests {
     }
 
     #[test]
-    fn open_request_identifies_low_order_ephemeral_and_static_keys() {
-        let responder = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
-            .generate_keypair()
-            .unwrap();
-        for low_order_static in [false, true] {
-            let message = request_with_low_order_key(&responder.public, low_order_static).unwrap();
-            assert!(message.len() > 32);
-            let error = open_request(&responder.private, &message).err().unwrap();
-            assert_eq!(error.to_string(), "low-order Noise DH result");
-        }
-    }
-
-    #[test]
     fn open_response_rejects_low_order_responder_ephemeral() {
         let initiator = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
             .generate_keypair()
@@ -299,9 +291,21 @@ mod tests {
         let sealed = seal_request(&initiator.private, &responder.public, 1000, b"request").unwrap();
         let mut message = vec![0; 32];
         message.extend_from_slice(&[0; 64]);
-
-        let error = open_response(sealed, &message).err().unwrap();
+        let error = open_response(sealed, &message).unwrap_err();
         assert_eq!(error.to_string(), "low-order Noise DH result");
+    }
+
+    #[test]
+    fn open_request_identifies_low_order_ephemeral_and_static_keys() {
+        let responder = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        for low_order_static in [false, true] {
+            let message = request_with_low_order_key(&responder.public, low_order_static).unwrap();
+            assert!(message.len() > 32);
+            let error = open_request(&responder.private, &message).err().unwrap();
+            assert_eq!(error.to_string(), "low-order Noise DH result");
+        }
     }
 
     #[test]

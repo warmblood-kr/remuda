@@ -32,8 +32,9 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-#[cfg(unix)]
 use std::sync::Mutex;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::SystemClock;
 use portable_pty::CommandBuilder;
@@ -266,8 +267,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     let listener: Listener = ipc::listen(path)?;
     #[cfg(unix)]
     let listener = prepare_unix_listener(listener, path)?;
-    #[cfg(windows)]
-    let listener = listener;
+    let anti_entropy = Arc::new(AntiEntropyTask::start()?);
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
 
     let registry = Arc::new(Registry::new());
@@ -307,212 +307,109 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
             registry,
             image,
             counters,
-            socket_owner,
-        )
+            (socket_owner, anti_entropy),
+        );
     }
     #[cfg(windows)]
     {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            spawn_connection(stream, &registry, &image, &counters, &socket_owner);
+            let registry = Arc::clone(&registry);
+            let image = image.clone();
+            let counters = Arc::clone(&counters);
+            let socket_owner = Arc::clone(&socket_owner);
+            let anti_entropy = anti_entropy.clone();
+            std::thread::spawn(move || {
+                let _ = handle(
+                    stream,
+                    &registry,
+                    &image,
+                    &counters,
+                    socket_owner,
+                    anti_entropy,
+                );
+            });
         }
+        anti_entropy.stop_and_join();
+        socket_owner.cleanup();
         Ok(())
     }
 }
 
-#[cfg(unix)]
-fn serve_unix(
-    mut listener: Listener,
-    socket: (&Path, Option<&Path>),
-    mut signals: std::os::unix::net::UnixStream,
-    registry: Arc<Registry>,
-    image: Image,
-    counters: Arc<crate::tick::Counters>,
-    socket_owner: Arc<SocketOwnership>,
-) -> ! {
-    use std::io::Read as _;
-    use std::os::fd::AsRawFd;
+struct AntiEntropyTask {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
 
-    // Auto-started (#107), the daemon leads its own session and a HUP is a
-    // stray one. Run by hand in a terminal it does not, and a HUP means that
-    // terminal really hung up — stop in order rather than write to a dead tty.
-    // SAFETY: getsid/getpid only read this process's ids.
-    let detached = unsafe { libc::getsid(0) == libc::getpid() };
-    let mut signal_bytes = [0u8; 1];
-    'poll_loop: loop {
-        let mut watched = [
-            libc::pollfd {
-                fd: unix_listener_fd(&listener),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: signals.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        // SAFETY: `watched` points to two initialized pollfd values for the
-        // duration of this blocking call. A negative timeout waits indefinitely.
-        let ready = unsafe { libc::poll(watched.as_mut_ptr(), watched.len() as _, -1) };
-        if ready < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            eprintln!("remuda daemon: poll failed: {error}");
-            continue;
-        }
+impl AntiEntropyTask {
+    fn start() -> std::io::Result<Self> {
+        let interval = anti_entropy_interval();
+        Self::start_with(
+            interval,
+            crate::cluster::replication::startup_sync,
+            crate::cluster::replication::anti_entropy_sync,
+        )
+    }
 
-        // Handle signals first when both descriptors are ready. In particular,
-        // SIGUSR1 can replace the listener before accepting a queued probe.
-        if watched[1].revents & libc::POLLIN != 0 {
-            match signals.read(&mut signal_bytes) {
-                Ok(0) => continue,
-                Ok(count) => {
-                    for byte in &signal_bytes[..count] {
-                        let signal = libc::c_int::from(*byte);
-                        if signal == libc::SIGUSR1 {
-                            rebind_after_sigusr1(&mut listener, socket.0, socket.1, &socket_owner);
-                            // The old listener's readiness bits cannot describe
-                            // the replacement listener. Poll both fds again.
-                            continue 'poll_loop;
-                        }
-                        let name = match signal {
-                            libc::SIGTERM => "SIGTERM",
-                            libc::SIGINT => "SIGINT",
-                            _ if detached => {
-                                let _ = writeln!(
-                                    std::io::stderr(),
-                                    "remuda daemon: SIGHUP ignored — use `remuda stop` to stop it"
-                                );
-                                continue;
-                            }
-                            _ => "SIGHUP",
-                        };
-                        let _ = writeln!(std::io::stderr(), "remuda daemon: {name}, shutting down");
-                        reap_processes_before_exit(&image);
-                        socket_owner.cleanup();
-                        std::process::exit(0);
-                    }
+    fn start_with(
+        interval: Duration,
+        initial_sync: impl FnOnce() + Send + 'static,
+        periodic_sync: impl Fn() + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("remuda-cluster-anti-entropy".into())
+            .spawn(move || {
+                initial_sync();
+                while matches!(
+                    stopped.recv_timeout(interval),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    periodic_sync();
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    eprintln!("remuda daemon: signal socket read failed: {error}");
-                    continue;
-                }
-            }
-        }
+            })?;
+        Ok(Self {
+            stop,
+            thread: Mutex::new(Some(thread)),
+        })
+    }
 
-        if watched[0].revents & libc::POLLIN != 0 {
-            match listener.accept() {
-                Ok(stream) => {
-                    if let Err(error) = stream.set_nonblocking(false) {
-                        eprintln!("remuda daemon: could not restore blocking client mode: {error}");
-                        continue;
-                    }
-                    spawn_connection(stream, &registry, &image, &counters, &socket_owner);
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::Interrupted
-                            | std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::ConnectionAborted
-                    ) => {}
-                Err(error) => eprintln!("remuda daemon: accept failed: {error}"),
-            }
+    fn stop_and_join(&self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = thread.join();
         }
+    }
+
+    #[cfg(test)]
+    fn is_joined(&self) -> bool {
+        self.thread
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_none()
     }
 }
 
-#[cfg(unix)]
-fn prepare_unix_listener(mut listener: Listener, path: &Path) -> std::io::Result<Listener> {
-    use std::os::unix::fs::PermissionsExt;
-
-    // SocketOwnership performs inode-conditional cleanup, so an old listener
-    // must never unlink a replacement path when it is dropped.
-    listener.do_not_reclaim_name_on_drop();
-    listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
-    // Both initial binds and SIGUSR1 rebinds occur inside a validated private
-    // directory before the socket mode is tightened.
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(listener)
-}
-
-#[cfg(unix)]
-fn unix_listener_fd(listener: &Listener) -> std::os::fd::RawFd {
-    use std::os::fd::AsRawFd;
-    match listener {
-        interprocess::local_socket::Listener::UdSocket(listener) => listener.inner().as_raw_fd(),
+impl Drop for AntiEntropyTask {
+    fn drop(&mut self) {
+        self.stop_and_join();
     }
 }
 
-#[cfg(unix)]
-fn rebind_after_sigusr1(
-    listener: &mut Listener,
-    path: &Path,
-    runtime: Option<&Path>,
-    socket_owner: &SocketOwnership,
-) {
-    // Our current listener already owns this exact path, so rebinding it would
-    // only perform an unnecessary self-connect and report a misleading error.
-    if socket_owner.owns_path() {
-        return;
+fn anti_entropy_interval() -> Duration {
+    if let Some(milliseconds) = std::env::var("REMUDA_TEST_CLUSTER_SYNC_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 10)
+    {
+        return Duration::from_millis(milliseconds);
     }
-    if let Err(error) = prepare_socket_path(path, runtime) {
-        eprintln!(
-            "remuda daemon: could not validate socket directory {} before rebind: {error}",
-            path.display()
-        );
-        return;
-    }
-    match ipc::listen(path) {
-        Ok(replacement) => {
-            let replacement = match prepare_unix_listener(replacement, path) {
-                Ok(listener) => listener,
-                Err(error) => {
-                    eprintln!(
-                        "remuda daemon: could not prepare rebound socket at {}: {error}",
-                        path.display()
-                    );
-                    return;
-                }
-            };
-            let refreshed = socket_owner.refresh();
-            *listener = replacement;
-            match refreshed {
-                Ok(()) => eprintln!(
-                    "remuda daemon: rebound socket at {} after SIGUSR1",
-                    path.display()
-                ),
-                Err(error) => eprintln!(
-                    "remuda daemon: could not record rebound socket at {}: {error}",
-                    path.display()
-                ),
-            }
-        }
-        Err(error) => eprintln!(
-            "remuda daemon: could not rebind socket at {} after SIGUSR1: {error}",
-            path.display()
-        ),
-    }
-}
-
-fn spawn_connection(
-    stream: Stream,
-    registry: &Arc<Registry>,
-    image: &Image,
-    counters: &Arc<crate::tick::Counters>,
-    socket_owner: &Arc<SocketOwnership>,
-) {
-    let registry = Arc::clone(registry);
-    let image = image.clone();
-    let counters = Arc::clone(counters);
-    let socket_owner = Arc::clone(socket_owner);
-    std::thread::spawn(move || {
-        let _ = handle(stream, &registry, &image, &counters, socket_owner);
-    });
+    Duration::from_secs(60 + u64::from(std::process::id() % 11))
 }
 
 /// Serialize stale-socket removal and bind for one daemon name. The lock file
@@ -873,10 +770,10 @@ const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 /// notifying anywhere else would race it and silently drop the event.
 pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String> {
     let dead = registry.reap_with_exit_info();
-    for (name, id, reason, exit_info) in &dead {
-        notify_exited(image, name, id, reason, exit_info.as_ref());
+    for (name, id, instance_id, reason, exit_info) in &dead {
+        notify_exited(image, name, id, instance_id, reason, exit_info.as_ref());
     }
-    dead.into_iter().map(|(name, _, _, _)| name).collect()
+    dead.into_iter().map(|(name, _, _, _, _)| name).collect()
 }
 
 fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<()>> {
@@ -889,22 +786,10 @@ fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<(
             image,
             name,
             session.id(),
+            session.instance_id(),
             "closed",
             session.exit_info().as_ref(),
         );
-    }
-    Some(closed.map(drop))
-}
-
-fn close_instance(
-    registry: &Registry,
-    image: &Image,
-    name: &str,
-    instance_id: &str,
-) -> Option<AgentResult<()>> {
-    let closed = registry.close_instance(name, instance_id)?;
-    if let Ok(true) = closed {
-        notify_exited(image, name, instance_id, "closed", None);
     }
     Some(closed.map(drop))
 }
@@ -915,6 +800,7 @@ fn notify_exited(
     image: &Image,
     name: &str,
     id: &str,
+    instance_id: &str,
     reason: &str,
     exit_info: Option<&remuda_core::agent::ExitInfo>,
 ) {
@@ -936,6 +822,10 @@ fn notify_exited(
             }
         }
     }
+    fields.push(format!(
+        "instance_id={}",
+        crate::mcp::lua_string(instance_id)
+    ));
     let details = format!("{{{}}}", fields.join(", "));
     let _ = image.submit(
         &format!(
@@ -979,6 +869,167 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
         Request::CaptureStyled { .. } => counters.counter("request_capture_styled").record_hit(),
         Request::Sync { .. } => counters.counter("request_sync").record_hit(),
         _ => {}
+    }
+}
+
+#[cfg(unix)]
+fn serve_unix(
+    mut listener: Listener,
+    socket: (&Path, Option<&Path>),
+    mut signals: std::os::unix::net::UnixStream,
+    registry: Arc<Registry>,
+    image: Image,
+    counters: Arc<crate::tick::Counters>,
+    lifecycle: (Arc<SocketOwnership>, Arc<AntiEntropyTask>),
+) -> ! {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd;
+
+    let (socket_owner, anti_entropy) = lifecycle;
+    let detached = unsafe { libc::getsid(0) == libc::getpid() };
+    let mut signal_bytes = [0u8; 1];
+    'poll_loop: loop {
+        let mut watched = [
+            libc::pollfd {
+                fd: unix_listener_fd(&listener),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: signals.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(watched.as_mut_ptr(), watched.len() as _, -1) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                eprintln!("remuda daemon: poll failed: {error}");
+            }
+            continue;
+        }
+
+        if watched[1].revents & libc::POLLIN != 0 {
+            match signals.read(&mut signal_bytes) {
+                Ok(0) => continue,
+                Ok(count) => {
+                    for byte in &signal_bytes[..count] {
+                        let signal = libc::c_int::from(*byte);
+                        if signal == libc::SIGUSR1 {
+                            rebind_after_sigusr1(&mut listener, socket.0, socket.1, &socket_owner);
+                            continue 'poll_loop;
+                        }
+                        let name = match signal {
+                            libc::SIGTERM => "SIGTERM",
+                            libc::SIGINT => "SIGINT",
+                            _ if detached => {
+                                let _ = writeln!(
+                                    std::io::stderr(),
+                                    "remuda daemon: SIGHUP ignored — use `remuda stop` to stop it"
+                                );
+                                continue;
+                            }
+                            _ => "SIGHUP",
+                        };
+                        let _ = writeln!(std::io::stderr(), "remuda daemon: {name}, shutting down");
+                        reap_processes_before_exit(&image);
+                        anti_entropy.stop_and_join();
+                        socket_owner.cleanup();
+                        std::process::exit(0);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    eprintln!("remuda daemon: signal socket read failed: {error}");
+                    continue;
+                }
+            }
+        }
+
+        if watched[0].revents & libc::POLLIN != 0 {
+            match listener.accept() {
+                Ok(stream) => {
+                    if let Err(error) = stream.set_nonblocking(false) {
+                        eprintln!("remuda daemon: could not restore blocking client mode: {error}");
+                        continue;
+                    }
+                    let registry = Arc::clone(&registry);
+                    let image = image.clone();
+                    let counters = Arc::clone(&counters);
+                    let socket_owner = Arc::clone(&socket_owner);
+                    let anti_entropy = Arc::clone(&anti_entropy);
+                    std::thread::spawn(move || {
+                        let _ = handle(
+                            stream,
+                            &registry,
+                            &image,
+                            &counters,
+                            socket_owner,
+                            anti_entropy,
+                        );
+                    });
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                Err(error) => eprintln!("remuda daemon: accept failed: {error}"),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn prepare_unix_listener(mut listener: Listener, path: &Path) -> std::io::Result<Listener> {
+    use std::os::unix::fs::PermissionsExt;
+
+    listener.do_not_reclaim_name_on_drop();
+    listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+#[cfg(unix)]
+fn unix_listener_fd(listener: &Listener) -> std::os::fd::RawFd {
+    use std::os::fd::AsRawFd;
+    match listener {
+        interprocess::local_socket::Listener::UdSocket(listener) => listener.inner().as_raw_fd(),
+    }
+}
+
+#[cfg(unix)]
+fn rebind_after_sigusr1(
+    listener: &mut Listener,
+    path: &Path,
+    runtime: Option<&Path>,
+    socket_owner: &SocketOwnership,
+) {
+    if socket_owner.owns_path() {
+        return;
+    }
+    if let Err(error) = prepare_socket_path(path, runtime) {
+        eprintln!(
+            "remuda daemon: could not validate socket directory {} before rebind: {error}",
+            path.display()
+        );
+        return;
+    }
+    match ipc::listen(path) {
+        Ok(replacement) => match prepare_unix_listener(replacement, path) {
+            Ok(replacement) => {
+                let refreshed = socket_owner.refresh();
+                *listener = replacement;
+                if let Err(error) = refreshed {
+                    eprintln!("remuda daemon: could not record rebound socket: {error}");
+                }
+            }
+            Err(error) => eprintln!("remuda daemon: could not prepare rebound socket: {error}"),
+        },
+        Err(error) => eprintln!("remuda daemon: could not rebind socket: {error}"),
     }
 }
 
@@ -1068,6 +1119,7 @@ fn handle(
     image: &Image,
     counters: &crate::tick::Counters,
     socket_owner: Arc<SocketOwnership>,
+    anti_entropy: Arc<AntiEntropyTask>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let Some(request) = read_request(&stream, &mut reader)? else {
@@ -1075,16 +1127,15 @@ fn handle(
     };
 
     record_request(counters, &request);
-    handle_request(stream, reader, registry, image, socket_owner, request)
-}
-
-fn handle_list(stream: &Stream, registry: &Registry, image: &Image) -> std::io::Result<()> {
-    // Where a session that ended stops being listed: a reaper thread would
-    // need a clock this layer is not given.
-    if !keep_exited() {
-        reap_and_notify(registry, image);
-    }
-    reply(stream, &Response::Sessions(registry.list()))
+    handle_request(
+        stream,
+        reader,
+        registry,
+        image,
+        socket_owner,
+        anti_entropy,
+        request,
+    )
 }
 
 fn handle_request(
@@ -1093,17 +1144,25 @@ fn handle_request(
     registry: &Registry,
     image: &Image,
     socket_owner: Arc<SocketOwnership>,
+    anti_entropy: Arc<AntiEntropyTask>,
     request: Request,
 ) -> std::io::Result<()> {
     match request {
-        Request::List => handle_list(&stream, registry, image),
+        Request::List => {
+            if !keep_exited() {
+                reap_and_notify(registry, image);
+            }
+            reply(&stream, &Response::Sessions(registry.list()))
+        }
 
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
 
-        // Answer before going. A client left guessing from a hung-up socket
-        // cannot tell "it stopped" from "it never heard me".
+        Request::ClusterRegistrySync { .. } | Request::ClusterRegistryUpdate { .. } => {
+            refuse_cluster_registry(&stream)
+        }
+
         request @ Request::Shutdown { .. } => {
-            handle_shutdown(stream, registry, image, socket_owner, request)
+            handle_shutdown(stream, registry, image, socket_owner, anti_entropy, request)
         }
 
         Request::New {
@@ -1188,13 +1247,7 @@ fn handle_request(
         Request::Attach { name } => attach(stream, reader, registry, &name, false),
         Request::AttachTracked { name } => attach(stream, reader, registry, &name, true),
         Request::AttachStatus { name, generation } => {
-            let response = registry.get(&name).map_or_else(
-                || Response::error(format!("no such session: {name}")),
-                |session| Response::AttachStatus {
-                    taken_over: session.was_attachment_taken_over(generation),
-                },
-            );
-            reply(&stream, &response)
+            attach_status(&stream, registry, &name, generation)
         }
 
         Request::Close {
@@ -1212,6 +1265,56 @@ fn handle_request(
             handle_eval(stream, reader, image, &code, name.as_deref(), caller)
         }
     }
+}
+
+fn handle_close(
+    stream: &Stream,
+    registry: &Registry,
+    image: &Image,
+    name: &str,
+    instance_id: Option<String>,
+    confirm: Option<bool>,
+) -> std::io::Result<()> {
+    let result = match (instance_id, confirm) {
+        (None, None) => close(registry, image, name),
+        (Some(instance_id), Some(true)) => close_instance(registry, image, name, &instance_id),
+        _ => Some(Err(remuda_core::agent::AgentError::Io(
+            "confirmed close requires an instance id and confirmation".into(),
+        ))),
+    };
+    respond(stream, name, result, |()| Response::Ok)
+}
+
+fn close_instance(
+    registry: &Registry,
+    image: &Image,
+    name: &str,
+    instance_id: &str,
+) -> Option<AgentResult<()>> {
+    let session = registry.get(name)?;
+    let closed = registry.close_instance(name, instance_id)?;
+    if let Ok(true) = closed {
+        // Closing the process can leave its PTY output monitor draining the
+        // final bytes. Keep the output-before-exit ordering, but don't make
+        // the close RPC wait for that monitor (notably, ConPTY can take
+        // longer to report EOF after Ctrl+\\ detach).
+        let image = image.clone();
+        let name = name.to_owned();
+        let id = session.id().to_owned();
+        let instance_id = session.instance_id().to_owned();
+        let exit_info = session.exit_info();
+        std::thread::spawn(move || {
+            notify_exited(
+                &image,
+                &name,
+                &id,
+                &instance_id,
+                "closed",
+                exit_info.as_ref(),
+            );
+        });
+    }
+    Some(closed.map(drop))
 }
 
 fn handle_eval(
@@ -1256,24 +1359,6 @@ fn caller_context(stream: &Stream, registry: &Registry) -> crate::image::CallerC
         },
         process_ancestry::CallerOrigin::Unknown => crate::image::CallerContext::default(),
     }
-}
-
-fn handle_close(
-    stream: &Stream,
-    registry: &Registry,
-    image: &Image,
-    name: &str,
-    instance_id: Option<String>,
-    confirm: Option<bool>,
-) -> std::io::Result<()> {
-    let result = match (instance_id, confirm) {
-        (None, None) => close(registry, image, name),
-        (Some(instance_id), Some(true)) => close_instance(registry, image, name, &instance_id),
-        _ => Some(Err(remuda_core::agent::AgentError::Io(
-            "confirmed close requires an instance id and confirmation".into(),
-        ))),
-    };
-    respond(stream, name, result, |()| Response::Ok)
 }
 
 fn deferred_reply(
@@ -1386,11 +1471,34 @@ fn handle_sync(
     )
 }
 
+fn refuse_cluster_registry(stream: &Stream) -> std::io::Result<()> {
+    reply(
+        stream,
+        &Response::error("remote front refuses cluster registry operations"),
+    )
+}
+
+fn attach_status(
+    stream: &Stream,
+    registry: &Registry,
+    name: &str,
+    generation: u64,
+) -> std::io::Result<()> {
+    let response = registry.get(name).map_or_else(
+        || Response::error(format!("no such session: {name}")),
+        |session| Response::AttachStatus {
+            taken_over: session.was_attachment_taken_over(generation),
+        },
+    );
+    reply(stream, &response)
+}
+
 fn handle_shutdown(
     stream: Stream,
     registry: &Registry,
     image: &Image,
     socket_owner: Arc<SocketOwnership>,
+    anti_entropy: Arc<AntiEntropyTask>,
     request: Request,
 ) -> std::io::Result<()> {
     let Request::Shutdown {
@@ -1449,6 +1557,7 @@ fn handle_shutdown(
     // exits and tears down their client connections.
     wait_for_new_requests();
     reap_processes_before_exit(image);
+    anti_entropy.stop_and_join();
     socket_owner.cleanup();
     std::process::exit(0);
 }
@@ -2017,7 +2126,9 @@ mod tests {
     use remuda_core::protocol::Response;
     use std::ffi::OsStr;
     use std::path::Path;
+    use std::sync::Arc;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     static SYNC_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -2094,6 +2205,30 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn anti_entropy_worker_stops_and_joins_on_shutdown() {
+        let syncs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = syncs.clone();
+        let task = super::AntiEntropyTask::start_with(
+            Duration::from_millis(10),
+            || {},
+            move || {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        task.stop_and_join();
+        assert!(task.is_joined());
+        let count_when_joined = syncs.load(std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            syncs.load(std::sync::atomic::Ordering::SeqCst),
+            count_when_joined,
+            "periodic sync callback ran after shutdown joined its worker"
+        );
     }
 
     #[test]
