@@ -77,11 +77,6 @@ pub fn run_sync(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     child_guard::harden(&mut command);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
-    }
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     if let Err(error) = process_tree.assign(&child) {
         let _ = child.kill();
@@ -643,7 +638,6 @@ impl ProcessTree {
         #[cfg(windows)]
         {
             self.job.assign(child)?;
-            self.job.resume_primary_thread(child.id())?;
         }
         #[cfg(not(windows))]
         let _ = child;
