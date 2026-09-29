@@ -14,7 +14,7 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 real_curl=$(command -v curl) || { echo "check-nightly-stale-index: need curl" >&2; exit 1; }
-expected_nightly=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nightly"])' "$ROOT/docs/latest.json")
+expected_nightly=$(jq -r '.nightly // empty' "$ROOT/docs/latest.json")
 [ -n "$expected_nightly" ] || { echo "check-nightly-stale-index: no nightly version in latest.json" >&2; exit 1; }
 
 mkdir -p "$tmp/shim"
