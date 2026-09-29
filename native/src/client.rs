@@ -7,16 +7,14 @@ use interprocess::local_socket::traits::Stream as _;
 use remuda_core::protocol::{Request, Response};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::time::Instant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Detach key: Ctrl-\ (0x1C). Chosen because almost nothing binds it, unlike
 /// Ctrl-C/D/Z, which the attached program needs. Consumed, never forwarded.
 pub const DETACH: u8 = 0x1C;
 const ATTACH_INPUT_QUEUE_BYTES: usize = 1024 * 1024;
 const ATTACH_INPUT_CHUNK_BYTES: usize = 16 * 1024;
-const ATTACH_INPUT_STALL: Duration = Duration::from_millis(500);
+const ATTACH_INPUT_STALL: Duration = Duration::from_secs(3);
 const ATTACH_INPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 struct AttachInputStatus {
@@ -25,15 +23,19 @@ struct AttachInputStatus {
 }
 
 struct AttachInputQueue {
-    sender: std::sync::mpsc::SyncSender<Vec<u8>>,
+    sender: std::sync::mpsc::Sender<Vec<u8>>,
     status: std::sync::Arc<std::sync::Mutex<AttachInputStatus>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    capacity: usize,
+    stall_after: Duration,
 }
 
 #[derive(Clone)]
 struct AttachInputWriter {
     status: std::sync::Arc<std::sync::Mutex<AttachInputStatus>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 enum AttachInputAttempt {
@@ -44,11 +46,14 @@ enum AttachInputAttempt {
 
 impl AttachInputQueue {
     fn new() -> (Self, std::sync::mpsc::Receiver<Vec<u8>>) {
-        Self::with_capacity(ATTACH_INPUT_QUEUE_BYTES / ATTACH_INPUT_CHUNK_BYTES)
+        Self::with_capacity(ATTACH_INPUT_QUEUE_BYTES, ATTACH_INPUT_STALL)
     }
 
-    fn with_capacity(chunks: usize) -> (Self, std::sync::mpsc::Receiver<Vec<u8>>) {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(chunks);
+    fn with_capacity(
+        capacity: usize,
+        stall_after: Duration,
+    ) -> (Self, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
         (
             Self {
                 sender,
@@ -57,6 +62,9 @@ impl AttachInputQueue {
                     dropping: false,
                 })),
                 dropped: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                queued_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                capacity,
+                stall_after,
             },
             receiver,
         )
@@ -64,35 +72,45 @@ impl AttachInputQueue {
 
     fn attempt(&self, bytes: Vec<u8>) -> AttachInputAttempt {
         let len = bytes.len();
-        {
-            let status = self.status.lock().unwrap_or_else(|p| p.into_inner());
-            if status.dropping {
-                self.dropped
-                    .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
-                return AttachInputAttempt::Dropped;
+        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        if status.dropping {
+            self.dropped
+                .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
+            return AttachInputAttempt::Dropped;
+        }
+        // Keep the reservation until the writer completes the full chunk, so
+        // queued plus in-flight data never exceeds the byte capacity.
+        let mut used = self.queued_bytes.load(std::sync::atomic::Ordering::SeqCst);
+        loop {
+            let Some(next) = used.checked_add(len).filter(|next| *next <= self.capacity) else {
+                if status.last_progress.elapsed() >= self.stall_after {
+                    status.dropping = true;
+                    self.dropped
+                        .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
+                    return AttachInputAttempt::Dropped;
+                }
+                return AttachInputAttempt::Full(bytes);
+            };
+            match self.queued_bytes.compare_exchange(
+                used,
+                next,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => used = actual,
             }
         }
-        match self.sender.try_send(bytes) {
+        match self.sender.send(bytes) {
             Ok(()) => AttachInputAttempt::Queued,
-            Err(std::sync::mpsc::TrySendError::Disconnected(bytes)) => {
-                let len = bytes.len();
-                let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+            Err(error) => {
+                let len = error.0.len();
+                self.queued_bytes
+                    .fetch_sub(len, std::sync::atomic::Ordering::SeqCst);
                 status.dropping = true;
                 self.dropped
                     .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
                 AttachInputAttempt::Dropped
-            }
-            Err(std::sync::mpsc::TrySendError::Full(bytes)) => {
-                let len = bytes.len();
-                let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
-                if status.last_progress.elapsed() >= ATTACH_INPUT_STALL {
-                    status.dropping = true;
-                    self.dropped
-                        .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
-                    AttachInputAttempt::Dropped
-                } else {
-                    AttachInputAttempt::Full(bytes)
-                }
             }
         }
     }
@@ -101,6 +119,7 @@ impl AttachInputQueue {
         AttachInputWriter {
             status: std::sync::Arc::clone(&self.status),
             dropped: std::sync::Arc::clone(&self.dropped),
+            queued_bytes: std::sync::Arc::clone(&self.queued_bytes),
         }
     }
 
@@ -112,7 +131,8 @@ impl AttachInputQueue {
     }
 
     fn enqueue(&self, bytes: &[u8]) {
-        let mut chunks = bytes.chunks(ATTACH_INPUT_CHUNK_BYTES).peekable();
+        let chunk_size = ATTACH_INPUT_CHUNK_BYTES.min(self.capacity);
+        let mut chunks = bytes.chunks(chunk_size).peekable();
         while let Some(chunk) = chunks.next() {
             let mut pending = chunk.to_vec();
             loop {
@@ -150,12 +170,21 @@ impl AttachInputWriter {
             .dropping = true;
         self.dropped
             .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        self.queued_bytes
+            .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn delivered(&self, bytes: usize) {
+        self.queued_bytes
+            .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn dropped(&self, bytes: usize) {
         if bytes > 0 {
             self.dropped
                 .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+            self.queued_bytes
+                .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -684,6 +713,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     writer_status.failed(bytes.len());
                     break;
                 }
+                writer_status.delivered(bytes.len());
             }
             let mut queued_after_stop = 0;
             while let Ok(bytes) = input_rx.try_recv() {
@@ -815,8 +845,8 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                 }
                 trace_input_read(trace_input.as_deref(), &buf[..n]);
                 match buf[..n].iter().position(|&b| b == DETACH) {
-                    // Queue preceding keys without blocking, then wake the
-                    // writer so Ctrl-\\ cannot sit behind a full pipe.
+                    // Queue preceding keys before ending this stream, so the
+                    // grace below can deliver them before detach closes it.
                     Some(at) => {
                         if mouse {
                             route_tokens(&mut route, parser.feed(&buf[..at]));
@@ -825,8 +855,6 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                         }
                         route_tokens(&mut route, parser.finish());
                         detached.store(true, std::sync::atomic::Ordering::SeqCst);
-                        ipc::wake_captured(writer_wake);
-                        ipc::wake(&reader_stream);
                         break;
                     }
                     None => {
@@ -1338,7 +1366,7 @@ mod tests {
 
     #[test]
     fn attach_detach_bypasses_a_full_input_queue_and_counts_dropped_bytes() {
-        let (queue, rx) = AttachInputQueue::with_capacity(1);
+        let (queue, rx) = AttachInputQueue::with_capacity(6, Duration::ZERO);
         queue.enqueue(b"queued");
         queue.enqueue(b"overflow");
         queue.enqueue(b"prefix");

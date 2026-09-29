@@ -1073,7 +1073,7 @@ fn attach_keys_before_detach_in_one_read_reach_the_child() {
 #[cfg(unix)]
 #[test]
 fn attach_large_paste_survives_a_slow_but_reading_child() {
-    let runtime = scratch_dir("attach-slow-reader-paste");
+    let runtime = scratch_dir("attach-295-slow-reader-paste");
     let path = daemon::socket_path_in(&runtime, "s");
     let _daemon = daemon_at(&path);
     let name = "target";
