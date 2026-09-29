@@ -1023,6 +1023,9 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::WriteTimeout => Err(mlua::Error::runtime(
             "session PTY write timed out; delivery may be partial or late",
         )),
+        Response::RemoteControlDisabled => {
+            Err(mlua::Error::runtime("remote control disabled on this node"))
+        }
         Response::AttachStarted { .. } | Response::AttachStatus { .. } => Err(
             mlua::Error::runtime("attach responses are not exposed to scripts"),
         ),
