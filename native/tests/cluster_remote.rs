@@ -402,7 +402,7 @@ fn real_remote_tui_paints_the_selected_remote_session_screen() {
 }
 
 #[test]
-fn driver_hosted_remote_tui_capture_shows_the_bottom_marker() {
+fn driver_hosted_remote_tui_capture_shows_live_output_with_trailing_blanks() {
     let client_node = Node::start("driver-remote-client");
     let driver_node = Node::start("driver-remote-driver");
     let server_node = Node::start("driver-remote-server");
@@ -465,17 +465,6 @@ fn driver_hosted_remote_tui_capture_shows_the_bottom_marker() {
         Response::Screen(screen) => screen,
         other => panic!("unexpected screen capture response: {other:?}"),
     };
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !capture().contains(&remuda_native::cluster::node_label(
-        &server_node.fingerprint(),
-    )) {
-        assert!(
-            Instant::now() < deadline,
-            "remote node did not render in driver PTY"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
     std::thread::sleep(Duration::from_secs(3));
     for name in ["screen", "tree"] {
         for input in ["\\27[B", "\\27[C", "\\27[B"] {
@@ -488,18 +477,45 @@ fn driver_hosted_remote_tui_capture_shows_the_bottom_marker() {
     let result = driver_node.command().args(["-e", lua]).output().unwrap();
     assert!(result.status.success(), "remuda.insert failed: {result:?}");
 
-    let deadline = Instant::now() + Duration::from_secs(12);
+    let request_deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let screen = capture();
-        assert!(
-            Instant::now() < deadline || screen.contains("PR8-MARKER"),
-            "driver-hosted 80x24 screen pane omitted bottom marker:\n{screen}"
-        );
-        if screen.contains("PR8-MARKER") {
+        let output = server_node
+            .command()
+            .args(["-e", "print(remuda.request_counts().capture_styled)"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "request count failed: {output:?}");
+        let count = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap_or_default();
+        if count > 0 {
             break;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            Instant::now() < request_deadline,
+            "remote pane never requested a screen capture"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     }
+    std::thread::sleep(Duration::from_millis(500));
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let screen = loop {
+        let screen = capture();
+        if screen.contains("remote live · reachable") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "remote session was not selected:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        screen.contains("PR8-MARKER"),
+        "driver-hosted 80x24 screen pane omitted the live marker:\n{screen}"
+    );
 }
 
 #[test]
