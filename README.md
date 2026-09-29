@@ -125,6 +125,11 @@ Two, in the shape rustup uses:
 | `stable` (default) | a `vX.Y.Z` tag | `0.1.0` |
 | `nightly` | every commit on `main` | `0.1.0-nightly.20260910.abc1234` |
 
+Nightly installs read a versioned release tag from `latest.json`; those releases
+are immutable and the newest ten are retained. The rolling `nightly` release is
+updated last for older installer copies, which may see a brief 404 while that
+compatibility URL is being replaced.
+
 No stable release has been published yet, so the [Install](#install) command
 above already pins `REMUDA_CHANNEL` to `nightly` explicitly — the plain
 one-liner without it would hit the missing `stable` default and fail. Once a
