@@ -66,7 +66,8 @@ submitted = 0
 returns = 0
 
 def redraw():
-    os.write(1, b'\x1b[2A\r\x1b[2K> ' + bytes(buf) + b'\r\nSTATUS ONE\r\nSTATUS TWO')
+    display = bytes(buf).replace(b'\n', b'\r\n  ')
+    os.write(1, b'\x1b[H\x1b[2JREADY\r\n> ' + display + b'\r\nSTATUS ONE\r\nSTATUS TWO')
 
 while True:
     ready, _, _ = select.select([fd], [], [], 5)
@@ -94,7 +95,8 @@ while True:
                 redraw()
             else:
                 submitted += 1
-                os.write(1, b'\r\nSUBMITTED:' + bytes(buf) + b'\r\nCOUNT:' + str(submitted).encode() + b'\r\nRETURNS:' + str(returns).encode() + b'\r\n')
+                display = bytes(buf).replace(b'\n', b'\\n')
+                os.write(1, b'\r\nSUBMITTED:' + display + b'\r\nCOUNT:' + str(submitted).encode() + b'\r\nRETURNS:' + str(returns).encode() + b'\r\n')
                 buf.clear()
         else:
             buf.append(b)
@@ -118,16 +120,18 @@ while True:
     .expect("start fake paste agent");
     wait_screen(&socket, "paste-agent", "READY");
 
+    let started = Instant::now();
     script::run_source(
         &socket,
         "input-unit-submit",
         "remuda.type_text('paste-agent', 'alpha\\nbeta')",
     )
     .expect("type_text");
+    eprintln!("type_text elapsed_ms={}", started.elapsed().as_millis());
 
     let screen = wait_screen(&socket, "paste-agent", "SUBMITTED:");
     assert!(
-        screen.contains("SUBMITTED:alpha\nbeta"),
+        screen.contains("SUBMITTED:alpha\\nbeta"),
         "text changed: {screen}"
     );
     assert!(
