@@ -31,6 +31,11 @@ buffers
 
 ``table`` — The `remuda.buffer` registry table, keyed by buffer name.
 
+caller
+------
+
+``caller() -> {kind: 'session'|'outside'|'unknown', session?: string}`` — ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run ``remuda -e`` and wrap ``_dispatch_extension_command``; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.
+
 cancel
 ------
 
@@ -114,7 +119,7 @@ expect_option
 extension_command
 -----------------
 
-``extension_command(name, handler(args, caller)) -> nil`` — Register a handler for an installed mod command.
+``extension_command(name, handler(args, caller)) -> nil`` — Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.
 
 fail
 ----

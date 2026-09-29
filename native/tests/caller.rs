@@ -2,7 +2,6 @@ use remuda_core::protocol::{Request, Response};
 use remuda_core::Registry;
 use remuda_core::Size;
 use remuda_native::{daemon, image::Image, tick::Counters};
-use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -58,8 +57,16 @@ fn caller_identifies_a_client_running_inside_a_managed_session() {
 
 #[test]
 fn in_process_evaluations_and_schedules_have_unknown_callers() {
+    let socket = std::env::temp_dir().join(format!(
+        "remuda-caller-image-{}-{}.sock",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos()
+    ));
     let image = Image::spawn(
-        Path::new("/tmp/remuda-caller-in-process.sock"),
+        &socket,
         Arc::new(Registry::new()),
         Arc::new(Counters::default()),
     );

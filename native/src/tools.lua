@@ -65,7 +65,7 @@ local function register(name, about, signature)
 end
 register("tools", "The `remuda.tool` registry table, keyed by tool name.", "table")
 register("_extension_commands", "Handlers registered for installed mod commands.", "table")
-register("extension_command", "Register a handler for an installed mod command.", "extension_command(name, handler(args, caller)) -> nil")
+register("extension_command", "Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.", "extension_command(name, handler(args, caller)) -> nil")
 register("_dispatch_extension_command", "Dispatch arguments and caller context to a loaded mod command handler.", "_dispatch_extension_command(name, args, caller) -> value")
 register("pending", "Return a bounded handle for an extension command's deferred result.", "pending({timeout?, on_cancel?}) -> handle")
 register("_pending_create", "Create a private pending reply handle.", "_pending_create(timeout?) -> id, handle")

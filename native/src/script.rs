@@ -115,7 +115,7 @@ pub const BINDINGS: [&str; 79] = [
 const WORDS: &[(&str, &str, &str)] = &[
     (
         "caller",
-        "Advisory daemon classification of a peer as a managed session, outside, or unknown.",
+        "ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run ``remuda -e`` and wrap ``_dispatch_extension_command``; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.",
         "caller() -> {kind: 'session'|'outside'|'unknown', session?: string}",
     ),
     (
