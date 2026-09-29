@@ -330,6 +330,61 @@ fn definitely_refused_batch_reservations_are_released_for_retry() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn batch_rejected_before_submit_is_busy_and_refunds_rate_for_retry() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer = Arc::new(BlockingWriter {
+        started: Mutex::new(Some(started_tx)),
+        release: Mutex::new(release_rx),
+        busy: AtomicBool::new(false),
+        timed_out: AtomicBool::new(false),
+        fail: false,
+        refusal_once: AtomicUsize::new(3),
+        writes: AtomicUsize::new(0),
+    });
+    let session = Arc::new(Session::new(
+        "batch-behind-timed-out-attach",
+        Box::new(BlockingAgent {
+            writer: Arc::clone(&writer),
+        }),
+        Arc::new(ManualClock::new()),
+    ));
+    let attach_session = Arc::clone(&session);
+    let attach = thread::spawn(move || {
+        let held = attach_session.attach();
+        held.write_raw(b"human input")
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("attached write is active");
+
+    let bytes = vec![b'x'; remuda_core::input::MAX_INPUT_BYTES];
+    let batch = InputBatch {
+        instance_id: session.instance_id(),
+        client_id: [14; 16],
+        seq: 1,
+        bytes: &bytes,
+    };
+    assert_eq!(session.apply_input_batch(batch), Err(InputError::Busy));
+    assert_eq!(writer.writes.load(Ordering::Acquire), 1);
+
+    release_tx.send(()).unwrap();
+    attach.join().unwrap().unwrap();
+    for seq in 1..=4 {
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            session.apply_input_batch(InputBatch { seq, ..batch }),
+            Ok(InputOutcome::Ack { duplicate: false })
+        );
+    }
+    assert_eq!(
+        session.apply_input_batch(InputBatch { seq: 5, ..batch }),
+        Err(InputError::RateLimited)
+    );
+}
+
+#[test]
 fn late_success_after_timeout_does_not_turn_a_batch_retry_into_an_ack() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -556,7 +611,7 @@ struct BlockingWriter {
     timed_out: AtomicBool,
     fail: bool,
     /// Test-only refusals returned before a write is accepted: 1 = Busy,
-    /// 2 = Exited.
+    /// 2 = Exited, 3 = an in-flight write timed out during submission.
     refusal_once: AtomicUsize,
     writes: AtomicUsize,
 }
@@ -566,6 +621,10 @@ impl AgentWriter for BlockingWriter {
         match self.refusal_once.swap(0, Ordering::AcqRel) {
             1 => return Err(AgentError::Busy),
             2 => return Err(AgentError::Exited),
+            3 if self.busy.load(Ordering::Acquire) => {
+                self.timed_out.store(true, Ordering::Release);
+                return Err(AgentError::Busy);
+            }
             _ => {}
         }
         self.writes.fetch_add(1, Ordering::AcqRel);
@@ -619,7 +678,7 @@ impl AgentWriter for BlockingWriter {
     }
 
     fn is_timed_out(&self) -> bool {
-        self.timed_out.load(Ordering::Acquire)
+        self.busy.load(Ordering::Acquire) && self.timed_out.load(Ordering::Acquire)
     }
 }
 

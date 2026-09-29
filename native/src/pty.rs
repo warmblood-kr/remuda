@@ -129,9 +129,10 @@ impl AgentWriter for PtyInputWriter {
             match self.submit(bytes) {
                 Ok(receiver) => break receiver,
                 Err(AgentError::Busy) if self.is_timed_out() => {
-                    return Err(AgentError::WriteTimeout {
-                        timeout: self.timeout,
-                    });
+                    // This request never reached the PTY worker. Leave it
+                    // retryable; only a timeout of our submitted receiver is
+                    // ambiguous to the caller.
+                    return Err(AgentError::Busy);
                 }
                 Err(AgentError::Busy) => std::thread::sleep(Duration::from_millis(10)),
                 Err(error) => return Err(error),
@@ -164,22 +165,13 @@ impl AgentWriter for PtyInputWriter {
                     }
                     match receiver.recv_timeout(Duration::from_millis(10)) {
                         Ok(result) => return result,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) if self.is_timed_out() => {
-                            return Err(AgentError::WriteTimeout {
-                                timeout: self.timeout,
-                            });
-                        }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                             return Err(AgentError::Io("pty writer worker stopped".into()));
                         }
                     }
                 },
-                Err(AgentError::Busy) if self.is_timed_out() => {
-                    return Err(AgentError::WriteTimeout {
-                        timeout: self.timeout,
-                    });
-                }
+                Err(AgentError::Busy) if self.is_timed_out() => return Err(AgentError::Busy),
                 Err(AgentError::Busy) => std::thread::sleep(Duration::from_millis(10)),
                 Err(error) => return Err(error),
             }
@@ -704,17 +696,15 @@ mod input_writer_tests {
         let first = std::thread::spawn(move || first_writer.write_bounded(b"first"));
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
-        let second_writer = Arc::clone(&writer);
-        let second = std::thread::spawn(move || second_writer.write_bounded(b"second"));
         assert!(matches!(
             first.join().unwrap(),
             Err(AgentError::WriteTimeout { .. })
         ));
-        assert!(matches!(
-            second.join().unwrap(),
-            Err(AgentError::WriteTimeout { .. })
-        ));
         assert!(writer.is_busy());
+        assert!(matches!(
+            writer.write_bounded(b"not submitted"),
+            Err(AgentError::Busy)
+        ));
 
         release_tx.send(()).unwrap();
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -723,7 +713,9 @@ mod input_writer_tests {
             std::thread::yield_now();
         }
         assert!(!writer.is_busy());
-        writer.write_bounded(b"recovered").unwrap();
+        writer
+            .write_bounded(b"retried after no-submit Busy")
+            .unwrap();
     }
 
     #[test]

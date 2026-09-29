@@ -1179,6 +1179,128 @@ fn attached_keystrokes_survive_a_pty_write_timeout_without_detaching() {
 
 #[cfg(unix)]
 #[test]
+fn attached_slow_reader_accepts_a_paste_larger_than_the_input_queue() {
+    let runtime = scratch_dir("attach-slow-reader-paste");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&socket);
+    let capture_path = runtime.join("typed-bytes");
+    let mut env = std::collections::HashMap::new();
+    env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    let response = client::request(
+        &socket,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw -echo; i=0; while [ \"$i\" -lt 192 ]; do head -c 64 >>\"$CAPTURE_PATH\"; i=$((i+1)); sleep 0.05; done".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start slow raw reader");
+    assert!(matches!(response, Response::Value(_)));
+
+    let mut stream = raw_attach(&socket, "target");
+    let expected = vec![b'x'; 12_288];
+    stream
+        .write_all(&expected)
+        .expect("paste into attached session");
+    assert_eq!(target_row(&socket, "r.attached"), "true");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if std::fs::read(&capture_path).ok().as_deref() == Some(expected.as_slice()) {
+            break;
+        }
+        assert_eq!(
+            target_row(&socket, "r.attached"),
+            "true",
+            "slow input must not tear down the healthy attachment"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "slow reader did not receive the paste"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        std::fs::read(&capture_path).expect("read captured paste"),
+        expected,
+        "every byte arrives in order"
+    );
+    drop(stream);
+    let detach_deadline = Instant::now() + PATIENCE;
+    while target_row(&socket, "r.attached") == "true" {
+        assert!(
+            Instant::now() < detach_deadline,
+            "EOF did not release attach"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_eof_drains_input_already_read_by_the_key_pump() {
+    let runtime = scratch_dir("attach-eof-drains-keys");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&socket);
+    let capture_path = runtime.join("typed-bytes");
+    let mut env = std::collections::HashMap::new();
+    env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    let response = client::request(
+        &socket,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw -echo; sleep 0.1; head -c 12288 >\"$CAPTURE_PATH\"".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start gated raw reader");
+    assert!(matches!(response, Response::Value(_)));
+
+    let mut stream = raw_attach(&socket, "target");
+    let expected = vec![b'y'; 12_288];
+    stream
+        .write_all(&expected)
+        .expect("send keys before immediate detach");
+    drop(stream);
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if std::fs::read(&capture_path).ok().as_deref() == Some(expected.as_slice()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "EOF discarded buffered attach keys"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read(&capture_path).expect("read bytes delivered before detach"),
+        expected
+    );
+    while target_row(&socket, "r.attached") == "true" {
+        assert!(
+            Instant::now() < deadline,
+            "drained EOF did not release attach"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
     let runtime = unique_scratch_dir("probe-attach-stall");
     let socket = daemon::socket_path_in(&runtime, "s");

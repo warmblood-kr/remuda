@@ -675,6 +675,16 @@ impl Attached<'_> {
         self.displaced.load(Ordering::SeqCst)
     }
 
+    /// Whether the active PTY input write has exceeded its bounded deadline.
+    pub fn is_writer_timed_out(&self) -> bool {
+        self.session
+            .agent
+            .lock()
+            .ok()
+            .and_then(|mut agent| agent.input_writer())
+            .is_some_and(|writer| writer.is_timed_out())
+    }
+
     /// Type exactly these bytes. No Enter is appended: the human sends their
     /// own, and inventing one here would submit a half-typed line.
     pub fn write_raw(&self, bytes: &[u8]) -> Result<()> {

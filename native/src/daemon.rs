@@ -1495,6 +1495,8 @@ fn attach(
     // already gone. The core got "a human is attached" forever.
     let done = std::sync::atomic::AtomicBool::new(false);
     let done = &done;
+    let reader_eof = std::sync::atomic::AtomicBool::new(false);
+    let reader_eof = &reader_eof;
     let input_failed = std::sync::atomic::AtomicBool::new(false);
     let input_failed = &input_failed;
     // Checked before every read of the key pump below, not just its first —
@@ -1508,28 +1510,43 @@ fn attach(
         let (keys_tx, keys_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
         let key_thread = scope.spawn(move || {
             let mut buf = [0u8; 4096];
-            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            'keys: while !stop.load(std::sync::atomic::Ordering::SeqCst)
+                && !done.load(std::sync::atomic::Ordering::SeqCst)
+            {
                 match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => match keys_tx.try_send(buf[..n].to_vec()) {
-                        Ok(()) => {}
-                        Err(std::sync::mpsc::TrySendError::Full(_)) => {
-                            input_failed.store(true, std::sync::atomic::Ordering::SeqCst);
-                            done.store(true, std::sync::atomic::Ordering::SeqCst);
-                            break;
+                    Ok(0) | Err(_) => {
+                        reader_eof.store(true, std::sync::atomic::Ordering::SeqCst);
+                        break;
+                    }
+                    Ok(n) => {
+                        let mut bytes = buf[..n].to_vec();
+                        loop {
+                            if stop.load(std::sync::atomic::Ordering::SeqCst)
+                                || done.load(std::sync::atomic::Ordering::SeqCst)
+                            {
+                                break 'keys;
+                            }
+                            match keys_tx.try_send(bytes) {
+                                Ok(()) => break,
+                                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                                    bytes = returned;
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
+                                }
+                                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                                    break 'keys;
+                                }
+                            }
                         }
-                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break,
-                    },
+                    }
                 }
             }
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
         });
 
         // One writer preserves read-buffer order. A failed write ends the pump:
         // only Busy means no write was submitted and is safe to retry.
         let held = &held;
-        let write_thread =
-            scope.spawn(move || pump_attach_input(keys_rx, held, done, stop, input_failed));
+        let write_thread = scope
+            .spawn(move || pump_attach_input(keys_rx, held, done, stop, reader_eof, input_failed));
 
         if let Some(rx) = held.subscribe() {
             while !done.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1577,6 +1594,7 @@ fn pump_attach_input(
     held: &remuda_core::session::Attached<'_>,
     done: &std::sync::atomic::AtomicBool,
     stop: &std::sync::atomic::AtomicBool,
+    reader_eof: &std::sync::atomic::AtomicBool,
     input_failed: &std::sync::atomic::AtomicBool,
 ) {
     while let Ok(bytes) = keys.recv() {
@@ -1584,6 +1602,8 @@ fn pump_attach_input(
             done.load(std::sync::atomic::Ordering::SeqCst)
                 || stop.load(std::sync::atomic::Ordering::SeqCst)
                 || held.is_displaced()
+                || (reader_eof.load(std::sync::atomic::Ordering::SeqCst)
+                    && held.is_writer_timed_out())
         };
         match forward_attach_input(|| held.write_raw_while(&bytes, &stopping), &stopping) {
             Ok(()) => {}
@@ -1596,6 +1616,7 @@ fn pump_attach_input(
             }
         }
     }
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 fn report_attach_input_failure(output: &mut impl Write) -> std::io::Result<()> {
