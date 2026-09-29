@@ -70,6 +70,11 @@ pub fn run_sync(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     child_guard::harden(&mut command);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+    }
     let mut child = command.spawn().map_err(|error| error.to_string())?;
     if let Err(error) = process_tree.assign(&child) {
         let _ = child.kill();
@@ -416,6 +421,66 @@ mod run_tests {
             "the grandchild survived after process.run timed out"
         );
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn synchronous_process_timeout_kills_an_immediately_spawned_grandchild() {
+        use std::process::Command;
+        use std::time::Duration;
+
+        fn ping_process_ids() -> std::collections::BTreeSet<u32> {
+            let output = Command::new("tasklist.exe")
+                .args(["/FI", "IMAGENAME eq ping.exe", "/FO", "CSV", "/NH"])
+                .output()
+                .expect("list ping processes");
+            assert!(output.status.success(), "tasklist failed: {output:?}");
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let mut fields = line.split(',');
+                    let image = fields.next()?.trim_matches('"');
+                    if !image.eq_ignore_ascii_case("ping.exe") {
+                        return None;
+                    }
+                    fields.next()?.trim_matches('"').parse().ok()
+                })
+                .collect()
+        }
+
+        let before = ping_process_ids();
+        let result = super::run_sync(
+            vec![
+                "cmd.exe".into(),
+                "/d".into(),
+                "/c".into(),
+                "start /b ping -n 30 127.0.0.1 & exit".into(),
+            ],
+            None,
+            0.2,
+        )
+        .expect("process.run should return at the timeout");
+        assert!(result.timed_out, "the direct child should hit its timeout");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut survivors: Vec<_> = ping_process_ids().difference(&before).copied().collect();
+        while !survivors.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            survivors = ping_process_ids().difference(&before).copied().collect();
+        }
+        // If the assertion catches a regression, clean up only the processes
+        // that appeared during this test so a failed run leaves no ping behind.
+        for process_id in &survivors {
+            let process_id = process_id.to_string();
+            let _ = Command::new("taskkill.exe")
+                .args(["/PID", process_id.as_str(), "/T", "/F"])
+                .status();
+        }
+        assert_eq!(
+            survivors,
+            Vec::<u32>::new(),
+            "the ping grandchild created immediately by cmd.exe survived the timeout"
+        );
+    }
 }
 
 struct ProcessTree {
@@ -437,7 +502,10 @@ impl ProcessTree {
 
     fn assign(&self, child: &Child) -> std::io::Result<()> {
         #[cfg(windows)]
-        self.job.assign(child)?;
+        {
+            self.job.assign(child)?;
+            self.job.resume_primary_thread(child.id())?;
+        }
         #[cfg(not(windows))]
         let _ = child;
         Ok(())
@@ -512,6 +580,84 @@ impl KillOnCloseJob {
         } else {
             Ok(())
         }
+    }
+
+    fn resume_primary_thread(&self, process_id: u32) -> std::io::Result<()> {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, GetLastError, ERROR_NO_MORE_FILES, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+        };
+        use windows_sys::Win32::System::Threading::{
+            OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+        };
+
+        // SAFETY: Toolhelp accepts a zero process id for a system-wide thread
+        // snapshot; the returned snapshot is closed below on every path.
+        let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let resumed = (|| {
+            let mut entry = THREADENTRY32 {
+                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                ..THREADENTRY32::default()
+            };
+            // SAFETY: `entry` is writable, sized as required, and `snapshot`
+            // remains live until the closure completes.
+            if unsafe { Thread32First(snapshot, &mut entry) } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
+            loop {
+                if entry.th32OwnerProcessID == process_id {
+                    // SAFETY: the id comes from a live snapshot entry; the
+                    // handle is closed immediately after ResumeThread.
+                    let thread =
+                        unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                    if thread.is_null() {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // SAFETY: `thread` is an owned handle with the required
+                    // suspend/resume access right.
+                    let previous = unsafe { ResumeThread(thread) };
+                    let resume_error = if previous == u32::MAX {
+                        Some(std::io::Error::last_os_error())
+                    } else if previous == 0 {
+                        Some(std::io::Error::other(
+                            "the suspended process thread was already running",
+                        ))
+                    } else {
+                        None
+                    };
+                    // SAFETY: this handle was returned by OpenThread above.
+                    unsafe { CloseHandle(thread) };
+                    if let Some(error) = resume_error {
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+
+                // SAFETY: `entry` and `snapshot` remain valid for the call.
+                if unsafe { Thread32Next(snapshot, &mut entry) } == 0 {
+                    // ERROR_NO_MORE_FILES is the normal end of the snapshot.
+                    // SAFETY: GetLastError reads the calling thread's error.
+                    let error = unsafe { GetLastError() };
+                    if error == ERROR_NO_MORE_FILES {
+                        return Err(std::io::Error::other(
+                            "the suspended process has no resumable thread",
+                        ));
+                    }
+                    return Err(std::io::Error::from_raw_os_error(error as i32));
+                }
+            }
+        })();
+
+        // SAFETY: `snapshot` was returned by CreateToolhelp32Snapshot.
+        unsafe { CloseHandle(snapshot) };
+        resumed
     }
 
     fn terminate(&self) {
