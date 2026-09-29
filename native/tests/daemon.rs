@@ -1110,6 +1110,120 @@ fn attach_large_paste_survives_a_slow_but_reading_child() {
     wait_for_cli_exit(&viewer, name);
 }
 
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
+    let runtime = scratch_dir("attach-stall-drop-recovery");
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = Daemon::spawn(&runtime);
+    let recovered_marker = runtime.join("recovered");
+    let progress_marker = runtime.join("progress");
+    let ready_marker = runtime.join("ready");
+    let reader_marker = runtime.join("start-reading");
+    let script = "stty raw -echo; while [ ! -e \"$READY_MARKER\" ]; do sleep 0.02; done; printf READY; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; perl -e 'my $total = 0; my $progress = 0; my $tail = \"\"; while (read(STDIN, my $b, 4096)) { $total += length($b); if (!$progress && $total >= 131072) { open(my $p, \">\", $ENV{PROGRESS_PATH}) or die; print $p $total; close($p); $progress = 1; }; $tail .= $b; if (index($tail, \"RECOVERED-END\") >= 0) { open(my $r, \">\", $ENV{RECOVERED_PATH}) or die; print $r \"done\"; close($r); last; }; $tail = substr($tail, -64) if length($tail) > 128; }'";
+    let env = std::collections::HashMap::from([
+        (
+            "PROGRESS_PATH".into(),
+            progress_marker.display().to_string(),
+        ),
+        (
+            "RECOVERED_PATH".into(),
+            recovered_marker.display().to_string(),
+        ),
+        ("READY_MARKER".into(), ready_marker.display().to_string()),
+        ("READER_MARKER".into(), reader_marker.display().to_string()),
+    ]);
+    assert!(matches!(
+        client::request(
+            &path,
+            &Request::New {
+                name: Some("target".into()),
+                command: vec!["sh".into(), "-c".into(), script.into()],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: Some(env),
+            },
+        )
+        .expect("start child that can resume reading"),
+        Response::Value(_)
+    ));
+
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "attach", "target"]);
+    command.env("REMUDA_RUNTIME_DIR", &runtime);
+    command.env("REMUDA_TEST_ATTACH_STALL_MS", "250");
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture attach terminal");
+    wait_until_attached(&path, "target");
+    std::fs::write(&ready_marker, b"attached").expect("release child readiness");
+    wait_for_session_screen(&viewer, "READY");
+
+    let flood = vec![b'x'; 2 * 1024 * 1024];
+    let (sent_tx, sent_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(|| {
+            let _ = sent_tx.send(held.write_raw(&flood));
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut seen = Vec::new();
+        while !seen
+            .windows(b"dropping input until the writer recovers".len())
+            .any(|window| window == b"dropping input until the writer recovers")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "stall drop notice was not printed"
+            );
+            if let Ok(chunk) = output.recv_timeout(Duration::from_millis(100)) {
+                seen.extend_from_slice(&chunk);
+            }
+        }
+        std::fs::write(&reader_marker, b"read").expect("resume child PTY reads");
+        assert!(
+            sent_rx
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap()
+                .is_ok(),
+            "flood write did not complete after the attach reader resumed"
+        );
+        sender.join().expect("join flood writer");
+        let progress_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(
+                Instant::now() < progress_deadline,
+                "child did not receive buffered input after recovery"
+            );
+            if progress_marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let recovered = b"RECOVERED-END";
+        let recovered_deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert!(
+                Instant::now() < recovered_deadline,
+                "input queue did not recover after child reads resumed"
+            );
+            held.write_raw(recovered)
+                .expect("send post-stall recovery marker");
+            if recovered_marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    });
+    let _ = held.write_raw(&[client::DETACH]);
+    wait_for_cli_exit(&viewer, "target");
+}
+
 #[test]
 fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_versions_advance() {
     let runtime = scratch_dir("ver-restart");

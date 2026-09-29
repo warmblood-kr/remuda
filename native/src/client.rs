@@ -16,10 +16,26 @@ const ATTACH_INPUT_QUEUE_BYTES: usize = 1024 * 1024;
 const ATTACH_INPUT_CHUNK_BYTES: usize = 16 * 1024;
 const ATTACH_INPUT_STALL: Duration = Duration::from_secs(3);
 const ATTACH_INPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
+const PASTE_START: &[u8] = b"\x1b[200~";
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+fn attach_input_stall_threshold() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(milliseconds) = std::env::var("REMUDA_TEST_ATTACH_STALL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(milliseconds);
+    }
+    ATTACH_INPUT_STALL
+}
 
 struct AttachInputStatus {
     last_progress: Instant,
     dropping: bool,
+    permanent_failure: bool,
+    paste_open: bool,
+    paste_pending: Vec<u8>,
 }
 
 struct AttachInputQueue {
@@ -27,6 +43,7 @@ struct AttachInputQueue {
     status: std::sync::Arc<std::sync::Mutex<AttachInputStatus>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    drop_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     capacity: usize,
     stall_after: Duration,
 }
@@ -36,6 +53,8 @@ struct AttachInputWriter {
     status: std::sync::Arc<std::sync::Mutex<AttachInputStatus>>,
     dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    drop_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    capacity: usize,
 }
 
 enum AttachInputAttempt {
@@ -46,13 +65,14 @@ enum AttachInputAttempt {
 
 impl AttachInputQueue {
     fn new() -> (Self, std::sync::mpsc::Receiver<Vec<u8>>) {
-        Self::with_capacity(ATTACH_INPUT_QUEUE_BYTES, ATTACH_INPUT_STALL)
+        Self::with_capacity(ATTACH_INPUT_QUEUE_BYTES, attach_input_stall_threshold())
     }
 
     fn with_capacity(
         capacity: usize,
         stall_after: Duration,
     ) -> (Self, std::sync::mpsc::Receiver<Vec<u8>>) {
+        assert!(capacity > 0, "attach input queue capacity must be nonzero");
         let (sender, receiver) = std::sync::mpsc::channel();
         (
             Self {
@@ -60,9 +80,13 @@ impl AttachInputQueue {
                 status: std::sync::Arc::new(std::sync::Mutex::new(AttachInputStatus {
                     last_progress: Instant::now(),
                     dropping: false,
+                    permanent_failure: false,
+                    paste_open: false,
+                    paste_pending: Vec::new(),
                 })),
                 dropped: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 queued_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                drop_notice_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 capacity,
                 stall_after,
             },
@@ -74,9 +98,14 @@ impl AttachInputQueue {
         let len = bytes.len();
         let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
         if status.dropping {
-            self.dropped
-                .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
-            return AttachInputAttempt::Dropped;
+            let used = self.queued_bytes.load(std::sync::atomic::Ordering::SeqCst);
+            if !status.permanent_failure && used < self.capacity {
+                status.dropping = false;
+            } else {
+                self.dropped
+                    .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
+                return AttachInputAttempt::Dropped;
+            }
         }
         // Keep the reservation until the writer completes the full chunk, so
         // queued plus in-flight data never exceeds the byte capacity.
@@ -85,6 +114,8 @@ impl AttachInputQueue {
             let Some(next) = used.checked_add(len).filter(|next| *next <= self.capacity) else {
                 if status.last_progress.elapsed() >= self.stall_after {
                     status.dropping = true;
+                    self.drop_notice_pending
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
                     self.dropped
                         .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
                     return AttachInputAttempt::Dropped;
@@ -107,7 +138,12 @@ impl AttachInputQueue {
                 let len = error.0.len();
                 self.queued_bytes
                     .fetch_sub(len, std::sync::atomic::Ordering::SeqCst);
+                if !status.dropping {
+                    self.drop_notice_pending
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 status.dropping = true;
+                status.permanent_failure = true;
                 self.dropped
                     .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
                 AttachInputAttempt::Dropped
@@ -120,6 +156,59 @@ impl AttachInputQueue {
             status: std::sync::Arc::clone(&self.status),
             dropped: std::sync::Arc::clone(&self.dropped),
             queued_bytes: std::sync::Arc::clone(&self.queued_bytes),
+            drop_notice_pending: std::sync::Arc::clone(&self.drop_notice_pending),
+            capacity: self.capacity,
+        }
+    }
+
+    fn take_drop_notice(&self) -> bool {
+        self.drop_notice_pending
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn track_paste(&self, bytes: &[u8]) -> (bool, bool) {
+        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        let was_open = status.paste_open;
+        for &byte in bytes {
+            status.paste_pending.push(byte);
+            loop {
+                if status.paste_pending.starts_with(PASTE_START) {
+                    status.paste_open = true;
+                    status.paste_pending.drain(..PASTE_START.len());
+                } else if status.paste_pending.starts_with(PASTE_END) {
+                    status.paste_open = false;
+                    status.paste_pending.drain(..PASTE_END.len());
+                } else if PASTE_START.starts_with(&status.paste_pending)
+                    || PASTE_END.starts_with(&status.paste_pending)
+                {
+                    break;
+                } else if !status.paste_pending.is_empty() {
+                    status.paste_pending.remove(0);
+                } else {
+                    break;
+                }
+            }
+        }
+        (was_open, status.paste_open)
+    }
+
+    fn reset_paste_tracker(&self) {
+        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        status.paste_open = false;
+        status.paste_pending.clear();
+    }
+
+    fn force_paste_close(&self) {
+        let len = PASTE_END.len();
+        // This one protocol marker may exceed the byte cap by six bytes. It
+        // follows all queued data so the child cannot remain in paste mode.
+        self.queued_bytes
+            .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
+        if self.sender.send(PASTE_END.to_vec()).is_err() {
+            self.queued_bytes
+                .fetch_sub(len, std::sync::atomic::Ordering::SeqCst);
+            self.dropped
+                .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -134,6 +223,7 @@ impl AttachInputQueue {
         let chunk_size = ATTACH_INPUT_CHUNK_BYTES.min(self.capacity);
         let mut chunks = bytes.chunks(chunk_size).peekable();
         while let Some(chunk) = chunks.next() {
+            let (paste_was_open, paste_is_open) = self.track_paste(chunk);
             let mut pending = chunk.to_vec();
             loop {
                 match self.attempt(pending) {
@@ -143,6 +233,10 @@ impl AttachInputQueue {
                         std::thread::sleep(Duration::from_millis(5));
                     }
                     AttachInputAttempt::Dropped => {
+                        if paste_was_open || paste_is_open {
+                            self.force_paste_close();
+                        }
+                        self.reset_paste_tracker();
                         let remaining = chunks.map(<[u8]>::len).sum();
                         self.stop_after_drop(remaining);
                         return;
@@ -156,18 +250,23 @@ impl AttachInputQueue {
 impl AttachInputWriter {
     fn progress(&self, count: usize) {
         if count > 0 {
-            self.status
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .last_progress = Instant::now();
+            let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+            status.last_progress = Instant::now();
+            if !status.permanent_failure {
+                status.dropping = false;
+            }
         }
     }
 
     fn failed(&self, bytes: usize) {
-        self.status
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .dropping = true;
+        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        if !status.dropping {
+            self.drop_notice_pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        status.dropping = true;
+        status.permanent_failure = true;
+        drop(status);
         self.dropped
             .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
         self.queued_bytes
@@ -177,6 +276,11 @@ impl AttachInputWriter {
     fn delivered(&self, bytes: usize) {
         self.queued_bytes
             .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+        let used = self.queued_bytes.load(std::sync::atomic::Ordering::SeqCst);
+        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        if status.dropping && !status.permanent_failure && used < self.capacity {
+            status.dropping = false;
+        }
     }
 
     fn dropped(&self, bytes: usize) {
@@ -218,6 +322,18 @@ fn report_attach_input_dropped(output: &mut impl Write, dropped: usize) -> std::
         output.flush()?;
     }
     Ok(())
+}
+
+fn report_attach_drop_started(queue: &AttachInputQueue, output_lock: &std::sync::Mutex<()>) {
+    if queue.take_drop_notice() {
+        let _guard = output_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut output = std::io::stdout();
+        let _ = writeln!(
+            output,
+            "\r\n[remuda] input delivery stalled; dropping input until the writer recovers"
+        );
+        let _ = output.flush();
+    }
 }
 
 pub const EMPTY_REPLY_ERROR: &str = "the daemon hung up without answering";
@@ -756,6 +872,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
             };
             let mut logged_pending_read = false;
             loop {
+                report_attach_drop_started(&input_queue, &output_lock);
                 if output_done.load(std::sync::atomic::Ordering::SeqCst) {
                     if output_taken_over.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
@@ -869,6 +986,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
             // Ends the screen pump below, which then returns from `attach` and
             // drops every handle on this connection — that hang-up is what the
             // daemon reads as "the human left".
+            report_attach_drop_started(&input_queue, &output_lock);
             drop(input_queue);
             if writer_done_rx
                 .recv_timeout(ATTACH_INPUT_DRAIN_GRACE)
@@ -1351,7 +1469,7 @@ mod tests {
     #[cfg(unix)]
     use super::trace_input_read;
     use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
-    use super::{report_attach_input_dropped, AttachInputQueue};
+    use super::{report_attach_input_dropped, AttachInputQueue, PASTE_END, PASTE_START};
     #[cfg(unix)]
     use crate::ipc;
     #[cfg(unix)]
@@ -1365,19 +1483,33 @@ mod tests {
     use std::sync::mpsc;
 
     #[test]
-    fn attach_detach_bypasses_a_full_input_queue_and_counts_dropped_bytes() {
+    fn attach_input_drop_recovers_after_writer_progress() {
         let (queue, rx) = AttachInputQueue::with_capacity(6, Duration::ZERO);
         queue.enqueue(b"queued");
-        queue.enqueue(b"overflow");
-        queue.enqueue(b"prefix");
+        queue.enqueue(b"dropped");
+        assert!(queue.take_drop_notice());
+        assert!(!queue.take_drop_notice());
+        assert_eq!(queue.dropped.load(std::sync::atomic::Ordering::SeqCst), 7);
+        queue.writer().delivered(6);
+        queue.enqueue(b"fresh!");
         assert_eq!(rx.try_recv().unwrap(), b"queued");
+        assert_eq!(rx.try_recv().unwrap(), b"fresh!");
         assert!(rx.try_recv().is_err());
-        assert_eq!(queue.dropped.load(std::sync::atomic::Ordering::SeqCst), 14);
         let mut notice = Vec::new();
-        report_attach_input_dropped(&mut notice, 14).unwrap();
+        report_attach_input_dropped(&mut notice, 7).unwrap();
         let notice = String::from_utf8(notice).unwrap();
-        assert!(notice.contains("input dropped: 14 bytes"));
+        assert!(notice.contains("input dropped: 7 bytes"));
         assert!(notice.contains("delivery may be partial"));
+    }
+
+    #[test]
+    fn dropping_during_bracketed_paste_forwards_the_closing_marker() {
+        let (queue, rx) = AttachInputQueue::with_capacity(PASTE_START.len(), Duration::ZERO);
+        queue.enqueue(PASTE_START);
+        queue.enqueue(b"paste body");
+        assert_eq!(rx.try_recv().unwrap(), PASTE_START);
+        assert_eq!(rx.try_recv().unwrap(), PASTE_END);
+        assert!(rx.try_recv().is_err());
     }
     #[cfg(unix)]
     use std::time::Instant;
