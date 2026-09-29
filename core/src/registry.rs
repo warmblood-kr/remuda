@@ -19,7 +19,7 @@
 //! transport. Adding those here would put a socket in the policy layer, which
 //! `core/clippy.toml` denies outright.
 
-use crate::agent::{Cursor, ExitInfo, Result, ScreenSnapshot, Size, StyledCell};
+use crate::agent::{AgentError, Cursor, ExitInfo, Result, ScreenSnapshot, Size, StyledCell};
 use crate::input::{InputBatch, InputError, InputOutcome};
 use crate::protocol::Step;
 use crate::session::Session;
@@ -324,5 +324,24 @@ impl Registry {
                 Err(error)
             }
         })
+    }
+
+    /// Close only the session start named by `instance_id`. The registry lock
+    /// covers identity validation, termination, and removal so a same-name
+    /// replacement can never be closed by a stale request.
+    pub fn close_instance(&self, name: &str, instance_id: &str) -> Option<Result<bool>> {
+        let mut sessions = self.lock();
+        let session = sessions.get(name)?.clone();
+        if session.instance_id() != instance_id {
+            return Some(Err(AgentError::Io(
+                "session restarted; close was refused".into(),
+            )));
+        }
+        session.mark_closing();
+        if let Err(error) = session.terminate() {
+            session.clear_closing();
+            return Some(Err(error));
+        }
+        Some(Ok(sessions.remove(name).is_some()))
     }
 }
