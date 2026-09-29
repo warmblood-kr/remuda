@@ -1035,6 +1035,7 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         )),
         Response::WrongInstance => Err(mlua::Error::runtime("session instance changed")),
         Response::RateLimited => Err(mlua::Error::runtime("session input rate limit exceeded")),
+        Response::SyncAtCapacity => Err(mlua::Error::runtime("Sync is at capacity; retry shortly")),
         Response::Busy => Err(mlua::Error::runtime("session input is busy")),
         Response::WriteTimeout => Err(mlua::Error::runtime(
             "session PTY write timed out; delivery may be partial or late",
@@ -1107,6 +1108,7 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::StyledScreen { .. } => Err(mlua::Error::runtime(
             "styled capture is not exposed to scripts",
         )),
+        Response::Sync { .. } => Err(mlua::Error::runtime("Sync is not exposed to scripts")),
         Response::MouseState(_) => Err(mlua::Error::runtime(
             "mouse state is not exposed to scripts",
         )),
