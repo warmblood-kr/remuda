@@ -353,6 +353,60 @@ fn selected_session_stays_visible_when_the_list_exceeds_a_short_terminal() {
 }
 
 #[test]
+fn list_wheel_scrolls_one_session_and_moves_selection_with_the_viewport() {
+    let mut ui = make_ui(
+        (0..12)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect(),
+    );
+    let wheel = |kind| MouseEvent {
+        kind,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert_eq!(
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
+        Action::Nothing
+    );
+    assert_eq!(ui.list_first_visible, Some(1));
+    assert_eq!(ui.selected, 1, "selection follows the viewport when needed");
+
+    ui.on_mouse(wheel(MouseEventKind::ScrollUp), 80, 24);
+    assert_eq!(ui.list_first_visible, Some(0));
+    assert_eq!(ui.selected, 1, "selection stays visible while scrolling up");
+}
+
+#[test]
+fn list_wheel_clamps_at_both_ends() {
+    let mut ui = make_ui(
+        (0..12)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect(),
+    );
+    let wheel = |kind| MouseEvent {
+        kind,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    ui.on_mouse(wheel(MouseEventKind::ScrollUp), 80, 24);
+    assert_eq!(ui.list_first_visible, Some(0));
+    for _ in 0..20 {
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24);
+    }
+    assert_eq!(ui.list_first_visible, Some(5));
+    assert_eq!(ui.selected, 5);
+    for _ in 0..20 {
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24);
+    }
+    assert_eq!(ui.list_first_visible, Some(5));
+    assert_eq!(ui.selected, 5);
+}
+
+#[test]
 fn clicking_the_top_visible_session_keeps_the_list_under_the_pointer() {
     let mut ui = make_ui(
         (0..12)
@@ -3875,4 +3929,46 @@ fn a_type_forced_refresh_with_a_real_session_and_a_shown_buffer_costs_one_daemon
              request — got {total} (list={list}, eval={eval_calls}, \
              capture_styled={capture_styled})"
     );
+}
+
+#[test]
+fn list_wheel_is_ignored_while_a_session_is_focused() {
+    let mut ui = make_ui(
+        (0..12)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect(),
+    );
+    ui.focus = Focus::Session;
+    let down = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert_eq!(ui.on_mouse(down, 80, 24), Action::Nothing);
+    assert_eq!(ui.list_first_visible, None);
+    assert_eq!(ui.selected, 0, "the focused session keeps the selection");
+}
+
+#[test]
+fn list_wheel_is_safe_with_zero_or_one_session() {
+    for count in [0, 1] {
+        let mut ui = make_ui(
+            (0..count)
+                .map(|index| row(&format!("session-{index}"), true, false))
+                .collect(),
+        );
+        for kind in [MouseEventKind::ScrollDown, MouseEventKind::ScrollUp] {
+            let wheel = MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert_eq!(ui.on_mouse(wheel, 80, 24), Action::Nothing);
+        }
+        assert_eq!(ui.selected, 0);
+        assert_eq!(ui.list_first_visible.unwrap_or(0), 0);
+    }
 }
