@@ -2383,9 +2383,37 @@ fn a_session_started_here_is_sized_to_the_pane_not_the_terminal() {
 }
 
 #[test]
-fn a_pane_below_the_floor_is_raised_rather_than_dropping_keystrokes() {
+fn a_narrow_pane_opts_out_of_the_default_size_floor() {
     let size = pane_size(&make_ui(vec![]), 80, 24);
-    assert_eq!((size.cols(), size.rows()), (80, 24), "Size::new's floor");
+    assert_eq!((size.cols(), size.rows()), (63, 24));
+    assert_eq!(
+        (Size::new(11, 3).cols(), Size::new(11, 3).rows()),
+        (Size::MIN_COLS, Size::MIN_ROWS),
+        "ordinary sizes keep the safety floor"
+    );
+}
+
+#[test]
+fn a_narrow_shown_list_pane_passes_its_visible_width_to_the_child() {
+    let mut ui = make_ui(vec![row("agent", true, false)]);
+    ui.set_list_width(24, 100);
+    assert_eq!(ui_layout(&ui, 100), (24, 75));
+
+    let size = pane_size(&ui, 100, 30);
+    assert_eq!(size.cols(), 75);
+    assert_eq!(size.rows(), 29);
+
+    let encoded = serde_json::to_vec(&size).expect("serialize pane size");
+    let decoded: Size = serde_json::from_slice(&encoded).expect("deserialize pane size");
+    assert_eq!(decoded, size, "the daemon must preserve the visible width");
+
+    let ordinary: Size =
+        serde_json::from_str(r#"{"cols":75,"rows":29}"#).expect("deserialize ordinary size");
+    assert_eq!(
+        ordinary.cols(),
+        Size::MIN_COLS,
+        "ordinary requests stay floored"
+    );
 }
 
 #[test]
@@ -2605,12 +2633,28 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
 
-    let dir = std::env::temp_dir().join(format!("remuda-tui-busy-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("make private busy daemon directory");
-    let socket = dir.join("s.sock");
+    struct TestDir(std::path::PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch")
+        .as_nanos();
+    let dir = TestDir(std::env::temp_dir().join(format!("r{:x}-{nonce:x}", std::process::id())));
+    std::fs::create_dir(&dir.0).expect("create unique busy daemon directory");
+    let socket = dir.0.join("s.sock");
+    assert!(
+        socket.as_os_str().len() < 104,
+        "private socket path must fit the macOS sun_path limit: {} bytes",
+        socket.as_os_str().len()
+    );
     drop(UnixListener::bind(&socket).expect("bind private endpoint"));
-    let lock_path = dir.join("s.sock.lock");
+    let lock_path = dir.0.join("s.sock.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -2656,7 +2700,6 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
     );
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     drop(lock);
-    std::fs::remove_dir_all(dir).expect("remove private busy daemon directory");
 }
 
 #[test]

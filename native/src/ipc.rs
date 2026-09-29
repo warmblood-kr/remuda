@@ -107,7 +107,9 @@ pub fn wake(stream: &Stream) {
         let Stream::NamedPipe(pipe) = stream;
         // `interprocess` opens pipes FILE_FLAG_OVERLAPPED and drives them with
         // synchronous waits, so the blocked read *is* a pending overlapped
-        // operation and this is the API that cancels one.
+        // operation and this is the API that cancels one. A null OVERLAPPED
+        // cancels every pending operation for this pipe handle, so callers use
+        // wake only with the stream dedicated to the blocked reader.
         unsafe {
             windows_sys::Win32::System::IO::CancelIoEx(
                 pipe.as_handle().as_raw_handle(),

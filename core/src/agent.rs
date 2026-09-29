@@ -12,8 +12,10 @@
 use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::sync::mpsc::Receiver;
+use std::sync::Arc;
 
-/// Terminal dimensions, clamped to the smallest usable interactive terminal.
+/// Terminal dimensions, normally clamped to the smallest usable interactive
+/// terminal. A pane may explicitly retain its narrower visible width.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Size {
     cols: u16,
@@ -32,6 +34,16 @@ impl Size {
     pub fn new(cols: u16, rows: u16) -> Self {
         Self {
             cols: cols.max(Self::MIN_COLS),
+            rows: rows.max(Self::MIN_ROWS),
+        }
+    }
+
+    /// A pane must tell its child the width the user can actually see. This
+    /// keeps the ordinary 80-column safety floor everywhere else while
+    /// allowing a constrained pane to opt into a narrower terminal.
+    pub fn for_pane(cols: u16, rows: u16) -> Self {
+        Self {
+            cols: cols.max(1),
             rows: rows.max(Self::MIN_ROWS),
         }
     }
@@ -126,6 +138,12 @@ pub enum AgentError {
     /// Someone is attached and driving this session by hand. Orchestrated
     /// input is refused rather than queued — see [`crate::session::Session`].
     Attached,
+    /// A previous PTY write is still active; no second write was queued.
+    Busy,
+    /// The bounded write deadline elapsed; bytes may still finish later.
+    WriteTimeout {
+        timeout: core::time::Duration,
+    },
     /// A `feed` act's `Pause`s summed past the caller's cap — refused before
     /// anything is written, not clamped, so a seconds/millis mixup errors
     /// instead of silently running a shorter pause than asked for.
@@ -141,6 +159,13 @@ impl fmt::Display for AgentError {
         match self {
             AgentError::Exited => write!(f, "agent process has exited"),
             AgentError::Attached => write!(f, "a human is attached to this session"),
+            AgentError::Busy => write!(f, "a session input write is already in flight"),
+            AgentError::WriteTimeout { timeout } => {
+                write!(
+                    f,
+                    "PTY write exceeded {timeout:?}; delivery may be partial or late"
+                )
+            }
             AgentError::PauseTooLong { total, cap } => {
                 write!(f, "feed's pauses total {total:?}, over the {cap:?} cap")
             }
@@ -150,6 +175,27 @@ impl fmt::Display for AgentError {
 }
 
 pub type Result<T> = core::result::Result<T, AgentError>;
+
+/// A backend writer that can wait independently of the locked process object.
+pub trait AgentWriter: Send + Sync {
+    fn write_bounded(&self, bytes: &[u8]) -> Result<()>;
+    /// Write these bytes once and wait for their actual completion. Interactive
+    /// input uses this path so a timeout cannot silently drop a keystroke or
+    /// cause a possibly partial write to be replayed.
+    fn write_to_completion(&self, bytes: &[u8]) -> Result<()> {
+        self.write_bounded(bytes)
+    }
+    /// As `write_to_completion`, but stop waiting if the caller is no longer
+    /// allowed to deliver this input. Backends with blocking completion paths
+    /// should poll `cancelled` while waiting.
+    fn write_to_completion_while(&self, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
+        if cancelled() {
+            return Err(AgentError::Attached);
+        }
+        self.write_to_completion(bytes)
+    }
+    fn is_busy(&self) -> bool;
+}
 
 /// Exit information retained by a process-backed agent after it is reaped.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -184,6 +230,12 @@ pub trait AgentProcess: Send {
     /// Type raw bytes. Not public API on [`Session`] — see
     /// [`crate::session::Session::send_line`] for why callers never get this.
     fn write(&mut self, bytes: &[u8]) -> Result<()>;
+
+    /// An optional writer handle that can outlive the process lock while it
+    /// waits for a bounded PTY write. Simpler agents keep using `write`.
+    fn input_writer(&mut self) -> Option<Arc<dyn AgentWriter>> {
+        None
+    }
 
     /// The visible screen, rendered as text, newline-separated.
     fn screen_text(&mut self) -> Result<String>;

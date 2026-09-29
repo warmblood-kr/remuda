@@ -23,8 +23,8 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, String> {
     if frame.len() > MAX_FRAME_BYTES {
         return Err(format!("remote frame exceeds {MAX_FRAME_BYTES} bytes"));
     }
-    let request: Request = serde_json::from_slice(frame)
-        .map_err(|error| format!("invalid remote request: {error}"))?;
+    let request: Request =
+        serde_json::from_slice(frame).map_err(|_| "invalid remote request".to_owned())?;
     authorize(&request)?;
     Ok(request)
 }
@@ -32,8 +32,18 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, String> {
 /// Forward an authorized frame to the existing local daemon and encode its
 /// typed response afresh. Request bytes are never copied to the daemon socket.
 pub fn forward_frame(path: &std::path::Path, frame: &[u8]) -> Result<Vec<u8>, String> {
+    forward_frame_with_timeout(path, frame, std::time::Duration::from_secs(30))
+}
+
+/// Forward a frame with an explicit bound on the local daemon response wait.
+pub fn forward_frame_with_timeout(
+    path: &std::path::Path,
+    frame: &[u8],
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, String> {
     let request = decode_frame(frame)?;
-    let response = crate::client::request(path, &request).map_err(|error| error.to_string())?;
+    let response = crate::client::request_with_timeout(path, &request, timeout)
+        .map_err(|error| error.to_string())?;
     serde_json::to_vec(&response).map_err(|error| error.to_string())
 }
 
@@ -261,6 +271,13 @@ mod tests {
                 "unexpectedly authorized {request:?}"
             );
         }
+    }
+
+    #[test]
+    fn malformed_request_errors_do_not_echo_payload_fragments() {
+        let error = decode_frame(br#"{"Eval":{"code":"SECRET_PAYLOAD_XYZ""#).unwrap_err();
+        assert_eq!(error, "invalid remote request");
+        assert!(!error.contains("SECRET_PAYLOAD_XYZ"));
     }
 
     #[test]
