@@ -648,7 +648,13 @@ fn revoke_cli_pushes_tombstone_across_a_b_c_join_chain() {
         revoke_topology("revoke-fast-path");
     let started = Instant::now();
     let output = a.run(&["cluster", "revoke", &b_fp, "--yes"]);
-    let stdout = successful(output, "revoke B with direct C push");
+    assert!(
+        output.status.success(),
+        "revoke B with direct C push failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(
         stdout.contains(&format!("Registry push reached peer {c_fp}.")),
         "revoke command did not report C reached: {stdout}"

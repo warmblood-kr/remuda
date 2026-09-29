@@ -414,9 +414,12 @@ fn log_listener_error(context: &str, error: &io::Error) {
 }
 
 impl RequestLimiter {
-    fn acquire_registry_request(&self, fingerprint: &str) -> bool {
+    fn acquire_registry_request(&self, fingerprint: &str, priority: bool) -> bool {
         const BURST: f64 = 10.0;
         const REFILL_PER_SECOND: f64 = 1.0;
+        // Background pulls may use nine tokens from the burst. Keep one
+        // available for a registry update carrying an admission or tombstone.
+        const UPDATE_RESERVE: f64 = 1.0;
         let now = Instant::now();
         let mut buckets = self
             .registry_requests
@@ -436,7 +439,7 @@ impl RequestLimiter {
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * REFILL_PER_SECOND).min(BURST);
         bucket.last_refill = now;
-        if bucket.tokens < 1.0 {
+        if bucket.tokens < 1.0 || (!priority && bucket.tokens < 1.0 + UPDATE_RESERVE) {
             return false;
         }
         bucket.tokens -= 1.0;
@@ -818,7 +821,7 @@ fn dispatch_payload(
     match request {
         Request::ClusterRegistrySync { digest, offset } => {
             let peer_fp = cluster::encoding::fingerprint(peer_static);
-            if !limiter.acquire_registry_request(&peer_fp) {
+            if !limiter.acquire_registry_request(&peer_fp, false) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "registry replication rate limit exceeded",
@@ -858,7 +861,7 @@ fn dispatch_payload(
         }
         Request::ClusterRegistryUpdate { update_json } => {
             let peer_fp = cluster::encoding::fingerprint(peer_static);
-            if !limiter.acquire_registry_request(&peer_fp) {
+            if !limiter.acquire_registry_request(&peer_fp, true) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "registry replication rate limit exceeded",
@@ -2396,13 +2399,21 @@ mod tests {
     }
 
     #[test]
-    fn registry_requests_allow_ten_burst_per_peer() {
+    fn registry_sync_leaves_reserved_capacity_for_revoke_push() {
         let limiter = RequestLimiter::default();
-        for _ in 0..10 {
-            assert!(limiter.acquire_registry_request("peer-a"));
+        for _ in 0..9 {
+            assert!(limiter.acquire_registry_request("peer-a", false));
         }
-        assert!(!limiter.acquire_registry_request("peer-a"));
-        assert!(limiter.acquire_registry_request("peer-b"));
+        // Anti-entropy keeps polling and must not consume the reserved token.
+        assert!(!limiter.acquire_registry_request("peer-a", false));
+        assert!(limiter.acquire_registry_request("peer-a", true));
+        assert!(!limiter.acquire_registry_request("peer-a", true));
+        // Updates still share the normal per-peer cap when no sync traffic
+        // competes with them.
+        for _ in 0..10 {
+            assert!(limiter.acquire_registry_request("peer-b", true));
+        }
+        assert!(!limiter.acquire_registry_request("peer-b", true));
     }
 
     #[cfg(unix)]

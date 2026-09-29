@@ -1285,13 +1285,17 @@ fn close_instance(
     let session = registry.get(name)?;
     let closed = registry.close_instance(name, instance_id)?;
     if let Ok(true) = closed {
-        notify_exited(
-            image,
-            name,
-            session.id(),
-            "closed",
-            session.exit_info().as_ref(),
-        );
+        // Closing the process can leave its PTY output monitor draining the
+        // final bytes. Keep the output-before-exit ordering, but don't make
+        // the close RPC wait for that monitor (notably, ConPTY can take
+        // longer to report EOF after Ctrl+\\ detach).
+        let image = image.clone();
+        let name = name.to_owned();
+        let id = session.id().to_owned();
+        let exit_info = session.exit_info();
+        std::thread::spawn(move || {
+            notify_exited(&image, &name, &id, "closed", exit_info.as_ref());
+        });
     }
     Some(closed.map(drop))
 }
