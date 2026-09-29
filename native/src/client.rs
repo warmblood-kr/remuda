@@ -87,15 +87,16 @@ fn read_response_with_timeout(
     stream: Stream,
     timeout: Duration,
 ) -> std::io::Result<Response> {
-    stream.set_nonblocking(true)?;
     let deadline = Instant::now() + timeout;
     let limit = max_reply_wire_bytes();
     let mut line = Vec::with_capacity(limit.min(8192));
     let mut bytes = [0u8; 4096];
     loop {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(request_timeout(path, timeout));
         }
+        stream.set_recv_timeout(Some(remaining))?;
         match (&stream).read(&mut bytes) {
             Ok(0) => break,
             Ok(count) => {
@@ -110,8 +111,13 @@ fn read_response_with_timeout(
                     break;
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(request_timeout(path, timeout));
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
