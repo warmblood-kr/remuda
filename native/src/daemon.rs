@@ -837,7 +837,7 @@ fn notify_exited(
     );
 }
 
-/// Wake the image once a period with `remuda._run_due_schedules(now)`, and
+/// Wake the image once a period to run due schedules in separate bounded jobs, and
 /// reap dead sessions, firing `session_exited` for each. Its own thread, so a
 /// wedged schedule stalls only the tick, never the listener loop.
 fn spawn_ticker(image: Image, counters: Arc<crate::tick::Counters>, registry: Arc<Registry>) {
@@ -850,7 +850,7 @@ fn spawn_ticker(image: Image, counters: Arc<crate::tick::Counters>, registry: Ar
                 if !keep_exited() {
                     reap_and_notify(&registry, &image);
                 }
-                image.submit(&format!("remuda._run_due_schedules({now})"), None)
+                image.submit_due_schedules(now)
             },
             clock,
             TICK_PERIOD,
