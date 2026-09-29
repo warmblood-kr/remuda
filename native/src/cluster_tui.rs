@@ -13,6 +13,8 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+
 pub mod composer;
 pub mod queue;
 pub mod sender;
@@ -465,7 +467,9 @@ fn session_status(status: &str, pending_count: usize) -> String {
 }
 
 fn list(path: &Path) -> io::Result<Vec<SessionSummary>> {
-    match client::request(path, &Request::List).map_err(io::Error::other)? {
+    match client::request_with_timeout(path, &Request::List, UI_REQUEST_TIMEOUT)
+        .map_err(io::Error::other)?
+    {
         Response::Sessions(sessions) => Ok(sessions),
         Response::Error(error) => Err(io::Error::other(error)),
         other => Err(io::Error::other(format!(
@@ -475,12 +479,13 @@ fn list(path: &Path) -> io::Result<Vec<SessionSummary>> {
 }
 
 fn screen(path: &Path, name: &str, clock: &dyn Clock) -> io::Result<(String, Duration)> {
-    let response = client::request(
+    let response = client::request_with_timeout(
         path,
         &Request::CaptureStyled {
             name: name.into(),
             scrollback: 0,
         },
+        UI_REQUEST_TIMEOUT,
     )
     .map_err(io::Error::other)?;
     let captured_at = clock.now();
