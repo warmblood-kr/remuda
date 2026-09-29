@@ -1244,10 +1244,26 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
 
 #[cfg(test)]
 mod binding_tests {
-    use super::BINDINGS;
+    use super::{lua_steps_to_wire, BINDINGS};
+    use remuda_core::protocol::Step;
 
     #[test]
     fn binding_names_are_sorted_and_unique() {
         assert!(BINDINGS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn feed_return_burst_is_the_same_byte_as_named_return() {
+        let lua = mlua::Lua::new();
+        let steps: mlua::Table = lua.load(r#"{{burst='\r'}}"#).eval().unwrap();
+        let wire = lua_steps_to_wire(steps).unwrap();
+        assert_eq!(
+            wire,
+            [Step::Burst(remuda_core::keys::RETURN_BYTES.to_vec())]
+        );
+        assert_eq!(
+            remuda_core::keys::key("RET").as_deref(),
+            Some(remuda_core::keys::RETURN_BYTES)
+        );
     }
 }

@@ -245,7 +245,7 @@ impl Session {
         // text callers use remuda.input.text, which removes escape bytes.
         if has_escape {
             let mut bytes = body.into_bytes();
-            bytes.push(b'\r');
+            bytes.extend_from_slice(crate::keys::RETURN_BYTES);
             let _held = self.acquire_input_lock()?;
             return self.write_one_burst(&bytes);
         }
@@ -289,7 +289,7 @@ impl Session {
 
     fn submit_locked(&self, tail: &str) -> Result<()> {
         if tail.is_empty() {
-            return self.write_one_burst(b"\r");
+            return self.write_one_burst(crate::keys::RETURN_BYTES);
         }
 
         let mut waited = Duration::ZERO;
@@ -306,7 +306,7 @@ impl Session {
         }
 
         let before = self.compact_screen().unwrap_or_default();
-        self.write_one_burst(b"\r")?;
+        self.write_one_burst(crate::keys::RETURN_BYTES)?;
 
         waited = Duration::ZERO;
         while waited < Duration::from_secs(1) {
@@ -321,7 +321,7 @@ impl Session {
             waited += step;
         }
         if self.is_alive() && self.compact_screen().as_deref() == Some(before.as_str()) {
-            self.write_one_burst(b"\r")?;
+            self.write_one_burst(crate::keys::RETURN_BYTES)?;
         }
         Ok(())
     }
