@@ -757,7 +757,6 @@ impl ClusterUi {
         if !self.visible_tree_rows().contains(&selection) {
             return;
         }
-        self.discard_remote_draft_if_switching(&selection, now);
         match selection {
             TreeSelection::RemoteNode(name) => {
                 self.remote_expanded.insert(name);
@@ -783,7 +782,7 @@ impl ClusterUi {
                     instance_id: instance_id.clone(),
                 });
                 self.composer_focused = can_send;
-                self.remote_composer_target = can_send.then_some((node, name, instance_id));
+                self.set_remote_composer_target(can_send.then_some((node, name, instance_id)), now);
             }
             TreeSelection::LocalSession(selected) => {
                 if self
@@ -797,7 +796,7 @@ impl ClusterUi {
                 self.expanded = true;
                 self.active = selected;
                 self.remote_active = None;
-                self.remote_composer_target = None;
+                self.set_remote_composer_target(None, now);
                 self.composer_focused = true;
                 self.bind_composer_target();
             }
@@ -827,28 +826,27 @@ impl ClusterUi {
         }
     }
 
-    fn discard_remote_draft_if_switching(&mut self, selection: &TreeSelection, now: Duration) {
-        if matches!(selection, TreeSelection::RemoteNode(_)) {
-            return;
+    fn set_remote_composer_target(
+        &mut self,
+        target: Option<(String, String, String)>,
+        now: Duration,
+    ) -> bool {
+        if self.remote_composer_target == target {
+            return false;
         }
-        let Some((node, name, instance_id)) = self.remote_composer_target.clone() else {
-            return;
+        let discarded = if let Some((node, name, _)) = &self.remote_composer_target {
+            if self.composer.text().is_empty() {
+                false
+            } else {
+                self.composer.clear();
+                self.notice = Some((format!("draft for {node}/{name} discarded"), now));
+                true
+            }
+        } else {
+            false
         };
-        if self.composer.text().is_empty() {
-            return;
-        }
-        let same_target = matches!(selection,
-            TreeSelection::RemoteSession {
-                node: selected_node,
-                name: selected_name,
-                instance_id: selected_instance,
-            } if selected_node == &node && selected_name == &name && selected_instance == &instance_id
-        );
-        if !same_target {
-            self.composer.clear();
-            self.remote_composer_target = None;
-            self.notice = Some((format!("draft for {node}/{name} discarded"), now));
-        }
+        self.remote_composer_target = target;
+        discarded
     }
 
     fn bind_composer_target(&mut self) {
@@ -1002,15 +1000,18 @@ impl ClusterUi {
                 self.clear_sending_notice();
             }
             Some(QueueEvent::Dropped { reason, .. }) | Some(QueueEvent::Failed { reason, .. }) => {
+                let mut draft_discarded = false;
                 if reason.contains("session restarted") {
                     if self.remote_composer_target.is_some() {
-                        self.remote_composer_target = None;
+                        draft_discarded = self.set_remote_composer_target(None, now);
                         self.composer_focused = false;
                     } else {
                         self.composer_target = None;
                     }
                 }
-                self.notice = Some((reason, now));
+                if !draft_discarded {
+                    self.notice = Some((reason, now));
+                }
             }
             Some(QueueEvent::RemoteControlDisabled { node, .. }) => {
                 self.remote_control_disabled.insert(node.clone());
@@ -1462,7 +1463,7 @@ fn run_loop(
             instance_id,
         }) = ui.remote_active.clone()
         {
-            ui.remote_composer_target = Some((node, name, instance_id));
+            ui.set_remote_composer_target(Some((node, name, instance_id)), clock.now());
             ui.composer_focused = true;
         }
     }
@@ -2083,6 +2084,53 @@ mod tests {
         );
         assert_eq!(ui.input_queue.items().count(), 0);
         assert_eq!(ui.remote_composer_target.as_ref().unwrap().1, "shell");
+    }
+
+    #[test]
+    fn reentering_unavailable_remote_target_discards_draft_before_target_clear() {
+        let clock = ManualClock::new();
+        let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        )));
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&source);
+        ui.remote_input_enabled = true;
+        ui.remote_expanded.insert("laptop".into());
+        ui.remote_selected = Some(RemoteSelection::Session {
+            node: "laptop".into(),
+            name: "build".into(),
+            instance_id: "remote-instance".into(),
+        });
+        ui.enter_selected(clock.now());
+        ui.key(crossterm::event::KeyCode::Char('d'));
+        ui.key(crossterm::event::KeyCode::Char('r'));
+        ui.key_event(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('\\'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+            clock.now(),
+        );
+
+        let mut unavailable = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        unavailable.nodes[0].sessions[0].alive = false;
+        source.replace(unavailable);
+        ui.remote_synced(&source);
+        ui.enter_selected(clock.now());
+
+        assert_eq!(ui.composer.text(), "");
+        assert_eq!(ui.remote_composer_target, None);
+        assert_eq!(
+            ui.notice.as_ref().map(|(notice, _)| notice.as_str()),
+            Some("draft for laptop/build discarded")
+        );
+        assert_eq!(ui.input_queue.items().count(), 0);
     }
 
     #[test]
