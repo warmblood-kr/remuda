@@ -2422,29 +2422,43 @@ fn a_narrow_shown_list_pane_passes_its_visible_width_to_the_child() {
     );
 }
 
-/// A list preview is observational: only an attached pane may resize the
-/// session PTY. An absent private socket makes any attempted request fail
-/// immediately, which the current code exposes as a notice.
+/// A list preview is observational: only an attached pane may send a Resize.
 #[test]
 fn a_narrow_preview_does_not_send_a_resize_request() {
-    let path = scratch_socket("narrow-preview-resize");
-    let _cleanup = ScratchSocketDir(path.parent().expect("socket parent").to_path_buf());
     let mut ui = make_ui(vec![row("background", true, false)]);
     let shown = Some(ShownTarget::Session("background".into()));
-    resize_shown_session(&path, &mut ui, &shown, 36, 24);
+    let mut requests = Vec::new();
+    resize_shown_session_with(&mut ui, &shown, None, 36, 24, |name, size| {
+        requests.push((name.to_owned(), size));
+        Ok(())
+    });
     assert!(
-        ui.notice.is_none(),
-        "a list preview must not send a resize request for its 36-column client: {:?}",
-        ui.notice
+        requests.is_empty(),
+        "a list preview must not resize its child PTY"
     );
 }
 
-struct ScratchSocketDir(std::path::PathBuf);
+#[test]
+fn a_focused_narrow_attach_still_sends_its_pane_resize() {
+    let mut ui = make_ui(vec![row("agent", true, false)]);
+    ui.focus = Focus::Session;
+    let shown = Some(ShownTarget::Session("agent".into()));
 
-impl Drop for ScratchSocketDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+    let mut requests = Vec::new();
+    resize_shown_session_with(&mut ui, &shown, Some("agent"), 36, 24, |name, size| {
+        requests.push((name.to_owned(), size));
+        Ok(())
+    });
+
+    let [(name, target)] = requests.as_slice() else {
+        panic!("the focused, held session should receive one resize: {requests:?}");
+    };
+    assert_eq!(name, "agent");
+    assert_eq!(*target, pane_size(&ui, 36, 24));
+    assert!(
+        target.cols() < Size::MIN_COLS,
+        "focused pane should use its narrow width"
+    );
 }
 
 #[test]
