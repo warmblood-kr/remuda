@@ -1014,9 +1014,15 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
     match response {
         Response::Ok => Ok(Value::Nil),
         Response::Ack { .. } => Ok(Value::Nil),
-        Response::Uncertain => Err(mlua::Error::runtime("input outcome is uncertain")),
+        Response::Uncertain => Err(mlua::Error::runtime(
+            "input outcome is uncertain; bytes may be partial or late",
+        )),
         Response::WrongInstance => Err(mlua::Error::runtime("session instance changed")),
         Response::RateLimited => Err(mlua::Error::runtime("session input rate limit exceeded")),
+        Response::Busy => Err(mlua::Error::runtime("session input is busy")),
+        Response::WriteTimeout => Err(mlua::Error::runtime(
+            "session PTY write timed out; delivery may be partial or late",
+        )),
         Response::AttachStarted { .. } | Response::AttachStatus { .. } => Err(
             mlua::Error::runtime("attach responses are not exposed to scripts"),
         ),
