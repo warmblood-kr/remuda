@@ -58,14 +58,14 @@ fn type_text_submits_paste_once_and_preserves_embedded_newline() {
         r#"import os, select, sys, termios, tty, time
 fd = sys.stdin.fileno()
 tty.setraw(fd)
-os.write(1, b'\x1b[?2004hREADY\r\n')
+os.write(1, b'\x1b[?2004hREADY\r\n> \r\nSTATUS ONE\r\nSTATUS TWO')
 buf = bytearray()
 last = 0.0
 paste = False
 submitted = 0
 
 def redraw():
-    os.write(1, b'\r\x1b[2K> ' + bytes(buf))
+    os.write(1, b'\x1b[2A\r\x1b[2K> ' + bytes(buf) + b'\r\nSTATUS ONE\r\nSTATUS TWO')
 
 while True:
     ready, _, _ = select.select([fd], [], [], 5)
@@ -131,6 +131,10 @@ while True:
     assert!(
         screen.contains("COUNT:1"),
         "expected exactly one submission: {screen}"
+    );
+    assert!(
+        !screen.contains("COUNT:2"),
+        "the visible transcript must not be mistaken for an active composer: {screen}"
     );
 }
 
