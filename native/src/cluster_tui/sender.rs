@@ -171,11 +171,16 @@ impl InputSender {
         queue.begin_due(now).is_some()
     }
 
-    pub fn take_partial_input_warning(&mut self, batch: &PendingBatch) -> bool {
-        self.partial_input_targets.remove(&(
-            batch.remote_node.clone(),
-            batch.name.clone(),
-            batch.instance_id.clone(),
+    pub fn has_partial_input_warning_for(
+        &self,
+        remote_node: &str,
+        name: &str,
+        instance_id: &str,
+    ) -> bool {
+        self.partial_input_targets.contains(&(
+            Some(remote_node.into()),
+            name.into(),
+            instance_id.into(),
         ))
     }
 
@@ -252,6 +257,13 @@ impl InputSender {
         now: Instant,
     ) -> Option<QueueEvent> {
         let mut event = queue.finish(batch.seq, outcome, now);
+        if matches!(event, Some(QueueEvent::Sent { .. })) {
+            self.partial_input_targets.remove(&(
+                batch.remote_node.clone(),
+                batch.name.clone(),
+                batch.instance_id.clone(),
+            ));
+        }
         let remote_target_failed = batch.remote_node.is_some()
             && matches!(
                 event,
