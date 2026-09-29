@@ -1260,10 +1260,10 @@ mod binding_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = format!(
-            "/private/tmp/remuda-mkdir-new-{}-{nonce}",
-            std::process::id()
-        );
+        let path = std::env::temp_dir()
+            .join(format!("remuda-mkdir-new-{}-{nonce}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
         let lua = Lua::new();
         let remuda = lua.create_table().unwrap();
         fs_bindings(&lua, &remuda).unwrap();
