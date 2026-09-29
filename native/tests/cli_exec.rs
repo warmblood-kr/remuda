@@ -417,3 +417,14 @@ fn extension_command_separator_passes_stdin_flag_as_a_literal_argument() {
     assert_eq!(output.stdout, b"y|--|--stdin|no-stdin\n");
     cleanup_stdin_fixture(&dir);
 }
+
+#[test]
+fn extension_command_separator_passes_dash_as_a_literal_argument() {
+    let dir = setup_stdin_fixture();
+    let output = stdin_cli(&dir, &["sample", "y", "--", "-"])
+        .output()
+        .expect("run extension command with literal dash argument");
+    assert!(output.status.success(), "literal dash failed: {output:?}");
+    assert_eq!(output.stdout, b"y|--|-|no-stdin\n");
+    cleanup_stdin_fixture(&dir);
+}
