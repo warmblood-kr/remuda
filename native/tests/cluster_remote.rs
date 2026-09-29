@@ -232,24 +232,6 @@ fn admit_pair(left: &Node, right: &Node) {
     }
 }
 
-fn snapshot_text(source: &dyn RemoteSource) -> Option<String> {
-    source
-        .snapshot()
-        .nodes
-        .first()?
-        .sessions
-        .first()?
-        .screen
-        .as_ref()
-        .map(|screen| {
-            screen
-                .cells
-                .iter()
-                .flat_map(|row| row.iter().map(|cell| cell.text.as_str()))
-                .collect::<String>()
-        })
-}
-
 fn proof_session(
     source: &dyn RemoteSource,
 ) -> Option<remuda_native::cluster_remote::RemoteSessionSnapshot> {
@@ -277,18 +259,19 @@ fn session_text(session: &remuda_native::cluster_remote::RemoteSessionSnapshot) 
         .unwrap_or_default()
 }
 
-fn wait_for(timeout: Duration, mut ready: impl FnMut() -> bool) {
+fn wait_for(label: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     while !ready() {
         assert!(
             Instant::now() < deadline,
-            "remote poll condition did not settle"
+            "remote poll condition did not settle: {label}"
         );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_restart() {
     const BEFORE_DOWN: &str = "REMOTE_BEFORE_DOWN";
     const AFTER_RECONNECT: &str = "REMOTE_AFTER_RECONNECT";
@@ -298,11 +281,9 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
     admit_pair(&client_node, &server_node);
     let mut listener = Listener::start(&server_node);
     let marker_before_down = server_node.root.join("emit-before-down");
-    let marker_after_reconnect = server_node.root.join("emit-after-reconnect");
     let shell = format!(
-        "printf REMOTE_START; while [ ! -e '{}' ]; do sleep 0.02; done; printf {BEFORE_DOWN}; while [ ! -e '{}' ]; do sleep 0.02; done; printf {AFTER_RECONNECT}; sleep 30",
+        "printf REMOTE_START; while [ ! -e '{}' ]; do sleep 0.02; done; while true; do printf '{BEFORE_DOWN}\\n'; sleep 0.1; done",
         marker_before_down.display(),
-        marker_after_reconnect.display(),
     );
     server_node.start_session(&shell);
     server_node.start_named_session("unselected", "printf SHOULD_NOT_CAPTURE; sleep 30");
@@ -337,11 +318,17 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
     let poller = RemotePoller::new(vec![target], transport);
     let source = poller.source();
     let selection = poller.selection();
-    selection.select(label, "proof");
     poller.start().unwrap();
 
-    wait_for(Duration::from_secs(10), || {
-        snapshot_text(source.as_ref()).is_some_and(|text| text.contains("REMOTE_START"))
+    wait_for(
+        "initial list without screen",
+        Duration::from_secs(10),
+        || proof_session(source.as_ref()).is_some_and(|session| session.screen.is_none()),
+    );
+    selection.select(label, "proof");
+    wait_for("selected session screen", Duration::from_secs(10), || {
+        proof_session(source.as_ref())
+            .is_some_and(|session| session_text(&session).contains("REMOTE_START"))
     });
     let first_list = source.snapshot();
     let listed_sessions = &first_list.nodes[0].sessions;
@@ -352,47 +339,62 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
         .iter()
         .any(|session| { session.name == "unselected" && session.screen.is_none() }));
     fs::write(&marker_before_down, b"go").unwrap();
-    wait_for(Duration::from_secs(10), || {
-        snapshot_text(source.as_ref()).is_some_and(|text| text.contains(BEFORE_DOWN))
+    wait_for("updated selected screen", Duration::from_secs(10), || {
+        proof_session(source.as_ref())
+            .is_some_and(|session| session_text(&session).contains(BEFORE_DOWN))
     });
+
+    server_node.stop_daemon();
+    wait_for(
+        "daemon stop becomes unreachable",
+        Duration::from_secs(6),
+        || {
+            source
+                .snapshot()
+                .nodes
+                .first()
+                .is_some_and(|node| node.state == RemoteState::Unreachable)
+        },
+    );
+    assert!(proof_session(source.as_ref())
+        .is_some_and(|session| session_text(&session).contains(BEFORE_DOWN)));
 
     listener.stop();
-    wait_for(Duration::from_secs(12), || {
-        source
-            .snapshot()
-            .nodes
-            .first()
-            .is_some_and(|node| node.state == RemoteState::Unreachable)
-    });
-    assert!(snapshot_text(source.as_ref()).is_some_and(|text| text.contains(BEFORE_DOWN)));
-
+    server_node.restart_daemon();
     listener.restart(&server_node);
-    let marker = marker_after_reconnect.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_secs(3));
-        let _ = fs::write(marker, b"go");
-    });
-    wait_for(Duration::from_secs(20), || {
-        let snapshot = source.snapshot();
-        snapshot.nodes.first().is_some_and(|node| {
-            node.state == RemoteState::Reachable
-                && snapshot_text(source.as_ref()).is_some_and(|text| text.contains(AFTER_RECONNECT))
-        })
-    });
+    server_node.start_session("printf REMOTE_AFTER_RECONNECT; sleep 30");
+    wait_for(
+        "listener restart and screen recovery",
+        Duration::from_secs(20),
+        || {
+            let snapshot = source.snapshot();
+            snapshot.nodes.first().is_some_and(|node| {
+                node.state == RemoteState::Reachable
+                    && proof_session(source.as_ref())
+                        .is_some_and(|session| session_text(&session).contains(AFTER_RECONNECT))
+            })
+        },
+    );
 
     let old_instance = proof_session(source.as_ref()).unwrap().instance_id;
     server_node.restart_daemon();
-    wait_for(Duration::from_secs(10), || {
-        proof_session(source.as_ref()).is_none()
-    });
+    wait_for(
+        "daemon restart removes prior instance",
+        Duration::from_secs(10),
+        || proof_session(source.as_ref()).is_none(),
+    );
     server_node.start_session("printf REMOTE_NEW_INSTANCE; sleep 30");
-    wait_for(Duration::from_secs(15), || {
-        proof_session(source.as_ref()).is_some_and(|session| {
-            session.instance_id != old_instance
-                && session.alive
-                && session_text(&session).contains("REMOTE_NEW_INSTANCE")
-                && !session_text(&session).contains("REMOTE_BEFORE_DOWN")
-                && !session_text(&session).contains("REMOTE_AFTER_RECONNECT")
-        })
-    });
+    wait_for(
+        "new daemon session is captured",
+        Duration::from_secs(15),
+        || {
+            proof_session(source.as_ref()).is_some_and(|session| {
+                session.instance_id != old_instance
+                    && session.alive
+                    && session_text(&session).contains("REMOTE_NEW_INSTANCE")
+                    && !session_text(&session).contains("REMOTE_BEFORE_DOWN")
+                    && !session_text(&session).contains("REMOTE_AFTER_RECONNECT")
+            })
+        },
+    );
 }
