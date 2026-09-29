@@ -839,26 +839,18 @@ pub fn load_registry() -> io::Result<Registry> {
 /// Listener request paths use this to invalidate a cached registry without
 /// taking the cluster state lock for every admitted peer.
 pub fn registry_revision_token() -> io::Result<String> {
+    #[cfg(windows)]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
+    ));
+    #[cfg(not(windows))]
     {
-        #[cfg(not(windows))]
         use std::os::unix::fs::MetadataExt;
         use std::time::UNIX_EPOCH;
         let path = storage::cluster_state_dir()?
             .join("cluster")
             .join(REGISTRY_FILE);
-        #[cfg(windows)]
-        let metadata = {
-            let file = match super::windows_security::open_for_read(&path) {
-                Ok(file) => file,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Ok("missing".to_owned());
-                }
-                Err(error) => return Err(error),
-            };
-            storage::check_private_file(&file, "cluster registry", &path)?;
-            file.metadata()?
-        };
-        #[cfg(not(windows))]
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(io::Error::new(
@@ -877,17 +869,14 @@ pub fn registry_revision_token() -> io::Result<String> {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        #[cfg(not(windows))]
-        return Ok(format!(
+        Ok(format!(
             "{}:{}:{}:{}:{}",
             metadata.dev(),
             metadata.ino(),
             metadata.len(),
             modified,
             metadata.mode() & 0o777
-        ));
-        #[cfg(windows)]
-        Ok(format!("{}:{}", metadata.len(), modified))
+        ))
     }
 }
 

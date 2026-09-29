@@ -456,7 +456,7 @@ register("expect_option", "Pick a unique numbered menu option by its label.", "e
 -- Called once per native tick with the current time (seconds, native's
 -- clock). Fires every schedule whose own interval has elapsed since ITS OWN
 -- last run — native never sees or compares an individual interval itself.
-function remuda._run_due_schedules(now)
+function remuda._take_due_schedules(now)
   deliver_pending_events()
   local schedule_now = now or expect_clock_now or schedule_clock_now
   schedule_clock_now = schedule_now
@@ -475,6 +475,7 @@ function remuda._run_due_schedules(now)
   for handle in pairs(remuda.schedules) do
     handles[#handles + 1] = handle
   end
+  local due = {}
   for _, handle in ipairs(handles) do
     local schedule = remuda.schedules[handle]
     if schedule and schedule_now - schedule.last_run >= schedule.every then
@@ -482,18 +483,41 @@ function remuda._run_due_schedules(now)
       if schedule.name then
         remuda._schedule_fire_counts[schedule.name] = (remuda._schedule_fire_counts[schedule.name] or 0) + 1
       end
+      due[#due + 1] = { name = schedule.name or "unnamed", handle = handle }
+    end
+  end
+  return due
+end
+
+function remuda._run_due_schedules(now)
+  for _, due in ipairs(remuda._take_due_schedules(now)) do
+    local schedule = remuda.schedules[due.handle]
+    if schedule then
       local ok, err = pcall(schedule.run)
       if not ok then
-        io.stderr:write("remuda schedule error for " .. (schedule.name or "unnamed") .. ": " .. tostring(err) .. "\n")
+        io.stderr:write("remuda schedule error for " .. due.name .. ": " .. tostring(err) .. "\n")
       end
     end
   end
+end
+
+function remuda._run_schedule(handle)
+  local schedule = remuda.schedules[handle]
+  if not schedule then return false end
+  schedule.run()
+  return true
 end
 register(
   "_run_due_schedules",
   "Fire every schedule whose interval has elapsed. Called once per native tick.",
   "_run_due_schedules(now) -> nil"
 )
+register(
+  "_take_due_schedules",
+  "Mark and return the schedules due at `now`, for the native tick to run each under its own budget.",
+  "_take_due_schedules(now) -> table"
+)
+register("_run_schedule", "Run one schedule by handle (native tick only).", "_run_schedule(handle) -> boolean")
 
 -- A shallow copy, the same discipline `emit`'s own hook snapshot already
 -- keeps — a caller mutating what it was handed must never reach back into
@@ -1795,26 +1819,33 @@ function remuda._call(name, arguments, caller)
 end
 register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments, caller) -> string")
 
--- Type TEXT into SESSION and submit it with Return, as one act `remuda.feed`
--- will not let a second sender split. Not an MCP tool — a plain stdlib
--- function beside `send`/`insert`, since remuda itself frames none of this
--- (no default pause, no paste sequence) and this is the caller that does.
--- SETTLE (seconds before the submitting Return) defaults to 0.1. Like
--- `remuda.feed`, this blocks the calling Image for SETTLE seconds.
-function remuda.type_text(session, text, settle)
-  local body = tostring(text):gsub("\r\n?", "\n"):gsub("\27", "")
-  settle = settle or 0.1
-  local typed = body:find("\n", 1, true) and ("\27[200~" .. body .. "\27[201~") or body
-  remuda.feed(session, {
-    { burst = typed },
-    { pause = settle },
-    { burst = "\r" },
-  })
+-- Input is expressed as two words: one contiguous text burst, then a
+-- separately-timed submit key after the composer shows the text.
+remuda.input = {}
+
+function remuda.input.text(session, text)
+  remuda._input_text(session, tostring(text))
 end
+
+register("input", "Terminal input words for text delivery and submission.", "table")
+register("input.text", "Deliver text as one burst, using bracketed paste when enabled by the child.", "input.text(session, text) -> nil")
+
+function remuda.input.submit(session, expect)
+  return remuda._input_submit(session, tostring(expect))
+end
+
+register("input.submit", "Submit visible composer text; returns 'submitted' or 'unverified'.", "input.submit(session, expect) -> status")
+
+-- Composite: hold the session input lock across text, settle, and submission.
+function remuda.type_text(session, text, settle)
+  return remuda._input_type_text(session, tostring(text), settle or 0.1)
+end
+remuda.input.type_text = remuda.type_text
+register("input.type_text", "Type text, honor the settle pause, then return 'submitted' or 'unverified'.", "input.type_text(session, text, settle?) -> status")
 register(
   "type_text",
-  "Type text into a session and submit it with Return.",
-  "type_text(session, text, settle?) -> nil"
+  "Type text into a session and submit it with Return; returns 'submitted' or 'unverified'.",
+  "type_text(session, text, settle?) -> status"
 )
 
 -- The left session list, re-expressed as the "*sessions*" buffer instead of

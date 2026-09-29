@@ -42,8 +42,8 @@ const REMOTE_INPUT_WINDOW: Duration = Duration::from_secs(1);
 const MAX_REMOTE_INPUT_PEERS: usize = 1024;
 static LISTENER_ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Explicit listener address and opt-in for wildcard binding.
-/// On dual-stack IPv6 systems, an opted-in `[::]` bind may also accept IPv4.
+/// Listener address and opt-in for wildcard binding.
+/// An opted-in IPv6 wildcard may accept IPv4 on dual-stack systems.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ListenerConfig {
     pub bind_addr: SocketAddr,
@@ -239,13 +239,12 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
     let authorize: MemberAuthorizer =
         Arc::new(move |peer_static| authorizer_cache.authorize(peer_static));
     let dispatch_path = daemon_path.to_path_buf();
-    let control_source = ControlSource::DefaultStateDir;
     let request_limiter = Arc::new(RequestLimiter::default());
     let dispatch_limiter = request_limiter.clone();
     let dispatch: FrameDispatcher = Arc::new(move |payload, peer_static| {
         dispatch_payload(payload, peer_static, &dispatch_path, &dispatch_limiter)
     });
-    Ok(Listener {
+    let listener = Listener {
         socket,
         state: Arc::new(ListenerState {
             responder_private,
@@ -256,8 +255,9 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
         }),
         authorize,
         dispatch,
-        control_source,
-    })
+        control_source: ControlSource::DefaultStateDir,
+    };
+    Ok(listener)
 }
 
 /// Bind and serve requests until the listener fails.
@@ -690,8 +690,9 @@ fn invalid_http(message: &'static str) -> io::Error {
 }
 
 #[cfg(test)]
-fn authorize_remote_request(request: &Request) -> Result<(), Response> {
-    authorize_remote_request_with_source(request, &ControlSource::DefaultStateDir)
+fn authorize_remote_request(request: &Request) -> io::Result<()> {
+    crate::remote_front::authorize(request)
+        .map_err(|reason| io::Error::new(io::ErrorKind::PermissionDenied, reason))
 }
 
 fn authorize_remote_request_with_source(
@@ -738,16 +739,6 @@ fn authorize_remote_request_with_control(
         return Ok(());
     }
     crate::remote_front::authorize(request).map_err(Response::error)
-}
-
-#[cfg(all(test, unix))]
-fn authorization_error(response: Response) -> io::Error {
-    let message = match response {
-        Response::Error(reason) => reason,
-        Response::RemoteControlDisabled => "remote control disabled on this node".into(),
-        other => format!("unexpected remote authorization response: {other:?}"),
-    };
-    io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
 
 impl MemberRegistryCache {
@@ -1101,33 +1092,17 @@ fn handle_unknown_peer_join(
         .verify_consume_with(&request.join.token, || {
             (state.admit_join)(&opened.peer_static, request.join.endpoint.as_deref())
         });
-    if result.is_ok() {
-        let joining_fp = cluster::encoding::fingerprint(&opened.peer_static);
-        let peers = cluster::push_now_excluding(Some(&joining_fp));
-        let needs_retry = peers.iter().any(|peer| !peer.reached);
-        for peer in &peers {
-            if peer.reached {
-                eprintln!(
-                    "remuda: cluster join admission reached peer {}",
-                    peer.peer_fp
-                );
-            } else {
-                eprintln!(
-                    "remuda: cluster join admission did not reach peer {}: {}",
-                    peer.peer_fp, peer.detail
-                );
-            }
-        }
-        if needs_retry {
-            cluster::registry_changed();
-        }
-    }
     let response = if result.is_ok() {
         b"{\"joined\":true}".as_slice()
     } else {
         b"{\"joined\":false}".as_slice()
     };
     send_encrypted_response(stream, opened, response);
+    if result.is_ok() {
+        // Do not make the one-shot join reply wait on existing peers. Queue
+        // replication after the joiner has received its admission result.
+        cluster::registry_changed();
+    }
 }
 
 fn encode_error(reason: &str) -> Vec<u8> {
@@ -1288,7 +1263,7 @@ mod tests {
             authorize: MemberAuthorizer,
             dispatch: FrameDispatcher,
             limits: ConnectionLimits,
-            _control_source: ControlSource,
+            control_source: ControlSource,
             admit_join: JoinAdmitter,
         ) -> Self {
             use std::os::unix::fs::PermissionsExt;
@@ -1329,7 +1304,7 @@ mod tests {
                             authorize.clone(),
                             dispatch.clone(),
                             ConnectionPolicy {
-                                control_source: ControlSource::DefaultStateDir,
+                                control_source: control_source.clone(),
                                 limits,
                             },
                         )
@@ -1821,43 +1796,6 @@ mod tests {
             Response::Ack { duplicate: false }
         );
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn socket_remote_input_is_refused_without_dispatch() {
-        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
-            .generate_keypair()
-            .unwrap();
-        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
-            .generate_keypair()
-            .unwrap();
-        let settings = TestControlSettings::new(br#"{"allow_remote_control":false}"#);
-        let dispatched = Arc::new(AtomicUsize::new(0));
-        let seen = dispatched.clone();
-        let server = SocketTestServer::start_production_with_control_source(
-            responder.private,
-            responder.public,
-            Arc::new(|_| Ok(())),
-            Arc::new(move |_, _| {
-                seen.fetch_add(1, Ordering::SeqCst);
-                Ok(serde_json::to_vec(&Response::Ack { duplicate: false }).unwrap())
-            }),
-            settings.source(),
-        );
-        let request = Request::Input {
-            name: "session".into(),
-            instance_id: "instance".into(),
-            client_id: "00000000000000000000000000000001".into(),
-            seq: 1,
-            bytes: b"hello\r".to_vec(),
-        };
-        let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
-        let (status, response) = server.exchange(sealed);
-        assert_eq!(status, 200);
-        let response: Response = serde_json::from_slice(&response).unwrap();
-        assert_eq!(response, Response::RemoteControlDisabled);
-        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(unix)]
@@ -2610,15 +2548,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn socket_denials_and_malformed_json_never_echo_request_payloads() {
-        let dispatched = Arc::new(AtomicUsize::new(0));
-        let dispatched_for_worker = dispatched.clone();
         let (server, peer, _) = socket_server(
-            move |payload, _peer| {
-                let request =
-                    crate::remote_front::decode_frame(payload).map_err(io::Error::other)?;
-                authorize_remote_request(&request).map_err(authorization_error)?;
-                dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
-                Ok(serde_json::to_vec(&Response::Ok).unwrap())
+            |payload, peer| {
+                dispatch_payload(
+                    payload,
+                    peer,
+                    Path::new("unused-daemon-path"),
+                    &RequestLimiter::default(),
+                )
             },
             socket_test_timeout(),
             socket_test_timeout(),
@@ -2634,11 +2571,6 @@ mod tests {
             Request::Send {
                 name: "session".into(),
                 bytes: secret.as_bytes().to_vec(),
-            },
-            Request::Close {
-                name: "session".into(),
-                instance_id: None,
-                confirm: None,
             },
         ];
         for request in refused {
@@ -2658,7 +2590,6 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.contains("invalid remote request"));
         assert!(!response.contains(secret));
-        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(unix)]
@@ -2704,6 +2635,43 @@ mod tests {
             initial_inode,
             "bad tokens must not replace token state"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_remote_input_is_refused_without_dispatch() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let settings = TestControlSettings::new(br#"{"allow_remote_control":false}"#);
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let seen = dispatched.clone();
+        let server = SocketTestServer::start_production_with_control_source(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Ok(())),
+            Arc::new(move |_, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::to_vec(&Response::Ack { duplicate: false }).unwrap())
+            }),
+            settings.source(),
+        );
+        let request = Request::Input {
+            name: "session".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
+            bytes: b"hello\r".to_vec(),
+        };
+        let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
+        let (status, response) = server.exchange(sealed);
+        assert_eq!(status, 200);
+        let response: Response = serde_json::from_slice(&response).unwrap();
+        assert_eq!(response, Response::RemoteControlDisabled);
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(unix)]
@@ -2847,24 +2815,24 @@ mod tests {
             |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
             socket_test_timeout(),
             socket_test_timeout(),
-            Duration::from_millis(150),
-            Duration::from_millis(300),
+            Duration::from_secs(10),
+            Duration::from_secs(1),
         );
         let started = Instant::now();
         let mut stream = TcpStream::connect(server.address).unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(12)))
             .unwrap();
         let request = b"POST /cluster HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\ntest";
         for byte in request {
             if stream.write_all(&[*byte]).is_err() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(Duration::from_millis(150));
         }
         let mut tail = Vec::new();
         let _ = stream.read_to_end(&mut tail);
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

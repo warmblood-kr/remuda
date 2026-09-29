@@ -342,16 +342,11 @@ impl Registry {
                 "session restarted; close was refused".into(),
             )));
         }
-        Some(match session.terminate_for_close() {
-            Ok(()) => {
-                let removed = sessions.remove(name).is_some();
-                drop(sessions);
-                if removed {
-                    session.wake_sync_waiters();
-                }
-                Ok(removed)
-            }
-            Err(error) => Err(error),
-        })
+        session.mark_closing();
+        if let Err(error) = session.terminate() {
+            session.clear_closing();
+            return Some(Err(error));
+        }
+        Some(Ok(sessions.remove(name).is_some()))
     }
 }

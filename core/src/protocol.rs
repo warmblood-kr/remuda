@@ -89,11 +89,9 @@ pub enum Request {
     AttachTracked { name: String },
     /// Ask whether a tracked attachment was superseded while its stream ended.
     AttachStatus { name: String, generation: u64 },
-    /// End a session — live or already self-exited — and stop tracking it.
-    /// Refused while a human is attached. A session that ended on its own is
-    /// dropped by `List`; this is for one still alive. Local callers may omit
-    /// the optional fields to retain legacy behavior; the remote front accepts
-    /// only an explicit confirmation bound to an instance id.
+    /// End a live or self-exited session and stop tracking it; refused while human-attached.
+    /// Local callers may omit optional fields for legacy behavior; the remote front requires
+    /// explicit confirmation bound to an instance id.
     Close {
         name: String,
         /// Session start the caller intends to close. Required by the remote
