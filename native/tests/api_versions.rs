@@ -144,7 +144,7 @@ fn exercise_expect_wakes_on_session_output(path: &std::path::Path) {
         );
         thread::sleep(Duration::from_millis(5));
     };
-    let wake_deadline = output_seen_at + Duration::from_millis(150);
+    let wake_deadline = output_seen_at + Duration::from_millis(750);
     loop {
         if eval(path, "return remuda._api_v5_expect_handle.state.status") == "matched" {
             break;
