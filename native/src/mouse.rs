@@ -89,6 +89,8 @@ pub struct SgrParser {
 }
 
 const ESC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(25);
+const PASTE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+const PASTE_BUFFER_LIMIT: usize = 1024 * 1024;
 
 /// Translate a host SGR event into the live child terminal's selected wire
 /// format. Unsupported release or motion reports are omitted.
@@ -144,7 +146,9 @@ pub fn encode_for_child(event: SgrMouse, state: MouseState) -> Option<Vec<u8>> {
 
 impl SgrParser {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<InputToken> {
-        if self.pending.is_empty() && bytes.contains(&0x1b) {
+        if self.in_paste {
+            self.pending_since = Some(std::time::Instant::now());
+        } else if self.pending.is_empty() && bytes.contains(&0x1b) {
             self.pending_since = Some(std::time::Instant::now());
         }
         self.pending.extend_from_slice(bytes);
@@ -158,6 +162,7 @@ impl SgrParser {
     pub fn finish(&mut self) -> Vec<InputToken> {
         let tokens = self.parse(true);
         self.pending_since = None;
+        self.in_paste = false;
         tokens
     }
 
@@ -166,20 +171,40 @@ impl SgrParser {
     }
 
     pub fn timeout_remaining(&self) -> Option<std::time::Duration> {
-        if self.in_paste {
-            return None;
-        }
+        let timeout = if self.in_paste {
+            PASTE_IDLE_TIMEOUT
+        } else {
+            ESC_TIMEOUT
+        };
         self.pending_since
-            .map(|since| ESC_TIMEOUT.saturating_sub(since.elapsed()))
+            .map(|since| timeout.saturating_sub(since.elapsed()))
     }
 
     pub fn flush_expired(&mut self) -> Vec<InputToken> {
-        if !self.in_paste
-            && self
-                .pending_since
-                .is_some_and(|since| since.elapsed() >= ESC_TIMEOUT)
+        let timeout = if self.in_paste {
+            PASTE_IDLE_TIMEOUT
+        } else {
+            ESC_TIMEOUT
+        };
+        if self
+            .pending_since
+            .is_some_and(|since| since.elapsed() >= timeout)
         {
-            self.finish()
+            if self.in_paste {
+                self.in_paste = false;
+                self.pending_since = None;
+                if self.pending.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut bytes = std::mem::take(&mut self.pending);
+                    // Close the child's bracketed paste too, so later input
+                    // is no longer interpreted as part of the unfinished paste.
+                    bytes.extend_from_slice(PASTE_END);
+                    vec![InputToken::Paste(bytes)]
+                }
+            } else {
+                self.finish()
+            }
         } else {
             Vec::new()
         }
@@ -195,9 +220,23 @@ impl SgrParser {
                     .position(|window| window == PASTE_END)
                 {
                     let len = end + PASTE_END.len();
-                    out.push(InputToken::Paste(self.pending.drain(..len).collect()));
-                    self.in_paste = false;
+                    if len <= PASTE_BUFFER_LIMIT {
+                        out.push(InputToken::Paste(self.pending.drain(..len).collect()));
+                        self.in_paste = false;
+                    } else {
+                        let chunk = end.min(PASTE_BUFFER_LIMIT);
+                        out.push(InputToken::Paste(self.pending.drain(..chunk).collect()));
+                    }
                     continue;
+                }
+                if self.pending.len() > PASTE_BUFFER_LIMIT {
+                    let held = longest_suffix_prefix(&self.pending, PASTE_END);
+                    let safe_len = self.pending.len().saturating_sub(held);
+                    let chunk = safe_len.min(PASTE_BUFFER_LIMIT);
+                    if chunk > 0 {
+                        out.push(InputToken::Paste(self.pending.drain(..chunk).collect()));
+                        continue;
+                    }
                 }
                 if finishing {
                     out.push(InputToken::Paste(std::mem::take(&mut self.pending)));
@@ -279,6 +318,13 @@ impl SgrParser {
         }
         merged
     }
+}
+
+fn longest_suffix_prefix(bytes: &[u8], prefix: &[u8]) -> usize {
+    (1..=bytes.len().min(prefix.len()))
+        .rev()
+        .find(|&len| bytes[bytes.len() - len..] == prefix[..len])
+        .unwrap_or(0)
 }
 
 enum Parse {
@@ -420,7 +466,9 @@ mod tests {
         parser.pending_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
         assert_eq!(
             parser.flush_expired(),
-            vec![InputToken::Paste(paste.to_vec())]
+            vec![InputToken::Paste(
+                b"\x1b[200~unfinished paste\x1b[201~".to_vec()
+            )]
         );
         assert_eq!(parser.feed(&[0x1c]), vec![InputToken::Bytes(vec![0x1c])]);
     }
