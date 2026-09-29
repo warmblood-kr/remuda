@@ -18,8 +18,13 @@ fn paste_input_strips_escape_and_wraps_only_when_child_mode_is_enabled() {
 fn paste_input_strips_c0_controls_except_tab_line_feed_and_carriage_return() {
     assert_eq!(
         paste_input("a\u{3}\u{4}\u{1a}\u{1c}\t\n\r\u{7f}z", false),
-        b"a\t\n\r\x7fz"
+        b"a\t\n\rz"
     );
+}
+
+#[test]
+fn paste_input_strips_del_and_c1_without_corrupting_utf8() {
+    assert_eq!(paste_input("한\u{9b}글\u{7f}!", false), "한글!".as_bytes());
 }
 
 #[test]
