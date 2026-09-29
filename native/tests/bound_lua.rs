@@ -4,13 +4,94 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[test]
-fn an_infinite_tool_callback_errors_and_the_image_answers_the_next_request() {
-    let image = Image::spawn(
+fn image() -> Image {
+    Image::spawn(
         Path::new("/tmp/remuda-bound-lua-test.sock"),
         Arc::new(Registry::new()),
         Arc::new(Counters::default()),
+    )
+}
+
+fn expect_bounded_error(code: &str) {
+    let image = image();
+    let answer = image.submit(code, None).expect("queue bounded regression");
+    let error = answer
+        .recv_timeout(Duration::from_secs(3))
+        .expect("Lua execution returns within the test bound")
+        .expect_err("the script must exceed the instruction budget");
+    assert!(
+        error.contains("execution limit"),
+        "unexpected error: {error}"
     );
+}
+
+#[test]
+fn pcall_cannot_swallow_the_instruction_limit() {
+    expect_bounded_error("return pcall(function() while true do end end)");
+}
+
+#[test]
+fn xpcall_error_handler_cannot_swallow_the_instruction_limit() {
+    expect_bounded_error(
+        "return xpcall(function() error('trigger') end, function() while true do end end)",
+    );
+}
+
+#[test]
+fn coroutine_wrap_loop_is_bounded() {
+    expect_bounded_error("return coroutine.wrap(function() while true do end end)()");
+}
+
+#[test]
+fn a_coroutine_resumed_in_a_later_job_is_bounded() {
+    let image = image();
+    image
+        .eval(
+            "saved_coroutine = coroutine.create(function() while true do end end)",
+            None,
+        )
+        .expect("create coroutine for a later job");
+    let answer = image
+        .submit("return coroutine.resume(saved_coroutine)", None)
+        .expect("queue resume");
+    let error = answer
+        .recv_timeout(Duration::from_secs(3))
+        .expect("resumed coroutine returns within the test bound")
+        .expect_err("the coroutine must exceed the instruction budget");
+    assert!(
+        error.contains("execution limit"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn time_in_rust_sleep_does_not_consume_the_instruction_budget() {
+    let image = image();
+    let answer = image
+        .submit(
+            "remuda.sleep(2.2); local sum = 0; for i = 1, 100000 do sum = sum + i end; return sum",
+            None,
+        )
+        .expect("queue sleep and short loop");
+    assert_eq!(
+        answer
+            .recv_timeout(Duration::from_secs(4))
+            .expect("sleep and short loop complete within the test bound")
+            .expect("Rust sleep time is outside the Lua instruction budget"),
+        "5000050000"
+    );
+}
+
+#[test]
+fn nested_protected_calls_share_the_outer_instruction_budget() {
+    expect_bounded_error(
+        "return xpcall(function() return pcall(function() while true do end end) end, function() return 'caught' end)",
+    );
+}
+
+#[test]
+fn an_infinite_tool_callback_errors_and_the_image_answers_the_next_request() {
+    let image = image();
     image
         .eval(
             r#"remuda.tool({name = "loop_forever", about = "Test callback budget.", run = function()

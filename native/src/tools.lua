@@ -14,6 +14,7 @@
 -- a vocabulary that accumulates rather than a side table of closures.
 
 remuda.tools = {}
+local reset_schedule_budget = __remuda_reset_schedule_budget or function() end
 
 -- Installed mods may claim a manifest-declared shell command. The core
 -- forwards its remaining words here after the mod has been explicitly
@@ -478,6 +479,7 @@ function remuda._run_due_schedules(now)
   for _, handle in ipairs(handles) do
     local schedule = remuda.schedules[handle]
     if schedule and schedule_now - schedule.last_run >= schedule.every then
+      reset_schedule_budget()
       schedule.last_run = schedule_now
       if schedule.name then
         remuda._schedule_fire_counts[schedule.name] = (remuda._schedule_fire_counts[schedule.name] or 0) + 1
