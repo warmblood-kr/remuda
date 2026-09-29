@@ -3,8 +3,6 @@
 #[cfg(not(windows))]
 use std::fs::{self, File, OpenOptions};
 use std::io;
-#[cfg(not(windows))]
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[cfg(not(windows))]
@@ -144,33 +142,7 @@ pub(super) fn check_private_file(_file: &File, description: &str, path: &Path) -
 
 #[cfg(not(windows))]
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temp = parent.join(format!(
-        ".{name}-{}-{}.tmp",
-        std::process::id(),
-        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temp)?;
-    let result = (|| {
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&temp, path)?;
-        File::open(parent)?.sync_all()
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(temp);
-    }
-    result
+    crate::fs_atomic::write_atomic(path, bytes, 0o600)
 }
 
 #[cfg(not(windows))]
