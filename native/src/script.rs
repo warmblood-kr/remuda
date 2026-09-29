@@ -148,6 +148,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "fs.write_atomic(path, bytes) -> true, nil | nil, error",
     ),
     (
+        "fs.mkdir_new",
+        "Create one new directory without creating parents or trusting an existing path.",
+        "fs.mkdir_new(path) -> true | nil, 'exists' | nil, error",
+    ),
+    (
         "ls",
         "List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.",
         "ls() -> {session...}",
@@ -944,11 +949,21 @@ fn dir_bindings(
     Ok(())
 }
 
-/// `remuda.fs` currently exposes one atomic write word. The Lua runtime is
-/// trusted and already has arbitrary `io.open`/`os.rename`; this bundles the
-/// durability and replacement guarantees into a single named operation.
+/// Filesystem operations with explicit creation and replacement semantics.
 fn fs_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
     let fs = lua.create_table()?;
+    fs.set(
+        "mkdir_new",
+        lua.create_function(|_, path: String| {
+            match std::fs::create_dir(Path::new(&path)) {
+                Ok(()) => Ok((Some(true), None::<String>)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Ok((None::<bool>, Some("exists".to_string())))
+                }
+                Err(error) => Ok((None::<bool>, Some(error.to_string()))),
+            }
+        })?,
+    )?;
     fs.set(
         "write_atomic",
         lua.create_function(|_, (path, bytes): (String, mlua::LuaString)| {
