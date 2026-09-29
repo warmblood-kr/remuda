@@ -17,6 +17,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  lua-shell-call-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sh scripts/test-no-shell-lua.sh
+
   test:
     runs-on: ubuntu-latest
     steps:
