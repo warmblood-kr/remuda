@@ -221,6 +221,16 @@ feed
 
 ``feed(name, steps) -> nil`` — Deliver a sequence of bursts and pauses as one indivisible act.
 
+fs
+--
+
+``table`` — Atomic replacement of files for trusted Lua callers.
+
+fs.write_atomic
+---------------
+
+``fs.write_atomic(path, bytes) -> true, nil | nil, error`` — Write bytes through a same-directory temporary file and atomically replace the target.
+
 hook_list
 ---------
 

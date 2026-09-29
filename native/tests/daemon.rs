@@ -3312,6 +3312,30 @@ fn the_daemon_names_the_build_it_was_started_from() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn idle_daemon_version_requests_do_not_wait_for_a_poll_interval() {
+    let dir = scratch_dir("version-latency");
+    let path = daemon::socket_path_in(&dir, "s");
+    let daemon = Daemon::spawn(&dir);
+    let mut samples = Vec::with_capacity(50);
+
+    for _ in 0..50 {
+        let started = Instant::now();
+        match client::request(&path, &Request::Version).expect("version") {
+            Response::Value(said) => assert_eq!(said, remuda_native::dist::BUILD_VERSION),
+            other => panic!("unexpected: {other:?}"),
+        }
+        samples.push(started.elapsed());
+    }
+
+    samples.sort_unstable();
+    let p50 = samples[samples.len() / 2];
+    assert!(p50 < Duration::from_millis(5), "Version p50 was {p50:?}");
+    drop(daemon);
+    std::fs::remove_dir_all(dir).expect("remove isolated runtime directory");
+}
+
 // Unix only: the regression is SIGPIPE, and `true` is not a Windows command.
 #[test]
 #[cfg(unix)]
