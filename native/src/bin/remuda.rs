@@ -38,6 +38,11 @@ fn main() -> ExitCode {
         Err(error) => return fail(error),
     };
     let argv: Vec<&str> = rest.iter().map(String::as_str).collect();
+
+    if let Some(exit) = run_internal_command(&argv) {
+        return exit;
+    }
+
     let path = daemon::socket_path(server);
 
     let skew = match prepare_command(&argv, &path) {
@@ -89,16 +94,7 @@ fn main() -> ExitCode {
 
         ["run", rest @ ..] => run_session(server, &path, rest),
 
-        ["send", name, text @ ..] => {
-            let text = text.join(" ");
-            with_daemon(server, &path, |path| {
-                let request = Request::SendLine {
-                    name: name.to_string(),
-                    text: text.clone(),
-                };
-                simple_request(path, request)
-            })
-        }
+        ["send", name, text @ ..] => send_command(server, &path, name, text),
 
         ["attach", name] => with_daemon(server, &path, |path| ride(path, name)),
         ["attach", name, "--mouse=false"] => {
@@ -1230,6 +1226,86 @@ fn run_upgrade(args: &[&str]) -> ExitCode {
     match upgrade_channel(args).and_then(dist::upgrade) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(e),
+    }
+}
+
+fn send_command(server: &str, path: &Path, name: &str, text: &[&str]) -> ExitCode {
+    let text = text.join(" ");
+    with_daemon(server, path, |path| {
+        let request = Request::SendLine {
+            name: name.to_string(),
+            text: text.clone(),
+        };
+        simple_request(path, request)
+    })
+}
+
+/// Commands used by release automation must not start a daemon or run update checks.
+fn run_internal_command(argv: &[&str]) -> Option<ExitCode> {
+    match argv {
+        ["_latest-index", args @ ..] => Some(run_latest_index(args)),
+        _ => None,
+    }
+}
+
+/// Internal release-workflow command. Reuse dist::is_newer so publication and
+/// update notices order channel versions identically.
+fn run_latest_index(args: &[&str]) -> ExitCode {
+    let [file, channel, version, updated] = args else {
+        return fail("usage: remuda _latest-index FILE CHANNEL VERSION UPDATED");
+    };
+    let (file, channel, version, updated) = (*file, *channel, *version, *updated);
+    if !dist::is_channel(channel) {
+        return fail(format!("unknown channel {channel:?} — stable or nightly"));
+    }
+
+    let result = (|| -> Result<&'static str, String> {
+        let path = Path::new(file);
+        let text = fs::read_to_string(path)
+            .map_err(|error| format!("cannot read latest index {}: {error}", path.display()))?;
+        let mut index: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| format!("cannot parse latest index {}: {error}", path.display()))?;
+        let object = index
+            .as_object_mut()
+            .ok_or_else(|| "latest index must be a JSON object".to_string())?;
+        let current = object
+            .get(channel)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        if version == current {
+            eprintln!("remuda: latest.json {channel} already points to {version}");
+            return Ok("publish=already");
+        }
+        if !dist::is_newer(version, current) {
+            eprintln!(
+                "remuda: latest.json {channel} is already {current}; skipping stale candidate {version}"
+            );
+            return Ok("publish=false");
+        }
+
+        object.insert(
+            channel.to_string(),
+            serde_json::Value::String(version.to_string()),
+        );
+        object.insert(
+            "updated".to_string(),
+            serde_json::Value::String(updated.to_string()),
+        );
+        let mut output = serde_json::to_vec_pretty(&index)
+            .map_err(|error| format!("cannot encode latest index: {error}"))?;
+        output.push(b'\n');
+        fs::write(path, output)
+            .map_err(|error| format!("cannot write latest index {}: {error}", path.display()))?;
+        Ok("publish=true")
+    })();
+
+    match result {
+        Ok(status) => {
+            println!("{status}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error),
     }
 }
 
