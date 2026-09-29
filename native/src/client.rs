@@ -7,13 +7,402 @@ use interprocess::local_socket::traits::Stream as _;
 use remuda_core::protocol::{Request, Response};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::time::Instant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Detach key: Ctrl-\ (0x1C). Chosen because almost nothing binds it, unlike
 /// Ctrl-C/D/Z, which the attached program needs. Consumed, never forwarded.
 pub const DETACH: u8 = 0x1C;
+const ATTACH_INPUT_QUEUE_BYTES: usize = 1024 * 1024;
+const ATTACH_INPUT_CHUNK_BYTES: usize = 16 * 1024;
+const ATTACH_INPUT_STALL: Duration = Duration::from_secs(3);
+const ATTACH_INPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+fn attach_input_stall_threshold() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(milliseconds) = std::env::var("REMUDA_TEST_ATTACH_STALL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Duration::from_millis(milliseconds);
+    }
+    ATTACH_INPUT_STALL
+}
+
+#[cfg(debug_assertions)]
+fn attach_test_input_hooks_enabled() -> bool {
+    std::env::var_os("REMUDA_TEST_INPUT_HOOKS").is_some_and(|value| value == "1")
+}
+
+struct AttachInputStatus {
+    last_progress: Duration,
+    dropping: bool,
+    permanent_failure: bool,
+    delivered_bytes: u64,
+    drop_started_after: u64,
+}
+
+struct AttachInputQueue {
+    sender: std::sync::mpsc::Sender<Vec<u8>>,
+    status: std::sync::Arc<std::sync::Mutex<AttachInputStatus>>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    drop_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    recovery_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(debug_assertions)]
+    test_hooks_enabled: bool,
+    capacity: usize,
+    stall_after: Duration,
+    now: std::sync::Arc<dyn Fn() -> Duration + Send + Sync>,
+}
+
+#[derive(Clone)]
+struct AttachInputWriter {
+    status: std::sync::Arc<std::sync::Mutex<AttachInputStatus>>,
+    dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    drop_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    recovery_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    now: std::sync::Arc<dyn Fn() -> Duration + Send + Sync>,
+}
+
+enum AttachInputAttempt {
+    Queued,
+    Full(Vec<u8>),
+    Dropped,
+}
+
+impl AttachInputQueue {
+    fn new() -> (Self, std::sync::mpsc::Receiver<Vec<u8>>) {
+        Self::with_capacity(ATTACH_INPUT_QUEUE_BYTES, attach_input_stall_threshold())
+    }
+
+    fn with_capacity(
+        capacity: usize,
+        stall_after: Duration,
+    ) -> (Self, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let started = Instant::now();
+        Self::with_clock(
+            capacity,
+            stall_after,
+            std::sync::Arc::new(move || started.elapsed()),
+        )
+    }
+
+    fn with_clock(
+        capacity: usize,
+        stall_after: Duration,
+        now: std::sync::Arc<dyn Fn() -> Duration + Send + Sync>,
+    ) -> (Self, std::sync::mpsc::Receiver<Vec<u8>>) {
+        assert!(capacity > 0, "attach input queue capacity must be nonzero");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let now_at_start = now();
+        (
+            Self {
+                sender,
+                status: std::sync::Arc::new(std::sync::Mutex::new(AttachInputStatus {
+                    last_progress: now_at_start,
+                    dropping: false,
+                    permanent_failure: false,
+                    delivered_bytes: 0,
+                    drop_started_after: 0,
+                })),
+                dropped: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                queued_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                drop_notice_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                recovery_notice_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )),
+                #[cfg(debug_assertions)]
+                test_hooks_enabled: attach_test_input_hooks_enabled(),
+                capacity,
+                stall_after,
+                now,
+            },
+            receiver,
+        )
+    }
+
+    fn attempt(&self, bytes: Vec<u8>) -> AttachInputAttempt {
+        let len = bytes.len();
+        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        if status.dropping {
+            if !status.permanent_failure && status.delivered_bytes > status.drop_started_after {
+                status.dropping = false;
+            } else {
+                self.dropped
+                    .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
+                return AttachInputAttempt::Dropped;
+            }
+        }
+        // Keep the reservation until the writer completes the full chunk, so
+        // queued plus in-flight data never exceeds the byte capacity.
+        let mut used = self.queued_bytes.load(std::sync::atomic::Ordering::SeqCst);
+        loop {
+            let Some(next) = used.checked_add(len).filter(|next| *next <= self.capacity) else {
+                if (self.now)().saturating_sub(status.last_progress) >= self.stall_after {
+                    self.mark_dropping(&mut status);
+                    self.dropped
+                        .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
+                    return AttachInputAttempt::Dropped;
+                }
+                return AttachInputAttempt::Full(bytes);
+            };
+            match self.queued_bytes.compare_exchange(
+                used,
+                next,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => used = actual,
+            }
+        }
+        match self.sender.send(bytes) {
+            Ok(()) => AttachInputAttempt::Queued,
+            Err(error) => {
+                let len = error.0.len();
+                self.queued_bytes
+                    .fetch_sub(len, std::sync::atomic::Ordering::SeqCst);
+                self.mark_dropping(&mut status);
+                status.permanent_failure = true;
+                self.dropped
+                    .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
+                AttachInputAttempt::Dropped
+            }
+        }
+    }
+
+    fn writer(&self) -> AttachInputWriter {
+        AttachInputWriter {
+            status: std::sync::Arc::clone(&self.status),
+            dropped: std::sync::Arc::clone(&self.dropped),
+            queued_bytes: std::sync::Arc::clone(&self.queued_bytes),
+            drop_notice_pending: std::sync::Arc::clone(&self.drop_notice_pending),
+            recovery_notice_pending: std::sync::Arc::clone(&self.recovery_notice_pending),
+            now: std::sync::Arc::clone(&self.now),
+        }
+    }
+
+    fn mark_dropping(&self, status: &mut AttachInputStatus) {
+        if !status.dropping {
+            status.dropping = true;
+            status.drop_started_after = status.delivered_bytes;
+            self.drop_notice_pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn take_drop_notice(&self) -> bool {
+        self.drop_notice_pending
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn take_recovery_notice(&self) -> bool {
+        if self.queued_bytes.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return false;
+        }
+        let status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if status.dropping || status.permanent_failure {
+            return false;
+        }
+        drop(status);
+        self.recovery_notice_pending
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn force_paste_close(&self) {
+        let len = crate::mouse::PASTE_END.len();
+        // This one protocol marker may exceed the byte cap by six bytes. It
+        // follows all queued data so the child cannot remain in paste mode.
+        self.queued_bytes
+            .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
+        if self.sender.send(crate::mouse::PASTE_END.to_vec()).is_err() {
+            self.queued_bytes
+                .fetch_sub(len, std::sync::atomic::Ordering::SeqCst);
+            self.dropped
+                .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn stop_after_drop(&self, bytes: usize) {
+        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        self.mark_dropping(&mut status);
+        self.dropped
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn enqueue(&self, bytes: &[u8], paste_open_before_chunk: bool, starts_paste: bool) -> bool {
+        let mut paste_open_delivered = paste_open_before_chunk && !starts_paste;
+        let chunk_size = ATTACH_INPUT_CHUNK_BYTES.min(self.capacity);
+        let mut chunks = bytes.chunks(chunk_size).peekable();
+        let mut first_chunk = true;
+        while let Some(chunk) = chunks.next() {
+            let mut pending = chunk.to_vec();
+            loop {
+                match self.attempt(pending) {
+                    AttachInputAttempt::Queued => {
+                        if first_chunk && starts_paste {
+                            paste_open_delivered = true;
+                        }
+                        first_chunk = false;
+                        break;
+                    }
+                    AttachInputAttempt::Full(bytes) => {
+                        pending = bytes;
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    AttachInputAttempt::Dropped => {
+                        if paste_open_delivered {
+                            self.force_paste_close();
+                        }
+                        let remaining = chunks.map(<[u8]>::len).sum();
+                        self.stop_after_drop(remaining);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+impl AttachInputWriter {
+    fn progress(&self, count: usize) {
+        if count > 0 {
+            self.status
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .last_progress = (self.now)();
+        }
+    }
+
+    fn failed(&self, bytes: usize) {
+        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        if !status.dropping {
+            status.drop_started_after = status.delivered_bytes;
+            self.drop_notice_pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        status.dropping = true;
+        status.permanent_failure = true;
+        drop(status);
+        self.dropped
+            .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+        self.queued_bytes
+            .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn delivered(&self, bytes: usize) {
+        self.queued_bytes
+            .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+        status.delivered_bytes = status.delivered_bytes.saturating_add(bytes as u64);
+        if status.dropping
+            && !status.permanent_failure
+            && status.delivered_bytes > status.drop_started_after
+        {
+            status.dropping = false;
+            self.recovery_notice_pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn dropped(&self, bytes: usize) {
+        if bytes > 0 {
+            self.dropped
+                .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+            self.queued_bytes
+                .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+fn write_attach_chunk(
+    stream: &mut Stream,
+    bytes: &[u8],
+    writer: &AttachInputWriter,
+) -> std::io::Result<()> {
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        let written = stream.write(remaining)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "attach input writer made no progress",
+            ));
+        }
+        writer.progress(written);
+        remaining = &remaining[written..];
+    }
+    stream.flush()
+}
+
+fn report_attach_input_dropped(output: &mut impl Write, dropped: usize) -> std::io::Result<()> {
+    if dropped > 0 {
+        writeln!(
+            output,
+            "\r\n[remuda] input dropped: {dropped} bytes could not be queued or confirmed; delivery may be partial"
+        )?;
+        output.flush()?;
+    }
+    Ok(())
+}
+
+fn report_attach_drop_started(queue: &AttachInputQueue, output_lock: &std::sync::Mutex<()>) {
+    if queue.take_drop_notice() {
+        let _guard = output_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut output = std::io::stdout();
+        let _ = writeln!(
+            output,
+            "\r\n[remuda] input delivery stalled; dropping input until the writer recovers"
+        );
+        let _ = output.flush();
+    }
+}
+
+fn report_attach_recovered(queue: &AttachInputQueue, output_lock: &std::sync::Mutex<()>) {
+    if queue.take_recovery_notice() {
+        let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut output = std::io::stdout();
+        let _ = writeln!(
+            output,
+            "\r\n[remuda] input writer recovered; queued input resumed"
+        );
+        let _ = output.flush();
+    }
+}
+
+#[cfg(debug_assertions)]
+fn report_test_attach_dropped_count(queue: &AttachInputQueue) {
+    if queue.test_hooks_enabled {
+        if let Some(path) = std::env::var_os("REMUDA_TEST_ATTACH_DROPPED_COUNT") {
+            let dropped = queue.dropped.load(std::sync::atomic::Ordering::SeqCst);
+            let path = PathBuf::from(path);
+            let temporary = path.with_extension("tmp");
+            if std::fs::write(&temporary, dropped.to_string()).is_ok() {
+                let _ = std::fs::rename(temporary, path);
+            }
+        }
+        if let Some(path) = std::env::var_os("REMUDA_TEST_ATTACH_INPUT_STATE") {
+            let queued = queue.queued_bytes.load(std::sync::atomic::Ordering::SeqCst);
+            let status = queue.status.lock().unwrap_or_else(|p| p.into_inner());
+            let state = format!(
+                "queued={queued} delivered={} dropping={}",
+                status.delivered_bytes, status.dropping
+            );
+            drop(status);
+            let path = PathBuf::from(path);
+            let temporary = path.with_extension("tmp");
+            if std::fs::write(&temporary, state).is_ok() {
+                let _ = std::fs::rename(temporary, path);
+            }
+        }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn report_test_attach_dropped_count(_queue: &AttachInputQueue) {}
+
 pub const EMPTY_REPLY_ERROR: &str = "the daemon hung up without answering";
 
 const RESET_INPUT_MODES: &[u8] =
@@ -480,12 +869,54 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     let trace_attach_exit = std::env::var_os("REMUDA_TRACE_ATTACH_EXIT").is_some();
     let scrollback = std::sync::Arc::new(AttachScrollback::default());
     let output_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    let (input_queue, input_rx) = AttachInputQueue::new();
+    let input_dropped = std::sync::Arc::clone(&input_queue.dropped);
+    let input_writer_status = input_queue.writer();
+    let input_writer_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writer_stream =
+        std::sync::Arc::new(std::sync::Mutex::new(reader_stream.as_ref().try_clone()?));
+    let writer_wake = ipc::wake_handle(
+        &writer_stream
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    let (writer_done_tx, writer_done_rx) = std::sync::mpsc::channel();
+    let input_writer = {
+        let writer_stream = std::sync::Arc::clone(&writer_stream);
+        let writer_status = input_writer_status;
+        let stop = std::sync::Arc::clone(&input_writer_stop);
+        std::thread::spawn(move || {
+            loop {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                let bytes = match input_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(bytes) => bytes,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                let mut stream = writer_stream
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if write_attach_chunk(&mut stream, &bytes, &writer_status).is_err() {
+                    writer_status.failed(bytes.len());
+                    break;
+                }
+                writer_status.delivered(bytes.len());
+            }
+            let mut queued_after_stop = 0;
+            while let Ok(bytes) = input_rx.try_recv() {
+                queued_after_stop += bytes.len();
+            }
+            writer_status.dropped(queued_after_stop);
+            let _ = writer_done_tx.send(());
+        })
+    };
     let attach_path = path.to_path_buf();
     let attach_name = name.to_string();
 
     // Keystrokes out, on their own thread; the screen pump runs here.
     let keys = std::thread::spawn({
-        let mut stream = reader_stream.as_ref().try_clone()?;
         let reader_stream = std::sync::Arc::clone(&reader_stream);
         let detached = std::sync::Arc::clone(&detached);
         let output_taken_over = std::sync::Arc::clone(&output_taken_over);
@@ -493,15 +924,32 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
         let output_done = std::sync::Arc::clone(&output_done);
         let scrollback = std::sync::Arc::clone(&scrollback);
         let output_lock = std::sync::Arc::clone(&output_lock);
+        let input_writer_stop = std::sync::Arc::clone(&input_writer_stop);
+        let writer_done_rx = writer_done_rx;
+        let writer_stream = std::sync::Arc::clone(&writer_stream);
         let path = attach_path.clone();
         let name = attach_name.clone();
         move || {
+            let _writer_stream_lifetime = writer_stream;
             let mut stdin = std::io::stdin().lock();
             let mut buf = [0u8; 1024];
             let mut parser = crate::mouse::SgrParser::default();
             let mut mouse_on = mouse;
+            let mut route = AttachRoute {
+                path: &path,
+                name: &name,
+                input: &input_queue,
+                mouse_on: &mut mouse_on,
+                mouse_toggle_enabled: mouse,
+                scrollback: &scrollback,
+                output_lock: &output_lock,
+                discarding_paste: false,
+            };
             let mut logged_pending_read = false;
             loop {
+                report_attach_drop_started(&input_queue, &output_lock);
+                report_attach_recovered(&input_queue, &output_lock);
+                report_test_attach_dropped_count(&input_queue);
                 if output_done.load(std::sync::atomic::Ordering::SeqCst) {
                     if output_taken_over.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
@@ -578,21 +1026,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                 let n = match read {
                     Ok(Some(n)) => n,
                     Ok(None) => {
-                        if mouse {
-                            route_tokens(
-                                &path,
-                                &name,
-                                &mut stream,
-                                parser.flush_expired(),
-                                &mut mouse_on,
-                                &scrollback,
-                                &output_lock,
-                            );
-                        } else {
-                            let paste_was_open = parser.paste_open();
-                            let _ = parser.flush_expired();
-                            let _ = close_raw_paste_if_needed(paste_was_open, &parser, &mut stream);
-                        }
+                        route_tokens(&mut route, parser.flush_expired());
                         continue;
                     }
                     Err(_) => break,
@@ -610,80 +1044,34 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     // Dropping those bytes would silently swallow input the
                     // user believes they sent.
                     Some(at) => {
-                        if mouse {
-                            route_tokens(
-                                &path,
-                                &name,
-                                &mut stream,
-                                parser.feed(&buf[..at]),
-                                &mut mouse_on,
-                                &scrollback,
-                                &output_lock,
-                            );
-                        } else if at > 0 {
-                            let _ = parser.feed(&buf[..at]);
-                            let _ = stream.write_all(&buf[..at]);
-                            let _ = stream.flush();
-                        }
-                        if mouse {
-                            route_tokens(
-                                &path,
-                                &name,
-                                &mut stream,
-                                parser.finish(),
-                                &mut mouse_on,
-                                &scrollback,
-                                &output_lock,
-                            );
-                        } else {
-                            let paste_was_open = parser.paste_open();
-                            let _ = parser.finish();
-                            let _ = close_raw_paste_if_needed(paste_was_open, &parser, &mut stream);
-                        }
+                        route_tokens(&mut route, parser.feed(&buf[..at]));
+                        route_tokens(&mut route, parser.finish());
                         detached.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
                     None => {
-                        if mouse {
-                            route_tokens(
-                                &path,
-                                &name,
-                                &mut stream,
-                                parser.feed(&buf[..n]),
-                                &mut mouse_on,
-                                &scrollback,
-                                &output_lock,
-                            );
-                        } else {
-                            let _ = parser.feed(&buf[..n]);
-                            let _ = stream.write_all(&buf[..n]);
-                            let _ = stream.flush();
-                        }
+                        route_tokens(&mut route, parser.feed(&buf[..n]));
                     }
                 }
             }
             // stdin EOF/errors and child exit can end this thread mid-paste.
             // Always restore the child parser before dropping its input pipe.
             if parser.paste_open() {
-                if mouse {
-                    route_tokens(
-                        &path,
-                        &name,
-                        &mut stream,
-                        parser.finish(),
-                        &mut mouse_on,
-                        &scrollback,
-                        &output_lock,
-                    );
-                } else {
-                    let paste_was_open = parser.paste_open();
-                    let _ = parser.finish();
-                    let _ = close_raw_paste_if_needed(paste_was_open, &parser, &mut stream);
-                }
+                route_tokens(&mut route, parser.finish());
             }
             // Ends the screen pump below, which then returns from `attach` and
             // drops every handle on this connection — that hang-up is what the
             // daemon reads as "the human left".
+            report_attach_drop_started(&input_queue, &output_lock);
+            drop(input_queue);
+            if writer_done_rx
+                .recv_timeout(ATTACH_INPUT_DRAIN_GRACE)
+                .is_err()
+            {
+                input_writer_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                ipc::wake_captured(writer_wake);
+                let _ = writer_done_rx.recv_timeout(Duration::from_secs(1));
+            }
             ipc::stop_reader(&reader_stream, &output_stop, || {
                 output_done.load(std::sync::atomic::Ordering::SeqCst)
             });
@@ -743,6 +1131,11 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     }
     #[cfg(unix)]
     let _ = keys.join();
+    input_writer_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    ipc::wake_captured(writer_wake);
+    let _ = input_writer.join();
+    let dropped = input_dropped.load(std::sync::atomic::Ordering::SeqCst);
+    let _ = report_attach_input_dropped(&mut stdout, dropped);
     Ok(left)
 }
 
@@ -838,15 +1231,18 @@ fn read_stdin_timeout(
     }
 }
 
-fn route_tokens(
-    path: &Path,
-    name: &str,
-    stream: &mut Stream,
-    tokens: Vec<crate::mouse::InputToken>,
-    mouse_on: &mut bool,
-    scrollback: &AttachScrollback,
-    output_lock: &std::sync::Mutex<()>,
-) {
+struct AttachRoute<'a> {
+    path: &'a Path,
+    name: &'a str,
+    input: &'a AttachInputQueue,
+    mouse_on: &'a mut bool,
+    mouse_toggle_enabled: bool,
+    scrollback: &'a AttachScrollback,
+    output_lock: &'a std::sync::Mutex<()>,
+    discarding_paste: bool,
+}
+
+fn route_tokens(route: &mut AttachRoute<'_>, tokens: Vec<crate::mouse::InputToken>) {
     use crate::mouse::{route_mouse_event, InputToken, MouseAction};
     use remuda_core::agent::MouseState;
     use std::sync::atomic::Ordering;
@@ -854,57 +1250,70 @@ fn route_tokens(
     for token in tokens {
         match token {
             InputToken::Mouse(event) => {
-                let state = if *mouse_on {
-                    match request(path, &Request::MouseState { name: name.into() }) {
+                let state = if *route.mouse_on {
+                    match request(
+                        route.path,
+                        &Request::MouseState {
+                            name: route.name.into(),
+                        },
+                    ) {
                         Ok(Response::MouseState(state)) => state,
                         _ => MouseState::default(),
                     }
                 } else {
                     MouseState::default()
                 };
-                if *mouse_on
+                if *route.mouse_on
                     && state.mode == remuda_core::agent::MouseMode::None
-                    && route_scrollback_wheel(path, name, event, scrollback, output_lock)
+                    && route_scrollback_wheel(
+                        route.path,
+                        route.name,
+                        event,
+                        route.scrollback,
+                        route.output_lock,
+                    )
                 {
                     continue;
                 }
-                let current = scrollback.offset.load(Ordering::SeqCst);
-                match route_mouse_event(event, state, *mouse_on, current) {
+                let current = route.scrollback.offset.load(Ordering::SeqCst);
+                match route_mouse_event(event, state, *route.mouse_on, current) {
                     MouseAction::Forward(bytes) => {
-                        let _ = stream.write_all(&bytes);
-                        let _ = stream.flush();
+                        let _ = route.input.enqueue(&bytes, false, false);
                     }
                     MouseAction::Scroll(next) => {
-                        let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
-                        scrollback.offset.store(next, Ordering::SeqCst);
-                        if let Some((_, total)) = paint_history(path, name, next) {
-                            scrollback.history_total.store(total, Ordering::SeqCst);
+                        let _guard = route.output_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        route.scrollback.offset.store(next, Ordering::SeqCst);
+                        if let Some((_, total)) = paint_history(route.path, route.name, next) {
+                            route
+                                .scrollback
+                                .history_total
+                                .store(total, Ordering::SeqCst);
                         }
                     }
                     MouseAction::Ignore => {}
                 }
             }
             InputToken::Bytes(bytes) => {
-                if route_scrollback_page(path, name, &bytes, *mouse_on, scrollback, output_lock) {
+                if route_scrollback_page(
+                    route.path,
+                    route.name,
+                    &bytes,
+                    *route.mouse_on,
+                    route.scrollback,
+                    route.output_lock,
+                ) {
                     continue;
                 }
                 let mut start = 0;
                 for (at, &byte) in bytes.iter().enumerate() {
-                    if byte == 0x1d {
+                    if byte == 0x1d && route.mouse_toggle_enabled {
                         if start < at {
-                            exit_history_if_needed(
-                                path,
-                                name,
-                                stream,
-                                &bytes[start..at],
-                                scrollback,
-                                output_lock,
-                            );
+                            exit_history_if_needed(route, &bytes[start..at]);
                         }
-                        *mouse_on = !*mouse_on;
+                        *route.mouse_on = !*route.mouse_on;
                         let mut stdout = std::io::stdout();
-                        let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
-                        let report = if *mouse_on {
+                        let _guard = route.output_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        let report = if *route.mouse_on {
                             b"\x1b[?1000h\x1b[?1006h"
                         } else {
                             b"\x1b[?1000l\x1b[?1006l"
@@ -915,20 +1324,21 @@ fn route_tokens(
                     }
                 }
                 if start < bytes.len() {
-                    exit_history_if_needed(
-                        path,
-                        name,
-                        stream,
-                        &bytes[start..],
-                        scrollback,
-                        output_lock,
-                    );
+                    exit_history_if_needed(route, &bytes[start..]);
                 }
             }
             InputToken::Paste(bytes) => {
-                exit_history_if_needed(path, name, stream, &[], scrollback, output_lock);
-                let _ = stream.write_all(&bytes);
-                let _ = stream.flush();
+                if route.discarding_paste {
+                    if bytes.ends {
+                        route.discarding_paste = false;
+                    }
+                    continue;
+                }
+                let _ = exit_history_if_needed(route, &[]);
+                let dropped = route
+                    .input
+                    .enqueue(&bytes.bytes, !bytes.starts, bytes.starts);
+                route.discarding_paste = dropped && !bytes.ends;
             }
         }
     }
@@ -1005,6 +1415,47 @@ fn route_scrollback_wheel(
     true
 }
 
+fn exit_history_if_needed(route: &mut AttachRoute<'_>, bytes: &[u8]) -> bool {
+    use std::sync::atomic::Ordering;
+    let _guard = route.output_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let old = route.scrollback.offset.load(Ordering::SeqCst);
+    if old != 0 {
+        if bytes == b"q" || bytes == b"\x1b" || bytes == b"\x1bq" {
+            route.scrollback.offset.store(0, Ordering::SeqCst);
+            if let Some((_, total)) = paint_history(route.path, route.name, 0) {
+                route
+                    .scrollback
+                    .history_total
+                    .store(total, Ordering::SeqCst);
+            }
+            return false;
+        }
+        route.scrollback.offset.store(0, Ordering::SeqCst);
+        if let Some((_, total)) = paint_history(route.path, route.name, 0) {
+            route
+                .scrollback
+                .history_total
+                .store(total, Ordering::SeqCst);
+        }
+    }
+    drop(_guard);
+    let dropped = route.input.enqueue(bytes, false, false);
+    #[cfg(not(debug_assertions))]
+    let _ = dropped;
+    #[cfg(debug_assertions)]
+    if route.input.test_hooks_enabled
+        && bytes
+            .windows(b"DRAINED-BARRIER".len())
+            .any(|window| window == b"DRAINED-BARRIER")
+    {
+        if let Some(path) = std::env::var_os("REMUDA_TEST_ATTACH_BARRIER_RESULT") {
+            let result: &[u8] = if dropped { b"dropped" } else { b"queued" };
+            let _ = std::fs::write(path, result);
+        }
+    }
+    dropped
+}
+
 fn detach_offset(parser: &crate::mouse::SgrParser, bytes: &[u8]) -> Option<usize> {
     if parser.paste_open()
         && bytes == [DETACH]
@@ -1016,47 +1467,6 @@ fn detach_offset(parser: &crate::mouse::SgrParser, bytes: &[u8]) -> Option<usize
     } else {
         parser.first_byte_outside_paste(bytes, DETACH)
     }
-}
-
-fn close_raw_paste_if_needed<W: std::io::Write>(
-    was_open: bool,
-    parser: &crate::mouse::SgrParser,
-    writer: &mut W,
-) -> std::io::Result<()> {
-    if was_open && !parser.paste_open() {
-        writer.write_all(b"\x1b[201~")?;
-        writer.flush()?;
-    }
-    Ok(())
-}
-
-fn exit_history_if_needed(
-    path: &Path,
-    name: &str,
-    stream: &mut Stream,
-    bytes: &[u8],
-    scrollback: &AttachScrollback,
-    output_lock: &std::sync::Mutex<()>,
-) {
-    use std::sync::atomic::Ordering;
-    let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
-    let old = scrollback.offset.load(Ordering::SeqCst);
-    if old != 0 {
-        if bytes == b"q" || bytes == b"\x1b" || bytes == b"\x1bq" {
-            scrollback.offset.store(0, Ordering::SeqCst);
-            if let Some((_, total)) = paint_history(path, name, 0) {
-                scrollback.history_total.store(total, Ordering::SeqCst);
-            }
-            return;
-        }
-        scrollback.offset.store(0, Ordering::SeqCst);
-        if let Some((_, total)) = paint_history(path, name, 0) {
-            scrollback.history_total.store(total, Ordering::SeqCst);
-        }
-    }
-    drop(_guard);
-    let _ = stream.write_all(bytes);
-    let _ = stream.flush();
 }
 
 /// Paint one captured frame while the caller holds the output lock.
@@ -1355,15 +1765,20 @@ mod tests {
     #[cfg(unix)]
     use super::trace_input_read;
     use super::{
-        close_raw_paste_if_needed, detach_offset, interpret, read_response_with_timeout,
-        request_with_timeout, reset_input_modes, truncate_terminal_text, write_input_trace, DETACH,
-        RESET_INPUT_MODES,
+        detach_offset, interpret, report_attach_input_dropped, reset_input_modes, route_tokens,
+        truncate_terminal_text, write_input_trace, AttachInputQueue, AttachRoute,
+        ATTACH_INPUT_STALL, DETACH, RESET_INPUT_MODES,
     };
+    #[cfg(unix)]
+    use super::{read_response_with_timeout, request_with_timeout};
     #[cfg(unix)]
     use crate::ipc;
     #[cfg(unix)]
     use interprocess::local_socket::traits::Listener as _;
-    use remuda_core::protocol::{Request, Response};
+    #[cfg(unix)]
+    use remuda_core::protocol::Request;
+    use remuda_core::protocol::Response;
+    use std::path::Path;
     #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(unix)]
@@ -1371,6 +1786,131 @@ mod tests {
     #[cfg(unix)]
     use std::time::Instant;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn attach_input_drop_recovers_after_writer_progress() {
+        let (queue, rx) = AttachInputQueue::with_capacity(6, Duration::ZERO);
+        queue.enqueue(b"queued", false, false);
+        queue.enqueue(b"dropped", false, false);
+        assert!(queue.take_drop_notice());
+        assert!(!queue.take_drop_notice());
+        assert_eq!(queue.dropped.load(std::sync::atomic::Ordering::SeqCst), 7);
+        queue.writer().delivered(6);
+        queue.enqueue(b"fresh!", false, false);
+        assert_eq!(rx.try_recv().unwrap(), b"queued");
+        assert_eq!(rx.try_recv().unwrap(), b"fresh!");
+        assert!(rx.try_recv().is_err());
+        let mut notice = Vec::new();
+        report_attach_input_dropped(&mut notice, 7).unwrap();
+        let notice = String::from_utf8(notice).unwrap();
+        assert!(notice.contains("input dropped: 7 bytes"));
+        assert!(notice.contains("delivery may be partial"));
+    }
+
+    #[test]
+    fn one_notice_per_drop_until_a_chunk_is_delivered() {
+        let (queue, rx) = AttachInputQueue::with_capacity(6, Duration::ZERO);
+        queue.enqueue(b"abcd", false, false);
+        queue.enqueue(b"xyz", false, false);
+        assert!(queue.take_drop_notice());
+        queue.enqueue(b"xyz", false, false);
+        assert!(!queue.take_drop_notice());
+
+        queue.writer().delivered(4);
+        assert!(queue.take_recovery_notice());
+        assert!(!queue.take_recovery_notice());
+        queue.enqueue(b"123456", false, false);
+        queue.enqueue(b"q", false, false);
+        assert!(queue.take_drop_notice());
+        assert!(!queue.take_drop_notice());
+        assert_eq!(rx.try_recv().unwrap(), b"abcd");
+        assert_eq!(rx.try_recv().unwrap(), b"123456");
+    }
+
+    #[test]
+    fn default_stall_threshold_uses_the_injected_clock() {
+        let millis = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clock_millis = std::sync::Arc::clone(&millis);
+        let now: std::sync::Arc<dyn Fn() -> Duration + Send + Sync> =
+            std::sync::Arc::new(move || {
+                Duration::from_millis(clock_millis.load(std::sync::atomic::Ordering::SeqCst))
+            });
+        let (queue, _rx) = AttachInputQueue::with_clock(6, ATTACH_INPUT_STALL, now);
+        assert!(matches!(
+            queue.attempt(b"queued".to_vec()),
+            super::AttachInputAttempt::Queued
+        ));
+        assert!(matches!(
+            queue.attempt(b"x".to_vec()),
+            super::AttachInputAttempt::Full(_)
+        ));
+        millis.store(2_999, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            queue.attempt(b"x".to_vec()),
+            super::AttachInputAttempt::Full(_)
+        ));
+        millis.store(3_000, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            queue.attempt(b"x".to_vec()),
+            super::AttachInputAttempt::Dropped
+        ));
+        assert!(queue.take_drop_notice());
+    }
+
+    #[test]
+    fn dropping_during_bracketed_paste_forwards_the_closing_marker() {
+        let (queue, rx) = AttachInputQueue::with_capacity(6, Duration::ZERO);
+        queue.enqueue(b"\x1b[200~", false, true);
+        queue.enqueue(b"paste body", true, false);
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b[200~");
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b[201~");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dropped_paste_opener_discards_through_the_real_end_marker() {
+        let (queue, rx) = AttachInputQueue::with_capacity(16, Duration::ZERO);
+        queue.enqueue(b"0123456789", false, false);
+        let mut mouse_on = false;
+        let scrollback = super::AttachScrollback::default();
+        let output_lock = std::sync::Mutex::new(());
+        let mut route = AttachRoute {
+            path: Path::new("unused"),
+            name: "unused",
+            input: &queue,
+            mouse_on: &mut mouse_on,
+            mouse_toggle_enabled: false,
+            scrollback: &scrollback,
+            output_lock: &output_lock,
+            discarding_paste: false,
+        };
+        route_tokens(
+            &mut route,
+            vec![crate::mouse::InputToken::Paste(crate::mouse::PasteChunk {
+                bytes: b"\x1b[200~ab".to_vec(),
+                starts: true,
+                ends: false,
+            })],
+        );
+        assert!(route.discarding_paste);
+        route_tokens(
+            &mut route,
+            vec![crate::mouse::InputToken::Paste(crate::mouse::PasteChunk {
+                bytes: b"cd\n\x1b[201~".to_vec(),
+                starts: false,
+                ends: true,
+            })],
+        );
+        assert!(!route.discarding_paste);
+        queue.writer().delivered(10);
+        route_tokens(
+            &mut route,
+            vec![crate::mouse::InputToken::Bytes(b"typed\n".to_vec())],
+        );
+        assert_eq!(rx.try_recv().unwrap(), b"0123456789");
+        assert_eq!(rx.try_recv().unwrap(), b"typed\n");
+        assert!(rx.try_recv().is_err());
+    }
 
     #[test]
     fn detach_inside_paste_requires_a_lone_ctrl_backslash_after_idle() {
@@ -1381,7 +1921,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1010));
         assert_eq!(detach_offset(&parser, &[DETACH]), Some(0));
         assert!(
-            matches!(parser.finish().last(), Some(crate::mouse::InputToken::Paste(bytes)) if bytes.ends_with(b"\x1b[201~"))
+            matches!(parser.finish().last(), Some(crate::mouse::InputToken::Paste(chunk)) if chunk.ends && chunk.bytes.ends_with(crate::mouse::PASTE_END))
         );
     }
 
@@ -1416,13 +1956,11 @@ mod tests {
     fn raw_mouse_disabled_recovery_closes_child_paste_after_timeout() {
         let mut parser = crate::mouse::SgrParser::default();
         assert!(parser.feed(b"\x1b[200~raw bytes").is_empty());
-        let was_open = parser.paste_open();
-        // A timeout or detach transitions the parser to closed; raw mode has
-        // already forwarded its buffered content, so it only writes the end.
-        let _ = parser.finish();
-        let mut child_input = Vec::new();
-        close_raw_paste_if_needed(was_open, &parser, &mut child_input).unwrap();
-        assert_eq!(child_input, b"\x1b[201~");
+        let tokens = parser.finish();
+        assert!(matches!(
+            tokens.last(),
+            Some(crate::mouse::InputToken::Paste(chunk)) if chunk.ends && chunk.bytes.ends_with(crate::mouse::PASTE_END)
+        ));
     }
 
     #[cfg(unix)]
@@ -1701,57 +2239,34 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn output_stream() -> (
-        std::path::PathBuf,
-        ipc::Stream,
-        std::thread::JoinHandle<Vec<u8>>,
-    ) {
-        use interprocess::local_socket::traits::Listener as _;
-        use std::io::Read as _;
-
-        static NEXT_STREAM: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "r-client-stream-{}-{}.sock",
-            std::process::id(),
-            NEXT_STREAM.fetch_add(1, Ordering::Relaxed)
-        ));
-        let listener = ipc::listen(&path).expect("bind child input collector");
-        let collector = std::thread::spawn(move || {
-            let mut peer = listener.accept().expect("accept child input");
-            let mut bytes = Vec::new();
-            peer.read_to_end(&mut bytes).expect("read child input");
-            bytes
-        });
-        let stream = ipc::connect(&path).expect("connect child input");
-        (path, stream, collector)
-    }
-
-    #[cfg(unix)]
     #[test]
     fn exit_key_is_forwarded_if_another_action_returned_live_under_the_lock() {
-        let (stream_path, stream, collector) = output_stream();
         let daemon_path =
             std::env::temp_dir().join(format!("r-no-daemon-{}.sock", std::process::id()));
         let scrollback = std::sync::Arc::new(super::AttachScrollback::default());
         scrollback.offset.store(3, Ordering::SeqCst);
         let output_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
         let held_lock = output_lock.lock().unwrap();
+        let (queue, input_rx) = AttachInputQueue::with_capacity(64, Duration::ZERO);
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let worker = std::thread::spawn({
             let scrollback = std::sync::Arc::clone(&scrollback);
             let output_lock = std::sync::Arc::clone(&output_lock);
             let daemon_path = daemon_path.clone();
             move || {
-                let mut stream = stream;
+                let mut mouse_on = false;
+                let mut route = AttachRoute {
+                    path: &daemon_path,
+                    name: "target",
+                    input: &queue,
+                    mouse_on: &mut mouse_on,
+                    mouse_toggle_enabled: false,
+                    scrollback: &scrollback,
+                    output_lock: &output_lock,
+                    discarding_paste: false,
+                };
                 started_tx.send(()).expect("signal exit-key routing");
-                super::exit_history_if_needed(
-                    &daemon_path,
-                    "target",
-                    &mut stream,
-                    b"q",
-                    &scrollback,
-                    &output_lock,
-                );
+                super::exit_history_if_needed(&mut route, b"q");
             }
         });
         started_rx.recv().expect("exit-key worker started");
@@ -1759,35 +2274,41 @@ mod tests {
         scrollback.offset.store(0, Ordering::SeqCst);
         drop(held_lock);
         worker.join().expect("exit-key worker");
-        let received = collector.join().expect("collect child input");
-        let _ = std::fs::remove_file(stream_path);
-        assert_eq!(received, b"q", "q must reach the child if history is live");
+        assert_eq!(input_rx.try_recv().unwrap(), b"q");
     }
 
     #[cfg(unix)]
     #[test]
     fn paste_while_scrolled_returns_live_and_reaches_child_unchanged() {
-        use crate::mouse::InputToken;
+        use crate::mouse::{InputToken, PasteChunk};
 
-        let (stream_path, mut stream, collector) = output_stream();
         let daemon_path =
             std::env::temp_dir().join(format!("r-no-daemon-{}.sock", std::process::id()));
         let scrollback = super::AttachScrollback::default();
         scrollback.offset.store(7, Ordering::SeqCst);
         let paste = b"\x1b[200~typed paste\x1b[201~".to_vec();
+        let (queue, input_rx) = AttachInputQueue::with_capacity(1024, Duration::ZERO);
         let mut mouse_on = false;
+        let output_lock = std::sync::Mutex::new(());
+        let mut route = AttachRoute {
+            path: &daemon_path,
+            name: "target",
+            input: &queue,
+            mouse_on: &mut mouse_on,
+            mouse_toggle_enabled: false,
+            scrollback: &scrollback,
+            output_lock: &output_lock,
+            discarding_paste: false,
+        };
         super::route_tokens(
-            &daemon_path,
-            "target",
-            &mut stream,
-            vec![InputToken::Paste(paste.clone())],
-            &mut mouse_on,
-            &scrollback,
-            &std::sync::Mutex::new(()),
+            &mut route,
+            vec![InputToken::Paste(PasteChunk {
+                bytes: paste.clone(),
+                starts: true,
+                ends: true,
+            })],
         );
-        drop(stream);
-        let received = collector.join().expect("collect pasted child input");
-        let _ = std::fs::remove_file(stream_path);
+        let received: Vec<u8> = input_rx.try_iter().flatten().collect();
         assert_eq!(scrollback.offset.load(Ordering::SeqCst), 0);
         assert_eq!(received, paste);
     }

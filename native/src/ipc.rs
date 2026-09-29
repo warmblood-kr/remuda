@@ -19,6 +19,47 @@ use std::path::Path;
 pub use interprocess::local_socket::{Listener, Stream};
 pub use interprocess::TryClone;
 
+#[derive(Clone, Copy)]
+pub(crate) enum WakeHandle {
+    #[cfg(unix)]
+    Unix(std::os::fd::RawFd),
+    #[cfg(windows)]
+    Windows(usize),
+}
+
+/// Keep the stream alive for as long as the returned handle may be used.
+pub(crate) fn wake_handle(stream: &Stream) -> WakeHandle {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsFd, AsRawFd};
+        let Stream::UdSocket(socket) = stream;
+        WakeHandle::Unix(socket.as_fd().as_raw_fd())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsHandle, AsRawHandle};
+        let Stream::NamedPipe(pipe) = stream;
+        WakeHandle::Windows(pipe.as_handle().as_raw_handle() as usize)
+    }
+}
+
+pub(crate) fn wake_captured(handle: WakeHandle) {
+    #[cfg(unix)]
+    {
+        let WakeHandle::Unix(fd) = handle;
+        let _ = nix::sys::socket::shutdown(fd, nix::sys::socket::Shutdown::Both);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::RawHandle;
+        let WakeHandle::Windows(handle) = handle;
+        use windows_sys::Win32::System::IO::CancelIoEx;
+        unsafe {
+            CancelIoEx(handle as RawHandle, std::ptr::null());
+        }
+    }
+}
+
 fn name(path: &Path) -> io::Result<Name<'_>> {
     #[cfg(unix)]
     {

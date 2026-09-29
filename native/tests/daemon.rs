@@ -22,6 +22,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PATIENCE: Duration = Duration::from_secs(10);
+#[cfg(unix)]
+const STALL_FLOOD_CHUNK_BYTES: usize = 4 * 1024;
+#[cfg(unix)]
+const STALL_FLOOD_CAP_BYTES: usize = 32 * 1024 * 1024;
 
 #[path = "daemon_support/spawn.rs"]
 mod spawn;
@@ -890,6 +894,527 @@ fn new_session(path: &Path, name: &str) {
         Response::Value(name.to_string()),
         "New answers with the name it gave the session"
     );
+}
+
+#[cfg(unix)]
+fn new_byte_capture_session(
+    path: &Path,
+    name: &str,
+    capture_path: &Path,
+    byte_count: usize,
+    wait_for_marker: Option<&Path>,
+    slow_reader: bool,
+    ready_marker: Option<&Path>,
+) {
+    let reader = if wait_for_marker.is_some() {
+        "while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; ".to_string()
+            + if slow_reader {
+                "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,1024); last unless $r; print $f $b; $n-=$r; select(undef,undef,undef,0.002)}'"
+            } else {
+                "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,$n); last unless $r; print $f $b; $n-=$r}'"
+            }
+    } else if slow_reader {
+        "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,1024); last unless $r; print $f $b; $n-=$r; select(undef,undef,undef,0.002)}'"
+            .to_string()
+    } else {
+        "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,$n); last unless $r; print $f $b; $n-=$r}'"
+            .to_string()
+    };
+    let ready_wait = if ready_marker.is_some() {
+        "while [ ! -e \"$READY_MARKER\" ]; do sleep 0.02; done; "
+    } else {
+        ""
+    };
+    let script = format!("stty raw -echo; {ready_wait}printf READY; {reader}");
+    let mut env = std::collections::HashMap::from([
+        ("CAPTURE_PATH".into(), capture_path.display().to_string()),
+        ("BYTE_COUNT".into(), byte_count.to_string()),
+    ]);
+    if let Some(marker) = wait_for_marker {
+        env.insert("READER_MARKER".into(), marker.display().to_string());
+    }
+    if let Some(marker) = ready_marker {
+        env.insert("READY_MARKER".into(), marker.display().to_string());
+    }
+    let response = client::request(
+        path,
+        &Request::New {
+            name: Some(name.into()),
+            command: vec!["sh".into(), "-c".into(), script],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start byte-capture child");
+    assert_eq!(response, Response::Value(name.into()));
+}
+
+#[cfg(unix)]
+fn wait_until_attached(path: &Path, name: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if let Ok(Response::Sessions(sessions)) = client::request(path, &Request::List) {
+            if sessions
+                .iter()
+                .any(|session| session.name == name && session.attached)
+            {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attach client never acquired {name}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_cli_exit(viewer: &Session, name: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    while viewer.is_alive() {
+        assert!(
+            Instant::now() < deadline,
+            "attach client {name} did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn attach_detach_during_stalled_input_reports_loss_and_exits() {
+    let runtime = scratch_dir("attach-detach-stall");
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = Daemon::spawn(&runtime);
+    let capture_path = runtime.join("captured");
+    let dropped_count_path = runtime.join("dropped-count");
+    let marker = runtime.join("start-reading");
+    let name = "target";
+    let script = "stty raw -echo min 1 time 0 </dev/tty; printf READY; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat > \"$CAPTURE_PATH\"";
+    let env = std::collections::HashMap::from([
+        ("CAPTURE_PATH".into(), capture_path.display().to_string()),
+        ("READER_MARKER".into(), marker.display().to_string()),
+    ]);
+    assert!(matches!(
+        client::request(
+            &path,
+            &Request::New {
+                name: Some(name.into()),
+                command: vec!["sh".into(), "-c".into(), script.into()],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: Some(env),
+            },
+        )
+        .expect("start child blocked until reading is released"),
+        Response::Value(_)
+    ));
+
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "attach", name]);
+    command.env("REMUDA_RUNTIME_DIR", &runtime);
+    command.env("REMUDA_TEST_INPUT_HOOKS", "1");
+    command.env("REMUDA_TEST_ATTACH_DROPPED_COUNT", &dropped_count_path);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture attach terminal");
+    wait_until_attached(&path, name);
+    wait_for_session_screen(&viewer, "READY");
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut output_bytes = Vec::new();
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(|| {
+            let chunk = [b'x'; STALL_FLOOD_CHUNK_BYTES];
+            while !stop.load(Ordering::SeqCst) {
+                let current = sent.load(Ordering::SeqCst);
+                if current >= STALL_FLOOD_CAP_BYTES {
+                    break;
+                }
+                let count = (STALL_FLOOD_CAP_BYTES - current).min(chunk.len());
+                if held.write_raw(&chunk[..count]).is_err() {
+                    break;
+                }
+                sent.fetch_add(count, Ordering::SeqCst);
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+        let notice = b"dropping input until the writer recovers";
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !output_bytes
+            .windows(notice.len())
+            .any(|window| window == notice)
+        {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stalled-child flood timed out before a drop notice: sent={}, dropped={}, child_total={}",
+                sent.load(Ordering::SeqCst),
+                std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+                std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len())
+            );
+            if let Ok(chunk) = output.recv_timeout(Duration::from_millis(100)) {
+                output_bytes.extend_from_slice(&chunk);
+            }
+        }
+        stop.store(true, Ordering::SeqCst);
+        sender.join().expect("join adaptive flood writer");
+    });
+    assert!(
+        output_bytes
+            .windows(b"dropping input until the writer recovers".len())
+            .any(|window| window == b"dropping input until the writer recovers"),
+        "stalled-child flood reached the 32 MiB cap without a drop notice: sent={}, dropped={}, child_total={}",
+        sent.load(Ordering::SeqCst),
+        std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+        std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len())
+    );
+    held.write_raw(&[client::DETACH]).expect("send Ctrl-\\");
+    wait_for_cli_exit(&viewer, name);
+    let output_deadline = Instant::now() + PATIENCE;
+    while !output_bytes
+        .windows(b"input dropped".len())
+        .any(|window| window == b"input dropped")
+    {
+        assert!(
+            Instant::now() < output_deadline,
+            "loss notice absent: sent={}, dropped={}, child_total={}, output tail: {}",
+            sent.load(Ordering::SeqCst),
+            std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+            std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+            escaped_tail(&output_bytes)
+        );
+        match output.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => output_bytes.extend_from_slice(&chunk),
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+    }
+    assert!(
+        output_bytes
+            .windows(b"input dropped".len())
+            .any(|window| window == b"input dropped"),
+        "client exited without loss notice: sent={}, dropped={}, child_total={}, output tail: {}",
+        sent.load(Ordering::SeqCst),
+        std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+        std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+        escaped_tail(&output_bytes)
+    );
+    std::fs::write(&marker, b"start").expect("release child for cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_keys_before_detach_in_one_read_reach_the_child() {
+    let runtime = scratch_dir("attach-detach-prefix");
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = Daemon::spawn(&runtime);
+    let prefix = b"prefix!\r";
+    for run in 0..5 {
+        let name = format!("target-{run}");
+        let capture_path = runtime.join(format!("captured-{run}"));
+        let ready_marker = runtime.join(format!("ready-{run}"));
+        new_byte_capture_session(
+            &path,
+            &name,
+            &capture_path,
+            prefix.len(),
+            None,
+            false,
+            Some(&ready_marker),
+        );
+        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+        command.args(["-s", "s", "attach", &name]);
+        command.env("REMUDA_RUNTIME_DIR", &runtime);
+        let viewer = Session::new(
+            format!("viewer-{run}"),
+            Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
+            Arc::new(SystemClock::new()),
+        );
+        let held = viewer.attach();
+        wait_until_attached(&path, &name);
+        std::fs::write(&ready_marker, b"attached").expect("release child readiness");
+        wait_for_session_screen(&viewer, "READY");
+
+        let mut input = prefix.to_vec();
+        input.push(client::DETACH);
+        held.write_raw(&input)
+            .expect("write prefix and detach in one key buffer");
+        wait_for_cli_exit(&viewer, &name);
+        let deadline = Instant::now() + PATIENCE;
+        while std::fs::read(&capture_path).ok().as_deref() != Some(prefix.as_slice()) {
+            assert!(
+                Instant::now() < deadline,
+                "pre-detach prefix was lost on run {run}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_large_paste_survives_a_slow_but_reading_child() {
+    let runtime = scratch_dir("paste-slow");
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = Daemon::spawn(&runtime);
+    let name = "target";
+    let capture_path = runtime.join("captured");
+    let paste = vec![b'p'; 256 * 1024];
+    new_byte_capture_session(&path, name, &capture_path, paste.len(), None, true, None);
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "attach", name]);
+    command.env("REMUDA_RUNTIME_DIR", &runtime);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    wait_until_attached(&path, name);
+    wait_for_session_screen(&viewer, "READY");
+
+    held.write_raw(&paste).expect("send 256 KiB paste");
+    let deadline = Instant::now() + PATIENCE;
+    while std::fs::read(&capture_path).ok().as_deref() != Some(paste.as_slice()) {
+        assert!(
+            Instant::now() < deadline,
+            "slow reader did not receive the complete paste"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = held.write_raw(&[client::DETACH]);
+    wait_for_cli_exit(&viewer, name);
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
+    let runtime = scratch_dir("input-recovery");
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = Daemon::spawn(&runtime);
+    let child_input_path = runtime.join("child-input");
+    let dropped_count_path = runtime.join("dropped-count");
+    let input_state_path = runtime.join("input-state");
+    let barrier_result_path = runtime.join("barrier-result");
+    let ready_marker = runtime.join("ready");
+    let reader_marker = runtime.join("start-reading");
+    let script = "stty raw -echo min 1 time 0 </dev/tty; while [ ! -e \"$READY_MARKER\" ]; do sleep 0.02; done; printf READY; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat > \"$CAPTURE_PATH\"";
+    let env = std::collections::HashMap::from([
+        (
+            "CAPTURE_PATH".into(),
+            child_input_path.display().to_string(),
+        ),
+        ("READY_MARKER".into(), ready_marker.display().to_string()),
+        ("READER_MARKER".into(), reader_marker.display().to_string()),
+    ]);
+    assert!(matches!(
+        client::request(
+            &path,
+            &Request::New {
+                name: Some("target".into()),
+                command: vec!["sh".into(), "-c".into(), script.into()],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: Some(env),
+            },
+        )
+        .expect("start child that can resume reading"),
+        Response::Value(_)
+    ));
+
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "attach", "target"]);
+    command.env("REMUDA_RUNTIME_DIR", &runtime);
+    command.env("REMUDA_TEST_ATTACH_STALL_MS", "250");
+    command.env("REMUDA_TEST_INPUT_HOOKS", "1");
+    command.env("REMUDA_TEST_ATTACH_BARRIER_RESULT", &barrier_result_path);
+    command.env("REMUDA_TEST_ATTACH_DROPPED_COUNT", &dropped_count_path);
+    command.env("REMUDA_TEST_ATTACH_INPUT_STATE", &input_state_path);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture attach terminal");
+    wait_until_attached(&path, "target");
+    std::fs::write(&ready_marker, b"attached").expect("release child readiness");
+    wait_for_session_screen(&viewer, "READY");
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        let sender = scope.spawn(|| {
+            let chunk = [b'x'; STALL_FLOOD_CHUNK_BYTES];
+            while !stop.load(Ordering::SeqCst) {
+                let current = sent.load(Ordering::SeqCst);
+                if current >= STALL_FLOOD_CAP_BYTES {
+                    break;
+                }
+                let count = (STALL_FLOOD_CAP_BYTES - current).min(chunk.len());
+                if held.write_raw(&chunk[..count]).is_err() {
+                    break;
+                }
+                sent.fetch_add(count, Ordering::SeqCst);
+            }
+            done.store(true, Ordering::SeqCst);
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut seen = Vec::new();
+        let drop_notice = b"dropping input until the writer recovers";
+        while !seen
+            .windows(drop_notice.len())
+            .any(|window| window == drop_notice)
+        {
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stall drop notice was not printed: sent={}, dropped={}, child_total={}, input_state={}",
+                sent.load(Ordering::SeqCst),
+                std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+                std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()),
+                std::fs::read_to_string(&input_state_path).unwrap_or_default()
+            );
+            if let Ok(chunk) = output.recv_timeout(Duration::from_millis(100)) {
+                seen.extend_from_slice(&chunk);
+            }
+        }
+        assert!(
+            seen.windows(drop_notice.len()).any(|window| window == drop_notice),
+            "stalled-child flood reached the 32 MiB cap without a drop notice: sent={}, dropped={}, child_total={}, input_state={}",
+            sent.load(Ordering::SeqCst),
+            std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+            std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()),
+            std::fs::read_to_string(&input_state_path).unwrap_or_default()
+        );
+        stop.store(true, Ordering::SeqCst);
+        sender.join().expect("join adaptive flood writer");
+        std::fs::write(&reader_marker, b"read").expect("resume child PTY reads");
+        let progress_deadline = Instant::now() + Duration::from_secs(15);
+        while std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()) == 0 {
+            assert!(
+                Instant::now() < progress_deadline,
+                "child did not receive buffered input after recovery"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let mut last_total = None;
+        let mut stable_since = Instant::now();
+        let sent = sent.load(Ordering::SeqCst) as u64;
+        let drain_deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            assert!(
+                Instant::now() < drain_deadline,
+                "child input did not drain to a stable recovered state: total={}, dropped={}, sent={sent}; notices={}",
+                std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()),
+                std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+                String::from_utf8_lossy(&seen)
+                    .replace('\n', " ")
+                    .chars()
+                    .rev()
+                    .take(180)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            );
+            if let Ok(chunk) = output.recv_timeout(Duration::from_millis(20)) {
+                seen.extend_from_slice(&chunk);
+            }
+            let total = std::fs::metadata(&child_input_path)
+                .ok()
+                .map(|metadata| metadata.len());
+            let dropped = std::fs::read_to_string(&dropped_count_path)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok());
+            if total.is_some() && total != last_total {
+                last_total = total;
+                stable_since = Instant::now();
+            }
+            let drained = total
+                .zip(dropped)
+                .is_some_and(|(total, dropped)| dropped <= sent && total == sent - dropped);
+            if drained && stable_since.elapsed() >= Duration::from_millis(500) {
+                break;
+            }
+        }
+
+        let drop_notice = b"dropping input until the writer recovers";
+        let recovery_notice = b"input writer recovered; queued input resumed";
+        let last_drop = seen
+            .windows(drop_notice.len())
+            .rposition(|window| window == drop_notice);
+        let last_recovery = seen
+            .windows(recovery_notice.len())
+            .rposition(|window| window == recovery_notice);
+        assert!(
+            last_recovery.is_some_and(|at| last_drop.is_none_or(|drop_at| at > drop_at)),
+            "input writer recovery notice was not printed after the latest drop notice"
+        );
+
+        let barrier = b"DRAINED-BARRIER\n";
+        held.write_raw(barrier)
+            .expect("send one ordered drain barrier after the child read total stabilizes");
+        let enqueue_deadline = Instant::now() + Duration::from_secs(3);
+        while !barrier_result_path.exists() {
+            assert!(
+                Instant::now() < enqueue_deadline,
+                "attach key pump did not classify the single drain barrier"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&barrier_result_path).unwrap(),
+            "queued",
+            "recovered attach queue dropped the single drain barrier"
+        );
+
+        let barrier_deadline = Instant::now() + Duration::from_secs(3);
+        while !std::fs::read(&child_input_path).is_ok_and(|bytes| {
+            bytes
+                .windows(b"DRAINED-BARRIER".len())
+                .any(|window| window == b"DRAINED-BARRIER")
+        }) {
+            if let Ok(chunk) = output.recv_timeout(Duration::from_millis(20)) {
+                seen.extend_from_slice(&chunk);
+            }
+            assert!(
+                Instant::now() < barrier_deadline,
+                "recovered attach input queue did not deliver the single ordered drain barrier; child received {} bytes; notices: {}; dropped count: {}",
+                std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()),
+                String::from_utf8_lossy(&seen)
+                    .replace('\n', " ")
+                    .chars()
+                    .rev()
+                    .take(180)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>(),
+                std::fs::read_to_string(&dropped_count_path).unwrap_or_default()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    let _ = held.write_raw(&[client::DETACH]);
+    wait_for_cli_exit(&viewer, "target");
 }
 
 #[test]
