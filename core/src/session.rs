@@ -4,8 +4,8 @@
 //! attachment at a time.
 
 use crate::agent::{
-    AgentError, AgentProcess, Cursor, ExitInfo, MouseState, Result, ScreenSnapshot, Size,
-    StyledCell, VersionedSnapshot,
+    AgentError, AgentProcess, Cursor, ExitInfo, MouseState, OutputWakeup, Result, ScreenSnapshot,
+    Size, StyledCell, VersionedSnapshot,
 };
 use crate::clock::Clock;
 use crate::input::{InputBatch, InputDeduplicator, InputError, InputOutcome, InputRateLimiter};
@@ -102,7 +102,18 @@ impl Session {
         let size = agent.size();
         let started = clock.now();
         let last_output_at = Arc::new(Mutex::new(started));
-        if let Some(output) = agent.subscribe() {
+        if let Some(output) = agent.subscribe_output_wakeup() {
+            let last_output_at = Arc::clone(&last_output_at);
+            let clock = Arc::clone(&clock);
+            std::thread::spawn(move || {
+                while output.recv().is_ok() {
+                    output.version_after_wake();
+                    if let Ok(mut at) = last_output_at.lock() {
+                        *at = clock.now();
+                    }
+                }
+            });
+        } else if let Some(output) = agent.subscribe() {
             let last_output_at = Arc::clone(&last_output_at);
             let clock = Arc::clone(&clock);
             std::thread::spawn(move || {
@@ -156,6 +167,11 @@ impl Session {
     /// Subscribe to the agent's output stream, when this backend supports it.
     pub fn subscribe(&self) -> Option<Receiver<Vec<u8>>> {
         self.agent.lock().ok()?.subscribe()
+    }
+
+    /// Subscribe to coalesced output-version changes without copying PTY data.
+    pub fn subscribe_output_wakeup(&self) -> Option<OutputWakeup> {
+        self.agent.lock().ok()?.subscribe_output_wakeup()
     }
 
     /// The current terminal size.

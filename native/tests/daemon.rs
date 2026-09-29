@@ -1196,6 +1196,89 @@ fn session_output_wakes_coalesce_while_lua_is_busy_and_list_stays_responsive() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn final_session_output_is_notified_once_before_session_exit() {
+    let path = scratch("session-output-before-exit");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda._final_output_order = {}
+            remuda.on("session_output", function(name, details)
+                if name == "last-before-exit" then
+                    table.insert(remuda._final_output_order, "output:" .. tostring(details.version))
+                end
+            end, { group = "final-output-test", id = "output" })
+            remuda.on("session_exited", function(name)
+                if name == "last-before-exit" then
+                    table.insert(remuda._final_output_order, "exit")
+                end
+            end, { group = "final-output-test", id = "exit" })
+        "#,
+    );
+
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::New {
+                name: Some("last-before-exit".into()),
+                command: vec!["sh".into(), "-c".into(), "sleep 0.1; printf BYE".into()],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            },
+        )
+        .expect("start short output session"),
+        Response::Value("last-before-exit".into())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let sessions = match client::request(&path, &Request::List).expect("reap short session") {
+            Response::Sessions(sessions) => sessions,
+            other => panic!("unexpected list response: {other:?}"),
+        };
+        if !sessions
+            .iter()
+            .any(|session| session.name == "last-before-exit")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "short output session did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let order = eval(
+        &path,
+        "return table.concat(remuda._final_output_order, ',')",
+    );
+    let events: Vec<_> = order.split(',').collect();
+    assert_eq!(
+        events.len(),
+        2,
+        "expected one final output and one exit: {order:?}"
+    );
+    assert!(
+        events[0].starts_with("output:"),
+        "final output event came after exit: {order:?}"
+    );
+    let version: u64 = events[0]["output:".len()..]
+        .parse()
+        .expect("final output version");
+    assert!(
+        version > 0,
+        "final output version must include BYE: {order:?}"
+    );
+    assert_eq!(
+        events[1], "exit",
+        "session_exited must follow final output: {order:?}"
+    );
+}
+
 fn listed_session(socket: &Path) -> remuda_core::SessionSummary {
     match client::request(socket, &Request::List).expect("list session") {
         Response::Sessions(sessions) => sessions

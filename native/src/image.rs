@@ -20,6 +20,7 @@ use crate::reply_limit::MAX_REPLY_BYTES;
 use crate::script;
 use mlua::Lua;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
@@ -27,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 // `Response::Error` remains a plain string on the wire. This reserved control
 // prefix carries typed failures to the CLI without changing ordinary errors.
@@ -100,6 +101,7 @@ enum JobKind {
         result: Result<crate::net::HttpResponse, String>,
     },
     SessionOutput(SessionOutputNotifier),
+    SessionOutputFlush(SessionOutputNotifier),
     #[cfg(test)]
     StopImage,
 }
@@ -107,8 +109,11 @@ enum JobKind {
 struct SessionOutputState {
     name: String,
     latest_version: AtomicU64,
+    delivered_version: AtomicU64,
     queued: AtomicBool,
-    active: AtomicBool,
+    accepting: AtomicBool,
+    monitor_finished: Mutex<bool>,
+    monitor_finished_cv: Condvar,
 }
 
 /// A coalescing wake for one session's output hook.
@@ -120,7 +125,7 @@ pub struct SessionOutputNotifier {
 
 impl SessionOutputNotifier {
     pub fn notify(&self, version: u64) {
-        if !self.state.active.load(Ordering::Acquire) {
+        if !self.state.accepting.load(Ordering::Acquire) {
             return;
         }
         self.state.latest_version.store(version, Ordering::Release);
@@ -128,11 +133,41 @@ impl SessionOutputNotifier {
     }
 
     pub fn deactivate(&self) {
-        self.state.active.store(false, Ordering::Release);
+        self.state.accepting.store(false, Ordering::Release);
+    }
+
+    /// Queue the final generation before the monitor is marked finished. The
+    /// caller may itself be a Lua request, so waiting here would deadlock the
+    /// image worker; the exit notification is queued after this flush instead.
+    pub fn flush(&self, version: u64) {
+        self.state.latest_version.store(version, Ordering::Release);
+        self.deactivate();
+        let _ = self.jobs.send(Job {
+            kind: JobKind::SessionOutputFlush(self.clone()),
+            reply: None,
+        });
+    }
+
+    pub fn finish_monitor(&self) {
+        if let Ok(mut finished) = self.state.monitor_finished.lock() {
+            *finished = true;
+            self.state.monitor_finished_cv.notify_all();
+        }
+    }
+
+    fn wait_monitor(&self) {
+        if let Ok(mut finished) = self.state.monitor_finished.lock() {
+            while !*finished {
+                let Ok(next) = self.state.monitor_finished_cv.wait(finished) else {
+                    return;
+                };
+                finished = next;
+            }
+        }
     }
 
     fn enqueue(&self) {
-        if !self.state.active.load(Ordering::Acquire)
+        if !self.state.accepting.load(Ordering::Acquire)
             || self
                 .state
                 .queued
@@ -149,19 +184,36 @@ impl SessionOutputNotifier {
             })
             .is_err()
         {
-            self.state.active.store(false, Ordering::Release);
+            self.state.accepting.store(false, Ordering::Release);
             self.state.queued.store(false, Ordering::Release);
         }
     }
 
     fn finish(&self, delivered_version: u64) {
         self.state.queued.store(false, Ordering::Release);
-        if self.state.active.load(Ordering::Acquire)
+        if self.state.accepting.load(Ordering::Acquire)
             && self.state.latest_version.load(Ordering::Acquire) != delivered_version
         {
             self.enqueue();
         }
     }
+}
+
+fn deliver_session_output(lua: &Lua, notifier: &SessionOutputNotifier, version: u64) {
+    if version <= notifier.state.delivered_version.load(Ordering::Acquire) {
+        return;
+    }
+    let code = format!(
+        "remuda.emit('session_output', {}, {{version={version}}})",
+        crate::mcp::lua_string(&notifier.state.name)
+    );
+    if let Err(error) = eval(lua, &code, None) {
+        eprintln!("remuda session_output hook error: {error}");
+    }
+    notifier
+        .state
+        .delivered_version
+        .store(version, Ordering::Release);
 }
 
 /// A handle to the daemon's Lua image. Cloneable and `Send`; the interpreter
@@ -171,6 +223,7 @@ pub struct Image {
     jobs: Sender<Job>,
     pending: crate::pending::PendingReplies,
     http: crate::net::HttpClient,
+    session_outputs: Arc<Mutex<HashMap<String, SessionOutputNotifier>>>,
 }
 
 impl Image {
@@ -191,6 +244,7 @@ impl Image {
             jobs,
             pending: crate::pending::PendingReplies::default(),
             http: crate::net::HttpClient::default(),
+            session_outputs: Arc::new(Mutex::new(HashMap::new())),
         };
         let handle = image.clone();
 
@@ -260,16 +314,13 @@ impl Image {
                         }
                         JobKind::SessionOutput(notifier) => {
                             let version = notifier.state.latest_version.load(Ordering::Acquire);
-                            if notifier.state.active.load(Ordering::Acquire) {
-                                let code = format!(
-                                    "remuda.emit('session_output', {}, {{version={version}}})",
-                                    crate::mcp::lua_string(&notifier.state.name)
-                                );
-                                if let Err(error) = eval(&lua, &code, None) {
-                                    eprintln!("remuda session_output hook error: {error}");
-                                }
-                            }
+                            deliver_session_output(&lua, notifier, version);
                             notifier.finish(version);
+                            Ok(String::new())
+                        }
+                        JobKind::SessionOutputFlush(notifier) => {
+                            let version = notifier.state.latest_version.load(Ordering::Acquire);
+                            deliver_session_output(&lua, notifier, version);
                             Ok(String::new())
                         }
                         #[cfg(test)]
@@ -317,15 +368,56 @@ impl Image {
         self.pending.clone()
     }
 
-    pub fn session_output_notifier(&self, name: &str) -> SessionOutputNotifier {
-        SessionOutputNotifier {
+    pub fn session_output_notifier(&self, name: &str, id: &str) -> SessionOutputNotifier {
+        let notifier = SessionOutputNotifier {
             jobs: self.jobs.clone(),
             state: Arc::new(SessionOutputState {
                 name: name.to_string(),
                 latest_version: AtomicU64::new(0),
+                delivered_version: AtomicU64::new(0),
                 queued: AtomicBool::new(false),
-                active: AtomicBool::new(true),
+                accepting: AtomicBool::new(true),
+                monitor_finished: Mutex::new(false),
+                monitor_finished_cv: Condvar::new(),
             }),
+        };
+        if let Ok(mut outputs) = self.session_outputs.lock() {
+            outputs.insert(id.to_string(), notifier.clone());
+        }
+        notifier
+    }
+
+    /// Wait for the output monitor to flush its final event before announcing
+    /// that this session exited; FIFO submission then preserves event order.
+    pub fn wait_session_output_monitor(&self, id: &str) {
+        let notifier = self
+            .session_outputs
+            .lock()
+            .ok()
+            .and_then(|outputs| outputs.get(id).cloned());
+        if let Some(notifier) = notifier {
+            notifier.wait_monitor();
+            if let Ok(mut outputs) = self.session_outputs.lock() {
+                if outputs
+                    .get(id)
+                    .is_some_and(|current| Arc::ptr_eq(&current.state, &notifier.state))
+                {
+                    outputs.remove(id);
+                }
+            }
+        }
+    }
+
+    pub fn discard_session_output_monitor(&self, id: &str, notifier: &SessionOutputNotifier) {
+        notifier.deactivate();
+        notifier.finish_monitor();
+        if let Ok(mut outputs) = self.session_outputs.lock() {
+            if outputs
+                .get(id)
+                .is_some_and(|current| Arc::ptr_eq(&current.state, &notifier.state))
+            {
+                outputs.remove(id);
+            }
         }
     }
 

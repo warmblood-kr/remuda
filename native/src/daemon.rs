@@ -615,10 +615,10 @@ const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 /// notifying anywhere else would race it and silently drop the event.
 pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String> {
     let dead = registry.reap_with_exit_info();
-    for (name, reason, exit_info) in &dead {
-        notify_exited(image, name, reason, exit_info.as_ref());
+    for (name, id, reason, exit_info) in &dead {
+        notify_exited(image, name, id, reason, exit_info.as_ref());
     }
-    dead.into_iter().map(|(name, _, _)| name).collect()
+    dead.into_iter().map(|(name, _, _, _)| name).collect()
 }
 
 fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<()>> {
@@ -627,7 +627,13 @@ fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<(
     if let Ok(true) = closed {
         // If the reaper removed it first, close returns false and the reaper
         // owns the single notification using the marker's `closed` reason.
-        notify_exited(image, name, "closed", session.exit_info().as_ref());
+        notify_exited(
+            image,
+            name,
+            session.id(),
+            "closed",
+            session.exit_info().as_ref(),
+        );
     }
     Some(closed.map(drop))
 }
@@ -637,9 +643,11 @@ fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<(
 fn notify_exited(
     image: &Image,
     name: &str,
+    id: &str,
     reason: &str,
     exit_info: Option<&remuda_core::agent::ExitInfo>,
 ) {
+    image.wait_session_output_monitor(id);
     let mut fields = vec![format!("reason={}", crate::mcp::lua_string(reason))];
     if let Some(exit_info) = exit_info {
         if let Some(exit_code) = exit_info.exit_code {
@@ -1107,15 +1115,25 @@ fn handle_new(
         Some(&session_env),
     ) {
         Err(e) => reply(&stream, &Response::error(e)),
-        Ok(session) => match registry.register(session) {
-            Ok(session) => {
-                if let Some(output) = session.subscribe() {
-                    monitor_session_output(session, output, image.session_output_notifier(&name));
+        Ok(session) => {
+            let session_id = session.id().to_string();
+            let notifier = image.session_output_notifier(&name, &session_id);
+            match registry.register(session) {
+                Ok(session) => {
+                    if let Some(output) = session.subscribe_output_wakeup() {
+                        monitor_session_output(output, notifier);
+                    } else {
+                        notifier.flush(session.output_version().unwrap_or(0));
+                        notifier.finish_monitor();
+                    }
+                    reply(&stream, &Response::Value(name))
                 }
-                reply(&stream, &Response::Value(name))
+                Err(_) => {
+                    image.discard_session_output_monitor(&session_id, &notifier);
+                    reply(&stream, &Response::error(format!("name taken: {name}")))
+                }
             }
-            Err(_) => reply(&stream, &Response::error(format!("name taken: {name}"))),
-        },
+        }
     }
 }
 
@@ -1123,33 +1141,44 @@ fn handle_new(
 /// The deadline starts with the first chunk so continuous output cannot starve
 /// a notification by continually restarting a quiet-period timer.
 fn monitor_session_output(
-    session: Arc<Session>,
-    output: std::sync::mpsc::Receiver<Vec<u8>>,
+    output: remuda_core::agent::OutputWakeup,
     notifier: crate::image::SessionOutputNotifier,
 ) {
     const COALESCE: std::time::Duration = std::time::Duration::from_millis(50);
-    std::thread::spawn(move || loop {
-        if output.recv().is_err() {
-            notifier.deactivate();
-            break;
-        }
-        let deadline = std::time::Instant::now() + COALESCE;
+    std::thread::spawn(move || {
+        let mut last_notified = 0;
         loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                break;
+            if output.recv().is_err() {
+                notifier.flush(output.version_after_wake());
+                notifier.finish_monitor();
+                return;
             }
-            match output.recv_timeout(remaining) {
-                Ok(_) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    notifier.deactivate();
-                    return;
+            let deadline = std::time::Instant::now() + COALESCE;
+            let mut disconnected = false;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match output.recv_timeout(remaining) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
                 }
             }
-        }
-        if let Some(version) = session.output_version() {
-            notifier.notify(version);
+            let version = output.version_after_wake();
+            if disconnected {
+                notifier.flush(version);
+                notifier.finish_monitor();
+                return;
+            }
+            if version > last_notified {
+                notifier.notify(version);
+                last_notified = version;
+            }
         }
     });
 }
