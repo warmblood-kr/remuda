@@ -536,7 +536,10 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             action,
             json,
         } => cluster_call(&target, address, action, json),
-        ClusterCommand::Invalid => fail("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | control on|off | remote [node/session] | listen --bind ADDR [--allow-public] | call NODE (list | capture SESSION) --addr HOST:PORT [--json]]"),
+        ClusterCommand::Invalid => {
+            eprintln!("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | control on|off | remote [node/session] | listen --bind ADDR [--allow-public] | call NODE (list | capture SESSION) --addr HOST:PORT [--json]]");
+            ExitCode::from(2)
+        }
     }
 }
 

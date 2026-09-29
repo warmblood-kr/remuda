@@ -1,6 +1,7 @@
 //! Bounded remote-node polling state, separate from the cluster tree renderer.
 
 use remuda_core::agent::ScreenSnapshot;
+use remuda_core::protocol::{Request, Response};
 use std::collections::{BTreeMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -23,6 +24,8 @@ pub enum RemoteState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteSessionSnapshot {
     pub name: String,
+    /// Original protocol name used when sending requests to this session.
+    pub wire_name: String,
     pub instance_id: String,
     pub alive: bool,
     pub output_version: Option<u64>,
@@ -45,6 +48,65 @@ pub struct RemoteSnapshot {
 /// Read-only view consumed by the cluster tree and replaceable by a test fake.
 pub trait RemoteSource: Send + Sync {
     fn snapshot(&self) -> RemoteSnapshot;
+}
+
+/// Sends idempotent Input batches to a remote member. Callers own retry policy.
+pub trait RemoteInputTransport: Send + Sync {
+    fn send_input(&self, node: &str, request: &Request) -> io::Result<Response>;
+}
+
+/// One-shot Noise client used by the remote composer.
+type RemoteTargetResolver =
+    dyn Fn(&str) -> io::Result<crate::cluster::ResolvedTarget> + Send + Sync;
+
+pub struct ClusterRemoteInput {
+    client: crate::net::cluster_client::ClusterClient,
+    local_static_private: zeroize::Zeroizing<Vec<u8>>,
+    resolve: Box<RemoteTargetResolver>,
+}
+
+impl ClusterRemoteInput {
+    pub fn system() -> io::Result<Self> {
+        let local_static_private = crate::cluster::identity::load_static_private_key()?;
+        let timeout = Duration::from_secs(1);
+        let client = crate::net::cluster_client::ClusterClient::with_timeouts(
+            std::sync::Arc::new(crate::SystemWallClock::new()),
+            crate::net::cluster_client::ClientTimeouts {
+                connect: timeout,
+                read: timeout,
+                total: timeout,
+            },
+        );
+        Ok(Self::with_client(local_static_private, client, |node| {
+            crate::cluster::resolve_target(node, None)
+        }))
+    }
+
+    pub fn with_client(
+        local_static_private: zeroize::Zeroizing<Vec<u8>>,
+        client: crate::net::cluster_client::ClusterClient,
+        resolve: impl Fn(&str) -> io::Result<crate::cluster::ResolvedTarget> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            client,
+            local_static_private,
+            resolve: Box::new(resolve),
+        }
+    }
+}
+
+impl RemoteInputTransport for ClusterRemoteInput {
+    fn send_input(&self, node: &str, request: &Request) -> io::Result<Response> {
+        let target = (self.resolve)(node)?;
+        self.client
+            .request(
+                target.address,
+                &target.pinned_static_key,
+                &self.local_static_private,
+                request,
+            )
+            .map_err(io::Error::other)
+    }
 }
 
 pub struct RemoteNode {
@@ -259,6 +321,7 @@ mod tests {
     fn session(name: &str, text: &str) -> RemoteSessionSnapshot {
         RemoteSessionSnapshot {
             name: name.into(),
+            wire_name: name.into(),
             instance_id: "instance-1".into(),
             alive: true,
             output_version: Some(4),

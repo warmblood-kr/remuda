@@ -1273,6 +1273,8 @@ mod tests {
         let close_error = authorize_remote_request_with_control(
             &Request::Close {
                 name: "session".into(),
+                instance_id: None,
+                confirm: None,
             },
             true,
         )
