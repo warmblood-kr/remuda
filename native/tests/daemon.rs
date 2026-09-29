@@ -1294,7 +1294,20 @@ fn attach_eof_drains_input_already_read_by_the_key_pump() {
     let expected = vec![b'y'; 12_288];
     stream
         .write_all(&expected)
-        .expect("send keys before immediate detach");
+        .expect("send keys before detach");
+
+    // A successful socket write only proves that the local kernel accepted
+    // the bytes. Wait until the daemon has forwarded an initial block into the
+    // PTY before closing the socket, so EOF races with queued input instead of
+    // racing with the key pump's very first read.
+    let first_block_deadline = Instant::now() + PATIENCE;
+    while std::fs::metadata(&capture_path).map_or(true, |metadata| metadata.len() < 1024) {
+        assert!(
+            Instant::now() < first_block_deadline,
+            "key pump did not forward the first block before detach"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     drop(stream);
 
     let deadline = Instant::now() + PATIENCE;
