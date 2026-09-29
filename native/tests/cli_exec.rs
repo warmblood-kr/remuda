@@ -255,8 +255,8 @@ fn setup_stdin_fixture() -> std::path::PathBuf {
         mod_dir.join("packages/sample/init.lua"),
         r#"remuda.extension_command("sample", function(args, caller)
           if args[1] == "-" then return caller.stdin or "<missing>" end
-          if args[1] == "--stdin" then
-            return "literal:--stdin:" .. (caller.stdin == nil and "no-stdin" or "stdin-set")
+          if args[1] == "y" then
+            return table.concat(args, "|") .. "|" .. (caller.stdin == nil and "no-stdin" or "stdin-set")
           end
           if args[1] == "bytes" then
             local bytes = {}
@@ -407,13 +407,13 @@ fn extension_command_rejects_trailing_stdin_flag_with_usage_hint() {
 #[test]
 fn extension_command_separator_passes_stdin_flag_as_a_literal_argument() {
     let dir = setup_stdin_fixture();
-    let output = stdin_cli(&dir, &["sample", "--", "--stdin"])
+    let output = stdin_cli(&dir, &["sample", "y", "--", "--stdin"])
         .output()
         .expect("run extension command with literal stdin flag");
     assert!(
         output.status.success(),
         "literal --stdin failed: {output:?}"
     );
-    assert_eq!(output.stdout, b"literal:--stdin:no-stdin\n");
+    assert_eq!(output.stdout, b"y|--|--stdin|no-stdin\n");
     cleanup_stdin_fixture(&dir);
 }
