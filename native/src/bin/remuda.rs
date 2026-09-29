@@ -1356,6 +1356,16 @@ fn with_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> Exit
     }
 }
 
+/// Installed extension commands may opt out of starting a daemon. This is
+/// useful for periodic, best-effort integrations such as editor status lines.
+fn with_extension_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> ExitCode {
+    if std::env::var_os("REMUDA_NO_AUTOSTART").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        with_existing_daemon(server, path, f)
+    } else {
+        with_daemon(server, path, f)
+    }
+}
+
 /// Run a read-only command only against a daemon that already exists.
 fn with_existing_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode) -> ExitCode {
     match remuda_native::ipc::connect(path) {
@@ -1516,7 +1526,7 @@ fn extension_command(
         return fail("--stdin requires a mod command handler, not a mod launch");
     }
     if let Some((headless, agent)) = launch {
-        return with_daemon(server, path, |path| {
+        return with_extension_daemon(server, path, |path| {
             if let Some(agent) = agent {
                 let code = format!(
                     "remuda._mod_launch_options = remuda._mod_launch_options or {{}}; remuda._mod_launch_options[{}] = {{agent = {}}}",
@@ -1571,7 +1581,7 @@ fn extension_command(
         "return remuda._dispatch_extension_command({}, {{{arguments}}}, {{env = {{{env}}}{stdin_field}}})",
         serde_json::to_string(command).expect("command serializes")
     );
-    with_daemon(server, path, |path| eval_once(path, &code))
+    with_extension_daemon(server, path, |path| eval_once(path, &code))
 }
 
 /// Encode arbitrary bytes as a quoted Lua string with fixed-width decimal

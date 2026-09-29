@@ -76,10 +76,24 @@ pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
     let timeout = match request {
         // Deferred extension replies are capped at 300 seconds by
         // remuda.pending; leave five seconds for delivery and scheduling.
-        Request::Eval { .. } => Duration::from_secs(305),
+        Request::Eval { .. } => eval_timeout(),
         _ => Duration::from_secs(10),
     };
     read_response_with_timeout(path, stream, timeout)
+}
+
+/// Extension launchers can impose a shorter best-effort deadline on Eval.
+/// Ignore invalid, zero, or excessive values and retain the normal budget.
+fn eval_timeout() -> Duration {
+    eval_timeout_from(std::env::var("REMUDA_CLIENT_TIMEOUT_MS").ok().as_deref())
+}
+
+fn eval_timeout_from(value: Option<&str>) -> Duration {
+    const DEFAULT: Duration = Duration::from_secs(305);
+    match value.and_then(|value| value.parse::<u64>().ok()) {
+        Some(milliseconds @ 1..=305_000) => Duration::from_millis(milliseconds),
+        _ => DEFAULT,
+    }
 }
 
 #[cfg(unix)]
@@ -1125,7 +1139,9 @@ mod tests {
     use super::request_with_timeout;
     #[cfg(unix)]
     use super::trace_input_read;
-    use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
+    use super::{
+        eval_timeout_from, interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES,
+    };
     #[cfg(unix)]
     use crate::ipc;
     #[cfg(unix)]
@@ -1140,6 +1156,14 @@ mod tests {
     #[cfg(unix)]
     use std::time::Instant;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn extension_eval_deadline_accepts_a_short_environment_budget() {
+        assert_eq!(eval_timeout_from(Some("500")), Duration::from_millis(500));
+        assert_eq!(eval_timeout_from(None), Duration::from_secs(305));
+        assert_eq!(eval_timeout_from(Some("0")), Duration::from_secs(305));
+        assert_eq!(eval_timeout_from(Some("305001")), Duration::from_secs(305));
+    }
 
     #[cfg(unix)]
     fn assert_request_timeout(request: Request) {
