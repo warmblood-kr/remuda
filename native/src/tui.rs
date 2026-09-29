@@ -275,6 +275,19 @@ impl Ui {
         }
 
         let preview_offset = if self.list_visible { list_w + 1 } else { 0 };
+        if self.list_visible && col <= list_w {
+            match event.kind {
+                MouseEventKind::ScrollUp => self.scroll_list(-1, body),
+                MouseEventKind::ScrollDown => self.scroll_list(1, body),
+                _ => {}
+            }
+            if matches!(
+                event.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            ) {
+                return Action::Nothing;
+            }
+        }
         if matches!(event.kind, MouseEventKind::ScrollUp)
             && event.modifiers.contains(KeyModifiers::SHIFT)
             && col > preview_offset
@@ -342,6 +355,22 @@ impl Ui {
             return self.select_session_text(event.kind, row, col - preview_offset, body);
         }
         self.click_session_pane(event.kind, row, col - preview_offset, body, preview_w)
+    }
+
+    fn scroll_list(&mut self, delta: isize, body: u16) {
+        let visible = (body as usize / self.session_rows).max(1);
+        let max_first = self.sessions.len().saturating_sub(visible);
+        let first = list_viewport(self, body);
+        let first = first.saturating_add_signed(delta).min(max_first);
+        self.list_first_visible = Some(first);
+
+        if self.selected < first {
+            self.selected = first;
+        } else if self.selected >= first.saturating_add(visible) {
+            self.selected = first
+                .saturating_add(visible - 1)
+                .min(self.sessions.len().saturating_sub(1));
+        }
     }
 
     fn select_session_text(
