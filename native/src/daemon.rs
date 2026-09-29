@@ -1138,6 +1138,7 @@ fn handle(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_request(
     stream: Stream,
     reader: BufReader<Stream>,
