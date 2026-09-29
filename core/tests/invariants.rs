@@ -225,6 +225,12 @@ fn size_is_clamped_to_the_floor_that_keeps_input_visible() {
 }
 
 #[test]
+fn narrow_pane_size_is_an_explicit_floor_exception() {
+    let pane = Size::for_pane(75, 29);
+    assert_eq!((pane.cols(), pane.rows()), (75, 29));
+}
+
+#[test]
 fn session_size_tracks_a_resize() {
     let agent = ScriptedAgent::new(vec![]).with_size(Size::new(120, 40));
     let (session, _clock) = session_with(Box::new(agent));
@@ -614,6 +620,37 @@ fn close_is_refused_while_attached_and_the_session_survives() {
         matches!(registry.close("worker"), Some(Ok(true))),
         "detaching lets close through, exactly as it does for send"
     );
+}
+
+#[test]
+fn confirmed_close_clears_its_closing_marker_when_attachment_refuses_it() {
+    let registry = Registry::new();
+    let alive = Arc::new(AtomicBool::new(true));
+    registry
+        .register(named(
+            "worker",
+            Box::new(FlagAgent {
+                alive: alive.clone(),
+            }),
+        ))
+        .expect("registration");
+    let session = registry.get("worker").expect("handle");
+    let instance_id = session.instance_id().to_owned();
+    let held = session.attach();
+
+    assert!(matches!(
+        registry.close_instance("worker", &instance_id),
+        Some(Err(AgentError::Attached))
+    ));
+    assert!(!session.is_closing());
+    assert!(alive.load(Ordering::SeqCst));
+    assert!(registry.get("worker").is_some());
+
+    drop(held);
+    assert!(matches!(
+        registry.close_instance("worker", &instance_id),
+        Some(Ok(true))
+    ));
 }
 
 // ---------------------------------------------------------------------------

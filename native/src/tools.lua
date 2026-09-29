@@ -61,6 +61,41 @@ register("tools", "The `remuda.tool` registry table, keyed by tool name.", "tabl
 register("_extension_commands", "Handlers registered for installed mod commands.", "table")
 register("extension_command", "Register a handler for an installed mod command.", "extension_command(name, handler(args, caller)) -> nil")
 register("_dispatch_extension_command", "Dispatch arguments and caller context to a loaded mod command handler.", "_dispatch_extension_command(name, args, caller) -> value")
+register("pending", "Return a bounded handle for an extension command's deferred result.", "pending({timeout?, on_cancel?}) -> handle")
+register("_pending_create", "Create a private pending reply handle.", "_pending_create(timeout?) -> id, handle")
+register("_pending_events", "Drain pending completion and cancellation notifications.", "_pending_events() -> {{id, reason?}...}")
+
+local pending_cancel_handlers = {}
+function remuda.pending(options)
+  if type(options) ~= "table" then
+    error("pending needs an options table", 2)
+  end
+  local timeout = options.timeout
+  if timeout ~= nil and (type(timeout) ~= "number" or timeout <= 0 or timeout > 300) then
+    error("pending timeout must be a positive number no greater than 300 seconds", 2)
+  end
+  local on_cancel = options.on_cancel
+  if on_cancel ~= nil and type(on_cancel) ~= "function" then
+    error("pending on_cancel must be a function", 2)
+  end
+  local id, handle = remuda._pending_create(timeout)
+  if on_cancel then pending_cancel_handlers[id] = on_cancel end
+  return handle
+end
+
+local function deliver_pending_events()
+  for _, event in ipairs(remuda._pending_events()) do
+    local callback = pending_cancel_handlers[event.id]
+    pending_cancel_handlers[event.id] = nil
+    if event.reason and callback then
+      local ok, err = pcall(callback, event.reason)
+      if not ok then
+        io.stderr:write("remuda.pending on_cancel failed: " .. tostring(err) .. "\n")
+      end
+    end
+  end
+end
+_G.__remuda_pending_tick = deliver_pending_events
 
 -- Required names first (a caller's own order, via `needs`), then everything
 -- else marked optional — the same order a hand-written signature would use.
@@ -238,7 +273,7 @@ end
 -- One step is kept separate from the wake-up source: the current driver is
 -- the one-second clock below, and a future PTY output event can call this same
 -- function without changing remuda.expect's API.
-local function expect_step(handle, now)
+local function expect_step(handle, now, force)
   local state, options = handle.state, handle.options
   if state.status ~= "pending" then return state.status, state.branch, state.screen end
   state.last_result = nil
@@ -255,9 +290,9 @@ local function expect_step(handle, now)
   if not state.deadline then
     state.deadline = now + handle.timeout
     state.next_at = now + (tonumber(options.interval) or 1)
-    return "waiting"
+    if not force then return "waiting" end
   end
-  if now < state.next_at then return "waiting" end
+  if not force and now < state.next_at then return "waiting" end
   local capture = options.capture or remuda.capture
   local captured, screen = pcall(capture, handle.session)
   if not captured then
@@ -373,6 +408,24 @@ local function expect_tick(now)
   end
   pending_expects = keep
 end
+
+local function expect_output(name)
+  local keep = {}
+  for _, handle in ipairs(pending_expects) do
+    if handle.state.status == "pending" then
+      if handle.session == name then
+        local ok, err = pcall(expect_step, handle, expect_clock_now, true)
+        if not ok then
+          handle.state.status, handle.state.error = "error", err
+          if handle.options.on_error then pcall(handle.options.on_error, err, handle) end
+        end
+      end
+      if handle.state.status == "pending" then keep[#keep + 1] = handle end
+    end
+  end
+  pending_expects = keep
+end
+
 function remuda.expect_option(screen, matches)
   if type(screen) ~= "string" or type(matches) ~= "function" then return nil end
   local found
@@ -404,6 +457,7 @@ register("expect_option", "Pick a unique numbered menu option by its label.", "e
 -- clock). Fires every schedule whose own interval has elapsed since ITS OWN
 -- last run — native never sees or compares an individual interval itself.
 function remuda._run_due_schedules(now)
+  deliver_pending_events()
   local schedule_now = now or expect_clock_now or schedule_clock_now
   schedule_clock_now = schedule_now
   -- Expectations are advanced from the same native one-second clock. A
@@ -503,6 +557,9 @@ function remuda.on(event, fn, opts)
     src = source_of(fn), errors = 0, owner = current_owner })
 end
 register("on", "Register a callback to run when an event fires. `opts`: `group`, `id` (same group+id replaces), `depth` (-100..100, lower first).", "on(event, fn, opts?) -> nil")
+
+remuda.on("session_output", function(name) expect_output(name) end,
+  { group = "remuda.expect", id = "session-output" })
 
 -- A snapshot, not a live reference to `remuda.hooks[event]` — a hook that
 -- calls `clear_hooks` on its own group must not skip or re-run a sibling
@@ -994,6 +1051,18 @@ function remuda._activate_module(name, candidate, reactivate)
   if candidate.stop ~= nil and type(candidate.stop) ~= "function" then
     error("module stop must be a function", 0)
   end
+  if candidate.ready ~= nil and type(candidate.ready) ~= "function" then
+    error("module ready must be a function", 0)
+  end
+  local timeout_ms = candidate.timeout_ms
+  if timeout_ms == nil then timeout_ms = 30000 end
+  if candidate.ready ~= nil and (type(timeout_ms) ~= "number" or timeout_ms % 1 ~= 0
+    or timeout_ms < 1 or timeout_ms > 240000) then
+    error("module timeout_ms must be an integer from 1 through 240000", 0)
+  end
+  if candidate.ready == nil and candidate.timeout_ms ~= nil then
+    error("module timeout_ms requires a ready function", 0)
+  end
 
   local hooks = candidate.hooks or {}
   local hook_count = array_length(hooks, "module hooks")
@@ -1247,6 +1316,9 @@ function remuda._activate_module(name, candidate, reactivate)
   local start = candidate.start and function(started_state)
     return with_owner(name, candidate.start, started_state)
   end
+  local ready = candidate.ready and function(ready_state)
+    return with_owner(name, candidate.ready, ready_state)
+  end
   local activation = {
     version = version,
     state = state,
@@ -1256,6 +1328,8 @@ function remuda._activate_module(name, candidate, reactivate)
     contributions = declared_contributions,
     stop = stop,
     start = start,
+    ready = ready,
+    timeout_ms = timeout_ms,
     stopped = false,
   }
   for index = 1, advice_count do
@@ -1387,6 +1461,28 @@ function remuda._stop_modules()
   end
 end
 
+-- The CLI polls this small lifecycle result between Eval requests. Keep the
+-- readiness callback in the declaration table, not as another public remuda
+-- word; an absent callback preserves today's immediate exec completion.
+function remuda._module_readiness(name)
+  local module = modules[name]
+  if not module or not module.ready then return { status = "ready" } end
+  local ok, ready, message = pcall(module.ready, module.state)
+  if not ok then return { status = "failed", message = tostring(ready) } end
+  if ready == true and message == nil then return { status = "ready" } end
+  if ready == nil and message == nil then
+    return { status = "pending", timeout_ms = module.timeout_ms }
+  end
+  if ready == nil and type(message) == "string" then
+    return { status = "failed", message = message }
+  end
+  return {
+    status = "failed",
+    message = "ready must return true, nil, or nil, message",
+  }
+end
+register("_module_readiness", "Internal readiness poll for remuda exec.", "_module_readiness(name) -> {status, timeout_ms?, message?}")
+
 local escapes = {
   ['"'] = '\\"',
   ["\\"] = "\\\\",
@@ -1426,6 +1522,40 @@ end
 
 remuda.buffers = {}
 register("buffers", "The `remuda.buffer` registry table, keyed by buffer name.", "table")
+
+-- Deprecated flat spellings keep resolving dynamically through this table.
+-- That matters for API v1-v4 callers which wrap/replace a flat function path:
+-- namespace words still pass through the old slot during the compatibility
+-- window. The alias itself calls the captured primitive, avoiding a cycle.
+local deprecated_notices = {}
+local through_namespace = {}
+local function call_flat(name, ...)
+  local prior = through_namespace[name]
+  through_namespace[name] = true
+  local result = table.pack(pcall(remuda[name], ...))
+  through_namespace[name] = prior
+  if not result[1] then error(result[2], 0) end
+  return table.unpack(result, 2, result.n)
+end
+
+local function deprecated_alias(name, replacement, primitive)
+  return function(...)
+    if not through_namespace[name]
+      and os.getenv("REMUDA_SUPPRESS_DEPRECATIONS") ~= "1"
+      and not deprecated_notices[name] then
+      deprecated_notices[name] = true
+      io.stderr:write("deprecated: remuda." .. name .. "; use remuda.session." .. replacement .. "\n")
+    end
+    return primitive(...)
+  end
+end
+
+local flat_session_words = {
+  ls = remuda.ls,
+  new = remuda.new,
+  close = remuda.close,
+  attach = remuda.attach,
+}
 
 local Buffer = {}
 Buffer.__index = Buffer
@@ -1473,13 +1603,13 @@ end
 -- session ≠ buffer: a session is a live process this daemon runs, a buffer
 -- is Lua-owned text. `session.buffer` is the buffer named after the session
 -- (create-if-absent, same as `buffer.new`) — a convenience, never the session
--- itself, so nothing here duplicates what `remuda.ls()` already reports.
+-- itself, so nothing here duplicates what `remuda.session.list()` reports.
 local Session = {}
 Session.__index = function(self, key)
   if key == "buffer" then
     return remuda.buffer.new(self.name)
   elseif key == "is_busy" then
-    for _, row in ipairs(remuda.ls()) do
+    for _, row in ipairs(remuda.session.list()) do
       if row.name == self.name then
         -- No output for a couple of seconds is a useful working/idle heuristic.
         -- `row.idle` remains since-input for callers that use that measure.
@@ -1496,13 +1626,38 @@ end
 -- of busy or of a context budget, whichever session's content it happens to
 -- hold. (`context_left` is not implemented: a generic pty has no channel a
 -- caller's token budget would arrive on. Named so a future one lands here.)
-function remuda.session(name)
+local function session_handle(name)
   if type(name) ~= "string" or name == "" then
     error("a session needs a name", 2)
   end
   return setmetatable({ name = name }, Session)
 end
-register("session", "A handle onto an existing session, by name.", "session(name) -> session")
+
+remuda.session = {
+  list = function(...) return call_flat("ls", ...) end,
+  new = function(...) return call_flat("new", ...) end,
+  close = function(...) return call_flat("close", ...) end,
+  attach = function(...) return call_flat("attach", ...) end,
+}
+setmetatable(remuda.session, {
+  __call = function(_, name) return session_handle(name) end,
+})
+register("session", "Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close and attach.",
+  "session(name) -> handle; table {list, new, close, attach}")
+register("session.list", "List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.", "session.list() -> {session...}")
+register("session.new", "Start a session, defaulting the command to the user's shell.",
+  "session.new(name?, argv?, cwd?, env?) -> string")
+register("session.close", "End a session, live or already self-exited.", "session.close(name) -> nil")
+register("session.attach", "Enter raw mode on a session.", "session.attach(name) -> nil")
+
+remuda.ls = deprecated_alias("ls", "list", flat_session_words.ls)
+remuda.new = deprecated_alias("new", "new", flat_session_words.new)
+remuda.close = deprecated_alias("close", "close", flat_session_words.close)
+remuda.attach = deprecated_alias("attach", "attach", flat_session_words.attach)
+register("ls", "Deprecated alias for `remuda.session.list`.", "ls() -> {session...}")
+register("new", "Deprecated alias for `remuda.session.new`.", "new(name?, argv?, cwd?, env?) -> string")
+register("close", "Deprecated alias for `remuda.session.close`.", "close(name) -> nil")
+register("attach", "Deprecated alias for `remuda.session.attach`.", "attach(name) -> nil")
 
 -- window: a screen rectangle showing exactly one buffer or attached session,
 -- owning the lifetime of neither — closing one kills nothing it showed
@@ -1671,7 +1826,7 @@ register(
 -- WIDTH travels with the bridge call so any budget-aware row detail can be
 -- chosen here; Rust still fits the resulting rows to the caller's pane.
 function remuda._refresh_sessions_buffer(width, selected, selected_name)
-  local sessions = remuda.ls()
+  local sessions = remuda.session.list()
   local ordered = sessions
   local has_order = false
   -- The private order line is tab-delimited. A daemon normally receives names
@@ -1848,13 +2003,16 @@ remuda.tool({
   args = {
     session = "The session to watch.",
     pattern = "A Lua pattern the screen must match. `%$ %s*$` is a shell prompt.",
-    seconds = "How long to wait before giving up. Default 30.",
+    seconds = "How long to wait before giving up. Default 30; positive and at most 300.",
   },
   needs = { "session", "pattern" },
   run = function(a)
     -- MCP argument values arrive as strings; every schema this frame emits says
     -- so. A number is what this one means, and `tonumber` is where that is said.
     local seconds = tonumber(a.seconds) or 30
+    if seconds ~= seconds or seconds <= 0 or seconds > 300 then
+      error("wait_for seconds must be positive and no greater than 300", 0)
+    end
     local screen
     for _ = 1, math.max(1, math.ceil(seconds / 0.1)) do
       screen = remuda.capture(a.session)
@@ -1903,9 +2061,15 @@ remuda.tool({
   end,
 })
 
-function remuda.process(spec)
+local function process_start(spec)
+  if type(spec) ~= "table" then error("a process needs a spec table", 2) end
   if type(spec.argv) ~= "table" or #spec.argv == 0 then
     error("a process needs a non-empty `argv`", 2)
+  end
+  for i, arg in ipairs(spec.argv) do
+    if type(arg) ~= "string" or (i == 1 and arg == "") then
+      error("a process argv must contain strings and a non-empty executable", 2)
+    end
   end
   if spec.on_line ~= nil and (type(spec.on_line) ~= "string" or spec.on_line == "") then
     error("a process's `on_line`, when given, must be a non-empty string", 2)
@@ -1915,7 +2079,31 @@ function remuda.process(spec)
   end
   return remuda._process_spawn(spec.argv, spec.on_line, spec.on_exit)
 end
-register("process", "Spawn a plain-pipe child process; its stdout lines and exit arrive as emit events.", "process(spec) -> id")
+local function process_run(spec)
+  if type(spec) ~= "table" then error("process.run needs a spec table", 2) end
+  if type(spec.argv) ~= "table" or #spec.argv == 0 then
+    error("process.run needs a non-empty `argv`", 2)
+  end
+  for i, arg in ipairs(spec.argv) do
+    if type(arg) ~= "string" or (i == 1 and arg == "") then
+      error("process.run argv must contain strings and a non-empty executable", 2)
+    end
+  end
+  if spec.stdin ~= nil and type(spec.stdin) ~= "string" then
+    error("process.run stdin must be a string", 2)
+  end
+  local timeout = spec.timeout
+  if timeout == nil then timeout = 5 end
+  if type(timeout) ~= "number" or timeout ~= timeout or timeout <= 0 or timeout > 30 then
+    error("process.run timeout must be positive and at most 30 seconds", 2)
+  end
+  return remuda._process_run(spec.argv, spec.stdin, timeout)
+end
+remuda.process = setmetatable({ run = process_run }, {
+  __call = function(_, spec) return process_start(spec) end,
+})
+register("process", "Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output.", "process(spec) -> id; process.run(spec) -> {code, stdout, stderr, timed_out}")
+register("process.run", "Run argv directly without a shell; inherits the daemon's environment and working directory. Blocks the Lua image until exit or timeout (default 5s, max 30s), captures each stream up to 1 MiB. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.", "process.run{argv, stdin?, timeout?} -> {code, stdout, stderr, timed_out, signal?}")
 
 -- Everything defined so far is core's; a mod may not replace it (#145).
 for key in pairs(remuda) do core_fields[key] = true end

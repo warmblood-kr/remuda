@@ -214,7 +214,15 @@ fn typing_into_a_real_claude_session_survives_the_trust_dialog() {
         "the real claude session never answered 42:\n{screen}"
     );
 
-    client::request(&socket, &Request::Close { name: name.clone() }).expect("close");
+    client::request(
+        &socket,
+        &Request::Close {
+            name: name.clone(),
+            instance_id: None,
+            confirm: None,
+        },
+    )
+    .expect("close");
 }
 
 /// Closes 「⒟ 그 세션이 MCP 로 remuda/butler 함수를 부른다」: a real `claude` session,
@@ -358,5 +366,13 @@ fn a_real_claude_session_calls_a_lua_defined_tool_over_mcp() {
         "the sentinel file exists but was not written by this tool's run function"
     );
 
-    client::request(&socket, &Request::Close { name: session }).expect("close");
+    client::request(
+        &socket,
+        &Request::Close {
+            name: session,
+            instance_id: None,
+            confirm: None,
+        },
+    )
+    .expect("close");
 }

@@ -19,7 +19,7 @@
 //! transport. Adding those here would put a socket in the policy layer, which
 //! `core/clippy.toml` denies outright.
 
-use crate::agent::{Cursor, Result, ScreenSnapshot, Size, StyledCell};
+use crate::agent::{AgentError, Cursor, ExitInfo, Result, ScreenSnapshot, Size, StyledCell};
 use crate::input::{InputBatch, InputError, InputOutcome};
 use crate::protocol::Step;
 use crate::session::Session;
@@ -191,16 +191,38 @@ impl Registry {
 
     /// Drop every session whose process has exited, returning their names.
     pub fn reap(&self) -> Vec<String> {
+        self.reap_with_exit_info()
+            .into_iter()
+            .map(|(name, _, _, _)| name)
+            .collect()
+    }
+
+    /// Drop exited sessions and retain any status their backend observed.
+    pub fn reap_with_exit_info(&self) -> Vec<(String, String, &'static str, Option<ExitInfo>)> {
         let mut sessions = self.lock();
-        let dead: Vec<String> = sessions
+        let dead: Vec<_> = sessions
             .iter()
             .filter(|(_, s)| !s.is_alive())
-            .map(|(n, _)| n.clone())
+            .map(|(name, session)| {
+                (
+                    name.clone(),
+                    session.id().to_string(),
+                    if session.is_closing() {
+                        "closed"
+                    } else {
+                        "exited"
+                    },
+                    Arc::clone(session),
+                )
+            })
             .collect();
-        for name in &dead {
+        for (name, _, _, _) in &dead {
             sessions.remove(name);
         }
-        dead
+        drop(sessions);
+        dead.into_iter()
+            .map(|(name, id, reason, session)| (name, id, reason, session.exit_info()))
+            .collect()
     }
 
     /// A panic under this lock cannot leave the map half-updated — an entry is
@@ -285,7 +307,41 @@ impl Registry {
     /// End and stop tracking a session; an attached one refuses and stays.
     /// `Ok(false)`: a concurrent `reap` removed it first and owns the notice.
     pub fn close(&self, name: &str) -> Option<Result<bool>> {
-        let session = self.get(name)?;
-        Some(session.terminate().map(|()| self.remove(name).is_some()))
+        let session = {
+            let sessions = self.lock();
+            let session = Arc::clone(sessions.get(name)?);
+            session.mark_closing();
+            session
+        };
+        Some(match session.terminate_for_close() {
+            Ok(()) => {
+                let removed = self.remove(name).is_some();
+                session.wake_sync_waiters();
+                Ok(removed)
+            }
+            Err(error) => {
+                session.clear_closing();
+                Err(error)
+            }
+        })
+    }
+
+    /// Close only the session start named by `instance_id`. The registry lock
+    /// covers identity validation, termination, and removal so a same-name
+    /// replacement can never be closed by a stale request.
+    pub fn close_instance(&self, name: &str, instance_id: &str) -> Option<Result<bool>> {
+        let mut sessions = self.lock();
+        let session = sessions.get(name)?.clone();
+        if session.instance_id() != instance_id {
+            return Some(Err(AgentError::Io(
+                "session restarted; close was refused".into(),
+            )));
+        }
+        session.mark_closing();
+        if let Err(error) = session.terminate() {
+            session.clear_closing();
+            return Some(Err(error));
+        }
+        Some(Ok(sessions.remove(name).is_some()))
     }
 }

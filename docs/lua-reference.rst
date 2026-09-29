@@ -36,6 +36,21 @@ _function_source
 
 ``_function_source(fn) -> string`` — Where a Lua function was defined, as `source:line`; internal, for `hook_list`, since scripts get no `debug` library.
 
+_module_readiness
+-----------------
+
+``_module_readiness(name) -> {status, timeout_ms?, message?}`` — Internal readiness poll for remuda exec.
+
+_pending_create
+---------------
+
+``_pending_create(timeout?) -> id, handle`` — Create a private pending reply handle.
+
+_pending_events
+---------------
+
+``_pending_events() -> {{id, reason?}...}`` — Drain pending completion and cancellation notifications.
+
 _process_drain
 --------------
 
@@ -45,6 +60,11 @@ _process_killpg
 ---------------
 
 ``_process_killpg(id) -> nil`` — Reap a process's whole process group (Linux only); internal, called by the daemon's own clean-shutdown sweep, not meant for scripts.
+
+_process_run
+------------
+
+``_process_run(argv, stdin?, timeout) -> result`` — Run an argv process synchronously with a bounded timeout and captured output; internal, called by `remuda.process.run`.
 
 _process_spawn
 --------------
@@ -99,7 +119,7 @@ advise
 attach
 ------
 
-``attach(name) -> nil`` — Enter raw mode on a session (a no-op inside the daemon's own image).
+``attach(name) -> nil`` — Deprecated alias for `remuda.session.attach`.
 
 buffer
 ------
@@ -139,7 +159,7 @@ click
 close
 -----
 
-``close(name) -> nil`` — End a session, live or already self-exited.
+``close(name) -> nil`` — Deprecated alias for `remuda.session.close`.
 
 contribute
 ----------
@@ -181,6 +201,16 @@ exec
 
 ``exec(name) -> nil`` — Run an installed mod's entry source, by name, in this same image.
 
+expect
+------
+
+``expect(session, branches, options?) -> handle`` — Watch a session asynchronously. Branches match a Lua pattern or predicate and run a key list or callback; `continue` keeps watching. Options accept a bounded timeout and unknown-screen matcher/callback.
+
+expect_option
+-------------
+
+``expect_option(screen, label_predicate) -> number|nil`` — Pick a unique numbered menu option by its label.
+
 extension_command
 -----------------
 
@@ -196,6 +226,16 @@ feed
 
 ``feed(name, steps) -> nil`` — Deliver a sequence of bursts and pauses as one indivisible act.
 
+fs
+--
+
+``table`` — Atomic replacement of files for trusted Lua callers.
+
+fs.write_atomic
+---------------
+
+``fs.write_atomic(path, bytes) -> true, nil | nil, error`` — Write bytes through a same-directory temporary file and atomically replace the target.
+
 hook_list
 ---------
 
@@ -206,10 +246,45 @@ hooks
 
 ``table`` — Deprecated for reading: use `hook_list`. The `remuda.on` table, keyed by event name; it becomes read-only once no mod edits it by hand.
 
+http
+----
+
+``http.request(options) -> {cancel()}`` — Start an asynchronous bounded HTTP request; completion is delivered on the Lua image queue.
+
 insert
 ------
 
 ``insert(name, text) -> nil`` — Insert raw bytes into a session with nothing appended.
+
+json
+----
+
+``table`` — Bounded JSON conversion for Lua values and UTF-8 JSON text.
+
+json.array
+----------
+
+``json.array(table) -> table`` — Tag a dense Lua table as a JSON array, including an empty table.
+
+json.decode
+-----------
+
+``json.decode(text) -> value, nil | nil, error`` — Decode strict UTF-8 JSON; repeated object keys and over-limit input return nil, error.
+
+json.encode
+-----------
+
+``json.encode(value, options?) -> string`` — Encode a Lua value as bounded JSON; unsupported values raise a clear error.
+
+json.null
+---------
+
+``value`` — The sentinel that represents JSON null in Lua tables.
+
+json.object
+-----------
+
+``json.object(table) -> table`` — Tag a string-keyed Lua table as a JSON object, including an empty table.
 
 key
 ---
@@ -229,7 +304,7 @@ list_dir
 ls
 --
 
-``ls() -> {session...}`` — List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.
+``ls() -> {session...}`` — Deprecated alias for `remuda.session.list`.
 
 mkdir
 -----
@@ -239,17 +314,27 @@ mkdir
 new
 ---
 
-``new(name?, argv?, cwd?, env?) -> string`` — Start a new session, defaulting the command to the user's shell.
+``new(name?, argv?, cwd?, env?) -> string`` — Deprecated alias for `remuda.session.new`.
 
 on
 --
 
 ``on(event, fn, opts?) -> nil`` — Register a callback to run when an event fires. `opts`: `group`, `id` (same group+id replaces), `depth` (-100..100, lower first).
 
+pending
+-------
+
+``pending({timeout?, on_cancel?}) -> handle`` — Return a bounded handle for an extension command's deferred result.
+
 process
 -------
 
-``process(spec) -> id`` — Spawn a plain-pipe child process; its stdout lines and exit arrive as emit events.
+``process(spec) -> id; process.run(spec) -> {code, stdout, stderr, timed_out}`` — Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output.
+
+process.run
+-----------
+
+``process.run{argv, stdin?, timeout?} -> {code, stdout, stderr, timed_out, signal?}`` — Run argv directly without a shell; inherits the daemon's environment and working directory. Blocks the Lua image until exit or timeout (default 5s, max 30s), captures each stream up to 1 MiB. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.
 
 processes
 ---------
@@ -299,7 +384,27 @@ send
 session
 -------
 
-``session(name) -> session`` — A handle onto an existing session, by name.
+``session(name) -> handle; table {list, new, close, attach}`` — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close and attach.
+
+session.attach
+--------------
+
+``session.attach(name) -> nil`` — Enter raw mode on a session.
+
+session.close
+-------------
+
+``session.close(name) -> nil`` — End a session, live or already self-exited.
+
+session.list
+------------
+
+``session.list() -> {session...}`` — List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.
+
+session.new
+-----------
+
+``session.new(name?, argv?, cwd?, env?) -> string`` — Start a session, defaulting the command to the user's shell.
 
 sleep
 -----

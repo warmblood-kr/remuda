@@ -1,18 +1,16 @@
 //! Per-node authorized membership entries, persistence, and merge semantics.
 
 use super::encoding;
-#[cfg(not(windows))]
 use super::storage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::fs;
 #[cfg(not(windows))]
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
-#[cfg(not(windows))]
 use std::path::Path;
 
-#[cfg(not(windows))]
 const REGISTRY_FILE: &str = "authorized_nodes.json";
 pub const MAX_UPDATE_BYTES: usize = 1024 * 1024;
 pub const MAX_UPDATE_ENTRIES: usize = 1024;
@@ -697,12 +695,6 @@ pub fn apply_registry_update(
     _update: &RegistryUpdate,
     _authenticated_sender_pubkey: &[u8],
 ) -> io::Result<UpdateOutcome> {
-    #[cfg(windows)]
-    return Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
-    ));
-    #[cfg(not(windows))]
     apply_update_at(
         &storage::cluster_state_dir()?.join("cluster"),
         _update,
@@ -716,12 +708,6 @@ pub(crate) fn apply_join_bootstrap(
     update: &RegistryUpdate,
     authenticated_issuer_pubkey: &[u8],
 ) -> io::Result<()> {
-    #[cfg(windows)]
-    return Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
-    ));
-    #[cfg(not(windows))]
     apply_join_bootstrap_at(
         &storage::cluster_state_dir()?.join("cluster"),
         update,
@@ -729,7 +715,6 @@ pub(crate) fn apply_join_bootstrap(
     )
 }
 
-#[cfg(not(windows))]
 fn apply_join_bootstrap_at(
     dir: &Path,
     update: &RegistryUpdate,
@@ -777,7 +762,6 @@ fn apply_join_bootstrap_snapshot(
     Ok(())
 }
 
-#[cfg(not(windows))]
 fn apply_update_at(
     dir: &Path,
     update: &RegistryUpdate,
@@ -848,12 +832,6 @@ fn prefer(incoming: &AuthorizedNode, current: &AuthorizedNode) -> bool {
 }
 
 pub fn load_registry() -> io::Result<Registry> {
-    #[cfg(windows)]
-    return Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
-    ));
-    #[cfg(not(windows))]
     load_registry_at(&storage::cluster_state_dir()?.join("cluster"))
 }
 
@@ -903,12 +881,6 @@ pub fn registry_revision_token() -> io::Result<String> {
 }
 
 pub fn save_registry(_registry: &Registry) -> io::Result<()> {
-    #[cfg(windows)]
-    return Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
-    ));
-    #[cfg(not(windows))]
     {
         let dir = storage::cluster_state_dir()?.join("cluster");
         storage::create_private_directory(&dir)?;
@@ -920,29 +892,37 @@ pub fn save_registry(_registry: &Registry) -> io::Result<()> {
     }
 }
 
-#[cfg(not(windows))]
 pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
     if fs::symlink_metadata(dir).is_ok() {
         storage::verify_directory(dir)?;
     }
     let path = dir.join(REGISTRY_FILE);
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = match options.open(&path) {
+    #[cfg(not(windows))]
+    let file = {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{} is a symlink; refusing", path.display()),
+                ))
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    #[cfg(windows)]
+    let file = match super::windows_security::open_for_read(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
-        #[cfg(unix)]
-        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{} is a symlink; refusing", path.display()),
-            ))
-        }
         Err(error) => return Err(error),
     };
     storage::check_private_file(&file, "cluster registry", &path)?;
@@ -962,7 +942,6 @@ pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
     Ok(folded)
 }
 
-#[cfg(not(windows))]
 pub(super) fn save_registry_at(dir: &Path, registry: &Registry) -> io::Result<()> {
     let mut validated = Registry::default();
     validated.merge(registry)?;
@@ -2541,5 +2520,32 @@ mod tests {
         registry.merge(&Registry::default()).unwrap();
         assert_eq!(registry.authorized_nodes.len(), 1);
         assert_eq!(registry.authorized_nodes[0].state, NodeState::Revoked);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_private_state_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn loading_legacy_default_acl_settings_tightens_acl_and_loads_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "remuda-registry-upgrade-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, br#"{"allow_remote_control":false}"#).unwrap();
+
+        assert!(!super::super::control::enabled_at(&dir).unwrap());
+        let directory = super::super::windows_security::open_for_check(&dir, true, true).unwrap();
+        assert!(super::super::windows_security::is_owner_acl_conforming(&directory).unwrap());
+        let file = super::super::windows_security::open_for_check(&path, false, true).unwrap();
+        assert!(super::super::windows_security::is_owner_acl_conforming(&file).unwrap());
+        drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

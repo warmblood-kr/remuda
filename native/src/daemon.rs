@@ -16,13 +16,21 @@ use crate::image::Image;
 use crate::ipc::{self, Listener, Stream, TryClone};
 use crate::process_ancestry;
 use crate::pty::PtyAgent;
+#[cfg(unix)]
+use interprocess::local_socket::traits::Listener as _;
+#[cfg(windows)]
 use interprocess::local_socket::traits::ListenerExt;
+#[cfg(unix)]
+use interprocess::local_socket::traits::Stream as LocalStream;
+#[cfg(unix)]
+use interprocess::local_socket::ListenerNonblockingMode;
 use remuda_core::agent::Result as AgentResult;
-use remuda_core::protocol::{collapse_runs, Request, Response};
+use remuda_core::protocol::{collapse_runs, Request, Response, StyledScreen};
 use remuda_core::{Clock, Registry, Session, Size};
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
@@ -31,13 +39,75 @@ use std::time::Duration;
 use crate::SystemClock;
 use portable_pty::CommandBuilder;
 
+/// Each protocol connection carries one request; cap all simultaneous long
+/// polls so they cannot consume an unbounded number of daemon worker threads.
+pub(crate) const MAX_CONCURRENT_SYNCS: usize = 16;
+static ACTIVE_SYNCS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_NEW_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+struct NewRequestInFlight;
+
+impl NewRequestInFlight {
+    fn start() -> Self {
+        ACTIVE_NEW_REQUESTS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for NewRequestInFlight {
+    fn drop(&mut self) {
+        ACTIVE_NEW_REQUESTS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn wait_for_new_requests() {
+    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
+    while ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let still_in_flight = ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst);
+    if still_in_flight != 0 {
+        eprintln!(
+            "remuda: continuing shutdown with {still_in_flight} New request(s) still in flight"
+        );
+    }
+}
+
+struct SyncPermit;
+
+impl SyncPermit {
+    fn acquire() -> Option<Self> {
+        ACTIVE_SYNCS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |active| {
+                (active < MAX_CONCURRENT_SYNCS).then_some(active + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+fn acquire_sync_permit() -> Result<SyncPermit, Response> {
+    SyncPermit::acquire().ok_or(Response::SyncAtCapacity)
+}
+
+impl Drop for SyncPermit {
+    fn drop(&mut self) {
+        ACTIVE_SYNCS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Where a node's socket lives. Prefer `$XDG_RUNTIME_DIR`; Android falls back
 /// to its process temp directory, while other Unix systems keep their old path.
 pub fn socket_path(server: &str) -> PathBuf {
-    let base = std::env::var_os("REMUDA_RUNTIME_DIR")
+    socket_path_in(&runtime_dir(), server)
+}
+
+/// Runtime root used by the client and daemon entry points.
+pub fn runtime_dir() -> PathBuf {
+    std::env::var_os("REMUDA_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(default_runtime_dir);
-    socket_path_in(&base, server)
+        .unwrap_or_else(default_runtime_dir)
 }
 
 /// The same derivation with the runtime directory supplied — what the daemon
@@ -171,7 +241,17 @@ fn load_user_config(image: &Image) {
 /// unconditional unlink displaces a *live* peer, which then keeps running
 /// unreachable and holds its pty children forever.
 pub fn serve(path: &Path) -> std::io::Result<()> {
-    let _socket_lock = SocketLock::acquire(path)?;
+    serve_inner(path, None)
+}
+
+/// Serve a CLI-derived path, protecting Remuda's own runtime directory while
+/// validating any user-selected socket parent without changing its mode.
+pub fn serve_with_runtime(path: &Path, runtime: &Path) -> std::io::Result<()> {
+    serve_inner(path, Some(runtime))
+}
+
+fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
+    let _socket_lock = SocketLock::acquire(path, runtime)?;
     if ipc::connect(path).is_ok() {
         return Err(std::io::Error::other(format!(
             "a daemon is already listening at {} — pick a different name (remuda -s <name>) \
@@ -181,10 +261,12 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     }
     // Before the bind: once a client can see the socket, a signal must find
     // the handler, not the default action. Signals queue in the pair until
-    // `stop_on_signals` below starts reading.
+    // `serve_unix` polls this together with the listener.
     #[cfg(unix)]
     let signals = catch_signals()?;
     let listener: Listener = ipc::listen(path)?;
+    #[cfg(unix)]
+    let listener = prepare_unix_listener(listener, path)?;
     let anti_entropy = Arc::new(AntiEntropyTask::start()?);
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
 
@@ -217,33 +299,41 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     }
     spawn_ticker(image.clone(), Arc::clone(&counters), Arc::clone(&registry));
     #[cfg(unix)]
-    stop_on_signals(
-        signals,
-        image.clone(),
-        Arc::clone(&socket_owner),
-        anti_entropy.clone(),
-    );
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        let registry = Arc::clone(&registry);
-        let image = image.clone();
-        let counters = Arc::clone(&counters);
-        let socket_owner = Arc::clone(&socket_owner);
-        let anti_entropy = anti_entropy.clone();
-        std::thread::spawn(move || {
-            let _ = handle(
-                stream,
-                &registry,
-                &image,
-                &counters,
-                socket_owner,
-                anti_entropy,
-            );
-        });
+    {
+        serve_unix(
+            listener,
+            (path, runtime),
+            signals,
+            registry,
+            image,
+            counters,
+            (socket_owner, anti_entropy),
+        );
     }
-    anti_entropy.stop_and_join();
-    socket_owner.cleanup();
-    Ok(())
+    #[cfg(windows)]
+    {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let registry = Arc::clone(&registry);
+            let image = image.clone();
+            let counters = Arc::clone(&counters);
+            let socket_owner = Arc::clone(&socket_owner);
+            let anti_entropy = anti_entropy.clone();
+            std::thread::spawn(move || {
+                let _ = handle(
+                    stream,
+                    &registry,
+                    &image,
+                    &counters,
+                    socket_owner,
+                    anti_entropy,
+                );
+            });
+        }
+        anti_entropy.stop_and_join();
+        socket_owner.cleanup();
+        Ok(())
+    }
 }
 
 struct AntiEntropyTask {
@@ -330,30 +420,53 @@ struct SocketLock {
     _file: std::fs::File,
 }
 
+#[cfg(unix)]
+const SOCKET_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(unix)]
+const SOCKET_LOCK_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
+
 impl SocketLock {
-    fn acquire(socket: &Path) -> std::io::Result<Self> {
+    fn acquire(socket: &Path, runtime: Option<&Path>) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-            let parent = socket.parent().unwrap_or_else(|| Path::new("."));
-            std::fs::create_dir_all(parent)?;
+            prepare_socket_path(socket, runtime).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("prepare socket path {}: {error}", socket.display()),
+                )
+            })?;
             let mut lock_name = socket.as_os_str().to_os_string();
             lock_name.push(".lock");
             let lock_path = PathBuf::from(lock_name);
-            let file = std::fs::OpenOptions::new()
+            let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .read(true)
                 .write(true)
                 .mode(0o600)
                 .open(&lock_path)?;
-            std::fs::set_permissions(lock_path, std::fs::Permissions::from_mode(0o600))?;
+            std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))?;
+            let started = std::time::Instant::now();
+            let deadline = started + SOCKET_LOCK_WAIT;
+            let mut announced = false;
             loop {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        socket_lock_timeout_message(&lock_path, socket_lock_holder(&lock_path)),
+                    ));
+                }
                 let result =
                     unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
                 if result == 0 {
+                    use std::io::{Seek, SeekFrom};
+                    file.set_len(0)?;
+                    file.seek(SeekFrom::Start(0))?;
+                    writeln!(file, "{}", std::process::id())?;
+                    file.flush()?;
                     break;
                 }
                 let error = std::io::Error::last_os_error();
@@ -364,8 +477,19 @@ impl SocketLock {
                             "Remuda daemon is already listening",
                         ));
                     }
+                    let holder = socket_lock_holder(&lock_path);
+                    let elapsed = started.elapsed();
+                    if !announced && elapsed >= SOCKET_LOCK_NOTICE_AFTER {
+                        eprintln!(
+                            "remuda: waiting for the socket lock held by another remuda daemon (pid {})",
+                            holder.map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
+                        );
+                        announced = true;
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(10));
-                } else if error.kind() != std::io::ErrorKind::Interrupted {
+                } else if error.kind() == std::io::ErrorKind::Interrupted {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                } else {
                     return Err(error);
                 }
             }
@@ -374,8 +498,192 @@ impl SocketLock {
         #[cfg(windows)]
         {
             let _ = socket;
+            let _ = runtime;
             Ok(Self {})
         }
+    }
+}
+
+#[cfg(unix)]
+pub fn prepare_socket_path(socket: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
+    let socket = normalize_socket_path(socket)?;
+    let parent = socket.parent().unwrap_or_else(|| Path::new("."));
+    let Some(runtime) = runtime else {
+        std::fs::create_dir_all(parent)?;
+        return validate_socket_directory(parent, unsafe { libc::geteuid() }, false);
+    };
+
+    let runtime = normalize_socket_path(runtime)?;
+    let managed = runtime.join("remuda");
+    if parent == managed || parent.starts_with(&managed) {
+        prepare_runtime_base(&runtime)?;
+        prepare_managed_socket_directory(&managed)?;
+        if parent != managed {
+            // Nested -s paths live below our private runtime directory, but
+            // their own mode remains user controlled.
+            std::fs::create_dir_all(parent)?;
+            validate_socket_directory(parent, unsafe { libc::geteuid() }, false)?;
+        }
+    } else {
+        // Absolute and escaping -s paths are user-owned locations. Never
+        // tighten them; inspect before the client creates the startup log.
+        std::fs::create_dir_all(parent)?;
+        validate_socket_directory(parent, unsafe { libc::geteuid() }, false)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_runtime_base(path: &Path) -> std::io::Result<()> {
+    let path = normalize_socket_path(path)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    create_private_directory_if_absent(&path)?;
+    validate_socket_directory(&path, unsafe { libc::geteuid() }, false)
+}
+
+#[cfg(unix)]
+fn prepare_managed_socket_directory(path: &Path) -> std::io::Result<()> {
+    let path = normalize_socket_path(path)?;
+    create_private_directory_if_absent(&path)?;
+    validate_socket_directory(&path, unsafe { libc::geteuid() }, true)
+}
+
+/// Remove path spellings that can hide the directory actually opened by the
+/// kernel. Parent traversal is rejected so validation cannot be bypassed by
+/// comparing a path before resolving `..`.
+#[cfg(unix)]
+fn normalize_socket_path(path: &Path) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("socket path {} contains '..'; refusing", path.display()),
+                ));
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    Ok(normalized)
+}
+
+#[cfg(unix)]
+fn create_private_directory_if_absent(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => {
+            // Umask can only remove permissions. Make the owner mode exact
+            // before any contents are created; the new leaf is not traversable
+            // by other users during this brief adjustment.
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn validate_socket_directory(
+    path: &Path,
+    expected_uid: libc::uid_t,
+    tighten: bool,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let path = normalize_socket_path(path)?;
+
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("socket directory {} is a symlink; refusing", path.display()),
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    let directory = options.open(&path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("socket parent {} is not a directory", path.display()),
+        ));
+    }
+    if metadata.uid() != expected_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "socket directory {} is owned by uid {}, expected {}; choose a private REMUDA_RUNTIME_DIR",
+                path.display(),
+                metadata.uid(),
+                expected_uid
+            ),
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "socket directory {} is group- or world-writable (mode {mode:04o}); remove those write permissions before starting remuda",
+                path.display()
+            ),
+        ));
+    }
+    if tighten && mode != 0o700 {
+        // Tighten through the opened directory handle; this also removes any
+        // special permission bits and avoids following a replacement symlink.
+        directory
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("tighten socket directory {}: {error}", path.display()),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn prepare_socket_path(_socket: &Path, _runtime: Option<&Path>) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn socket_lock_holder(lock_path: &Path) -> Option<u32> {
+    std::fs::read_to_string(lock_path).ok()?.trim().parse().ok()
+}
+
+#[cfg(unix)]
+fn socket_lock_timeout_message(lock_path: &Path, holder: Option<u32>) -> String {
+    match holder {
+        Some(pid) => format!(
+            "timed out waiting for the socket lock held by remuda daemon pid {pid}; \
+             if it is stopped, run `kill -CONT {pid}` to resume it; if it is stuck, \
+             verify it is this daemon, run `kill {pid}`, then retry"
+        ),
+        None => format!(
+            "timed out waiting for the socket lock (holder pid unavailable; inspect {})",
+            lock_path.display()
+        ),
     }
 }
 
@@ -384,7 +692,7 @@ impl SocketLock {
 struct SocketOwnership {
     path: PathBuf,
     #[cfg(unix)]
-    identity: (u64, u64),
+    identity: Mutex<(u64, u64)>,
 }
 
 impl SocketOwnership {
@@ -395,7 +703,7 @@ impl SocketOwnership {
             let metadata = std::fs::symlink_metadata(path)?;
             Ok(Self {
                 path: path.to_path_buf(),
-                identity: (metadata.dev(), metadata.ino()),
+                identity: Mutex::new((metadata.dev(), metadata.ino())),
             })
         }
         #[cfg(windows)]
@@ -412,12 +720,37 @@ impl SocketOwnership {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            let Ok(identity) = self.identity.lock() else {
+                return;
+            };
             if std::fs::symlink_metadata(&self.path)
-                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.identity)
+                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == *identity)
             {
                 let _ = std::fs::remove_file(&self.path);
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn refresh(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(&self.path)?;
+        let mut identity = self
+            .identity
+            .lock()
+            .map_err(|_| std::io::Error::other("socket ownership lock poisoned"))?;
+        *identity = (metadata.dev(), metadata.ino());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn owns_path(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(identity) = self.identity.lock() else {
+            return false;
+        };
+        std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == *identity)
     }
 }
 
@@ -436,28 +769,63 @@ const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 /// go through: `Registry::reap()` hands its answer to whoever calls first, so
 /// notifying anywhere else would race it and silently drop the event.
 pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String> {
-    let dead = registry.reap();
-    for name in &dead {
-        notify_exited(image, name);
+    let dead = registry.reap_with_exit_info();
+    for (name, id, reason, exit_info) in &dead {
+        notify_exited(image, name, id, reason, exit_info.as_ref());
     }
-    dead
+    dead.into_iter().map(|(name, _, _, _)| name).collect()
 }
 
 fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<()>> {
+    let session = registry.get(name)?;
     let closed = registry.close(name)?;
     if let Ok(true) = closed {
-        notify_exited(image, name);
+        // If the reaper removed it first, close returns false and the reaper
+        // owns the single notification using the marker's `closed` reason.
+        notify_exited(
+            image,
+            name,
+            session.id(),
+            "closed",
+            session.exit_info().as_ref(),
+        );
     }
     Some(closed.map(drop))
 }
 
 /// `close` stops tracking a session itself, so the reaper never sees it die:
 /// whichever of the two removes the entry fires the one `session_exited`.
-fn notify_exited(image: &Image, name: &str) {
+fn notify_exited(
+    image: &Image,
+    name: &str,
+    id: &str,
+    reason: &str,
+    exit_info: Option<&remuda_core::agent::ExitInfo>,
+) {
+    image.wait_session_output_monitor(id);
+    let mut fields = vec![format!("reason={}", crate::mcp::lua_string(reason))];
+    if let Some(exit_info) = exit_info {
+        if let Some(exit_code) = exit_info.exit_code {
+            fields.push(format!("exit_code={exit_code}"));
+        }
+        if reason != "closed" {
+            if let Some(signal) = exit_info.signal {
+                fields.push(format!("signal={signal}"));
+            }
+            if let Some(signal_name) = &exit_info.signal_name {
+                fields.push(format!(
+                    "signal_name={}",
+                    crate::mcp::lua_string(signal_name)
+                ));
+            }
+        }
+    }
+    let details = format!("{{{}}}", fields.join(", "));
     let _ = image.submit(
         &format!(
-            "remuda.emit('session_exited', {})",
-            crate::mcp::lua_string(name)
+            "remuda.emit('session_exited', {}, {})",
+            crate::mcp::lua_string(name),
+            details,
         ),
         None,
     );
@@ -493,13 +861,174 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
         Request::List => counters.counter("request_list").record_hit(),
         Request::Eval { .. } => counters.counter("request_eval").record_hit(),
         Request::CaptureStyled { .. } => counters.counter("request_capture_styled").record_hit(),
+        Request::Sync { .. } => counters.counter("request_sync").record_hit(),
         _ => {}
     }
 }
 
-/// SIGTERM/SIGINT: log, reap like `Shutdown`, remove the socket, exit 0. SIGHUP: ignored
-/// when detached (#106), else the same. Caught, never SIG_IGN (pty children would inherit
-/// it); the handler only writes the signal number to a socketpair.
+#[cfg(unix)]
+fn serve_unix(
+    mut listener: Listener,
+    socket: (&Path, Option<&Path>),
+    mut signals: std::os::unix::net::UnixStream,
+    registry: Arc<Registry>,
+    image: Image,
+    counters: Arc<crate::tick::Counters>,
+    lifecycle: (Arc<SocketOwnership>, Arc<AntiEntropyTask>),
+) -> ! {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd;
+
+    let (socket_owner, anti_entropy) = lifecycle;
+    let detached = unsafe { libc::getsid(0) == libc::getpid() };
+    let mut signal_bytes = [0u8; 1];
+    'poll_loop: loop {
+        let mut watched = [
+            libc::pollfd {
+                fd: unix_listener_fd(&listener),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: signals.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(watched.as_mut_ptr(), watched.len() as _, -1) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                eprintln!("remuda daemon: poll failed: {error}");
+            }
+            continue;
+        }
+
+        if watched[1].revents & libc::POLLIN != 0 {
+            match signals.read(&mut signal_bytes) {
+                Ok(0) => continue,
+                Ok(count) => {
+                    for byte in &signal_bytes[..count] {
+                        let signal = libc::c_int::from(*byte);
+                        if signal == libc::SIGUSR1 {
+                            rebind_after_sigusr1(&mut listener, socket.0, socket.1, &socket_owner);
+                            continue 'poll_loop;
+                        }
+                        let name = match signal {
+                            libc::SIGTERM => "SIGTERM",
+                            libc::SIGINT => "SIGINT",
+                            _ if detached => {
+                                let _ = writeln!(
+                                    std::io::stderr(),
+                                    "remuda daemon: SIGHUP ignored — use `remuda stop` to stop it"
+                                );
+                                continue;
+                            }
+                            _ => "SIGHUP",
+                        };
+                        let _ = writeln!(std::io::stderr(), "remuda daemon: {name}, shutting down");
+                        reap_processes_before_exit(&image);
+                        anti_entropy.stop_and_join();
+                        socket_owner.cleanup();
+                        std::process::exit(0);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    eprintln!("remuda daemon: signal socket read failed: {error}");
+                    continue;
+                }
+            }
+        }
+
+        if watched[0].revents & libc::POLLIN != 0 {
+            match listener.accept() {
+                Ok(stream) => {
+                    if let Err(error) = stream.set_nonblocking(false) {
+                        eprintln!("remuda daemon: could not restore blocking client mode: {error}");
+                        continue;
+                    }
+                    let registry = Arc::clone(&registry);
+                    let image = image.clone();
+                    let counters = Arc::clone(&counters);
+                    let socket_owner = Arc::clone(&socket_owner);
+                    let anti_entropy = Arc::clone(&anti_entropy);
+                    std::thread::spawn(move || {
+                        let _ = handle(
+                            stream,
+                            &registry,
+                            &image,
+                            &counters,
+                            socket_owner,
+                            anti_entropy,
+                        );
+                    });
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                Err(error) => eprintln!("remuda daemon: accept failed: {error}"),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn prepare_unix_listener(mut listener: Listener, path: &Path) -> std::io::Result<Listener> {
+    use std::os::unix::fs::PermissionsExt;
+
+    listener.do_not_reclaim_name_on_drop();
+    listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(listener)
+}
+
+#[cfg(unix)]
+fn unix_listener_fd(listener: &Listener) -> std::os::fd::RawFd {
+    use std::os::fd::AsRawFd;
+    match listener {
+        interprocess::local_socket::Listener::UdSocket(listener) => listener.inner().as_raw_fd(),
+    }
+}
+
+#[cfg(unix)]
+fn rebind_after_sigusr1(
+    listener: &mut Listener,
+    path: &Path,
+    runtime: Option<&Path>,
+    socket_owner: &SocketOwnership,
+) {
+    if socket_owner.owns_path() {
+        return;
+    }
+    if let Err(error) = prepare_socket_path(path, runtime) {
+        eprintln!(
+            "remuda daemon: could not validate socket directory {} before rebind: {error}",
+            path.display()
+        );
+        return;
+    }
+    match ipc::listen(path) {
+        Ok(replacement) => match prepare_unix_listener(replacement, path) {
+            Ok(replacement) => {
+                let refreshed = socket_owner.refresh();
+                *listener = replacement;
+                if let Err(error) = refreshed {
+                    eprintln!("remuda daemon: could not record rebound socket: {error}");
+                }
+            }
+            Err(error) => eprintln!("remuda daemon: could not prepare rebound socket: {error}"),
+        },
+        Err(error) => eprintln!("remuda daemon: could not rebind socket: {error}"),
+    }
+}
+
+/// The handler writes signal numbers to a socketpair polled with the listener.
+/// Catching signals preserves default dispositions in pty children.
 #[cfg(unix)]
 fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::os::fd::AsRawFd;
@@ -519,7 +1048,7 @@ fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
     WRITE_FD.store(writer.as_raw_fd(), Ordering::Relaxed);
     std::mem::forget(writer);
-    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGUSR1] {
         // SAFETY: installs a handler that only calls write(2).
         unsafe {
             libc::signal(
@@ -531,51 +1060,11 @@ fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     Ok(reader)
 }
 
-/// The other half of `catch_signals`: act on what the handler wrote.
-#[cfg(unix)]
-fn stop_on_signals(
-    mut reader: std::os::unix::net::UnixStream,
-    image: Image,
-    socket_owner: Arc<SocketOwnership>,
-    anti_entropy: Arc<AntiEntropyTask>,
-) {
-    use std::io::Read;
-    // Auto-started (#107), the daemon leads its own session and a HUP is a
-    // stray one. Run by hand in a terminal it does not, and a HUP means that
-    // terminal really hung up — stop in order rather than write to a dead tty.
-    // SAFETY: getsid/getpid only read this process's ids.
-    let detached = unsafe { libc::getsid(0) == libc::getpid() };
-    std::thread::spawn(move || {
-        use std::io::Write;
-        let mut byte = [0u8];
-        while reader.read_exact(&mut byte).is_ok() {
-            // `writeln!`, not `eprintln!`: stderr may be a dead tty (EIO), and
-            // a panic here would leave every later signal unhandled.
-            let name = match libc::c_int::from(byte[0]) {
-                libc::SIGTERM => "SIGTERM",
-                libc::SIGINT => "SIGINT",
-                _ if detached => {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "remuda daemon: SIGHUP ignored — use `remuda stop` to stop it"
-                    );
-                    continue;
-                }
-                _ => "SIGHUP",
-            };
-            let _ = writeln!(std::io::stderr(), "remuda daemon: {name}, shutting down");
-            reap_processes_before_exit(&image);
-            anti_entropy.stop_and_join();
-            socket_owner.cleanup();
-            std::process::exit(0);
-        }
-    });
-}
-
 /// Best-effort group-wide reap before a clean `Request::Shutdown` exits —
 /// covers a grandchild PDEATHSIG alone can't reach (see child_guard.rs).
 /// Only THIS death mode runs any code at all; SIGTERM/SIGKILL run none.
 fn reap_processes_before_exit(image: &Image) {
+    image.shutdown_pending_replies();
     let _ = image.eval(
         "for _, id in ipairs(remuda.processes()) do remuda._process_killpg(id) end",
         Some("@remuda/shutdown-reap"),
@@ -632,11 +1121,27 @@ fn handle(
     };
 
     record_request(counters, &request);
+    handle_request(
+        stream,
+        reader,
+        registry,
+        image,
+        socket_owner,
+        anti_entropy,
+        request,
+    )
+}
 
+fn handle_request(
+    stream: Stream,
+    reader: BufReader<Stream>,
+    registry: &Registry,
+    image: &Image,
+    socket_owner: Arc<SocketOwnership>,
+    anti_entropy: Arc<AntiEntropyTask>,
+    request: Request,
+) -> std::io::Result<()> {
     match request {
-        // Where a session that ended stops being listed. Here rather than on a
-        // timer because listing is the only moment the answer is looked at, and
-        // a reaper thread would need a clock this layer is not given.
         Request::List => {
             if !keep_exited() {
                 reap_and_notify(registry, image);
@@ -646,17 +1151,10 @@ fn handle(
 
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
 
-        Request::ClusterRegistrySync { .. } => reply(
-            &stream,
-            &Response::error("remote front refuses ClusterRegistrySync"),
-        ),
-        Request::ClusterRegistryUpdate { .. } => reply(
-            &stream,
-            &Response::error("remote front refuses ClusterRegistryUpdate"),
-        ),
+        Request::ClusterRegistrySync { .. } | Request::ClusterRegistryUpdate { .. } => {
+            refuse_cluster_registry(&stream)
+        }
 
-        // Answer before going. A client left guessing from a hung-up socket
-        // cannot tell "it stopped" from "it never heard me".
         request @ Request::Shutdown { .. } => {
             handle_shutdown(stream, registry, image, socket_owner, anti_entropy, request)
         }
@@ -667,7 +1165,18 @@ fn handle(
             size,
             cwd,
             env,
-        } => handle_new(stream, registry, name, command, size, cwd, env),
+        } => handle_new(
+            stream,
+            registry,
+            image,
+            NewSessionRequest {
+                name,
+                command,
+                size,
+                cwd,
+                env,
+            },
+        ),
 
         Request::SendLine { name, text } => {
             respond(&stream, &name, registry.send_line(&name, &text), |()| {
@@ -720,35 +1229,229 @@ fn handle(
             capture_styled(&stream, registry, &name, scrollback)
         }
 
+        Request::Sync {
+            name,
+            instance_id,
+            since,
+            timeout_ms,
+        } => handle_sync(&stream, registry, &name, instance_id, since, timeout_ms),
+
         Request::MouseState { name } => mouse_state(&stream, registry, &name),
 
         Request::Attach { name } => attach(stream, reader, registry, &name, false),
         Request::AttachTracked { name } => attach(stream, reader, registry, &name, true),
         Request::AttachStatus { name, generation } => {
-            let response = registry.get(&name).map_or_else(
-                || Response::error(format!("no such session: {name}")),
-                |session| Response::AttachStatus {
-                    taken_over: session.was_attachment_taken_over(generation),
-                },
-            );
-            reply(&stream, &response)
+            attach_status(&stream, registry, &name, generation)
         }
 
-        Request::Close { name } => respond(&stream, &name, close(registry, image, &name), |()| {
-            Response::Ok
-        }),
+        Request::Close {
+            name,
+            instance_id,
+            confirm,
+        } => handle_close(&stream, registry, image, &name, instance_id, confirm),
 
         Request::ListDir { path: dir } => reply(&stream, &list_dir(&dir)),
         Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
         Request::RemoveDirAll { path: dir } => reply(&stream, &remove_dir_all(&dir)),
 
-        Request::Eval { code, name } => match image.eval(&code, name.as_deref()) {
-            Ok(value) => reply(&stream, &Response::Value(value)),
-            // Lua's own message, which already carries the line and a
-            // traceback — the same treatment `remuda run` gives a script file.
-            Err(e) => reply(&stream, &Response::error(e)),
-        },
+        Request::Eval { code, name } => handle_eval(stream, reader, image, &code, name.as_deref()),
     }
+}
+
+fn handle_close(
+    stream: &Stream,
+    registry: &Registry,
+    image: &Image,
+    name: &str,
+    instance_id: Option<String>,
+    confirm: Option<bool>,
+) -> std::io::Result<()> {
+    let result = match (instance_id, confirm) {
+        (None, None) => close(registry, image, name),
+        (Some(instance_id), Some(true)) => close_instance(registry, image, name, &instance_id),
+        _ => Some(Err(remuda_core::agent::AgentError::Io(
+            "confirmed close requires an instance id and confirmation".into(),
+        ))),
+    };
+    respond(stream, name, result, |()| Response::Ok)
+}
+
+fn close_instance(
+    registry: &Registry,
+    image: &Image,
+    name: &str,
+    instance_id: &str,
+) -> Option<AgentResult<()>> {
+    let session = registry.get(name)?;
+    let closed = registry.close_instance(name, instance_id)?;
+    if let Ok(true) = closed {
+        notify_exited(
+            image,
+            name,
+            session.id(),
+            "closed",
+            session.exit_info().as_ref(),
+        );
+    }
+    Some(closed.map(drop))
+}
+
+fn handle_eval(
+    stream: Stream,
+    reader: BufReader<Stream>,
+    image: &Image,
+    code: &str,
+    name: Option<&str>,
+) -> std::io::Result<()> {
+    match image.eval_request(code, name) {
+        Ok(value) => match image.pending_replies().pending_id(&value) {
+            Some(id) => deferred_reply(stream, reader, image, id),
+            None if value.len() > crate::reply_limit::MAX_REPLY_BYTES => reply(
+                &stream,
+                &Response::error(format!(
+                    "synchronous reply exceeds the {} MiB output limit ({} bytes)",
+                    crate::reply_limit::MAX_REPLY_BYTES / (1024 * 1024),
+                    value.len()
+                )),
+            ),
+            None => reply(&stream, &Response::Value(value)),
+        },
+        // Lua's own message, which already carries the line and a traceback —
+        // the same treatment `remuda run` gives a script file.
+        Err(error) => reply(&stream, &Response::error(error)),
+    }
+}
+
+fn deferred_reply(
+    stream: Stream,
+    reader: BufReader<Stream>,
+    image: &Image,
+    id: u64,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    let mut reader = reader;
+    #[cfg(unix)]
+    if let Err(error) = stream.set_nonblocking(true) {
+        image.pending_replies().abandon(id);
+        return Err(error);
+    }
+    let result = image.pending_replies().wait(id, || {
+        #[cfg(unix)]
+        {
+            let mut extra = [0u8; 1];
+            match reader.read(&mut extra) {
+                Ok(0) => true,
+                Ok(_) => false,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => false,
+                Err(_) => true,
+            }
+        }
+        #[cfg(windows)]
+        {
+            crate::ipc::peer_disconnected(reader.get_ref()).unwrap_or(true)
+        }
+    });
+    #[cfg(unix)]
+    let _ = stream.set_nonblocking(false);
+    match result {
+        Ok(result) => {
+            let response = match result.completion {
+                Ok(crate::pending::Completion::Result(result)) => Some(Response::CommandResult {
+                    exit_code: result.exit_code,
+                    stdout_base64: crate::cluster::encoding::encode_base64(&result.stdout),
+                    stderr_base64: crate::cluster::encoding::encode_base64(&result.stderr),
+                }),
+                Ok(crate::pending::Completion::Failure(error)) => Some(Response::error(error)),
+                Err(error) if error == "client disconnected" => None,
+                Err(error) => Some(Response::error(error)),
+            };
+            let sent = response.map_or(Ok(()), |response| reply(&stream, &response));
+            if let Some(ack) = result.shutdown_ack {
+                let _ = ack.send(());
+            }
+            sent
+        }
+        Err(error) => reply(&stream, &Response::error(error)),
+    }
+}
+
+fn handle_sync(
+    stream: &Stream,
+    registry: &Registry,
+    name: &str,
+    expected_instance: Option<String>,
+    since: u64,
+    timeout_ms: u64,
+) -> std::io::Result<()> {
+    let Some(session) = registry.get(name) else {
+        return reply(stream, &Response::error(format!("no such session: {name}")));
+    };
+    if expected_instance
+        .as_deref()
+        .is_some_and(|expected| expected != session.instance_id())
+    {
+        return reply(stream, &Response::WrongInstance);
+    }
+    let _permit = match acquire_sync_permit() {
+        Ok(permit) => permit,
+        Err(response) => return reply(stream, &response),
+    };
+    let result = remuda_core::sync::wait(&session, since, timeout_ms);
+    if let Some(expected) = expected_instance.as_deref() {
+        if registry
+            .get(name)
+            .is_none_or(|current| current.instance_id() != expected)
+        {
+            return reply(stream, &Response::WrongInstance);
+        }
+    }
+    let versioned = match result {
+        Ok(snapshot) => snapshot,
+        Err(error) => return reply(stream, &Response::error(error)),
+    };
+    let rows = versioned
+        .snapshot
+        .cells
+        .iter()
+        .map(|row| collapse_runs(row))
+        .collect();
+    reply(
+        stream,
+        &Response::Sync {
+            instance_id: session.instance_id().to_owned(),
+            output_version: versioned.output_version.unwrap_or(0),
+            snapshot: StyledScreen {
+                rows,
+                wrapped: versioned.snapshot.wrapped,
+                scrollback_len: versioned.snapshot.scrollback_len,
+                scrollback_total: versioned.snapshot.scrollback_total,
+                cursor: versioned.snapshot.cursor,
+            },
+        },
+    )
+}
+
+fn refuse_cluster_registry(stream: &Stream) -> std::io::Result<()> {
+    reply(
+        stream,
+        &Response::error("remote front refuses cluster registry operations"),
+    )
+}
+
+fn attach_status(
+    stream: &Stream,
+    registry: &Registry,
+    name: &str,
+    generation: u64,
+) -> std::io::Result<()> {
+    let response = registry.get(name).map_or_else(
+        || Response::error(format!("no such session: {name}")),
+        |session| Response::AttachStatus {
+            taken_over: session.was_attachment_taken_over(generation),
+        },
+    );
+    reply(stream, &response)
 }
 
 fn handle_shutdown(
@@ -808,7 +1511,12 @@ fn handle_shutdown(
             ),
         }
     }
+    image.shutdown_pending_replies();
     reply(&stream, &Response::Ok)?;
+    // A session can request this shutdown as soon as its process starts. Let
+    // every already-running New handler flush its response before the daemon
+    // exits and tears down their client connections.
+    wait_for_new_requests();
     reap_processes_before_exit(image);
     anti_entropy.stop_and_join();
     socket_owner.cleanup();
@@ -824,15 +1532,28 @@ fn refuse_hosted_shutdown(stream: &Stream, identity: &str) -> std::io::Result<()
     )
 }
 
-fn handle_new(
-    stream: Stream,
-    registry: &Registry,
+struct NewSessionRequest {
     name: Option<String>,
     command: Vec<String>,
     size: Size,
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
+}
+
+fn handle_new(
+    stream: Stream,
+    registry: &Registry,
+    image: &Image,
+    request: NewSessionRequest,
 ) -> std::io::Result<()> {
+    let _in_flight = NewRequestInFlight::start();
+    let NewSessionRequest {
+        name,
+        command,
+        size,
+        cwd,
+        env,
+    } = request;
     let name = match name {
         Some(given) => given,
         None => registry.unique_name(&remuda_core::registry::slug(
@@ -856,11 +1577,79 @@ fn handle_new(
         Some(&session_env),
     ) {
         Err(e) => reply(&stream, &Response::error(e)),
-        Ok(session) => match registry.register(session) {
-            Ok(_) => reply(&stream, &Response::Value(name)),
-            Err(_) => reply(&stream, &Response::error(format!("name taken: {name}"))),
-        },
+        Ok(session) => {
+            let session_id = session.id().to_string();
+            let notifier = image.session_output_notifier(&name, &session_id);
+            match registry.register(session) {
+                Ok(session) => {
+                    if let Some(output) = session.subscribe_output_wakeup() {
+                        monitor_session_output(output, notifier);
+                    } else {
+                        notifier.flush(session.output_version().unwrap_or(0));
+                        notifier.finish_monitor();
+                    }
+                    reply(&stream, &Response::Value(name))
+                }
+                Err(_) => {
+                    image.discard_session_output_monitor(&session_id, &notifier);
+                    reply(&stream, &Response::error(format!("name taken: {name}")))
+                }
+            }
+        }
     }
+}
+
+/// Wait for PTY output, then submit one coalesced wake into the Lua image.
+/// The deadline starts with the first chunk so continuous output cannot starve
+/// a notification by continually restarting a quiet-period timer.
+fn monitor_session_output(
+    output: remuda_core::agent::OutputWakeup,
+    notifier: crate::image::SessionOutputNotifier,
+) {
+    const COALESCE: std::time::Duration = std::time::Duration::from_millis(50);
+    std::thread::spawn(move || {
+        // The PTY reader starts with the child, before `handle_new` can
+        // register the session and attach this monitor. Catch any output that
+        // arrived in that gap; output racing this snapshot will also leave a
+        // wake queued on `output`.
+        let mut last_notified = output.version_after_wake();
+        if last_notified > 0 {
+            notifier.notify(last_notified);
+        }
+        loop {
+            if output.recv().is_err() {
+                notifier.flush(output.version_after_wake());
+                notifier.finish_monitor();
+                return;
+            }
+            let deadline = std::time::Instant::now() + COALESCE;
+            let mut disconnected = false;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match output.recv_timeout(remaining) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            let version = output.version_after_wake();
+            if disconnected {
+                notifier.flush(version);
+                notifier.finish_monitor();
+                return;
+            }
+            if version > last_notified {
+                notifier.notify(version);
+                last_notified = version;
+            }
+        }
+    });
 }
 
 fn read_request(
@@ -907,6 +1696,7 @@ fn input(
         Some(Err(remuda_core::input::InputError::RateLimited)) => {
             reply(stream, &Response::RateLimited)
         }
+        Some(Err(remuda_core::input::InputError::Busy)) => reply(stream, &Response::Busy),
         Some(Err(error)) => reply(stream, &Response::error(error.to_string())),
         Some(Ok(remuda_core::input::InputOutcome::Ack { duplicate })) => {
             reply(stream, &Response::Ack { duplicate })
@@ -943,6 +1733,10 @@ fn respond<T>(
 ) -> std::io::Result<()> {
     match result {
         None => reply(stream, &Response::error(format!("no such session: {name}"))),
+        Some(Err(remuda_core::AgentError::Busy)) => reply(stream, &Response::Busy),
+        Some(Err(remuda_core::AgentError::WriteTimeout { .. })) => {
+            reply(stream, &Response::WriteTimeout)
+        }
         Some(Err(e)) => reply(stream, &Response::error(e)),
         Some(Ok(v)) => reply(stream, &ok(v)),
     }
@@ -1068,6 +1862,8 @@ fn attach(
     // already gone. The core got "a human is attached" forever.
     let done = std::sync::atomic::AtomicBool::new(false);
     let done = &done;
+    let input_failed = std::sync::atomic::AtomicBool::new(false);
+    let input_failed = &input_failed;
     // Checked before every read of the key pump below, not just its first —
     // a cancel that arrives before a read is pending is a documented no-op
     // on Windows, so the flag (not the cancel alone) is what actually stops
@@ -1081,12 +1877,37 @@ fn attach(
         let held = &held;
         let key_thread = scope.spawn(move || {
             let mut buf = [0u8; 4096];
-            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            'keys: while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if held.write_raw(&buf[..n]).is_err() {
-                            break;
+                        // Preserve this exact read buffer until the session
+                        // or fails. Busy means no write was queued; every other
+                        // error may follow a partial write and ends this pump.
+                        match forward_attach_input(
+                            || {
+                                held.write_raw_while(&buf[..n], &|| {
+                                    stop.load(std::sync::atomic::Ordering::SeqCst)
+                                        || held.is_displaced()
+                                })
+                            },
+                            || {
+                                stop.load(std::sync::atomic::Ordering::SeqCst)
+                                    || held.is_displaced()
+                            },
+                        ) {
+                            Ok(()) => {}
+                            Err(remuda_core::AgentError::Exited) => break 'keys,
+                            Err(remuda_core::AgentError::Attached)
+                                if stop.load(std::sync::atomic::Ordering::SeqCst)
+                                    || held.is_displaced() =>
+                            {
+                                break 'keys;
+                            }
+                            Err(_) => {
+                                input_failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                                break 'keys;
+                            }
                         }
                     }
                 }
@@ -1121,6 +1942,9 @@ fn attach(
             let _ = out.write_all(b"\r\n[remuda] attached elsewhere, detached\r\n");
             let _ = out.flush();
         }
+        if input_failed.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = report_attach_input_failure(&mut out);
+        }
         done.store(true, std::sync::atomic::Ordering::SeqCst);
         // Unblocks the key thread's read so the scope can close.
         ipc::stop_reader(&stream, stop, || key_thread.is_finished());
@@ -1128,10 +1952,75 @@ fn attach(
     Ok(())
 }
 
+const ATTACH_INPUT_FAILURE_NOTICE: &str =
+    "\r\n[remuda] input stopped after a PTY write error; some bytes may have been delivered partially or lost\r\n";
+
+fn report_attach_input_failure(output: &mut impl Write) -> std::io::Result<()> {
+    output.write_all(ATTACH_INPUT_FAILURE_NOTICE.as_bytes())?;
+    output.flush()
+}
+
+fn forward_attach_input(
+    mut write: impl FnMut() -> AgentResult<()>,
+    mut stopping: impl FnMut() -> bool,
+) -> AgentResult<()> {
+    loop {
+        if stopping() {
+            return Err(remuda_core::agent::AgentError::Attached);
+        }
+        match write() {
+            Err(remuda_core::agent::AgentError::Busy) => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+}
+
+struct LimitedReplyWriter<'a> {
+    bytes: &'a mut Vec<u8>,
+    limit: usize,
+}
+
+impl std::io::Write for LimitedReplyWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.bytes.len().saturating_add(bytes.len()) > self.limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "serialized daemon reply exceeds the wire limit",
+            ));
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
-    let mut line = serde_json::to_string(response)?;
-    line.push('\n');
-    stream.write_all(line.as_bytes())?;
+    let wire_limit = crate::reply_limit::max_reply_wire_bytes();
+    let mut line = Vec::with_capacity(1024);
+    let serialized = serde_json::to_writer(
+        LimitedReplyWriter {
+            bytes: &mut line,
+            limit: wire_limit - 1,
+        },
+        response,
+    );
+    if serialized.is_err() {
+        line.clear();
+        serde_json::to_writer(
+            LimitedReplyWriter {
+                bytes: &mut line,
+                limit: wire_limit - 1,
+            },
+            &Response::error("daemon reply exceeds the maximum serialized size"),
+        )?;
+    }
+    line.push(b'\n');
+    stream.write_all(&line)?;
     stream.flush()
 }
 
@@ -1202,6 +2091,127 @@ mod tests {
             runtime_base_for(false, None, Path::new("/termux/tmp"), "jeongsoo"),
             Path::new("/tmp/remuda-jeongsoo")
         );
+    }
+
+    #[cfg(unix)]
+    fn socket_test_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "remuda-socket-policy-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_socket_parent_is_validated_without_changing_its_mode() {
+        use super::prepare_socket_path;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = socket_test_dir("custom-parent");
+        let runtime = root.join("runtime");
+        let custom = root.join("chosen");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::set_permissions(&custom, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let before = std::fs::metadata(&custom).unwrap().mode() & 0o7777;
+
+        prepare_socket_path(&custom.join("X.sock"), Some(&runtime)).unwrap();
+
+        assert_eq!(std::fs::metadata(&custom).unwrap().mode() & 0o7777, before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_socket_name_keeps_the_managed_runtime_directory_private() {
+        use super::prepare_socket_path;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = socket_test_dir("nested-name");
+        let runtime = root.join("runtime");
+        let socket = runtime.join("remuda/sub/X.sock");
+
+        prepare_socket_path(&socket, Some(&runtime)).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(runtime.join("remuda"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_socket_directory_is_refused() {
+        use super::validate_socket_directory;
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = socket_test_dir("writable-leaf");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let uid = unsafe { libc::geteuid() };
+
+        let error = validate_socket_directory(&path, uid, true).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("group- or world-writable"));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_runtime_base_is_refused_before_managed_directory_creation() {
+        use super::prepare_socket_path;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = socket_test_dir("writable-base");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = prepare_socket_path(&root.join("remuda/s.sock"), Some(&root)).unwrap_err();
+
+        assert!(error.to_string().contains("group- or world-writable"));
+        assert!(!root.join("remuda").exists());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_owned_base_is_refused() {
+        use super::validate_socket_directory;
+
+        let path = socket_test_dir("foreign-base");
+        let uid = unsafe { libc::geteuid() };
+
+        let error = validate_socket_directory(&path, uid.wrapping_add(1), false).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("owned by uid"));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_socket_directory_has_a_specific_refusal_message() {
+        use super::validate_socket_directory;
+
+        let root = socket_test_dir("symlink");
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let uid = unsafe { libc::geteuid() };
+
+        let error = validate_socket_directory(&link, uid, true).unwrap_err();
+
+        assert!(error.to_string().contains("is a symlink; refusing"));
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]

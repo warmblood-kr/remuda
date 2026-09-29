@@ -3,7 +3,11 @@
 //! chunk and discard the declaration. #98 item 3.
 
 use std::fs;
+use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_STDIN_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 #[test]
 fn cli_exec_activates_a_lifecycle_mod() {
@@ -50,6 +54,183 @@ fn cli_exec_activates_a_lifecycle_mod() {
         "1",
         "the mod was not activated (tool missing or start not run): {starts:?}"
     );
+}
+
+#[test]
+fn cli_exec_waits_for_lifecycle_readiness_and_reports_failures() {
+    use std::time::{Duration, Instant};
+
+    let dir = std::env::temp_dir().join(format!("rc-ready-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let write_mod = |name: &str, source: &str| {
+        let mod_dir = dir.join(format!("data/remuda/mods/{name}"));
+        fs::create_dir_all(mod_dir.join(format!("packages/{name}"))).unwrap();
+        fs::write(
+            mod_dir.join("extension.toml"),
+            format!(
+                "name = \"{name}\"\nentry = \"packages/{name}/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(mod_dir.join(format!("packages/{name}/init.lua")), source).unwrap();
+    };
+    let declaration = |fields: &str| {
+        format!(
+            "return {{ api = \"remuda-module-v1\", state_version = 1, initialize = function() return {{ polls = 0 }} end, {fields} }}"
+        )
+    };
+    write_mod("no_ready", &declaration("start = function() end,"));
+    write_mod(
+        "ready_now",
+        &declaration("ready = function() return true end, timeout_ms = 1000,"),
+    );
+    write_mod(
+        "ready_later",
+        &declaration(
+            "ready = function(state) state.polls = state.polls + 1; return state.polls >= 4 and true or nil end, timeout_ms = 3000,",
+        ),
+    );
+    write_mod(
+        "ready_fail",
+        &declaration("ready = function() return nil, 'connection refused' end, timeout_ms = 1000,"),
+    );
+    write_mod(
+        "ready_error",
+        &declaration("ready = function() error('readiness exploded') end, timeout_ms = 1000,"),
+    );
+    write_mod(
+        "ready_timeout",
+        &declaration("ready = function() return nil end, timeout_ms = 50,"),
+    );
+    let remuda = |args: &[&str]| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(["-s", "s"])
+            .args(args)
+            .env("REMUDA_RUNTIME_DIR", &dir)
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("HOME", &dir)
+            .output()
+            .expect("run remuda")
+    };
+    let boot = remuda(&["-e", "return remuda.session.list()"]);
+    assert!(boot.status.success(), "boot private daemon: {boot:?}");
+
+    let no_ready_started = Instant::now();
+    let no_ready = remuda(&["exec", "no_ready"]);
+    assert!(
+        no_ready.status.success(),
+        "no ready declaration: {no_ready:?}"
+    );
+    assert!(
+        no_ready_started.elapsed() < Duration::from_secs(3),
+        "a mod without ready must keep immediate completion: {no_ready:?}"
+    );
+
+    let ready = remuda(&["exec", "ready_now"]);
+    assert!(ready.status.success(), "immediately ready: {ready:?}");
+
+    let wait_started = Instant::now();
+    let later = remuda(&["exec", "ready_later"]);
+    assert!(later.status.success(), "eventually ready: {later:?}");
+    assert!(
+        wait_started.elapsed() >= Duration::from_millis(500),
+        "exec did not poll between Eval requests: {later:?}"
+    );
+
+    let failed = remuda(&["exec", "ready_fail"]);
+    assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+    assert_eq!(
+        failed.stderr,
+        b"mod ready_fail failed to become ready: connection refused\n"
+    );
+
+    let errored = remuda(&["exec", "ready_error"]);
+    assert_eq!(errored.status.code(), Some(1), "{errored:?}");
+    assert!(
+        String::from_utf8_lossy(&errored.stderr)
+            .starts_with("mod ready_error failed to become ready: "),
+        "thrown readiness error was not reported as startup failure: {errored:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&errored.stderr).contains("readiness exploded"),
+        "thrown readiness error message was lost: {errored:?}"
+    );
+
+    let timed_out = remuda(&["exec", "ready_timeout"]);
+    assert_eq!(timed_out.status.code(), Some(124), "{timed_out:?}");
+    assert_eq!(
+        timed_out.stderr,
+        b"mod ready_timeout did not become ready within 0.05s\n"
+    );
+
+    remuda(&["stop", "-f"]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_exec_reports_timeout_declaration_errors_cleanly() {
+    let dir = std::env::temp_dir().join(format!("rc-ready-timeout-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    for (name, fields) in [
+        (
+            "invalid_timeout",
+            "ready = function() return nil end, timeout_ms = 0,",
+        ),
+        ("timeout_without_ready", "timeout_ms = 1000,"),
+    ] {
+        let mod_dir = dir.join(format!("data/remuda/mods/{name}"));
+        fs::create_dir_all(mod_dir.join(format!("packages/{name}"))).unwrap();
+        fs::write(
+            mod_dir.join("extension.toml"),
+            format!(
+                "name = \"{name}\"\nentry = \"packages/{name}/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            mod_dir.join(format!("packages/{name}/init.lua")),
+            format!(
+                "return {{ api = \"remuda-module-v1\", state_version = 1, initialize = function() return {{}} end, {fields} }}"
+            ),
+        )
+        .unwrap();
+    }
+    let remuda = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(["-s", "s"])
+            .args(args)
+            .env("REMUDA_RUNTIME_DIR", &dir)
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("HOME", &dir)
+            .output()
+            .expect("run remuda")
+    };
+
+    let boot = remuda(&["-e", "return remuda.session.list()"]);
+    assert!(boot.status.success(), "boot private daemon: {boot:?}");
+    let invalid_timeout = remuda(&["exec", "invalid_timeout"]);
+    assert_eq!(
+        invalid_timeout.status.code(),
+        Some(1),
+        "{invalid_timeout:?}"
+    );
+    assert_eq!(
+        invalid_timeout.stderr,
+        b"module timeout_ms must be an integer from 1 through 240000\n"
+    );
+    let timeout_without_ready = remuda(&["exec", "timeout_without_ready"]);
+    assert_eq!(
+        timeout_without_ready.status.code(),
+        Some(1),
+        "{timeout_without_ready:?}"
+    );
+    assert_eq!(
+        timeout_without_ready.stderr,
+        b"module timeout_ms requires a ready function\n"
+    );
+
+    remuda(&["stop", "-f"]);
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// The one-line `remuda.exec(...)` wrapper must not borrow the mod's chunk
@@ -219,4 +400,161 @@ fn typed_failures_print_only_the_message_and_use_the_requested_exit_code() {
         String::from_utf8_lossy(&docs.stdout).contains("fail(message, code?)"),
         "remuda doc omitted remuda.fail: {docs:?}"
     );
+}
+
+fn stdin_cli(dir: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+    command
+        .args(["-s", "s"])
+        .args(args)
+        .env("REMUDA_RUNTIME_DIR", dir)
+        .env("REMUDA_SUPPRESS_DEPRECATIONS", "1")
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("HOME", dir);
+    command
+}
+
+fn setup_stdin_fixture() -> std::path::PathBuf {
+    // These tests run in parallel in the same integration-test process. Give
+    // each fixture its own runtime directory so one test cannot remove the
+    // other's loaded mod or daemon data.
+    let fixture_id = NEXT_STDIN_FIXTURE.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("rc-stdin-{}-{fixture_id}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let mod_dir = dir.join("data/remuda/mods/sample");
+    fs::create_dir_all(mod_dir.join("packages/sample")).unwrap();
+    fs::write(
+        mod_dir.join("extension.toml"),
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\ncommand = \"sample\"\n",
+    )
+    .unwrap();
+    fs::write(
+        mod_dir.join("packages/sample/init.lua"),
+        r#"remuda.extension_command("sample", function(args, caller)
+          if args[1] == "-" then return caller.stdin or "<missing>" end
+          if args[1] == "bytes" then
+            local bytes = {}
+            for i = 1, #caller.stdin do bytes[#bytes + 1] = tostring(string.byte(caller.stdin, i)) end
+            return table.concat(bytes, ",")
+          end
+          return caller.stdin == nil and "<nil>" or "unexpected stdin"
+        end)"#,
+    )
+    .unwrap();
+
+    let boot = stdin_cli(&dir, &["-e", "remuda.session.list()"])
+        .output()
+        .expect("start daemon");
+    assert!(boot.status.success(), "daemon boot failed: {boot:?}");
+    let loaded = stdin_cli(&dir, &["exec", "sample"])
+        .output()
+        .expect("load mod");
+    assert!(loaded.status.success(), "mod load failed: {loaded:?}");
+    dir
+}
+
+fn cleanup_stdin_fixture(dir: &Path) {
+    let _ = stdin_cli(dir, &["stop", "-f"]).output();
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn extension_commands_receive_stdin_with_dash_and_enforce_limit() {
+    use std::io::Write;
+
+    const MAX_STDIN: usize = 1024 * 1024;
+    let dir = setup_stdin_fixture();
+
+    let payload = b"message from pipe\nwith \"quotes\" and backslash \\";
+    let mut command = stdin_cli(&dir, &["sample", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run extension command with piped stdin");
+    command
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(payload)
+        .expect("write stdin payload");
+    let output = command.wait_with_output().expect("extension result");
+    assert!(output.status.success(), "stdin command failed: {output:?}");
+    assert_eq!(output.stdout, [payload.as_slice(), b"\n"].concat());
+
+    let oversized = vec![b'x'; MAX_STDIN + 1];
+    let mut command = stdin_cli(&dir, &["sample", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run oversized extension command");
+    command
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(&oversized)
+        .expect("write oversized stdin");
+    let output = command
+        .wait_with_output()
+        .expect("oversized extension result");
+    assert!(
+        !output.status.success(),
+        "oversized stdin should be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("stdin exceeds 1 MiB limit"),
+        "unexpected oversized stdin error: {output:?}"
+    );
+
+    cleanup_stdin_fixture(&dir);
+}
+
+#[test]
+fn extension_commands_accept_binary_stdin_only_when_requested() {
+    use std::io::Write;
+
+    let dir = setup_stdin_fixture();
+    let bytes = [0, 0xff, b'A'];
+    let mut command = stdin_cli(&dir, &["--stdin", "sample", "bytes"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run extension command with binary stdin");
+    command
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(&bytes)
+        .expect("write binary stdin payload");
+    let output = command.wait_with_output().expect("binary stdin result");
+    assert!(
+        output.status.success(),
+        "binary stdin command failed: {output:?}"
+    );
+    assert_eq!(output.stdout, b"0,255,65\n");
+
+    // Keep stdin open: an ordinary extension command must not wait for EOF.
+    let mut command = stdin_cli(&dir, &["sample", "no-stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run extension command without stdin opt-in");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let status = loop {
+        if let Some(status) = command.try_wait().expect("poll extension command") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = command.kill();
+            panic!("extension command blocked on an unrequested stdin pipe");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(status.success(), "no-stdin extension failed: {status:?}");
+    let output = command.wait_with_output().expect("no-stdin command result");
+    assert_eq!(output.stdout, b"<nil>\n");
+    cleanup_stdin_fixture(&dir);
 }
