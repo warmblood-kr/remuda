@@ -2,7 +2,7 @@ use super::queue::{InputQueue, InputTarget, PendingBatch, QueueEvent, SendOutcom
 use crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES;
 use remuda_core::input::MAX_INPUT_BYTES;
 use remuda_core::protocol::{Request, Response};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::Path;
 use std::time::Instant;
@@ -12,6 +12,7 @@ pub struct InputSender {
     next_paste_id: u64,
     next_seq: HashMap<(Option<String>, String, String), u64>,
     target_client_ids: HashMap<(Option<String>, String, String), [u8; 16]>,
+    partial_input_targets: HashSet<(Option<String>, String, String)>,
 }
 
 impl InputSender {
@@ -21,6 +22,7 @@ impl InputSender {
             next_paste_id: 1,
             next_seq: HashMap::new(),
             target_client_ids: HashMap::new(),
+            partial_input_targets: HashSet::new(),
         }
     }
 
@@ -169,6 +171,19 @@ impl InputSender {
         queue.begin_due(now).is_some()
     }
 
+    pub fn has_partial_input_warning_for(
+        &self,
+        remote_node: &str,
+        name: &str,
+        instance_id: &str,
+    ) -> bool {
+        self.partial_input_targets.contains(&(
+            Some(remote_node.into()),
+            name.into(),
+            instance_id.into(),
+        ))
+    }
+
     pub fn send_started<F>(
         &mut self,
         queue: &mut InputQueue,
@@ -242,25 +257,35 @@ impl InputSender {
         now: Instant,
     ) -> Option<QueueEvent> {
         let mut event = queue.finish(batch.seq, outcome, now);
-        let paste_failed = batch.paste_id.is_some()
+        if matches!(event, Some(QueueEvent::Sent { .. })) {
+            self.partial_input_targets.remove(&(
+                batch.remote_node.clone(),
+                batch.name.clone(),
+                batch.instance_id.clone(),
+            ));
+        }
+        let remote_target_failed = batch.remote_node.is_some()
             && matches!(
                 event,
                 Some(QueueEvent::Uncertain { .. } | QueueEvent::Failed { .. })
             );
-        if paste_failed {
-            let paste_id = batch.paste_id.expect("paste failure has a paste id");
-            queue.drop_waiting_paste(
+        if remote_target_failed {
+            queue.drop_waiting_target(
                 batch.remote_node.as_deref(),
                 &batch.name,
                 &batch.instance_id,
-                paste_id,
-                "paste stopped after a failed chunk",
+                "remote input stopped after a failed chunk",
             );
+            self.partial_input_targets.insert((
+                batch.remote_node.clone(),
+                batch.name.clone(),
+                batch.instance_id.clone(),
+            ));
             let reason = match event.take().expect("terminal paste event exists") {
                 QueueEvent::Uncertain { reason, .. } | QueueEvent::Failed { reason, .. } => reason,
-                _ => unreachable!("paste failure is uncertain or failed"),
+                _ => unreachable!("remote target failure is uncertain or failed"),
             };
-            event = Some(QueueEvent::PasteAborted {
+            event = Some(QueueEvent::RemoteTargetFailed {
                 seq: batch.seq,
                 reason,
             });
@@ -271,6 +296,7 @@ impl InputSender {
                 QueueEvent::Uncertain { .. }
                     | QueueEvent::Failed { .. }
                     | QueueEvent::PasteAborted { .. }
+                    | QueueEvent::RemoteTargetFailed { .. }
             )
         ) {
             self.rotate_target(queue, batch);
@@ -724,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_listener_errors_retry_identically_then_uncertain_rotates_target() {
+    fn remote_listener_errors_retry_identically_then_uncertain_drops_target_lines() {
         let (mut sender, mut queue, now) = remote_queued(b"first\r".to_vec());
         let first_client = queue.items().next().unwrap().client_id.clone();
         sender
@@ -760,13 +786,15 @@ mod tests {
                     Some(QueueEvent::RetryScheduled { seq: 1, .. })
                 ));
             } else {
-                assert!(matches!(result, Some(QueueEvent::Uncertain { seq: 1, .. })));
+                assert!(matches!(
+                    result,
+                    Some(QueueEvent::RemoteTargetFailed { seq: 1, .. })
+                ));
             }
         }
-        let waiting = queue.items().next_back().unwrap();
-        assert_eq!(waiting.state, QueueState::Waiting);
-        assert_eq!(waiting.seq, 1);
-        assert_ne!(waiting.client_id, first_client);
+        let later = queue.items().next_back().unwrap();
+        assert_eq!(later.state, QueueState::Dropped);
+        assert_eq!(later.client_id, first_client);
     }
 
     #[test]
@@ -909,7 +937,67 @@ mod tests {
     }
 
     #[test]
-    fn remote_oversize_error_retries_identically_then_marks_uncertain_with_bug_notice() {
+    fn uncertain_paste_failure_drops_later_target_lines_but_preserves_other_targets() {
+        let now = Instant::now();
+        let mut sender = InputSender::with_client_id([7; 16]);
+        let mut queue = InputQueue::default();
+        let limit = crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES;
+        sender
+            .enqueue_remote(
+                &mut queue,
+                "fp-laptop",
+                "build",
+                "remote-instance",
+                vec![b'x'; limit * 2 + 7],
+                now,
+            )
+            .unwrap();
+        sender
+            .enqueue_remote(
+                &mut queue,
+                "fp-laptop",
+                "build",
+                "remote-instance",
+                b"later line\r".to_vec(),
+                now,
+            )
+            .unwrap();
+        sender
+            .enqueue_remote(
+                &mut queue,
+                "fp-tablet",
+                "build",
+                "tablet-instance",
+                b"other target\r".to_vec(),
+                now,
+            )
+            .unwrap();
+
+        assert!(queue.begin_due(now).is_some());
+        let event = sender.send_remote_started(&mut queue, now, |node, _| {
+            assert_eq!(node, "fp-laptop");
+            Ok(Response::Uncertain)
+        });
+
+        assert!(matches!(event, Some(QueueEvent::RemoteTargetFailed { .. })));
+        assert!(
+            !queue.items().any(|batch| {
+                batch.remote_node.as_deref() == Some("fp-laptop")
+                    && batch.state == QueueState::Waiting
+            }),
+            "later lines for the failed target should be dropped"
+        );
+        assert!(
+            queue.items().any(|batch| {
+                batch.remote_node.as_deref() == Some("fp-tablet")
+                    && batch.state == QueueState::Waiting
+            }),
+            "other targets should remain queued"
+        );
+    }
+
+    #[test]
+    fn remote_oversize_error_retries_identically_then_drops_target_lines_with_bug_notice() {
         let (mut sender, mut queue, now) = remote_queued(b"line\r".to_vec());
         sender
             .enqueue_remote(
@@ -946,7 +1034,7 @@ mod tests {
             } else {
                 assert!(matches!(
                     result,
-                    Some(QueueEvent::Uncertain { seq: 1, reason })
+                    Some(QueueEvent::RemoteTargetFailed { seq: 1, reason })
                         if reason.contains("bug:") && reason.contains("exceeds")
                 ));
             }
@@ -954,11 +1042,8 @@ mod tests {
         let next = queue.items().next().unwrap();
         assert_eq!(next.state, QueueState::Uncertain);
         assert!(next.status.contains("bug:"));
-        let waiting = queue
-            .items()
-            .find(|batch| batch.state == QueueState::Waiting)
-            .unwrap();
-        assert_eq!(waiting.seq, 1);
-        assert_ne!(waiting.client_id, first_client_id);
+        let later = queue.items().next_back().unwrap();
+        assert_eq!(later.state, QueueState::Dropped);
+        assert_eq!(later.client_id, first_client_id);
     }
 }

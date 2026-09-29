@@ -25,7 +25,9 @@ use std::time::{Duration, Instant};
 pub mod close_request;
 const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 const REMOTE_PASTE_FAILURE_NOTICE: &str =
-    "remote paste stopped after a failed chunk; remaining paste chunks dropped";
+    "remote input stopped after a failed chunk; remaining lines dropped";
+const REMOTE_PARTIAL_INPUT_NOTICE: &str =
+    "partial input may remain at the remote prompt; your new line would be appended to the leftover fragment and run with it — press Enter again to send anyway";
 pub mod composer;
 pub mod confirm;
 pub mod ended;
@@ -91,6 +93,7 @@ pub struct ClusterUi {
     remote_active: Option<RemoteSelection>,
     // (registry fingerprint, display label, session name, instance id)
     remote_composer_target: Option<(String, String, String, String)>,
+    partial_input_confirm_target: Option<(String, String, String, String)>,
     remote_input_enabled: bool,
     remote_control_disabled: HashSet<String>,
 }
@@ -173,6 +176,7 @@ impl ClusterUi {
             remote_selected: None,
             remote_active: None,
             remote_composer_target: None,
+            partial_input_confirm_target: None,
             remote_input_enabled: false,
             remote_control_disabled: HashSet::new(),
         }
@@ -736,6 +740,14 @@ impl ClusterUi {
     }
 
     fn key_event(&mut self, event: crossterm::event::KeyEvent, now: Duration) -> bool {
+        if self.partial_input_confirm_target.is_some()
+            && !self
+                .notice
+                .as_ref()
+                .is_some_and(|(notice, _)| notice == REMOTE_PARTIAL_INPUT_NOTICE)
+        {
+            self.partial_input_confirm_target = None;
+        }
         if let Some(decision) = self.confirmation.handle(event.code) {
             match decision {
                 Decision::Confirmed { name, instance_id } => {
@@ -923,17 +935,45 @@ impl ClusterUi {
             self.bind_composer_target();
         }
         match self.composer.handle_key(event) {
-            ComposerAction::None => {}
+            ComposerAction::None => {
+                if self
+                    .partial_input_confirm_target
+                    .as_ref()
+                    .is_some_and(|(_, _, _, confirmed_text)| self.composer.text() != confirmed_text)
+                {
+                    self.partial_input_confirm_target = None;
+                }
+            }
             ComposerAction::Cleared => {
+                self.partial_input_confirm_target = None;
                 if self.remote_composer_target.is_none() {
                     self.composer_target = None;
                 }
                 self.notice = Some(("draft cleared".into(), now));
             }
-            ComposerAction::Detach => self.composer_focused = false,
+            ComposerAction::Detach => {
+                self.partial_input_confirm_target = None;
+                self.composer_focused = false;
+            }
             ComposerAction::Submit(bytes) => {
-                if self.remote_composer_target.is_some() {
-                    self.enqueue_remote_draft(bytes, now);
+                if let Some((node, _, name, instance_id)) = self.remote_composer_target.clone() {
+                    let draft = bytes.strip_suffix(b"\r").unwrap_or(&bytes);
+                    let target = (
+                        node.clone(),
+                        name.clone(),
+                        instance_id.clone(),
+                        String::from_utf8_lossy(draft).into_owned(),
+                    );
+                    if self.partial_input_confirm_target.as_ref() == Some(&target) {
+                        self.partial_input_confirm_target = None;
+                        self.enqueue_remote_draft(bytes, now);
+                    } else if self.remote_target_may_be_partial(&node, &name, &instance_id) {
+                        self.restore_draft(&bytes);
+                        self.partial_input_confirm_target = Some(target);
+                        self.notice = Some((REMOTE_PARTIAL_INPUT_NOTICE.into(), now));
+                    } else {
+                        self.enqueue_remote_draft(bytes, now);
+                    }
                 } else {
                     self.enqueue_draft(bytes, now);
                 }
@@ -949,6 +989,7 @@ impl ClusterUi {
         if self.remote_composer_target == target {
             return false;
         }
+        self.partial_input_confirm_target = None;
         let discarded = if let Some((_, node_label, name, _)) = &self.remote_composer_target {
             if self.composer.text().is_empty() {
                 false
@@ -962,6 +1003,18 @@ impl ClusterUi {
         };
         self.remote_composer_target = target;
         discarded
+    }
+
+    fn remote_target_may_be_partial(&self, node: &str, name: &str, instance_id: &str) -> bool {
+        let selection = RemoteSelection::Session {
+            node: node.into(),
+            name: name.into(),
+            instance_id: instance_id.into(),
+        };
+        self.remote_session(&selection).is_some_and(|(_, session)| {
+            self.input_sender
+                .has_partial_input_warning_for(node, &session.wire_name, instance_id)
+        })
     }
 
     fn bind_composer_target(&mut self) {
@@ -1074,10 +1127,11 @@ impl ClusterUi {
         self.input_sender
             .begin_due(&mut self.input_queue, Instant::now());
         if let Some(batch) = self.input_queue.sending_batch() {
-            if !self
-                .notice
-                .as_ref()
-                .is_some_and(|(notice, _)| notice == REMOTE_PASTE_FAILURE_NOTICE)
+            if self.partial_input_confirm_target.is_none()
+                && !self
+                    .notice
+                    .as_ref()
+                    .is_some_and(|(notice, _)| notice == REMOTE_PASTE_FAILURE_NOTICE)
             {
                 self.notice = Some((format!("sending input to {}", batch.name), now));
             }
@@ -1122,6 +1176,9 @@ impl ClusterUi {
                 self.clear_sending_notice();
             }
             Some(QueueEvent::PasteAborted { .. }) => {
+                self.notice = Some((REMOTE_PASTE_FAILURE_NOTICE.into(), now));
+            }
+            Some(QueueEvent::RemoteTargetFailed { .. }) => {
                 self.notice = Some((REMOTE_PASTE_FAILURE_NOTICE.into(), now));
             }
             Some(QueueEvent::Dropped { reason, .. }) | Some(QueueEvent::Failed { reason, .. }) => {
@@ -2065,6 +2122,259 @@ mod tests {
         assert!(ui.notice.is_none());
     }
 
+    fn ui_with_uncertain_remote_target() -> (ManualClock, ClusterUi, FakeRemoteInput) {
+        let clock = ManualClock::new();
+        let limit = crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES;
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        let mut other = snapshot.nodes[0].clone();
+        other.registry_key = "fp-tablet".into();
+        other.name = "tablet".into();
+        other.sessions[0].instance_id = "tablet-instance".into();
+        snapshot.nodes.push(other);
+
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        ui.enter_selected(clock.now());
+        ui.enqueue_remote_draft(vec![b'x'; limit + 1], clock.now());
+        ui.start_pending(clock.now());
+        let transport = FakeRemoteInput::new(Response::Uncertain);
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        (clock, ui, transport)
+    }
+
+    fn arm_partial_input_confirmation(ui: &mut ClusterUi) {
+        for ch in "draft".chars() {
+            ui.key(crossterm::event::KeyCode::Char(ch));
+        }
+        ui.key(crossterm::event::KeyCode::Enter);
+        assert!(ui.notice.as_ref().is_some_and(|(notice, _)| {
+            notice.contains("appended to the leftover fragment and run with it")
+                && notice.contains("press Enter again to send anyway")
+        }));
+    }
+
+    #[test]
+    fn uncertain_remote_target_warns_on_its_next_send_once() {
+        let (clock, mut ui, transport) = ui_with_uncertain_remote_target();
+        let failure_notice = ui.notice.as_ref().map(|(notice, _)| notice.as_str());
+        assert!(failure_notice.is_some());
+        assert_eq!(
+            ui.render(100, 24, "", &clock)
+                .matches(failure_notice.unwrap())
+                .count(),
+            1
+        );
+
+        ui.select_target(Some("fp-tablet/build")).unwrap();
+        ui.enter_selected(clock.now());
+        ui.enqueue_remote_draft(b"tablet line\r".to_vec(), clock.now());
+        *transport.response.lock().unwrap() = Some(Response::Ack { duplicate: false });
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        assert!(!ui
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("partial input may remain")));
+
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        ui.enter_selected(clock.now());
+        for ch in "next line".chars() {
+            ui.key(crossterm::event::KeyCode::Char(ch));
+        }
+        *transport.response.lock().unwrap() = Some(Response::Ack { duplicate: false });
+        let request_count = transport.requests.lock().unwrap().len();
+        ui.key(crossterm::event::KeyCode::Enter);
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        assert_eq!(transport.requests.lock().unwrap().len(), request_count);
+        assert!(ui
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+
+        ui.key(crossterm::event::KeyCode::Enter);
+        *transport.response.lock().unwrap() = Some(Response::Uncertain);
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        assert_eq!(transport.requests.lock().unwrap().len(), request_count + 1);
+
+        for ch in "retry line".chars() {
+            ui.key(crossterm::event::KeyCode::Char(ch));
+        }
+        ui.key(crossterm::event::KeyCode::Enter);
+        assert!(ui
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        assert_eq!(transport.requests.lock().unwrap().len(), request_count + 1);
+
+        ui.key(crossterm::event::KeyCode::Enter);
+        *transport.response.lock().unwrap() = Some(Response::Ack { duplicate: false });
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        assert_eq!(transport.requests.lock().unwrap().len(), request_count + 2);
+        assert!(!ui
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("partial input may remain")));
+
+        for ch in "after success".chars() {
+            ui.key(crossterm::event::KeyCode::Char(ch));
+        }
+        *transport.response.lock().unwrap() = Some(Response::Ack { duplicate: false });
+        ui.key(crossterm::event::KeyCode::Enter);
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        assert_eq!(transport.requests.lock().unwrap().len(), request_count + 3);
+    }
+
+    #[test]
+    fn changing_remote_target_cancels_partial_input_confirmation() {
+        let (clock, mut ui, transport) = ui_with_uncertain_remote_target();
+        let request_count = transport.requests.lock().unwrap().len();
+
+        for ch in "draft".chars() {
+            ui.key(crossterm::event::KeyCode::Char(ch));
+        }
+        ui.key(crossterm::event::KeyCode::Enter);
+        assert!(ui
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+
+        ui.select_target(Some("fp-tablet/build")).unwrap();
+        ui.enter_selected(clock.now());
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        ui.enter_selected(clock.now());
+        for ch in "fresh draft".chars() {
+            ui.key(crossterm::event::KeyCode::Char(ch));
+        }
+        ui.key(crossterm::event::KeyCode::Enter);
+        assert!(ui
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        assert_eq!(transport.requests.lock().unwrap().len(), request_count);
+    }
+
+    #[test]
+    fn editing_draft_disarms_partial_input_confirmation() {
+        let (clock, mut ui, transport) = ui_with_uncertain_remote_target();
+        let request_count = transport.requests.lock().unwrap().len();
+        arm_partial_input_confirmation(&mut ui);
+
+        ui.key(crossterm::event::KeyCode::Backspace);
+        *transport.response.lock().unwrap() = Some(Response::Ack { duplicate: false });
+        ui.key(crossterm::event::KeyCode::Enter);
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        assert_eq!(transport.requests.lock().unwrap().len(), request_count);
+        assert!(ui
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+    }
+
+    #[test]
+    fn detach_disarms_partial_input_confirmation() {
+        let (clock, mut ui, transport) = ui_with_uncertain_remote_target();
+        let request_count = transport.requests.lock().unwrap().len();
+        arm_partial_input_confirmation(&mut ui);
+
+        ui.key_event(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('\\'),
+                crossterm::event::KeyModifiers::CONTROL,
+            ),
+            clock.now(),
+        );
+        ui.key(crossterm::event::KeyCode::Enter);
+        *transport.response.lock().unwrap() = Some(Response::Ack { duplicate: false });
+        ui.key(crossterm::event::KeyCode::Enter);
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        assert_eq!(transport.requests.lock().unwrap().len(), request_count);
+        assert!(ui
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+    }
+
+    #[test]
+    fn replacing_partial_warning_disarms_confirmation() {
+        let (clock, mut ui, transport) = ui_with_uncertain_remote_target();
+        let request_count = transport.requests.lock().unwrap().len();
+        arm_partial_input_confirmation(&mut ui);
+        ui.notice = Some(("another notice replaced the warning".into(), clock.now()));
+
+        *transport.response.lock().unwrap() = Some(Response::Ack { duplicate: false });
+        ui.key(crossterm::event::KeyCode::Enter);
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        assert_eq!(transport.requests.lock().unwrap().len(), request_count);
+        assert!(ui
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("press Enter again to send anyway")));
+    }
+
     #[test]
     fn empty_attention_filter_has_clear_message_and_badges_remain_visible() {
         let clock = ManualClock::new();
@@ -2547,11 +2857,11 @@ mod tests {
             );
         }
         let notice = ui.notice.as_ref().map(|(notice, _)| notice.as_str());
-        assert!(notice.is_some_and(|notice| notice.contains("remaining paste chunks")));
+        assert!(notice.is_some_and(|notice| notice.contains("remaining lines dropped")));
         let frame = ui.render(100, 24, "", &clock);
         assert_eq!(frame.matches(notice.unwrap()).count(), 1);
         let requests = transport.requests.lock().unwrap();
-        assert!(requests.iter().any(|(node, request)| {
+        assert!(!requests.iter().any(|(node, request)| {
             node == "fp-laptop"
                 && matches!(request, Request::Input { bytes, .. } if bytes == b"later\r")
         }));

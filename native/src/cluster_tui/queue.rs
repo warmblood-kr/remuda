@@ -53,6 +53,7 @@ pub enum QueueEvent {
     Failed { seq: u64, reason: String },
     RemoteControlDisabled { seq: u64, node: String },
     PasteAborted { seq: u64, reason: String },
+    RemoteTargetFailed { seq: u64, reason: String },
 }
 
 pub const MAX_IO_RETRIES: u8 = 3;
