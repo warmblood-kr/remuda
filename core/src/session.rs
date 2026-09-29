@@ -46,7 +46,7 @@ fn normalize_input_text(text: &str) -> String {
 
 #[cfg(test)]
 mod input_text_tests {
-    use super::normalize_input_text;
+    use super::{normalize_input_text, occurrence_count};
 
     #[test]
     fn strips_terminal_controls_by_unicode_character_and_preserves_korean() {
@@ -54,6 +54,13 @@ mod input_text_tests {
             normalize_input_text("a\x01\tb\r\nc\x7f\u{0085}\u{009b}한글"),
             "a\tb\nc한글"
         );
+    }
+
+    #[test]
+    fn occurrence_count_counts_visible_tail_matches() {
+        assert_eq!(occurrence_count("old: abc / new: abc", "abc"), 2);
+        assert_eq!(occurrence_count("old: abc", "missing"), 0);
+        assert_eq!(occurrence_count("anything", ""), 0);
     }
 }
 
@@ -63,6 +70,14 @@ fn occurrence_count(screen: &str, tail: &str) -> usize {
     } else {
         screen.match_indices(tail).count()
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputSubmitOutcome {
+    /// The screen changed after Return, or the Return-only operation was sent.
+    Submitted,
+    /// Return was sent, but the visible screen did not verify submission.
+    Unverified,
 }
 
 struct PendingInput {
@@ -279,7 +294,10 @@ impl Session {
     /// The complete text/submit sequence shares one input lock. Backends
     /// without a rendered screen keep the historical single-burst behavior.
     pub fn send_line(&self, text: &str) -> Result<()> {
-        self.type_text(text, Duration::ZERO)
+        match self.type_text(text, Duration::ZERO)? {
+            InputSubmitOutcome::Submitted => Ok(()),
+            InputSubmitOutcome::Unverified => Err(AgentError::InputUnverified),
+        }
     }
 
     /// Deliver a normalized text burst, bracketed when the child enabled mode
@@ -319,7 +337,7 @@ impl Session {
     /// Submit with a separate Return after the text is visible. A changed
     /// screen after Return means it was submitted; an unchanged screen after
     /// the bounded observation means Return became a composer newline.
-    pub fn submit(&self, expect: &str) -> Result<()> {
+    pub fn submit(&self, expect: &str) -> Result<InputSubmitOutcome> {
         let _held = self.acquire_input_lock()?;
         let tail = input_tail(expect);
         let baseline = self
@@ -335,13 +353,22 @@ impl Session {
 
     /// Deliver TEXT and submit it as one act. This is the composite used by
     /// type_text and SendLine; no other input sender can split the two units.
-    pub fn type_text(&self, text: &str, settle: Duration) -> Result<()> {
+    pub fn type_text(&self, text: &str, settle: Duration) -> Result<InputSubmitOutcome> {
         let body = normalize_input_text(text);
+        if body.is_empty() {
+            let _held = self.acquire_input_lock()?;
+            if let Ok(mut pending) = self.pending_input.lock() {
+                *pending = None;
+            }
+            self.write_one_burst(crate::keys::RETURN_BYTES)?;
+            return Ok(InputSubmitOutcome::Submitted);
+        }
         if self.output_version().is_none() || self.screen_text().is_err() {
             let mut bytes = body.into_bytes();
             bytes.extend_from_slice(crate::keys::RETURN_BYTES);
             let _held = self.acquire_input_lock()?;
-            return self.write_one_burst(&bytes);
+            self.write_one_burst(&bytes)?;
+            return Ok(InputSubmitOutcome::Submitted);
         }
 
         let tail = input_tail(&body);
@@ -357,32 +384,35 @@ impl Session {
         self.submit_locked(&tail, baseline)
     }
 
-    fn submit_locked(&self, tail: &str, baseline_occurrences: usize) -> Result<()> {
+    fn submit_locked(&self, tail: &str, baseline_occurrences: usize) -> Result<InputSubmitOutcome> {
         if tail.is_empty() {
-            return self.write_one_burst(crate::keys::RETURN_BYTES);
+            self.write_one_burst(crate::keys::RETURN_BYTES)?;
+            return Ok(InputSubmitOutcome::Submitted);
         }
         let Some(mut version) = self.output_version() else {
-            return self.write_one_burst(crate::keys::RETURN_BYTES);
+            self.write_one_burst(crate::keys::RETURN_BYTES)?;
+            return Ok(InputSubmitOutcome::Submitted);
         };
         if self.screen_text().is_err() {
-            return self.write_one_burst(crate::keys::RETURN_BYTES);
+            self.write_one_burst(crate::keys::RETURN_BYTES)?;
+            return Ok(InputSubmitOutcome::Submitted);
         }
         let visible = self.wait_for_visible_tail(tail, baseline_occurrences, &mut version);
         let before = self.compact_screen().unwrap_or_default();
         let before_version = self.output_version().unwrap_or(version);
         self.write_one_burst(crate::keys::RETURN_BYTES)?;
         if !visible {
-            return Ok(());
+            return Ok(InputSubmitOutcome::Unverified);
         }
 
         version = before_version;
         let deadline = self.clock.now() + Duration::from_millis(500);
         while self.clock.now() < deadline {
             if !self.is_alive() {
-                return Ok(());
+                return Ok(InputSubmitOutcome::Unverified);
             }
             if self.compact_screen().is_some_and(|screen| screen != before) {
-                return Ok(());
+                return Ok(InputSubmitOutcome::Submitted);
             }
             let remaining = deadline.saturating_sub(self.clock.now());
             let timeout = remaining.min(Duration::from_millis(50));
@@ -393,7 +423,7 @@ impl Session {
         if self.is_alive() && self.compact_screen().as_deref() == Some(before.as_str()) {
             self.write_one_burst(crate::keys::RETURN_BYTES)?;
         }
-        Ok(())
+        Ok(InputSubmitOutcome::Unverified)
     }
 
     fn wait_for_visible_tail(

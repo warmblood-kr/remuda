@@ -95,7 +95,7 @@ time.sleep(2)
     script::run_source(
         &socket,
         "input-unit-empty-submit",
-        "remuda.type_text('empty-agent', '')",
+        "assert(remuda.type_text('empty-agent', '') == 'submitted')",
     )
     .expect("submit an empty body");
     let screen = wait_screen(&socket, "empty-agent", "BARE_RETURN");

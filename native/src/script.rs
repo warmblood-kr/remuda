@@ -20,6 +20,7 @@ use crate::client;
 use mlua::{Lua, Table, Value};
 use remuda_core::keys;
 use remuda_core::protocol::{Request, Response, Step};
+use remuda_core::InputSubmitOutcome;
 use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
@@ -481,6 +482,10 @@ pub fn bindings(
                 .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
             session
                 .submit(&expect)
+                .map(|outcome| match outcome {
+                    InputSubmitOutcome::Submitted => "submitted",
+                    InputSubmitOutcome::Unverified => "unverified",
+                })
                 .map_err(|error| mlua::Error::runtime(error.to_string()))
         })?,
     )?;
@@ -500,6 +505,10 @@ pub fn bindings(
                     .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
                 session
                     .type_text(&text, Duration::from_secs_f64(settle))
+                    .map(|outcome| match outcome {
+                        InputSubmitOutcome::Submitted => "submitted",
+                        InputSubmitOutcome::Unverified => "unverified",
+                    })
                     .map_err(|error| mlua::Error::runtime(error.to_string()))
             },
         )?,

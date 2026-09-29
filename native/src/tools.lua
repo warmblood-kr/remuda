@@ -1807,21 +1807,21 @@ register("input", "Terminal input words for text delivery and submission.", "tab
 register("input.text", "Deliver text as one burst, using bracketed paste when enabled by the child.", "input.text(session, text) -> nil")
 
 function remuda.input.submit(session, expect)
-  remuda._input_submit(session, tostring(expect))
+  return remuda._input_submit(session, tostring(expect))
 end
 
-register("input.submit", "Submit visible composer text with a separate Return and at most one retry.", "input.submit(session, expect) -> nil")
+register("input.submit", "Submit visible composer text; returns 'submitted' or 'unverified'.", "input.submit(session, expect) -> status")
 
 -- Composite: hold the session input lock across text, settle, and submission.
 function remuda.type_text(session, text, settle)
-  remuda._input_type_text(session, tostring(text), settle or 0.1)
+  return remuda._input_type_text(session, tostring(text), settle or 0.1)
 end
 remuda.input.type_text = remuda.type_text
-register("input.type_text", "Type text, honor the settle pause, then submit it.", "input.type_text(session, text, settle?) -> nil")
+register("input.type_text", "Type text, honor the settle pause, then return 'submitted' or 'unverified'.", "input.type_text(session, text, settle?) -> status")
 register(
   "type_text",
-  "Type text into a session and submit it with Return.",
-  "type_text(session, text, settle?) -> nil"
+  "Type text into a session and submit it with Return; returns 'submitted' or 'unverified'.",
+  "type_text(session, text, settle?) -> status"
 )
 
 -- The left session list, re-expressed as the "*sessions*" buffer instead of
