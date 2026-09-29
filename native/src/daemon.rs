@@ -831,6 +831,19 @@ fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<(
     Some(closed.map(drop))
 }
 
+fn close_instance(
+    registry: &Registry,
+    image: &Image,
+    name: &str,
+    instance_id: &str,
+) -> Option<AgentResult<()>> {
+    let closed = registry.close_instance(name, instance_id)?;
+    if let Ok(true) = closed {
+        notify_exited(image, name, "closed", None);
+    }
+    Some(closed.map(drop))
+}
+
 /// `close` stops tracking a session itself, so the reaper never sees it die:
 /// whichever of the two removes the entry fires the one `session_exited`.
 fn notify_exited(
@@ -1087,9 +1100,11 @@ fn handle(
             reply(&stream, &response)
         }
 
-        Request::Close { name } => respond(&stream, &name, close(registry, image, &name), |()| {
-            Response::Ok
-        }),
+        Request::Close {
+            name,
+            instance_id,
+            confirm,
+        } => handle_close(&stream, registry, image, &name, instance_id, confirm),
 
         Request::ListDir { path: dir } => reply(&stream, &list_dir(&dir)),
         Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
@@ -1123,6 +1138,24 @@ fn handle_eval(
         // the same treatment `remuda run` gives a script file.
         Err(error) => reply(&stream, &Response::error(error)),
     }
+}
+
+fn handle_close(
+    stream: &Stream,
+    registry: &Registry,
+    image: &Image,
+    name: &str,
+    instance_id: Option<String>,
+    confirm: Option<bool>,
+) -> std::io::Result<()> {
+    let result = match (instance_id, confirm) {
+        (None, None) => close(registry, image, name),
+        (Some(instance_id), Some(true)) => close_instance(registry, image, name, &instance_id),
+        _ => Some(Err(remuda_core::agent::AgentError::Io(
+            "confirmed close requires an instance id and confirmation".into(),
+        ))),
+    };
+    respond(stream, name, result, |()| Response::Ok)
 }
 
 fn deferred_reply(

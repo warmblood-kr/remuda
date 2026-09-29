@@ -1257,6 +1257,8 @@ mod tests {
         assert!(authorize_remote_request(&Request::List).is_ok());
         let close_error = authorize_remote_request(&Request::Close {
             name: "session".into(),
+            instance_id: None,
+            confirm: None,
         })
         .unwrap_err();
         assert_eq!(close_error, Response::error("remote front refuses Close"));
@@ -1636,6 +1638,8 @@ mod tests {
         );
         let close = Request::Close {
             name: "session-to-protect".into(),
+            instance_id: None,
+            confirm: None,
         };
         let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&close).unwrap());
         let duplicate_body = sealed.message.clone();
@@ -1730,6 +1734,8 @@ mod tests {
             },
             Request::Close {
                 name: "session".into(),
+                instance_id: None,
+                confirm: None,
             },
         ];
         for request in refused {

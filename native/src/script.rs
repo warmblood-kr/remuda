@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 75] = [
+pub const BINDINGS: [&str; 76] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -73,6 +73,7 @@ pub const BINDINGS: [&str; 75] = [
     "extension_command",
     "fail",
     "feed",
+    "fs",
     "hook_list",
     "hooks",
     "http",
@@ -123,6 +124,16 @@ const WORDS: &[(&str, &str, &str)] = &[
         "http",
         "Start an asynchronous bounded HTTP request; completion is delivered on the Lua image queue.",
         "http.request(options) -> {cancel()}",
+    ),
+    (
+        "fs",
+        "Atomic replacement of files for trusted Lua callers.",
+        "table",
+    ),
+    (
+        "fs.write_atomic",
+        "Write bytes through a same-directory temporary file and atomically replace the target.",
+        "fs.write_atomic(path, bytes) -> true, nil | nil, error",
     ),
     (
         "ls",
@@ -310,6 +321,7 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
         registry.set(*name, row)?;
     }
     table.set("json", crate::json::bindings(lua)?)?;
+    fs_bindings(lua, table)?;
     table.set("_registry", registry)
 }
 
@@ -480,16 +492,7 @@ pub fn bindings(
         })?,
     )?;
 
-    // End a session — live, or already self-exited (step 006). A dead session
-    // stays listed with its last screen intact until this is called; nothing
-    // reaps it on its own, on purpose (`steps/006-lifetime.md`).
-    let path = at();
-    table.set(
-        "close",
-        lua.create_function(move |lua, name: String| {
-            value(lua, ask(&path, Request::Close { name })?)
-        })?,
-    )?;
+    close_binding(lua, &table, at())?;
 
     exec_binding(lua, &table)?;
     function_source_binding(lua, &table)?;
@@ -509,6 +512,28 @@ pub fn bindings(
     sleep_binding(lua, &table)?;
 
     Ok(table)
+}
+
+fn close_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
+    // End a session — live, or already self-exited (step 006). A dead session
+    // stays listed with its last screen intact until this is called; nothing
+    // reaps it on its own, on purpose (`steps/006-lifetime.md`).
+    table.set(
+        "close",
+        lua.create_function(move |lua, name: String| {
+            value(
+                lua,
+                ask(
+                    &path,
+                    Request::Close {
+                        name,
+                        instance_id: None,
+                        confirm: None,
+                    },
+                )?,
+            )
+        })?,
+    )
 }
 
 fn sleep_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
@@ -841,6 +866,23 @@ fn dir_bindings(
     )?;
 
     Ok(())
+}
+
+/// `remuda.fs` currently exposes one atomic write word. The Lua runtime is
+/// trusted and already has arbitrary `io.open`/`os.rename`; this bundles the
+/// durability and replacement guarantees into a single named operation.
+fn fs_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
+    let fs = lua.create_table()?;
+    fs.set(
+        "write_atomic",
+        lua.create_function(|_, (path, bytes): (String, mlua::LuaString)| {
+            match crate::fs_atomic::write_atomic(Path::new(&path), &bytes.as_bytes(), 0o644) {
+                Ok(()) => Ok((Some(true), None::<String>)),
+                Err(error) => Ok((None::<bool>, Some(error.to_string()))),
+            }
+        })?,
+    )?;
+    table.set("fs", fs)
 }
 
 /// The `Ticker`'s own skip counters, read-only — no threshold or alarm here,

@@ -81,6 +81,8 @@ fn exercise_session_exit_payload(path: &std::path::Path) {
             path,
             &Request::Close {
                 name: close_name.clone(),
+                instance_id: None,
+                confirm: None,
             },
         )
         .expect("close session"),
@@ -96,8 +98,15 @@ fn exercise_session_exit_payload(path: &std::path::Path) {
         let name = format!("api-v5-close-race-{}-{iteration}", std::process::id());
         start_session(path, &name, long_lived.clone());
         assert_eq!(
-            client::request(path, &Request::Close { name: name.clone() },)
-                .expect("close race session"),
+            client::request(
+                path,
+                &Request::Close {
+                    name: name.clone(),
+                    instance_id: None,
+                    confirm: None,
+                },
+            )
+            .expect("close race session"),
             Response::Ok
         );
         wait_for_exit_event(path, &name);
