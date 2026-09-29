@@ -65,7 +65,6 @@ pub fn run_sync(
     #[cfg(not(test))]
     let diagnose = false;
     let (stdout_permit, stderr_permit) = reserve_run_reader_workers()?;
-    let process_tree = ProcessTree::new().map_err(|error| error.to_string())?;
 
     let started_at = Instant::now();
     let deadline = started_at + Duration::from_secs_f64(timeout_seconds);
@@ -78,6 +77,7 @@ pub fn run_sync(
         .stderr(Stdio::piped());
     child_guard::harden(&mut command);
     let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let process_tree = ProcessTree::new().map_err(|error| error.to_string())?;
     if let Err(error) = process_tree.assign(&child) {
         let _ = child.kill();
         let _ = child.wait();
