@@ -40,10 +40,14 @@ use portable_pty::CommandBuilder;
 /// Where a node's socket lives. Prefer `$XDG_RUNTIME_DIR`; Android falls back
 /// to its process temp directory, while other Unix systems keep their old path.
 pub fn socket_path(server: &str) -> PathBuf {
-    let base = std::env::var_os("REMUDA_RUNTIME_DIR")
+    socket_path_in(&runtime_dir(), server)
+}
+
+/// Runtime root used by the client and daemon entry points.
+pub fn runtime_dir() -> PathBuf {
+    std::env::var_os("REMUDA_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(default_runtime_dir);
-    socket_path_in(&base, server)
+        .unwrap_or_else(default_runtime_dir)
 }
 
 /// The same derivation with the runtime directory supplied — what the daemon
@@ -177,7 +181,17 @@ fn load_user_config(image: &Image) {
 /// unconditional unlink displaces a *live* peer, which then keeps running
 /// unreachable and holds its pty children forever.
 pub fn serve(path: &Path) -> std::io::Result<()> {
-    let _socket_lock = SocketLock::acquire(path)?;
+    serve_inner(path, None)
+}
+
+/// Serve a CLI-derived path, protecting Remuda's own runtime directory while
+/// validating any user-selected socket parent without changing its mode.
+pub fn serve_with_runtime(path: &Path, runtime: &Path) -> std::io::Result<()> {
+    serve_inner(path, Some(runtime))
+}
+
+fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
+    let _socket_lock = SocketLock::acquire(path, runtime)?;
     if ipc::connect(path).is_ok() {
         return Err(std::io::Error::other(format!(
             "a daemon is already listening at {} — pick a different name (remuda -s <name>) \
@@ -192,7 +206,7 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     let signals = catch_signals()?;
     let listener: Listener = ipc::listen(path)?;
     #[cfg(unix)]
-    let listener = prepare_unix_listener(listener)?;
+    let listener = prepare_unix_listener(listener, path)?;
     #[cfg(windows)]
     let listener = listener;
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
@@ -229,7 +243,7 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     {
         serve_unix(
             listener,
-            path,
+            (path, runtime),
             signals,
             registry,
             image,
@@ -250,7 +264,7 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
 #[cfg(unix)]
 fn serve_unix(
     mut listener: Listener,
-    path: &Path,
+    socket: (&Path, Option<&Path>),
     mut signals: std::os::unix::net::UnixStream,
     registry: Arc<Registry>,
     image: Image,
@@ -300,7 +314,7 @@ fn serve_unix(
                     for byte in &signal_bytes[..count] {
                         let signal = libc::c_int::from(*byte);
                         if signal == libc::SIGUSR1 {
-                            rebind_after_sigusr1(&mut listener, path, &socket_owner);
+                            rebind_after_sigusr1(&mut listener, socket.0, socket.1, &socket_owner);
                             // The old listener's readiness bits cannot describe
                             // the replacement listener. Poll both fds again.
                             continue 'poll_loop;
@@ -354,11 +368,16 @@ fn serve_unix(
 }
 
 #[cfg(unix)]
-fn prepare_unix_listener(mut listener: Listener) -> std::io::Result<Listener> {
+fn prepare_unix_listener(mut listener: Listener, path: &Path) -> std::io::Result<Listener> {
+    use std::os::unix::fs::PermissionsExt;
+
     // SocketOwnership performs inode-conditional cleanup, so an old listener
     // must never unlink a replacement path when it is dropped.
     listener.do_not_reclaim_name_on_drop();
     listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+    // Both initial binds and SIGUSR1 rebinds occur inside a validated private
+    // directory before the socket mode is tightened.
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
 }
 
@@ -371,15 +390,27 @@ fn unix_listener_fd(listener: &Listener) -> std::os::fd::RawFd {
 }
 
 #[cfg(unix)]
-fn rebind_after_sigusr1(listener: &mut Listener, path: &Path, socket_owner: &SocketOwnership) {
+fn rebind_after_sigusr1(
+    listener: &mut Listener,
+    path: &Path,
+    runtime: Option<&Path>,
+    socket_owner: &SocketOwnership,
+) {
     // Our current listener already owns this exact path, so rebinding it would
     // only perform an unnecessary self-connect and report a misleading error.
     if socket_owner.owns_path() {
         return;
     }
+    if let Err(error) = prepare_socket_path(path, runtime) {
+        eprintln!(
+            "remuda daemon: could not validate socket directory {} before rebind: {error}",
+            path.display()
+        );
+        return;
+    }
     match ipc::listen(path) {
         Ok(replacement) => {
-            let replacement = match prepare_unix_listener(replacement) {
+            let replacement = match prepare_unix_listener(replacement, path) {
                 Ok(listener) => listener,
                 Err(error) => {
                     eprintln!(
@@ -439,14 +470,18 @@ const SOCKET_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 const SOCKET_LOCK_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 
 impl SocketLock {
-    fn acquire(socket: &Path) -> std::io::Result<Self> {
+    fn acquire(socket: &Path, runtime: Option<&Path>) -> std::io::Result<Self> {
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-            let parent = socket.parent().unwrap_or_else(|| Path::new("."));
-            std::fs::create_dir_all(parent)?;
+            prepare_socket_path(socket, runtime).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("prepare socket path {}: {error}", socket.display()),
+                )
+            })?;
             let mut lock_name = socket.as_os_str().to_os_string();
             lock_name.push(".lock");
             let lock_path = PathBuf::from(lock_name);
@@ -507,9 +542,173 @@ impl SocketLock {
         #[cfg(windows)]
         {
             let _ = socket;
+            let _ = runtime;
             Ok(Self {})
         }
     }
+}
+
+#[cfg(unix)]
+pub fn prepare_socket_path(socket: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
+    let socket = normalize_socket_path(socket)?;
+    let parent = socket.parent().unwrap_or_else(|| Path::new("."));
+    let Some(runtime) = runtime else {
+        std::fs::create_dir_all(parent)?;
+        return validate_socket_directory(parent, unsafe { libc::geteuid() }, false);
+    };
+
+    let runtime = normalize_socket_path(runtime)?;
+    let managed = runtime.join("remuda");
+    if parent == managed || parent.starts_with(&managed) {
+        prepare_runtime_base(&runtime)?;
+        prepare_managed_socket_directory(&managed)?;
+        if parent != managed {
+            // Nested -s paths live below our private runtime directory, but
+            // their own mode remains user controlled.
+            std::fs::create_dir_all(parent)?;
+            validate_socket_directory(parent, unsafe { libc::geteuid() }, false)?;
+        }
+    } else {
+        // Absolute and escaping -s paths are user-owned locations. Never
+        // tighten them; inspect before the client creates the startup log.
+        std::fs::create_dir_all(parent)?;
+        validate_socket_directory(parent, unsafe { libc::geteuid() }, false)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_runtime_base(path: &Path) -> std::io::Result<()> {
+    let path = normalize_socket_path(path)?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    create_private_directory_if_absent(&path)?;
+    validate_socket_directory(&path, unsafe { libc::geteuid() }, false)
+}
+
+#[cfg(unix)]
+fn prepare_managed_socket_directory(path: &Path) -> std::io::Result<()> {
+    let path = normalize_socket_path(path)?;
+    create_private_directory_if_absent(&path)?;
+    validate_socket_directory(&path, unsafe { libc::geteuid() }, true)
+}
+
+/// Remove path spellings that can hide the directory actually opened by the
+/// kernel. Parent traversal is rejected so validation cannot be bypassed by
+/// comparing a path before resolving `..`.
+#[cfg(unix)]
+fn normalize_socket_path(path: &Path) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("socket path {} contains '..'; refusing", path.display()),
+                ));
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    Ok(normalized)
+}
+
+#[cfg(unix)]
+fn create_private_directory_if_absent(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => {
+            // Umask can only remove permissions. Make the owner mode exact
+            // before any contents are created; the new leaf is not traversable
+            // by other users during this brief adjustment.
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn validate_socket_directory(
+    path: &Path,
+    expected_uid: libc::uid_t,
+    tighten: bool,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let path = normalize_socket_path(path)?;
+
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("socket directory {} is a symlink; refusing", path.display()),
+        ));
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    let directory = options.open(&path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("socket parent {} is not a directory", path.display()),
+        ));
+    }
+    if metadata.uid() != expected_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "socket directory {} is owned by uid {}, expected {}; choose a private REMUDA_RUNTIME_DIR",
+                path.display(),
+                metadata.uid(),
+                expected_uid
+            ),
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "socket directory {} is group- or world-writable (mode {mode:04o}); remove those write permissions before starting remuda",
+                path.display()
+            ),
+        ));
+    }
+    if tighten && mode != 0o700 {
+        // Tighten through the opened directory handle; this also removes any
+        // special permission bits and avoids following a replacement symlink.
+        directory
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("tighten socket directory {}: {error}", path.display()),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+pub fn prepare_socket_path(_socket: &Path, _runtime: Option<&Path>) -> std::io::Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1639,6 +1838,127 @@ mod tests {
             runtime_base_for(false, None, Path::new("/termux/tmp"), "jeongsoo"),
             Path::new("/tmp/remuda-jeongsoo")
         );
+    }
+
+    #[cfg(unix)]
+    fn socket_test_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "remuda-socket-policy-{}-{label}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_socket_parent_is_validated_without_changing_its_mode() {
+        use super::prepare_socket_path;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = socket_test_dir("custom-parent");
+        let runtime = root.join("runtime");
+        let custom = root.join("chosen");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::set_permissions(&custom, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let before = std::fs::metadata(&custom).unwrap().mode() & 0o7777;
+
+        prepare_socket_path(&custom.join("X.sock"), Some(&runtime)).unwrap();
+
+        assert_eq!(std::fs::metadata(&custom).unwrap().mode() & 0o7777, before);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_socket_name_keeps_the_managed_runtime_directory_private() {
+        use super::prepare_socket_path;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = socket_test_dir("nested-name");
+        let runtime = root.join("runtime");
+        let socket = runtime.join("remuda/sub/X.sock");
+
+        prepare_socket_path(&socket, Some(&runtime)).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(runtime.join("remuda"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_socket_directory_is_refused() {
+        use super::validate_socket_directory;
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = socket_test_dir("writable-leaf");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let uid = unsafe { libc::geteuid() };
+
+        let error = validate_socket_directory(&path, uid, true).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("group- or world-writable"));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_runtime_base_is_refused_before_managed_directory_creation() {
+        use super::prepare_socket_path;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = socket_test_dir("writable-base");
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = prepare_socket_path(&root.join("remuda/s.sock"), Some(&root)).unwrap_err();
+
+        assert!(error.to_string().contains("group- or world-writable"));
+        assert!(!root.join("remuda").exists());
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_owned_base_is_refused() {
+        use super::validate_socket_directory;
+
+        let path = socket_test_dir("foreign-base");
+        let uid = unsafe { libc::geteuid() };
+
+        let error = validate_socket_directory(&path, uid.wrapping_add(1), false).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("owned by uid"));
+        std::fs::remove_dir_all(path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_socket_directory_has_a_specific_refusal_message() {
+        use super::validate_socket_directory;
+
+        let root = socket_test_dir("symlink");
+        let target = root.join("target");
+        let link = root.join("link");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let uid = unsafe { libc::geteuid() };
+
+        let error = validate_socket_directory(&link, uid, true).unwrap_err();
+
+        assert!(error.to_string().contains("is a symlink; refusing"));
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[cfg(windows)]

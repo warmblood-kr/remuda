@@ -66,6 +66,19 @@ convenient.
 restart a daemon or stop sessions; already-loaded Lua definitions remain live
 until the next daemon restart.
 
+## Atomic file writes
+
+`remuda.fs.write_atomic(path, bytes)` replaces one file from trusted Lua code.
+It writes a unique temporary file beside the target, syncs the bytes, and
+renames the temporary file over the target. Unix also syncs the parent
+directory. The target path is replaced as a directory entry, so a symlink at
+that path is not followed. The parent directory must already exist.
+
+On success the function returns `true, nil`; on an I/O error it returns
+`nil, error`. New files use mode `0644` filtered through the process umask.
+This word does not restrict paths: the Lua runtime already provides trusted
+scripts with `io.open` and `os.rename`.
+
 ## JSON values
 
 `remuda.json.decode(text)` reads at most 8 MiB of UTF-8 JSON and returns

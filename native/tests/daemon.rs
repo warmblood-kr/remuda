@@ -308,6 +308,179 @@ fn daemon_lock_file_is_private() {
 
 #[cfg(unix)]
 #[test]
+fn daemon_socket_and_directory_are_private_on_first_start() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("private-socket-fresh");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create isolated runtime directory");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let daemon = Daemon::spawn(&dir);
+    let directory_mode = std::fs::metadata(socket.parent().unwrap())
+        .expect("socket directory exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    let socket_mode = std::fs::metadata(&socket)
+        .expect("daemon socket exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    drop(daemon);
+    std::fs::remove_dir_all(&dir).expect("remove isolated runtime directory");
+
+    assert_eq!(directory_mode, 0o700, "socket directory must be private");
+    assert_eq!(socket_mode, 0o600, "daemon socket must be private");
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_tightens_a_preexisting_socket_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("private-socket-existing");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create isolated runtime directory");
+    let socket = daemon::socket_path_in(&dir, "s");
+    std::fs::create_dir_all(socket.parent().unwrap()).expect("create socket directory");
+    std::fs::set_permissions(
+        socket.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("make a permissive preexisting socket directory");
+
+    let daemon = Daemon::spawn(&dir);
+    let directory_mode = std::fs::metadata(socket.parent().unwrap())
+        .expect("socket directory exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    let socket_mode = std::fs::metadata(&socket)
+        .expect("daemon socket exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    drop(daemon);
+    std::fs::remove_dir_all(&dir).expect("remove isolated runtime directory");
+
+    assert_eq!(
+        directory_mode, 0o700,
+        "existing directory must be tightened"
+    );
+    assert_eq!(socket_mode, 0o600, "daemon socket must be private");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_custom_absolute_socket_path_does_not_change_its_parent_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runtime = scratch_dir("custom-absolute-socket");
+    let custom = runtime.join("chosen");
+    std::fs::create_dir(&custom).expect("create user-selected socket directory");
+    std::fs::set_permissions(&custom, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let custom_server = custom.join("X").to_string_lossy().into_owned();
+    let output = remuda_timed(&runtime, &["-s", &custom_server, "-e", "return true"]);
+
+    assert!(
+        output.status.success(),
+        "custom socket path failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(&custom).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    let _ = remuda_timed(&runtime, &["-s", &custom_server, "stop"]);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_nested_socket_name_keeps_the_runtime_directory_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let runtime = scratch_dir("nested-socket-name");
+    let output = remuda_timed(&runtime, &["-s", "sub/X", "-e", "return true"]);
+
+    assert!(
+        output.status.success(),
+        "nested socket path failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(runtime.join("remuda"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    let _ = remuda_timed(&runtime, &["-s", "sub/X", "stop"]);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_symlinked_runtime_directory_is_rejected_before_a_startup_log_is_created() {
+    let runtime = scratch_dir("symlink-runtime");
+    let target = runtime.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, runtime.join("remuda")).unwrap();
+
+    let output = remuda_timed(&runtime, &["-s", "s", "-e", "return true"]);
+
+    assert!(!output.status.success());
+    assert!(
+        !target.join("s.log").exists(),
+        "must not create log through symlink"
+    );
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    std::fs::remove_dir_all(runtime).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_runtime_base_is_rejected_with_trailing_separators_and_dot() {
+    let root = scratch_dir("symlink-runtime-base");
+    let target = root.join("target");
+    let link = root.join("link");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    for runtime in [link.clone(), root.join("link/"), root.join("link/.")] {
+        let socket = runtime.join("remuda").join("s.sock");
+        let result = daemon::prepare_socket_path(&socket, Some(&runtime));
+        assert!(result.is_err(), "accepted symlink runtime {runtime:?}");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_custom_socket_parents_are_rejected_after_path_normalization() {
+    let root = scratch_dir("symlink-custom-parent");
+    let target = root.join("target");
+    let link = root.join("link");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    for parent in [
+        link.clone(),
+        PathBuf::from(format!("{}/", link.display())),
+        PathBuf::from(format!("{}/.", link.display())),
+    ] {
+        let socket = parent.join("s.sock");
+        let result = daemon::prepare_socket_path(&socket, Some(&root.join("runtime")));
+        assert!(result.is_err(), "accepted symlink socket parent {parent:?}");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_signal_cleanup_preserves_a_replacement_socket_path() {
     use std::os::unix::fs::FileTypeExt;
 
@@ -334,6 +507,8 @@ fn daemon_signal_cleanup_preserves_a_replacement_socket_path() {
 #[cfg(unix)]
 #[test]
 fn sigusr1_rebinds_a_deleted_socket() {
+    use std::os::unix::fs::PermissionsExt;
+
     let dir = scratch_dir("daemon-sigusr1-rebind");
     let mut daemon = Daemon::spawn(&dir);
     let socket = daemon::socket_path_in(&dir, "s");
@@ -341,6 +516,21 @@ fn sigusr1_rebinds_a_deleted_socket() {
         for cycle in 1..=20 {
             signal_rebind_and_wait(&daemon, &socket)
                 .map_err(|error| format!("rebind cycle {cycle}/20: {error}"))?;
+            let socket_mode = std::fs::metadata(&socket)
+                .map_err(|error| error.to_string())?
+                .permissions()
+                .mode()
+                & 0o777;
+            let directory_mode = std::fs::metadata(socket.parent().unwrap())
+                .map_err(|error| error.to_string())?
+                .permissions()
+                .mode()
+                & 0o777;
+            if socket_mode != 0o600 || directory_mode != 0o700 {
+                return Err(format!(
+                    "rebind cycle {cycle}/20 modes were socket {socket_mode:04o}, directory {directory_mode:04o}"
+                ));
+            }
         }
         Ok::<(), String>(())
     })();
@@ -3269,6 +3459,30 @@ fn the_daemon_names_the_build_it_was_started_from() {
         Response::Value(said) => assert_eq!(said, remuda_native::dist::BUILD_VERSION),
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn idle_daemon_version_requests_do_not_wait_for_a_poll_interval() {
+    let dir = scratch_dir("version-latency");
+    let path = daemon::socket_path_in(&dir, "s");
+    let daemon = Daemon::spawn(&dir);
+    let mut samples = Vec::with_capacity(50);
+
+    for _ in 0..50 {
+        let started = Instant::now();
+        match client::request(&path, &Request::Version).expect("version") {
+            Response::Value(said) => assert_eq!(said, remuda_native::dist::BUILD_VERSION),
+            other => panic!("unexpected: {other:?}"),
+        }
+        samples.push(started.elapsed());
+    }
+
+    samples.sort_unstable();
+    let p50 = samples[samples.len() / 2];
+    assert!(p50 < Duration::from_millis(5), "Version p50 was {p50:?}");
+    drop(daemon);
+    std::fs::remove_dir_all(dir).expect("remove isolated runtime directory");
 }
 
 // Unix only: the regression is SIGPIPE, and `true` is not a Windows command.
