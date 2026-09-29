@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 //! Regression coverage for text entry that a terminal UI recognizes as paste.
 
 use remuda_core::protocol::{Request, Response};
