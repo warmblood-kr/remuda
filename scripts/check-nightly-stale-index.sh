@@ -1,16 +1,10 @@
 #!/bin/sh
-# Regression test for a live defect: latest.json is served with
-# cache-control: max-age=600, but the nightly tag is fixed and every release
-# replaces its assets. For up to ten minutes after a push to main, the cached
-# index names a nightly version whose assets no longer exist, and a naive
-# `remuda-$version-$target.tar.gz` 404s outright. This shipped twice on
-# 2026-09-10, four minutes apart, overlapping into one continuous window.
-#
-# This test injects a deliberately WRONG nightly version in place of the real
-# index (a curl shim rewrites only the latest.json fetch; every other URL,
-# including the real SHA256SUMS and asset download, goes to the real curl)
-# and requires the install to succeed anyway by discovering the real asset
-# name from SHA256SUMS instead of trusting the stale version string.
+# Integration check for cached nightly pointers. CI checks out the published
+# latest.json value; while a run is in progress, main can advance and make that
+# snapshot stale. Immutable nightly releases mean the old pointer still works.
+# The curl shim serves this checkout's nightly version as the cached snapshot
+# and confirms the installer tries the versioned tag before its migration
+# fallback to the rolling alias (needed until the first new release publishes).
 #
 # Run it yourself:  scripts/check-nightly-stale-index.sh
 set -eu
@@ -20,33 +14,44 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 real_curl=$(command -v curl) || { echo "check-nightly-stale-index: need curl" >&2; exit 1; }
+expected_nightly=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nightly"])' "$ROOT/docs/latest.json")
+[ -n "$expected_nightly" ] || { echo "check-nightly-stale-index: no nightly version in latest.json" >&2; exit 1; }
 
 mkdir -p "$tmp/shim"
 cat >"$tmp/shim/curl" <<'EOF'
 #!/bin/sh
+url=
 for a in "$@"; do
-	case "$a" in
-	*/latest.json)
-		echo '{"stable":"0.0.0","nightly":"0.0.0-stale-test-version","updated":"1970-01-01T00:00:00Z"}'
-		exit 0
-		;;
-	esac
+  case "$a" in http://*|https://*) url=$a ;; esac
 done
-exec __REAL_CURL__ "$@"
+case "$url" in
+  */latest.json)
+    printf '{"stable":"0.0.0","nightly":"%s","updated":"1970-01-01T00:00:00Z"}\n' "$EXPECTED_NIGHTLY"
+    exit 0
+    ;;
+  */releases/download/"$EXPECTED_NIGHTLY"/*)
+    printf '%s\n' "$url" >> "$REQUEST_LOG"
+    exec "$REAL_CURL" "$@"
+    ;;
+esac
+exec "$REAL_CURL" "$@"
 EOF
-sed "s#__REAL_CURL__#$real_curl#" "$tmp/shim/curl" >"$tmp/shim/curl.tmp" && mv "$tmp/shim/curl.tmp" "$tmp/shim/curl"
 chmod +x "$tmp/shim/curl"
 
-export HOME="$tmp/home"
-export XDG_DATA_HOME="$tmp/data"
-export REMUDA_INSTALL_DIR="$tmp/bin"
+export REAL_CURL="$real_curl" EXPECTED_NIGHTLY="$expected_nightly" REQUEST_LOG="$tmp/requests"
+export HOME="$tmp/home" XDG_DATA_HOME="$tmp/data" REMUDA_INSTALL_DIR="$tmp/bin"
 export REMUDA_CHANNEL=nightly
 mkdir -p "$HOME" "$XDG_DATA_HOME" "$REMUDA_INSTALL_DIR"
 
 PATH="$tmp/shim:$PATH" sh "$ROOT/docs/install.sh"
 
-[ -x "$REMUDA_INSTALL_DIR/remuda" ] || {
-	echo "check-nightly-stale-index: install did not produce $REMUDA_INSTALL_DIR/remuda despite a stale index" >&2
+grep -F "/releases/download/$expected_nightly/SHA256SUMS" "$REQUEST_LOG" >/dev/null || {
+	echo "check-nightly-stale-index: installer did not try the indexed version tag first" >&2
 	exit 1
 }
-echo "ok — nightly install succeeded despite a deliberately stale latest.json"
+
+[ -x "$REMUDA_INSTALL_DIR/remuda" ] || {
+  echo "check-nightly-stale-index: install did not produce $REMUDA_INSTALL_DIR/remuda" >&2
+  exit 1
+}
+echo "ok — cached nightly index tried immutable tag $expected_nightly first"
