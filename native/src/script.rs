@@ -30,13 +30,14 @@ use std::time::Duration;
 /// directions.
 pub const BINDINGS: [&str; 81] = [
     "_advice_reattach",
-    "_bracketed_paste_enabled",
     "_call",
     "_descriptors",
     "_dispatch_extension_command",
     "_event_counts",
     "_extension_commands",
     "_function_source",
+    "_input_submit",
+    "_input_text",
     "_module_readiness",
     "_pending_create",
     "_pending_events",
@@ -49,7 +50,6 @@ pub const BINDINGS: [&str; 81] = [
     "_registry_dump",
     "_run_due_schedules",
     "_schedule_fire_counts",
-    "_session_alive",
     "_session_resize",
     "_sync_window_shown",
     "advice_list",
@@ -116,9 +116,14 @@ pub const BINDINGS: [&str; 81] = [
 /// own rows for the words it defines in pure Lua, into the same table.
 const WORDS: &[(&str, &str, &str)] = &[
     (
-        "_bracketed_paste_enabled",
-        "Read whether a child session enabled bracketed paste mode.",
-        "_bracketed_paste_enabled(name) -> boolean",
+        "_input_submit",
+        "Submit visible session text with a separate Return and at most one retry.",
+        "_input_submit(name, expect) -> nil",
+    ),
+    (
+        "_input_text",
+        "Deliver a normalized text burst, bracketed when enabled by the child.",
+        "_input_text(name, text) -> nil",
     ),
     (
         "_module_readiness",
@@ -139,11 +144,6 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_session_resize",
         "Resize a session after validating its requested dimensions.",
         "_session_resize(name, cols, rows) -> true, nil | nil, error",
-    ),
-    (
-        "_session_alive",
-        "Check whether a session's child process is still running.",
-        "_session_alive(name) -> boolean",
     ),
     (
         "http",
@@ -410,7 +410,7 @@ pub fn bindings(
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
-    let alive_registry = registry.clone();
+    let input_registry = registry.clone();
     fail_binding(lua, &table, image.clone())?;
     pending_bindings(lua, &table, image.pending_replies())?;
 
@@ -454,23 +454,27 @@ pub fn bindings(
         })?,
     )?;
 
-    let path = at();
+    let text_registry = input_registry.clone();
     table.set(
-        "_bracketed_paste_enabled",
-        lua.create_function(move |lua, name: String| {
-            match ask(&path, Request::MouseState { name })? {
-                Response::MouseState(state) => Ok(state.bracketed_paste),
-                other => value(lua, other).map(|_| false),
-            }
+        "_input_text",
+        lua.create_function(move |_, (name, text): (String, String)| {
+            let session = text_registry
+                .get(&name)
+                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
+            session
+                .input_text(&text)
+                .map_err(|error| mlua::Error::runtime(error.to_string()))
         })?,
     )?;
-
     table.set(
-        "_session_alive",
-        lua.create_function(move |_, name: String| {
-            Ok(alive_registry
+        "_input_submit",
+        lua.create_function(move |_, (name, expect): (String, String)| {
+            let session = input_registry
                 .get(&name)
-                .is_some_and(|session| session.is_alive()))
+                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
+            session
+                .submit(&expect)
+                .map_err(|error| mlua::Error::runtime(error.to_string()))
         })?,
     )?;
 

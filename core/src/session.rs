@@ -249,10 +249,24 @@ impl Session {
             let _held = self.acquire_input_lock()?;
             return self.write_one_burst(&bytes);
         }
-        let compact_tail = input_tail(&body);
-        let bracketed = self.mouse_state().bracketed_paste;
         let _held = self.acquire_input_lock()?;
+        self.input_text_locked(&body)?;
+        self.submit_locked(&input_tail(&body))
+    }
 
+    /// Deliver a normalized text burst, bracketed when the child enabled mode
+    /// 2004. The burst contains no submit key.
+    pub fn input_text(&self, text: &str) -> Result<()> {
+        let body = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\x1b', "");
+        let _held = self.acquire_input_lock()?;
+        self.input_text_locked(&body)
+    }
+
+    fn input_text_locked(&self, body: &str) -> Result<()> {
+        let bracketed = self.mouse_state().bracketed_paste;
         let burst = if bracketed {
             let mut bytes = Vec::with_capacity(body.len() + 12);
             bytes.extend_from_slice(b"\x1b[200~");
@@ -262,23 +276,36 @@ impl Session {
         } else {
             body.as_bytes().to_vec()
         };
-        self.write_one_burst(&burst)?;
+        self.write_one_burst(&burst)
+    }
 
-        if compact_tail.is_empty() {
+    /// Submit with a separate Return after the text is visible. A changed
+    /// screen after Return means it was submitted; an unchanged screen after
+    /// the bounded observation means Return became a composer newline.
+    pub fn submit(&self, expect: &str) -> Result<()> {
+        let _held = self.acquire_input_lock()?;
+        self.submit_locked(&input_tail(expect))
+    }
+
+    fn submit_locked(&self, tail: &str) -> Result<()> {
+        if tail.is_empty() {
             return self.write_one_burst(b"\r");
         }
 
-        // The input may be plain shell input (or a TUI whose echo is delayed).
-        // Wait for the tail to appear, but preserve the old useful fallback.
         let mut waited = Duration::ZERO;
         while waited < Duration::from_secs(2) {
-            if self.composer_tail_visible(&compact_tail) {
+            if self
+                .compact_screen()
+                .is_some_and(|screen| screen.contains(tail))
+            {
                 break;
             }
             let step = Duration::from_millis(50);
             self.clock.sleep(step);
             waited += step;
         }
+
+        let before = self.compact_screen().unwrap_or_default();
         self.write_one_burst(b"\r")?;
 
         waited = Duration::ZERO;
@@ -286,27 +313,24 @@ impl Session {
             if !self.is_alive() {
                 return Ok(());
             }
-            if !self.composer_tail_visible(&compact_tail) {
+            if self.compact_screen().is_some_and(|screen| screen != before) {
                 return Ok(());
             }
             let step = Duration::from_millis(50);
             self.clock.sleep(step);
             waited += step;
         }
-        if self.is_alive() && self.composer_tail_visible(&compact_tail) {
+        if self.is_alive() && self.compact_screen().as_deref() == Some(before.as_str()) {
             self.write_one_burst(b"\r")?;
         }
         Ok(())
     }
 
-    fn composer_tail_visible(&self, tail: &str) -> bool {
-        self.screen_text()
-            .ok()
-            .map(|screen| {
-                let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
-                compact.ends_with(tail)
-            })
-            .unwrap_or(false)
+    fn compact_screen(&self) -> Option<String> {
+        self.screen_text().ok().map(|screen| {
+            let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+            compact
+        })
     }
 
     /// Deliver a burst of input as one indivisible act, appending nothing — the

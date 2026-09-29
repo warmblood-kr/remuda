@@ -1804,62 +1804,14 @@ local function normalized_text(text)
 end
 
 function remuda.input.text(session, text)
-  local body = normalized_text(text)
-  if remuda._bracketed_paste_enabled(session) then
-    body = "\27[200~" .. body .. "\27[201~"
-  end
-  -- One Send request means even an unbracketed multiline body is one burst.
-  remuda.insert(session, body)
+  remuda._input_text(session, normalized_text(text))
 end
 
 register("input", "Terminal input words for text delivery and submission.", "table")
 register("input.text", "Deliver text as one burst, using bracketed paste when enabled by the child.", "input.text(session, text) -> nil")
 
-local function visible_tail(session, tail)
-  if tail == "" then return false end
-  local screen = remuda.capture(session):gsub("%s", "")
-  return screen:sub(-#tail) == tail
-end
-
-local function expected_tail(text)
-  local compact = normalized_text(text):gsub("%s", "")
-  local tail = compact:sub(-20)
-  while tail:byte(1) and tail:byte(1) >= 0x80 and tail:byte(1) <= 0xBF do
-    tail = tail:sub(2)
-  end
-  return tail
-end
-
 function remuda.input.submit(session, expect)
-  local tail = expected_tail(expect)
-  if tail == "" then
-    remuda.insert(session, "\r")
-    return
-  end
-  local waited = 0
-  while waited < 2 do
-    if visible_tail(session, tail) then
-      break
-    end
-    remuda.sleep(0.05)
-    waited = waited + 0.05
-  end
-
-  -- A plain shell may not expose an editable composer. Keep it usable by
-  -- sending Return after the bounded visibility wait even when unseen.
-  remuda.insert(session, "\r")
-
-  waited = 0
-  while waited < 1 do
-    if not remuda._session_alive(session) then return end
-    if not visible_tail(session, tail) then return end
-    remuda.sleep(0.05)
-    waited = waited + 0.05
-  end
-  -- The first Return may have become a newline in a paste-sensitive TUI.
-  if remuda._session_alive(session) and visible_tail(session, tail) then
-    remuda.insert(session, "\r")
-  end
+  remuda._input_submit(session, normalized_text(expect))
 end
 
 register("input.submit", "Submit visible composer text with a separate Return and at most one retry.", "input.submit(session, expect) -> nil")
