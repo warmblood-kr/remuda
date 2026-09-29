@@ -121,7 +121,12 @@ fn wheel_reaches_a_focused_agent_but_scrolls_remuda_history_in_browse_mode() {
         ui.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         Action::Focus("agent".into())
     );
-    assert_eq!(ui.on_mouse(wheel, 80, 24), Action::Nothing);
+    assert_eq!(ui.on_mouse(wheel, 80, 24), Action::Scroll(-3));
+    let wheel_up = MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        ..wheel
+    };
+    assert_eq!(ui.on_mouse(wheel_up, 80, 24), Action::Scroll(3));
 
     let mut tracking = ui_with_mouse_tracking(true);
     assert_eq!(

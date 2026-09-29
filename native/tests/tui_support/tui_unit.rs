@@ -652,6 +652,58 @@ fn shift_wheel_is_forwarded_to_the_child_tui() {
 }
 
 #[test]
+fn any_session_key_returns_scrollback_to_live_follow() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    assert_eq!(ui.on_key(press(KeyCode::Enter)), Action::Focus("a".into()));
+    ui.scrollback.insert(
+        "a".into(),
+        ScrollState {
+            offset: 7,
+            history_rows: 20,
+            ..ScrollState::default()
+        },
+    );
+
+    assert_eq!(ui.on_key(press(KeyCode::Null)), Action::Nothing);
+    assert_eq!(ui.scrollback["a"].offset, 0);
+}
+
+#[test]
+fn scrolled_preview_shows_indicator_in_plain_and_styled_frames_until_live() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    ui.scrollback.insert(
+        "a".into(),
+        ScrollState {
+            offset: 3,
+            history_rows: 20,
+            ..ScrollState::default()
+        },
+    );
+    let indicator = "[scrollback: 3 rows — any key returns]";
+    let plain = render(&ui, "older content", "test", 80, 24);
+    assert!(plain.contains(indicator), "plain frame: {plain:?}");
+
+    let cells = vec![vec![remuda_core::agent::StyledCell::default(); 80]; 24];
+    let styled = render_styled(
+        &ui,
+        &cells,
+        Cursor {
+            row: 0,
+            col: 0,
+            visible: false,
+        },
+        "test",
+        80,
+        24,
+    );
+    assert!(styled.contains(indicator), "styled frame: {styled:?}");
+
+    scroll_selected(&mut ui, -3);
+    let live = render(&ui, "current content", "test", 80, 24);
+    assert!(!live.contains("[scrollback:"), "live frame: {live:?}");
+}
+
+#[test]
 fn paging_moves_by_one_preview_page_and_end_returns_to_follow() {
     let mut ui = make_ui(vec![row("a", true, false)]);
     ui.scrollback.insert(
@@ -814,7 +866,7 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     }
     assert!(ui.scrollback["stream"].offset >= 30);
 
-    for _ in 0..30 {
+    for _ in 0..60 {
         assert_eq!(
             ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
             Action::Scroll(-3)
@@ -922,6 +974,85 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
             }
         },
         || "history did not grow while scrolled".into(),
+    );
+    let _ = client::request(
+        &path,
+        &Request::Close {
+            name: "stream".into(),
+            instance_id: None,
+            confirm: None,
+        },
+    );
+}
+
+#[test]
+fn real_preview_keeps_content_anchored_after_wheel_down_enters_settle() {
+    let path = scratch_socket("preview-settle-content-anchor");
+    daemon_at(&path);
+    let command = streaming_command(
+        "i=0; while [ $i -lt 90 ]; do printf 'settle-%03d\\n' $i; i=$((i + 1)); sleep 0.1; done; sleep 2",
+        "$ErrorActionPreference='Stop'; for ($i=0; $i -lt 90; $i++) { Write-Output ('settle-{0:D3}' -f $i); Start-Sleep -Milliseconds 100 }; Start-Sleep -Seconds 2",
+    );
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("stream".into()),
+            command,
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("new streaming session");
+    assert_eq!(response, Response::Value("stream".into()));
+
+    let mut ui = make_ui(vec![row("stream", true, false)]);
+    wait_for_output(
+        || {
+            capture_preview(&path, &mut ui, "stream").expect("capture preview");
+            (ui.scrollback["stream"].history_rows >= 40).then_some(())
+        },
+        || "output did not reach scrollback".into(),
+    );
+    let wheel = |kind| MouseEvent {
+        kind,
+        column: 19,
+        row: 4,
+        modifiers: KeyModifiers::NONE,
+    };
+    for _ in 0..5 {
+        assert_eq!(
+            ui.on_mouse(wheel(MouseEventKind::ScrollUp), 80, 24),
+            Action::Scroll(3)
+        );
+        scroll_selected(&mut ui, 3);
+        capture_preview(&path, &mut ui, "stream").expect("capture scroll-up");
+    }
+    assert_eq!(
+        ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
+        Action::Scroll(-3)
+    );
+    scroll_selected(&mut ui, -3);
+    let (anchor_cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("enter settle");
+    let anchor_text = terminal_rows_text(&anchor_cells);
+    let anchor_history = ui.scrollback["stream"].history_rows;
+
+    wait_for_output(
+        || {
+            let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture output");
+            let state = ui.scrollback["stream"];
+            if state.history_rows >= anchor_history + 3 {
+                assert_eq!(
+                    terminal_rows_text(&cells),
+                    anchor_text,
+                    "wheel-down settle must preserve the visible history rows"
+                );
+                Some(())
+            } else {
+                None
+            }
+        },
+        || "history did not grow while in wheel-down settle".into(),
     );
     let _ = client::request(
         &path,

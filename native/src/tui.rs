@@ -39,7 +39,6 @@ const DAEMON_FAILURES_BEFORE_GONE: u8 = 3;
 /// than `TICK` so a keypress is never left waiting to be noticed. Used to
 /// also be the redraw cadence; see steps/017 for why that was the bug.
 const TICK_TYPING: Duration = Duration::from_millis(40);
-const SCROLL_DOWN_SETTLE: Duration = Duration::from_millis(1500);
 const MAX_ANCHOR_CAPTURES: usize = 3;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -155,7 +154,6 @@ struct ScrollState {
     /// Total corresponding to `offset`; can lag `history_total` when output
     /// keeps arriving through the bounded capture retries.
     anchor_total: usize,
-    last_scroll_down: Option<Instant>,
     scroll_direction: i8,
     recent_up_output: usize,
 }
@@ -501,7 +499,11 @@ impl Ui {
             return Action::Nothing;
         };
         if !session.mouse_tracking {
-            return Action::Nothing;
+            return match button {
+                "wheel-up" => Action::Scroll(3),
+                "wheel-down" => Action::Scroll(-3),
+                _ => Action::Nothing,
+            };
         }
         let row_offset = if self.visual_screen.is_empty() {
             (session.size.rows() as usize).saturating_sub(body as usize)
@@ -518,17 +520,15 @@ impl Ui {
     /// first and unconditionally, so no remuda command can be typed by accident
     /// into a shell — the whole reason focus exists rather than modeless keys.
     fn session_key(&mut self, key: KeyEvent) -> Action {
+        if let Some(name) = self.selected().map(|session| session.name.clone()) {
+            self.scrollback.entry(name).or_default().offset = 0;
+        }
         if is_detach(key) {
             self.focus = Focus::List;
             self.notice = None;
             return Action::Nothing;
         }
         let bytes = to_bytes(key);
-        if bytes.is_some() {
-            if let Some(name) = self.selected().map(|session| session.name.clone()) {
-                self.scrollback.entry(name).or_default().offset = 0;
-            }
-        }
         bytes.map_or(Action::Nothing, Action::Type)
     }
 
@@ -1917,7 +1917,12 @@ pub fn render(ui: &Ui, screen: &str, server: &str, cols: u16, rows: u16) -> Stri
         ""
     };
 
-    let (lines, cut) = crop(screen, preview_w, body, ui.pan);
+    let (mut lines, cut) = crop(screen, preview_w, body, ui.pan);
+    if let Some(indicator) = scrollback_indicator(ui) {
+        if let Some(first) = lines.first_mut() {
+            *first = indicator;
+        }
+    }
     let mut out = String::from("\x1b[H\x1b[2J");
     for row in 0..body {
         out.push_str(&format!("\x1b[{};1H", row + 1));
@@ -2119,6 +2124,14 @@ fn ui_preview_row_offset(ui: &Ui, height: u16) -> usize {
     )
 }
 
+fn scrollback_indicator(ui: &Ui) -> Option<String> {
+    let offset = ui
+        .selected()
+        .and_then(|session| ui.scrollback.get(&session.name))
+        .map_or(0, |state| state.offset);
+    (offset > 0).then(|| format!("[scrollback: {offset} rows — any key returns]"))
+}
+
 /// The one text-width rule the list renderer uses. Ambiguous-width
 /// characters (East Asian Width A, e.g. the status dot) count as narrow.
 fn char_width(c: char) -> usize {
@@ -2221,7 +2234,12 @@ pub fn render_styled(
         .and_then(|session| ui.scrollback.get(&session.name))
         .is_some_and(|state| state.offset > 0);
     let row_offset = preview_row_offset(cells, cursor, body, preserve_history);
-    let (lines, cut) = crop_styled_at_offset(&selected, preview_w, body, ui.pan, row_offset);
+    let (mut lines, cut) = crop_styled_at_offset(&selected, preview_w, body, ui.pan, row_offset);
+    if let Some(indicator) = scrollback_indicator(ui) {
+        if let Some(first) = lines.first_mut() {
+            *first = indicator;
+        }
+    }
     let caret = locate_cursor(
         cells,
         cursor,
@@ -3016,7 +3034,6 @@ fn scroll_state(state: &mut ScrollState, delta: i16) {
             state.recent_up_output = 0;
         }
         state.scroll_direction = -1;
-        state.last_scroll_down = Some(Instant::now());
         state.offset = state.offset.saturating_sub(delta.unsigned_abs() as usize);
     }
 }
@@ -3033,13 +3050,7 @@ fn anchor_offset_to_new_history(
     current_total: usize,
     current_rows: usize,
 ) -> usize {
-    if offset == 0 {
-        0
-    } else {
-        offset
-            .saturating_add(current_total.saturating_sub(previous_total))
-            .min(current_rows)
-    }
+    crate::mouse::anchor_offset_to_new_history(offset, previous_total, current_total, current_rows)
 }
 
 /// Capture at the offset computed from the history total in that capture.
@@ -3073,22 +3084,12 @@ fn capture_anchored<T>(
 /// Keep a scrolled preview on the same history rows as output pushes new rows.
 fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCapture, String> {
     let state = ui.scrollback.entry(name.to_string()).or_default();
-    let scrolling_down = state
-        .last_scroll_down
-        .is_some_and(|last| last.elapsed() < SCROLL_DOWN_SETTLE);
-    let (cells, wrapped, cursor, history_rows, history_total, anchored, anchor_total) =
-        if scrolling_down {
-            let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, state.offset)?;
-            (cells, wrapped, cursor, rows, total, state.offset, total)
-        } else {
-            let (capture, rows, total, anchored, anchor_total) =
-                capture_anchored(state.offset, state.anchor_total, |offset| {
-                    let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, offset)?;
-                    Ok(((cells, wrapped, cursor), rows, total))
-                })?;
-            let (cells, wrapped, cursor) = capture;
-            (cells, wrapped, cursor, rows, total, anchored, anchor_total)
-        };
+    let (capture, history_rows, history_total, anchored, anchor_total) =
+        capture_anchored(state.offset, state.anchor_total, |offset| {
+            let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, offset)?;
+            Ok(((cells, wrapped, cursor), rows, total))
+        })?;
+    let (cells, wrapped, cursor) = capture;
     state.offset = anchored;
     if state.scroll_direction == 1 {
         state.recent_up_output = state

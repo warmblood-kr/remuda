@@ -28,6 +28,23 @@ pub fn scroll_offset(current: usize, delta: isize, limit: usize) -> usize {
     }
 }
 
+/// Keep a scrolled offset attached to the same absolute history rows as output
+/// grows, or pinned to the oldest row once retained history is full.
+pub(crate) fn anchor_offset_to_new_history(
+    offset: usize,
+    previous_total: usize,
+    current_total: usize,
+    current_rows: usize,
+) -> usize {
+    if offset == 0 {
+        0
+    } else {
+        offset
+            .saturating_add(current_total.saturating_sub(previous_total))
+            .min(current_rows)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum MouseAction {
     Forward(Vec<u8>),
@@ -504,8 +521,8 @@ fn parse_sgr(bytes: &[u8]) -> Parse {
 #[cfg(test)]
 mod tests {
     use super::{
-        encode_for_child, route_mouse_event, scroll_offset, wheel_delta, InputToken, MouseAction,
-        SgrMouse, SgrParser, PASTE_END,
+        anchor_offset_to_new_history, encode_for_child, route_mouse_event, scroll_offset,
+        wheel_delta, InputToken, MouseAction, SgrMouse, SgrParser, PASTE_END,
     };
     use remuda_core::agent::{MouseEncoding, MouseMode, MouseState};
 
@@ -785,6 +802,16 @@ mod tests {
         assert_eq!(scroll_offset(0, 3, 10_000), 3);
         assert_eq!(scroll_offset(3, -3, 10_000), 0);
         assert_eq!(scroll_offset(9_999, 3, 10_000), 10_000);
+    }
+
+    #[test]
+    fn history_anchor_tracks_new_rows_clamps_at_oldest_and_follows_at_bottom() {
+        assert_eq!(anchor_offset_to_new_history(6, 40, 43, 100), 9);
+        assert_eq!(anchor_offset_to_new_history(0, 40, 43, 100), 0);
+        assert_eq!(
+            anchor_offset_to_new_history(9_998, 10_000, 10_010, 10_000),
+            10_000
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub struct PendingBatch {
     pub remote_node: Option<String>,
     pub name: String,
     pub instance_id: String,
+    pub paste_id: Option<u64>,
     pub client_id: String,
     pub seq: u64,
     pub bytes: Vec<u8>,
@@ -51,6 +52,7 @@ pub enum QueueEvent {
     Dropped { seq: u64, reason: String },
     Failed { seq: u64, reason: String },
     RemoteControlDisabled { seq: u64, node: String },
+    PasteAborted { seq: u64, reason: String },
 }
 
 pub const MAX_IO_RETRIES: u8 = 3;
@@ -78,6 +80,7 @@ impl InputQueue {
                 name,
                 instance_id,
             },
+            None,
             client_id,
             seq,
             bytes,
@@ -88,6 +91,7 @@ impl InputQueue {
     pub fn enqueue_target(
         &mut self,
         target: InputTarget,
+        paste_id: Option<u64>,
         client_id: String,
         seq: u64,
         bytes: Vec<u8>,
@@ -100,6 +104,7 @@ impl InputQueue {
             remote_node: target.remote_node,
             name: target.name,
             instance_id: target.instance_id,
+            paste_id,
             client_id,
             seq,
             bytes,
@@ -160,6 +165,28 @@ impl InputQueue {
             if batch.name == name
                 && batch.remote_node.as_deref() == remote_node
                 && batch.instance_id == instance_id
+                && batch.state == QueueState::Waiting
+            {
+                batch.state = QueueState::Dropped;
+                batch.status = reason.into();
+            }
+        }
+        self.prune_finished();
+    }
+
+    pub fn drop_waiting_paste(
+        &mut self,
+        remote_node: Option<&str>,
+        name: &str,
+        instance_id: &str,
+        paste_id: u64,
+        reason: &str,
+    ) {
+        for batch in &mut self.batches {
+            if batch.name == name
+                && batch.remote_node.as_deref() == remote_node
+                && batch.instance_id == instance_id
+                && batch.paste_id == Some(paste_id)
                 && batch.state == QueueState::Waiting
             {
                 batch.state = QueueState::Dropped;

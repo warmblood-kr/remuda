@@ -9,6 +9,7 @@ use std::time::Instant;
 
 pub struct InputSender {
     client_id: [u8; 16],
+    next_paste_id: u64,
     next_seq: HashMap<(Option<String>, String, String), u64>,
     target_client_ids: HashMap<(Option<String>, String, String), [u8; 16]>,
 }
@@ -17,6 +18,7 @@ impl InputSender {
     pub fn with_client_id(client_id: [u8; 16]) -> Self {
         Self {
             client_id,
+            next_paste_id: 1,
             next_seq: HashMap::new(),
             target_client_ids: HashMap::new(),
         }
@@ -36,7 +38,17 @@ impl InputSender {
         bytes: Vec<u8>,
         now: Instant,
     ) -> io::Result<u64> {
-        self.enqueue_one(queue, None, name, instance_id, bytes, now)
+        self.enqueue_one(
+            queue,
+            InputTarget {
+                remote_node: None,
+                name: name.into(),
+                instance_id: instance_id.into(),
+            },
+            None,
+            bytes,
+            now,
+        )
     }
 
     /// Queue a remote line as ordered batches within the listener's tighter cap.
@@ -66,13 +78,25 @@ impl InputSender {
         if !queue.can_enqueue(chunk_count) {
             return Err(queue_full_error());
         }
+        let paste_id = if chunk_count > 1 {
+            let paste_id = self.next_paste_id;
+            self.next_paste_id = paste_id
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("paste id exhausted"))?;
+            Some(paste_id)
+        } else {
+            None
+        };
         let mut seqs = Vec::with_capacity(chunk_count);
         for chunk in bytes.chunks(max_batch_bytes) {
             seqs.push(self.enqueue_one(
                 queue,
-                Some(node),
-                name,
-                instance_id,
+                InputTarget {
+                    remote_node: Some(node.into()),
+                    name: name.into(),
+                    instance_id: instance_id.into(),
+                },
+                paste_id,
                 chunk.to_vec(),
                 now,
             )?);
@@ -83,9 +107,8 @@ impl InputSender {
     fn enqueue_one(
         &mut self,
         queue: &mut InputQueue,
-        remote_node: Option<&str>,
-        name: &str,
-        instance_id: &str,
+        target: InputTarget,
+        paste_id: Option<u64>,
         bytes: Vec<u8>,
         now: Instant,
     ) -> io::Result<u64> {
@@ -104,26 +127,23 @@ impl InputSender {
         if !queue.can_enqueue(1) {
             return Err(queue_full_error());
         }
-        let target = (
-            remote_node.map(str::to_owned),
-            name.to_owned(),
-            instance_id.to_owned(),
+        let target_key = (
+            target.remote_node.clone(),
+            target.name.clone(),
+            target.instance_id.clone(),
         );
         let client_id = *self
             .target_client_ids
-            .entry(target.clone())
+            .entry(target_key.clone())
             .or_insert(self.client_id);
-        let next_seq = self.next_seq.entry(target).or_insert(1);
+        let next_seq = self.next_seq.entry(target_key).or_insert(1);
         let seq = *next_seq;
         *next_seq = seq
             .checked_add(1)
             .ok_or_else(|| io::Error::other("input sequence exhausted"))?;
         if !queue.enqueue_target(
-            InputTarget {
-                remote_node: remote_node.map(str::to_owned),
-                name: name.into(),
-                instance_id: instance_id.into(),
-            },
+            target,
+            paste_id,
             format_client_id(&client_id),
             seq,
             bytes,
@@ -221,10 +241,37 @@ impl InputSender {
         outcome: SendOutcome,
         now: Instant,
     ) -> Option<QueueEvent> {
-        let event = queue.finish(batch.seq, outcome, now);
+        let mut event = queue.finish(batch.seq, outcome, now);
+        let paste_failed = batch.paste_id.is_some()
+            && matches!(
+                event,
+                Some(QueueEvent::Uncertain { .. } | QueueEvent::Failed { .. })
+            );
+        if paste_failed {
+            let paste_id = batch.paste_id.expect("paste failure has a paste id");
+            queue.drop_waiting_paste(
+                batch.remote_node.as_deref(),
+                &batch.name,
+                &batch.instance_id,
+                paste_id,
+                "paste stopped after a failed chunk",
+            );
+            let reason = match event.take().expect("terminal paste event exists") {
+                QueueEvent::Uncertain { reason, .. } | QueueEvent::Failed { reason, .. } => reason,
+                _ => unreachable!("paste failure is uncertain or failed"),
+            };
+            event = Some(QueueEvent::PasteAborted {
+                seq: batch.seq,
+                reason,
+            });
+        }
         if matches!(
             event,
-            Some(QueueEvent::Uncertain { .. } | QueueEvent::Failed { .. })
+            Some(
+                QueueEvent::Uncertain { .. }
+                    | QueueEvent::Failed { .. }
+                    | QueueEvent::PasteAborted { .. }
+            )
         ) {
             self.rotate_target(queue, batch);
         } else if matches!(event, Some(QueueEvent::Dropped { .. })) {
