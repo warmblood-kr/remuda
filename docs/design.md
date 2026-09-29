@@ -105,7 +105,9 @@ session, or `reason = "exited"` when the child process ended. When known, the
 table also includes `exit_code` and/or numeric `signal` when known; a known
 signal name such as `SIGTERM` appears as `signal_name`. Explicit closes can
 terminate the child with a signal internally, but both signal fields are
-omitted when `reason` is `"closed"`. It fires once per session the daemon
+omitted when `reason` is `"closed"`. The third argument is the exited
+session's instance ID, so handlers can distinguish a late event from a newer
+session reusing the same name. It fires once per session the daemon
 notices has died, regardless of what triggered the detection — a tick, a
 `List`, or an `ls()` call.
 

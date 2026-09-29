@@ -2,10 +2,11 @@
 -- v1-v4 remain frozen; v5 remains open until the next tagged release.
 remuda._api_v5_exit_events = {}
 remuda._api_v5_legacy_exit_names = {}
+remuda._api_v5_instance_ids = {}
 remuda._api_v5_output_events = {}
 remuda._api_v5_legacy_output_names = {}
-remuda.on("session_exited", function(name, details)
-  table.insert(remuda._api_v5_exit_events, { name = name, details = details })
+remuda.on("session_exited", function(name, details, instance_id)
+  table.insert(remuda._api_v5_exit_events, { name = name, details = details, instance_id = instance_id })
 end)
 remuda.on("session_exited", function(name)
   table.insert(remuda._api_v5_legacy_exit_names, name)
@@ -58,6 +59,12 @@ function remuda._api_v5_assert_exit(name, reason, exit_code, signal, signal_name
   assert(type(event.name) == "string" and event.name == name,
     "session_exited's first argument must remain the session name")
   assert(type(event.details) == "table", "session_exited must provide its details as argument two")
+  assert(type(event.instance_id) == "string" and event.instance_id ~= "",
+    "session_exited must provide the exited session instance id as argument three")
+  if remuda._api_v5_instance_ids[name] then
+    assert(event.instance_id == remuda._api_v5_instance_ids[name],
+      "session_exited must report the instance id of the exited session")
+  end
   assert(event.details.reason == reason,
     "unexpected session_exited reason: " .. tostring(event.details.reason))
   if exit_code ~= nil then
@@ -110,7 +117,10 @@ local opened = session.new(name, { "sh" })
 assert(opened == name, "session.new must preserve new's return value")
 local found = false
 for _, row in ipairs(session.list()) do
-  if row.name == name then found = true end
+  if row.name == name then
+    found = true
+    remuda._api_v5_instance_ids[name] = row.instance_id
+  end
 end
 assert(found, "session.list must include the session created by session.new")
 assert(session.resize(name, 91, 31) == true, "session.resize must report success")

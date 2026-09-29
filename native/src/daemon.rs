@@ -939,9 +939,10 @@ fn notify_exited(
     let details = format!("{{{}}}", fields.join(", "));
     let _ = image.submit(
         &format!(
-            "remuda.emit('session_exited', {}, {})",
+            "remuda.emit('session_exited', {}, {}, {})",
             crate::mcp::lua_string(name),
             details,
+            crate::mcp::lua_string(id),
         ),
         None,
     );
