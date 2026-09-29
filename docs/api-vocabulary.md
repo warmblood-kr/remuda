@@ -121,7 +121,7 @@ The protocol is deliberately lower than the Lua word set: Lua `send` uses `SendL
 | `remuda.session` | `list`, `new`, `close`, `attach`; callable table for `session(name)` | Session identity and lifecycle; `__call` preserves the existing handle constructor. |
 | `remuda.input` | `line`, `insert`, `key`, `click`, `feed`, `type_text` | Distinguishes input kinds and composes type-text behavior from atomic input. |
 | `remuda.screen` | `capture`, `styled`, `expect`, `expect_option` | Reading and acting on screen observations. |
-| `remuda.fs` | `list_dir`, `mkdir`, `mkdir_new`, `remove_tree`, `write_atomic` | Filesystem primitives named by intent; `mkdir_new` creates exactly one new directory, and `write_atomic` replaces one target without following a target symlink. |
+| `remuda.fs` | `list_dir`, `mkdir`, `mkdir_new`, `remove_tree`, `write_atomic` | Filesystem primitives named by intent; `mkdir_new` creates exactly one new directory from an absolute path without a trailing separator, and `write_atomic` replaces one target without following a target symlink. |
 | `remuda.runtime` | `sleep`, `fail`, `registry` (read-only) | Runtime controls and supported introspection. |
 | `remuda.module` | `exec`, `reload` | Module loading and lifecycle. |
 | `remuda.hook` | `on`, `emit*`, `list`, `clear`, `counts` | Event registration and dispatch vocabulary. |

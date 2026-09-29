@@ -954,14 +954,12 @@ fn fs_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
     let fs = lua.create_table()?;
     fs.set(
         "mkdir_new",
-        lua.create_function(|_, path: String| {
-            match std::fs::create_dir(Path::new(&path)) {
-                Ok(()) => Ok((Some(true), None::<String>)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    Ok((None::<bool>, Some("exists".to_string())))
-                }
-                Err(error) => Ok((None::<bool>, Some(error.to_string()))),
+        lua.create_function(|_, path: String| match mkdir_new(Path::new(&path), &path) {
+            Ok(()) => Ok((Some(true), None::<String>)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok((None::<bool>, Some("exists".to_string())))
             }
+            Err(error) => Ok((None::<bool>, Some(error.to_string()))),
         })?,
     )?;
     fs.set(
@@ -974,6 +972,29 @@ fn fs_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
         })?,
     )?;
     table.set("fs", fs)
+}
+
+fn mkdir_new(path: &Path, raw_path: &str) -> std::io::Result<()> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path must be absolute",
+        ));
+    }
+    if raw_path.ends_with(std::path::MAIN_SEPARATOR) || cfg!(windows) && raw_path.ends_with('/') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path must not end with a separator",
+        ));
+    }
+
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 /// The `Ticker`'s own skip counters, read-only — no threshold or alarm here,
@@ -1239,7 +1260,10 @@ mod binding_tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = format!("/private/tmp/remuda-mkdir-new-{}-{nonce}", std::process::id());
+        let path = format!(
+            "/private/tmp/remuda-mkdir-new-{}-{nonce}",
+            std::process::id()
+        );
         let lua = Lua::new();
         let remuda = lua.create_table().unwrap();
         fs_bindings(&lua, &remuda).unwrap();
