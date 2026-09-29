@@ -31,6 +31,9 @@ const OBSERVE_INTERVAL: Duration = Duration::from_secs(5);
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 const ACCEPT_RESOURCE_BACKOFF: Duration = Duration::from_millis(250);
 const REPLAY_CAPACITY: usize = 65_536;
+const REMOTE_INPUT_BYTES_PER_SECOND: usize = 256 * 1024;
+const REMOTE_INPUT_WINDOW: Duration = Duration::from_secs(1);
+const MAX_REMOTE_INPUT_PEERS: usize = 1024;
 static LISTENER_ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Explicit listener address and opt-in for wildcard binding.
@@ -77,6 +80,53 @@ struct RequestLimiter {
     active_global: AtomicUsize,
     active_ips: Mutex<HashMap<std::net::IpAddr, usize>>,
     active_peers: Mutex<HashMap<String, usize>>,
+    remote_inputs: Mutex<RemoteInputRateLimiter>,
+}
+
+#[derive(Default)]
+struct RemoteInputRateLimiter {
+    windows: HashMap<String, InputWindow>,
+}
+
+struct InputWindow {
+    started: Instant,
+    bytes: usize,
+}
+
+impl RemoteInputRateLimiter {
+    fn check(&mut self, peer_fp: &str, bytes: usize, now: Instant) -> bool {
+        self.windows.retain(|_, window| {
+            now.saturating_duration_since(window.started) < REMOTE_INPUT_WINDOW
+        });
+        if bytes == 0 || bytes > REMOTE_INPUT_BYTES_PER_SECOND {
+            return false;
+        }
+        match self.windows.get_mut(peer_fp) {
+            Some(window) if now.saturating_duration_since(window.started) < REMOTE_INPUT_WINDOW => {
+                if window.bytes.saturating_add(bytes) > REMOTE_INPUT_BYTES_PER_SECOND {
+                    return false;
+                }
+                window.bytes += bytes;
+            }
+            Some(window) => {
+                window.started = now;
+                window.bytes = bytes;
+            }
+            None => {
+                if self.windows.len() >= MAX_REMOTE_INPUT_PEERS {
+                    return false;
+                }
+                self.windows.insert(
+                    peer_fp.to_owned(),
+                    InputWindow {
+                        started: now,
+                        bytes,
+                    },
+                );
+            }
+        }
+        true
+    }
 }
 
 struct GlobalPermit(Arc<RequestLimiter>);
@@ -333,6 +383,13 @@ impl RequestLimiter {
             fingerprint: fingerprint.to_owned(),
         }))
     }
+
+    fn allow_remote_input(&self, fingerprint: &str, bytes: usize) -> bool {
+        self.remote_inputs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .check(fingerprint, bytes, Instant::now())
+    }
 }
 
 impl Drop for GlobalPermit {
@@ -498,26 +555,49 @@ fn invalid_http(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn authorize_remote_request(request: &Request) -> io::Result<()> {
+fn authorize_remote_request(request: &Request) -> Result<(), Response> {
+    let enabled = if matches!(request, Request::Input { .. }) {
+        cluster::control::enabled()
+            .map_err(|_| Response::error("remote control setting unavailable; refusing Input"))?
+    } else {
+        true
+    };
+    authorize_remote_request_with_control(request, enabled)
+}
+
+fn authorize_remote_request_with_control(
+    request: &Request,
+    allow_remote_control: bool,
+) -> Result<(), Response> {
     match request {
-        // Enable after #252 (PTY write timeout) merges.
         Request::Input { .. } => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "remote front refuses Input",
-            ));
+            if !allow_remote_control {
+                return Err(Response::RemoteControlDisabled);
+            }
         }
-        // Enable only after the listener's explicit Close security review.
+        // Close remains disabled until PR11's explicit confirmation and review.
         Request::Close { .. } => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "remote front refuses Close",
-            ));
+            return Err(Response::error("remote front refuses Close"));
         }
         _ => {}
     }
-    crate::remote_front::authorize(request)
-        .map_err(|reason| io::Error::new(io::ErrorKind::PermissionDenied, reason))
+    crate::remote_front::authorize(request).map_err(Response::error)
+}
+
+fn decode_authorized_request(payload: &[u8]) -> Result<Request, Response> {
+    let request = crate::remote_front::decode_frame(payload).map_err(Response::error)?;
+    authorize_remote_request(&request)?;
+    Ok(request)
+}
+
+#[cfg(all(test, unix))]
+fn authorization_error(response: Response) -> io::Error {
+    let message = match response {
+        Response::Error(reason) => reason,
+        Response::RemoteControlDisabled => "remote control disabled on this node".into(),
+        other => format!("unexpected remote authorization response: {other:?}"),
+    };
+    io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
 
 impl MemberRegistryCache {
@@ -592,7 +672,9 @@ where
 fn dispatch_payload(payload: &[u8], daemon_path: &Path) -> io::Result<Vec<u8>> {
     let request = crate::remote_front::decode_frame(payload)
         .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
-    authorize_remote_request(&request)?;
+    if let Err(response) = authorize_remote_request(&request) {
+        return serde_json::to_vec(&response).map_err(io::Error::other);
+    }
     crate::remote_front::forward_frame_with_timeout(
         daemon_path,
         payload,
@@ -662,6 +744,20 @@ fn handle_connection_with(
             b"peer request capacity reached",
         ));
     };
+    let request = match decode_authorized_request(&opened.payload) {
+        Ok(request) => request,
+        Err(response) => {
+            let response = serde_json::to_vec(&response).unwrap_or_else(|_| b"null".to_vec());
+            return send_encrypted_response(stream, opened, &response);
+        }
+    };
+    if let Request::Input { bytes, .. } = &request {
+        if !state.limiter.allow_remote_input(&peer_fp, bytes.len()) {
+            let response =
+                serde_json::to_vec(&Response::RateLimited).unwrap_or_else(|_| b"null".to_vec());
+            return send_encrypted_response(stream, opened, &response);
+        }
+    }
     let payload = opened.payload.clone();
     let peer_static = opened.peer_static.clone();
     let dispatch_worker = dispatch.clone();
@@ -1048,22 +1144,67 @@ mod tests {
     }
 
     #[test]
-    fn remote_input_is_refused_until_pty_timeout_merges() {
+    fn remote_input_obeys_local_control_setting_and_close_stays_refused() {
         assert!(authorize_remote_request(&Request::List).is_ok());
         let close_error = authorize_remote_request(&Request::Close {
             name: "session".into(),
         })
         .unwrap_err();
-        assert_eq!(close_error.to_string(), "remote front refuses Close");
-        let error = authorize_remote_request(&Request::Input {
+        assert_eq!(close_error, Response::error("remote front refuses Close"));
+        let input = Request::Input {
             name: "session".into(),
             instance_id: "instance".into(),
             client_id: "00000000000000000000000000000001".into(),
             seq: 1,
             bytes: b"hello\r".to_vec(),
-        })
+        };
+        assert!(authorize_remote_request_with_control(&input, true).is_ok());
+        let close_error = authorize_remote_request_with_control(
+            &Request::Close {
+                name: "session".into(),
+            },
+            true,
+        )
         .unwrap_err();
-        assert_eq!(error.to_string(), "remote front refuses Input");
+        assert_eq!(close_error, Response::error("remote front refuses Close"));
+        assert_eq!(
+            authorize_remote_request_with_control(&input, false),
+            Err(Response::RemoteControlDisabled)
+        );
+        let wire = serde_json::to_vec(&Response::RemoteControlDisabled).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Response>(&wire).unwrap(),
+            Response::RemoteControlDisabled
+        );
+    }
+
+    #[test]
+    fn remote_input_rate_limit_aggregates_bytes_by_peer_and_resets_after_a_second() {
+        let mut limiter = RemoteInputRateLimiter::default();
+        let now = Instant::now();
+        assert!(limiter.check("peer-a", REMOTE_INPUT_BYTES_PER_SECOND, now));
+        assert!(!limiter.check("peer-a", 1, now));
+        assert!(limiter.check("peer-b", 1, now));
+        assert!(limiter.check(
+            "peer-a",
+            1,
+            now + REMOTE_INPUT_WINDOW + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn remote_input_rate_limiter_bounds_peer_state_and_expires_old_windows() {
+        let mut limiter = RemoteInputRateLimiter::default();
+        let now = Instant::now();
+        for index in 0..MAX_REMOTE_INPUT_PEERS {
+            assert!(limiter.check(&format!("peer-{index}"), 1, now));
+        }
+        assert!(!limiter.check("peer-over-cap", 1, now));
+        assert!(limiter.check(
+            "peer-over-cap",
+            1,
+            now + REMOTE_INPUT_WINDOW + Duration::from_millis(1)
+        ));
     }
 
     #[test]
@@ -1443,7 +1584,7 @@ mod tests {
             move |payload| {
                 let request =
                     crate::remote_front::decode_frame(payload).map_err(io::Error::other)?;
-                authorize_remote_request(&request)?;
+                authorize_remote_request(&request).map_err(authorization_error)?;
                 dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
                 Ok(serde_json::to_vec(&Response::Ok).unwrap())
             },
@@ -1488,19 +1629,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn socket_remote_input_is_refused_without_dispatch() {
+    fn socket_remote_input_dispatches_the_idempotent_batch() {
         let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
             .generate_keypair()
             .unwrap();
         let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
             .generate_keypair()
             .unwrap();
-        let server = SocketTestServer::start_production(
-            responder.private,
-            responder.public,
-            Arc::new(|_| Ok(())),
-            Arc::new(|payload| dispatch_payload(payload, Path::new("unused-daemon-path"))),
-        );
         let request = Request::Input {
             name: "session".into(),
             instance_id: "instance".into(),
@@ -1508,14 +1643,69 @@ mod tests {
             seq: 1,
             bytes: b"hello\r".to_vec(),
         };
+        let expected_request = request.clone();
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let dispatched_for_worker = dispatched.clone();
+        let server = SocketTestServer::start_production(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Ok(())),
+            Arc::new(move |payload| {
+                let request = decode_authorized_request(payload).map_err(authorization_error)?;
+                assert_eq!(request, expected_request);
+                dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::to_vec(&Response::Ack { duplicate: false }).unwrap())
+            }),
+        );
         let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
         let (status, response) = server.exchange(sealed);
         assert_eq!(status, 200);
         let response: Response = serde_json::from_slice(&response).unwrap();
-        assert!(
-            matches!(&response, Response::Error(message) if message == "remote front refuses Input"),
-            "unexpected response: {response:?}"
+        assert_eq!(response, Response::Ack { duplicate: false });
+        assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_peer_input_budget_is_charged_before_dispatch() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let dispatched_for_worker = dispatched.clone();
+        let server = SocketTestServer::start_production(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Ok(())),
+            Arc::new(move |payload| {
+                decode_authorized_request(payload).map_err(authorization_error)?;
+                dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::to_vec(&Response::Ack { duplicate: false }).unwrap())
+            }),
         );
+        let mut responses = Vec::new();
+        for index in 0..22 {
+            let request = Request::Input {
+                name: format!("session-{index}"),
+                instance_id: "instance".into(),
+                client_id: format!("{:032x}", index + 1),
+                seq: 1,
+                bytes: vec![b'x'; 12_000],
+            };
+            let sealed =
+                sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
+            let (status, response) = server.exchange(sealed);
+            assert_eq!(status, 200);
+            responses.push(serde_json::from_slice::<Response>(&response).unwrap());
+        }
+        assert!(responses[..21]
+            .iter()
+            .all(|response| *response == Response::Ack { duplicate: false }));
+        assert_eq!(responses[21], Response::RateLimited);
+        assert_eq!(dispatched.load(Ordering::SeqCst), 21);
     }
 
     #[cfg(unix)]

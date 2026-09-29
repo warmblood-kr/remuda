@@ -1,5 +1,6 @@
 //! Cluster vocabulary composed from identity and membership registry units.
 
+pub mod control;
 pub mod encoding;
 pub mod identity;
 pub mod join_line;
