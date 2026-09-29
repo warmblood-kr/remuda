@@ -2513,7 +2513,7 @@ fn refresh(
     if !skip_list && ui.daemon_gone.is_none() {
         sync_shown_session(path, ui, shown, selection_moved);
     }
-    resize_shown_session(path, ui, shown, cols, rows);
+    resize_held_shown_session(path, ui, shown, held, cols, rows);
     let (cells, wrapped, cursor) = if ui.daemon_gone.is_some() {
         (Vec::new(), Vec::new(), hidden)
     } else {
@@ -2595,20 +2595,70 @@ fn resize_shown_session(
     path: &Path,
     ui: &mut Ui,
     shown: &Option<ShownTarget>,
+    held_name: Option<&str>,
     cols: u16,
     rows: u16,
 ) {
-    if let Some(ShownTarget::Session(name)) = shown.as_ref() {
-        let target = pane_size(ui, cols, rows);
+    resize_shown_session_with(ui, shown, held_name, cols, rows, |name, target| {
+        resize(path, name, target)
+    });
+}
+
+fn resize_held_shown_session(
+    path: &Path,
+    ui: &mut Ui,
+    shown: &Option<ShownTarget>,
+    held: &Option<(String, Hold)>,
+    cols: u16,
+    rows: u16,
+) {
+    resize_shown_session(
+        path,
+        ui,
+        shown,
+        held.as_ref().map(|(name, _)| name.as_str()),
+        cols,
+        rows,
+    );
+}
+
+fn resize_shown_session_with(
+    ui: &mut Ui,
+    shown: &Option<ShownTarget>,
+    held_name: Option<&str>,
+    cols: u16,
+    rows: u16,
+    mut send_resize: impl FnMut(&str, Size) -> Result<(), String>,
+) {
+    if let Some((name, target)) = shown_session_resize_target(ui, shown, held_name, cols, rows) {
         if ui.last_resized.as_ref() != Some(&(name.clone(), target)) {
-            match resize(path, name, target) {
-                Ok(()) => ui.last_resized = Some((name.clone(), target)),
+            match send_resize(&name, target) {
+                Ok(()) => ui.last_resized = Some((name, target)),
                 Err(e) => ui.notice = Some(format!("{name}: {e}")),
             }
         }
     } else {
         ui.last_resized = None;
     }
+}
+
+/// Only an actively held session is attached to this pane. A session shown
+/// while list-focused is a preview, so its PTY keeps its creation or last
+/// attached size even when the client itself is narrow.
+fn shown_session_resize_target(
+    ui: &Ui,
+    shown: &Option<ShownTarget>,
+    held_name: Option<&str>,
+    cols: u16,
+    rows: u16,
+) -> Option<(String, Size)> {
+    if ui.focus != Focus::Session {
+        return None;
+    }
+    let Some(ShownTarget::Session(name)) = shown.as_ref() else {
+        return None;
+    };
+    (held_name == Some(name.as_str())).then(|| (name.clone(), pane_size(ui, cols, rows)))
 }
 
 /// Enables SGR mouse reporting on construction, disables it on drop — for
