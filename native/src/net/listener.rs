@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-#[cfg(all(test, unix))]
+#[cfg(test)]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -59,6 +59,7 @@ pub struct Listener {
     state: Arc<ListenerState>,
     authorize: MemberAuthorizer,
     dispatch: FrameDispatcher,
+    control_source: ControlSource,
 }
 
 type MemberAuthorizer = Arc<dyn Fn(&[u8]) -> io::Result<()> + Send + Sync>;
@@ -69,6 +70,28 @@ struct ListenerState {
     replay: Mutex<replay::ReplayWindow>,
     limiter: Arc<RequestLimiter>,
     join_tokens: JoinTokenStore,
+}
+
+#[derive(Clone)]
+enum ControlSource {
+    DefaultStateDir,
+    #[cfg(test)]
+    StateDir(PathBuf),
+}
+
+impl ControlSource {
+    #[cfg(test)]
+    fn from_state_dir(path: impl Into<PathBuf>) -> Self {
+        Self::StateDir(path.into())
+    }
+
+    fn enabled(&self) -> io::Result<bool> {
+        match self {
+            Self::DefaultStateDir => cluster::control::enabled(),
+            #[cfg(test)]
+            Self::StateDir(path) => cluster::control::enabled_at(path),
+        }
+    }
 }
 
 struct MemberRegistryCache {
@@ -195,8 +218,11 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
     let authorize: MemberAuthorizer =
         Arc::new(move |peer_static| authorizer_cache.authorize(peer_static));
     let dispatch_path = daemon_path.to_path_buf();
-    let dispatch: FrameDispatcher =
-        Arc::new(move |payload| dispatch_payload(payload, &dispatch_path));
+    let control_source = ControlSource::DefaultStateDir;
+    let dispatch_control_source = control_source.clone();
+    let dispatch: FrameDispatcher = Arc::new(move |payload| {
+        dispatch_payload_with_control_source(payload, &dispatch_path, &dispatch_control_source)
+    });
     Ok(Listener {
         socket,
         state: Arc::new(ListenerState {
@@ -207,6 +233,7 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
         }),
         authorize,
         dispatch,
+        control_source,
     })
 }
 
@@ -245,6 +272,7 @@ impl Listener {
             let state = self.state.clone();
             let authorize = self.authorize.clone();
             let dispatch = self.dispatch.clone();
+            let control_source = self.control_source.clone();
             let limits = ConnectionLimits {
                 outer_hold: MAX_HELD_REQUEST,
                 post_dispatch_hold: MAX_HELD_REQUEST,
@@ -266,6 +294,7 @@ impl Listener {
                         state.clone(),
                         authorize.clone(),
                         dispatch.clone(),
+                        control_source.clone(),
                         limits,
                     )
                 },
@@ -555,9 +584,18 @@ fn invalid_http(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+#[cfg(test)]
 fn authorize_remote_request(request: &Request) -> Result<(), Response> {
+    authorize_remote_request_with_source(request, &ControlSource::DefaultStateDir)
+}
+
+fn authorize_remote_request_with_source(
+    request: &Request,
+    control_source: &ControlSource,
+) -> Result<(), Response> {
     let enabled = if matches!(request, Request::Input { .. }) {
-        cluster::control::enabled()
+        control_source
+            .enabled()
             .map_err(|_| Response::error("remote control setting unavailable; refusing Input"))?
     } else {
         true
@@ -584,9 +622,12 @@ fn authorize_remote_request_with_control(
     crate::remote_front::authorize(request).map_err(Response::error)
 }
 
-fn decode_authorized_request(payload: &[u8]) -> Result<Request, Response> {
+fn decode_authorized_request_with_source(
+    payload: &[u8],
+    control_source: &ControlSource,
+) -> Result<Request, Response> {
     let request = crate::remote_front::decode_frame(payload).map_err(Response::error)?;
-    authorize_remote_request(&request)?;
+    authorize_remote_request_with_source(&request, control_source)?;
     Ok(request)
 }
 
@@ -669,10 +710,14 @@ where
     Ok(response)
 }
 
-fn dispatch_payload(payload: &[u8], daemon_path: &Path) -> io::Result<Vec<u8>> {
+fn dispatch_payload_with_control_source(
+    payload: &[u8],
+    daemon_path: &Path,
+    control_source: &ControlSource,
+) -> io::Result<Vec<u8>> {
     let request = crate::remote_front::decode_frame(payload)
         .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
-    if let Err(response) = authorize_remote_request(&request) {
+    if let Err(response) = authorize_remote_request_with_source(&request, control_source) {
         return serde_json::to_vec(&response).map_err(io::Error::other);
     }
     crate::remote_front::forward_frame_with_timeout(
@@ -689,6 +734,7 @@ fn spawn_connection_handler(
     state: Arc<ListenerState>,
     authorize: MemberAuthorizer,
     dispatch: FrameDispatcher,
+    control_source: ControlSource,
     limits: ConnectionLimits,
 ) -> io::Result<()> {
     let Some(ip_permit) = state.limiter.acquire_ip(remote_addr.ip()) else {
@@ -701,7 +747,15 @@ fn spawn_connection_handler(
         .name("remuda-cluster-listener".into())
         .spawn(move || {
             let _ip_permit = ip_permit;
-            handle_connection_with(stream, state, global_permit, authorize, dispatch, limits);
+            handle_connection_with(
+                stream,
+                state,
+                global_permit,
+                authorize,
+                dispatch,
+                control_source,
+                limits,
+            );
         })
         .map(|_| ())
 }
@@ -712,6 +766,7 @@ fn handle_connection_with(
     global_permit: Arc<GlobalPermit>,
     authorize: MemberAuthorizer,
     dispatch: FrameDispatcher,
+    control_source: ControlSource,
     limits: ConnectionLimits,
 ) {
     let _ = stream.set_read_timeout(Some(limits.idle_read));
@@ -744,7 +799,7 @@ fn handle_connection_with(
             b"peer request capacity reached",
         ));
     };
-    let request = match decode_authorized_request(&opened.payload) {
+    let request = match decode_authorized_request_with_source(&opened.payload, &control_source) {
         Ok(request) => request,
         Err(response) => {
             let response = serde_json::to_vec(&response).unwrap_or_else(|_| b"null".to_vec());
@@ -849,28 +904,38 @@ mod tests {
     use std::sync::{mpsc, Arc};
 
     #[cfg(unix)]
-    static STATE_HOME_LOCK: Mutex<()> = Mutex::new(());
+    struct TestControlSettings(PathBuf);
 
     #[cfg(unix)]
-    struct StateHomeGuard(Option<std::ffi::OsString>, PathBuf);
+    impl TestControlSettings {
+        fn new(contents: &[u8]) -> Self {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let path = std::env::temp_dir().join(format!(
+                "remuda-listener-settings-{}-{}",
+                std::process::id(),
+                LISTENER_ERROR_COUNT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut settings = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path.join("settings.json"))
+                .unwrap();
+            settings.write_all(contents).unwrap();
+            Self(path)
+        }
 
-    #[cfg(unix)]
-    impl StateHomeGuard {
-        fn set(path: PathBuf) -> Self {
-            let previous = std::env::var_os("XDG_STATE_HOME");
-            std::env::set_var("XDG_STATE_HOME", &path);
-            Self(previous, path)
+        fn source(&self) -> ControlSource {
+            ControlSource::from_state_dir(&self.0)
         }
     }
 
     #[cfg(unix)]
-    impl Drop for StateHomeGuard {
+    impl Drop for TestControlSettings {
         fn drop(&mut self) {
-            match self.0.take() {
-                Some(previous) => std::env::set_var("XDG_STATE_HOME", previous),
-                None => std::env::remove_var("XDG_STATE_HOME"),
-            }
-            let _ = std::fs::remove_dir_all(&self.1);
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -928,6 +993,7 @@ mod tests {
                             state.clone(),
                             authorize.clone(),
                             dispatch.clone(),
+                            ControlSource::DefaultStateDir,
                             limits,
                         )
                     },
@@ -948,6 +1014,22 @@ mod tests {
             responder_public: Vec<u8>,
             authorize: MemberAuthorizer,
             dispatch: FrameDispatcher,
+        ) -> Self {
+            Self::start_production_with_control_source(
+                responder_private,
+                responder_public,
+                authorize,
+                dispatch,
+                ControlSource::DefaultStateDir,
+            )
+        }
+
+        fn start_production_with_control_source(
+            responder_private: Vec<u8>,
+            responder_public: Vec<u8>,
+            authorize: MemberAuthorizer,
+            dispatch: FrameDispatcher,
+            control_source: ControlSource,
         ) -> Self {
             use std::os::unix::fs::PermissionsExt;
             let responder_private_for_test = responder_private.clone();
@@ -975,6 +1057,7 @@ mod tests {
                 state,
                 authorize,
                 dispatch,
+                control_source,
             };
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = stop.clone();
@@ -1539,7 +1622,13 @@ mod tests {
     #[test]
     fn socket_accepts_a_fresh_ik_request_and_refuses_its_replay() {
         let (server, peer, _) = socket_server(
-            |payload| dispatch_payload(payload, Path::new("unused-daemon-path")),
+            |payload| {
+                dispatch_payload_with_control_source(
+                    payload,
+                    Path::new("unused-daemon-path"),
+                    &ControlSource::DefaultStateDir,
+                )
+            },
             socket_test_timeout(),
             socket_test_timeout(),
             socket_test_timeout(),
@@ -1682,16 +1771,19 @@ mod tests {
         let expected_request = request.clone();
         let dispatched = Arc::new(AtomicUsize::new(0));
         let dispatched_for_worker = dispatched.clone();
-        let server = SocketTestServer::start_production(
+        let settings = TestControlSettings::new(br#"{"allow_remote_control":true}"#);
+        let server = SocketTestServer::start_production_with_control_source(
             responder.private,
             responder.public,
             Arc::new(|_| Ok(())),
             Arc::new(move |payload| {
-                let request = decode_authorized_request(payload).map_err(authorization_error)?;
+                let request = crate::remote_front::decode_frame(payload)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 assert_eq!(request, expected_request);
                 dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
                 Ok(serde_json::to_vec(&Response::Ack { duplicate: false }).unwrap())
             }),
+            settings.source(),
         );
         let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
         let (status, response) = server.exchange(sealed);
@@ -1706,30 +1798,9 @@ mod tests {
         setting: &[u8],
         expected: Response,
     ) {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let _lock = STATE_HOME_LOCK.lock().unwrap();
-        let state_home = std::env::temp_dir().join(format!(
-            "remuda-listener-settings-{}-{}",
-            std::process::id(),
-            LISTENER_ERROR_COUNT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let cluster_dir = state_home.join("remuda/cluster");
-        std::fs::create_dir_all(&cluster_dir).unwrap();
-        std::fs::set_permissions(
-            state_home.join("remuda"),
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .unwrap();
-        std::fs::set_permissions(&cluster_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut settings = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(cluster_dir.join("settings.json"))
-            .unwrap();
-        settings.write_all(setting).unwrap();
-        drop(settings);
-        let _state_home_guard = StateHomeGuard::set(state_home);
+        let settings = TestControlSettings::new(setting);
+        let control_source = settings.source();
+        let dispatch_control_source = control_source.clone();
 
         let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
             .generate_keypair()
@@ -1739,15 +1810,15 @@ mod tests {
             .unwrap();
         let dispatched = Arc::new(AtomicUsize::new(0));
         let dispatched_for_worker = dispatched.clone();
-        let server = SocketTestServer::start_production(
+        let server = SocketTestServer::start_production_with_control_source(
             responder.private,
             responder.public,
             Arc::new(|_| Ok(())),
-            Arc::new(move |payload| {
-                decode_authorized_request(payload).map_err(authorization_error)?;
+            Arc::new(move |_payload| {
                 dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
                 Ok(serde_json::to_vec(&Response::Ack { duplicate: false }).unwrap())
             }),
+            dispatch_control_source,
         );
         let request = Request::Input {
             name: "session".into(),
