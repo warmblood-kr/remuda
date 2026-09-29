@@ -533,7 +533,19 @@ impl ClusterUi {
         let footer_rows = if self.composer_focused { 2 } else { 1 };
         let reserved = frame.len() + queue_rows.len() + usize::from(notice.is_some()) + footer_rows;
         let screen_rows = height.saturating_sub(reserved);
-        frame.extend(pane_body.lines().take(screen_rows).map(str::to_string));
+        let mut visible_pane_lines = if self.remote_active.is_some() {
+            pane_body
+                .lines()
+                .rev()
+                .take(screen_rows)
+                .collect::<Vec<_>>()
+        } else {
+            pane_body.lines().take(screen_rows).collect::<Vec<_>>()
+        };
+        if self.remote_active.is_some() {
+            visible_pane_lines.reverse();
+        }
+        frame.extend(visible_pane_lines.into_iter().map(str::to_string));
         if let Some((notice, _)) = notice {
             frame.push(notice.clone());
         }

@@ -9,6 +9,7 @@ use remuda_native::cluster_remote::{
 use remuda_native::net::cluster_client::{ClientTimeouts, ClusterClient};
 use remuda_native::SystemWallClock;
 use std::fs;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -259,6 +260,96 @@ fn session_text(session: &remuda_native::cluster_remote::RemoteSessionSnapshot) 
         .unwrap_or_default()
 }
 
+struct RemoteTui {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    pid: u32,
+    writer: Box<dyn Write + Send>,
+    output: Arc<std::sync::Mutex<Vec<u8>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RemoteTui {
+    fn start(node: &Node, target: Option<&str>) -> Self {
+        let pty = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+        command.args(["-s", &node.name, "cluster", "remote"]);
+        if let Some(target) = target {
+            command.arg(target);
+        }
+        command.env("REMUDA_RUNTIME_DIR", &node.runtime);
+        command.env("HOME", node.root.join("home"));
+        command.env("XDG_CONFIG_HOME", node.root.join("config"));
+        command.env("XDG_DATA_HOME", node.root.join("data"));
+        command.env("XDG_CACHE_HOME", node.root.join("cache"));
+        command.env("XDG_STATE_HOME", &node.state);
+        let child = pty.slave.spawn_command(command).expect("spawn remote TUI");
+        let pid = child.process_id().expect("remote TUI child PID");
+        drop(pty.slave);
+        let writer = pty.master.take_writer().unwrap();
+        let mut source = pty.master.try_clone_reader().unwrap();
+        let output = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader_output = output.clone();
+        let reader = std::thread::spawn(move || {
+            let mut buffer = [0; 2048];
+            while let Ok(count) = source.read(&mut buffer) {
+                if count == 0 {
+                    break;
+                }
+                reader_output
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buffer[..count]);
+            }
+        });
+        Self {
+            child,
+            pid,
+            writer,
+            output,
+            reader: Some(reader),
+        }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    }
+
+    fn wait_for(&self, needle: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let text = self.text();
+            if text.contains(needle) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "TUI did not render {needle:?}: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for RemoteTui {
+    fn drop(&mut self) {
+        assert_eq!(self.child.process_id(), Some(self.pid));
+        unsafe {
+            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
 fn wait_for(label: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
     let deadline = Instant::now() + timeout;
     while !ready() {
@@ -268,6 +359,45 @@ fn wait_for(label: &str, timeout: Duration, mut ready: impl FnMut() -> bool) {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+#[test]
+fn real_remote_tui_paints_the_selected_remote_session_screen() {
+    let client_node = Node::start("tui-remote-client");
+    let server_node = Node::start("tui-remote-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    server_node.start_session(
+        "for i in $(seq 1 22); do printf 'FILLER\\n'; done; while true; do printf 'PR8-MARKER'; sleep 1; done",
+    );
+
+    let registry_path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    let server = registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap();
+    server.endpoint = Some(listener.address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let server_label = remuda_native::cluster::node_label(&server_node.fingerprint());
+    let mut tui = RemoteTui::start(&client_node, None);
+    tui.wait_for(&server_label, Duration::from_secs(10));
+    tui.writer.write_all(b"\x1b[B\x1b[C").unwrap();
+    tui.wait_for("proof", Duration::from_secs(10));
+    tui.writer.write_all(b"\x1b[B\r").unwrap();
+    tui.wait_for("remote live · reachable", Duration::from_secs(10));
+    tui.writer.write_all(b"x").unwrap();
+    tui.wait_for("Remote session is read-only", Duration::from_secs(3));
+    tui.wait_for("PR8-MARKER", Duration::from_secs(10));
 }
 
 #[test]
