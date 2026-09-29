@@ -1650,7 +1650,7 @@ register("session.new", "Start a session, defaulting the command to the user's s
   "session.new(name?, argv?, cwd?, env?) -> string")
 register("session.close", "End a session, live or already self-exited.", "session.close(name) -> nil")
 register("session.attach", "Enter raw mode on a session.", "session.attach(name) -> nil")
-register("session.resize", "Resize a session's terminal.", "session.resize(name, cols, rows) -> true | nil, err")
+register("session.resize", "Resize a session's terminal (cols 20..1000, rows 24..500).", "session.resize(name, cols, rows) -> true | nil, err")
 
 remuda.ls = deprecated_alias("ls", "list", flat_session_words.ls)
 remuda.new = deprecated_alias("new", "new", flat_session_words.new)
@@ -1933,13 +1933,15 @@ register(
 local function registry_rows()
   local rows = {}
   for _, name in ipairs(sorted_keys(remuda._registry)) do
-    local word = remuda._registry[name]
-    rows[#rows + 1] = {
-      name = word.name,
-      signature = word.signature,
-      description = word.about,
-      kind = word.signature == "table" and "variable" or "function",
-    }
+    if name:sub(1, 1) ~= "_" then
+      local word = remuda._registry[name]
+      rows[#rows + 1] = {
+        name = word.name,
+        signature = word.signature,
+        description = word.about,
+        kind = word.signature == "table" and "variable" or "function",
+      }
+    end
   end
   return rows
 end

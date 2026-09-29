@@ -1,106 +1,6 @@
 Remuda Lua runtime
 ==================
 
-_advice_reattach
-----------------
-
-``_advice_reattach() -> nil`` — Re-install advice trampolines over redefined functions. Called after each mod load.
-
-_call
------
-
-``_call(name, arguments, caller) -> string`` — Dispatch one MCP tools/call by name.
-
-_descriptors
-------------
-
-``_descriptors() -> string`` — MCP tool descriptors for everything `remuda.tool` has registered.
-
-_dispatch_extension_command
----------------------------
-
-``_dispatch_extension_command(name, args, caller) -> value`` — Dispatch arguments and caller context to a loaded mod command handler.
-
-_event_counts
--------------
-
-``table`` — Internal event-emit counts, keyed by event name. Read via `event_counts()`.
-
-_extension_commands
--------------------
-
-``table`` — Handlers registered for installed mod commands.
-
-_function_source
-----------------
-
-``_function_source(fn) -> string`` — Where a Lua function was defined, as `source:line`; internal, for `hook_list`, since scripts get no `debug` library.
-
-_module_readiness
------------------
-
-``_module_readiness(name) -> {status, timeout_ms?, message?}`` — Internal readiness poll for remuda exec.
-
-_pending_create
----------------
-
-``_pending_create(timeout?) -> id, handle`` — Create a private pending reply handle.
-
-_pending_events
----------------
-
-``_pending_events() -> {{id, reason?}...}`` — Drain pending completion and cancellation notifications.
-
-_process_drain
---------------
-
-``_process_drain(id) -> nil`` — Deliver buffered process output as emit events; internal, an Image job only.
-
-_process_killpg
----------------
-
-``_process_killpg(id) -> nil`` — Reap a process's whole process group (Linux only); internal, called by the daemon's own clean-shutdown sweep, not meant for scripts.
-
-_process_run
-------------
-
-``_process_run(argv, stdin?, timeout) -> result`` — Run an argv process synchronously with a bounded timeout and captured output; internal, called by `remuda.process.run`.
-
-_process_spawn
---------------
-
-``_process_spawn(argv, on_line?, on_exit?) -> id`` — Spawn a plain-pipe child process; internal, wrapped by `remuda.process`.
-
-_refresh_sessions_buffer
-------------------------
-
-``_refresh_sessions_buffer(width, selected) -> nil`` — Rebuild the *sessions* buffer's content.
-
-_registry
----------
-
-``table`` — The word registry itself: name, about and signature for every bound word.
-
-_registry_dump
---------------
-
-``_registry_dump(format?) -> string`` — Render the live word registry as documentation.
-
-_run_due_schedules
-------------------
-
-``_run_due_schedules(now) -> nil`` — Fire every schedule whose interval has elapsed. Called once per native tick.
-
-_schedule_fire_counts
----------------------
-
-``table`` — Internal named-schedule fire counts. Read via `schedule_fires()`.
-
-_sync_window_shown
-------------------
-
-``_sync_window_shown(name, selection_changed) -> string`` — Reconcile the current window with the session Rust wants to auto-follow.
-
 advice_list
 -----------
 
@@ -409,7 +309,7 @@ session.new
 session.resize
 --------------
 
-``session.resize(name, cols, rows) -> true | nil, err`` — Resize a session's terminal. Columns must be 20 through 1000 and rows 24 through 500.
+``session.resize(name, cols, rows) -> true | nil, err`` — Resize a session's terminal (cols 20..1000, rows 24..500).
 
 sleep
 -----
