@@ -185,15 +185,32 @@ fn autostart_reports_the_pid_and_recovery_for_a_held_socket_lock() {
         "hold private socket lock"
     );
 
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_remuda"))
         .args(["-s", "s", "-e", "return 1"])
         .env("REMUDA_RUNTIME_DIR", &dir)
         .env("HOME", dir.join("home"))
         .env_remove("XDG_CONFIG_HOME")
-        .output()
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("run a client that autostarts the daemon");
-    let success = output.status.success();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stderr = child.stderr.take().expect("captured client stderr");
+    let (first_send, first_receive) = std::sync::mpsc::channel();
+    let (rest_send, rest_receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = std::io::BufReader::new(stderr);
+        let mut line = String::new();
+        let _ = std::io::BufRead::read_line(&mut reader, &mut line);
+        let _ = first_send.send(line);
+        let mut rest = String::new();
+        let _ = std::io::Read::read_to_string(&mut reader, &mut rest);
+        let _ = rest_send.send(rest);
+    });
+    let early_notice = first_receive.recv_timeout(Duration::from_millis(2500));
+    let status = child.wait().expect("wait for failed autostart");
+    let notice_was_early = early_notice.is_ok();
+    let mut stderr = early_notice.unwrap_or_default();
+    stderr.push_str(&rest_receive.recv().unwrap_or_default());
+    let success = status.success();
     let names_holder = stderr.contains(&format!("pid {holder_pid}"));
     let explains_recovery = stderr.contains("kill -CONT")
         && stderr.contains(&format!("kill {holder_pid}"))
@@ -211,6 +228,43 @@ fn autostart_reports_the_pid_and_recovery_for_a_held_socket_lock() {
     assert!(names_holder, "{stderr}");
     assert!(explains_recovery, "{stderr}");
     assert!(announced_wait, "{stderr}");
+    assert!(
+        notice_was_early,
+        "the one-second socket-lock notice should reach the client before the three-second lock timeout"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn request_to_stopped_daemon_times_out_with_recovery_instructions() {
+    let dir = scratch_dir("stopped-request");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create isolated runtime dir");
+    let daemon = Daemon::spawn(&dir);
+    let pid = daemon.0.id();
+    let socket = daemon::socket_path_in(&dir, "s");
+    assert_eq!(unsafe { libc::kill(pid as i32, libc::SIGSTOP) }, 0);
+
+    let (send, receive) = std::sync::mpsc::channel();
+    let request_socket = socket.clone();
+    std::thread::spawn(move || {
+        let result = client::request(&request_socket, &Request::List);
+        let _ = send.send(result);
+    });
+    let result = receive.recv_timeout(Duration::from_secs(12));
+
+    let _ = unsafe { libc::kill(pid as i32, libc::SIGCONT) };
+    let result = result.expect("request to stopped daemon must have a bounded timeout");
+    let message = result
+        .expect_err("stopped daemon did not answer")
+        .to_string();
+    assert!(message.contains(&socket.display().to_string()), "{message}");
+    assert!(message.contains(&format!("pid {pid}")), "{message}");
+    assert!(message.contains("kill -CONT"), "{message}");
+    assert!(message.contains(&format!("kill {pid}")), "{message}");
+    assert!(message.contains("verify"), "{message}");
+    drop(daemon);
+    std::fs::remove_dir_all(&dir).expect("remove private runtime dir");
 }
 
 #[cfg(unix)]
