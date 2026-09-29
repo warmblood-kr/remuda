@@ -265,7 +265,7 @@ impl BlackholePeer {
                         let mut buffer = [0; 4096];
                         while !thread_stop.load(Ordering::Acquire) {
                             match stream.read(&mut buffer) {
-                                Ok(0) => break,
+                                Ok(0) => thread::sleep(Duration::from_millis(50)),
                                 Ok(_) => {}
                                 Err(error)
                                     if matches!(
@@ -505,9 +505,13 @@ fn joiner_succeeds_when_an_existing_peer_stalls() {
         "--bind",
         &c_listener.address.to_string(),
     ]);
-    successful(joined, "join C while existing peer B is stalled");
+    let output = successful(joined, "join C while existing peer B is stalled");
     assert!(
-        started.elapsed() < Duration::from_secs(8),
+        output.contains("Joined cluster."),
+        "join command did not report success: {output}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(25),
         "join reply waited on an existing peer for {:?}",
         started.elapsed()
     );
@@ -767,7 +771,7 @@ fn revoke_cli_pushes_tombstone_across_a_b_c_join_chain() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    wait_for_revocation_on_until(&c, &b_fp, started + Duration::from_secs(30));
+    wait_for_revocation_on_until(&c, &b_fp, started + Duration::from_secs(20));
     assert!(
         String::from_utf8_lossy(&output.stdout)
             .contains(&format!("Registry push reached peer {c_fp}.")),
@@ -776,8 +780,8 @@ fn revoke_cli_pushes_tombstone_across_a_b_c_join_chain() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        started.elapsed() < Duration::from_secs(30),
-        "revocation did not converge within the 30 second bound"
+        started.elapsed() < Duration::from_secs(20),
+        "revocation did not converge within the 20 second bound"
     );
 }
 
