@@ -94,6 +94,15 @@ assert(type(remuda.pending) == "function", "remuda.pending is missing")
 assert(remuda._registry.pending ~= nil, "remuda.pending needs a registry entry")
 assert(remuda._pending_replies == nil, "pending manager internals must remain private")
 
+local input = remuda.input
+assert(type(input) == "table", "remuda.input is missing")
+assert(type(input.text) == "function", "remuda.input.text is missing")
+assert(type(input.submit) == "function", "remuda.input.submit is missing")
+assert(type(input.type_text) == "function", "remuda.input.type_text is missing")
+assert(remuda._registry["input.text"] ~= nil, "remuda.input.text needs a registry entry")
+assert(remuda._registry["input.submit"] ~= nil, "remuda.input.submit needs a registry entry")
+assert(remuda._registry["input.type_text"] ~= nil, "remuda.input.type_text needs a registry entry")
+
 local bad_timeout = pcall(remuda.pending, { timeout = 301 })
 assert(not bad_timeout, "pending timeout must not exceed 300 seconds")
 
@@ -108,6 +117,7 @@ end
 local name = "api-v5-" .. tostring(os.time())
 local opened = session.new(name, { "sh" })
 assert(opened == name, "session.new must preserve new's return value")
+assert(input.submit(name, "") == "submitted", "an empty input.submit must return quickly")
 local found = false
 for _, row in ipairs(session.list()) do
   if row.name == name then found = true end
@@ -170,9 +180,27 @@ assert(result.stdout:find("remuda-process-run-v5", 1, true), "process.run should
 assert(result.stderr == "", "process.run should capture stderr separately")
 assert(result.timed_out == false, "a completed process must not be marked timed out")
 
+local missing_program = "remuda-process-run-missing-executable-267"
+local missing_ok, missing_error = pcall(function()
+  remuda.process.run({ argv = { missing_program }, timeout = 1 })
+end)
+assert(not missing_ok, "process.run should fail for a missing executable")
+assert(tostring(missing_error):find(missing_program, 1, true),
+  "missing executable error should name the program")
+
 local async_id = remuda.process({ argv = echo_argv })
 assert(type(async_id) == "number", "the callable process namespace must preserve process(spec)")
 if not windows then
+  local capped_output = remuda.process.run({
+    argv = { "/usr/bin/head", "-c", "1048577", "/dev/zero" }, timeout = 3,
+  })
+  local marker = "\n[output truncated by remuda.process.run]"
+  assert(#capped_output.stdout == 1048576 + #marker,
+    "the output cap should retain 1 MiB of data before the truncation marker")
+  assert(capped_output.stdout:byte(1) == 0 and capped_output.stdout:byte(1048576) == 0,
+    "the truncation marker must not consume bytes from the 1 MiB payload cap")
+  assert(capped_output.stdout:sub(-#marker) == marker, "the truncation marker should be appended")
+
   local piped = remuda.process.run({ argv = { "/bin/cat" }, stdin = "process stdin v5", timeout = 3 })
   assert(piped.stdout == "process stdin v5", "process.run should pass stdin to the child")
 end
@@ -185,23 +213,33 @@ assert(timed.timed_out, "process.run must kill a child when its timeout expires"
 assert(timed.code == 124, "timed-out process.run must return timeout code 124")
 if not windows then
   assert(timed.signal == 9, "process.run should report Unix SIGKILL when timeout kills the child")
-  -- The shell exits immediately, but its background child inherits stdout
-  -- and stderr. The entire call, including pipe draining, must obey timeout.
-  local started = os.time()
-  local held_pipes = remuda.process.run({
-    argv = { "/bin/sh", "-c", "sleep 30 & echo $!" }, timeout = 0.2,
-  })
-  local held_pid = held_pipes.stdout:match("(%d+)")
-  if held_pid then os.execute("/bin/kill -KILL " .. held_pid) end
-  assert(held_pipes.timed_out, "process.run must time out when a descendant holds its pipes")
-  assert(held_pid, "the pipe-holding descendant pid should be captured")
-  assert(os.time() - started < 4, "process.run must return by its deadline when a descendant holds pipes")
+  -- The shell exits naturally, but its background child inherits stdout and
+  -- stderr. Preserve the leader's status and kill the remaining process group.
+  for _ = 1, 20 do
+    local started = os.time()
+    local held_pipes = remuda.process.run({
+      argv = { "/bin/sh", "-c", "sleep 30 & echo $!; exit 0" }, timeout = 3,
+    })
+    local held_pid = held_pipes.stdout:match("(%d+)")
+    assert(not held_pipes.timed_out, "a naturally exited leader must not be reported timed out")
+    assert(held_pipes.code == 0, "process.run must report the leader's zero exit code")
+    assert(held_pid, "the pipe-holding descendant pid should be captured")
+    assert(os.time() - started < 3, "process.run should drain after killing the leader's process group")
+    local child_alive = os.execute("/bin/kill -0 " .. held_pid .. " >/dev/null 2>&1")
+    assert(child_alive ~= true and child_alive ~= 0,
+      "the background child should be gone after process.run returns")
+    local after_group_cleanup = remuda.process.run({ argv = echo_argv, timeout = 1 })
+    assert(after_group_cleanup.code == 0, "group cleanup should release output-reader permits")
+  end
 
   -- A descendant can escape the process group with setsid and keep both
-  -- output pipes alive. Limit detached readers so repeated calls cannot leak
-  -- unbounded threads and file descriptors. Skip systems without setsid.
+  -- output pipes alive. Use -f explicitly: util-linux setsid otherwise forks
+  -- only when its caller is already a process-group leader. Keep the original
+  -- leader alive until process.run times out, so the assertion does not depend
+  -- on a scheduling race. Limit detached readers so repeated calls cannot leak
+  -- unbounded threads and file descriptors. Skip systems without setsid -f.
   local setsid_probe = pcall(function()
-    local probe = remuda.process.run({ argv = { "setsid", "/bin/true" }, timeout = 1 })
+    local probe = remuda.process.run({ argv = { "setsid", "-f", "/bin/true" }, timeout = 1 })
     assert(probe.code == 0, "setsid probe failed")
   end)
   if setsid_probe then
@@ -209,7 +247,7 @@ if not windows then
     local exercised_cap, cap_error = pcall(function()
       for _ = 1, 8 do
         local escaped = remuda.process.run({
-          argv = { "/bin/sh", "-c", "setsid /bin/sh -c 'echo $$; exec /bin/sleep 30' &" },
+          argv = { "/bin/sh", "-c", "setsid -f /bin/sh -c 'echo $$; exec /bin/sleep 30' & exec /bin/sleep 30" },
           timeout = 0.1,
         })
         assert(escaped.timed_out, "setsid descendant should leave output pipes open")
@@ -257,6 +295,35 @@ assert(limited == nil and type(limit_error) == "string", "JSON depth limit must 
 
 local fs = remuda.fs
 assert(type(fs) == "table", "remuda.fs is missing")
+assert(type(fs.mkdir_new) == "function", "remuda.fs.mkdir_new is missing")
+local mkdir_path = os.tmpname()
+os.remove(mkdir_path)
+local made, mkdir_error = fs.mkdir_new(mkdir_path)
+assert(made == true and mkdir_error == nil, tostring(mkdir_error))
+made, mkdir_error = fs.mkdir_new(mkdir_path)
+assert(made == nil and mkdir_error == "exists", "second mkdir_new call must report exists")
+assert(remuda.remove_dir_all(mkdir_path) == nil, "test directory cleanup failed")
+local trailing_path = os.tmpname()
+os.remove(trailing_path)
+local separator = package.config:sub(1, 1)
+local trailing_made, trailing_error = fs.mkdir_new(trailing_path .. separator)
+if trailing_made then remuda.remove_dir_all(trailing_path) end
+assert(trailing_made == nil and type(trailing_error) == "string",
+  "trailing separators must be rejected")
+local relative_made, relative_error = fs.mkdir_new(".")
+assert(relative_made == nil and type(relative_error) == "string" and relative_error ~= "exists",
+  "relative paths must be rejected")
+local file_path = os.tmpname()
+local file = assert(io.open(file_path, "wb"))
+file:close()
+local file_made, file_error = fs.mkdir_new(file_path)
+assert(file_made == nil and file_error == "exists", "a file at the target must report exists")
+os.remove(file_path)
+local missing_parent = os.tmpname()
+os.remove(missing_parent)
+missing_parent = missing_parent .. "/child"
+local parent_made, parent_error = fs.mkdir_new(missing_parent)
+assert(parent_made == nil and type(parent_error) == "string", "missing parent must return an error")
 assert(type(fs.write_atomic) == "function", "remuda.fs.write_atomic is missing")
 local write_path = os.tmpname()
 os.remove(write_path)

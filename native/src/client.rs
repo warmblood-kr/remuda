@@ -16,8 +16,6 @@ const ATTACH_INPUT_QUEUE_BYTES: usize = 1024 * 1024;
 const ATTACH_INPUT_CHUNK_BYTES: usize = 16 * 1024;
 const ATTACH_INPUT_STALL: Duration = Duration::from_secs(3);
 const ATTACH_INPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
-const PASTE_START: &[u8] = b"\x1b[200~";
-const PASTE_END: &[u8] = b"\x1b[201~";
 
 fn attach_input_stall_threshold() -> Duration {
     #[cfg(debug_assertions)]
@@ -34,8 +32,6 @@ struct AttachInputStatus {
     last_progress: Instant,
     dropping: bool,
     permanent_failure: bool,
-    paste_open: bool,
-    paste_pending: Vec<u8>,
 }
 
 struct AttachInputQueue {
@@ -81,8 +77,6 @@ impl AttachInputQueue {
                     last_progress: Instant::now(),
                     dropping: false,
                     permanent_failure: false,
-                    paste_open: false,
-                    paste_pending: Vec::new(),
                 })),
                 dropped: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 queued_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -166,45 +160,13 @@ impl AttachInputQueue {
             .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn track_paste(&self, bytes: &[u8]) -> (bool, bool) {
-        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
-        let was_open = status.paste_open;
-        for &byte in bytes {
-            status.paste_pending.push(byte);
-            loop {
-                if status.paste_pending.starts_with(PASTE_START) {
-                    status.paste_open = true;
-                    status.paste_pending.drain(..PASTE_START.len());
-                } else if status.paste_pending.starts_with(PASTE_END) {
-                    status.paste_open = false;
-                    status.paste_pending.drain(..PASTE_END.len());
-                } else if PASTE_START.starts_with(&status.paste_pending)
-                    || PASTE_END.starts_with(&status.paste_pending)
-                {
-                    break;
-                } else if !status.paste_pending.is_empty() {
-                    status.paste_pending.remove(0);
-                } else {
-                    break;
-                }
-            }
-        }
-        (was_open, status.paste_open)
-    }
-
-    fn reset_paste_tracker(&self) {
-        let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
-        status.paste_open = false;
-        status.paste_pending.clear();
-    }
-
     fn force_paste_close(&self) {
-        let len = PASTE_END.len();
+        let len = crate::mouse::PASTE_END.len();
         // This one protocol marker may exceed the byte cap by six bytes. It
         // follows all queued data so the child cannot remain in paste mode.
         self.queued_bytes
             .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
-        if self.sender.send(PASTE_END.to_vec()).is_err() {
+        if self.sender.send(crate::mouse::PASTE_END.to_vec()).is_err() {
             self.queued_bytes
                 .fetch_sub(len, std::sync::atomic::Ordering::SeqCst);
             self.dropped
@@ -219,11 +181,10 @@ impl AttachInputQueue {
             .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn enqueue(&self, bytes: &[u8]) {
+    fn enqueue(&self, bytes: &[u8], close_paste_on_drop: bool) {
         let chunk_size = ATTACH_INPUT_CHUNK_BYTES.min(self.capacity);
         let mut chunks = bytes.chunks(chunk_size).peekable();
         while let Some(chunk) = chunks.next() {
-            let (paste_was_open, paste_is_open) = self.track_paste(chunk);
             let mut pending = chunk.to_vec();
             loop {
                 match self.attempt(pending) {
@@ -233,10 +194,9 @@ impl AttachInputQueue {
                         std::thread::sleep(Duration::from_millis(5));
                     }
                     AttachInputAttempt::Dropped => {
-                        if paste_was_open || paste_is_open {
+                        if close_paste_on_drop {
                             self.force_paste_close();
                         }
-                        self.reset_paste_tracker();
                         let remaining = chunks.map(<[u8]>::len).sum();
                         self.stop_after_drop(remaining);
                         return;
@@ -961,27 +921,26 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     break;
                 }
                 trace_input_read(trace_input.as_deref(), &buf[..n]);
-                match buf[..n].iter().position(|&b| b == DETACH) {
-                    // Queue preceding keys before ending this stream, so the
-                    // grace below can deliver them before detach closes it.
+                let detach_at = detach_offset(&parser, &buf[..n]);
+                match detach_at {
+                    // Forward what was typed before the detach key, then stop.
+                    // Dropping those bytes would silently swallow input the
+                    // user believes they sent.
                     Some(at) => {
-                        if mouse {
-                            route_tokens(&mut route, parser.feed(&buf[..at]));
-                        } else if at > 0 {
-                            input_queue.enqueue(&buf[..at]);
-                        }
+                        route_tokens(&mut route, parser.feed(&buf[..at]));
                         route_tokens(&mut route, parser.finish());
                         detached.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
                     None => {
-                        if mouse {
-                            route_tokens(&mut route, parser.feed(&buf[..n]));
-                        } else {
-                            input_queue.enqueue(&buf[..n]);
-                        }
+                        route_tokens(&mut route, parser.feed(&buf[..n]));
                     }
                 }
+            }
+            // stdin EOF/errors and child exit can end this thread mid-paste.
+            // Always restore the child parser before dropping its input pipe.
+            if parser.paste_open() {
+                route_tokens(&mut route, parser.finish());
             }
             // Ends the screen pump below, which then returns from `attach` and
             // drops every handle on this connection — that hang-up is what the
@@ -1191,7 +1150,7 @@ fn route_tokens(route: &mut AttachRoute<'_>, tokens: Vec<crate::mouse::InputToke
                     route.scrollback.load(Ordering::SeqCst),
                 ) {
                     MouseAction::Forward(bytes) => {
-                        route.input.enqueue(&bytes);
+                        route.input.enqueue(&bytes, false);
                     }
                     MouseAction::Scroll(next) => {
                         let _guard = route.output_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1240,7 +1199,7 @@ fn route_tokens(route: &mut AttachRoute<'_>, tokens: Vec<crate::mouse::InputToke
                 }
             }
             InputToken::Paste(bytes) => {
-                route.input.enqueue(&bytes);
+                route.input.enqueue(&bytes, true);
             }
         }
     }
@@ -1259,7 +1218,20 @@ fn exit_history_if_needed(route: &mut AttachRoute<'_>, bytes: &[u8]) {
         route.scrollback.store(0, Ordering::SeqCst);
         paint_history(route.path, route.name, 0);
     }
-    route.input.enqueue(bytes);
+    route.input.enqueue(bytes, false);
+}
+
+fn detach_offset(parser: &crate::mouse::SgrParser, bytes: &[u8]) -> Option<usize> {
+    if parser.paste_open()
+        && bytes == [DETACH]
+        && parser.paste_idle_at_least(std::time::Duration::from_secs(1))
+    {
+        // While a bracketed paste is live, Ctrl-\\ is data unless it arrives
+        // alone after the paste has gone idle.
+        Some(0)
+    } else {
+        parser.first_byte_outside_paste(bytes, DETACH)
+    }
 }
 
 /// Paint one captured frame while the caller holds the output lock.
@@ -1468,8 +1440,8 @@ mod tests {
     use super::request_with_timeout;
     #[cfg(unix)]
     use super::trace_input_read;
+    use super::{detach_offset, report_attach_input_dropped, AttachInputQueue, DETACH};
     use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
-    use super::{report_attach_input_dropped, AttachInputQueue, PASTE_END, PASTE_START};
     #[cfg(unix)]
     use crate::ipc;
     #[cfg(unix)]
@@ -1481,17 +1453,20 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(unix)]
     use std::sync::mpsc;
+    #[cfg(unix)]
+    use std::time::Instant;
+    use std::time::{Duration, UNIX_EPOCH};
 
     #[test]
     fn attach_input_drop_recovers_after_writer_progress() {
         let (queue, rx) = AttachInputQueue::with_capacity(6, Duration::ZERO);
-        queue.enqueue(b"queued");
-        queue.enqueue(b"dropped");
+        queue.enqueue(b"queued", false);
+        queue.enqueue(b"dropped", false);
         assert!(queue.take_drop_notice());
         assert!(!queue.take_drop_notice());
         assert_eq!(queue.dropped.load(std::sync::atomic::Ordering::SeqCst), 7);
         queue.writer().delivered(6);
-        queue.enqueue(b"fresh!");
+        queue.enqueue(b"fresh!", false);
         assert_eq!(rx.try_recv().unwrap(), b"queued");
         assert_eq!(rx.try_recv().unwrap(), b"fresh!");
         assert!(rx.try_recv().is_err());
@@ -1504,16 +1479,64 @@ mod tests {
 
     #[test]
     fn dropping_during_bracketed_paste_forwards_the_closing_marker() {
-        let (queue, rx) = AttachInputQueue::with_capacity(PASTE_START.len(), Duration::ZERO);
-        queue.enqueue(PASTE_START);
-        queue.enqueue(b"paste body");
-        assert_eq!(rx.try_recv().unwrap(), PASTE_START);
-        assert_eq!(rx.try_recv().unwrap(), PASTE_END);
+        let (queue, rx) = AttachInputQueue::with_capacity(6, Duration::ZERO);
+        queue.enqueue(b"\x1b[200~", true);
+        queue.enqueue(b"paste body", true);
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b[200~");
+        assert_eq!(rx.try_recv().unwrap(), b"\x1b[201~");
         assert!(rx.try_recv().is_err());
     }
-    #[cfg(unix)]
-    use std::time::Instant;
-    use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn detach_inside_paste_requires_a_lone_ctrl_backslash_after_idle() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[200~payload").is_empty());
+        assert_eq!(detach_offset(&parser, &[DETACH]), None);
+        assert_eq!(detach_offset(&parser, &[b'x', DETACH]), None);
+        std::thread::sleep(Duration::from_millis(1010));
+        assert_eq!(detach_offset(&parser, &[DETACH]), Some(0));
+        assert!(
+            matches!(parser.finish().last(), Some(crate::mouse::InputToken::Paste(bytes)) if bytes.ends_with(b"\x1b[201~"))
+        );
+    }
+
+    #[test]
+    fn detach_byte_inside_single_read_paste_is_data() {
+        let parser = crate::mouse::SgrParser::default();
+        let paste = b"\x1b[200~ab\x1ccd\x1b[201~";
+        assert_eq!(detach_offset(&parser, paste), None);
+    }
+
+    #[test]
+    fn detach_byte_inside_paste_after_split_start_marker_is_data() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[20").is_empty());
+        let tail = b"0~ab\x1ccd\x1b[201~";
+        assert_eq!(detach_offset(&parser, tail), None);
+        assert!(parser
+            .feed(tail)
+            .iter()
+            .all(|token| matches!(token, crate::mouse::InputToken::Paste(_))));
+    }
+
+    #[test]
+    fn detach_after_paste_end_in_the_same_read_is_still_a_hotkey() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[200~body").is_empty());
+        let input = b"tail\x1b[201~x\x1c";
+        assert_eq!(detach_offset(&parser, input), Some(input.len() - 1));
+    }
+
+    #[test]
+    fn raw_mouse_disabled_recovery_closes_child_paste_after_timeout() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[200~raw bytes").is_empty());
+        let tokens = parser.finish();
+        assert!(matches!(
+            tokens.last(),
+            Some(crate::mouse::InputToken::Paste(bytes)) if bytes.ends_with(b"\x1b[201~")
+        ));
+    }
 
     #[cfg(unix)]
     fn assert_request_timeout(request: Request) {

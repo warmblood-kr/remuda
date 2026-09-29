@@ -114,17 +114,12 @@ fn clear_trust_dialog(socket: &Path, name: &str) {
 
     // Step 2: Down, then Enter — selects "Yes, I trust this folder" (the
     // default is "No, exit", so an unconditional Enter here would exit).
-    // One `SendLine` (raw text plus its appended `\r`) rather than two raw
-    // `Send`s: a pty is a byte stream with no keypress framing, so
-    // `"\x1b[B"` + auto-appended `\r` lands identically to Down then Enter —
-    // and it keeps this test entirely on the `SendLine`/`Capture` wire path
-    // that is already exercised elsewhere, rather than also being the first
-    // exerciser of raw `Send`'s bytes-array wire encoding.
+    // Explicit key bytes select the trust option, then Return submits it.
     client::request(
         socket,
-        &Request::SendLine {
+        &Request::Send {
             name: name.to_string(),
-            text: "\x1b[B".to_string(),
+            bytes: b"\x1b[B\r".to_vec(),
         },
     )
     .expect("send down arrow + enter");

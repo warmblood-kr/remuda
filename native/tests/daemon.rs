@@ -981,7 +981,7 @@ fn wait_for_cli_exit(viewer: &Session, name: &str) {
 #[cfg(unix)]
 #[test]
 fn attach_detach_during_stalled_input_reports_loss_and_exits() {
-    let runtime = scratch_dir("attach-detach-stalled-input");
+    let runtime = scratch_dir("attach-detach-stall");
     let path = daemon::socket_path_in(&runtime, "s");
     let _daemon = Daemon::spawn(&runtime);
     let capture_path = runtime.join("captured");
@@ -1078,7 +1078,7 @@ fn attach_keys_before_detach_in_one_read_reach_the_child() {
 #[cfg(unix)]
 #[test]
 fn attach_large_paste_survives_a_slow_but_reading_child() {
-    let runtime = scratch_dir("attach-295-slow-reader-paste");
+    let runtime = scratch_dir("paste-slow");
     let path = daemon::socket_path_in(&runtime, "s");
     let _daemon = Daemon::spawn(&runtime);
     let name = "target";
@@ -1114,7 +1114,7 @@ fn attach_large_paste_survives_a_slow_but_reading_child() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
-    let runtime = scratch_dir("attach-stall-drop-recovery");
+    let runtime = scratch_dir("input-recovery");
     let path = daemon::socket_path_in(&runtime, "s");
     let _daemon = Daemon::spawn(&runtime);
     let recovered_marker = runtime.join("recovered");
@@ -1208,15 +1208,15 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
         let recovered = b"RECOVERED-END";
         let recovered_deadline = Instant::now() + Duration::from_secs(20);
         loop {
+            if recovered_marker.exists() {
+                break;
+            }
             assert!(
                 Instant::now() < recovered_deadline,
                 "input queue did not recover after child reads resumed"
             );
             held.write_raw(recovered)
                 .expect("send post-stall recovery marker");
-            if recovered_marker.exists() {
-                break;
-            }
             std::thread::sleep(Duration::from_millis(100));
         }
     });
@@ -3522,7 +3522,7 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
     let dir = scratch_dir("attach-mouse-forward");
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
-    let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006h'; dd bs=1 count=12 2>/dev/null | od -An -tx1; printf '\\nmouse-forwarded\\n'";
+    let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006h\\033[?2004h'; dd bs=1 count=12 2>/dev/null | od -An -tx1; printf '\\nmouse-forwarded\\n'";
     let created = client::request(
         &path,
         &Request::New {
@@ -3547,6 +3547,7 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
             Ok(Response::MouseState(MouseState {
                 mode: MouseMode::PressRelease,
                 encoding: MouseEncoding::Sgr,
+                bracketed_paste: true,
             })) => break,
             other => {
                 assert!(
