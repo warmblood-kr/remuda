@@ -58,16 +58,10 @@ pub fn run_sync(
     timeout_seconds: f64,
 ) -> Result<RunOutput, String> {
     validate_run(&argv, timeout_seconds)?;
-    #[cfg(test)]
-    let diagnose = argv
-        .iter()
-        .any(|argument| argument.contains("remuda-process-run-grandchild"));
-    #[cfg(not(test))]
-    let diagnose = false;
     let (stdout_permit, stderr_permit) = reserve_run_reader_workers()?;
+    let process_tree = ProcessTree::new().map_err(|error| error.to_string())?;
 
-    let started_at = Instant::now();
-    let deadline = started_at + Duration::from_secs_f64(timeout_seconds);
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds);
     let (program, args) = argv.split_first().expect("argv checked above");
     let mut command = Command::new(program);
     command
@@ -76,8 +70,12 @@ pub fn run_sync(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     child_guard::harden(&mut command);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+    }
     let mut child = command.spawn().map_err(|error| error.to_string())?;
-    let process_tree = ProcessTree::new().map_err(|error| error.to_string())?;
     if let Err(error) = process_tree.assign(&child) {
         let _ = child.kill();
         let _ = child.wait();
@@ -96,13 +94,7 @@ pub fn run_sync(
         let state = stdout_reader.clone();
         std::thread::spawn(move || {
             let _permit = stdout_permit;
-            capture_bounded(
-                stdout,
-                capture,
-                state,
-                "stdout",
-                diagnose.then_some(started_at),
-            )
+            capture_bounded(stdout, capture, state)
         })
     };
     let stderr_reader_thread = {
@@ -110,13 +102,7 @@ pub fn run_sync(
         let state = stderr_reader.clone();
         std::thread::spawn(move || {
             let _permit = stderr_permit;
-            capture_bounded(
-                stderr,
-                capture,
-                state,
-                "stderr",
-                diagnose.then_some(started_at),
-            )
+            capture_bounded(stderr, capture, state)
         })
     };
     let stdin_done = Arc::new(AtomicBool::new(false));
@@ -139,8 +125,6 @@ pub fn run_sync(
         &stdout_reader,
         &stderr_reader,
         &stdin_done,
-        diagnose,
-        started_at,
     )?;
 
     if timed_out {
@@ -221,11 +205,7 @@ fn wait_for_process_io(
     stdout_reader: &ReaderState,
     stderr_reader: &ReaderState,
     stdin_done: &AtomicBool,
-    diagnose: bool,
-    started_at: Instant,
 ) -> Result<(std::process::ExitStatus, bool), String> {
-    #[cfg(not(windows))]
-    let _ = (diagnose, started_at);
     let mut child_status = None;
     loop {
         if child_status.is_none() {
@@ -253,18 +233,6 @@ fn wait_for_process_io(
             }
         }
         if Instant::now() >= deadline {
-            #[cfg(windows)]
-            if diagnose {
-                eprintln!(
-                    "process.run diagnostic: deadline reached at {:?}; leader exited before timeout: {}",
-                    started_at.elapsed(),
-                    child_status.is_some()
-                );
-                eprintln!(
-                    "process.run diagnostic: job accounting before termination: {:?}",
-                    process_tree.job.active_processes()
-                );
-            }
             // On Unix, only signal the process group while its direct leader
             // is known to be alive; after reap, its pgid may have been reused.
             // A Windows Job Object handle remains tied to its job after the
@@ -356,37 +324,17 @@ impl ReaderState {
     }
 }
 
-fn capture_bounded(
-    mut reader: impl Read,
-    capture: Arc<Mutex<BoundedCapture>>,
-    state: ReaderState,
-    label: &'static str,
-    diagnostic_started_at: Option<Instant>,
-) {
+fn capture_bounded(mut reader: impl Read, capture: Arc<Mutex<BoundedCapture>>, state: ReaderState) {
     let mut buffer = [0u8; 8192];
     let result = loop {
         match reader.read(&mut buffer) {
             Ok(0) => break Ok(()),
-            Ok(read) => {
-                if let Some(started_at) = diagnostic_started_at {
-                    eprintln!(
-                        "process.run diagnostic: {label} reader received {read} bytes at {:?}",
-                        started_at.elapsed()
-                    );
-                }
-                capture.lock().unwrap().push(&buffer[..read]);
-            }
+            Ok(read) => capture.lock().unwrap().push(&buffer[..read]),
             Err(error) => break Err(error.to_string()),
         }
     };
     if let Err(error) = result {
         *state.error.lock().unwrap() = Some(error);
-    }
-    if let Some(started_at) = diagnostic_started_at {
-        eprintln!(
-            "process.run diagnostic: {label} reader reached EOF at {:?}",
-            started_at.elapsed()
-        );
     }
     state.done.store(true, Ordering::Release);
 }
@@ -422,8 +370,6 @@ mod run_tests {
             Cursor::new(vec![b'x'; RUN_OUTPUT_LIMIT + 1]),
             capture.clone(),
             super::ReaderState::new(),
-            "test",
-            None,
         );
         let output = capture.lock().unwrap().snapshot();
         assert_eq!(output.len(), RUN_OUTPUT_LIMIT);
@@ -496,40 +442,25 @@ mod run_tests {
         ));
         let started_path = stem.with_extension("started");
         let finished_path = stem.with_extension("finished");
-        let script_path = stem.with_extension("ps1");
-        for path in [&started_path, &finished_path, &script_path] {
+        for path in [&started_path, &finished_path] {
             let _ = std::fs::remove_file(path);
         }
-        let started = started_path.to_string_lossy().replace('\'', "''");
-        let finished = finished_path.to_string_lossy().replace('\'', "''");
-        std::fs::write(
-            &script_path,
-            format!(
-                "Set-Content -LiteralPath '{started}' -Value started\nStart-Sleep -Seconds 4\nSet-Content -LiteralPath '{finished}' -Value finished\n"
-            ),
-        )
-        .expect("write grandchild script");
-        let script = script_path.to_string_lossy();
-        let command = format!(
-            r#"start "" /b powershell.exe -NoProfile -NonInteractive -File "{script}" & echo spawned"#
-        );
+        let helper = std::env::current_exe().expect("locate test helper");
+        let paths = format!("{}\n{}\n", started_path.display(), finished_path.display());
 
         let started = Instant::now();
         let result = super::run_sync(
-            vec!["cmd.exe".into(), "/d".into(), "/c".into(), command],
-            None,
+            vec![
+                helper.to_string_lossy().into_owned(),
+                "--exact".into(),
+                "process::run_tests::timeout_grandchild_launcher".into(),
+                "--nocapture".into(),
+                "--test-threads=1".into(),
+            ],
+            Some(paths.into_bytes()),
             2.0,
         )
         .expect("process.run should return at the timeout");
-        eprintln!(
-            "process.run diagnostic: test returned after {:?}; timed_out={}, code={}, stdout={:?}, stderr={:?}, started file exists={}",
-            started.elapsed(),
-            result.timed_out,
-            result.code,
-            String::from_utf8_lossy(&result.stdout),
-            String::from_utf8_lossy(&result.stderr),
-            started_path.exists()
-        );
         assert!(result.timed_out, "the parent should hit its timeout");
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -547,13 +478,66 @@ mod run_tests {
 
         std::thread::sleep(Duration::from_secs(3));
         let grandchild_survived = finished_path.exists();
-        for path in [&started_path, &finished_path, &script_path] {
+        for path in [&started_path, &finished_path] {
             let _ = std::fs::remove_file(path);
         }
         assert!(
             !grandchild_survived,
             "the grandchild survived after process.run timed out"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn timeout_grandchild_launcher() {
+        use std::io::{stdin, Read, Write};
+        use std::process::{Command, Stdio};
+
+        if !std::env::args().any(|arg| arg == "process::run_tests::timeout_grandchild_launcher") {
+            return;
+        }
+
+        let mut paths = String::new();
+        stdin()
+            .read_to_string(&mut paths)
+            .expect("read grandchild marker paths from stdin");
+        let mut paths = paths.lines();
+        let started_path = paths.next().expect("started marker path");
+        let finished_path = paths.next().expect("finished marker path");
+        let helper = std::env::current_exe().expect("locate test helper");
+        let _grandchild = Command::new(helper)
+            .args([
+                "--exact",
+                "process::run_tests::timeout_grandchild_sleeper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("REMUDA_TEST_GRANDCHILD_STARTED", started_path)
+            .env("REMUDA_TEST_GRANDCHILD_FINISHED", finished_path)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn grandchild test helper");
+        println!("spawned");
+        std::io::stdout().flush().expect("flush spawn marker");
+        // Dropping the handle does not wait. The job object should terminate
+        // this child together with the launcher when process.run times out.
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn timeout_grandchild_sleeper() {
+        let (Some(started), Some(finished)) = (
+            std::env::var_os("REMUDA_TEST_GRANDCHILD_STARTED"),
+            std::env::var_os("REMUDA_TEST_GRANDCHILD_FINISHED"),
+        ) else {
+            return;
+        };
+
+        std::fs::write(started, b"started").expect("write started marker");
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        std::fs::write(finished, b"finished").expect("write finished marker");
     }
 
     #[cfg(windows)]
@@ -637,7 +621,8 @@ impl ProcessTree {
     fn assign(&self, child: &Child) -> std::io::Result<()> {
         #[cfg(windows)]
         {
-            let _ = child;
+            self.job.assign(child)?;
+            self.job.resume_primary_thread(child.id())?;
         }
         #[cfg(not(windows))]
         let _ = child;
@@ -796,31 +781,6 @@ impl KillOnCloseJob {
         // SAFETY: self owns a valid Job Object handle. It may already be
         // empty or terminated, in which case this best-effort call is benign.
         unsafe { TerminateJobObject(self.0, RUN_TIMEOUT_EXIT_CODE as u32) };
-    }
-
-    fn active_processes(&self) -> std::io::Result<u32> {
-        use windows_sys::Win32::System::JobObjects::{
-            JobObjectBasicAccountingInformation, QueryInformationJobObject,
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-        };
-
-        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        // SAFETY: `accounting` is writable and its size matches the requested
-        // information class; the job handle remains live for this call.
-        let queried = unsafe {
-            QueryInformationJobObject(
-                self.0,
-                JobObjectBasicAccountingInformation,
-                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
-                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                std::ptr::null_mut(),
-            )
-        };
-        if queried == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(accounting.ActiveProcesses)
-        }
     }
 }
 
