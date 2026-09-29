@@ -131,6 +131,11 @@ fs
 
 ``table`` — Atomic replacement of files for trusted Lua callers.
 
+fs.mkdir_new
+------------
+
+``fs.mkdir_new(path) -> true | nil, 'exists' | nil, error`` — Create one new directory without creating parents or trusting an existing path.
+
 fs.write_atomic
 ---------------
 

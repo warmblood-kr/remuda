@@ -1,8 +1,69 @@
 use super::*;
 use remuda_core::Size;
+use std::sync::{Arc, Mutex};
 
 const REAL_OUTPUT_WAIT: Duration = Duration::from_secs(60);
 const REAL_OUTPUT_POLL: Duration = Duration::from_millis(50);
+
+#[test]
+fn paste_input_strips_escape_and_wraps_only_when_child_mode_is_enabled() {
+    assert_eq!(
+        paste_input("first\n\x1b[201~second", true),
+        b"\x1b[200~first\n[201~second\x1b[201~"
+    );
+    assert_eq!(paste_input("first\nsecond", false), b"first\nsecond");
+}
+
+#[test]
+fn paste_input_strips_c0_controls_except_tab_line_feed_and_carriage_return() {
+    assert_eq!(
+        paste_input("a\u{3}\u{4}\u{1a}\u{1c}\t\n\r\u{7f}z", false),
+        b"a\t\n\rz"
+    );
+}
+
+#[test]
+fn paste_input_strips_del_and_c1_without_corrupting_utf8() {
+    assert_eq!(paste_input("한\u{9b}글\u{7f}!", false), "한글!".as_bytes());
+}
+
+#[test]
+fn old_mouse_state_wire_shape_defaults_bracketed_paste_to_off() {
+    let state: remuda_core::agent::MouseState =
+        serde_json::from_str(r#"{"mode":"None","encoding":"Default"}"#).unwrap();
+    assert!(!state.bracketed_paste);
+}
+
+#[derive(Clone)]
+struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn bracketed_paste_capture_toggles_and_drop_resets_the_terminal() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut capture = BracketedPasteCapture::new(SharedWriter(Arc::clone(&output)));
+        capture.set(true).unwrap();
+        capture.set(true).unwrap();
+        capture.set(false).unwrap();
+        capture.set(false).unwrap();
+        capture.set(true).unwrap();
+    }
+    assert_eq!(
+        *output.lock().unwrap(),
+        b"\x1b[?2004h\x1b[?2004l\x1b[?2004h\x1b[?2004l"
+    );
+}
 
 fn wait_for_output<T>(
     mut check: impl FnMut() -> Option<T>,

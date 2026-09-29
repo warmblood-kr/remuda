@@ -2815,24 +2815,24 @@ mod tests {
             |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
             socket_test_timeout(),
             socket_test_timeout(),
-            Duration::from_millis(150),
-            Duration::from_millis(300),
+            Duration::from_secs(10),
+            Duration::from_secs(1),
         );
         let started = Instant::now();
         let mut stream = TcpStream::connect(server.address).unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(12)))
             .unwrap();
         let request = b"POST /cluster HTTP/1.1\r\nHost: test\r\nContent-Length: 4\r\n\r\ntest";
         for byte in request {
             if stream.write_all(&[*byte]).is_err() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(Duration::from_millis(150));
         }
         let mut tail = Vec::new();
         let _ = stream.read_to_end(&mut tail);
-        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

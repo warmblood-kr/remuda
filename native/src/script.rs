@@ -170,6 +170,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "fs.write_atomic(path, bytes) -> true, nil | nil, error",
     ),
     (
+        "fs.mkdir_new",
+        "Create one new directory without creating parents or trusting an existing path.",
+        "fs.mkdir_new(path) -> true | nil, 'exists' | nil, error",
+    ),
+    (
         "ls",
         "List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.",
         "ls() -> {session...}",
@@ -1036,11 +1041,19 @@ fn dir_bindings(
     Ok(())
 }
 
-/// `remuda.fs` currently exposes one atomic write word. The Lua runtime is
-/// trusted and already has arbitrary `io.open`/`os.rename`; this bundles the
-/// durability and replacement guarantees into a single named operation.
+/// Filesystem operations with explicit creation and replacement semantics.
 fn fs_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
     let fs = lua.create_table()?;
+    fs.set(
+        "mkdir_new",
+        lua.create_function(|_, path: String| match mkdir_new(Path::new(&path), &path) {
+            Ok(()) => Ok((Some(true), None::<String>)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok((None::<bool>, Some("exists".to_string())))
+            }
+            Err(error) => Ok((None::<bool>, Some(error.to_string()))),
+        })?,
+    )?;
     fs.set(
         "write_atomic",
         lua.create_function(|_, (path, bytes): (String, mlua::LuaString)| {
@@ -1051,6 +1064,29 @@ fn fs_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
         })?,
     )?;
     table.set("fs", fs)
+}
+
+fn mkdir_new(path: &Path, raw_path: &str) -> std::io::Result<()> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path must be absolute",
+        ));
+    }
+    if raw_path.ends_with(std::path::MAIN_SEPARATOR) || cfg!(windows) && raw_path.ends_with('/') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path must not end with a separator",
+        ));
+    }
+
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 /// The `Ticker`'s own skip counters, read-only — no threshold or alarm here,
@@ -1302,12 +1338,41 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
 
 #[cfg(test)]
 mod binding_tests {
-    use super::{lua_steps_to_wire, BINDINGS};
+    use super::{fs_bindings, lua_steps_to_wire, BINDINGS};
+    use mlua::Lua;
     use remuda_core::protocol::Step;
 
     #[test]
     fn binding_names_are_sorted_and_unique() {
         assert!(BINDINGS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mkdir_new_creates_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("remuda-mkdir-new-{}-{nonce}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let lua = Lua::new();
+        let remuda = lua.create_table().unwrap();
+        fs_bindings(&lua, &remuda).unwrap();
+        lua.globals().set("remuda", remuda).unwrap();
+        lua.globals().set("target", path.as_str()).unwrap();
+
+        lua.load("assert(remuda.fs.mkdir_new(target) == true)")
+            .exec()
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(mode, 0o700, "new directories must be owner-only");
     }
 
     #[test]
