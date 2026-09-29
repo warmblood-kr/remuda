@@ -2026,13 +2026,95 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{runtime_base_for, shell_or_default};
-    use remuda_core::agent::{Color, StyledCell};
+    use super::{
+        acquire_sync_permit, forward_attach_input, report_attach_input_failure, runtime_base_for,
+        shell_or_default, SyncPermit, ATTACH_INPUT_FAILURE_NOTICE, MAX_CONCURRENT_SYNCS,
+    };
+    use remuda_core::agent::{AgentError, Color, StyledCell};
     use remuda_core::protocol::collapse_runs;
+    use remuda_core::protocol::Response;
     use std::ffi::OsStr;
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::Duration;
+
+    static SYNC_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn sync_concurrency_is_bounded() {
+        let _lock = SYNC_PERMIT_TEST_LOCK.lock().unwrap();
+        let mut permits: Vec<_> = (0..MAX_CONCURRENT_SYNCS)
+            .map(|_| SyncPermit::acquire().expect("permit within sync capacity"))
+            .collect();
+        assert!(
+            SyncPermit::acquire().is_none(),
+            "excess Sync must be refused"
+        );
+        drop(permits.pop());
+        let reusable = SyncPermit::acquire().expect("a released slot must be reusable");
+        drop(reusable);
+        drop(permits);
+    }
+
+    #[test]
+    fn daemon_sync_capacity_refusal_is_typed_on_wire() {
+        let _lock = SYNC_PERMIT_TEST_LOCK.lock().unwrap();
+        let permits: Vec<_> = (0..MAX_CONCURRENT_SYNCS)
+            .map(|_| SyncPermit::acquire().expect("fill daemon Sync capacity"))
+            .collect();
+        let response = match acquire_sync_permit() {
+            Ok(_) => panic!("over-cap Sync must be refused"),
+            Err(response) => response,
+        };
+        assert_eq!(response, Response::SyncAtCapacity);
+        let mut wire = serde_json::to_vec(&response).expect("serialize protocol response");
+        wire.push(b'\n');
+        let decoded: Response =
+            serde_json::from_slice(&wire[..wire.len() - 1]).expect("decode daemon response frame");
+        assert_eq!(decoded, Response::SyncAtCapacity);
+        drop(permits);
+    }
+
+    #[test]
+    fn attach_input_does_not_replay_after_terminal_write_error_and_has_a_human_notice() {
+        let mut attempts = 0;
+        let result = forward_attach_input(
+            || {
+                attempts += 1;
+                Err(AgentError::Io("injected partial write failure".into()))
+            },
+            || false,
+        );
+        assert!(matches!(result, Err(AgentError::Io(_))));
+        assert_eq!(
+            attempts, 1,
+            "a possibly partial write must never be replayed"
+        );
+        assert!(ATTACH_INPUT_FAILURE_NOTICE.contains("input stopped"));
+        assert!(ATTACH_INPUT_FAILURE_NOTICE.contains("may have been delivered"));
+        let mut notice = Vec::new();
+        report_attach_input_failure(&mut notice).unwrap();
+        assert_eq!(notice, ATTACH_INPUT_FAILURE_NOTICE.as_bytes());
+    }
+
+    #[test]
+    fn attach_input_retries_busy_only_until_the_original_buffer_is_accepted() {
+        let mut attempts = 0;
+        let result = forward_attach_input(
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(AgentError::Busy)
+                } else {
+                    Ok(())
+                }
+            },
+            || false,
+        );
+        assert!(result.is_ok());
+        assert_eq!(attempts, 2);
+    }
 
     #[test]
     fn anti_entropy_worker_stops_and_joins_on_shutdown() {
