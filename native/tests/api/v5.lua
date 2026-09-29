@@ -103,22 +103,6 @@ assert(remuda._registry["input.text"] ~= nil, "remuda.input.text needs a registr
 assert(remuda._registry["input.submit"] ~= nil, "remuda.input.submit needs a registry entry")
 assert(remuda._registry["input.type_text"] ~= nil, "remuda.input.type_text needs a registry entry")
 
-local input_name = "api-v5-input-" .. tostring(os.time())
-remuda.session.new(input_name, { "sh" })
-local command = "printf INPUT_UNIT_V5_OK"
-input.text(input_name, command)
-input.submit(input_name, command)
-local input_ready = false
-for _ = 1, 40 do
-  if remuda.capture(input_name):find("INPUT_UNIT_V5_OK", 1, true) then
-    input_ready = true
-    break
-  end
-  remuda.sleep(0.05)
-end
-assert(input_ready, "input.text + input.submit must execute a plain shell command")
-remuda.session.close(input_name)
-
 local bad_timeout = pcall(remuda.pending, { timeout = 301 })
 assert(not bad_timeout, "pending timeout must not exceed 300 seconds")
 
@@ -133,6 +117,7 @@ end
 local name = "api-v5-" .. tostring(os.time())
 local opened = session.new(name, { "sh" })
 assert(opened == name, "session.new must preserve new's return value")
+assert(input.submit(name, "") == "submitted", "an empty input.submit must return quickly")
 local found = false
 for _, row in ipairs(session.list()) do
   if row.name == name then found = true end

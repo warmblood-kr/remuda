@@ -380,7 +380,7 @@ impl Session {
         let baseline = self.tail_occurrences(&tail);
         self.input_text_locked(&body)?;
         if !settle.is_zero() {
-            std::thread::sleep(settle);
+            self.clock.sleep(settle);
         }
         self.submit_locked(&tail, baseline)
     }
@@ -736,7 +736,7 @@ impl Session {
             .input_lock
             .lock()
             .map_err(|_| AgentError::Io("session input lock poisoned".into()))?;
-        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        let deadline = self.clock.now() + Duration::from_millis(500);
         loop {
             if !*locked {
                 *locked = true;
@@ -745,7 +745,7 @@ impl Session {
             if self.input_writer_timed_out()? {
                 return Err(AgentError::Busy);
             }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let remaining = deadline.saturating_sub(self.clock.now());
             if remaining.is_zero() {
                 return Err(AgentError::Busy);
             }
