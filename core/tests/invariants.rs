@@ -89,32 +89,30 @@ fn session_with(agent: Box<dyn AgentProcess>) -> (Session, Arc<ManualClock>) {
     (session, clock)
 }
 
-/// True when every individual write is itself a whole instruction. Kept for
-/// negative controls that prove separate raw sends can interleave.
+/// True when every write is a whole instruction — a body with its Enter on the
+/// end, never a body alone and never a bare Enter.
+///
+/// This used to check that a body write was *followed by* an Enter write,
+/// because `send_line` wrote the two separately under one lock. Since
+/// 2026-09-10 `send_line` is one burst through `Session::send`, so the pair
+/// cannot be observed apart at all and the predicate states the stronger claim
+/// directly. The negative control below still fails it, which is the only
+/// reason this is a strengthening rather than a loosening.
 fn every_write_is_a_whole_instruction(writes: &[Vec<u8>]) -> bool {
     writes.iter().all(|w| {
         matches!(w.split_last(), Some((&b'\r', body)) if !body.is_empty() && !body.contains(&b'\r'))
     })
 }
 
-/// A send_line remains indivisible to other writers while its text and
-/// separate Return are emitted as a pair of bursts.
-fn send_line_writes_are_paired(writes: &[Vec<u8>]) -> bool {
-    writes.len() % 2 == 0
-        && writes
-            .chunks_exact(2)
-            .all(|pair| !pair[0].is_empty() && !pair[0].contains(&b'\r') && pair[1] == b"\r")
-}
-
 #[test]
-fn send_line_writes_text_then_a_separate_return() {
+fn send_line_writes_the_body_and_its_enter_as_one_burst() {
     let writes = Arc::new(Mutex::new(Vec::new()));
     let (session, _clock) = session_with(Box::new(RecordingAgent::new(writes.clone())));
 
     session.send_line("hello").unwrap();
 
     let got = writes.lock().unwrap().clone();
-    assert_eq!(got, vec![b"hello".to_vec(), b"\r".to_vec()]);
+    assert_eq!(got, vec![b"hello\r".to_vec()]);
 }
 
 #[test]
@@ -153,10 +151,14 @@ fn concurrent_send_lines_never_interleave() {
     }
 
     let got = writes.lock().unwrap().clone();
-    assert_eq!(got.len(), 32, "16 sends should produce two writes each");
+    assert_eq!(
+        got.len(),
+        16,
+        "16 sends should produce 16 indivisible bursts"
+    );
     assert!(
-        send_line_writes_are_paired(&got),
-        "a send_line text/Return pair interleaved: {got:?}"
+        every_write_is_a_whole_instruction(&got),
+        "a body write was separated from its Enter: {got:?}"
     );
 }
 
@@ -430,8 +432,8 @@ fn a_name_collision_is_refused_and_the_first_session_survives() {
         .expect("write ok");
     assert_eq!(
         first_writes.lock().unwrap().len(),
-        2,
-        "a text burst and a separate Return"
+        1,
+        "one indivisible burst"
     );
     assert!(
         second_writes.lock().unwrap().is_empty(),
@@ -458,7 +460,7 @@ fn many_handles_drive_one_session() {
 
     viewer.send_line("from the viewer").expect("viewer write");
     core.send_line("from the core").expect("core write");
-    assert_eq!(writes.lock().unwrap().len(), 4, "two bursts per send");
+    assert_eq!(writes.lock().unwrap().len(), 2, "one burst per send");
 }
 
 /// #136: the listing carries the human idle time, `None` until a keystroke.
@@ -668,7 +670,7 @@ fn orchestrated_input_reaches_a_session_while_a_human_is_attached() {
     // the assertion below would also pass on a session that never accepts
     // anything at all.
     session.send_line("before").expect("core drives when free");
-    assert_eq!(writes.lock().unwrap().len(), 2, "text and Return bursts");
+    assert_eq!(writes.lock().unwrap().len(), 1, "one indivisible burst");
 
     let held = session.attach();
     assert!(session.is_attached());
@@ -680,7 +682,7 @@ fn orchestrated_input_reaches_a_session_while_a_human_is_attached() {
         .expect("a viewer does not block raw input");
     assert_eq!(
         writes.lock().unwrap().len(),
-        5,
+        3,
         "both messages reach the pty while a human monitors it"
     );
 
@@ -689,7 +691,7 @@ fn orchestrated_input_reaches_a_session_while_a_human_is_attached() {
     session
         .send_line("after")
         .expect("detach restores the core");
-    assert_eq!(writes.lock().unwrap().len(), 7);
+    assert_eq!(writes.lock().unwrap().len(), 4);
 }
 
 #[test]

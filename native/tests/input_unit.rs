@@ -173,6 +173,16 @@ fn type_text_still_submits_plain_shell_commands_and_long_wrapped_text() {
     .expect("type shell command");
     assert!(wait_screen(&socket, "plain-shell", "SHELL_OK").contains("SHELL_OK"));
 
+    client::request(
+        &socket,
+        &Request::SendLine {
+            name: "plain-shell".into(),
+            text: "printf SEND_LINE_OK".into(),
+        },
+    )
+    .expect("send line through the shared text/submit path");
+    assert!(wait_screen(&socket, "plain-shell", "SEND_LINE_OK").contains("SEND_LINE_OK"));
+
     let wrapped = "printf WRAPPED_OK; # this text is deliberately longer than two screen lines in this narrow terminal";
     script::run_source(
         &socket,

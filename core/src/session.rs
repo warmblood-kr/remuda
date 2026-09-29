@@ -249,6 +249,19 @@ impl Session {
             let _held = self.acquire_input_lock()?;
             return self.write_one_burst(&bytes);
         }
+        if body.is_empty() {
+            let _held = self.acquire_input_lock()?;
+            return self.write_one_burst(crate::keys::RETURN_BYTES);
+        }
+        // Backends without a rendered screen cannot expose a composer. Keep
+        // their established one-burst SendLine behavior; PTYs use the
+        // separate text/submit sequence below.
+        if self.output_version().is_none() || self.screen_text().is_err() {
+            let mut bytes = body.into_bytes();
+            bytes.extend_from_slice(crate::keys::RETURN_BYTES);
+            let _held = self.acquire_input_lock()?;
+            return self.write_one_burst(&bytes);
+        }
         let _held = self.acquire_input_lock()?;
         self.input_text_locked(&body)?;
         self.submit_locked(&input_tail(&body))
@@ -291,45 +304,67 @@ impl Session {
         if tail.is_empty() {
             return self.write_one_burst(crate::keys::RETURN_BYTES);
         }
-
-        let mut visible = false;
-        for poll in 0..40 {
-            match self.compact_screen() {
-                Some(screen) if screen.contains(tail) => {
-                    visible = true;
-                    break;
-                }
-                // A backend with no screen output cannot reveal a composer.
-                // Give it a short grace period, then use the bounded fallback.
-                Some(screen) if screen.is_empty() && poll >= 3 => break,
-                _ => {}
-            }
-            if poll < 39 {
-                std::thread::sleep(Duration::from_millis(50));
-            }
+        let Some(mut version) = self.output_version() else {
+            return self.write_one_burst(crate::keys::RETURN_BYTES);
+        };
+        if self.screen_text().is_err() {
+            return self.write_one_burst(crate::keys::RETURN_BYTES);
         }
-
+        let visible = self.wait_for_visible_tail(tail, &mut version);
         let before = self.compact_screen().unwrap_or_default();
+        let before_version = self.output_version().unwrap_or(version);
         self.write_one_burst(crate::keys::RETURN_BYTES)?;
         if !visible {
             return Ok(());
         }
 
-        for poll in 0..20 {
+        version = before_version;
+        let started = self.clock.now();
+        for _ in 0..20 {
             if !self.is_alive() {
                 return Ok(());
             }
             if self.compact_screen().is_some_and(|screen| screen != before) {
                 return Ok(());
             }
-            if poll < 19 {
-                std::thread::sleep(Duration::from_millis(50));
+            let elapsed = self.clock.now().saturating_sub(started);
+            let remaining = Duration::from_secs(1).saturating_sub(elapsed);
+            if remaining.is_zero() {
+                break;
+            }
+            let timeout = remaining.min(Duration::from_millis(50));
+            if let Ok(snapshot) = self.wait_for_output_after(version, timeout) {
+                version = snapshot.output_version.unwrap_or(version);
             }
         }
         if self.is_alive() && self.compact_screen().as_deref() == Some(before.as_str()) {
             self.write_one_burst(crate::keys::RETURN_BYTES)?;
         }
         Ok(())
+    }
+
+    fn wait_for_visible_tail(&self, tail: &str, version: &mut u64) -> bool {
+        let started = self.clock.now();
+        for _ in 0..40 {
+            if self
+                .compact_screen()
+                .is_some_and(|screen| screen.contains(tail))
+            {
+                return true;
+            }
+            let elapsed = self.clock.now().saturating_sub(started);
+            let remaining = Duration::from_secs(2).saturating_sub(elapsed);
+            if remaining.is_zero() {
+                break;
+            }
+            let timeout = remaining.min(Duration::from_millis(50));
+            match self.wait_for_output_after(*version, timeout) {
+                Ok(snapshot) => *version = snapshot.output_version.unwrap_or(*version),
+                Err(_) => return false,
+            }
+        }
+        self.compact_screen()
+            .is_some_and(|screen| screen.contains(tail))
     }
 
     fn compact_screen(&self) -> Option<String> {
