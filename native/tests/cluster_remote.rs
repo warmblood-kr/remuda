@@ -396,8 +396,7 @@ fn real_remote_tui_paints_the_selected_remote_session_screen() {
     tui.wait_for("proof", Duration::from_secs(10));
     tui.writer.write_all(b"\x1b[B\r").unwrap();
     tui.wait_for("remote live · reachable", Duration::from_secs(10));
-    tui.writer.write_all(b"x").unwrap();
-    tui.wait_for("Remote session is read-only", Duration::from_secs(3));
+    tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
     tui.wait_for("PR8-MARKER", Duration::from_secs(10));
 }
 

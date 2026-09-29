@@ -1724,6 +1724,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn remote_stale_confirmed_close_reaches_daemon_and_is_refused() {
+        production_socket_close_response(
+            br#"{"allow_remote_control":true}"#,
+            Request::Close {
+                name: "session".into(),
+                instance_id: Some("stale-instance".into()),
+                confirm: Some(true),
+            },
+            Response::error("session restarted; close was refused"),
+            Response::error("session restarted; close was refused"),
+            1,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn remote_close_without_confirmation_is_refused_before_dispatch() {
         production_socket_close_response(
             br#"{"allow_remote_control":true}"#,
