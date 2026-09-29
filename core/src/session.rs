@@ -17,6 +17,18 @@ use std::sync::{Arc, Condvar, Mutex};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
+fn input_tail(text: &str) -> String {
+    let compact: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    compact
+        .into_iter()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
 /// A running agent, addressable by name.
 pub struct Session {
     id: String,
@@ -222,12 +234,79 @@ impl Session {
 
     /// Deliver one instruction: the text, then Enter, as one indivisible act.
     /// Carriage return, not newline — canonical mode takes CR as submit, and
-    /// raw-key TUIs expect the byte a real Enter produces. Decided only here.
+    /// raw-key TUIs expect the byte a real Enter produces. Keep the complete
+    /// text/submit sequence under one input lock so concurrent writers cannot
+    /// land between its separate PTY bursts.
     pub fn send_line(&self, text: &str) -> Result<()> {
-        let mut line = Vec::with_capacity(text.len() + 1);
-        line.extend_from_slice(text.as_bytes());
-        line.push(b'\r');
-        self.send(&line)
+        let has_escape = text.contains('\x1b');
+        let body = text.replace("\r\n", "\n").replace('\r', "\n");
+        // SendLine has historically also carried key sequences (for example
+        // Down+Return through a startup dialog). Keep those as raw keystrokes;
+        // text callers use remuda.input.text, which removes escape bytes.
+        if has_escape {
+            let mut bytes = body.into_bytes();
+            bytes.push(b'\r');
+            let _held = self.acquire_input_lock()?;
+            return self.write_one_burst(&bytes);
+        }
+        let compact_tail = input_tail(&body);
+        let bracketed = self.mouse_state().bracketed_paste;
+        let _held = self.acquire_input_lock()?;
+
+        let burst = if bracketed {
+            let mut bytes = Vec::with_capacity(body.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(body.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            bytes
+        } else {
+            body.as_bytes().to_vec()
+        };
+        self.write_one_burst(&burst)?;
+
+        if compact_tail.is_empty() {
+            return self.write_one_burst(b"\r");
+        }
+
+        // The input may be plain shell input (or a TUI whose echo is delayed).
+        // Wait for the tail to appear, but preserve the old useful fallback.
+        let mut waited = Duration::ZERO;
+        while waited < Duration::from_secs(2) {
+            if self.composer_tail_visible(&compact_tail) {
+                break;
+            }
+            let step = Duration::from_millis(50);
+            self.clock.sleep(step);
+            waited += step;
+        }
+        self.write_one_burst(b"\r")?;
+
+        waited = Duration::ZERO;
+        while waited < Duration::from_secs(1) {
+            if !self.is_alive() {
+                return Ok(());
+            }
+            if !self.composer_tail_visible(&compact_tail) {
+                return Ok(());
+            }
+            let step = Duration::from_millis(50);
+            self.clock.sleep(step);
+            waited += step;
+        }
+        if self.is_alive() && self.composer_tail_visible(&compact_tail) {
+            self.write_one_burst(b"\r")?;
+        }
+        Ok(())
+    }
+
+    fn composer_tail_visible(&self, tail: &str) -> bool {
+        self.screen_text()
+            .ok()
+            .map(|screen| {
+                let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
+                compact.ends_with(tail)
+            })
+            .unwrap_or(false)
     }
 
     /// Deliver a burst of input as one indivisible act, appending nothing — the

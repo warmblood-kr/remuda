@@ -10,7 +10,10 @@ use std::time::{Duration, Instant};
 mod spawn;
 
 fn scratch(tag: &str) -> PathBuf {
-    let dir = PathBuf::from(format!("/private/tmp/remuda-input-{}-{tag}", std::process::id()));
+    let dir = PathBuf::from(format!(
+        "/private/tmp/remuda-input-{}-{tag}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -36,7 +39,10 @@ fn wait_screen(path: &Path, name: &str, needle: &str) -> String {
         if screen.contains(needle) {
             return screen;
         }
-        assert!(Instant::now() < deadline, "did not see {needle:?}:\n{screen}");
+        assert!(
+            Instant::now() < deadline,
+            "did not see {needle:?}:\n{screen}"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -52,7 +58,7 @@ fn type_text_submits_paste_once_and_preserves_embedded_newline() {
         r#"import os, select, sys, termios, tty, time
 fd = sys.stdin.fileno()
 tty.setraw(fd)
-os.write(1, b'READY\r\n')
+os.write(1, b'\x1b[?2004hREADY\r\n')
 buf = bytearray()
 last = 0.0
 paste = False
@@ -118,8 +124,14 @@ while True:
     .expect("type_text");
 
     let screen = wait_screen(&socket, "paste-agent", "SUBMITTED:");
-    assert!(screen.contains("SUBMITTED:alpha\nbeta"), "text changed: {screen}");
-    assert!(screen.contains("COUNT:1"), "expected exactly one submission: {screen}");
+    assert!(
+        screen.contains("SUBMITTED:alpha\nbeta"),
+        "text changed: {screen}"
+    );
+    assert!(
+        screen.contains("COUNT:1"),
+        "expected exactly one submission: {screen}"
+    );
 }
 
 #[test]
@@ -139,8 +151,12 @@ fn type_text_still_submits_plain_shell_commands_and_long_wrapped_text() {
     )
     .expect("start shell");
 
-    script::run_source(&socket, "input-unit-shell", "remuda.type_text('plain-shell', 'printf SHELL_OK')")
-        .expect("type shell command");
+    script::run_source(
+        &socket,
+        "input-unit-shell",
+        "remuda.type_text('plain-shell', 'printf SHELL_OK')",
+    )
+    .expect("type shell command");
     assert!(wait_screen(&socket, "plain-shell", "SHELL_OK").contains("SHELL_OK"));
 
     let wrapped = "printf WRAPPED_OK; # this text is deliberately longer than two screen lines in this narrow terminal";

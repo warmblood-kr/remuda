@@ -28,8 +28,9 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 78] = [
+pub const BINDINGS: [&str; 81] = [
     "_advice_reattach",
+    "_bracketed_paste_enabled",
     "_call",
     "_descriptors",
     "_dispatch_extension_command",
@@ -48,6 +49,7 @@ pub const BINDINGS: [&str; 78] = [
     "_registry_dump",
     "_run_due_schedules",
     "_schedule_fire_counts",
+    "_session_alive",
     "_session_resize",
     "_sync_window_shown",
     "advice_list",
@@ -79,6 +81,7 @@ pub const BINDINGS: [&str; 78] = [
     "hook_list",
     "hooks",
     "http",
+    "input",
     "insert",
     "json",
     "key",
@@ -113,6 +116,11 @@ pub const BINDINGS: [&str; 78] = [
 /// own rows for the words it defines in pure Lua, into the same table.
 const WORDS: &[(&str, &str, &str)] = &[
     (
+        "_bracketed_paste_enabled",
+        "Read whether a child session enabled bracketed paste mode.",
+        "_bracketed_paste_enabled(name) -> boolean",
+    ),
+    (
         "_module_readiness",
         "Internal readiness poll for remuda exec.",
         "_module_readiness(name) -> {status, timeout_ms?, message?}",
@@ -123,7 +131,7 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_pending_create(timeout?) -> id, handle",
     ),
     (
-        "_pending_events",
+    "_pending_events",
         "Drain deferred-reply completion and cancellation notifications for the Lua tick.",
         "_pending_events() -> {{id, reason?}...}",
     ),
@@ -131,6 +139,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_session_resize",
         "Resize a session after validating its requested dimensions.",
         "_session_resize(name, cols, rows) -> true, nil | nil, error",
+    ),
+    (
+        "_session_alive",
+        "Check whether a session's child process is still running.",
+        "_session_alive(name) -> boolean",
     ),
     (
         "http",
@@ -397,6 +410,7 @@ pub fn bindings(
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
+    let alive_registry = registry.clone();
     fail_binding(lua, &table, image.clone())?;
     pending_bindings(lua, &table, image.pending_replies())?;
 
@@ -437,6 +451,26 @@ pub fn bindings(
         lua.create_function(move |lua, (name, text): (String, mlua::LuaString)| {
             let bytes = text.as_bytes().to_vec();
             value(lua, ask(&path, Request::Send { name, bytes })?)
+        })?,
+    )?;
+
+    let path = at();
+    table.set(
+        "_bracketed_paste_enabled",
+        lua.create_function(move |lua, name: String| {
+            match ask(&path, Request::MouseState { name })? {
+                Response::MouseState(state) => Ok(state.bracketed_paste),
+                other => value(lua, other).map(|_| false),
+            }
+        })?,
+    )?;
+
+    table.set(
+        "_session_alive",
+        lua.create_function(move |_, name: String| {
+            Ok(alive_registry
+                .get(&name)
+                .is_some_and(|session| session.is_alive()))
         })?,
     )?;
 

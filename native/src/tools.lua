@@ -1795,22 +1795,86 @@ function remuda._call(name, arguments, caller)
 end
 register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments, caller) -> string")
 
--- Type TEXT into SESSION and submit it with Return, as one act `remuda.feed`
--- will not let a second sender split. Not an MCP tool — a plain stdlib
--- function beside `send`/`insert`, since remuda itself frames none of this
--- (no default pause, no paste sequence) and this is the caller that does.
--- SETTLE (seconds before the submitting Return) defaults to 0.1. Like
--- `remuda.feed`, this blocks the calling Image for SETTLE seconds.
-function remuda.type_text(session, text, settle)
-  local body = tostring(text):gsub("\r\n?", "\n"):gsub("\27", "")
-  settle = settle or 0.1
-  local typed = body:find("\n", 1, true) and ("\27[200~" .. body .. "\27[201~") or body
-  remuda.feed(session, {
-    { burst = typed },
-    { pause = settle },
-    { burst = "\r" },
-  })
+-- Input is expressed as two words: one contiguous text burst, then a
+-- separately-timed submit key after the composer shows the text.
+remuda.input = {}
+
+local function normalized_text(text)
+  return tostring(text):gsub("\r\n?", "\n"):gsub("\27", "")
 end
+
+function remuda.input.text(session, text)
+  local body = normalized_text(text)
+  if remuda._bracketed_paste_enabled(session) then
+    body = "\27[200~" .. body .. "\27[201~"
+  end
+  -- One Send request means even an unbracketed multiline body is one burst.
+  remuda.insert(session, body)
+end
+
+register("input", "Terminal input words for text delivery and submission.", "table")
+register("input.text", "Deliver text as one burst, using bracketed paste when enabled by the child.", "input.text(session, text) -> nil")
+
+local function visible_tail(session, tail)
+  if tail == "" then return false end
+  local screen = remuda.capture(session):gsub("%s", "")
+  return screen:sub(-#tail) == tail
+end
+
+local function expected_tail(text)
+  local compact = normalized_text(text):gsub("%s", "")
+  local tail = compact:sub(-20)
+  while tail:byte(1) and tail:byte(1) >= 0x80 and tail:byte(1) <= 0xBF do
+    tail = tail:sub(2)
+  end
+  return tail
+end
+
+function remuda.input.submit(session, expect)
+  local tail = expected_tail(expect)
+  if tail == "" then
+    remuda.insert(session, "\r")
+    return
+  end
+  local waited = 0
+  while waited < 2 do
+    if visible_tail(session, tail) then
+      break
+    end
+    remuda.sleep(0.05)
+    waited = waited + 0.05
+  end
+
+  -- A plain shell may not expose an editable composer. Keep it usable by
+  -- sending Return after the bounded visibility wait even when unseen.
+  remuda.insert(session, "\r")
+
+  waited = 0
+  while waited < 1 do
+    if not remuda._session_alive(session) then return end
+    if not visible_tail(session, tail) then return end
+    remuda.sleep(0.05)
+    waited = waited + 0.05
+  end
+  -- The first Return may have become a newline in a paste-sensitive TUI.
+  if remuda._session_alive(session) and visible_tail(session, tail) then
+    remuda.insert(session, "\r")
+  end
+end
+
+register("input.submit", "Submit visible composer text with a separate Return and at most one retry.", "input.submit(session, expect) -> nil")
+
+-- Composite retained for compatibility: type text, honor the minimum settle
+-- pause, then submit it through the bounded visibility check.
+function remuda.type_text(session, text, settle)
+  local body = normalized_text(text)
+  settle = settle or 0.1
+  remuda.input.text(session, body)
+  if settle > 0 then remuda.sleep(settle) end
+  remuda.input.submit(session, body)
+end
+remuda.input.type_text = remuda.type_text
+register("input.type_text", "Type text, honor the settle pause, then submit it.", "input.type_text(session, text, settle?) -> nil")
 register(
   "type_text",
   "Type text into a session and submit it with Return.",

@@ -469,6 +469,7 @@ impl AgentProcess for PtyAgent {
                         vt100::MouseProtocolEncoding::Utf8 => MouseEncoding::Utf8,
                         vt100::MouseProtocolEncoding::Sgr => MouseEncoding::Sgr,
                     },
+                    bracketed_paste: screen.bracketed_paste(),
                 }
             })
             .unwrap_or_default()

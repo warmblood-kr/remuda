@@ -200,6 +200,8 @@ pub enum MouseEncoding {
 pub struct MouseState {
     pub mode: MouseMode,
     pub encoding: MouseEncoding,
+    #[serde(default)]
+    pub bracketed_paste: bool,
 }
 
 #[derive(Debug)]
