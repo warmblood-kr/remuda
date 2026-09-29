@@ -103,6 +103,78 @@ time.sleep(2)
 }
 
 #[test]
+fn silent_submit_does_not_retry_when_the_raw_screen_is_unchanged() {
+    let dir = scratch("silent-submit");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&socket, &dir);
+    let fake = dir.join("silent_agent.py");
+    std::fs::write(
+        &fake,
+        r#"import os, select, sys, termios, tty, time
+fd = sys.stdin.fileno()
+tty.setraw(fd)
+os.write(1, b'\x1b[?2004hREADY\r\n> \r\nSTATUS')
+buf = bytearray()
+paste = False
+returns = 0
+deadline = time.monotonic() + 2.0
+reported = False
+while time.monotonic() < deadline:
+    ready, _, _ = select.select([fd], [], [], 0.02)
+    if ready:
+        data = os.read(fd, 4096)
+        i = 0
+        while i < len(data):
+            if data.startswith(b'\x1b[200~', i):
+                paste = True
+                i += 6
+                continue
+            if data.startswith(b'\x1b[201~', i):
+                paste = False
+                i += 6
+                continue
+            b = data[i]
+            if b == 13:
+                returns += 1
+                buf.clear()  # accepted, but deliberately do not redraw
+            else:
+                buf.append(b)
+                os.write(1, b'\x1b[H\x1b[2JREADY\r\n> ' + bytes(buf) + b'\r\nSTATUS')
+            i += 1
+    if not reported and time.monotonic() > deadline - 0.3:
+        os.write(1, b'\r\nRETURNS:' + str(returns).encode())
+        reported = True
+"#,
+    )
+    .unwrap();
+
+    client::request(
+        &socket,
+        &Request::New {
+            name: Some("silent-agent".into()),
+            command: vec!["python3".into(), fake.display().to_string()],
+            size: Size::new(80, 24),
+            cwd: Some(dir.display().to_string()),
+            env: None,
+        },
+    )
+    .expect("start silent submit agent");
+    wait_screen(&socket, "silent-agent", "READY");
+
+    script::run_source(
+        &socket,
+        "input-unit-silent-submit",
+        "assert(remuda.type_text('silent-agent', 'silent') == 'unverified')",
+    )
+    .expect("report the unverified silent submission");
+    let screen = wait_screen(&socket, "silent-agent", "RETURNS:");
+    assert!(
+        screen.contains("RETURNS:1"),
+        "a silent successful submit must send exactly one Return: {screen}"
+    );
+}
+
+#[test]
 fn type_text_submits_paste_once_and_preserves_embedded_newline() {
     let dir = scratch("submit");
     let socket = daemon::socket_path_in(&dir, "s");
