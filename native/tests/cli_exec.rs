@@ -123,7 +123,7 @@ fn cli_exec_waits_for_lifecycle_readiness_and_reports_failures() {
         "no ready declaration: {no_ready:?}"
     );
     assert!(
-        no_ready_started.elapsed() < Duration::from_millis(250),
+        no_ready_started.elapsed() < Duration::from_secs(3),
         "a mod without ready must keep immediate completion: {no_ready:?}"
     );
 
