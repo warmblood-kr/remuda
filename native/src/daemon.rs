@@ -1345,7 +1345,14 @@ fn monitor_session_output(
 ) {
     const COALESCE: std::time::Duration = std::time::Duration::from_millis(50);
     std::thread::spawn(move || {
-        let mut last_notified = 0;
+        // The PTY reader starts with the child, before `handle_new` can
+        // register the session and attach this monitor. Catch any output that
+        // arrived in that gap; output racing this snapshot will also leave a
+        // wake queued on `output`.
+        let mut last_notified = output.version_after_wake();
+        if last_notified > 0 {
+            notifier.notify(last_notified);
+        }
         loop {
             if output.recv().is_err() {
                 notifier.flush(output.version_after_wake());
