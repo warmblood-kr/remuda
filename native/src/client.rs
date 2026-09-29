@@ -1113,11 +1113,12 @@ fn paint_history(path: &Path, name: &str, offset: usize) -> Option<(usize, usize
         }
     }
     if offset != 0 {
-        let _ = write!(
-            stdout,
-            "\x1b[{};1H\x1b[2K[scrollback: {offset} rows — PgUp/PgDn scroll; q/Esc exits, other keys return live and pass through]",
-            rows.len().max(1)
+        let columns = crossterm::terminal::size().map_or(80, |(columns, _)| usize::from(columns));
+        let indicator = truncate_terminal_text(
+            &format!("[scrollback: {offset} rows · q/Esc exit · keys go live]"),
+            columns,
         );
+        let _ = write!(stdout, "\x1b[{};1H\x1b[2K{indicator}", rows.len().max(1),);
     }
     if offset == 0 {
         let _ = if cursor.visible {
@@ -1135,6 +1136,22 @@ fn paint_history(path: &Path, name: &str, offset: usize) -> Option<(usize, usize
     }
     let _ = stdout.flush();
     Some((scrollback_len, scrollback_total))
+}
+
+fn truncate_terminal_text(text: &str, max_columns: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut result = String::new();
+    let mut columns = 0;
+    for character in text.chars() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width > max_columns.saturating_sub(columns) {
+            break;
+        }
+        result.push(character);
+        columns += width;
+    }
+    result
 }
 
 fn history_metadata(path: &Path, name: &str) -> Option<(usize, usize)> {
@@ -1337,7 +1354,8 @@ mod tests {
     use super::trace_input_read;
     use super::{
         close_raw_paste_if_needed, detach_offset, interpret, read_response_with_timeout,
-        request_with_timeout, reset_input_modes, write_input_trace, DETACH, RESET_INPUT_MODES,
+        request_with_timeout, reset_input_modes, truncate_terminal_text, write_input_trace, DETACH,
+        RESET_INPUT_MODES,
     };
     #[cfg(unix)]
     use crate::ipc;
@@ -1670,5 +1688,13 @@ mod tests {
     #[test]
     fn a_normal_reply_still_arrives_as_itself() {
         assert_eq!(interpret(r#""Ok""#), Response::Ok);
+    }
+
+    #[test]
+    fn scrollback_indicator_truncates_at_terminal_display_width() {
+        let indicator = "[scrollback: 24 rows · q/Esc exit · keys go live]";
+        let short = truncate_terminal_text(indicator, 40);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(short.as_str()), 40);
+        assert_eq!(truncate_terminal_text(indicator, 80), indicator);
     }
 }

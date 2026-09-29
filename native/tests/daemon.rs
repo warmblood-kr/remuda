@@ -3505,20 +3505,27 @@ fn direct_attach_history_exit_keys_are_swallowed_and_other_keys_pass_through() {
     cmd.env("REMUDA_RUNTIME_DIR", &dir);
     let viewer = Session::new(
         "viewer",
-        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Box::new(PtyAgent::spawn(cmd, Size::new(40, 24)).expect("spawn viewer")),
         Arc::new(SystemClock::new()),
     );
     let held = viewer.attach();
     let output = held.subscribe().expect("capture viewer output");
     wait_for_session_screen(&viewer, "history-key-ready");
     let _ = collect_until_bytes(&output, b"history-key-ready");
+    let expected_history = capture_styled_snapshot(&path, "target", 24).0;
+    let expected_top = expected_history.lines().next().unwrap().trim().to_string();
 
     held.write_raw(b"\x1b[5~").expect("PageUp into history");
     let _ = collect_until_bytes(&output, b"[scrollback: 24 rows");
     let indicator = viewer.screen_text().expect("history indicator");
     assert!(
-        indicator.contains("q/Esc exits, other keys return live and pass through"),
-        "indicator must explain exit and key routing: {indicator:?}"
+        indicator.contains("q/Esc exit · keys go live"),
+        "short indicator must explain exit and key routing: {indicator:?}"
+    );
+    assert_eq!(
+        indicator.lines().next().unwrap().trim(),
+        expected_top,
+        "the indicator must not wrap and scroll history off the top"
     );
 
     held.write_raw(b"q").expect("exit history with q");
