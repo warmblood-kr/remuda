@@ -499,12 +499,22 @@ fn invalid_http(message: &'static str) -> io::Error {
 }
 
 fn authorize_remote_request(request: &Request) -> io::Result<()> {
-    // Enable after #252 (PTY write timeout) merges.
-    if matches!(request, Request::Input { .. }) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "remote front refuses Input",
-        ));
+    match request {
+        // Enable after #252 (PTY write timeout) merges.
+        Request::Input { .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "remote front refuses Input",
+            ));
+        }
+        // Enable only after the listener's explicit Close security review.
+        Request::Close { .. } => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "remote front refuses Close",
+            ));
+        }
+        _ => {}
     }
     crate::remote_front::authorize(request)
         .map_err(|reason| io::Error::new(io::ErrorKind::PermissionDenied, reason))
@@ -1040,6 +1050,11 @@ mod tests {
     #[test]
     fn remote_input_is_refused_until_pty_timeout_merges() {
         assert!(authorize_remote_request(&Request::List).is_ok());
+        let close_error = authorize_remote_request(&Request::Close {
+            name: "session".into(),
+        })
+        .unwrap_err();
+        assert_eq!(close_error.to_string(), "remote front refuses Close");
         let error = authorize_remote_request(&Request::Input {
             name: "session".into(),
             instance_id: "instance".into(),
@@ -1422,8 +1437,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn socket_denials_and_malformed_json_never_echo_request_payloads() {
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let dispatched_for_worker = dispatched.clone();
         let (server, peer, _) = socket_server(
-            |payload| dispatch_payload(payload, Path::new("unused-daemon-path")),
+            move |payload| {
+                let request =
+                    crate::remote_front::decode_frame(payload).map_err(io::Error::other)?;
+                authorize_remote_request(&request)?;
+                dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::to_vec(&Response::Ok).unwrap())
+            },
             socket_test_timeout(),
             socket_test_timeout(),
             socket_test_timeout(),
@@ -1438,6 +1461,9 @@ mod tests {
             Request::Send {
                 name: "session".into(),
                 bytes: secret.as_bytes().to_vec(),
+            },
+            Request::Close {
+                name: "session".into(),
             },
         ];
         for request in refused {
@@ -1457,6 +1483,7 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.contains("invalid remote request"));
         assert!(!response.contains(secret));
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(unix)]
