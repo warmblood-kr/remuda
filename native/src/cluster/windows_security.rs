@@ -760,10 +760,16 @@ mod tests {
         let expected = b"legacy state";
         std::fs::write(&path, expected).unwrap();
 
+        let user = UserSid::current().unwrap();
+        let legacy = open_for_check(&path, false, true).unwrap();
+        assert!(
+            !dacl_conforms(legacy.as_raw_handle(), user.sid).unwrap(),
+            "temp directory should give the legacy file a non-private inherited ACL"
+        );
+        drop(legacy);
+
         let file = open_for_read(&path).unwrap();
-        assert!(secure_or_upgrade(&file, &path, false).unwrap());
-        // Windows temp directories inherit permissive ACLs, so migration must have happened.
-        assert!(dacl_conforms(file.as_raw_handle(), UserSid::current().unwrap().sid).unwrap());
+        assert!(dacl_conforms(file.as_raw_handle(), user.sid).unwrap());
         let mut actual = Vec::new();
         (&file).read_to_end(&mut actual).unwrap();
         assert_eq!(actual, expected);
