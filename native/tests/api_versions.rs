@@ -11,12 +11,7 @@ use std::time::{Duration, Instant};
 mod spawn;
 
 fn scratch(version: &str) -> PathBuf {
-    let root = if cfg!(target_os = "macos") {
-        PathBuf::from("/private/tmp")
-    } else {
-        std::env::temp_dir()
-    };
-    let dir = root.join(format!("r-api-{}-{version}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("r-api-{}-{version}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -289,8 +284,47 @@ fn frozen_api_fixtures_v1_through_v4_and_new_v5_surface_run() {
         let path = daemon::socket_path_in(&dir, "s");
         let mut private_daemon = spawn::Daemon::spawn(&dir);
         let fixture = dir.join(format!("{version}.lua"));
+        if version == "v5" {
+            let private_path = dir.join("private-atomic-write");
+            std::fs::write(&private_path, b"old contents").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o644))
+                    .unwrap();
+            }
+            eval(
+                &path,
+                &format!(
+                    "remuda._api_v5_private_write_path = {:?}",
+                    private_path.to_string_lossy()
+                ),
+            );
+            #[cfg(unix)]
+            {
+                std::fs::hard_link(&private_path, dir.join("private-atomic-write.old")).unwrap();
+            }
+        }
         std::fs::write(&fixture, source).unwrap();
         script::run(&path, &fixture).unwrap_or_else(|error| panic!("{version} fixture: {error}"));
+        if version == "v5" {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let private_path = dir.join("private-atomic-write");
+                let metadata = std::fs::metadata(&private_path).unwrap();
+                assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+                assert_eq!(
+                    std::fs::read(&private_path).unwrap(),
+                    b"private replacement"
+                );
+                assert_eq!(
+                    std::fs::read(dir.join("private-atomic-write.old")).unwrap(),
+                    b"old contents",
+                    "atomic rename leaves the prior hard link unchanged"
+                );
+            }
+        }
         if version == "v5" {
             exercise_session_exit_payload(&path);
             exercise_session_output_payload(&path);

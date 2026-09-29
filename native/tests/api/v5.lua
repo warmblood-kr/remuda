@@ -120,9 +120,22 @@ assert(opened == name, "session.new must preserve new's return value")
 assert(input.submit(name, "") == "submitted", "an empty input.submit must return quickly")
 local found = false
 for _, row in ipairs(session.list()) do
-  if row.name == name then found = true end
+  if row.name == name then
+    found = true
+    assert(type(row.instance_id) == "string" and #row.instance_id > 0,
+      "session.list must include the live session instance_id")
+  end
 end
 assert(found, "session.list must include the session created by session.new")
+local legacy_found_instance = false
+for _, row in ipairs(remuda.ls()) do
+  if row.name == name then
+    legacy_found_instance = true
+    assert(type(row.instance_id) == "string" and #row.instance_id > 0,
+      "remuda.ls must include the live session instance_id")
+  end
+end
+assert(legacy_found_instance, "remuda.ls must include the session created by session.new")
 assert(session.resize(name, 91, 31) == true, "session.resize must report success")
 local resized = false
 for _, row in ipairs(remuda.ls()) do
@@ -248,7 +261,9 @@ if not windows then
       for _ = 1, 8 do
         local escaped = remuda.process.run({
           argv = { "/bin/sh", "-c", "setsid -f /bin/sh -c 'echo $$; exec /bin/sleep 30' & exec /bin/sleep 30" },
-          timeout = 0.1,
+          -- Leave room for a loaded runner to schedule the escaped child and
+          -- write its PID before the timeout closes the pipes.
+          timeout = 0.5,
         })
         assert(escaped.timed_out, "setsid descendant should leave output pipes open")
         local pid = escaped.stdout:match("(%d+)")
@@ -279,6 +294,16 @@ local bad_timeout = pcall(function()
   remuda.process.run({ argv = echo_argv, timeout = 31 })
 end)
 assert(not bad_timeout, "process.run must reject a timeout above the 30-second hard cap")
+local caller = remuda.caller()
+assert(type(caller) == "table", "remuda.caller must return a table")
+local caller_kind_ok = caller.kind == "outside"
+if package.config:sub(1, 1) == "\\" then
+  -- Windows parent PIDs are advisory and can be stale/unreadable after an
+  -- ancestor exits; fail closed as unknown rather than claiming a session.
+  caller_kind_ok = caller_kind_ok or caller.kind == "unknown"
+end
+assert(caller_kind_ok, "a client outside managed sessions must not be a session; got " .. tostring(caller.kind))
+assert(caller.session == nil, "an outside caller has no managed session")
 local absent_readiness = remuda._module_readiness("api-v5-no-ready-declaration")
 assert(absent_readiness.status == "ready",
   "a missing readiness declaration must preserve immediate completion")
@@ -335,6 +360,31 @@ local written = assert(io.open(write_path, "rb"))
 assert(written:read("*a") == "replacement", "atomic write must replace an existing file")
 written:close()
 os.remove(write_path)
+local private_write_path = remuda._api_v5_private_write_path or os.tmpname()
+local private_write_path_is_temporary = remuda._api_v5_private_write_path == nil
+local unknown_private_option = pcall(function()
+  fs.write_atomic(private_write_path, "must reject", { Private = true })
+end)
+assert(not unknown_private_option, "write_atomic must reject unknown option keys")
+local non_boolean_private_option = pcall(function()
+  fs.write_atomic(private_write_path, "must reject", { private = "no" })
+end)
+assert(not non_boolean_private_option, "write_atomic private option must be a boolean")
+local additional_option = pcall(function()
+  fs.write_atomic(private_write_path, "must reject", { private = true, other = false })
+end)
+assert(not additional_option, "write_atomic must reject additional option keys")
+wrote, write_error = fs.write_atomic(private_write_path, "first private write", { private = true })
+assert(wrote == true and write_error == nil, tostring(write_error))
+wrote, write_error = fs.write_atomic(private_write_path, "private replacement", { private = true })
+assert(wrote == true and write_error == nil, tostring(write_error))
+local private_written = assert(io.open(private_write_path, "rb"))
+assert(private_written:read("*a") == "private replacement",
+  "private atomic write must replace an existing file")
+private_written:close()
+if private_write_path_is_temporary then
+  os.remove(private_write_path)
+end
 local failed, file_error = fs.write_atomic(write_path .. ".missing/child", "unwritable")
 assert(failed == nil and type(file_error) == "string", "write errors must return nil, error")
 

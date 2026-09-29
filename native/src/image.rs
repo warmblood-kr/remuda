@@ -219,6 +219,7 @@ enum JobKind {
         code: String,
         name: Option<String>,
         allow_pending: bool,
+        caller: CallerContext,
     },
     StopModules,
     RunSchedules {
@@ -232,6 +233,29 @@ enum JobKind {
     SessionOutputFlush(SessionOutputNotifier),
     #[cfg(test)]
     StopImage,
+}
+
+/// How much the daemon can say about the process that submitted this Eval.
+#[derive(Clone, Debug)]
+pub(crate) struct CallerContext {
+    pub kind: CallerKind,
+    pub session: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum CallerKind {
+    Session,
+    Outside,
+    Unknown,
+}
+
+impl Default for CallerContext {
+    fn default() -> Self {
+        Self {
+            kind: CallerKind::Unknown,
+            session: None,
+        }
+    }
 }
 
 struct SessionOutputState {
@@ -378,6 +402,7 @@ impl Image {
 
         std::thread::spawn(move || {
             let lua = Lua::new();
+            let caller = Rc::new(RefCell::new(CallerContext::default()));
             let budget = LuaExecutionBudget::default();
             // Everything `print` writes during one job, so it can travel back
             // to whoever asked instead of vanishing. `Rc` rather than `Arc`
@@ -389,25 +414,32 @@ impl Image {
             // rather than the thread dying quietly and every caller hanging.
             let ready = budget
                 .run(&lua, || {
-                    script::bindings(&lua, &socket, registry, counters, handle.clone())
-                        .and_then(|table| lua.globals().set("remuda", table))
-                        .and_then(|()| install_execution_guards(&lua, budget.clone()))
-                        // The tool frame loads after bindings and guard helpers,
-                        // before any caller can access it.
-                        .and_then(|()| {
-                            lua.load(include_str!("tools.lua"))
-                                .set_name("@remuda/tools.lua")
-                                .exec()
-                        })
-                        .and_then(|()| remove_execution_guard_helpers(&lua))
-                        .and_then(|()| script::hide_module_activator(&lua))
-                        .and_then(|()| capture_print(&lua, Rc::clone(&printed)))
+                    script::bindings(
+                        &lua,
+                        &socket,
+                        registry,
+                        counters,
+                        handle.clone(),
+                        Rc::clone(&caller),
+                    )
+                    .and_then(|table| lua.globals().set("remuda", table))
+                    .and_then(|()| install_execution_guards(&lua, budget.clone()))
+                    // The tool frame loads after bindings and guard helpers,
+                    // before any caller can access it.
+                    .and_then(|()| {
+                        lua.load(include_str!("tools.lua"))
+                            .set_name("@remuda/tools.lua")
+                            .exec()
+                    })
+                    .and_then(|()| remove_execution_guard_helpers(&lua))
+                    .and_then(|()| script::hide_module_activator(&lua))
+                    .and_then(|()| capture_print(&lua, Rc::clone(&printed)))
                 })
                 .map_err(|e| e.to_string());
 
             for job in inbox {
                 printed.borrow_mut().clear();
-                let answer = process_job(&lua, &budget, &handle, &printed, &ready, &job);
+                let answer = process_job(&lua, &budget, &handle, &printed, &ready, &job, &caller);
                 // A caller that gave up and dropped its receiver is not an
                 // error: `remuda -e` can be Ctrl-C'd mid-evaluation, and the
                 // work still ran.
@@ -438,6 +470,7 @@ impl Image {
                     code: code.to_string(),
                     name: name.map(str::to_string),
                     allow_pending: false,
+                    caller: CallerContext::default(),
                 },
                 reply: Some(reply),
             })
@@ -562,7 +595,12 @@ impl Image {
             .map_err(|_| "the image stopped without answering".to_string())?
     }
 
-    pub fn eval_request(&self, code: &str, name: Option<&str>) -> Result<String, String> {
+    pub(crate) fn eval_request(
+        &self,
+        code: &str,
+        name: Option<&str>,
+        caller: CallerContext,
+    ) -> Result<String, String> {
         let (reply, answer) = channel();
         self.jobs
             .send(Job {
@@ -570,6 +608,7 @@ impl Image {
                     code: code.to_string(),
                     name: name.map(str::to_string),
                     allow_pending: true,
+                    caller,
                 },
                 reply: Some(reply),
             })
@@ -604,6 +643,7 @@ fn process_job(
     printed: &Rc<RefCell<String>>,
     ready: &Result<(), String>,
     job: &Job,
+    caller: &Rc<RefCell<CallerContext>>,
 ) -> Result<String, String> {
     match ready {
         Err(why) => Err(format!("image failed to start: {why}")),
@@ -612,7 +652,9 @@ fn process_job(
                 code,
                 name,
                 allow_pending,
+                caller: request_caller,
             } => {
+                *caller.borrow_mut() = request_caller.clone();
                 handle.pending.begin_eval();
                 let answer = budget
                     .run(lua, || eval(lua, code, name.as_deref()))
@@ -627,6 +669,9 @@ fn process_job(
                     .as_ref()
                     .ok()
                     .and_then(|value| handle.pending.pending_id(value));
+                // Keep daemon-derived process identity scoped to this one Eval;
+                // schedules, module lifecycle hooks, and native jobs stay unknown.
+                *caller.borrow_mut() = CallerContext::default();
                 if pending_id.is_some() && !allow_pending {
                     handle.pending.finish_eval(None);
                     Err("pending replies may only be returned from a daemon request".into())
@@ -636,16 +681,22 @@ fn process_job(
                 }
             }
             JobKind::StopModules => {
+                *caller.borrow_mut() = CallerContext::default();
                 budget.run(lua, || script::stop_modules(lua).map(|()| String::new()))
             }
-            JobKind::RunSchedules { now } => run_due_schedules(lua, budget, *now),
+            JobKind::RunSchedules { now } => {
+                *caller.borrow_mut() = CallerContext::default();
+                run_due_schedules(lua, budget, *now)
+            }
             JobKind::HttpComplete { id, result } => {
+                *caller.borrow_mut() = CallerContext::default();
                 if let Err(error) = budget.run(lua, || deliver_http(lua, *id, result.clone())) {
                     eprintln!("remuda: HTTP callback delivery failed: {error}");
                 }
                 Ok(String::new())
             }
             JobKind::SessionOutput(notifier) => {
+                *caller.borrow_mut() = CallerContext::default();
                 let version = notifier.state.latest_version.load(Ordering::Acquire);
                 let _ = budget.run(lua, || -> mlua::Result<()> {
                     deliver_session_output(lua, notifier, version);
@@ -655,6 +706,7 @@ fn process_job(
                 Ok(String::new())
             }
             JobKind::SessionOutputFlush(notifier) => {
+                *caller.borrow_mut() = CallerContext::default();
                 let version = notifier.state.latest_version.load(Ordering::Acquire);
                 let _ = budget.run(lua, || -> mlua::Result<()> {
                     deliver_session_output(lua, notifier, version);
@@ -663,7 +715,10 @@ fn process_job(
                 Ok(String::new())
             }
             #[cfg(test)]
-            JobKind::StopImage => Ok(String::new()),
+            JobKind::StopImage => {
+                *caller.borrow_mut() = CallerContext::default();
+                Ok(String::new())
+            }
         },
     }
 }
