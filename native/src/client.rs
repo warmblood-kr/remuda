@@ -934,6 +934,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                 name: &name,
                 input: &input_queue,
                 mouse_on: &mut mouse_on,
+                mouse_toggle_enabled: mouse,
                 scrollback: &scrollback,
                 output_lock: &output_lock,
                 discarding_paste: false,
@@ -1228,6 +1229,7 @@ struct AttachRoute<'a> {
     name: &'a str,
     input: &'a AttachInputQueue,
     mouse_on: &'a mut bool,
+    mouse_toggle_enabled: bool,
     scrollback: &'a std::sync::atomic::AtomicUsize,
     output_lock: &'a std::sync::Mutex<()>,
     discarding_paste: bool,
@@ -1288,7 +1290,7 @@ fn route_tokens(route: &mut AttachRoute<'_>, tokens: Vec<crate::mouse::InputToke
                 }
                 let mut start = 0;
                 for (at, &byte) in bytes.iter().enumerate() {
-                    if byte == 0x1d {
+                    if byte == 0x1d && route.mouse_toggle_enabled {
                         if start < at {
                             exit_history_if_needed(route, &bytes[start..at]);
                         }
@@ -1686,6 +1688,7 @@ mod tests {
             name: "unused",
             input: &queue,
             mouse_on: &mut mouse_on,
+            mouse_toggle_enabled: false,
             scrollback: &scrollback,
             output_lock: &output_lock,
             discarding_paste: false,
