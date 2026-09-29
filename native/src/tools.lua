@@ -512,6 +512,12 @@ register(
   "Fire every schedule whose interval has elapsed. Called once per native tick.",
   "_run_due_schedules(now) -> nil"
 )
+register(
+  "_take_due_schedules",
+  "Mark and return the schedules due at `now`, for the native tick to run each under its own budget.",
+  "_take_due_schedules(now) -> table"
+)
+register("_run_schedule", "Run one schedule by handle (native tick only).", "_run_schedule(handle) -> boolean")
 
 -- A shallow copy, the same discipline `emit`'s own hook snapshot already
 -- keeps — a caller mutating what it was handed must never reach back into
