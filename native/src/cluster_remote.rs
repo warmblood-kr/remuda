@@ -26,7 +26,7 @@ pub enum RemoteState {
 pub struct RemoteSessionSnapshot {
     /// Sanitized label used only for display and UI selection.
     pub name: String,
-    /// Original protocol name used when sending requests to this session.
+    /// Original protocol name used for authenticated read requests.
     pub wire_name: String,
     pub instance_id: String,
     pub alive: bool,
@@ -940,12 +940,12 @@ mod tests {
 
     #[test]
     fn remote_names_and_screen_cells_strip_terminal_injection_controls() {
-        let hostile_name = "x\u{1b}]0;pwn\u{7}";
+        let hostile_name = "x\u{1b}]0;pwn\u{7}\u{202e}";
         assert_eq!(display_name(hostile_name), "x]0;pwn");
 
         let snapshot = to_screen_snapshot(remuda_core::protocol::StyledScreen {
             rows: vec![vec![remuda_core::protocol::StyledRun {
-                text: "\u{1b}]52;c;aGk=\u{7}safe\u{009b}31m".into(),
+                text: "\u{1b}]52;c;aGk=\u{7}safe\u{009b}31m\u{202e}".into(),
                 fg: Color::Default,
                 bg: Color::Default,
                 bold: false,

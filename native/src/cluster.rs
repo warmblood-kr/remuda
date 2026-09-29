@@ -348,8 +348,16 @@ fn resolve_target_in_registry(
         None => entry
             .endpoint
             .as_deref()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "supply --addr HOST:PORT"))?
-            .parse::<SocketAddr>()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "node {} has no registry endpoint; supply --addr HOST:PORT",
+                        entry.node_fp
+                    ),
+                )
+            })?
+            .parse()
             .map_err(|_| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,

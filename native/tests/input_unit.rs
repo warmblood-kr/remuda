@@ -46,106 +46,24 @@ fn wait_screen(path: &Path, name: &str, needle: &str) -> String {
     }
 }
 
-const PASTE_AGENT: &str = r#"import os, queue, select, sys, termios, tty, time, threading
-fd = sys.stdin.fileno()
-tty.setraw(fd)
-os.write(1, b'\x1b[?2004hREADY\r\n> \r\nSTATUS ONE\r\nSTATUS TWO')
-buf = bytearray()
-last = 0.0
-paste = False
-submitted = 0
-returns = 0
-transcript = bytearray()
-incoming = queue.Queue()
-
-def read_input():
-    while True:
-        data = os.read(fd, 4096)
-        if not data:
-            break
-        incoming.put((data, time.monotonic()))
-
-threading.Thread(target=read_input, daemon=True).start()
-
-def redraw():
-    display = bytes(buf).replace(b'\n', b'\r\n  ')
-    os.write(1, b'\x1b[H\x1b[2JREADY\r\n' + bytes(transcript) + b'\r\n> ' + display + b'\r\nSTATUS ONE\r\nSTATUS TWO')
-
-while True:
-    try:
-        data, arrived = incoming.get(timeout=5)
-    except queue.Empty:
-        continue
-    i = 0
-    if transcript and data.startswith(b'\x1b[200~'):
-        # Real interactive TUIs can take several frames to repaint a pasted
-        # composer. Leave the prior transcript visible while this paste lands.
-        time.sleep(0.3)
-    while i < len(data):
-        if data.startswith(b'\x1b[200~', i):
-            paste = True
-            i += 6
-            continue
-        if data.startswith(b'\x1b[201~', i):
-            paste = False
-            i += 6
-            continue
-        b = data[i]
-        now = arrived
-        if b == 13:
-            returns += 1
-            if paste or (last and now - last < 0.5):
-                buf.extend(b'\n')
-                redraw()
-            else:
-                submitted += 1
-                display = bytes(buf).replace(b'\n', b'\\n')
-                record = b'SUBMITTED:' + display + b'\r\nCOUNT:' + str(submitted).encode() + b'\r\nRETURNS:' + str(returns).encode() + b'\r\n'
-                transcript.extend(record)
-                os.write(1, b'\r\n' + record)
-                buf.clear()
-        else:
-            buf.append(b)
-            redraw()
-        last = now
-        i += 1
-"#;
+fn fake_agent(mode: &str) -> Vec<String> {
+    vec![
+        env!("CARGO_BIN_EXE_input_unit_fake_agent").into(),
+        mode.into(),
+    ]
+}
 
 #[test]
 fn empty_type_text_sends_only_return_in_bracketed_paste_mode() {
     let dir = scratch("empty-submit");
     let socket = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&socket, &dir);
-    let fake = dir.join("empty_agent.py");
-    std::fs::write(
-        &fake,
-        r#"import os, select, sys, termios, tty, time
-fd = sys.stdin.fileno()
-tty.setraw(fd)
-os.write(1, b'\x1b[?2004hREADY')
-data = bytearray()
-deadline = time.monotonic() + 1.0
-while time.monotonic() < deadline:
-    ready, _, _ = select.select([fd], [], [], 0.05)
-    if ready:
-        chunk = os.read(fd, 4096)
-        if not chunk:
-            break
-        data.extend(chunk)
-if data == b'\r':
-    os.write(1, b'\r\nBARE_RETURN')
-else:
-    os.write(1, b'\r\nBYTES:' + data.hex().encode())
-time.sleep(2)
-"#,
-    )
-    .unwrap();
 
     client::request(
         &socket,
         &Request::New {
             name: Some("empty-agent".into()),
-            command: vec!["python3".into(), fake.display().to_string()],
+            command: fake_agent("empty"),
             size: Size::new(80, 24),
             cwd: Some(dir.display().to_string()),
             env: None,
@@ -169,52 +87,12 @@ fn silent_submit_does_not_retry_when_the_raw_screen_is_unchanged() {
     let dir = scratch("silent-submit");
     let socket = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&socket, &dir);
-    let fake = dir.join("silent_agent.py");
-    std::fs::write(
-        &fake,
-        r#"import os, select, sys, termios, tty, time
-fd = sys.stdin.fileno()
-tty.setraw(fd)
-os.write(1, b'\x1b[?2004hREADY\r\n> \r\nSTATUS')
-buf = bytearray()
-paste = False
-returns = 0
-deadline = time.monotonic() + 2.0
-reported = False
-while time.monotonic() < deadline:
-    ready, _, _ = select.select([fd], [], [], 0.02)
-    if ready:
-        data = os.read(fd, 4096)
-        i = 0
-        while i < len(data):
-            if data.startswith(b'\x1b[200~', i):
-                paste = True
-                i += 6
-                continue
-            if data.startswith(b'\x1b[201~', i):
-                paste = False
-                i += 6
-                continue
-            b = data[i]
-            if b == 13:
-                returns += 1
-                buf.clear()  # accepted, but deliberately do not redraw
-            else:
-                buf.append(b)
-                os.write(1, b'\x1b[H\x1b[2JREADY\r\n> ' + bytes(buf) + b'\r\nSTATUS')
-            i += 1
-    if not reported and time.monotonic() > deadline - 0.3:
-        os.write(1, b'\r\nRETURNS:' + str(returns).encode())
-        reported = True
-"#,
-    )
-    .unwrap();
 
     client::request(
         &socket,
         &Request::New {
             name: Some("silent-agent".into()),
-            command: vec!["python3".into(), fake.display().to_string()],
+            command: fake_agent("silent"),
             size: Size::new(80, 24),
             cwd: Some(dir.display().to_string()),
             env: None,
@@ -241,14 +119,12 @@ fn type_text_submits_paste_once_and_preserves_embedded_newline() {
     let dir = scratch("submit");
     let socket = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&socket, &dir);
-    let fake = dir.join("paste_agent.py");
-    std::fs::write(&fake, PASTE_AGENT).unwrap();
 
     client::request(
         &socket,
         &Request::New {
             name: Some("paste-agent".into()),
-            command: vec!["python3".into(), fake.display().to_string()],
+            command: fake_agent("paste"),
             size: Size::new(80, 24),
             cwd: Some(dir.display().to_string()),
             env: None,

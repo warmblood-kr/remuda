@@ -542,24 +542,11 @@ impl ClusterUi {
         let footer_rows = if self.composer_focused { 2 } else { 1 };
         let reserved = frame.len() + queue_rows.len() + usize::from(notice.is_some()) + footer_rows;
         let screen_rows = height.saturating_sub(reserved);
-        let mut pane_lines = pane_body.lines().collect::<Vec<_>>();
-        if self.remote_active.is_some() {
-            while pane_lines.last().is_some_and(|line| line.trim().is_empty()) {
-                pane_lines.pop();
-            }
-        }
-        let first_visible = if self.remote_active.is_some() {
-            pane_lines.len().saturating_sub(screen_rows)
-        } else {
-            0
-        };
-        let visible_pane_lines = pane_lines
-            .iter()
-            .skip(first_visible)
-            .take(screen_rows)
-            .copied()
-            .collect::<Vec<_>>();
-        frame.extend(visible_pane_lines.into_iter().map(str::to_string));
+        frame.extend(
+            visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
+                .into_iter()
+                .map(str::to_string),
+        );
         if let Some((notice, _)) = notice {
             frame.push(notice.clone());
         }
@@ -1204,6 +1191,30 @@ impl ClusterUi {
         self.active = self.selected;
         Ok(())
     }
+}
+
+fn visible_remote_pane_lines(
+    pane_body: &str,
+    remote_active: bool,
+    screen_rows: usize,
+) -> Vec<&str> {
+    let mut pane_lines = pane_body.lines().collect::<Vec<_>>();
+    if remote_active {
+        while pane_lines.last().is_some_and(|line| line.trim().is_empty()) {
+            pane_lines.pop();
+        }
+    }
+    let first_visible = if remote_active {
+        pane_lines.len().saturating_sub(screen_rows)
+    } else {
+        0
+    };
+    pane_lines
+        .iter()
+        .skip(first_visible)
+        .take(screen_rows)
+        .copied()
+        .collect()
 }
 
 fn age_seconds(now: Duration, since: Duration) -> u64 {
