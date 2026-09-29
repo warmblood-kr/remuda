@@ -637,7 +637,7 @@ impl ProcessTree {
     fn assign(&self, child: &Child) -> std::io::Result<()> {
         #[cfg(windows)]
         {
-            self.job.assign(child)?;
+            let _ = child;
         }
         #[cfg(not(windows))]
         let _ = child;
