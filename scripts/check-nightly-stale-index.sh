@@ -55,3 +55,49 @@ grep -F "/releases/download/$expected_nightly/SHA256SUMS" "$REQUEST_LOG" >/dev/n
   exit 1
 }
 echo "ok — cached nightly index tried immutable tag $expected_nightly first"
+
+# A delayed workflow_dispatch/re-run must not move the public pointer back to
+# an older version after a newer publisher has already advanced it.
+cat >"$tmp/latest.json" <<'EOF'
+{"stable":"1.0.0","nightly":"0.1.0-nightly.20260929120000.abcdef1","updated":"old"}
+EOF
+stale_result=$(python3 "$ROOT/scripts/latest-index.py" "$tmp/latest.json" nightly \
+	0.1.0-nightly.20260928120000.abcdef1 2>&1)
+case "$stale_result" in
+*"skipping stale candidate"*"publish=false"*) ;;
+*) echo "check-nightly-stale-index: stale candidate was not skipped: $stale_result" >&2; exit 1 ;;
+esac
+grep -F '"nightly":"0.1.0-nightly.20260929120000.abcdef1"' "$tmp/latest.json" >/dev/null || {
+	echo "check-nightly-stale-index: stale candidate moved latest.json backwards" >&2
+	exit 1
+}
+echo "ok — stale nightly candidate leaves the newer latest.json pointer intact"
+
+# Match native/src/dist.rs numeric ordering: 0.10.0 outranks 0.9.0.
+printf '{"stable":"0.9.0","nightly":"0.1.0-nightly.20260929120000.abcdef1"}\n' \
+	>"$tmp/numeric.json"
+numeric_result=$(python3 "$ROOT/scripts/latest-index.py" "$tmp/numeric.json" stable 0.10.0)
+[ "$numeric_result" = publish=true ] && grep -F '"stable": "0.10.0"' "$tmp/numeric.json" >/dev/null || {
+	echo "check-nightly-stale-index: version ordering did not rank 0.10.0 above 0.9.0" >&2
+	exit 1
+}
+echo "ok — nightly index ordering compares numeric version components"
+
+# latest.json is public input: a malformed version must be rejected before it
+# can become a release-download URL component.
+if PATH="$tmp/shim:$PATH" EXPECTED_NIGHTLY='../../untrusted' \
+	REQUEST_LOG="$tmp/malicious-requests" sh "$ROOT/docs/install.sh" \
+	>"$tmp/malicious-output" 2>&1; then
+	echo "check-nightly-stale-index: installer accepted a malformed indexed version" >&2
+	exit 1
+fi
+grep -F 'invalid '\''nightly'\'' version in' "$tmp/malicious-output" >/dev/null || {
+	cat "$tmp/malicious-output" >&2
+	echo "check-nightly-stale-index: malformed version was not refused clearly" >&2
+	exit 1
+}
+[ ! -s "$tmp/malicious-requests" ] || {
+	echo "check-nightly-stale-index: malformed version was used in a release URL" >&2
+	exit 1
+}
+echo "ok — malformed indexed version is refused before a release URL is requested"

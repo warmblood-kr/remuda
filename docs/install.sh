@@ -88,6 +88,12 @@ if [ -z "$version" ] || [ "$version" = 0.0.0 ]; then
 	die "no '$channel' version published at $INDEX"
 fi
 
+# latest.json is public input. Validate before using the value as a tag or URL
+# path component; the release workflow and prune job accept this same shape.
+if ! printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-nightly\.[0-9]{14}\.[0-9a-f]{7})?$'; then
+	die "invalid '$channel' version in $INDEX: '$version'"
+fi
+
 case "$channel" in
 stable) tag="v$version" ;;
 nightly) tag=$version ;;
