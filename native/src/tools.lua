@@ -1825,26 +1825,33 @@ function remuda._call(name, arguments, caller)
 end
 register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments, caller) -> string")
 
--- Type TEXT into SESSION and submit it with Return, as one act `remuda.feed`
--- will not let a second sender split. Not an MCP tool — a plain stdlib
--- function beside `send`/`insert`, since remuda itself frames none of this
--- (no default pause, no paste sequence) and this is the caller that does.
--- SETTLE (seconds before the submitting Return) defaults to 0.1. Like
--- `remuda.feed`, this blocks the calling Image for SETTLE seconds.
-function remuda.type_text(session, text, settle)
-  local body = tostring(text):gsub("\r\n?", "\n"):gsub("\27", "")
-  settle = settle or 0.1
-  local typed = body:find("\n", 1, true) and ("\27[200~" .. body .. "\27[201~") or body
-  remuda.feed(session, {
-    { burst = typed },
-    { pause = settle },
-    { burst = "\r" },
-  })
+-- Input is expressed as two words: one contiguous text burst, then a
+-- separately-timed submit key after the composer shows the text.
+remuda.input = {}
+
+function remuda.input.text(session, text)
+  remuda._input_text(session, tostring(text))
 end
+
+register("input", "Terminal input words for text delivery and submission.", "table")
+register("input.text", "Deliver text as one burst, using bracketed paste when enabled by the child.", "input.text(session, text) -> nil")
+
+function remuda.input.submit(session, expect)
+  return remuda._input_submit(session, tostring(expect))
+end
+
+register("input.submit", "Submit visible composer text; returns 'submitted' or 'unverified'.", "input.submit(session, expect) -> status")
+
+-- Composite: hold the session input lock across text, settle, and submission.
+function remuda.type_text(session, text, settle)
+  return remuda._input_type_text(session, tostring(text), settle or 0.1)
+end
+remuda.input.type_text = remuda.type_text
+register("input.type_text", "Type text, honor the settle pause, then return 'submitted' or 'unverified'.", "input.type_text(session, text, settle?) -> status")
 register(
   "type_text",
-  "Type text into a session and submit it with Return.",
-  "type_text(session, text, settle?) -> nil"
+  "Type text into a session and submit it with Return; returns 'submitted' or 'unverified'.",
+  "type_text(session, text, settle?) -> status"
 )
 
 -- The left session list, re-expressed as the "*sessions*" buffer instead of

@@ -16,6 +16,9 @@
 //! the other end expects. ⚠ The one most often got wrong, where the two agree
 //! anyway: **Backspace sends 127 (DEL), not 8 (BS).**
 
+/// The bytes emitted for a Return key, shared with session submit operations.
+pub const RETURN_BYTES: &[u8] = b"\r";
+
 /// The bytes a terminal sends for a key, or `None` if we do not know the name.
 /// `None` rather than an empty vector on purpose — every surface must turn an
 /// unknown key into a visible refusal, never into a silent no-op.
@@ -81,7 +84,7 @@ fn named(spec: &str) -> Option<&'static [u8]> {
         // The seven Emacs spells as bare shorthands, plus the lower-case event
         // names it uses for the same keys in symbol form.
         "NUL" => b"\0",
-        "RET" | "return" | "enter" => b"\r",
+        "RET" | "return" | "enter" => RETURN_BYTES,
         "LFD" | "linefeed" => b"\n",
         "TAB" | "tab" => b"\t",
         // Shift-Tab is not Tab with a modifier: the terminal sends its own

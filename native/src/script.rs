@@ -20,6 +20,7 @@ use crate::client;
 use mlua::{Lua, Table, Value};
 use remuda_core::keys;
 use remuda_core::protocol::{Request, Response, Step};
+use remuda_core::InputSubmitOutcome;
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
@@ -28,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 81] = [
+pub const BINDINGS: [&str; 85] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -36,6 +37,9 @@ pub const BINDINGS: [&str; 81] = [
     "_event_counts",
     "_extension_commands",
     "_function_source",
+    "_input_submit",
+    "_input_text",
+    "_input_type_text",
     "_module_readiness",
     "_pending_create",
     "_pending_events",
@@ -82,6 +86,7 @@ pub const BINDINGS: [&str; 81] = [
     "hook_list",
     "hooks",
     "http",
+    "input",
     "insert",
     "json",
     "key",
@@ -116,6 +121,21 @@ pub const BINDINGS: [&str; 81] = [
 /// own rows for the words it defines in pure Lua, into the same table.
 const WORDS: &[(&str, &str, &str)] = &[
     (
+        "_input_submit",
+        "Submit visible session text; returns 'submitted' or 'unverified'.",
+        "_input_submit(name, expect) -> status",
+    ),
+    (
+        "_input_text",
+        "Deliver a normalized text burst, bracketed when enabled by the child.",
+        "_input_text(name, text) -> nil",
+    ),
+    (
+        "_input_type_text",
+        "Deliver text and submit it while holding one input lock; returns 'submitted' or 'unverified'.",
+        "_input_type_text(name, text, settle?) -> status",
+    ),
+    (
         "caller",
         "ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run ``remuda -e`` and wrap ``_dispatch_extension_command``; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.",
         "caller() -> {kind: 'session'|'outside'|'unknown', session?: string}",
@@ -131,7 +151,7 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_pending_create(timeout?) -> id, handle",
     ),
     (
-        "_pending_events",
+    "_pending_events",
         "Drain deferred-reply completion and cancellation notifications for the Lua tick.",
         "_pending_events() -> {{id, reason?}...}",
     ),
@@ -418,6 +438,67 @@ fn caller_binding(
     )
 }
 
+fn input_bindings(
+    lua: &Lua,
+    table: &Table,
+    input_registry: std::sync::Arc<remuda_core::Registry>,
+) -> mlua::Result<()> {
+    let text_registry = input_registry.clone();
+    table.set(
+        "_input_text",
+        lua.create_function(move |_, (name, text): (String, String)| {
+            let session = text_registry
+                .get(&name)
+                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
+            session
+                .input_text(&text)
+                .map_err(|error| mlua::Error::runtime(error.to_string()))
+        })?,
+    )?;
+
+    let submit_registry = input_registry.clone();
+    table.set(
+        "_input_submit",
+        lua.create_function(move |_, (name, expect): (String, String)| {
+            let session = submit_registry
+                .get(&name)
+                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
+            session
+                .submit(&expect)
+                .map(|outcome| match outcome {
+                    InputSubmitOutcome::Submitted => "submitted",
+                    InputSubmitOutcome::Unverified => "unverified",
+                })
+                .map_err(|error| mlua::Error::runtime(error.to_string()))
+        })?,
+    )?;
+
+    table.set(
+        "_input_type_text",
+        lua.create_function(
+            move |_, (name, text, settle): (String, String, Option<f64>)| {
+                let settle = settle.unwrap_or(0.1);
+                if !settle.is_finite() || !(0.0..=5.0).contains(&settle) {
+                    return Err(mlua::Error::runtime(
+                        "settle must be between 0 and 5 seconds",
+                    ));
+                }
+                let session = input_registry
+                    .get(&name)
+                    .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
+                session
+                    .type_text(&text, Duration::from_secs_f64(settle))
+                    .map(|outcome| match outcome {
+                        InputSubmitOutcome::Submitted => "submitted",
+                        InputSubmitOutcome::Unverified => "unverified",
+                    })
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))
+            },
+        )?,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn bindings(
     lua: &Lua,
     socket: &Path,
@@ -428,6 +509,7 @@ pub(crate) fn bindings(
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
+    let input_registry = registry.clone();
     fail_binding(lua, &table, image.clone())?;
     pending_bindings(lua, &table, image.pending_replies())?;
     caller_binding(lua, &table, caller)?;
@@ -471,6 +553,8 @@ pub(crate) fn bindings(
             value(lua, ask(&path, Request::Send { name, bytes })?)
         })?,
     )?;
+
+    input_bindings(lua, &table, input_registry)?;
 
     // Named keys, in Emacs's `kbd` notation. An unknown name is raised, not
     // quietly encoded as an empty burst — a script that presses nothing and
@@ -1244,10 +1328,26 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
 
 #[cfg(test)]
 mod binding_tests {
-    use super::BINDINGS;
+    use super::{lua_steps_to_wire, BINDINGS};
+    use remuda_core::protocol::Step;
 
     #[test]
     fn binding_names_are_sorted_and_unique() {
         assert!(BINDINGS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn feed_return_burst_is_the_same_byte_as_named_return() {
+        let lua = mlua::Lua::new();
+        let steps: mlua::Table = lua.load(r#"{{burst='\r'}}"#).eval().unwrap();
+        let wire = lua_steps_to_wire(steps).unwrap();
+        assert_eq!(
+            wire,
+            [Step::Burst(remuda_core::keys::RETURN_BYTES.to_vec())]
+        );
+        assert_eq!(
+            remuda_core::keys::key("RET").as_deref(),
+            Some(remuda_core::keys::RETURN_BYTES)
+        );
     }
 }
