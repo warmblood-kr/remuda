@@ -168,6 +168,7 @@ pub struct UpdateOutcome {
     pub local_metadata_changed: bool,
     pub dropped_origin_entries: usize,
     pub dropped_invalid_entries: usize,
+    pub dropped_registry_cap_entries: usize,
 }
 
 impl RegistryUpdate {
@@ -257,7 +258,17 @@ impl Registry {
         if merged.len() > MAX_REGISTRY_ENTRIES {
             return Err(invalid_update("registry exceeds total entry cap"));
         }
-        self.authorized_nodes = merged.into_values().collect();
+        let candidate = Registry {
+            authorized_nodes: merged.into_values().collect(),
+        };
+        if serde_json::to_vec_pretty(&candidate)
+            .map_err(io::Error::other)?
+            .len()
+            > MAX_REGISTRY_BYTES
+        {
+            return Err(invalid_update("registry exceeds byte cap"));
+        }
+        self.authorized_nodes = candidate.authorized_nodes;
         Ok(())
     }
 
@@ -558,12 +569,19 @@ fn merge_update(
             }
         }
         accepted_entry.delivered_by = Some(update.sender_fp.clone());
+        let mut candidate = current.clone();
+        if candidate
+            .merge(&Registry {
+                authorized_nodes: vec![accepted_entry.clone()],
+            })
+            .is_err()
+        {
+            outcome.dropped_registry_cap_entries += 1;
+            continue;
+        }
+        current = candidate;
         accepted.push(accepted_entry);
     }
-    let received = Registry {
-        authorized_nodes: accepted.clone(),
-    };
-    current.merge(&received)?;
     for incoming in &accepted {
         if let Some(merged) = current
             .authorized_nodes
@@ -666,6 +684,12 @@ fn apply_update_at(
         eprintln!(
             "remuda: cluster replication dropped {} invalid or over-cap entries",
             outcome.dropped_invalid_entries
+        );
+    }
+    if outcome.dropped_registry_cap_entries > 0 {
+        eprintln!(
+            "remuda: cluster replication dropped {} entries exceeding registry total cap",
+            outcome.dropped_registry_cap_entries
         );
     }
     drop(guard);
@@ -794,12 +818,7 @@ pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
     }
     let registry: Registry = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     let mut folded = Registry::default();
-    for entry in registry.authorized_nodes {
-        validate_entry(&entry)?;
-        folded.merge(&Registry {
-            authorized_nodes: vec![entry],
-        })?;
-    }
+    folded.merge(&registry)?;
     Ok(folded)
 }
 
@@ -1109,6 +1128,73 @@ mod tests {
             .authorized_nodes
             .iter()
             .any(|entry| entry.node_fp == valid.node_fp));
+    }
+
+    #[test]
+    fn update_over_aggregate_registry_cap_is_dropped_and_saved_registry_loads() {
+        let sender = admitted_sender();
+        let mut entries = vec![sender.clone()];
+        for index in 0..MAX_REGISTRY_ENTRIES - 2 {
+            let mut node = entry(
+                &format!("aggregate-size-entry-{index}"),
+                NodeState::Admitted,
+                1,
+                "sender",
+            );
+            let mut seed = index as u64 + 1;
+            let mut key = [0u8; 32];
+            for byte in &mut key {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                *byte = (seed >> 32) as u8;
+            }
+            node.static_pubkey = encoding::encode_base64(&key);
+            node.node_fp = encoding::fingerprint(&key);
+            node.by = sender.node_fp.clone();
+            entries.push(node);
+        }
+
+        let mut low = 1;
+        let mut high = MAX_OPTIONAL_FIELDS_BYTES - 32;
+        let mut near_cap = None;
+        while low <= high {
+            let padding_len = low + (high - low) / 2;
+            let mut candidate_entries = entries.clone();
+            for node in candidate_entries.iter_mut().skip(1) {
+                node.optional_fields
+                    .insert("padding".into(), serde_json::json!("x".repeat(padding_len)));
+            }
+            let candidate = Registry {
+                authorized_nodes: candidate_entries,
+            };
+            let encoded_len = serde_json::to_vec_pretty(&candidate).unwrap().len();
+            if encoded_len <= MAX_REGISTRY_BYTES - 200 {
+                near_cap = Some(candidate);
+                low = padding_len + 1;
+            } else {
+                high = padding_len - 1;
+            }
+        }
+        let mut registry = near_cap.expect("fixture should reach the registry byte cap");
+        let mut additional = entry("aggregate-cap-update", NodeState::Admitted, 1, "sender");
+        additional.by = sender.node_fp.clone();
+        additional
+            .optional_fields
+            .insert("padding".into(), serde_json::json!("y".repeat(900)));
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![additional.clone()],
+        };
+        let outcome = apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+        assert_eq!(outcome.dropped_registry_cap_entries, 1);
+        assert!(!registry
+            .authorized_nodes
+            .iter()
+            .any(|node| node.node_fp == additional.node_fp));
+
+        let dir = temp_dir();
+        save_registry_at(&dir, &registry).unwrap();
+        assert_eq!(load_registry_at(&dir).unwrap(), registry);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1562,7 +1648,7 @@ mod tests {
     }
 
     #[test]
-    fn update_refuses_more_than_total_registry_cap() {
+    fn update_drops_entries_over_total_registry_cap() {
         let sender = admitted_sender();
         let receiver = entry("local-receiver", NodeState::Admitted, 1, "sender");
         let mut registry = registry_with_sender(&sender);
@@ -1581,13 +1667,15 @@ mod tests {
             sender_fp: sender.node_fp.clone(),
             entries: vec![overflow],
         };
-        assert!(apply_update(
+        let outcome = apply_update(
             &mut registry,
             &update,
             &public_key(&sender),
-            &receiver.node_fp
+            &receiver.node_fp,
         )
-        .is_err());
+        .unwrap();
+        assert_eq!(outcome.dropped_registry_cap_entries, 1);
+        assert_eq!(registry.authorized_nodes.len(), MAX_REGISTRY_ENTRIES);
     }
 
     #[test]
