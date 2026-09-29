@@ -3930,3 +3930,45 @@ fn a_type_forced_refresh_with_a_real_session_and_a_shown_buffer_costs_one_daemon
              capture_styled={capture_styled})"
     );
 }
+
+#[test]
+fn list_wheel_is_ignored_while_a_session_is_focused() {
+    let mut ui = make_ui(
+        (0..12)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect(),
+    );
+    ui.focus = Focus::Session;
+    let down = MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert_eq!(ui.on_mouse(down, 80, 24), Action::Nothing);
+    assert_eq!(ui.list_first_visible, None);
+    assert_eq!(ui.selected, 0, "the focused session keeps the selection");
+}
+
+#[test]
+fn list_wheel_is_safe_with_zero_or_one_session() {
+    for count in [0, 1] {
+        let mut ui = make_ui(
+            (0..count)
+                .map(|index| row(&format!("session-{index}"), true, false))
+                .collect(),
+        );
+        for kind in [MouseEventKind::ScrollDown, MouseEventKind::ScrollUp] {
+            let wheel = MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            };
+            assert_eq!(ui.on_mouse(wheel, 80, 24), Action::Nothing);
+        }
+        assert_eq!(ui.selected, 0);
+        assert_eq!(ui.list_first_visible.unwrap_or(0), 0);
+    }
+}

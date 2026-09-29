@@ -276,10 +276,13 @@ impl Ui {
 
         let preview_offset = if self.list_visible { list_w + 1 } else { 0 };
         if self.list_visible && col <= list_w {
-            match event.kind {
-                MouseEventKind::ScrollUp => self.scroll_list(-1, body),
-                MouseEventKind::ScrollDown => self.scroll_list(1, body),
-                _ => {}
+            // A focused session owns the selection; follow_focus would snap it back.
+            if self.focus != Focus::Session {
+                match event.kind {
+                    MouseEventKind::ScrollUp => self.scroll_list(-1, body),
+                    MouseEventKind::ScrollDown => self.scroll_list(1, body),
+                    _ => {}
+                }
             }
             if matches!(
                 event.kind,
