@@ -39,7 +39,7 @@ struct AttachInputWriter {
 enum AttachInputAttempt {
     Queued,
     Full(Vec<u8>),
-    Dropped(usize),
+    Dropped,
 }
 
 impl AttachInputQueue {
@@ -47,9 +47,7 @@ impl AttachInputQueue {
         Self::with_capacity(ATTACH_INPUT_QUEUE_BYTES / ATTACH_INPUT_CHUNK_BYTES)
     }
 
-    fn with_capacity(
-        chunks: usize,
-    ) -> (Self, std::sync::mpsc::Receiver<Vec<u8>>) {
+    fn with_capacity(chunks: usize) -> (Self, std::sync::mpsc::Receiver<Vec<u8>>) {
         let (sender, receiver) = std::sync::mpsc::sync_channel(chunks);
         (
             Self {
@@ -67,11 +65,11 @@ impl AttachInputQueue {
     fn attempt(&self, bytes: Vec<u8>) -> AttachInputAttempt {
         let len = bytes.len();
         {
-            let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
+            let status = self.status.lock().unwrap_or_else(|p| p.into_inner());
             if status.dropping {
                 self.dropped
                     .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
-                return AttachInputAttempt::Dropped(len);
+                return AttachInputAttempt::Dropped;
             }
         }
         match self.sender.try_send(bytes) {
@@ -82,7 +80,7 @@ impl AttachInputQueue {
                 status.dropping = true;
                 self.dropped
                     .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
-                AttachInputAttempt::Dropped(len)
+                AttachInputAttempt::Dropped
             }
             Err(std::sync::mpsc::TrySendError::Full(bytes)) => {
                 let len = bytes.len();
@@ -91,7 +89,7 @@ impl AttachInputQueue {
                     status.dropping = true;
                     self.dropped
                         .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
-                    AttachInputAttempt::Dropped(len)
+                    AttachInputAttempt::Dropped
                 } else {
                     AttachInputAttempt::Full(bytes)
                 }
@@ -124,7 +122,7 @@ impl AttachInputQueue {
                         pending = bytes;
                         std::thread::sleep(Duration::from_millis(5));
                     }
-                    AttachInputAttempt::Dropped(_) => {
+                    AttachInputAttempt::Dropped => {
                         let remaining = chunks.map(<[u8]>::len).sum();
                         self.stop_after_drop(remaining);
                         return;
@@ -133,7 +131,6 @@ impl AttachInputQueue {
             }
         }
     }
-
 }
 
 impl AttachInputWriter {
@@ -708,10 +705,8 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
         let output_done = std::sync::Arc::clone(&output_done);
         let scrollback = std::sync::Arc::clone(&scrollback);
         let output_lock = std::sync::Arc::clone(&output_lock);
-        let input_dropped = std::sync::Arc::clone(&input_dropped);
         let input_writer_stop = std::sync::Arc::clone(&input_writer_stop);
         let writer_done_rx = writer_done_rx;
-        let writer_wake = writer_wake;
         let writer_stream = std::sync::Arc::clone(&writer_stream);
         let path = attach_path.clone();
         let name = attach_name.clone();
@@ -721,6 +716,14 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
             let mut buf = [0u8; 1024];
             let mut parser = crate::mouse::SgrParser::default();
             let mut mouse_on = mouse;
+            let mut route = AttachRoute {
+                path: &path,
+                name: &name,
+                input: &input_queue,
+                mouse_on: &mut mouse_on,
+                scrollback: &scrollback,
+                output_lock: &output_lock,
+            };
             let mut logged_pending_read = false;
             loop {
                 if output_done.load(std::sync::atomic::Ordering::SeqCst) {
@@ -799,15 +802,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                 let n = match read {
                     Ok(Some(n)) => n,
                     Ok(None) => {
-                        route_tokens(
-                            &path,
-                            &name,
-                            &input_queue,
-                            parser.flush_expired(),
-                            &mut mouse_on,
-                            &scrollback,
-                            &output_lock,
-                        );
+                        route_tokens(&mut route, parser.flush_expired());
                         continue;
                     }
                     Err(_) => break,
@@ -824,27 +819,11 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     // writer so Ctrl-\\ cannot sit behind a full pipe.
                     Some(at) => {
                         if mouse {
-                            route_tokens(
-                                &path,
-                                &name,
-                                &input_queue,
-                                parser.feed(&buf[..at]),
-                                &mut mouse_on,
-                                &scrollback,
-                                &output_lock,
-                            );
+                            route_tokens(&mut route, parser.feed(&buf[..at]));
                         } else if at > 0 {
                             input_queue.enqueue(&buf[..at]);
                         }
-                        route_tokens(
-                            &path,
-                            &name,
-                            &input_queue,
-                            parser.finish(),
-                            &mut mouse_on,
-                            &scrollback,
-                            &output_lock,
-                        );
+                        route_tokens(&mut route, parser.finish());
                         detached.store(true, std::sync::atomic::Ordering::SeqCst);
                         ipc::wake_captured(writer_wake);
                         ipc::wake(&reader_stream);
@@ -852,15 +831,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     }
                     None => {
                         if mouse {
-                            route_tokens(
-                                &path,
-                                &name,
-                                &input_queue,
-                                parser.feed(&buf[..n]),
-                                &mut mouse_on,
-                                &scrollback,
-                                &output_lock,
-                            );
+                            route_tokens(&mut route, parser.feed(&buf[..n]));
                         } else {
                             input_queue.enqueue(&buf[..n]);
                         }
@@ -937,7 +908,8 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     }
     #[cfg(unix)]
     let _ = keys.join();
-    drop(input_tx);
+    input_writer_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    ipc::wake_captured(writer_wake);
     let _ = input_writer.join();
     let dropped = input_dropped.load(std::sync::atomic::Ordering::SeqCst);
     let _ = report_attach_input_dropped(&mut stdout, dropped);
@@ -1036,16 +1008,16 @@ fn read_stdin_timeout(
     }
 }
 
-fn route_tokens(
-    path: &Path,
-    name: &str,
-    input: &std::sync::mpsc::SyncSender<Vec<u8>>,
-    dropped: &std::sync::atomic::AtomicUsize,
-    tokens: Vec<crate::mouse::InputToken>,
-    mouse_on: &mut bool,
-    scrollback: &std::sync::atomic::AtomicUsize,
-    output_lock: &std::sync::Mutex<()>,
-) {
+struct AttachRoute<'a> {
+    path: &'a Path,
+    name: &'a str,
+    input: &'a AttachInputQueue,
+    mouse_on: &'a mut bool,
+    scrollback: &'a std::sync::atomic::AtomicUsize,
+    output_lock: &'a std::sync::Mutex<()>,
+}
+
+fn route_tokens(route: &mut AttachRoute<'_>, tokens: Vec<crate::mouse::InputToken>) {
     use crate::mouse::{route_mouse_event, InputToken, MouseAction};
     use remuda_core::agent::MouseState;
     use std::sync::atomic::Ordering;
@@ -1053,39 +1025,48 @@ fn route_tokens(
     for token in tokens {
         match token {
             InputToken::Mouse(event) => {
-                let state = if *mouse_on {
-                    match request(path, &Request::MouseState { name: name.into() }) {
+                let state = if *route.mouse_on {
+                    match request(
+                        route.path,
+                        &Request::MouseState {
+                            name: route.name.into(),
+                        },
+                    ) {
                         Ok(Response::MouseState(state)) => state,
                         _ => MouseState::default(),
                     }
                 } else {
                     MouseState::default()
                 };
-                match route_mouse_event(event, state, *mouse_on, scrollback.load(Ordering::SeqCst))
-                {
+                match route_mouse_event(
+                    event,
+                    state,
+                    *route.mouse_on,
+                    route.scrollback.load(Ordering::SeqCst),
+                ) {
                     MouseAction::Forward(bytes) => {
-                        queue_attach_bytes(input, dropped, &bytes);
+                        route.input.enqueue(&bytes);
                     }
                     MouseAction::Scroll(next) => {
-                        let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
-                        scrollback.store(next, Ordering::SeqCst);
-                        paint_history(path, name, next);
+                        let _guard = route.output_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        route.scrollback.store(next, Ordering::SeqCst);
+                        paint_history(route.path, route.name, next);
                     }
                     MouseAction::Ignore => {}
                 }
             }
             InputToken::Bytes(bytes) => {
-                if *mouse_on && (bytes == b"\x1b[5~" || bytes == b"\x1b[6~") {
-                    let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    let old = scrollback.load(Ordering::SeqCst);
+                if *route.mouse_on && (bytes == b"\x1b[5~" || bytes == b"\x1b[6~") {
+                    let _guard = route.output_lock.lock().unwrap_or_else(|e| e.into_inner());
+                    let old = route.scrollback.load(Ordering::SeqCst);
                     let next = if bytes == b"\x1b[5~" {
                         (old + 24).min(10_000)
                     } else {
                         old.saturating_sub(24)
                     };
                     if next != 0 || old != 0 {
-                        scrollback.store(next, Ordering::SeqCst);
-                        paint_history(path, name, next);
+                        route.scrollback.store(next, Ordering::SeqCst);
+                        paint_history(route.path, route.name, next);
                         continue;
                     }
                 }
@@ -1093,20 +1074,12 @@ fn route_tokens(
                 for (at, &byte) in bytes.iter().enumerate() {
                     if byte == 0x1d {
                         if start < at {
-                            exit_history_if_needed(
-                                path,
-                                name,
-                                input,
-                                dropped,
-                                &bytes[start..at],
-                                scrollback,
-                                output_lock,
-                            );
+                            exit_history_if_needed(route, &bytes[start..at]);
                         }
-                        *mouse_on = !*mouse_on;
+                        *route.mouse_on = !*route.mouse_on;
                         let mut stdout = std::io::stdout();
-                        let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
-                        let report = if *mouse_on {
+                        let _guard = route.output_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        let report = if *route.mouse_on {
                             b"\x1b[?1000h\x1b[?1006h"
                         } else {
                             b"\x1b[?1000l\x1b[?1006l"
@@ -1117,46 +1090,30 @@ fn route_tokens(
                     }
                 }
                 if start < bytes.len() {
-                    exit_history_if_needed(
-                        path,
-                        name,
-                        input,
-                        dropped,
-                        &bytes[start..],
-                        scrollback,
-                        output_lock,
-                    );
+                    exit_history_if_needed(route, &bytes[start..]);
                 }
             }
             InputToken::Paste(bytes) => {
-                queue_attach_bytes(input, dropped, &bytes);
+                route.input.enqueue(&bytes);
             }
         }
     }
 }
 
-fn exit_history_if_needed(
-    path: &Path,
-    name: &str,
-    input: &std::sync::mpsc::SyncSender<Vec<u8>>,
-    dropped: &std::sync::atomic::AtomicUsize,
-    bytes: &[u8],
-    scrollback: &std::sync::atomic::AtomicUsize,
-    output_lock: &std::sync::Mutex<()>,
-) {
+fn exit_history_if_needed(route: &mut AttachRoute<'_>, bytes: &[u8]) {
     use std::sync::atomic::Ordering;
-    let old = scrollback.load(Ordering::SeqCst);
+    let old = route.scrollback.load(Ordering::SeqCst);
     if old != 0 {
-        let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = route.output_lock.lock().unwrap_or_else(|e| e.into_inner());
         if bytes == b"q" || bytes == b"\x1b" || bytes == b"\x1bq" {
-            scrollback.store(0, Ordering::SeqCst);
-            paint_history(path, name, 0);
+            route.scrollback.store(0, Ordering::SeqCst);
+            paint_history(route.path, route.name, 0);
             return;
         }
-        scrollback.store(0, Ordering::SeqCst);
-        paint_history(path, name, 0);
+        route.scrollback.store(0, Ordering::SeqCst);
+        paint_history(route.path, route.name, 0);
     }
-    queue_attach_bytes(input, dropped, bytes);
+    route.input.enqueue(bytes);
 }
 
 /// Paint one captured frame while the caller holds the output lock.
@@ -1365,8 +1322,8 @@ mod tests {
     use super::request_with_timeout;
     #[cfg(unix)]
     use super::trace_input_read;
-    use super::{enqueue_attach_input, report_attach_input_dropped, AttachInputEnqueue};
     use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
+    use super::{report_attach_input_dropped, AttachInputQueue};
     #[cfg(unix)]
     use crate::ipc;
     #[cfg(unix)]
@@ -1381,21 +1338,13 @@ mod tests {
 
     #[test]
     fn attach_detach_bypasses_a_full_input_queue_and_counts_dropped_bytes() {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        assert_eq!(
-            enqueue_attach_input(&tx, b"queued"),
-            AttachInputEnqueue::Queued
-        );
-        assert_eq!(
-            enqueue_attach_input(&tx, b"overflow"),
-            AttachInputEnqueue::Dropped(8)
-        );
-        assert_eq!(
-            enqueue_attach_input(&tx, b"prefix\x1c"),
-            AttachInputEnqueue::Detach { dropped: 6 }
-        );
+        let (queue, rx) = AttachInputQueue::with_capacity(1);
+        queue.enqueue(b"queued");
+        queue.enqueue(b"overflow");
+        queue.enqueue(b"prefix");
         assert_eq!(rx.try_recv().unwrap(), b"queued");
         assert!(rx.try_recv().is_err());
+        assert_eq!(queue.dropped.load(std::sync::atomic::Ordering::SeqCst), 14);
         let mut notice = Vec::new();
         report_attach_input_dropped(&mut notice, 14).unwrap();
         let notice = String::from_utf8(notice).unwrap();

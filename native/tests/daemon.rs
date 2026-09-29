@@ -902,7 +902,7 @@ fn new_byte_capture_session(
     slow_reader: bool,
 ) {
     let reader = if wait_for_marker.is_some() {
-        format!("while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; ")
+        "while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; ".to_string()
             + if slow_reader {
                 "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,1024); last unless $r; print $f $b; $n-=$r; select(undef,undef,undef,0.002)}'"
             } else {
