@@ -147,7 +147,11 @@ impl InputSender {
     }
 }
 
-pub const INPUT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// `MAX_IO_RETRIES` permits four one-second attempts. Four UI refresh/poll
+/// cycles (at most 750 ms each) and the final 500 ms refresh add at most 3.5
+/// seconds, so Uncertain appears within 7.5 seconds. Retry delays expire
+/// during those cycles.
+pub const INPUT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub fn input_request(batch: &PendingBatch) -> Request {
     Request::Input {
