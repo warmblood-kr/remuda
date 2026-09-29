@@ -2714,14 +2714,20 @@ impl<W: Write> Drop for BracketedPasteCapture<W> {
 }
 
 fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
-    let text = text
-        .bytes()
-        .filter(|&byte| byte >= 0x20 || matches!(byte, b'\t' | b'\n' | b'\r'));
+    let text: String = text
+        .chars()
+        .filter(|character| {
+            let codepoint = *character as u32;
+            matches!(codepoint, 0x09 | 0x0a | 0x0d)
+                || (0x20..=0x7e).contains(&codepoint)
+                || codepoint >= 0xa0
+        })
+        .collect();
     let mut bytes = Vec::new();
     if bracketed {
         bytes.extend_from_slice(b"\x1b[200~");
     }
-    bytes.extend(text);
+    bytes.extend_from_slice(text.as_bytes());
     if bracketed {
         bytes.extend_from_slice(b"\x1b[201~");
     }
