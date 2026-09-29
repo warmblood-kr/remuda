@@ -1943,13 +1943,16 @@ remuda.tool({
   args = {
     session = "The session to watch.",
     pattern = "A Lua pattern the screen must match. `%$ %s*$` is a shell prompt.",
-    seconds = "How long to wait before giving up. Default 30.",
+    seconds = "How long to wait before giving up. Default 30; positive and at most 300.",
   },
   needs = { "session", "pattern" },
   run = function(a)
     -- MCP argument values arrive as strings; every schema this frame emits says
     -- so. A number is what this one means, and `tonumber` is where that is said.
     local seconds = tonumber(a.seconds) or 30
+    if seconds ~= seconds or seconds <= 0 or seconds > 300 then
+      error("wait_for seconds must be positive and no greater than 300", 0)
+    end
     local screen
     for _ = 1, math.max(1, math.ceil(seconds / 0.1)) do
       screen = remuda.capture(a.session)
