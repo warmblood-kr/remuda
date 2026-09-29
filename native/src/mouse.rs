@@ -74,7 +74,9 @@ pub enum InputToken {
     Bytes(Vec<u8>),
     Mouse(SgrMouse),
     /// Bytes between bracketed-paste markers, including both markers. They
-    /// bypass mouse parsing and attach hotkeys verbatim.
+    /// bypass mouse parsing and attach hotkeys verbatim. In direct attach,
+    /// an embedded end marker retains its terminal meaning and closes the
+    /// child's paste early, as it does in a regular terminal.
     Paste(Vec<u8>),
 }
 
@@ -193,15 +195,7 @@ impl SgrParser {
             if self.in_paste {
                 self.in_paste = false;
                 self.pending_since = None;
-                if self.pending.is_empty() {
-                    Vec::new()
-                } else {
-                    let mut bytes = std::mem::take(&mut self.pending);
-                    // Close the child's bracketed paste too, so later input
-                    // is no longer interpreted as part of the unfinished paste.
-                    bytes.extend_from_slice(PASTE_END);
-                    vec![InputToken::Paste(bytes)]
-                }
+                close_paste(std::mem::take(&mut self.pending))
             } else {
                 self.finish()
             }
@@ -239,7 +233,9 @@ impl SgrParser {
                     }
                 }
                 if finishing {
-                    out.push(InputToken::Paste(std::mem::take(&mut self.pending)));
+                    out.extend(close_paste(std::mem::take(&mut self.pending)));
+                    self.in_paste = false;
+                    continue;
                 }
                 break;
             }
@@ -325,6 +321,18 @@ fn longest_suffix_prefix(bytes: &[u8], prefix: &[u8]) -> usize {
         .rev()
         .find(|&len| bytes[bytes.len() - len..] == prefix[..len])
         .unwrap_or(0)
+}
+
+fn close_paste(mut bytes: Vec<u8>) -> Vec<InputToken> {
+    let mut tokens = Vec::new();
+    let final_chunk_limit = PASTE_BUFFER_LIMIT - PASTE_END.len();
+    while bytes.len() > final_chunk_limit {
+        let chunk_len = (bytes.len() - final_chunk_limit).min(PASTE_BUFFER_LIMIT);
+        tokens.push(InputToken::Paste(bytes.drain(..chunk_len).collect()));
+    }
+    bytes.extend_from_slice(PASTE_END);
+    tokens.push(InputToken::Paste(bytes));
+    tokens
 }
 
 enum Parse {

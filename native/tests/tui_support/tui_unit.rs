@@ -1,5 +1,6 @@
 use super::*;
 use remuda_core::Size;
+use std::sync::{Arc, Mutex};
 
 const REAL_OUTPUT_WAIT: Duration = Duration::from_secs(60);
 const REAL_OUTPUT_POLL: Duration = Duration::from_millis(50);
@@ -26,6 +27,37 @@ fn old_mouse_state_wire_shape_defaults_bracketed_paste_to_off() {
     let state: remuda_core::agent::MouseState =
         serde_json::from_str(r#"{"mode":"None","encoding":"Default"}"#).unwrap();
     assert!(!state.bracketed_paste);
+}
+
+#[derive(Clone)]
+struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn bracketed_paste_capture_toggles_and_drop_resets_the_terminal() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut capture = BracketedPasteCapture::new(SharedWriter(Arc::clone(&output)));
+        capture.set(true).unwrap();
+        capture.set(true).unwrap();
+        capture.set(false).unwrap();
+        capture.set(false).unwrap();
+        capture.set(true).unwrap();
+    }
+    assert_eq!(
+        *output.lock().unwrap(),
+        b"\x1b[?2004h\x1b[?2004l\x1b[?2004h\x1b[?2004l"
+    );
 }
 
 fn wait_for_output<T>(

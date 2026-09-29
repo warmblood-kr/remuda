@@ -22,7 +22,6 @@ use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
 use remuda_core::Size;
 use std::collections::HashMap;
-#[cfg(not(test))]
 use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -2679,34 +2678,45 @@ impl Drop for MouseCapture {
     }
 }
 
-#[derive(Default)]
-struct BracketedPasteCapture(bool);
+struct BracketedPasteCapture<W: Write> {
+    output: W,
+    enabled: bool,
+}
 
-impl BracketedPasteCapture {
+impl<W: Write> BracketedPasteCapture<W> {
+    fn new(output: W) -> Self {
+        Self {
+            output,
+            enabled: false,
+        }
+    }
+
     fn set(&mut self, enabled: bool) -> std::io::Result<()> {
-        if self.0 == enabled {
+        if self.enabled == enabled {
             return Ok(());
         }
         if enabled {
-            crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
+            crossterm::execute!(&mut self.output, crossterm::event::EnableBracketedPaste)?;
         } else {
-            crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste)?;
+            crossterm::execute!(&mut self.output, crossterm::event::DisableBracketedPaste)?;
         }
-        self.0 = enabled;
+        self.enabled = enabled;
         Ok(())
     }
 }
 
-impl Drop for BracketedPasteCapture {
+impl<W: Write> Drop for BracketedPasteCapture<W> {
     fn drop(&mut self) {
-        if self.0 {
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+        if self.enabled {
+            let _ = crossterm::execute!(&mut self.output, crossterm::event::DisableBracketedPaste);
         }
     }
 }
 
 fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
-    let text = text.bytes().filter(|&byte| byte != 0x1b);
+    let text = text
+        .bytes()
+        .filter(|&byte| byte >= 0x20 || matches!(byte, b'\t' | b'\n' | b'\r'));
     let mut bytes = Vec::new();
     if bracketed {
         bytes.extend_from_slice(b"\x1b[200~");
@@ -2741,8 +2751,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     // The exclusive hold on the focused session, and the name it was taken on.
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
     let mut held: Option<(String, Hold)> = None;
-    let mut paste_capture = BracketedPasteCapture::default();
-    let mut child_bracketed_paste = false;
+    let mut paste_capture = BracketedPasteCapture::new(std::io::stdout());
     // What the window last reported showing — refreshed only on a
     // non-skip_list wake, and reused as-is on a Type-forced one.
     let mut shown: Option<ShownTarget> = None;
@@ -2776,12 +2785,6 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 skip_list,
                 selection_moved,
             )?;
-            child_bracketed_paste = held.as_ref().is_some_and(|(name, _)| {
-                matches!(
-                    client::request(path, &Request::MouseState { name: name.clone() }),
-                    Ok(Response::MouseState(state)) if state.bracketed_paste
-                )
-            });
             paste_capture.set(held.is_some())?;
             skip_list = false;
             selection_moved = false;
@@ -2802,10 +2805,18 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 action
             }
             Event::Paste(text) => {
-                if held.is_none() {
-                    continue;
+                // Crossterm emits this only after finding the matching end
+                // marker; it buffers an unterminated host paste internally.
+                let Some((name, _)) = &held else { continue };
+                match client::request(path, &Request::MouseState { name: name.clone() }) {
+                    Ok(Response::MouseState(state)) => {
+                        Action::Type(paste_input(&text, state.bracketed_paste))
+                    }
+                    other => {
+                        ui.notice = Some(format!("{name}: cannot determine paste mode: {other:?}"));
+                        Action::Nothing
+                    }
                 }
-                Action::Type(paste_input(&text, child_bracketed_paste))
             }
             Event::Mouse(m) => ui.on_mouse(m, cols, rows),
             Event::Resize(_, _) => {
