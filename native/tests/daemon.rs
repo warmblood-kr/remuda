@@ -220,7 +220,13 @@ fn sigusr1_rebinds_a_deleted_socket() {
     let dir = scratch_dir("daemon-sigusr1-rebind");
     let mut daemon = Daemon::spawn(&dir);
     let socket = daemon::socket_path_in(&dir, "s");
-    let result = signal_rebind_and_wait(&daemon, &socket);
+    let result = (|| {
+        for cycle in 1..=20 {
+            signal_rebind_and_wait(&daemon, &socket)
+                .map_err(|error| format!("rebind cycle {cycle}/20: {error}"))?;
+        }
+        Ok::<(), String>(())
+    })();
 
     let socket_removed = stop_and_clean(&mut daemon, &dir, &socket);
     assert!(result.is_ok(), "{}", result.unwrap_err());
@@ -256,6 +262,76 @@ fn sigusr1_rebind_refreshes_cleanup_identity() {
     assert!(result.is_ok(), "{}", result.unwrap_err());
     assert!(stopped, "daemon handles SIGTERM after rebinding");
     assert!(preserved, "cleanup preserves a replacement path inode");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigusr1_on_the_owned_socket_is_silent() {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd;
+
+    let dir = scratch_dir("daemon-sigusr1-owned");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let mut command = spawn::base_command(&dir);
+    command.stderr(std::process::Stdio::piped());
+    let mut daemon = spawn::spawn_and_wait(command, &dir);
+
+    let signalled = unsafe { libc::kill(daemon.0.id() as libc::pid_t, libc::SIGUSR1) };
+    assert_eq!(signalled, 0, "send SIGUSR1");
+    assert!(matches!(
+        client::request(&socket, &Request::Version),
+        Ok(Response::Value(_))
+    ));
+
+    // If SIGUSR1 takes the erroneous ipc::listen path, it writes its failure
+    // promptly. Wait on the captured pipe for that output without relying on
+    // whether a subsequent request happened to race the signal thread.
+    let mut stderr = daemon.0.stderr.take().expect("captured daemon stderr");
+    let mut pending = libc::pollfd {
+        fd: stderr.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let readable = unsafe { libc::poll(&mut pending, 1, 200) };
+
+    let stopped = stop_and_clean(&mut daemon, &dir, &socket);
+    let mut output = String::new();
+    stderr
+        .read_to_string(&mut output)
+        .expect("read daemon stderr");
+    assert_eq!(
+        readable, 0,
+        "SIGUSR1 wrote stderr before shutdown: {output}"
+    );
+    assert!(stopped, "daemon stops and removes its socket");
+    assert!(
+        !output.contains("could not rebind socket"),
+        "a signal on the daemon's own live socket is a no-op: {output}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn idle_daemon_accepts_local_connections_without_polling_delay() {
+    let dir = scratch_dir("daemon-accept-latency");
+    let mut daemon = Daemon::spawn(&dir);
+    let socket = daemon::socket_path_in(&dir, "s");
+    let mut samples = Vec::with_capacity(50);
+    for _ in 0..50 {
+        let started = Instant::now();
+        let response = client::request(&socket, &Request::Version);
+        samples.push(started.elapsed());
+        assert!(matches!(response, Ok(Response::Value(_))));
+    }
+    samples.sort_unstable();
+    let p90 = samples[44];
+
+    let stopped = stop_and_clean(&mut daemon, &dir, &socket);
+    assert!(stopped, "daemon stops and removes its socket");
+    assert!(
+        p90 < Duration::from_millis(2),
+        "p90 accept/response latency was {p90:?} over 50 idle-daemon connects"
+    );
 }
 
 #[cfg(unix)]
