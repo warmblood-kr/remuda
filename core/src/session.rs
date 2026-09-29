@@ -399,6 +399,7 @@ impl Session {
             return Ok(InputSubmitOutcome::Submitted);
         }
         let visible = self.wait_for_visible_tail(tail, baseline_occurrences, &mut version);
+        self.wait_for_screen_quiet(&mut version);
         let before_raw = self.screen_text().unwrap_or_default();
         let before_compact = compact_screen(&before_raw);
         let before_version = self.output_version().unwrap_or(version);
@@ -467,6 +468,18 @@ impl Session {
     fn tail_occurrences(&self, tail: &str) -> usize {
         self.compact_screen()
             .map_or(0, |screen| occurrence_count(&screen, tail))
+    }
+
+    fn wait_for_screen_quiet(&self, version: &mut u64) {
+        let deadline = self.clock.now() + Duration::from_millis(300);
+        while self.clock.now() < deadline {
+            let remaining = deadline.saturating_sub(self.clock.now());
+            let timeout = remaining.min(Duration::from_millis(75));
+            match self.wait_for_output_after(*version, timeout) {
+                Ok(snapshot) => *version = snapshot.output_version.unwrap_or(*version),
+                Err(_) => return,
+            }
+        }
     }
 
     fn compact_screen(&self) -> Option<String> {
