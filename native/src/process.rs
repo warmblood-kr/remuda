@@ -70,17 +70,21 @@ pub fn run_sync(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     child_guard::harden(&mut command);
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
     }
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("start process.run program {program:?}: {error}"))?;
     if let Err(error) = process_tree.assign(&child) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(error.to_string());
     }
+
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
     let child_stdin = child.stdin.take().expect("stdin was piped");
@@ -118,7 +122,7 @@ pub fn run_sync(
         })
     };
 
-    let (child_status, timed_out) = wait_for_process_io(
+    let (child_status, timed_out, tree_terminated) = wait_for_process_io(
         &mut child,
         deadline,
         &process_tree,
@@ -127,7 +131,7 @@ pub fn run_sync(
         &stdin_done,
     )?;
 
-    if timed_out {
+    if tree_terminated {
         // Terminating the Windows Job closes descendant-held pipe handles.
         // Give the readers a short bounded window to consume bytes that were
         // already written before taking the output snapshots below.
@@ -205,76 +209,191 @@ fn wait_for_process_io(
     stdout_reader: &ReaderState,
     stderr_reader: &ReaderState,
     stdin_done: &AtomicBool,
-) -> Result<(std::process::ExitStatus, bool), String> {
+) -> Result<(std::process::ExitStatus, bool, bool), String> {
     let mut child_status = None;
+    let mut tree_terminated = false;
     loop {
         if child_status.is_none() {
-            match child.try_wait() {
-                Ok(status) => child_status = status,
-                Err(error) => {
-                    process_tree.terminate(child);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error.to_string());
-                }
-            }
+            let pipes_open = !stdout_reader.done() || !stderr_reader.done();
+            let (status, terminated) = observe_child_status(child, process_tree, pipes_open)?;
+            child_status = status;
+            tree_terminated |= terminated;
         }
         if let Some(error) = stdout_reader.error() {
-            terminate_child(child, process_tree);
+            terminate_child(child, process_tree, child_status.is_none());
             return Err(format!("read process.run stdout: {error}"));
         }
         if let Some(error) = stderr_reader.error() {
-            terminate_child(child, process_tree);
+            terminate_child(child, process_tree, child_status.is_none());
+
             return Err(format!("read process.run stderr: {error}"));
         }
         if stdout_reader.done() && stderr_reader.done() && stdin_done.load(Ordering::Acquire) {
             if let Some(status) = child_status.take() {
-                return Ok((status, false));
+                return Ok((status, false, tree_terminated));
             }
         }
         if Instant::now() >= deadline {
-            // On Unix, only signal the process group while its direct leader
-            // is known to be alive; after reap, its pgid may have been reused.
-            // A Windows Job Object handle remains tied to its job after the
-            // leader exits, so it is safe to terminate in either case.
-            let status = match child_status {
-                Some(status) => {
-                    // On Windows, the direct child may have exited while a
-                    // grandchild still holds either pipe open. The Job Object
-                    // remains valid after the leader exits, so terminate it
-                    // at the deadline as well.
-                    #[cfg(windows)]
-                    process_tree.terminate(child);
-                    status
-                }
-                None => match child.try_wait() {
-                    Ok(Some(status)) => {
-                        #[cfg(windows)]
-                        process_tree.terminate(child);
-                        status
-                    }
-                    Ok(None) => {
-                        process_tree.terminate(child);
-                        let _ = child.kill();
-                        child.wait().map_err(|error| error.to_string())?
-                    }
-                    Err(error) => {
-                        #[cfg(windows)]
-                        process_tree.terminate(child);
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(error.to_string());
-                    }
-                },
-            };
-            return Ok((status, true));
+            return expire_process_run(
+                child,
+                process_tree,
+                child_status.take(),
+                !stdout_reader.done() || !stderr_reader.done(),
+                tree_terminated,
+            );
         }
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
-fn terminate_child(child: &mut Child, process_tree: &ProcessTree) {
+fn observe_child_status(
+    child: &mut Child,
+    process_tree: &ProcessTree,
+    _pipes_open: bool,
+) -> Result<(Option<std::process::ExitStatus>, bool), String> {
+    #[cfg(unix)]
+    if _pipes_open {
+        match child_exited_without_reaping(child) {
+            Ok(false) => return Ok((None, false)),
+            Ok(true) => {
+                // WNOWAIT keeps the exited leader as a zombie, reserving its
+                // pid/pgid until we kill the group and then reap the leader.
+                process_tree.terminate(child);
+                return child
+                    .wait()
+                    .map(|status| (Some(status), true))
+                    .map_err(|error| error.to_string());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("inspect process.run leader: {error}"));
+            }
+        }
+    }
+    #[cfg(windows)]
+    if _pipes_open {
+        match child.try_wait() {
+            Ok(None) => return Ok((None, false)),
+            Ok(Some(status)) => {
+                // The Job handle remains valid after its leader exits. Kill
+                // descendants that keep the captured pipes open, and report
+                // the leader's natural exit rather than a timeout.
+                process_tree.terminate(child);
+                return Ok((Some(status), true));
+            }
+            Err(error) => {
+                process_tree.terminate(child);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error.to_string());
+            }
+        }
+    }
+    match child.try_wait() {
+        Ok(status) => Ok((status, false)),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error.to_string())
+        }
+    }
+}
+
+fn expire_process_run(
+    child: &mut Child,
+    process_tree: &ProcessTree,
+    child_status: Option<std::process::ExitStatus>,
+    _pipes_open: bool,
+    tree_terminated: bool,
+) -> Result<(std::process::ExitStatus, bool, bool), String> {
+    if let Some(status) = child_status {
+        #[cfg(windows)]
+        if _pipes_open && !tree_terminated {
+            // The leader has exited, but a descendant may still hold a pipe.
+            // The Job Object remains valid after the leader exits.
+            process_tree.terminate(child);
+        }
+        return Ok((status, false, tree_terminated || _pipes_open));
+    }
+    #[cfg(unix)]
+    {
+        match child_exited_without_reaping(child) {
+            Ok(true) => {
+                if _pipes_open {
+                    // The unreaped leader still pins its pgid, so this cannot
+                    // signal a recycled process group.
+                    process_tree.terminate(child);
+                }
+                let status = child.wait().map_err(|error| error.to_string())?;
+                Ok((status, false, tree_terminated || _pipes_open))
+            }
+            Ok(false) => {
+                process_tree.terminate(child);
+                let _ = child.kill();
+                let status = child.wait().map_err(|error| error.to_string())?;
+                Ok((status, true, true))
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(format!("inspect process.run leader: {error}"))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                #[cfg(windows)]
+                if _pipes_open {
+                    process_tree.terminate(child);
+                }
+                Ok((status, false, tree_terminated || _pipes_open))
+            }
+            Ok(None) => {
+                process_tree.terminate(child);
+                let _ = child.kill();
+                let status = child.wait().map_err(|error| error.to_string())?;
+                Ok((status, true, true))
+            }
+            Err(error) => {
+                process_tree.terminate(child);
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(error.to_string())
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn child_exited_without_reaping(child: &Child) -> std::io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+fn terminate_child(child: &mut Child, process_tree: &ProcessTree, _leader_not_reaped: bool) {
+    #[cfg(unix)]
+    if _leader_not_reaped {
+        process_tree.terminate(child);
+    }
+    #[cfg(windows)]
     process_tree.terminate(child);
+    #[cfg(not(any(unix, windows)))]
+    let _ = (process_tree, _leader_not_reaped);
+
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -287,8 +406,7 @@ struct BoundedCapture {
 
 impl BoundedCapture {
     fn push(&mut self, bytes: &[u8]) {
-        let retained_limit = RUN_OUTPUT_LIMIT - RUN_OUTPUT_MARKER.len();
-        let retain = retained_limit
+        let retain = RUN_OUTPUT_LIMIT
             .saturating_sub(self.bytes.len())
             .min(bytes.len());
         self.bytes.extend_from_slice(&bytes[..retain]);
@@ -372,7 +490,8 @@ mod run_tests {
             super::ReaderState::new(),
         );
         let output = capture.lock().unwrap().snapshot();
-        assert_eq!(output.len(), RUN_OUTPUT_LIMIT);
+        assert_eq!(output.len(), RUN_OUTPUT_LIMIT + RUN_OUTPUT_MARKER.len());
+        assert_eq!(output[..RUN_OUTPUT_LIMIT], vec![b'x'; RUN_OUTPUT_LIMIT]);
         assert!(output.ends_with(RUN_OUTPUT_MARKER));
     }
 
@@ -433,7 +552,7 @@ mod run_tests {
 
     #[cfg(windows)]
     #[test]
-    fn synchronous_process_timeout_kills_grandchild_holding_pipes() {
+    fn synchronous_process_kills_grandchild_holding_pipes_after_leader_exit() {
         use std::time::{Duration, Instant};
 
         let stem = std::env::temp_dir().join(format!(
@@ -458,13 +577,17 @@ mod run_tests {
                 "--test-threads=1".into(),
             ],
             Some(paths.into_bytes()),
-            2.0,
+            3.0,
         )
-        .expect("process.run should return at the timeout");
-        assert!(result.timed_out, "the parent should hit its timeout");
+        .expect("process.run should return after the leader exits");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "process.run waited for its grandchild's inherited pipes"
+            !result.timed_out,
+            "a completed leader should keep its exit status when its descendant is cleaned up"
+        );
+        assert_eq!(result.code, 0, "the launcher should exit successfully");
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "process.run should clean up the descendant before the deadline"
         );
         assert!(
             String::from_utf8_lossy(&result.stdout).contains("spawned"),
@@ -473,17 +596,17 @@ mod run_tests {
         );
         assert!(
             started_path.exists(),
-            "the grandchild should have started before process.run timed out"
+            "the grandchild should have started before its pipes were cleaned up"
         );
 
-        std::thread::sleep(Duration::from_secs(3));
+        std::thread::sleep(Duration::from_secs(5));
         let grandchild_survived = finished_path.exists();
         for path in [&started_path, &finished_path] {
             let _ = std::fs::remove_file(path);
         }
         assert!(
             !grandchild_survived,
-            "the grandchild survived after process.run timed out"
+            "the grandchild survived after process.run cleaned up the job"
         );
     }
 
@@ -492,6 +615,7 @@ mod run_tests {
     fn timeout_grandchild_launcher() {
         use std::io::{stdin, Read, Write};
         use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
 
         if !std::env::args().any(|arg| arg == "process::run_tests::timeout_grandchild_launcher") {
             return;
@@ -519,10 +643,18 @@ mod run_tests {
             .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn grandchild test helper");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !std::path::Path::new(started_path).exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            std::path::Path::new(started_path).exists(),
+            "the grandchild should start before the launcher exits"
+        );
         println!("spawned");
         std::io::stdout().flush().expect("flush spawn marker");
         // Dropping the handle does not wait. The job object should terminate
-        // this child together with the launcher when process.run times out.
+        // this child together with the launcher after its pipes remain open.
     }
 
     #[cfg(windows)]
@@ -542,7 +674,7 @@ mod run_tests {
 
     #[cfg(windows)]
     #[test]
-    fn synchronous_process_timeout_kills_an_immediately_spawned_grandchild() {
+    fn synchronous_process_kills_an_immediately_spawned_grandchild_after_leader_exit() {
         use std::process::Command;
         use std::time::Duration;
 
@@ -566,6 +698,7 @@ mod run_tests {
         }
 
         let before = ping_process_ids();
+        let started = std::time::Instant::now();
         let result = super::run_sync(
             vec![
                 "cmd.exe".into(),
@@ -574,10 +707,18 @@ mod run_tests {
                 "start /b ping -n 30 127.0.0.1 & exit".into(),
             ],
             None,
-            0.2,
+            1.0,
         )
-        .expect("process.run should return at the timeout");
-        assert!(result.timed_out, "the direct child should hit its timeout");
+        .expect("process.run should return after the leader exits");
+        assert!(
+            !result.timed_out,
+            "a completed leader should keep its exit status when its descendant is cleaned up"
+        );
+        assert_eq!(result.code, 0, "cmd.exe should exit successfully");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "process.run should clean up the descendant before the deadline"
+        );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         let mut survivors: Vec<_> = ping_process_ids().difference(&before).copied().collect();

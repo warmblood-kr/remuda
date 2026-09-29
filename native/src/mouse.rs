@@ -280,38 +280,7 @@ impl SgrParser {
         let mut out = Vec::new();
         loop {
             if self.in_paste {
-                let search_from = self.paste_scan_offset.min(self.pending.len());
-                let end = self.pending[search_from..]
-                    .windows(PASTE_END.len())
-                    .position(|window| window == PASTE_END)
-                    .map(|offset| search_from + offset);
-                if let Some(end) = end {
-                    let len = end + PASTE_END.len();
-                    if len <= PASTE_BUFFER_LIMIT {
-                        out.push(InputToken::Paste(self.pending.drain(..len).collect()));
-                        self.in_paste = false;
-                        self.paste_last_input_at = None;
-                        self.paste_scan_offset = 0;
-                    } else {
-                        let chunk = end.min(PASTE_BUFFER_LIMIT);
-                        out.push(InputToken::Paste(self.drain_paste_prefix(chunk)));
-                    }
-                    continue;
-                }
-                self.paste_scan_offset = self.pending.len().saturating_sub(PASTE_END.len() - 1);
-                if self.pending.len() > PASTE_BUFFER_LIMIT {
-                    let held = longest_suffix_prefix(&self.pending, PASTE_END);
-                    let safe_len = self.pending.len().saturating_sub(held);
-                    let chunk = safe_len.min(PASTE_BUFFER_LIMIT);
-                    if chunk > 0 {
-                        out.push(InputToken::Paste(self.drain_paste_prefix(chunk)));
-                        continue;
-                    }
-                }
-                if finishing {
-                    out.extend(close_paste(std::mem::take(&mut self.pending)));
-                    self.in_paste = false;
-                    self.paste_scan_offset = 0;
+                if self.parse_paste(&mut out, finishing) {
                     continue;
                 }
                 break;
@@ -392,6 +361,46 @@ impl SgrParser {
             }
         }
         merged
+    }
+
+    /// Consume available paste input; return whether parsing can continue.
+    fn parse_paste(&mut self, out: &mut Vec<InputToken>, finishing: bool) -> bool {
+        let search_from = self.paste_scan_offset.min(self.pending.len());
+        let end = self.pending[search_from..]
+            .windows(PASTE_END.len())
+            .position(|window| window == PASTE_END)
+            .map(|offset| search_from + offset);
+        if let Some(end) = end {
+            let len = end + PASTE_END.len();
+            if len <= PASTE_BUFFER_LIMIT {
+                out.push(InputToken::Paste(self.pending.drain(..len).collect()));
+                self.in_paste = false;
+                self.paste_last_input_at = None;
+                self.paste_scan_offset = 0;
+            } else {
+                out.push(InputToken::Paste(
+                    self.drain_paste_prefix(end.min(PASTE_BUFFER_LIMIT)),
+                ));
+            }
+            return true;
+        }
+        self.paste_scan_offset = self.pending.len().saturating_sub(PASTE_END.len() - 1);
+        if self.pending.len() > PASTE_BUFFER_LIMIT {
+            let held = longest_suffix_prefix(&self.pending, PASTE_END);
+            let safe_len = self.pending.len().saturating_sub(held);
+            let chunk = safe_len.min(PASTE_BUFFER_LIMIT);
+            if chunk > 0 {
+                out.push(InputToken::Paste(self.drain_paste_prefix(chunk)));
+                return true;
+            }
+        }
+        if finishing {
+            out.extend(close_paste(std::mem::take(&mut self.pending)));
+            self.in_paste = false;
+            self.paste_scan_offset = 0;
+            return true;
+        }
+        false
     }
 
     fn drain_paste_prefix(&mut self, len: usize) -> Vec<u8> {

@@ -2737,6 +2737,7 @@ fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
 /// Draw the herd until the user quits. One screen for the whole run: focus
 /// moves between the panes, and the terminal is never handed over, so the
 /// alternate screen is entered exactly once. `notice` is what stderr cannot reach.
+#[allow(clippy::too_many_lines)]
 pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result<()> {
     let _terminal = RawMode::enable()?;
     // Scoped to the herd screen, not `RawMode` itself: `attach` uses `RawMode`

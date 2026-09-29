@@ -1344,6 +1344,14 @@ fn split_stdin_flag(args: &[String]) -> Result<(bool, &[String]), &'static str> 
         [flag, ..] if flag == "--stdin" => {
             Err("--stdin is only valid before an installed mod command")
         }
+        [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
+            let options = rest.split(|arg| arg == "--").next().unwrap_or(rest);
+            if options.iter().any(|arg| arg == "--stdin") {
+                Err("usage: remuda --stdin MOD [ARGS…] (put --stdin before the mod command)")
+            } else {
+                Ok((false, args))
+            }
+        }
         _ => Ok((false, args)),
     }
 }
@@ -1547,7 +1555,11 @@ fn extension_command(
         .collect::<Vec<_>>()
         .join(", ");
     let env = caller_env(std::env::vars());
-    let stdin_opted_in = stdin_enabled || args.contains(&"-");
+    let stdin_opted_in = stdin_enabled
+        || args
+            .iter()
+            .take_while(|argument| **argument != "--")
+            .any(|argument| *argument == "-");
     let stdin = if stdin_opted_in {
         const MAX_CALLER_STDIN: usize = 1024 * 1024;
         let mut bytes = Vec::new();
@@ -2521,6 +2533,10 @@ fn simple_request(path: &Path, request: Request) -> ExitCode {
 fn describe(response: std::io::Result<Response>) -> String {
     match response {
         Ok(Response::Error(reason)) => reason,
+        Ok(Response::Busy) => "session input is busy".into(),
+        Ok(Response::WriteTimeout) => {
+            "session PTY write timed out; delivery may be partial or late".into()
+        }
         Ok(other) => format!("unexpected response: {other:?}"),
         Err(e) => e.to_string(),
     }
@@ -2561,6 +2577,15 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_timeout_has_a_user_facing_diagnostic() {
+        assert_eq!(
+            describe(Ok(Response::WriteTimeout)),
+            "session PTY write timed out; delivery may be partial or late"
+        );
+        assert_eq!(describe(Ok(Response::Busy)), "session input is busy");
+    }
 
     #[test]
     fn a_failed_daemon_start_includes_its_stderr() {

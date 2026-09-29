@@ -1179,6 +1179,167 @@ fn attached_keystrokes_survive_a_pty_write_timeout_without_detaching() {
 
 #[cfg(unix)]
 #[test]
+fn attached_slow_reader_accepts_a_paste_larger_than_the_input_queue() {
+    let runtime = scratch_dir("attach-slow-reader-paste");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&socket);
+    let capture_path = runtime.join("typed-bytes");
+    let ready_path = runtime.join("reader-ready");
+    let mut env = std::collections::HashMap::new();
+    env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    env.insert("READY_PATH".into(), ready_path.display().to_string());
+    let response = client::request(
+        &socket,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw -echo; : >\"$READY_PATH\"; i=0; while [ \"$i\" -lt 192 ]; do dd bs=64 count=1 2>/dev/null >>\"$CAPTURE_PATH\"; i=$((i+1)); sleep 0.05; done; while :; do sleep 1; done".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start slow raw reader");
+    assert!(matches!(response, Response::Value(_)));
+    let ready_deadline = Instant::now() + PATIENCE;
+    while !ready_path.exists() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "slow reader did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut stream = raw_attach(&socket, "target");
+    let expected = vec![b'x'; 12_288];
+    stream
+        .write_all(&expected)
+        .expect("paste into attached session");
+    assert_eq!(target_row(&socket, "r.attached"), "true");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if std::fs::read(&capture_path).ok().as_deref() == Some(expected.as_slice()) {
+            break;
+        }
+        assert_eq!(
+            target_row(&socket, "r.attached"),
+            "true",
+            "slow input must not tear down the healthy attachment"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "slow reader did not receive the paste (captured {} of {} bytes)",
+            std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+            expected.len()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        std::fs::read(&capture_path).expect("read captured paste"),
+        expected,
+        "every byte arrives in order"
+    );
+    drop(stream);
+    let detach_deadline = Instant::now() + PATIENCE;
+    while target_row(&socket, "r.attached") == "true" {
+        assert!(
+            Instant::now() < detach_deadline,
+            "EOF did not release attach"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_eof_drains_input_already_read_by_the_key_pump() {
+    let runtime = scratch_dir("attach-eof-drains-keys");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&socket);
+    let capture_path = runtime.join("typed-bytes");
+    let ready_path = runtime.join("reader-ready");
+    let mut env = std::collections::HashMap::new();
+    env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    env.insert("READY_PATH".into(), ready_path.display().to_string());
+    let response = client::request(
+        &socket,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw echo; : >\"$READY_PATH\"; i=0; while [ \"$i\" -lt 12 ]; do dd bs=1024 count=1 iflag=fullblock 2>/dev/null >>\"$CAPTURE_PATH\"; i=$((i+1)); sleep 0.05; done; while :; do sleep 1; done".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start gated raw reader");
+    assert!(matches!(response, Response::Value(_)));
+    let ready_deadline = Instant::now() + PATIENCE;
+    while !ready_path.exists() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "gated reader did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut stream = ipc::connect(&socket).expect("connect attach client");
+    let mut request = serde_json::to_vec(&Request::Attach {
+        name: "target".to_string(),
+    })
+    .expect("serialize Attach");
+    request.push(b'\n');
+    stream.write_all(&request).expect("send Attach");
+    // The daemon's acknowledgement and initial screen paint now encounter
+    // EPIPE, while the client can still send input on the other half.
+    let ipc::Stream::UdSocket(unix_socket) = &stream;
+    use std::os::fd::{AsFd, AsRawFd};
+    nix::sys::socket::shutdown(
+        unix_socket.as_fd().as_raw_fd(),
+        nix::sys::socket::Shutdown::Read,
+    )
+    .expect("shut down attach output half");
+    let expected = vec![b'y'; 12_288];
+    stream
+        .write_all(&expected)
+        .expect("send keys after shutting down output half");
+    drop(stream);
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if std::fs::read(&capture_path).ok().as_deref() == Some(expected.as_slice()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "EOF discarded buffered attach keys (captured {} of {} bytes)",
+            std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+            expected.len()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read(&capture_path).expect("read bytes delivered before detach"),
+        expected
+    );
+    while target_row(&socket, "r.attached") == "true" {
+        assert!(
+            Instant::now() < deadline,
+            "drained EOF did not release attach"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
     let runtime = unique_scratch_dir("probe-attach-stall");
     let socket = daemon::socket_path_in(&runtime, "s");
@@ -3029,7 +3190,7 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
     let dir = scratch_dir("attach-mouse-forward");
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
-    let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006h'; dd bs=1 count=12 2>/dev/null | od -An -tx1; printf '\\nmouse-forwarded\\n'";
+    let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006h\\033[?2004h'; dd bs=1 count=12 2>/dev/null | od -An -tx1; printf '\\nmouse-forwarded\\n'";
     let created = client::request(
         &path,
         &Request::New {
@@ -3054,7 +3215,7 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
             Ok(Response::MouseState(MouseState {
                 mode: MouseMode::PressRelease,
                 encoding: MouseEncoding::Sgr,
-                bracketed_paste: false,
+                bracketed_paste: true,
             })) => break,
             other => {
                 assert!(
