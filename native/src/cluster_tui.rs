@@ -824,6 +824,7 @@ impl ClusterUi {
                     ));
                 } else {
                     let label = node_snapshot.name.clone();
+                    let short_fingerprint = node.chars().take(6).collect::<String>();
                     let wire_name = session.wire_name.clone();
                     self.remote_close_confirmation = Some(RemoteCloseTarget {
                         registry_key: node,
@@ -831,7 +832,7 @@ impl ClusterUi {
                         wire_name,
                     });
                     self.confirmation
-                        .begin(format!("{label}/{name}"), instance_id);
+                        .begin(format!("{label}({short_fingerprint})/{name}"), instance_id);
                 }
             } else {
                 self.notice = Some(("remote session is no longer listed".into(), now));
@@ -2135,11 +2136,11 @@ mod tests {
         let frame = ui.render(100, 24, "", &clock);
         assert!(frame.contains("laptop · unreachable"));
         assert!(frame.contains("last good screen"));
-        assert!(frame.contains("kill laptop/build? it is running — y / n"));
+        assert!(frame.contains("kill laptop(fp-lap)/build? it is running — y / n"));
         ui.key(crossterm::event::KeyCode::Char('n'));
         assert!(!ui
             .render(100, 24, "", &clock)
-            .contains("kill laptop/build?"));
+            .contains("kill laptop(fp-lap)/build?"));
     }
 
     #[test]
@@ -2207,7 +2208,7 @@ mod tests {
 
         assert!(ui
             .render(100, 24, "", &clock)
-            .contains("kill laptop/build? it is running — y / n"));
+            .contains("kill laptop(fp-lap)/build? it is running — y / n"));
 
         ui.key(crossterm::event::KeyCode::Char('y'));
         let transport = FakeRemoteInput::new(Response::RemoteControlDisabled);
