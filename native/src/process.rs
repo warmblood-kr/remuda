@@ -127,6 +127,14 @@ pub fn run_sync(
         &stdin_done,
     )?;
 
+    if timed_out {
+        // Terminating the Windows Job closes descendant-held pipe handles.
+        // Give the readers a short bounded window to consume bytes that were
+        // already written before taking the output snapshots below.
+        #[cfg(windows)]
+        wait_for_readers(&stdout_reader, &stderr_reader, Duration::from_millis(500));
+    }
+
     // All three workers are finished on the successful path. On timeout,
     // dropping their handles detaches them so an escaped descendant holding
     // a pipe cannot keep the Lua image blocked past the deadline.
@@ -329,6 +337,14 @@ fn capture_bounded(mut reader: impl Read, capture: Arc<Mutex<BoundedCapture>>, s
         *state.error.lock().unwrap() = Some(error);
     }
     state.done.store(true, Ordering::Release);
+}
+
+#[cfg(windows)]
+fn wait_for_readers(stdout: &ReaderState, stderr: &ReaderState, grace: Duration) {
+    let deadline = Instant::now() + grace;
+    while !(stdout.done() && stderr.done()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[cfg(unix)]
