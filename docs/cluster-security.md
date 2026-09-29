@@ -37,8 +37,12 @@ limit. `remuda cluster` status shows whether remote control is enabled and
 warns that a compromised admitted node can type into and close every session.
 
 Remote Input uses only the idempotent client ID and sequence batch path. The
-peer aggregate budget is charged before dispatch; the local daemon also enforces
-its per-session byte budget. A disabled node returns the typed
+remote front accepts at most 12 KiB (12,288 bytes) in one batch; remote
+senders split larger input into sequential batches at this limit. This keeps
+the JSON byte-array encoding below the listener body cap, including batches of
+three-digit byte values. An oversized batch receives a typed error before
+dispatch. The peer aggregate budget is charged before dispatch; the local daemon
+also enforces its per-session byte budget. A disabled node returns the typed
 `RemoteControlDisabled` response. Confirmed remote Close remains refused until
 its reviewed protocol lands; once enabled, it will use this same local setting.
 Turning remote control off refuses remote Input and, when confirmed Close is

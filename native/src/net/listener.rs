@@ -1766,7 +1766,7 @@ mod tests {
             instance_id: "instance".into(),
             client_id: "00000000000000000000000000000001".into(),
             seq: 1,
-            bytes: b"hello\r".to_vec(),
+            bytes: vec![u8::MAX; crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES],
         };
         let expected_request = request.clone();
         let dispatched = Arc::new(AtomicUsize::new(0));
@@ -1791,6 +1791,48 @@ mod tests {
         let response: Response = serde_json::from_slice(&response).unwrap();
         assert_eq!(response, Response::Ack { duplicate: false });
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_refuses_input_over_remote_batch_limit_with_typed_error() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let settings = TestControlSettings::new(br#"{"allow_remote_control":true}"#);
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let dispatched_for_worker = dispatched.clone();
+        let server = SocketTestServer::start_production_with_control_source(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Ok(())),
+            Arc::new(move |_| {
+                dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::to_vec(&Response::Ack { duplicate: false }).unwrap())
+            }),
+            settings.source(),
+        );
+        let request = Request::Input {
+            name: "session".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
+            bytes: vec![u8::MAX; crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES + 1],
+        };
+        let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
+        let (status, response) = server.exchange(sealed);
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Response>(&response).unwrap(),
+            Response::Error(format!(
+                "remote Input batch exceeds {} bytes",
+                crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES
+            ))
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
 
     #[cfg(unix)]

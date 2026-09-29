@@ -11,6 +11,8 @@ use std::path::Path;
 pub const MAX_FRAME_BYTES: usize = 512 * 1024;
 /// Maximum bytes accepted in one atomic input batch (64 KiB).
 pub const MAX_INPUT_BYTES: usize = remuda_core::input::MAX_INPUT_BYTES;
+/// Maximum bytes accepted in one remote Input batch (12 KiB).
+pub const MAX_REMOTE_INPUT_BATCH_BYTES: usize = 12 * 1024;
 /// Maximum simultaneous local front connections.
 pub const MAX_CONNECTIONS: usize = 8;
 /// A connection is closed if one request takes longer than this.
@@ -163,7 +165,14 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             seq,
             bytes,
             ..
-        } => validate_batch(client_id, *seq, bytes).map(|_| ()),
+        } => {
+            if bytes.len() > MAX_REMOTE_INPUT_BATCH_BYTES {
+                return Err(format!(
+                    "remote Input batch exceeds {MAX_REMOTE_INPUT_BATCH_BYTES} bytes"
+                ));
+            }
+            validate_batch(client_id, *seq, bytes).map(|_| ())
+        }
         Request::New { .. } => Err(refusal("New")),
         Request::SendLine { .. } => Err(refusal("SendLine")),
         Request::Send { .. } => Err(refusal("Send")),
@@ -291,7 +300,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversize_frames_and_batches() {
+    fn rejects_oversize_frames_and_remote_batches() {
         assert!(decode_frame(&vec![b' '; MAX_FRAME_BYTES + 1])
             .unwrap_err()
             .contains("exceeds"));
@@ -304,7 +313,7 @@ mod tests {
         };
         assert!(decode_frame(&serde_json::to_vec(&oversized).unwrap())
             .unwrap_err()
-            .contains("input"));
+            .contains("remote Input batch exceeds"));
         let empty = Request::Input {
             name: "dev".into(),
             instance_id: "instance".into(),
@@ -315,6 +324,26 @@ mod tests {
         assert!(decode_frame(&serde_json::to_vec(&empty).unwrap())
             .unwrap_err()
             .contains("input"));
+    }
+
+    #[test]
+    fn remote_input_batch_limit_accepts_12288_and_refuses_12289() {
+        let request = |length| Request::Input {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
+            bytes: vec![u8::MAX; length],
+        };
+        assert!(
+            decode_frame(&serde_json::to_vec(&request(MAX_REMOTE_INPUT_BATCH_BYTES)).unwrap())
+                .is_ok()
+        );
+        assert_eq!(
+            decode_frame(&serde_json::to_vec(&request(MAX_REMOTE_INPUT_BATCH_BYTES + 1)).unwrap())
+                .unwrap_err(),
+            format!("remote Input batch exceeds {MAX_REMOTE_INPUT_BATCH_BYTES} bytes")
+        );
     }
 
     #[test]
