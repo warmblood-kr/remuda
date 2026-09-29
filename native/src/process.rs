@@ -188,36 +188,18 @@ fn wait_for_process_io(
     stdin_done: &AtomicBool,
 ) -> Result<(std::process::ExitStatus, bool), String> {
     let mut child_status = None;
-    let mut process_group_killed = false;
     loop {
         if child_status.is_none() {
-            match child.try_wait() {
-                Ok(status) => child_status = status,
-                Err(error) => {
-                    kill_process_tree(child);
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(error.to_string());
-                }
-            }
+            let pipes_open = !stdout_reader.done() || !stderr_reader.done();
+            child_status = observe_child_status(child, pipes_open)?;
         }
         if let Some(error) = stdout_reader.error() {
-            terminate_child(child);
+            terminate_child(child, child_status.is_none());
             return Err(format!("read process.run stdout: {error}"));
         }
         if let Some(error) = stderr_reader.error() {
-            terminate_child(child);
+            terminate_child(child, child_status.is_none());
             return Err(format!("read process.run stderr: {error}"));
-        }
-        // A naturally exited leader can leave ordinary background children
-        // holding its pipes. Keep the leader's status, but close its process
-        // group so both readers can finish and release their permits.
-        if child_status.is_some()
-            && (!stdout_reader.done() || !stderr_reader.done())
-            && !process_group_killed
-        {
-            kill_process_tree(child);
-            process_group_killed = true;
         }
         if stdout_reader.done() && stderr_reader.done() && stdin_done.load(Ordering::Acquire) {
             if let Some(status) = child_status.take() {
@@ -225,31 +207,119 @@ fn wait_for_process_io(
             }
         }
         if Instant::now() >= deadline {
-            let timed_out = child_status.is_none();
-            let status = match child_status {
-                Some(status) => status,
-                None => match child.try_wait() {
-                    Ok(Some(status)) => status,
-                    Ok(None) => {
-                        kill_process_tree(child);
-                        let _ = child.kill();
-                        child.wait().map_err(|error| error.to_string())?
-                    }
-                    Err(error) => {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        return Err(error.to_string());
-                    }
-                },
-            };
-            return Ok((status, timed_out));
+            return expire_process_run(
+                child,
+                child_status.take(),
+                !stdout_reader.done() || !stderr_reader.done(),
+            );
         }
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
-fn terminate_child(child: &mut Child) {
-    kill_process_tree(child);
+fn observe_child_status(
+    child: &mut Child,
+    _pipes_open: bool,
+) -> Result<Option<std::process::ExitStatus>, String> {
+    #[cfg(unix)]
+    if _pipes_open {
+        match child_exited_without_reaping(child) {
+            Ok(false) => return Ok(None),
+            Ok(true) => {
+                // WNOWAIT keeps the exited leader as a zombie, reserving its
+                // pid/pgid until we kill the group and then reap the leader.
+                kill_process_tree(child);
+                return child.wait().map(Some).map_err(|error| error.to_string());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("inspect process.run leader: {error}"));
+            }
+        }
+    }
+    match child.try_wait() {
+        Ok(status) => Ok(status),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(error.to_string())
+        }
+    }
+}
+
+fn expire_process_run(
+    child: &mut Child,
+    child_status: Option<std::process::ExitStatus>,
+    _pipes_open: bool,
+) -> Result<(std::process::ExitStatus, bool), String> {
+    if let Some(status) = child_status {
+        return Ok((status, false));
+    }
+    #[cfg(unix)]
+    {
+        match child_exited_without_reaping(child) {
+            Ok(true) => {
+                if _pipes_open {
+                    // The unreaped leader still pins its pgid, so this cannot
+                    // signal a recycled process group.
+                    kill_process_tree(child);
+                }
+                let status = child.wait().map_err(|error| error.to_string())?;
+                Ok((status, false))
+            }
+            Ok(false) => {
+                kill_process_tree(child);
+                let _ = child.kill();
+                let status = child.wait().map_err(|error| error.to_string())?;
+                Ok((status, true))
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(format!("inspect process.run leader: {error}"))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        match child.try_wait() {
+            Ok(Some(status)) => Ok((status, false)),
+            Ok(None) => {
+                let _ = child.kill();
+                let status = child.wait().map_err(|error| error.to_string())?;
+                Ok((status, true))
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(error.to_string())
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn child_exited_without_reaping(child: &Child) -> std::io::Result<bool> {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { info.si_pid() } != 0)
+}
+
+fn terminate_child(child: &mut Child, leader_not_reaped: bool) {
+    if leader_not_reaped {
+        kill_process_tree(child);
+    }
     let _ = child.kill();
     let _ = child.wait();
 }

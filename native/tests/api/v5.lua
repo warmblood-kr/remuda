@@ -150,18 +150,22 @@ if not windows then
   assert(timed.signal == 9, "process.run should report Unix SIGKILL when timeout kills the child")
   -- The shell exits naturally, but its background child inherits stdout and
   -- stderr. Preserve the leader's status and kill the remaining process group.
-  local started = os.time()
-  local held_pipes = remuda.process.run({
-    argv = { "/bin/sh", "-c", "sleep 30 & echo $!; exit 7" }, timeout = 3,
-  })
-  local held_pid = held_pipes.stdout:match("(%d+)")
-  if held_pid then os.execute("/bin/kill -KILL " .. held_pid) end
-  assert(not held_pipes.timed_out, "a naturally exited leader must not be reported timed out")
-  assert(held_pipes.code == 7, "process.run must report the leader's exit code")
-  assert(held_pid, "the pipe-holding descendant pid should be captured")
-  assert(os.time() - started < 3, "process.run should drain after killing the leader's process group")
-  local after_group_cleanup = remuda.process.run({ argv = echo_argv, timeout = 1 })
-  assert(after_group_cleanup.code == 0, "group cleanup should release output-reader permits")
+  for _ = 1, 20 do
+    local started = os.time()
+    local held_pipes = remuda.process.run({
+      argv = { "/bin/sh", "-c", "sleep 30 & echo $!; exit 0" }, timeout = 3,
+    })
+    local held_pid = held_pipes.stdout:match("(%d+)")
+    assert(not held_pipes.timed_out, "a naturally exited leader must not be reported timed out")
+    assert(held_pipes.code == 0, "process.run must report the leader's zero exit code")
+    assert(held_pid, "the pipe-holding descendant pid should be captured")
+    assert(os.time() - started < 3, "process.run should drain after killing the leader's process group")
+    local child_alive = os.execute("/bin/kill -0 " .. held_pid .. " >/dev/null 2>&1")
+    assert(child_alive ~= true and child_alive ~= 0,
+      "the background child should be gone after process.run returns")
+    local after_group_cleanup = remuda.process.run({ argv = echo_argv, timeout = 1 })
+    assert(after_group_cleanup.code == 0, "group cleanup should release output-reader permits")
+  end
 
   -- A descendant can escape the process group with setsid and keep both
   -- output pipes alive. Limit detached readers so repeated calls cannot leak
