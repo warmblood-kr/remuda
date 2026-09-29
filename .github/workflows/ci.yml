@@ -17,6 +17,12 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  no-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/check-no-python.sh
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -436,13 +442,10 @@ jobs:
         # the one this fence catches.
         run: |
           cp steps/001-pty-manager-daemon.md /tmp/step.bak
-          python3 - <<'EOF'
-          import pathlib
-          p = pathlib.Path("steps/001-pty-manager-daemon.md")
-          t = p.read_text()
-          assert "```" in t, "probe text not found — the control never ran"
-          p.write_text(t.replace("```", "~~~"))
-          EOF
+          grep -q '```' steps/001-pty-manager-daemon.md \
+            || { echo "::error::probe text not found — the control never ran"; exit 1; }
+          sed 's/```/~~~/g' steps/001-pty-manager-daemon.md > /tmp/step.planted
+          mv /tmp/step.planted steps/001-pty-manager-daemon.md
           if python3 scripts/check-steps.py 2>/tmp/out; then
             echo "::error::check-steps.py ACCEPTED a step with no captured output"
             cp /tmp/step.bak steps/001-pty-manager-daemon.md
