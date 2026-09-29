@@ -43,10 +43,10 @@ the JSON byte-array encoding below the listener body cap, including batches of
 three-digit byte values. An oversized batch receives a typed error before
 dispatch. The peer aggregate budget is charged before dispatch; the local daemon
 also enforces its per-session byte budget. A disabled node returns the typed
-`RemoteControlDisabled` response. Confirmed remote Close remains refused until
-its reviewed protocol lands; once enabled, it will use this same local setting.
-Turning remote control off refuses remote Input and, when confirmed Close is
-enabled, Close requests.
+`RemoteControlDisabled` response for both remote Input and remote Close. A
+remote Close is accepted only with the current session `instance_id` and
+`confirm: true`; a missing confirmation or stale instance is refused. Turning
+remote control off refuses both remote Input and confirmed remote Close.
 
 A batch already in dispatch may still be delivered if the setting changes to
 off while that batch is in flight. A revoke during dispatch may likewise allow
@@ -61,8 +61,8 @@ An admitted peer can submit bounded Input batches to any session while remote
 control is enabled. The listener enforces a 256 KiB/s peer-wide aggregate
 budget, and the local daemon enforces its per-session cap. PTY writes have a
 bounded timeout. The local flag defaults to enabled because joining a cluster
-is a trust decision; disabling it refuses remote Input. A compromised admitted
-node can type into every session. Remote Close remains refused in this change.
+is a trust decision; disabling it refuses remote Input and Close. A compromised
+admitted node can type into and close every session while the setting is on.
 
 These controls do not protect against a compromised local account or host,
 which can read the local cluster keys and change the setting.

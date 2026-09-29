@@ -1085,6 +1085,15 @@ fn handle(
     handle_request(stream, reader, registry, image, socket_owner, request)
 }
 
+fn handle_list(stream: &Stream, registry: &Registry, image: &Image) -> std::io::Result<()> {
+    // Where a session that ended stops being listed: a reaper thread would
+    // need a clock this layer is not given.
+    if !keep_exited() {
+        reap_and_notify(registry, image);
+    }
+    reply(stream, &Response::Sessions(registry.list()))
+}
+
 fn handle_request(
     stream: Stream,
     reader: BufReader<Stream>,
@@ -1094,15 +1103,7 @@ fn handle_request(
     request: Request,
 ) -> std::io::Result<()> {
     match request {
-        // Where a session that ended stops being listed. Here rather than on a
-        // timer because listing is the only moment the answer is looked at, and
-        // a reaper thread would need a clock this layer is not given.
-        Request::List => {
-            if !keep_exited() {
-                reap_and_notify(registry, image);
-            }
-            reply(&stream, &Response::Sessions(registry.list()))
-        }
+        Request::List => handle_list(&stream, registry, image),
 
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
 

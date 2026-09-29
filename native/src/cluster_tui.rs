@@ -21,9 +21,8 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
-
 pub mod close_request;
+const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 pub mod composer;
 pub mod confirm;
 pub mod ended;
@@ -417,7 +416,11 @@ impl ClusterUi {
         let Some((name, instance_id)) = self.pending_close.take() else {
             return;
         };
-        let response = client::request(path, &confirmed_close(name.clone(), instance_id.clone()));
+        let response = client::request_with_timeout(
+            path,
+            &confirmed_close(name.clone(), instance_id.clone()),
+            UI_REQUEST_TIMEOUT,
+        );
         self.close_completed(name, instance_id, response, now);
     }
 
@@ -729,7 +732,7 @@ impl ClusterUi {
                     self.notice = Some(("cannot close: session identity is missing".into(), now));
                 }
             } else {
-                self.notice = Some((format!("{} has already ended", session.name), now));
+                self.notice = Some((format!("{} has already ended.", session.name), now));
             }
         }
     }
@@ -1917,7 +1920,7 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('x'));
 
         let frame = ui.render(80, 24, "", &clock);
-        assert!(frame.contains("dev has already ended"));
+        assert!(frame.contains("dev has already ended."));
         assert!(!frame.contains("kill dev?"));
     }
 

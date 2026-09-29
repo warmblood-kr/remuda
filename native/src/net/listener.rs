@@ -593,10 +593,17 @@ fn authorize_remote_request_with_source(
     request: &Request,
     control_source: &ControlSource,
 ) -> Result<(), Response> {
-    let enabled = if matches!(request, Request::Input { .. }) {
-        control_source
-            .enabled()
-            .map_err(|_| Response::error("remote control setting unavailable; refusing Input"))?
+    let enabled = if matches!(request, Request::Input { .. } | Request::Close { .. }) {
+        control_source.enabled().map_err(|_| {
+            let operation = if matches!(request, Request::Input { .. }) {
+                "Input"
+            } else {
+                "Close"
+            };
+            Response::error(format!(
+                "remote control setting unavailable; refusing {operation}"
+            ))
+        })?
     } else {
         true
     };
@@ -613,9 +620,8 @@ fn authorize_remote_request_with_control(
                 return Err(Response::RemoteControlDisabled);
             }
         }
-        // Close remains disabled until PR11's explicit confirmation and review.
-        Request::Close { .. } => {
-            return Err(Response::error("remote front refuses Close"));
+        Request::Close { .. } if !allow_remote_control => {
+            return Err(Response::RemoteControlDisabled);
         }
         _ => {}
     }
@@ -1331,14 +1337,20 @@ mod tests {
         assert!(validate_bind_address("0.0.0.0:0".parse().unwrap(), true).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_input_obeys_local_control_setting_and_close_stays_refused() {
-        assert!(authorize_remote_request(&Request::List).is_ok());
-        let close_error = authorize_remote_request(&Request::Close {
-            name: "session".into(),
-            instance_id: None,
-            confirm: None,
-        })
+        let settings = TestControlSettings::new(br#"{"allow_remote_control":true}"#);
+        let control_source = settings.source();
+        assert!(authorize_remote_request_with_source(&Request::List, &control_source).is_ok());
+        let close_error = authorize_remote_request_with_source(
+            &Request::Close {
+                name: "session".into(),
+                instance_id: None,
+                confirm: None,
+            },
+            &control_source,
+        )
         .unwrap_err();
         assert_eq!(close_error, Response::error("remote front refuses Close"));
         let input = Request::Input {
@@ -1348,7 +1360,7 @@ mod tests {
             seq: 1,
             bytes: b"hello\r".to_vec(),
         };
-        assert!(authorize_remote_request_with_control(&input, true).is_ok());
+        assert!(authorize_remote_request_with_source(&input, &control_source).is_ok());
         let close_error = authorize_remote_request_with_control(
             &Request::Close {
                 name: "session".into(),
@@ -1964,6 +1976,113 @@ mod tests {
             expected
         );
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    fn production_socket_close_response(
+        setting: &[u8],
+        request: Request,
+        dispatch_response: Response,
+        expected: Response,
+        expected_dispatches: usize,
+    ) {
+        let settings = TestControlSettings::new(setting);
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let dispatched_for_worker = dispatched.clone();
+        let payload = serde_json::to_vec(&dispatch_response).unwrap();
+        let server = SocketTestServer::start_production_with_control_source(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Ok(())),
+            Arc::new(move |_| {
+                dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
+                Ok(payload.clone())
+            }),
+            settings.source(),
+        );
+        let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
+        let (status, response) = server.exchange(sealed);
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Response>(&response).unwrap(),
+            expected
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), expected_dispatches);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_close_with_control_off_returns_typed_refusal() {
+        let close = |instance_id: Option<&str>, confirm| Request::Close {
+            name: "session".into(),
+            instance_id: instance_id.map(str::to_owned),
+            confirm,
+        };
+        let disabled = br#"{"allow_remote_control":false}"#;
+        production_socket_close_response(
+            disabled,
+            close(Some("current-instance"), Some(true)),
+            Response::Ok,
+            Response::RemoteControlDisabled,
+            0,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_confirmed_close_with_control_on_reaches_dispatch() {
+        let close = Request::Close {
+            name: "session".into(),
+            instance_id: Some("current-instance".into()),
+            confirm: Some(true),
+        };
+        production_socket_close_response(
+            br#"{"allow_remote_control":true}"#,
+            close,
+            Response::Ok,
+            Response::Ok,
+            1,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_close_without_confirmation_is_refused_before_dispatch() {
+        let close = Request::Close {
+            name: "session".into(),
+            instance_id: Some("current-instance".into()),
+            confirm: None,
+        };
+        production_socket_close_response(
+            br#"{"allow_remote_control":true}"#,
+            close,
+            Response::Ok,
+            Response::error("remote front refuses Close"),
+            0,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_remote_close_without_identity_or_confirmation_is_refused() {
+        let close = Request::Close {
+            name: "session".into(),
+            instance_id: None,
+            confirm: None,
+        };
+        production_socket_close_response(
+            br#"{"allow_remote_control":true}"#,
+            close,
+            Response::Ok,
+            Response::error("remote front refuses Close"),
+            0,
+        );
     }
 
     #[cfg(unix)]

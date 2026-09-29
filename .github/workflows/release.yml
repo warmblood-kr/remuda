@@ -371,13 +371,17 @@ jobs:
           set -eu
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          index_tool=$(mktemp -d)
+          trap 'rm -rf "$index_tool"' EXIT
+          tar -xzf "dist/remuda-$VERSION-x86_64-unknown-linux-gnu.tar.gz" -C "$index_tool"
           for attempt in 1 2 3; do
             # Start each attempt from the current main pointer. A concurrent
             # publisher can still win between fetch and push, so a rejected
             # push retries from its newer index and rechecks ordering.
             git fetch origin main
             git reset --hard origin/main
-            result=$(python3 scripts/latest-index.py docs/latest.json "$CHANNEL" "$VERSION")
+            updated=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            result=$("$index_tool/remuda" _latest-index docs/latest.json "$CHANNEL" "$VERSION" "$updated")
             echo "$result"
             if [ "$result" = publish=false ]; then
               echo "publish=false" >> "$GITHUB_OUTPUT"

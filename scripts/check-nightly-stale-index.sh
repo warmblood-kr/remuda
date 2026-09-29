@@ -14,8 +14,13 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 real_curl=$(command -v curl) || { echo "check-nightly-stale-index: need curl" >&2; exit 1; }
-expected_nightly=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["nightly"])' "$ROOT/docs/latest.json")
+expected_nightly=$(sed -n 's/.*"nightly"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$ROOT/docs/latest.json")
 [ -n "$expected_nightly" ] || { echo "check-nightly-stale-index: no nightly version in latest.json" >&2; exit 1; }
+remuda_bin=${REMUDA_BIN:-$ROOT/target/debug/remuda}
+if [ ! -x "$remuda_bin" ]; then
+	CARGO_TARGET_DIR="$ROOT/target" cargo build --quiet --manifest-path "$ROOT/Cargo.toml" -p remuda-native --bin remuda
+fi
+[ -x "$remuda_bin" ] || { echo "check-nightly-stale-index: remuda binary is missing: $remuda_bin" >&2; exit 1; }
 
 mkdir -p "$tmp/shim"
 cat >"$tmp/shim/curl" <<'EOF'
@@ -61,8 +66,8 @@ echo "ok — cached nightly index tried immutable tag $expected_nightly first"
 cat >"$tmp/latest.json" <<'EOF'
 {"stable":"1.0.0","nightly":"0.1.0-nightly.20260929120000.abcdef1","updated":"old"}
 EOF
-stale_result=$(python3 "$ROOT/scripts/latest-index.py" "$tmp/latest.json" nightly \
-	0.1.0-nightly.20260928120000.abcdef1 2>&1)
+stale_result=$("$remuda_bin" _latest-index "$tmp/latest.json" nightly \
+	0.1.0-nightly.20260928120000.abcdef1 2026-09-29T00:00:00Z 2>&1)
 case "$stale_result" in
 *"skipping stale candidate"*"publish=false"*) ;;
 *) echo "check-nightly-stale-index: stale candidate was not skipped: $stale_result" >&2; exit 1 ;;
@@ -76,7 +81,7 @@ echo "ok — stale nightly candidate leaves the newer latest.json pointer intact
 # Match native/src/dist.rs numeric ordering: 0.10.0 outranks 0.9.0.
 printf '{"stable":"0.9.0","nightly":"0.1.0-nightly.20260929120000.abcdef1"}\n' \
 	>"$tmp/numeric.json"
-numeric_result=$(python3 "$ROOT/scripts/latest-index.py" "$tmp/numeric.json" stable 0.10.0)
+numeric_result=$("$remuda_bin" _latest-index "$tmp/numeric.json" stable 0.10.0 2026-09-29T00:00:00Z)
 [ "$numeric_result" = publish=true ] && grep -F '"stable": "0.10.0"' "$tmp/numeric.json" >/dev/null || {
 	echo "check-nightly-stale-index: version ordering did not rank 0.10.0 above 0.9.0" >&2
 	exit 1
