@@ -1,44 +1,4 @@
 <h1 id="remuda-lua-runtime">Remuda Lua runtime</h1>
-<h2 id="advice_reattach">_advice_reattach</h2>
-<p><code>_advice_reattach() -&gt; nil</code> — Re-install advice trampolines over redefined functions. Called after each mod load.</p>
-<h2 id="call">_call</h2>
-<p><code>_call(name, arguments, caller) -&gt; string</code> — Dispatch one MCP tools/call by name.</p>
-<h2 id="descriptors">_descriptors</h2>
-<p><code>_descriptors() -&gt; string</code> — MCP tool descriptors for everything <span class="title-ref">remuda.tool</span> has registered.</p>
-<h2 id="dispatch_extension_command">_dispatch_extension_command</h2>
-<p><code>_dispatch_extension_command(name, args, caller) -&gt; value</code> — Dispatch arguments and caller context to a loaded mod command handler.</p>
-<h2 id="event_counts">_event_counts</h2>
-<p><code>table</code> — Internal event-emit counts, keyed by event name. Read via <span class="title-ref">event_counts()</span>.</p>
-<h2 id="extension_commands">_extension_commands</h2>
-<p><code>table</code> — Handlers registered for installed mod commands.</p>
-<h2 id="function_source">_function_source</h2>
-<p><code>_function_source(fn) -&gt; string</code> — Where a Lua function was defined, as <span class="title-ref">source:line</span>; internal, for <span class="title-ref">hook_list</span>, since scripts get no <span class="title-ref">debug</span> library.</p>
-<h2 id="module_readiness">_module_readiness</h2>
-<p><code>_module_readiness(name) -&gt; {status, timeout_ms?, message?}</code> — Internal readiness poll for remuda exec.</p>
-<h2 id="pending_create">_pending_create</h2>
-<p><code>_pending_create(timeout?) -&gt; id, handle</code> — Create a private pending reply handle.</p>
-<h2 id="pending_events">_pending_events</h2>
-<p><code>_pending_events() -&gt; {{id, reason?}...}</code> — Drain pending completion and cancellation notifications.</p>
-<h2 id="process_drain">_process_drain</h2>
-<p><code>_process_drain(id) -&gt; nil</code> — Deliver buffered process output as emit events; internal, an Image job only.</p>
-<h2 id="process_killpg">_process_killpg</h2>
-<p><code>_process_killpg(id) -&gt; nil</code> — Reap a process's whole process group (Linux only); internal, called by the daemon's own clean-shutdown sweep, not meant for scripts.</p>
-<h2 id="process_run">_process_run</h2>
-<p><code>_process_run(argv, stdin?, timeout) -&gt; result</code> — Run an argv process synchronously with a bounded timeout and captured output; internal, called by <span class="title-ref">remuda.process.run</span>.</p>
-<h2 id="process_spawn">_process_spawn</h2>
-<p><code>_process_spawn(argv, on_line?, on_exit?) -&gt; id</code> — Spawn a plain-pipe child process; internal, wrapped by <span class="title-ref">remuda.process</span>.</p>
-<h2 id="refresh_sessions_buffer">_refresh_sessions_buffer</h2>
-<p><code>_refresh_sessions_buffer(width, selected) -&gt; nil</code> — Rebuild the <em>sessions</em> buffer's content.</p>
-<h2 id="registry">_registry</h2>
-<p><code>table</code> — The word registry itself: name, about and signature for every bound word.</p>
-<h2 id="registry_dump">_registry_dump</h2>
-<p><code>_registry_dump(format?) -&gt; string</code> — Render the live word registry as documentation.</p>
-<h2 id="run_due_schedules">_run_due_schedules</h2>
-<p><code>_run_due_schedules(now) -&gt; nil</code> — Fire every schedule whose interval has elapsed. Called once per native tick.</p>
-<h2 id="schedule_fire_counts">_schedule_fire_counts</h2>
-<p><code>table</code> — Internal named-schedule fire counts. Read via <span class="title-ref">schedule_fires()</span>.</p>
-<h2 id="sync_window_shown">_sync_window_shown</h2>
-<p><code>_sync_window_shown(name, selection_changed) -&gt; string</code> — Reconcile the current window with the session Rust wants to auto-follow.</p>
 <h2 id="advice_list">advice_list</h2>
 <p><code>advice_list(path?) -&gt; {{path, id, how, depth, owner}...}</code> — Copies of the advice on one path or all, outermost first.</p>
 <h2 id="advice_member">advice_member</h2>
@@ -75,7 +35,7 @@
 <p><code>emit_until_failure(event, ...) -&gt; boolean</code> — Fire an event until a hook returns false (a veto). An erroring hook is no answer, never a veto.</p>
 <h2 id="emit_until_success">emit_until_success</h2>
 <p><code>emit_until_success(event, ...) -&gt; value?</code> — Fire an event until a hook returns non-nil, and return that value. An erroring hook is no answer.</p>
-<h2 id="event_counts-1">event_counts</h2>
+<h2 id="event_counts">event_counts</h2>
 <p><code>event_counts() -&gt; {[event]=n}</code> — How many times each event has been emitted.</p>
 <h2 id="exec">exec</h2>
 <p><code>exec(name) -&gt; nil</code> — Run an installed mod's entry source, by name, in this same image.</p>
@@ -152,7 +112,7 @@
 <h2 id="send">send</h2>
 <p><code>send(name, text) -&gt; nil</code> — Deliver a line of text to a session, with Enter appended.</p>
 <h2 id="session">session</h2>
-<p><code>session(name) -&gt; handle; table {list, new, close, attach}</code> — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close and attach.</p>
+<p><code>session(name) -&gt; handle; table {list, new, close, attach, resize}</code> — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach and resize.</p>
 <h2 id="session.attach">session.attach</h2>
 <p><code>session.attach(name) -&gt; nil</code> — Enter raw mode on a session.</p>
 <h2 id="session.close">session.close</h2>
@@ -161,6 +121,8 @@
 <p><code>session.list() -&gt; {session...}</code> — List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.</p>
 <h2 id="session.new">session.new</h2>
 <p><code>session.new(name?, argv?, cwd?, env?) -&gt; string</code> — Start a session, defaulting the command to the user's shell.</p>
+<h2 id="session.resize">session.resize</h2>
+<p><code>session.resize(name, cols, rows) -&gt; true | nil, err</code> — Resize a session's terminal (cols 20..1000, rows 24..500).</p>
 <h2 id="sleep">sleep</h2>
 <p><code>sleep(seconds) -&gt; nil</code> — Block the calling image for a number of seconds.</p>
 <h2 id="tool">tool</h2>

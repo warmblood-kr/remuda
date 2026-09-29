@@ -91,6 +91,7 @@ fn main() -> ExitCode {
         ["stop", rest @ ..] => stop(server, &path, rest),
 
         ["ls"] => with_existing_daemon(server, &path, list_sessions),
+        ["resize", rest @ ..] => resize_command(server, &path, rest),
 
         ["run", rest @ ..] => run_session(server, &path, rest),
 
@@ -285,6 +286,7 @@ remuda — terminal orchestration for coding agents
                                  Ctrl-] toggles mouse; wheel scrolls history
                                  --mouse=false disables mouse handling (before or after NAME)
   remuda ls | send NAME TEXT     inspect or message sessions
+  remuda resize NAME COLS ROWS   resize a session (cols 20..1000, rows 24..500)
   remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon (sessions are lost)
 
   remuda mod install OWNER/REPO  install a mod from GitHub
@@ -1820,6 +1822,50 @@ fn list_sessions(path: &Path) -> ExitCode {
     }
 }
 
+fn resize_session(path: &Path, name: &str, cols: &str, rows: &str) -> ExitCode {
+    use remuda_core::Size;
+    let parsed = cols
+        .parse::<u16>()
+        .ok()
+        .zip(rows.parse::<u16>().ok())
+        .filter(|(cols, rows)| {
+            (Size::MIN_RESIZE_COLS..=Size::MAX_RESIZE_COLS).contains(cols)
+                && (Size::MIN_ROWS..=Size::MAX_RESIZE_ROWS).contains(rows)
+        });
+    let Some((cols, rows)) = parsed else {
+        eprintln!(
+            "resize dimensions must be integers: cols {}..{}, rows {}..{}",
+            Size::MIN_RESIZE_COLS,
+            Size::MAX_RESIZE_COLS,
+            Size::MIN_ROWS,
+            Size::MAX_RESIZE_ROWS
+        );
+        return ExitCode::from(2);
+    };
+    let size = if cols < Size::MIN_COLS {
+        Size::for_pane(cols, rows)
+    } else {
+        Size::new(cols, rows)
+    };
+    let request = Request::Resize {
+        name: name.to_string(),
+        size,
+    };
+    match remuda_native::client::request(path, &request) {
+        Ok(Response::Ok) => ExitCode::SUCCESS,
+        Ok(Response::Error(error)) => fail(error),
+        other => fail(format!("resize failed: {}", describe(other))),
+    }
+}
+
+fn resize_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let [name, cols, rows] = args else {
+        eprintln!("usage: remuda resize NAME COLS ROWS (cols 20..1000, rows 24..500)");
+        return ExitCode::from(2);
+    };
+    with_existing_daemon(server, path, |path| resize_session(path, name, cols, rows))
+}
+
 /// Evaluate one chunk in the daemon's image and print what it came to. Nothing
 /// is printed when it returned nothing, so `-e "x = 1"` is silent.
 fn eval_once(path: &Path, code: &str) -> ExitCode {
@@ -2475,6 +2521,10 @@ fn simple_request(path: &Path, request: Request) -> ExitCode {
 fn describe(response: std::io::Result<Response>) -> String {
     match response {
         Ok(Response::Error(reason)) => reason,
+        Ok(Response::Busy) => "session input is busy".into(),
+        Ok(Response::WriteTimeout) => {
+            "session PTY write timed out; delivery may be partial or late".into()
+        }
         Ok(other) => format!("unexpected response: {other:?}"),
         Err(e) => e.to_string(),
     }
@@ -2515,6 +2565,15 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_timeout_has_a_user_facing_diagnostic() {
+        assert_eq!(
+            describe(Ok(Response::WriteTimeout)),
+            "session PTY write timed out; delivery may be partial or late"
+        );
+        assert_eq!(describe(Ok(Response::Busy)), "session input is busy");
+    }
 
     #[test]
     fn a_failed_daemon_start_includes_its_stderr() {
