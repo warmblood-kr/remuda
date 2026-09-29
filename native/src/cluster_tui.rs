@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 pub mod close_request;
 const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 const REMOTE_PASTE_FAILURE_NOTICE: &str =
-    "remote paste stopped after a failed chunk; remaining paste chunks dropped";
+    "remote input stopped after a failed chunk; remaining lines dropped";
+const REMOTE_PARTIAL_INPUT_NOTICE: &str = "partial input may remain on this remote target";
 pub mod composer;
 pub mod confirm;
 pub mod ended;
@@ -1090,6 +1091,10 @@ impl ClusterUi {
         now: Duration,
         remote_input: Option<&dyn RemoteInputTransport>,
     ) {
+        let warn_partial = self
+            .input_queue
+            .sending_batch()
+            .is_some_and(|batch| self.input_sender.take_partial_input_warning(&batch));
         let remote_node = self
             .input_queue
             .sending_batch()
@@ -1114,6 +1119,9 @@ impl ClusterUi {
                 })
         };
         self.handle_send_event(event, now);
+        if warn_partial {
+            self.notice = Some((REMOTE_PARTIAL_INPUT_NOTICE.into(), now));
+        }
     }
 
     fn handle_send_event(&mut self, event: Option<QueueEvent>, now: Duration) {
@@ -1122,6 +1130,9 @@ impl ClusterUi {
                 self.clear_sending_notice();
             }
             Some(QueueEvent::PasteAborted { .. }) => {
+                self.notice = Some((REMOTE_PASTE_FAILURE_NOTICE.into(), now));
+            }
+            Some(QueueEvent::RemoteTargetFailed { .. }) => {
                 self.notice = Some((REMOTE_PASTE_FAILURE_NOTICE.into(), now));
             }
             Some(QueueEvent::Dropped { reason, .. }) | Some(QueueEvent::Failed { reason, .. }) => {
@@ -2066,6 +2077,88 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_remote_target_warns_on_its_next_send_once() {
+        let clock = ManualClock::new();
+        let limit = crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES;
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        let mut other = snapshot.nodes[0].clone();
+        other.registry_key = "fp-tablet".into();
+        other.name = "tablet".into();
+        other.sessions[0].instance_id = "tablet-instance".into();
+        snapshot.nodes.push(other);
+
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        ui.enter_selected(clock.now());
+        ui.enqueue_remote_draft(vec![b'x'; limit + 1], clock.now());
+        ui.start_pending(clock.now());
+        let transport = FakeRemoteInput::new(Response::Uncertain);
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let failure_notice = ui.notice.as_ref().map(|(notice, _)| notice.as_str());
+        assert!(failure_notice.is_some());
+        assert_eq!(
+            ui.render(100, 24, "", &clock)
+                .matches(failure_notice.unwrap())
+                .count(),
+            1
+        );
+
+        ui.select_target(Some("fp-tablet/build")).unwrap();
+        ui.enter_selected(clock.now());
+        ui.enqueue_remote_draft(b"tablet line\r".to_vec(), clock.now());
+        *transport.response.lock().unwrap() = Some(Response::Ack { duplicate: false });
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        assert!(!ui
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("partial input may remain")));
+
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        ui.enter_selected(clock.now());
+        ui.enqueue_remote_draft(b"next line\r".to_vec(), clock.now());
+        *transport.response.lock().unwrap() = Some(Response::Ack { duplicate: false });
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        assert!(ui
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("partial input may remain")));
+
+        ui.enqueue_remote_draft(b"after warning\r".to_vec(), clock.now());
+        *transport.response.lock().unwrap() = Some(Response::Ack { duplicate: false });
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        assert!(!ui
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.contains("partial input may remain")));
+    }
+
+    #[test]
     fn empty_attention_filter_has_clear_message_and_badges_remain_visible() {
         let clock = ManualClock::new();
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
@@ -2547,11 +2640,11 @@ mod tests {
             );
         }
         let notice = ui.notice.as_ref().map(|(notice, _)| notice.as_str());
-        assert!(notice.is_some_and(|notice| notice.contains("remaining paste chunks")));
+        assert!(notice.is_some_and(|notice| notice.contains("remaining lines dropped")));
         let frame = ui.render(100, 24, "", &clock);
         assert_eq!(frame.matches(notice.unwrap()).count(), 1);
         let requests = transport.requests.lock().unwrap();
-        assert!(requests.iter().any(|(node, request)| {
+        assert!(!requests.iter().any(|(node, request)| {
             node == "fp-laptop"
                 && matches!(request, Request::Input { bytes, .. } if bytes == b"later\r")
         }));
