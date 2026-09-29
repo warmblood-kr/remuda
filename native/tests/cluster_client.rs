@@ -310,6 +310,17 @@ fn short_client() -> ClusterClient {
     )
 }
 
+fn response_test_client() -> ClusterClient {
+    ClusterClient::with_timeouts(
+        std::sync::Arc::new(ManualWallClock::new(1_800_000_000)),
+        ClientTimeouts {
+            connect: Duration::from_secs(2),
+            read: Duration::from_secs(5),
+            total: Duration::from_secs(5),
+        },
+    )
+}
+
 #[test]
 fn client_obeys_total_timeout() {
     let (address, responder, task) = test_server(Vec::new(), Duration::from_millis(400));
@@ -340,7 +351,7 @@ fn client_rejects_plaintext_200_as_crypto() {
     let initiator = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
         .generate_keypair()
         .unwrap();
-    let result = short_client().request(
+    let result = response_test_client().request(
         address,
         &responder.public,
         &initiator.private,
@@ -356,7 +367,7 @@ fn client_rejects_a_tampered_noise_message_two() {
     let initiator = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
         .generate_keypair()
         .unwrap();
-    let result = short_client().request(
+    let result = response_test_client().request(
         address,
         &responder.public,
         &initiator.private,
@@ -464,7 +475,7 @@ fn client_rejects_oversized_response() {
     let initiator = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
         .generate_keypair()
         .unwrap();
-    let result = short_client().request(
+    let result = response_test_client().request(
         address,
         &responder.public,
         &initiator.private,
@@ -486,7 +497,7 @@ fn client_rejects_a_real_oversized_response_body_before_reading_it() {
     let initiator = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
         .generate_keypair()
         .unwrap();
-    let result = short_client().request(
+    let result = response_test_client().request(
         address,
         &responder.public,
         &initiator.private,
