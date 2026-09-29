@@ -1117,20 +1117,17 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
     let runtime = scratch_dir("input-recovery");
     let path = daemon::socket_path_in(&runtime, "s");
     let _daemon = Daemon::spawn(&runtime);
-    let recovered_marker = runtime.join("recovered");
+    let drained_marker = runtime.join("drained");
     let progress_marker = runtime.join("progress");
     let ready_marker = runtime.join("ready");
     let reader_marker = runtime.join("start-reading");
-    let script = "stty raw -echo; while [ ! -e \"$READY_MARKER\" ]; do sleep 0.02; done; printf READY; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; perl -e 'my $total = 0; my $progress = 0; my $tail = \"\"; while (read(STDIN, my $b, 4096)) { $total += length($b); if (!$progress && $total >= 131072) { open(my $p, \">\", $ENV{PROGRESS_PATH}) or die; print $p $total; close($p); $progress = 1; }; $tail .= $b; if (index($tail, \"RECOVERED-END\") >= 0) { open(my $r, \">\", $ENV{RECOVERED_PATH}) or die; print $r \"done\"; close($r); last; }; $tail = substr($tail, -64) if length($tail) > 128; }'";
+    let script = "stty raw -echo; while [ ! -e \"$READY_MARKER\" ]; do sleep 0.02; done; printf READY; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; perl -e 'my $total = 0; my $progress = 0; my $drained = 0; my $tail = \"\"; while (read(STDIN, my $b, 4096)) { $total += length($b); if (!$progress && $total >= 131072) { open(my $p, \">\", $ENV{PROGRESS_PATH}) or die; print $p $total; close($p); $progress = 1; }; $tail .= $b; if (!$drained && index($tail, \"DRAINED-BARRIER\") >= 0) { open(my $d, \">\", $ENV{DRAINED_PATH}) or die; print $d \"done\"; close($d); $drained = 1; }; $tail = substr($tail, -64) if length($tail) > 128; }'";
     let env = std::collections::HashMap::from([
         (
             "PROGRESS_PATH".into(),
             progress_marker.display().to_string(),
         ),
-        (
-            "RECOVERED_PATH".into(),
-            recovered_marker.display().to_string(),
-        ),
+        ("DRAINED_PATH".into(), drained_marker.display().to_string()),
         ("READY_MARKER".into(), ready_marker.display().to_string()),
         ("READER_MARKER".into(), reader_marker.display().to_string()),
     ]);
@@ -1205,20 +1202,26 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let recovered = b"RECOVERED-END";
-        let recovered_deadline = Instant::now() + Duration::from_secs(20);
+        let barrier = b"DRAINED-BARRIER";
+        let barrier_deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            if recovered_marker.exists() {
+            if drained_marker.exists() {
                 break;
             }
             assert!(
-                Instant::now() < recovered_deadline,
-                "input queue did not recover after child reads resumed"
+                Instant::now() < barrier_deadline,
+                "attach did not forward the ordered drain barrier after the input stall"
             );
-            held.write_raw(recovered)
-                .expect("send post-stall recovery marker");
+            held.write_raw(barrier).expect("send ordered drain barrier");
             std::thread::sleep(Duration::from_millis(100));
         }
+        assert!(
+            drained_marker.exists(),
+            "child acknowledged queue drain barrier"
+        );
+
+        // The child acknowledged this ordered marker, which follows the
+        // flood in the PTY stream. Reaching it proves the input queue resumed.
     });
     let _ = held.write_raw(&[client::DETACH]);
     wait_for_cli_exit(&viewer, "target");

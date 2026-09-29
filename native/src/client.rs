@@ -29,9 +29,11 @@ fn attach_input_stall_threshold() -> Duration {
 }
 
 struct AttachInputStatus {
-    last_progress: Instant,
+    last_progress: Duration,
     dropping: bool,
     permanent_failure: bool,
+    delivered_bytes: u64,
+    drop_started_after: u64,
 }
 
 struct AttachInputQueue {
@@ -42,6 +44,7 @@ struct AttachInputQueue {
     drop_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     capacity: usize,
     stall_after: Duration,
+    now: std::sync::Arc<dyn Fn() -> Duration + Send + Sync>,
 }
 
 #[derive(Clone)]
@@ -50,7 +53,7 @@ struct AttachInputWriter {
     dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     drop_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    capacity: usize,
+    now: std::sync::Arc<dyn Fn() -> Duration + Send + Sync>,
 }
 
 enum AttachInputAttempt {
@@ -68,21 +71,38 @@ impl AttachInputQueue {
         capacity: usize,
         stall_after: Duration,
     ) -> (Self, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let started = Instant::now();
+        Self::with_clock(
+            capacity,
+            stall_after,
+            std::sync::Arc::new(move || started.elapsed()),
+        )
+    }
+
+    fn with_clock(
+        capacity: usize,
+        stall_after: Duration,
+        now: std::sync::Arc<dyn Fn() -> Duration + Send + Sync>,
+    ) -> (Self, std::sync::mpsc::Receiver<Vec<u8>>) {
         assert!(capacity > 0, "attach input queue capacity must be nonzero");
         let (sender, receiver) = std::sync::mpsc::channel();
+        let now_at_start = now();
         (
             Self {
                 sender,
                 status: std::sync::Arc::new(std::sync::Mutex::new(AttachInputStatus {
-                    last_progress: Instant::now(),
+                    last_progress: now_at_start,
                     dropping: false,
                     permanent_failure: false,
+                    delivered_bytes: 0,
+                    drop_started_after: 0,
                 })),
                 dropped: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 queued_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 drop_notice_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 capacity,
                 stall_after,
+                now,
             },
             receiver,
         )
@@ -92,8 +112,7 @@ impl AttachInputQueue {
         let len = bytes.len();
         let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
         if status.dropping {
-            let used = self.queued_bytes.load(std::sync::atomic::Ordering::SeqCst);
-            if !status.permanent_failure && used < self.capacity {
+            if !status.permanent_failure && status.delivered_bytes > status.drop_started_after {
                 status.dropping = false;
             } else {
                 self.dropped
@@ -106,10 +125,8 @@ impl AttachInputQueue {
         let mut used = self.queued_bytes.load(std::sync::atomic::Ordering::SeqCst);
         loop {
             let Some(next) = used.checked_add(len).filter(|next| *next <= self.capacity) else {
-                if status.last_progress.elapsed() >= self.stall_after {
-                    status.dropping = true;
-                    self.drop_notice_pending
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                if (self.now)().saturating_sub(status.last_progress) >= self.stall_after {
+                    self.mark_dropping(&mut status);
                     self.dropped
                         .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
                     return AttachInputAttempt::Dropped;
@@ -132,11 +149,7 @@ impl AttachInputQueue {
                 let len = error.0.len();
                 self.queued_bytes
                     .fetch_sub(len, std::sync::atomic::Ordering::SeqCst);
-                if !status.dropping {
-                    self.drop_notice_pending
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
-                status.dropping = true;
+                self.mark_dropping(&mut status);
                 status.permanent_failure = true;
                 self.dropped
                     .fetch_add(len, std::sync::atomic::Ordering::SeqCst);
@@ -151,7 +164,16 @@ impl AttachInputQueue {
             dropped: std::sync::Arc::clone(&self.dropped),
             queued_bytes: std::sync::Arc::clone(&self.queued_bytes),
             drop_notice_pending: std::sync::Arc::clone(&self.drop_notice_pending),
-            capacity: self.capacity,
+            now: std::sync::Arc::clone(&self.now),
+        }
+    }
+
+    fn mark_dropping(&self, status: &mut AttachInputStatus) {
+        if !status.dropping {
+            status.dropping = true;
+            status.drop_started_after = status.delivered_bytes;
+            self.drop_notice_pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -176,51 +198,60 @@ impl AttachInputQueue {
 
     fn stop_after_drop(&self, bytes: usize) {
         let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
-        status.dropping = true;
+        self.mark_dropping(&mut status);
         self.dropped
             .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
     }
 
-    fn enqueue(&self, bytes: &[u8], close_paste_on_drop: bool) {
+    fn enqueue(&self, bytes: &[u8], paste_open_before_chunk: bool, starts_paste: bool) -> bool {
+        let mut paste_open_delivered = paste_open_before_chunk && !starts_paste;
         let chunk_size = ATTACH_INPUT_CHUNK_BYTES.min(self.capacity);
         let mut chunks = bytes.chunks(chunk_size).peekable();
+        let mut first_chunk = true;
         while let Some(chunk) = chunks.next() {
             let mut pending = chunk.to_vec();
             loop {
                 match self.attempt(pending) {
-                    AttachInputAttempt::Queued => break,
+                    AttachInputAttempt::Queued => {
+                        if first_chunk && starts_paste {
+                            paste_open_delivered = true;
+                        }
+                        first_chunk = false;
+                        break;
+                    }
                     AttachInputAttempt::Full(bytes) => {
                         pending = bytes;
                         std::thread::sleep(Duration::from_millis(5));
                     }
                     AttachInputAttempt::Dropped => {
-                        if close_paste_on_drop {
+                        if paste_open_delivered {
                             self.force_paste_close();
                         }
                         let remaining = chunks.map(<[u8]>::len).sum();
                         self.stop_after_drop(remaining);
-                        return;
+                        return true;
                     }
                 }
             }
         }
+        false
     }
 }
 
 impl AttachInputWriter {
     fn progress(&self, count: usize) {
         if count > 0 {
-            let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
-            status.last_progress = Instant::now();
-            if !status.permanent_failure {
-                status.dropping = false;
-            }
+            self.status
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .last_progress = (self.now)();
         }
     }
 
     fn failed(&self, bytes: usize) {
         let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
         if !status.dropping {
+            status.drop_started_after = status.delivered_bytes;
             self.drop_notice_pending
                 .store(true, std::sync::atomic::Ordering::SeqCst);
         }
@@ -236,9 +267,12 @@ impl AttachInputWriter {
     fn delivered(&self, bytes: usize) {
         self.queued_bytes
             .fetch_sub(bytes, std::sync::atomic::Ordering::SeqCst);
-        let used = self.queued_bytes.load(std::sync::atomic::Ordering::SeqCst);
         let mut status = self.status.lock().unwrap_or_else(|p| p.into_inner());
-        if status.dropping && !status.permanent_failure && used < self.capacity {
+        status.delivered_bytes = status.delivered_bytes.saturating_add(bytes as u64);
+        if status.dropping
+            && !status.permanent_failure
+            && status.delivered_bytes > status.drop_started_after
+        {
             status.dropping = false;
         }
     }
@@ -829,6 +863,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                 mouse_on: &mut mouse_on,
                 scrollback: &scrollback,
                 output_lock: &output_lock,
+                discarding_paste: false,
             };
             let mut logged_pending_read = false;
             loop {
@@ -1120,6 +1155,7 @@ struct AttachRoute<'a> {
     mouse_on: &'a mut bool,
     scrollback: &'a std::sync::atomic::AtomicUsize,
     output_lock: &'a std::sync::Mutex<()>,
+    discarding_paste: bool,
 }
 
 fn route_tokens(route: &mut AttachRoute<'_>, tokens: Vec<crate::mouse::InputToken>) {
@@ -1150,7 +1186,7 @@ fn route_tokens(route: &mut AttachRoute<'_>, tokens: Vec<crate::mouse::InputToke
                     route.scrollback.load(Ordering::SeqCst),
                 ) {
                     MouseAction::Forward(bytes) => {
-                        route.input.enqueue(&bytes, false);
+                        let _ = route.input.enqueue(&bytes, false, false);
                     }
                     MouseAction::Scroll(next) => {
                         let _guard = route.output_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1199,7 +1235,16 @@ fn route_tokens(route: &mut AttachRoute<'_>, tokens: Vec<crate::mouse::InputToke
                 }
             }
             InputToken::Paste(bytes) => {
-                route.input.enqueue(&bytes, true);
+                if route.discarding_paste {
+                    if bytes.ends {
+                        route.discarding_paste = false;
+                    }
+                    continue;
+                }
+                let dropped = route
+                    .input
+                    .enqueue(&bytes.bytes, !bytes.starts, bytes.starts);
+                route.discarding_paste = dropped && !bytes.ends;
             }
         }
     }
@@ -1218,7 +1263,7 @@ fn exit_history_if_needed(route: &mut AttachRoute<'_>, bytes: &[u8]) {
         route.scrollback.store(0, Ordering::SeqCst);
         paint_history(route.path, route.name, 0);
     }
-    route.input.enqueue(bytes, false);
+    let _ = route.input.enqueue(bytes, false, false);
 }
 
 fn detach_offset(parser: &crate::mouse::SgrParser, bytes: &[u8]) -> Option<usize> {
@@ -1440,7 +1485,10 @@ mod tests {
     use super::request_with_timeout;
     #[cfg(unix)]
     use super::trace_input_read;
-    use super::{detach_offset, report_attach_input_dropped, AttachInputQueue, DETACH};
+    use super::{
+        detach_offset, report_attach_input_dropped, route_tokens, AttachInputQueue, AttachRoute,
+        ATTACH_INPUT_STALL, DETACH,
+    };
     use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
     #[cfg(unix)]
     use crate::ipc;
@@ -1449,6 +1497,7 @@ mod tests {
     #[cfg(unix)]
     use remuda_core::protocol::Request;
     use remuda_core::protocol::Response;
+    use std::path::Path;
     #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(unix)]
@@ -1460,13 +1509,13 @@ mod tests {
     #[test]
     fn attach_input_drop_recovers_after_writer_progress() {
         let (queue, rx) = AttachInputQueue::with_capacity(6, Duration::ZERO);
-        queue.enqueue(b"queued", false);
-        queue.enqueue(b"dropped", false);
+        queue.enqueue(b"queued", false, false);
+        queue.enqueue(b"dropped", false, false);
         assert!(queue.take_drop_notice());
         assert!(!queue.take_drop_notice());
         assert_eq!(queue.dropped.load(std::sync::atomic::Ordering::SeqCst), 7);
         queue.writer().delivered(6);
-        queue.enqueue(b"fresh!", false);
+        queue.enqueue(b"fresh!", false, false);
         assert_eq!(rx.try_recv().unwrap(), b"queued");
         assert_eq!(rx.try_recv().unwrap(), b"fresh!");
         assert!(rx.try_recv().is_err());
@@ -1478,12 +1527,104 @@ mod tests {
     }
 
     #[test]
+    fn one_notice_per_drop_until_a_chunk_is_delivered() {
+        let (queue, rx) = AttachInputQueue::with_capacity(6, Duration::ZERO);
+        queue.enqueue(b"abcd", false, false);
+        queue.enqueue(b"xyz", false, false);
+        assert!(queue.take_drop_notice());
+        queue.enqueue(b"xyz", false, false);
+        assert!(!queue.take_drop_notice());
+
+        queue.writer().delivered(4);
+        queue.enqueue(b"123456", false, false);
+        queue.enqueue(b"q", false, false);
+        assert!(queue.take_drop_notice());
+        assert!(!queue.take_drop_notice());
+        assert_eq!(rx.try_recv().unwrap(), b"abcd");
+        assert_eq!(rx.try_recv().unwrap(), b"123456");
+    }
+
+    #[test]
+    fn default_stall_threshold_uses_the_injected_clock() {
+        let millis = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let clock_millis = std::sync::Arc::clone(&millis);
+        let now: std::sync::Arc<dyn Fn() -> Duration + Send + Sync> =
+            std::sync::Arc::new(move || {
+                Duration::from_millis(clock_millis.load(std::sync::atomic::Ordering::SeqCst))
+            });
+        let (queue, _rx) = AttachInputQueue::with_clock(6, ATTACH_INPUT_STALL, now);
+        assert!(matches!(
+            queue.attempt(b"queued".to_vec()),
+            super::AttachInputAttempt::Queued
+        ));
+        assert!(matches!(
+            queue.attempt(b"x".to_vec()),
+            super::AttachInputAttempt::Full(_)
+        ));
+        millis.store(2_999, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            queue.attempt(b"x".to_vec()),
+            super::AttachInputAttempt::Full(_)
+        ));
+        millis.store(3_000, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            queue.attempt(b"x".to_vec()),
+            super::AttachInputAttempt::Dropped
+        ));
+        assert!(queue.take_drop_notice());
+    }
+
+    #[test]
     fn dropping_during_bracketed_paste_forwards_the_closing_marker() {
         let (queue, rx) = AttachInputQueue::with_capacity(6, Duration::ZERO);
-        queue.enqueue(b"\x1b[200~", true);
-        queue.enqueue(b"paste body", true);
+        queue.enqueue(b"\x1b[200~", false, true);
+        queue.enqueue(b"paste body", true, false);
         assert_eq!(rx.try_recv().unwrap(), b"\x1b[200~");
         assert_eq!(rx.try_recv().unwrap(), b"\x1b[201~");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn dropped_paste_opener_discards_through_the_real_end_marker() {
+        let (queue, rx) = AttachInputQueue::with_capacity(16, Duration::ZERO);
+        queue.enqueue(b"0123456789", false, false);
+        let mut mouse_on = false;
+        let scrollback = std::sync::atomic::AtomicUsize::new(0);
+        let output_lock = std::sync::Mutex::new(());
+        let mut route = AttachRoute {
+            path: Path::new("unused"),
+            name: "unused",
+            input: &queue,
+            mouse_on: &mut mouse_on,
+            scrollback: &scrollback,
+            output_lock: &output_lock,
+            discarding_paste: false,
+        };
+        route_tokens(
+            &mut route,
+            vec![crate::mouse::InputToken::Paste(crate::mouse::PasteChunk {
+                bytes: b"\x1b[200~ab".to_vec(),
+                starts: true,
+                ends: false,
+            })],
+        );
+        assert!(route.discarding_paste);
+        route_tokens(
+            &mut route,
+            vec![crate::mouse::InputToken::Paste(crate::mouse::PasteChunk {
+                bytes: b"cd\n\x1b[201~".to_vec(),
+                starts: false,
+                ends: true,
+            })],
+        );
+        assert!(!route.discarding_paste);
+        queue.writer().delivered(10);
+        route_tokens(
+            &mut route,
+            vec![crate::mouse::InputToken::Bytes(b"typed\n".to_vec())],
+        );
+        assert_eq!(rx.try_recv().unwrap(), b"0123456789");
+        assert_eq!(rx.try_recv().unwrap(), b"typed\n");
         assert!(rx.try_recv().is_err());
     }
 
@@ -1496,7 +1637,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1010));
         assert_eq!(detach_offset(&parser, &[DETACH]), Some(0));
         assert!(
-            matches!(parser.finish().last(), Some(crate::mouse::InputToken::Paste(bytes)) if bytes.ends_with(b"\x1b[201~"))
+            matches!(parser.finish().last(), Some(crate::mouse::InputToken::Paste(chunk)) if chunk.ends && chunk.bytes.ends_with(crate::mouse::PASTE_END))
         );
     }
 
@@ -1534,7 +1675,7 @@ mod tests {
         let tokens = parser.finish();
         assert!(matches!(
             tokens.last(),
-            Some(crate::mouse::InputToken::Paste(bytes)) if bytes.ends_with(b"\x1b[201~")
+            Some(crate::mouse::InputToken::Paste(chunk)) if chunk.ends && chunk.bytes.ends_with(crate::mouse::PASTE_END)
         ));
     }
 
