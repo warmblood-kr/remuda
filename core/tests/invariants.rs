@@ -622,6 +622,37 @@ fn close_is_refused_while_attached_and_the_session_survives() {
     );
 }
 
+#[test]
+fn confirmed_close_clears_its_closing_marker_when_attachment_refuses_it() {
+    let registry = Registry::new();
+    let alive = Arc::new(AtomicBool::new(true));
+    registry
+        .register(named(
+            "worker",
+            Box::new(FlagAgent {
+                alive: alive.clone(),
+            }),
+        ))
+        .expect("registration");
+    let session = registry.get("worker").expect("handle");
+    let instance_id = session.instance_id().to_owned();
+    let held = session.attach();
+
+    assert!(matches!(
+        registry.close_instance("worker", &instance_id),
+        Some(Err(AgentError::Attached))
+    ));
+    assert!(!session.is_closing());
+    assert!(alive.load(Ordering::SeqCst));
+    assert!(registry.get("worker").is_some());
+
+    drop(held);
+    assert!(matches!(
+        registry.close_instance("worker", &instance_id),
+        Some(Ok(true))
+    ));
+}
+
 // ---------------------------------------------------------------------------
 // Invariant 3 — raw keystrokes exist only while exactly one human holds it.
 //
