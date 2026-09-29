@@ -185,6 +185,15 @@ pub trait AgentWriter: Send + Sync {
     fn write_to_completion(&self, bytes: &[u8]) -> Result<()> {
         self.write_bounded(bytes)
     }
+    /// As `write_to_completion`, but stop waiting if the caller is no longer
+    /// allowed to deliver this input. Backends with blocking completion paths
+    /// should poll `cancelled` while waiting.
+    fn write_to_completion_while(&self, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
+        if cancelled() {
+            return Err(AgentError::Attached);
+        }
+        self.write_to_completion(bytes)
+    }
     fn is_busy(&self) -> bool;
 }
 
