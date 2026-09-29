@@ -598,6 +598,58 @@ fn shift_wheel_is_forwarded_to_the_child_tui() {
 }
 
 #[test]
+fn any_session_key_returns_scrollback_to_live_follow() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    assert_eq!(ui.on_key(press(KeyCode::Enter)), Action::Focus("a".into()));
+    ui.scrollback.insert(
+        "a".into(),
+        ScrollState {
+            offset: 7,
+            history_rows: 20,
+            ..ScrollState::default()
+        },
+    );
+
+    assert_eq!(ui.on_key(press(KeyCode::Null)), Action::Nothing);
+    assert_eq!(ui.scrollback["a"].offset, 0);
+}
+
+#[test]
+fn scrolled_preview_shows_indicator_in_plain_and_styled_frames_until_live() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    ui.scrollback.insert(
+        "a".into(),
+        ScrollState {
+            offset: 3,
+            history_rows: 20,
+            ..ScrollState::default()
+        },
+    );
+    let indicator = "[scrollback: 3 rows — any key returns]";
+    let plain = render(&ui, "older content", "test", 80, 24);
+    assert!(plain.contains(indicator), "plain frame: {plain:?}");
+
+    let cells = vec![vec![remuda_core::agent::StyledCell::default(); 80]; 24];
+    let styled = render_styled(
+        &ui,
+        &cells,
+        Cursor {
+            row: 0,
+            col: 0,
+            visible: false,
+        },
+        "test",
+        80,
+        24,
+    );
+    assert!(styled.contains(indicator), "styled frame: {styled:?}");
+
+    scroll_selected(&mut ui, -3);
+    let live = render(&ui, "current content", "test", 80, 24);
+    assert!(!live.contains("[scrollback:"), "live frame: {live:?}");
+}
+
+#[test]
 fn paging_moves_by_one_preview_page_and_end_returns_to_follow() {
     let mut ui = make_ui(vec![row("a", true, false)]);
     ui.scrollback.insert(
