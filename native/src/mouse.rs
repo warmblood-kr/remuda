@@ -172,6 +172,10 @@ impl SgrParser {
         !self.pending.is_empty()
     }
 
+    pub fn paste_open(&self) -> bool {
+        self.in_paste
+    }
+
     pub fn timeout_remaining(&self) -> Option<std::time::Duration> {
         let timeout = if self.in_paste {
             PASTE_IDLE_TIMEOUT

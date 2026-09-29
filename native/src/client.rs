@@ -572,15 +572,24 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                 let n = match read {
                     Ok(Some(n)) => n,
                     Ok(None) => {
-                        route_tokens(
-                            &path,
-                            &name,
-                            &mut stream,
-                            parser.flush_expired(),
-                            &mut mouse_on,
-                            &scrollback,
-                            &output_lock,
-                        );
+                        if mouse {
+                            route_tokens(
+                                &path,
+                                &name,
+                                &mut stream,
+                                parser.flush_expired(),
+                                &mut mouse_on,
+                                &scrollback,
+                                &output_lock,
+                            );
+                        } else {
+                            let paste_was_open = parser.paste_open();
+                            let _ = parser.flush_expired();
+                            if paste_was_open && !parser.paste_open() {
+                                let _ = stream.write_all(b"\x1b[201~");
+                                let _ = stream.flush();
+                            }
+                        }
                         continue;
                     }
                     Err(_) => break,
@@ -608,18 +617,28 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                                 &output_lock,
                             );
                         } else if at > 0 {
+                            let _ = parser.feed(&buf[..at]);
                             let _ = stream.write_all(&buf[..at]);
                             let _ = stream.flush();
                         }
-                        route_tokens(
-                            &path,
-                            &name,
-                            &mut stream,
-                            parser.finish(),
-                            &mut mouse_on,
-                            &scrollback,
-                            &output_lock,
-                        );
+                        if mouse {
+                            route_tokens(
+                                &path,
+                                &name,
+                                &mut stream,
+                                parser.finish(),
+                                &mut mouse_on,
+                                &scrollback,
+                                &output_lock,
+                            );
+                        } else {
+                            let paste_was_open = parser.paste_open();
+                            let _ = parser.finish();
+                            if paste_was_open {
+                                let _ = stream.write_all(b"\x1b[201~");
+                                let _ = stream.flush();
+                            }
+                        }
                         detached.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
@@ -635,6 +654,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                                 &output_lock,
                             );
                         } else {
+                            let _ = parser.feed(&buf[..n]);
                             let _ = stream.write_all(&buf[..n]);
                             let _ = stream.flush();
                         }
