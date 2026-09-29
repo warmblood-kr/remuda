@@ -183,6 +183,25 @@ The tree may offer an attention-only filter (`!`) in addition to `/` name search
 
 Sync returns the selected session’s latest snapshot plus an output version; a reconnect resumes from the last version. Enter submits `input(session, batch_id, bytes)`, and retries reuse the same ID and bytes. The host deduplicates each viewer’s batch and applies whole batches atomically in arrival order. Local calls reuse the daemon socket; remote calls use Remuda’s authenticated short request/response channel over the VPN, with joined node keys and pinned peers. The channel uses off-the-shelf Noise IK via `snow`; a per-session output event from #190 can later wake sync without changing the TUI.
 
+PTY writes have a two-second caller deadline. A `WriteTimeout` means the bytes
+may have been partially written or may finish later; `Send` and `SendLine` are
+not idempotent, so callers must not blindly replay them. An idempotent `Input`
+retry uses the same client ID and sequence and receives `Uncertain` after a
+timed-out attempt, even if its worker finishes later. A `Busy` response means
+the session already has one in-flight write and did not queue this request;
+it does not consume the input rate budget. Attached human input waits for the
+same writer to finish before forwarding the next bytes, preserving the input
+buffer without replaying a possibly partial write.
+
+On Unix and Windows/ConPTY, the PTY write runs on one background worker per
+session. The caller deadline and `WriteTimeout` response are the same on both
+platforms; after timeout, that worker retains the PTY until the underlying
+write completes or fails. A child that never reads can therefore keep that
+session's input busy while captures and listings continue. `Busy` and
+`WriteTimeout` are additive response variants: clients built against the older
+wire enum may reject them as unknown variants and should upgrade before using
+the bounded input path.
+
 ### Security and implementation constraints
 
 - The allowlisted request front comes first, initially on a local socket. It exposes only the operations required by this UX; never forward the general daemon protocol or arbitrary Lua remotely. The network listener is a later layer over that restricted front.

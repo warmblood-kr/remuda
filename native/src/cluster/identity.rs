@@ -11,7 +11,6 @@ use std::io;
 use std::io::Read;
 #[cfg(not(windows))]
 use std::path::Path;
-#[cfg(not(windows))]
 use zeroize::Zeroizing;
 
 #[cfg(not(windows))]
@@ -140,6 +139,25 @@ pub(super) fn init_identity_locked(dir: &Path) -> io::Result<(NodeIdentity, bool
 
 #[cfg(not(windows))]
 pub(super) fn load_identity_at(dir: &Path) -> io::Result<NodeIdentity> {
+    let bytes = read_identity_material_at(dir)?;
+    identity_from_parts(&bytes[..])
+}
+
+/// Load the node's Noise static private key from the private cluster store.
+/// The returned key is zeroized when dropped and must never be logged.
+pub fn load_static_private_key() -> io::Result<Zeroizing<Vec<u8>>> {
+    #[cfg(windows)]
+    return Err(windows_storage_error());
+    #[cfg(not(windows))]
+    {
+        let dir = storage::cluster_state_dir()?.join("cluster");
+        let bytes = read_identity_material_at(&dir)?;
+        Ok(Zeroizing::new(bytes[..32].to_vec()))
+    }
+}
+
+#[cfg(not(windows))]
+fn read_identity_material_at(dir: &Path) -> io::Result<Zeroizing<[u8; 64]>> {
     let path = dir.join(IDENTITY_FILE);
     let mut options = OpenOptions::new();
     options.read(true);
@@ -171,7 +189,8 @@ pub(super) fn load_identity_at(dir: &Path) -> io::Result<NodeIdentity> {
             "cluster identity key must be exactly 64 bytes",
         ));
     }
-    identity_from_parts(&bytes[..])
+    identity_from_parts(&bytes[..])?;
+    Ok(bytes)
 }
 
 #[cfg(not(windows))]
