@@ -364,12 +364,16 @@ impl Ui {
         let first = first.saturating_add_signed(delta).min(max_first);
         self.list_first_visible = Some(first);
 
+        let before = self.selected;
         if self.selected < first {
             self.selected = first;
         } else if self.selected >= first.saturating_add(visible) {
             self.selected = first
                 .saturating_add(visible - 1)
                 .min(self.sessions.len().saturating_sub(1));
+        }
+        if self.selected != before {
+            self.pan = 0;
         }
     }
 
