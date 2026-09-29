@@ -37,6 +37,9 @@ pub struct RemoteSessionSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteNodeSnapshot {
+    /// Exact registry fingerprint used for routing and selection identity.
+    pub registry_key: String,
+    /// Short label retained for display and explicit user target lookup.
     pub name: String,
     pub state: RemoteState,
     pub last_sync_age: Option<Duration>,
@@ -125,23 +128,23 @@ pub struct RemoteTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SelectedSession {
-    node: String,
+    registry_key: String,
     session: String,
 }
 
-/// Mutable selection signal kept separate from the read-only snapshot source.
+/// Mutable selection signal keyed by exact registry fingerprint.
 #[derive(Clone, Default)]
 pub struct RemoteSelection {
     selected: Arc<Mutex<Option<SelectedSession>>>,
 }
 
 impl RemoteSelection {
-    pub fn select(&self, node: impl Into<String>, session: impl Into<String>) {
+    pub fn select(&self, registry_key: impl Into<String>, session: impl Into<String>) {
         *self
             .selected
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(SelectedSession {
-            node: node.into(),
+            registry_key: registry_key.into(),
             session: session.into(),
         });
     }
@@ -153,12 +156,12 @@ impl RemoteSelection {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
-    fn selected_session(&self, node: &str) -> Option<String> {
+    fn selected_session(&self, registry_key: &str) -> Option<String> {
         self.selected
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .as_ref()
-            .filter(|selected| selected.node == node)
+            .filter(|selected| selected.registry_key == registry_key)
             .map(|selected| selected.session.clone())
     }
 }
@@ -277,6 +280,7 @@ impl RemoteNode {
 
     fn snapshot_at(&self, now: Instant) -> RemoteNodeSnapshot {
         RemoteNodeSnapshot {
+            registry_key: self.key.clone(),
             name: self.name.clone(),
             state: self.state,
             last_sync_age: self
@@ -724,7 +728,7 @@ impl RemotePoller {
                                 break;
                             }
                             let target = targets[(start + offset) % len].clone();
-                            let selected = selection.selected_session(&target.name);
+                            let selected = selection.selected_session(&target.registry_key);
                             let _ = schedule_remote_poll(
                                 &state, &transport, &workers, target, selected,
                             );
@@ -901,6 +905,8 @@ impl Drop for RemoteWorkerPermit {
 mod tests {
     use super::*;
     use remuda_core::agent::{Color, Cursor, StyledCell};
+    use std::collections::HashMap;
+    use std::sync::Condvar;
 
     fn screen(text: &str) -> ScreenSnapshot {
         ScreenSnapshot {
@@ -1064,6 +1070,64 @@ mod tests {
         let targets = registry_targets(&registry, "local");
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].registry_key, "admitted-fingerprint");
+    }
+
+    #[test]
+    fn polling_selection_is_scoped_by_fingerprint_when_labels_collide() {
+        struct RecordingTransport {
+            selected: Mutex<HashMap<String, Option<String>>>,
+            changed: Condvar,
+        }
+
+        impl RemoteTransport for RecordingTransport {
+            fn poll_node(
+                &self,
+                target: &RemoteTarget,
+                selected_session: Option<&str>,
+                _previous: &[RemoteSessionSnapshot],
+            ) -> io::Result<Vec<RemoteSessionSnapshot>> {
+                self.selected.lock().unwrap().insert(
+                    target.registry_key.clone(),
+                    selected_session.map(str::to_owned),
+                );
+                self.changed.notify_all();
+                Ok(Vec::new())
+            }
+        }
+
+        let transport = Arc::new(RecordingTransport {
+            selected: Mutex::new(HashMap::new()),
+            changed: Condvar::new(),
+        });
+        let targets = ["fp-a", "fp-b"]
+            .into_iter()
+            .map(|registry_key| RemoteTarget {
+                name: "laptop".into(),
+                registry_key: registry_key.into(),
+                addr_override: None,
+            })
+            .collect();
+        let poller = RemotePoller::new(targets, transport.clone());
+        let selection = poller.selection();
+        selection.select("fp-a", "build");
+        poller.start().unwrap();
+
+        let selected = transport.selected.lock().unwrap();
+        let (selected, timeout) = transport
+            .changed
+            .wait_timeout_while(selected, Duration::from_secs(2), |selected| {
+                selected.len() < 2
+            })
+            .unwrap();
+        assert!(
+            !timeout.timed_out(),
+            "poll workers did not visit both nodes"
+        );
+        assert_eq!(
+            selected.get("fp-a").and_then(Option::as_deref),
+            Some("build")
+        );
+        assert_eq!(selected.get("fp-b"), Some(&None));
     }
 
     #[test]

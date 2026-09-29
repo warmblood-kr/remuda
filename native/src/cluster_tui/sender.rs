@@ -62,7 +62,11 @@ impl InputSender {
                 "input must contain at least one byte",
             ));
         }
-        let mut seqs = Vec::with_capacity(bytes.len().div_ceil(max_batch_bytes));
+        let chunk_count = bytes.len().div_ceil(max_batch_bytes);
+        if !queue.can_enqueue(chunk_count) {
+            return Err(queue_full_error());
+        }
+        let mut seqs = Vec::with_capacity(chunk_count);
         for chunk in bytes.chunks(max_batch_bytes) {
             seqs.push(self.enqueue_one(
                 queue,
@@ -97,6 +101,9 @@ impl InputSender {
                 "input must contain at least one byte",
             ));
         }
+        if !queue.can_enqueue(1) {
+            return Err(queue_full_error());
+        }
         let target = (
             remote_node.map(str::to_owned),
             name.to_owned(),
@@ -111,7 +118,7 @@ impl InputSender {
         *next_seq = seq
             .checked_add(1)
             .ok_or_else(|| io::Error::other("input sequence exhausted"))?;
-        queue.enqueue_target(
+        if !queue.enqueue_target(
             InputTarget {
                 remote_node: remote_node.map(str::to_owned),
                 name: name.into(),
@@ -121,7 +128,9 @@ impl InputSender {
             seq,
             bytes,
             now,
-        );
+        ) {
+            return Err(queue_full_error());
+        }
         Ok(seq)
     }
 
@@ -278,6 +287,16 @@ fn remote_oversize_error() -> String {
     format!("remote Input batch exceeds {MAX_REMOTE_INPUT_BATCH_BYTES} bytes")
 }
 
+fn queue_full_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        format!(
+            "input queue is full (max {} batches)",
+            super::queue::MAX_QUEUED_BATCHES
+        ),
+    )
+}
+
 /// Uncertain is bounded by 8s: four 1s attempts plus retry and UI-loop overhead.
 pub const INPUT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
@@ -313,7 +332,7 @@ fn increment_client_id(mut client_id: [u8; 16]) -> [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::InputSender;
-    use crate::cluster_tui::queue::{InputQueue, QueueEvent, QueueState};
+    use crate::cluster_tui::queue::{InputQueue, QueueEvent, QueueState, MAX_QUEUED_BATCHES};
     use remuda_core::input::MAX_INPUT_BYTES;
     use remuda_core::protocol::{Request, Response};
     use std::collections::HashSet;
@@ -626,6 +645,35 @@ mod tests {
         assert!(batches
             .iter()
             .all(|batch| batch.remote_node.as_deref() == Some("laptop")));
+    }
+
+    #[test]
+    fn remote_line_is_rejected_atomically_when_its_chunks_exceed_queue_capacity() {
+        let now = Instant::now();
+        let mut sender = InputSender::with_client_id([7; 16]);
+        let mut queue = InputQueue::default();
+        for seq in 1..MAX_QUEUED_BATCHES {
+            assert!(queue.enqueue(
+                format!("session-{seq}"),
+                "instance".into(),
+                "client".into(),
+                seq as u64,
+                vec![b'x'],
+                now,
+            ));
+        }
+
+        let result = sender.enqueue_remote(
+            &mut queue,
+            "fp-laptop",
+            "build",
+            "remote-instance",
+            vec![b'x'; MAX_INPUT_BYTES],
+            now,
+        );
+
+        assert!(result.is_err());
+        assert_eq!(queue.items().count(), MAX_QUEUED_BATCHES - 1);
     }
 
     #[test]

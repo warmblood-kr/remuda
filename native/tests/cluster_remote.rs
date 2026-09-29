@@ -566,7 +566,7 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
         registry_key: server_node.fingerprint(),
         addr_override: Some(address),
     };
-    let poller = RemotePoller::new(vec![target], transport);
+    let poller = RemotePoller::new(vec![target.clone()], transport);
     let source = poller.source();
     let selection = poller.selection();
     poller.start().unwrap();
@@ -576,7 +576,7 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
         Duration::from_secs(10),
         || proof_session(source.as_ref()).is_some_and(|session| session.screen.is_none()),
     );
-    selection.select(label, "proof");
+    selection.select(target.registry_key.clone(), "proof");
     wait_for("selected session screen", Duration::from_secs(10), || {
         proof_session(source.as_ref())
             .is_some_and(|session| session_text(&session).contains("REMOTE_START"))
