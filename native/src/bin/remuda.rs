@@ -567,6 +567,7 @@ fn cluster_call(
             return ExitCode::from(code);
         }
     };
+    let response = sanitize_peer_response(response);
     if let Response::Error(message) = &response {
         eprintln!("cluster call: {message}");
         return ExitCode::from(4);
@@ -609,6 +610,49 @@ fn cluster_call(
             ExitCode::from(5)
         }
     }
+}
+
+fn sanitize_peer_response(
+    mut response: remuda_core::protocol::Response,
+) -> remuda_core::protocol::Response {
+    use remuda_core::protocol::Response;
+
+    fn strip(text: &mut String) {
+        *text = remuda_native::text::strip_terminal_controls(text).into_owned();
+    }
+
+    match &mut response {
+        Response::Sessions(sessions) => {
+            for session in sessions {
+                strip(&mut session.id);
+                strip(&mut session.name);
+                if let Some(instance_id) = &mut session.instance_id {
+                    strip(instance_id);
+                }
+            }
+        }
+        Response::Screen(text) | Response::Value(text) | Response::Error(text) => strip(text),
+        Response::StyledScreen { rows, .. } => {
+            for run in rows.iter_mut().flatten() {
+                strip(&mut run.text);
+            }
+        }
+        Response::CommandResult {
+            stdout_base64,
+            stderr_base64,
+            ..
+        } => {
+            strip(stdout_base64);
+            strip(stderr_base64);
+        }
+        Response::Entries(entries) => {
+            for entry in entries {
+                strip(entry);
+            }
+        }
+        _ => {}
+    }
+    response
 }
 
 fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
@@ -1932,7 +1976,11 @@ mod mod_update_tests {
 
 #[cfg(test)]
 mod cluster_call_tests {
-    use super::{parse_cluster_command, CallAction, ClusterCommand};
+    use super::{parse_cluster_command, sanitize_peer_response, CallAction, ClusterCommand};
+    use remuda_core::agent::{Color, Cursor, Size};
+    use remuda_core::protocol::{Response, StyledRun};
+    use remuda_core::registry::SessionSummary;
+    use std::time::Duration;
 
     #[test]
     fn cluster_call_accepts_only_list_and_capture_with_required_address() {
@@ -1989,6 +2037,59 @@ mod cluster_call_tests {
                 "{args:?}"
             );
         }
+    }
+
+    #[test]
+    fn cluster_call_strips_osc52_and_osc0_from_peer_text() {
+        let sessions = sanitize_peer_response(Response::Sessions(vec![SessionSummary {
+            id: "id\u{1b}]52;c;clipboard\u{7}".into(),
+            name: "name\u{1b}]0;peer title\u{7}".into(),
+            instance_id: None,
+            output_version: None,
+            alive: true,
+            idle: Duration::ZERO,
+            output_idle: None,
+            size: Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+        }]));
+        let Response::Sessions(sessions) = sessions else {
+            panic!("expected sanitized sessions");
+        };
+        assert_eq!(sessions[0].id, "id]52;c;clipboard");
+        assert_eq!(sessions[0].name, "name]0;peer title");
+
+        let error = sanitize_peer_response(Response::Error("bad\u{1b}]52;c;clipboard\u{7}".into()));
+        assert_eq!(error, Response::Error("bad]52;c;clipboard".into()));
+
+        let capture = sanitize_peer_response(Response::StyledScreen {
+            rows: vec![vec![StyledRun {
+                text: "screen\u{1b}]0;peer title\u{7}".into(),
+                fg: Color::default(),
+                bg: Color::default(),
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                inverse: false,
+                wide: false,
+            }]],
+            instance_id: None,
+            output_version: None,
+            wrapped: vec![],
+            scrollback_len: 0,
+            scrollback_total: 0,
+            cursor: Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+        });
+        let Response::StyledScreen { rows, .. } = capture else {
+            panic!("expected sanitized capture");
+        };
+        assert_eq!(rows[0][0].text, "screen]0;peer title");
     }
 }
 
