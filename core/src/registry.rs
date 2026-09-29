@@ -312,11 +312,17 @@ impl Registry {
             session.mark_closing();
             session
         };
-        if let Err(error) = session.terminate() {
-            session.clear_closing();
-            return Some(Err(error));
-        }
-        Some(Ok(self.remove(name).is_some()))
+        Some(match session.terminate_for_close() {
+            Ok(()) => {
+                let removed = self.remove(name).is_some();
+                session.wake_sync_waiters();
+                Ok(removed)
+            }
+            Err(error) => {
+                session.clear_closing();
+                Err(error)
+            }
+        })
     }
 
     /// Close only the session start named by `instance_id`. The registry lock

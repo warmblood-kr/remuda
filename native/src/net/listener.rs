@@ -1250,6 +1250,85 @@ mod tests {
         Duration::from_secs(1)
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ninth_concurrent_remote_sync_is_refused_by_listener_dispatch() {
+        use interprocess::local_socket::traits::ListenerExt as _;
+
+        let _capacity_lock = crate::remote_front::SYNC_CAPACITY_TEST_LOCK.lock().unwrap();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            PathBuf::from("/tmp").join(format!("rsync-capacity-{}-{stamp}", std::process::id()));
+        let daemon_path = crate::daemon::socket_path_in(&base, "fake");
+        let daemon_listener = crate::ipc::listen(&daemon_path).unwrap();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let fake_daemon = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for _ in 0..crate::remote_front::MAX_REMOTE_SYNCS {
+                let stream = daemon_listener.incoming().next().unwrap().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut request = Vec::new();
+                reader.read_until(b'\n', &mut request).unwrap();
+                let decoded: Request = serde_json::from_slice(&request).unwrap();
+                assert!(matches!(decoded, Request::Sync { .. }));
+                held.push(reader);
+            }
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            let mut response = serde_json::to_vec(&Response::Ok).unwrap();
+            response.push(b'\n');
+            for mut reader in held {
+                reader.get_mut().write_all(&response).unwrap();
+            }
+        });
+
+        let request = Request::Sync {
+            name: "dev".into(),
+            instance_id: None,
+            since: 0,
+            timeout_ms: 20_000,
+        };
+        let payload = serde_json::to_vec(&request).unwrap();
+        let mut workers = Vec::new();
+        for _ in 0..crate::remote_front::MAX_REMOTE_SYNCS {
+            let daemon_path = daemon_path.clone();
+            let payload = payload.clone();
+            workers.push(std::thread::spawn(move || {
+                dispatch_payload_with_control_source(
+                    &payload,
+                    &daemon_path,
+                    &ControlSource::DefaultStateDir,
+                )
+            }));
+        }
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let ninth = dispatch_payload_with_control_source(
+            &payload,
+            &daemon_path,
+            &ControlSource::DefaultStateDir,
+        )
+        .unwrap();
+        let response: Response = serde_json::from_slice(&ninth).unwrap();
+        assert_eq!(response, Response::SyncAtCapacity);
+
+        release_tx.send(()).unwrap();
+        for worker in workers {
+            let response = worker.join().unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Response>(&response).unwrap(),
+                Response::Ok
+            );
+        }
+        fake_daemon.join().unwrap();
+        drop(daemon_path);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn unspecified_bind_requires_explicit_public_opt_in() {
         assert!(validate_bind_address("127.0.0.1:0".parse().unwrap(), false).is_ok());
