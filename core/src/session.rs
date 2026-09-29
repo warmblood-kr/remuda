@@ -13,7 +13,7 @@ use crate::protocol::Step;
 use core::time::Duration;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Condvar, Mutex};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -46,7 +46,8 @@ pub struct Session {
     /// Held for the whole of one input act — every `Burst` **and** every
     /// `Pause` between them — so a second sender cannot land a write during a
     /// pause, when the `agent` lock is briefly free. See [`Self::feed`].
-    input_lock: Mutex<()>,
+    input_lock: Mutex<bool>,
+    input_ready: Condvar,
     /// Bounded retry history for remote byte batches, kept per session.
     input_dedup: Mutex<InputDeduplicator>,
     /// Per-session byte budget, checked before taking `input_lock`.
@@ -126,7 +127,8 @@ impl Session {
             closing: AtomicBool::new(false),
             attach_slot: Mutex::new(None),
             next_attach_generation: AtomicU64::new(1),
-            input_lock: Mutex::new(()),
+            input_lock: Mutex::new(false),
+            input_ready: Condvar::new(),
             input_dedup: Mutex::new(InputDeduplicator::new()),
             input_rate: Mutex::new(InputRateLimiter::default()),
         }
@@ -368,14 +370,23 @@ impl Session {
     /// The one place that touches the backend. PTY handles wait without the
     /// process mutex; callers hold `input_lock` except an attachment writer.
     fn write_one_burst(&self, bytes: &[u8]) -> Result<()> {
-        self.write_one_burst_with(bytes, false)
+        self.write_one_burst_with(bytes, false, &|| false)
     }
 
-    fn write_one_burst_to_completion(&self, bytes: &[u8]) -> Result<()> {
-        self.write_one_burst_with(bytes, true)
+    fn write_one_burst_to_completion_while(
+        &self,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.write_one_burst_with(bytes, true, cancelled)
     }
 
-    fn write_one_burst_with(&self, bytes: &[u8], wait_to_completion: bool) -> Result<()> {
+    fn write_one_burst_with(
+        &self,
+        bytes: &[u8],
+        wait_to_completion: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
         let writer = {
             let mut agent = self
                 .agent
@@ -388,7 +399,7 @@ impl Session {
         };
         let result = if let Some(writer) = writer {
             if wait_to_completion {
-                writer.write_to_completion(bytes)
+                writer.write_to_completion_while(bytes, cancelled)
             } else {
                 writer.write_bounded(bytes)
             }
@@ -415,23 +426,24 @@ impl Session {
         Ok(())
     }
 
-    fn acquire_input_lock(&self) -> Result<MutexGuard<'_, ()>> {
+    fn acquire_input_lock(&self) -> Result<InputActGuard<'_>> {
+        let mut locked = self
+            .input_lock
+            .lock()
+            .map_err(|_| AgentError::Io("session input lock poisoned".into()))?;
         loop {
-            match self.input_lock.try_lock() {
-                Ok(guard) => return Ok(guard),
-                Err(TryLockError::Poisoned(_)) => {
-                    return Err(AgentError::Io("session input lock poisoned".into()));
-                }
-                Err(TryLockError::WouldBlock) if self.input_writer_busy()? => {
-                    return Err(AgentError::Busy);
-                }
-                Err(TryLockError::WouldBlock) => {
-                    // Feed pauses intentionally keep other input atomic, but
-                    // poll so a later burst that stalls the PTY can refuse the
-                    // waiting act instead of leaving it queued indefinitely.
-                    std::thread::yield_now();
-                }
+            if !*locked {
+                *locked = true;
+                return Ok(InputActGuard { session: self });
             }
+            if self.input_writer_busy()? {
+                return Err(AgentError::Busy);
+            }
+            locked = self
+                .input_ready
+                .wait_timeout(locked, Duration::from_millis(10))
+                .map_err(|_| AgentError::Io("session input lock poisoned".into()))?
+                .0;
         }
     }
 
@@ -626,6 +638,22 @@ impl Session {
     }
 }
 
+struct InputActGuard<'a> {
+    session: &'a Session,
+}
+
+impl Drop for InputActGuard<'_> {
+    fn drop(&mut self) {
+        let mut locked = self
+            .session
+            .input_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *locked = false;
+        self.session.input_ready.notify_all();
+    }
+}
+
 /// Current viewer's hold: the only guard that can write raw bytes. A displaced
 /// guard cannot write or release its successor.
 pub struct Attached<'a> {
@@ -648,19 +676,29 @@ impl Attached<'_> {
     /// Type exactly these bytes. No Enter is appended: the human sends their
     /// own, and inventing one here would submit a half-typed line.
     pub fn write_raw(&self, bytes: &[u8]) -> Result<()> {
-        let slot = self
-            .session
-            .attach_slot
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if self.is_displaced()
-            || !slot
-                .as_ref()
-                .is_some_and(|(generation, _)| *generation == self.generation)
+        self.write_raw_while(bytes, &|| false)
+    }
+
+    /// Type bytes unless displaced or cancelled; the slot is released while waiting.
+    /// A takeover may still let one pending buffer land after `attach()` returns.
+    /// Single-flight writes do not interleave, and the buffer is never replayed.
+    pub fn write_raw_while(&self, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
         {
-            return Err(AgentError::Attached);
+            let slot = self
+                .session
+                .attach_slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if self.is_displaced()
+                || !slot
+                    .as_ref()
+                    .is_some_and(|(generation, _)| *generation == self.generation)
+            {
+                return Err(AgentError::Attached);
+            }
         }
-        self.session.write_one_burst_to_completion(bytes)?;
+        self.session
+            .write_one_burst_to_completion_while(bytes, &|| self.is_displaced() || cancelled())?;
         // Only after the write lands, as `last_input_at` is.
         if let Ok(mut at) = self.session.last_human_input_at.lock() {
             *at = Some(self.session.clock.now());
