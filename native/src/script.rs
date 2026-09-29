@@ -472,10 +472,11 @@ pub fn bindings(
                 .map_err(|error| mlua::Error::runtime(error.to_string()))
         })?,
     )?;
+    let submit_registry = input_registry.clone();
     table.set(
         "_input_submit",
         lua.create_function(move |_, (name, expect): (String, String)| {
-            let session = input_registry
+            let session = submit_registry
                 .get(&name)
                 .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
             session
