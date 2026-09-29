@@ -249,7 +249,7 @@ pub(crate) fn create_or_open_lock(path: &Path) -> io::Result<File> {
     let user = UserSid::current()?;
     let security = user.security()?;
     let path = wide(path);
-    loop {
+    for _ in 0..5 {
         let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
@@ -295,6 +295,10 @@ pub(crate) fn create_or_open_lock(path: &Path) -> io::Result<File> {
         }
         return Err(error);
     }
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        "cluster lock kept disappearing while opening",
+    ))
 }
 
 fn file_from_handle(handle: HANDLE) -> io::Result<File> {
@@ -604,6 +608,52 @@ mod tests {
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn enable_restore_privilege() -> io::Result<Handle> {
+        use windows_sys::Win32::Foundation::{SetLastError, ERROR_NOT_ALL_ASSIGNED};
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
+            SE_PRIVILEGE_ENABLED, SE_RESTORE_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+        };
+
+        let mut token = ptr::null_mut();
+        if unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES,
+                &mut token,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        let token = Handle(token);
+        let mut luid = windows_sys::Win32::Foundation::LUID::default();
+        if unsafe { LookupPrivilegeValueW(ptr::null(), SE_RESTORE_NAME, &mut luid) } == 0 {
+            return Err(last_error());
+        }
+        let privileges = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+        unsafe { SetLastError(0) };
+        if unsafe {
+            AdjustTokenPrivileges(token.0, 0, &privileges, 0, ptr::null_mut(), ptr::null_mut())
+        } == 0
+        {
+            return Err(last_error());
+        }
+        if unsafe { GetLastError() } == ERROR_NOT_ALL_ASSIGNED {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "SeRestorePrivilege is not present in the process token",
+            ));
+        }
+        Ok(token)
+    }
+
     static NEXT: AtomicUsize = AtomicUsize::new(0);
 
     fn owner_sid_from_sddl(sddl: &str) -> io::Result<(*mut c_void, LocalMemory)> {
@@ -622,11 +672,12 @@ mod tests {
         }
         let descriptor = LocalMemory(descriptor.cast());
         let mut owner = ptr::null_mut();
+        let mut defaulted = 0;
         if unsafe {
             windows_sys::Win32::Security::GetSecurityDescriptorOwner(
                 descriptor.0.cast(),
                 &mut owner,
-                ptr::null_mut(),
+                &mut defaulted,
             )
         } == 0
         {
@@ -709,7 +760,7 @@ mod tests {
         let expected = b"legacy state";
         std::fs::write(&path, expected).unwrap();
 
-        let file = open_for_check(&path, false, true).unwrap();
+        let file = open_for_read(&path).unwrap();
         assert!(secure_or_upgrade(&file, &path, false).unwrap());
         // Windows temp directories inherit permissive ACLs, so migration must have happened.
         assert!(dacl_conforms(file.as_raw_handle(), UserSid::current().unwrap().sid).unwrap());
@@ -752,6 +803,20 @@ mod tests {
         drop(file);
         let file = open_for_owner_update(&path, false).unwrap();
         let user = UserSid::current().unwrap();
+        let _restore_privilege = match enable_restore_privilege() {
+            Ok(token) => token,
+            Err(error) if std::env::var_os("CI").is_some() => {
+                panic!("CI runner must enable SeRestorePrivilege for owner test: {error}");
+            }
+            Err(error) => {
+                eprintln!(
+                    "skipping unrelated-owner ACL test: cannot enable SeRestorePrivilege: {error}"
+                );
+                drop(file);
+                std::fs::remove_file(path).unwrap();
+                return;
+            }
+        };
         let mut assigned = false;
         let mut last_error = None;
         for candidate in ["O:SY", "O:BG", "O:BA"] {
@@ -768,9 +833,18 @@ mod tests {
             }
         }
         if !assigned {
-            eprintln!("skipping unrelated-owner ACL test: runner cannot assign a non-token owner (likely lacks SeRestorePrivilege): {}", last_error.map_or_else(|| "all candidate SIDs are token owners".to_owned(), |error| error.to_string()));
+            let reason = last_error.map_or_else(
+                || "all candidate SIDs are token owners".to_owned(),
+                |error| error.to_string(),
+            );
             drop(file);
             std::fs::remove_file(path).unwrap();
+            if std::env::var_os("CI").is_some() {
+                panic!("CI runner could not assign a non-token owner despite SeRestorePrivilege: {reason}");
+            }
+            eprintln!(
+                "skipping unrelated-owner ACL test: cannot assign a non-token owner: {reason}"
+            );
             return;
         }
         let error = secure_or_upgrade(&file, &path, false).unwrap_err();
