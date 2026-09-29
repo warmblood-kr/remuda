@@ -1,20 +1,23 @@
 //! Per-node authorized membership entries, persistence, and merge semantics.
 
 use super::encoding;
-#[cfg(not(windows))]
 use super::storage;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fs;
 #[cfg(not(windows))]
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io;
-#[cfg(not(windows))]
 use std::path::Path;
 
-#[cfg(not(windows))]
 const REGISTRY_FILE: &str = "authorized_nodes.json";
+pub const MAX_UPDATE_BYTES: usize = 1024 * 1024;
+pub const MAX_UPDATE_ENTRIES: usize = 1024;
+pub const MAX_REGISTRY_BYTES: usize = 1024 * 1024;
+pub const MAX_REGISTRY_ENTRIES: usize = 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AuthorizedNode {
     pub node_fp: String,
     pub static_pubkey: String,
@@ -33,6 +36,43 @@ pub enum NodeState {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Registry {
     pub authorized_nodes: Vec<AuthorizedNode>,
+}
+
+/// One authenticated member's bounded membership update.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryUpdate {
+    pub sender_fp: String,
+    pub entries: Vec<AuthorizedNode>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UpdateOutcome {
+    pub applied: Vec<AuthorizedNode>,
+    pub alerts: Vec<String>,
+}
+
+impl RegistryUpdate {
+    /// Encode a validated update as bounded strict JSON.
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        validate_update(self)?;
+        let encoded = serde_json::to_vec(self).map_err(io::Error::other)?;
+        if encoded.len() > MAX_UPDATE_BYTES {
+            return Err(invalid_update("registry update exceeds byte cap"));
+        }
+        Ok(encoded)
+    }
+
+    /// Decode bounded strict JSON and validate all registry fingerprints.
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() > MAX_UPDATE_BYTES {
+            return Err(invalid_update("registry update exceeds byte cap"));
+        }
+        let update: Self = serde_json::from_slice(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        validate_update(&update)?;
+        Ok(update)
+    }
 }
 
 impl Registry {
@@ -55,9 +95,43 @@ impl Registry {
                 }
             }
         }
+        if merged.len() > MAX_REGISTRY_ENTRIES {
+            return Err(invalid_update("registry exceeds total entry cap"));
+        }
         self.authorized_nodes = merged.into_values().collect();
         Ok(())
     }
+
+    /// Return a canonical SHA-256 digest independent of entry order.
+    pub fn digest(&self) -> io::Result<String> {
+        let mut canonical = Registry::default();
+        canonical.merge(self)?;
+        for entry in &mut canonical.authorized_nodes {
+            let public_key = encoding::decode_base64(&entry.static_pubkey)?;
+            entry.static_pubkey = encoding::encode_base64(&public_key);
+        }
+        let encoded = serde_json::to_vec(&canonical.authorized_nodes).map_err(io::Error::other)?;
+        Ok(encoding::fingerprint(&encoded))
+    }
+}
+
+fn validate_update(update: &RegistryUpdate) -> io::Result<()> {
+    if !valid_fingerprint(&update.sender_fp) {
+        return Err(invalid_update(
+            "registry update sender is not a SHA256 fingerprint",
+        ));
+    }
+    if update.entries.len() > MAX_UPDATE_ENTRIES {
+        return Err(invalid_update("registry update exceeds entry cap"));
+    }
+    for entry in &update.entries {
+        validate_entry(entry)?;
+    }
+    Ok(())
+}
+
+fn invalid_update(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 fn validate_entry(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
@@ -68,8 +142,17 @@ fn validate_entry(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
             "registry fingerprint does not match public key",
         ));
     }
-    let valid_by = entry
-        .by
+    if !valid_fingerprint(&entry.by) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "registry by is not a valid SHA256 fingerprint",
+        ));
+    }
+    Ok(public_key)
+}
+
+fn valid_fingerprint(value: &str) -> bool {
+    value
         .strip_prefix("SHA256:")
         .and_then(|encoded| {
             encoding::decode_base64(encoded)
@@ -79,14 +162,142 @@ fn validate_entry(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
         .is_some_and(|(encoded, decoded)| {
             decoded.len() == 32
                 && encoding::encode_base64(&decoded).trim_end_matches('=') == encoded
-        });
-    if !valid_by {
+        })
+}
+
+/// Validate and merge one authenticated member's update into the local view.
+#[cfg_attr(windows, allow(dead_code))]
+pub(super) fn apply_update(
+    registry: &mut Registry,
+    update: &RegistryUpdate,
+    authenticated_sender_pubkey: &[u8],
+    receiver_fp: &str,
+) -> io::Result<UpdateOutcome> {
+    validate_update(update)?;
+    if authenticated_sender_pubkey.len() != 32
+        || encoding::fingerprint(authenticated_sender_pubkey) != update.sender_fp
+    {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "registry by is not a valid SHA256 fingerprint",
+            io::ErrorKind::PermissionDenied,
+            "authenticated sender key does not match update sender fingerprint",
         ));
     }
-    Ok(public_key)
+
+    let mut current = Registry::default();
+    current.merge(registry)?;
+    let sender = current
+        .authorized_nodes
+        .iter()
+        .find(|entry| entry.node_fp == update.sender_fp)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "registry update sender is not a current member",
+            )
+        })?;
+    if sender.state != NodeState::Admitted {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "registry update sender is revoked",
+        ));
+    }
+    if validate_entry(sender)? != authenticated_sender_pubkey {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "authenticated sender key does not match current registry member",
+        ));
+    }
+
+    let previous = current.clone();
+    let mut outcome = UpdateOutcome::default();
+    let mut accepted = Vec::with_capacity(update.entries.len());
+    for entry in &update.entries {
+        if entry.node_fp == receiver_fp && entry.state == NodeState::Revoked {
+            outcome.alerts.push(format!(
+                "dropped peer tombstone for receiver own key {}",
+                receiver_fp
+            ));
+            continue;
+        }
+        if current
+            .authorized_nodes
+            .iter()
+            .any(|known| known.node_fp == entry.by && known.state == NodeState::Revoked)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "registry entry is attributed to a revoked member",
+            ));
+        }
+        let exists = current
+            .authorized_nodes
+            .iter()
+            .any(|known| known.node_fp == entry.node_fp);
+        if !exists && entry.state == NodeState::Admitted && entry.by != update.sender_fp {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "new admission must be vouched for by the update sender",
+            ));
+        }
+        accepted.push(entry.clone());
+    }
+    let received = Registry {
+        authorized_nodes: accepted,
+    };
+    current.merge(&received)?;
+    outcome.applied = current
+        .authorized_nodes
+        .iter()
+        .filter(|entry| !previous.authorized_nodes.contains(entry))
+        .cloned()
+        .collect();
+    registry.authorized_nodes = current.authorized_nodes;
+    Ok(outcome)
+}
+
+/// Apply an update to the local persisted registry under one state lock.
+pub fn apply_registry_update(
+    _update: &RegistryUpdate,
+    _authenticated_sender_pubkey: &[u8],
+) -> io::Result<UpdateOutcome> {
+    apply_update_at(
+        &storage::cluster_state_dir()?.join("cluster"),
+        _update,
+        _authenticated_sender_pubkey,
+    )
+}
+
+fn apply_update_at(
+    dir: &Path,
+    update: &RegistryUpdate,
+    authenticated_sender_pubkey: &[u8],
+) -> io::Result<UpdateOutcome> {
+    match fs::symlink_metadata(dir) {
+        Ok(_) => storage::verify_directory(dir)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "cluster is not initialized; run `remuda cluster init`",
+            ))
+        }
+        Err(error) => return Err(error),
+    }
+    let _guard = storage::StateLock::acquire(dir)?;
+    let mut registry = load_registry_at(dir)?;
+    let receiver = super::identity::load_identity_at(dir)?;
+    let outcome = apply_update(
+        &mut registry,
+        update,
+        authenticated_sender_pubkey,
+        &receiver.node_fp,
+    )?;
+    if !outcome.applied.is_empty() {
+        save_registry_at(dir, &registry)?;
+    }
+    for alert in &outcome.alerts {
+        eprintln!("remuda: cluster replication alert: {alert}");
+    }
+    Ok(outcome)
 }
 
 fn prefer(incoming: &AuthorizedNode, current: &AuthorizedNode) -> bool {
@@ -98,22 +309,66 @@ fn prefer(incoming: &AuthorizedNode, current: &AuthorizedNode) -> bool {
 }
 
 pub fn load_registry() -> io::Result<Registry> {
-    #[cfg(windows)]
-    return Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
-    ));
-    #[cfg(not(windows))]
     load_registry_at(&storage::cluster_state_dir()?.join("cluster"))
 }
 
+/// Return a cheap change token for the atomically replaced membership file.
+/// Listener request paths use this to invalidate a cached registry without
+/// taking the cluster state lock for every admitted peer.
+pub fn registry_revision_token() -> io::Result<String> {
+    {
+        #[cfg(not(windows))]
+        use std::os::unix::fs::MetadataExt;
+        use std::time::UNIX_EPOCH;
+        let path = storage::cluster_state_dir()?
+            .join("cluster")
+            .join(REGISTRY_FILE);
+        #[cfg(windows)]
+        let metadata = {
+            let file = match super::windows_security::open_for_read(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok("missing".to_owned());
+                }
+                Err(error) => return Err(error),
+            };
+            storage::check_private_file(&file, "cluster registry", &path)?;
+            file.metadata()?
+        };
+        #[cfg(not(windows))]
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cluster registry is a symlink; refusing",
+                ));
+            }
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok("missing".to_owned());
+            }
+            Err(error) => return Err(error),
+        };
+        let modified = metadata
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        #[cfg(not(windows))]
+        return Ok(format!(
+            "{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            modified,
+            metadata.mode() & 0o777
+        ));
+        #[cfg(windows)]
+        Ok(format!("{}:{}", metadata.len(), modified))
+    }
+}
+
 pub fn save_registry(_registry: &Registry) -> io::Result<()> {
-    #[cfg(windows)]
-    return Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
-    ));
-    #[cfg(not(windows))]
     {
         let dir = storage::cluster_state_dir()?.join("cluster");
         storage::create_private_directory(&dir)?;
@@ -125,35 +380,50 @@ pub fn save_registry(_registry: &Registry) -> io::Result<()> {
     }
 }
 
-#[cfg(not(windows))]
 pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
     if fs::symlink_metadata(dir).is_ok() {
         storage::verify_directory(dir)?;
     }
     let path = dir.join(REGISTRY_FILE);
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut file = match options.open(&path) {
+    #[cfg(not(windows))]
+    let file = {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("{} is a symlink; refusing", path.display()),
+                ))
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    #[cfg(windows)]
+    let file = match super::windows_security::open_for_read(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
-        #[cfg(unix)]
-        Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{} is a symlink; refusing", path.display()),
-            ))
-        }
         Err(error) => return Err(error),
     };
     storage::check_private_file(&file, "cluster registry", &path)?;
     use std::io::Read;
+    if file.metadata()?.len() > MAX_REGISTRY_BYTES as u64 {
+        return Err(invalid_update("cluster registry exceeds byte cap"));
+    }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)?;
+    file.take(MAX_REGISTRY_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_REGISTRY_BYTES {
+        return Err(invalid_update("cluster registry exceeds byte cap"));
+    }
     let registry: Registry = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     let mut folded = Registry::default();
     for entry in registry.authorized_nodes {
@@ -165,7 +435,6 @@ pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
     Ok(folded)
 }
 
-#[cfg(not(windows))]
 pub(super) fn save_registry_at(dir: &Path, registry: &Registry) -> io::Result<()> {
     let mut validated = Registry::default();
     validated.merge(registry)?;
@@ -213,6 +482,431 @@ mod tests {
             "SHA256:{}",
             encoding::encode_base64(&[byte; 32]).trim_end_matches('=')
         )
+    }
+
+    fn admitted_sender() -> AuthorizedNode {
+        entry("replication-sender", NodeState::Admitted, 1, "sender")
+    }
+
+    fn public_key(entry: &AuthorizedNode) -> Vec<u8> {
+        encoding::decode_base64(&entry.static_pubkey).unwrap()
+    }
+
+    fn registry_with_sender(sender: &AuthorizedNode) -> Registry {
+        Registry {
+            authorized_nodes: vec![sender.clone()],
+        }
+    }
+
+    fn apply_as_sender(
+        registry: &mut Registry,
+        update: &RegistryUpdate,
+        authenticated_sender_pubkey: &[u8],
+    ) -> io::Result<UpdateOutcome> {
+        apply_update(
+            registry,
+            update,
+            authenticated_sender_pubkey,
+            &update.sender_fp,
+        )
+    }
+
+    #[test]
+    fn digest_is_independent_of_entry_order() {
+        let first = entry("digest-a", NodeState::Admitted, 1, "a");
+        let second = entry("digest-b", NodeState::Revoked, 4, "b");
+        let left = Registry {
+            authorized_nodes: vec![first.clone(), second.clone()],
+        };
+        let right = Registry {
+            authorized_nodes: vec![second, first],
+        };
+        assert_eq!(left.digest().unwrap(), right.digest().unwrap());
+
+        let mut unpadded = left.authorized_nodes[0].clone();
+        unpadded.static_pubkey = unpadded.static_pubkey.trim_end_matches('=').into();
+        assert_eq!(
+            Registry {
+                authorized_nodes: vec![unpadded],
+            }
+            .digest()
+            .unwrap(),
+            Registry {
+                authorized_nodes: vec![left.authorized_nodes[0].clone()],
+            }
+            .digest()
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn registry_update_round_trips_and_rejects_unknown_fields() {
+        let sender = admitted_sender();
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp,
+            entries: vec![entry(
+                "replication-target",
+                NodeState::Admitted,
+                1,
+                "sender",
+            )],
+        };
+        let encoded = update.encode().unwrap();
+        assert_eq!(RegistryUpdate::decode(&encoded).unwrap(), update);
+        let mut unknown = encoded;
+        unknown.pop();
+        unknown.extend_from_slice(b",\"unknown\":true}");
+        assert_eq!(
+            RegistryUpdate::decode(&unknown).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let encoded = String::from_utf8(update.encode().unwrap()).unwrap();
+        let nested_unknown = encoded.replace(
+            "\"state\":\"admitted\"",
+            "\"state\":\"admitted\",\"extra\":true",
+        );
+        assert_eq!(
+            RegistryUpdate::decode(nested_unknown.as_bytes())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn registry_update_rejects_invalid_entry_attribution() {
+        let sender = admitted_sender();
+        let mut target = entry("invalid-attribution", NodeState::Admitted, 1, "sender");
+        target.by.push('\n');
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp,
+            entries: vec![target],
+        };
+        assert_eq!(
+            update.encode().unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn registry_update_enforces_byte_and_entry_caps() {
+        let sender = admitted_sender();
+        let too_many = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![
+                entry("capped", NodeState::Admitted, 1, "sender");
+                MAX_UPDATE_ENTRIES + 1
+            ],
+        };
+        assert!(too_many.encode().is_err());
+        assert!(RegistryUpdate::decode(&vec![b' '; MAX_UPDATE_BYTES + 1]).is_err());
+        let too_many_json = serde_json::to_vec(&too_many).unwrap();
+        assert!(RegistryUpdate::decode(&too_many_json).is_err());
+    }
+
+    #[test]
+    fn update_refuses_tombstoned_sender_without_changing_registry() {
+        let mut sender = admitted_sender();
+        sender.state = NodeState::Revoked;
+        let mut registry = registry_with_sender(&sender);
+        let before = registry.clone();
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![entry("revoked-push", NodeState::Admitted, 1, "sender")],
+        };
+        assert!(apply_as_sender(&mut registry, &update, &public_key(&sender)).is_err());
+        assert_eq!(registry, before);
+    }
+
+    #[test]
+    fn update_refuses_nonmember_sender() {
+        let sender = admitted_sender();
+        let mut registry = Registry::default();
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![entry("nonmember-push", NodeState::Admitted, 1, "sender")],
+        };
+        assert!(apply_as_sender(&mut registry, &update, &public_key(&sender)).is_err());
+        assert!(registry.authorized_nodes.is_empty());
+    }
+
+    #[test]
+    fn update_refuses_a_different_authenticated_sender_key() {
+        let sender = admitted_sender();
+        let other = entry("other-authenticated-key", NodeState::Admitted, 1, "other");
+        let mut registry = registry_with_sender(&sender);
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![entry("forged-sender", NodeState::Admitted, 1, "sender")],
+        };
+        assert!(apply_as_sender(&mut registry, &update, &public_key(&other)).is_err());
+        assert_eq!(registry, registry_with_sender(&sender));
+    }
+
+    #[test]
+    fn update_rejects_sender_fingerprint_mismatch_alone() {
+        let sender = admitted_sender();
+        let registry = registry_with_sender(&sender);
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![],
+        };
+        let other = entry("other", NodeState::Admitted, 1, "other");
+        assert!(apply_update(
+            &mut registry.clone(),
+            &update,
+            &public_key(&other),
+            &sender.node_fp
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn update_drops_self_tombstone_surfaces_alert_and_applies_other_entries() {
+        let sender = admitted_sender();
+        let receiver = entry("local-receiver", NodeState::Admitted, 1, "sender");
+        let mut registry = registry_with_sender(&sender);
+        registry.authorized_nodes.push(receiver.clone());
+        let mut self_tombstone = receiver.clone();
+        self_tombstone.state = NodeState::Revoked;
+        self_tombstone.version = 2;
+        let mut other = entry("other-valid-member", NodeState::Admitted, 1, "sender");
+        other.by = sender.node_fp.clone();
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![self_tombstone, other.clone()],
+        };
+        let outcome = apply_update(
+            &mut registry,
+            &update,
+            &public_key(&sender),
+            &receiver.node_fp,
+        )
+        .unwrap();
+        assert_eq!(outcome.applied, vec![other]);
+        assert_eq!(outcome.alerts.len(), 1);
+        assert!(outcome.alerts[0].contains("own key"));
+        assert_eq!(
+            registry
+                .authorized_nodes
+                .iter()
+                .find(|entry| entry.node_fp == receiver.node_fp)
+                .unwrap()
+                .state,
+            NodeState::Admitted
+        );
+    }
+
+    #[test]
+    fn update_rejects_revoked_attribution_and_non_sender_new_admission() {
+        let sender = admitted_sender();
+        let mut revoked_voucher = entry("revoked-voucher", NodeState::Revoked, 2, "sender");
+        let receiver = entry("local-receiver", NodeState::Admitted, 1, "sender");
+        let mut registry = registry_with_sender(&sender);
+        registry
+            .authorized_nodes
+            .extend([receiver.clone(), revoked_voucher.clone()]);
+        let mut target = entry("target", NodeState::Admitted, 1, "sender");
+        target.by = revoked_voucher.node_fp.clone();
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![target],
+        };
+        assert!(apply_update(
+            &mut registry.clone(),
+            &update,
+            &public_key(&sender),
+            &receiver.node_fp
+        )
+        .is_err());
+
+        revoked_voucher.state = NodeState::Admitted;
+        registry
+            .authorized_nodes
+            .retain(|entry| entry.node_fp != revoked_voucher.node_fp);
+        registry.authorized_nodes.push(revoked_voucher.clone());
+        let mut new_target = entry("new-target", NodeState::Admitted, 1, "sender");
+        new_target.by = revoked_voucher.node_fp;
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![new_target],
+        };
+        assert!(apply_update(
+            &mut registry,
+            &update,
+            &public_key(&sender),
+            &receiver.node_fp
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn later_voucher_revocation_does_not_cascade_to_existing_entry() {
+        let sender = admitted_sender();
+        let voucher = entry("voucher", NodeState::Admitted, 1, "sender");
+        let mut target = entry("already-vouched", NodeState::Admitted, 3, "sender");
+        target.by = voucher.node_fp.clone();
+        let receiver = entry("local-receiver", NodeState::Admitted, 1, "sender");
+        let mut registry = registry_with_sender(&sender);
+        registry
+            .authorized_nodes
+            .extend([receiver.clone(), voucher.clone(), target.clone()]);
+
+        // The source can be revoked later; this does not cascade to its old entry.
+        registry
+            .authorized_nodes
+            .iter_mut()
+            .find(|entry| entry.node_fp == voucher.node_fp)
+            .unwrap()
+            .state = NodeState::Revoked;
+        let mut unrelated = entry("unrelated-new-entry", NodeState::Admitted, 1, "sender");
+        unrelated.by = sender.node_fp.clone();
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![unrelated],
+        };
+        apply_update(
+            &mut registry,
+            &update,
+            &public_key(&sender),
+            &receiver.node_fp,
+        )
+        .unwrap();
+        let stored = registry
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == target.node_fp)
+            .unwrap();
+        assert_eq!(stored.state, NodeState::Admitted);
+    }
+
+    #[test]
+    fn update_refuses_more_than_total_registry_cap() {
+        let sender = admitted_sender();
+        let receiver = entry("local-receiver", NodeState::Admitted, 1, "sender");
+        let mut registry = registry_with_sender(&sender);
+        registry.authorized_nodes.push(receiver.clone());
+        for index in 0..MAX_REGISTRY_ENTRIES - 2 {
+            registry.authorized_nodes.push(entry(
+                &format!("existing-{index}"),
+                NodeState::Admitted,
+                1,
+                "sender",
+            ));
+        }
+        let mut overflow = entry("overflow", NodeState::Admitted, 1, "sender");
+        overflow.by = sender.node_fp.clone();
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![overflow],
+        };
+        assert!(apply_update(
+            &mut registry,
+            &update,
+            &public_key(&sender),
+            &receiver.node_fp
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn registry_load_refuses_file_over_byte_cap() {
+        let dir = temp_dir();
+        fs::write(dir.join(REGISTRY_FILE), vec![b' '; MAX_REGISTRY_BYTES + 1]).unwrap();
+        assert!(load_registry_at(&dir).is_err());
+    }
+
+    #[test]
+    fn update_rejects_pubkey_swap_and_alternate_fingerprint() {
+        let sender = admitted_sender();
+        let mut registry = registry_with_sender(&sender);
+        let original = entry("victim", NodeState::Admitted, 1, "sender");
+        let mut swapped = original.clone();
+        swapped.static_pubkey =
+            entry("different-key", NodeState::Admitted, 1, "sender").static_pubkey;
+        let swap_update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![swapped],
+        };
+        assert!(apply_as_sender(&mut registry, &swap_update, &public_key(&sender)).is_err());
+
+        let mut alternate = original;
+        alternate.node_fp = entry("alternate", NodeState::Admitted, 1, "sender").node_fp;
+        let alternate_update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![alternate],
+        };
+        assert!(apply_as_sender(&mut registry, &alternate_update, &public_key(&sender)).is_err());
+        assert_eq!(registry, registry_with_sender(&sender));
+    }
+
+    #[test]
+    fn revoked_entry_survives_old_and_newer_update_lists() {
+        let sender = admitted_sender();
+        let mut target = entry("replication-target", NodeState::Revoked, 7, "sender");
+        let mut registry = registry_with_sender(&sender);
+        registry.authorized_nodes.push(target.clone());
+        for version in [1, 99] {
+            target.state = NodeState::Admitted;
+            target.version = version;
+            let update = RegistryUpdate {
+                sender_fp: sender.node_fp.clone(),
+                entries: vec![target.clone()],
+            };
+            apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+            let stored = registry
+                .authorized_nodes
+                .iter()
+                .find(|entry| entry.node_fp == target.node_fp)
+                .unwrap();
+            assert_eq!(stored.state, NodeState::Revoked);
+        }
+    }
+
+    #[test]
+    fn concurrent_persisted_updates_keep_all_changes() {
+        use std::thread;
+
+        let dir = temp_dir();
+        let (receiver, _) = super::super::identity::init_identity_at(&dir).unwrap();
+        let sender = admitted_sender();
+        let mut initial = registry_with_sender(&sender);
+        initial.authorized_nodes.push(AuthorizedNode {
+            node_fp: receiver.node_fp.clone(),
+            static_pubkey: encoding::encode_base64(&receiver.static_pubkey),
+            state: NodeState::Admitted,
+            version: 1,
+            by: sender.node_fp.clone(),
+        });
+        save_registry_at(&dir, &initial).unwrap();
+        let sender_fp = sender.node_fp.clone();
+        let auth_key = public_key(&sender);
+        let workers: Vec<_> = (0..8)
+            .map(|index| {
+                let dir = dir.clone();
+                let sender_fp = sender_fp.clone();
+                let auth_key = auth_key.clone();
+                thread::spawn(move || {
+                    let mut target = entry(
+                        &format!("concurrent-{index}"),
+                        NodeState::Admitted,
+                        1,
+                        "sender",
+                    );
+                    target.by = sender_fp.clone();
+                    let update = RegistryUpdate {
+                        sender_fp,
+                        entries: vec![target],
+                    };
+                    apply_update_at(&dir, &update, &auth_key).unwrap()
+                })
+            })
+            .collect();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap().applied.len(), 1);
+        }
+        let registry = load_registry_at(&dir).unwrap();
+        assert_eq!(registry.authorized_nodes.len(), 10);
     }
 
     #[test]
@@ -514,5 +1208,32 @@ mod tests {
         registry.merge(&Registry::default()).unwrap();
         assert_eq!(registry.authorized_nodes.len(), 1);
         assert_eq!(registry.authorized_nodes[0].state, NodeState::Revoked);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_private_state_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn loading_legacy_default_acl_settings_tightens_acl_and_loads_data() {
+        let dir = std::env::temp_dir().join(format!(
+            "remuda-registry-upgrade-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, br#"{"allow_remote_control":false}"#).unwrap();
+
+        assert!(!super::super::control::enabled_at(&dir).unwrap());
+        let directory = super::super::windows_security::open_for_check(&dir, true, true).unwrap();
+        assert!(super::super::windows_security::is_owner_acl_conforming(&directory).unwrap());
+        let file = super::super::windows_security::open_for_check(&path, false, true).unwrap();
+        assert!(super::super::windows_security::is_owner_acl_conforming(&file).unwrap());
+        drop(file);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

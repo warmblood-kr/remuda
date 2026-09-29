@@ -20,6 +20,7 @@ use crate::client;
 use mlua::{Lua, Table, Value};
 use remuda_core::keys;
 use remuda_core::protocol::{Request, Response, Step};
+use remuda_core::InputSubmitOutcome;
 use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
@@ -28,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 70] = [
+pub const BINDINGS: [&str; 84] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -36,15 +37,25 @@ pub const BINDINGS: [&str; 70] = [
     "_event_counts",
     "_extension_commands",
     "_function_source",
+    "_input_submit",
+    "_input_text",
+    "_input_type_text",
+    "_module_readiness",
+    "_pending_create",
+    "_pending_events",
     "_process_drain",
     "_process_killpg",
+    "_process_run",
     "_process_spawn",
     "_refresh_sessions_buffer",
     "_registry",
     "_registry_dump",
     "_run_due_schedules",
+    "_run_schedule",
     "_schedule_fire_counts",
+    "_session_resize",
     "_sync_window_shown",
+    "_take_due_schedules",
     "advice_list",
     "advice_member",
     "advise",
@@ -70,10 +81,13 @@ pub const BINDINGS: [&str; 70] = [
     "extension_command",
     "fail",
     "feed",
+    "fs",
     "hook_list",
     "hooks",
     "http",
+    "input",
     "insert",
+    "json",
     "key",
     "kill",
     "list_dir",
@@ -81,6 +95,7 @@ pub const BINDINGS: [&str; 70] = [
     "mkdir",
     "new",
     "on",
+    "pending",
     "process",
     "processes",
     "reload",
@@ -105,9 +120,59 @@ pub const BINDINGS: [&str; 70] = [
 /// own rows for the words it defines in pure Lua, into the same table.
 const WORDS: &[(&str, &str, &str)] = &[
     (
+        "_input_submit",
+        "Submit visible session text; returns 'submitted' or 'unverified'.",
+        "_input_submit(name, expect) -> status",
+    ),
+    (
+        "_input_text",
+        "Deliver a normalized text burst, bracketed when enabled by the child.",
+        "_input_text(name, text) -> nil",
+    ),
+    (
+        "_input_type_text",
+        "Deliver text and submit it while holding one input lock; returns 'submitted' or 'unverified'.",
+        "_input_type_text(name, text, settle?) -> status",
+    ),
+    (
+        "_module_readiness",
+        "Internal readiness poll for remuda exec.",
+        "_module_readiness(name) -> {status, timeout_ms?, message?}",
+    ),
+    (
+        "_pending_create",
+        "Create a private bounded reply handle for remuda.pending.",
+        "_pending_create(timeout?) -> id, handle",
+    ),
+    (
+    "_pending_events",
+        "Drain deferred-reply completion and cancellation notifications for the Lua tick.",
+        "_pending_events() -> {{id, reason?}...}",
+    ),
+    (
+        "_session_resize",
+        "Resize a session after validating its requested dimensions.",
+        "_session_resize(name, cols, rows) -> true, nil | nil, error",
+    ),
+    (
         "http",
         "Start an asynchronous bounded HTTP request; completion is delivered on the Lua image queue.",
         "http.request(options) -> {cancel()}",
+    ),
+    (
+        "fs",
+        "Atomic replacement of files for trusted Lua callers.",
+        "table",
+    ),
+    (
+        "fs.write_atomic",
+        "Write bytes through a same-directory temporary file and atomically replace the target.",
+        "fs.write_atomic(path, bytes) -> true, nil | nil, error",
+    ),
+    (
+        "fs.mkdir_new",
+        "Create one new directory without creating parents or trusting an existing path.",
+        "fs.mkdir_new(path) -> true | nil, 'exists' | nil, error",
     ),
     (
         "ls",
@@ -128,6 +193,36 @@ const WORDS: &[(&str, &str, &str)] = &[
         "insert",
         "Insert raw bytes into a session with nothing appended.",
         "insert(name, text) -> nil",
+    ),
+    (
+        "json",
+        "Bounded JSON conversion for Lua values and UTF-8 JSON text.",
+        "table",
+    ),
+    (
+        "json.decode",
+        "Decode strict UTF-8 JSON; repeated object keys and over-limit input return nil, error.",
+        "json.decode(text) -> value, nil | nil, error",
+    ),
+    (
+        "json.encode",
+        "Encode a Lua value as bounded JSON; unsupported values raise a clear error.",
+        "json.encode(value, options?) -> string",
+    ),
+    (
+        "json.null",
+        "The sentinel that represents JSON null in Lua tables.",
+        "value",
+    ),
+    (
+        "json.array",
+        "Tag a dense Lua table as a JSON array, including an empty table.",
+        "json.array(table) -> table",
+    ),
+    (
+        "json.object",
+        "Tag a string-keyed Lua table as a JSON object, including an empty table.",
+        "json.object(table) -> table",
     ),
     (
         "key",
@@ -215,6 +310,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "table",
     ),
     (
+        "_process_run",
+        "Run an argv process synchronously with a bounded timeout and captured output; internal, called by `remuda.process.run`.",
+        "_process_run(argv, stdin?, timeout) -> result",
+    ),
+    (
         "_process_spawn",
         "Spawn a plain-pipe child process; internal, wrapped by `remuda.process`.",
         "_process_spawn(argv, on_line?, on_exit?) -> id",
@@ -259,6 +359,8 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
         row.set("signature", *signature)?;
         registry.set(*name, row)?;
     }
+    table.set("json", crate::json::bindings(lua)?)?;
+    fs_bindings(lua, table)?;
     table.set("_registry", registry)
 }
 
@@ -266,21 +368,23 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
 /// chunk with no file on disk. `name` becomes the chunk name, so a traceback
 /// still names it.
 pub fn run_source(socket: &Path, name: &str, source: &str) -> Result<(), String> {
+    let output = eval_source(socket, name, source)?;
+    if !output.is_empty() {
+        println!("{output}");
+    }
+    Ok(())
+}
+
+/// Evaluate source in the daemon's image and return captured output without
+/// relaying it. The CLI uses this for private status probes between user-facing
+/// commands.
+pub fn eval_source(socket: &Path, name: &str, source: &str) -> Result<String, String> {
     let request = Request::Eval {
         code: source.to_string(),
         name: Some(name.to_string()),
     };
     match client::request(socket, &request).map_err(|e| e.to_string())? {
-        // Whatever the script printed comes back in the same string (the
-        // daemon's own stdout is /dev/null, so `print` is captured rather than
-        // written) and is relayed here. Empty means it printed nothing and
-        // returned nothing, which should stay silent.
-        Response::Value(output) => {
-            if !output.is_empty() {
-                println!("{output}");
-            }
-            Ok(())
-        }
+        Response::Value(output) => Ok(output),
         Response::Error(reason) => Err(reason),
         other => Err(format!("unexpected response: {other:?}")),
     }
@@ -311,6 +415,67 @@ fn new_request(
     }
 }
 
+fn input_bindings(
+    lua: &Lua,
+    table: &Table,
+    input_registry: std::sync::Arc<remuda_core::Registry>,
+) -> mlua::Result<()> {
+    let text_registry = input_registry.clone();
+    table.set(
+        "_input_text",
+        lua.create_function(move |_, (name, text): (String, String)| {
+            let session = text_registry
+                .get(&name)
+                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
+            session
+                .input_text(&text)
+                .map_err(|error| mlua::Error::runtime(error.to_string()))
+        })?,
+    )?;
+
+    let submit_registry = input_registry.clone();
+    table.set(
+        "_input_submit",
+        lua.create_function(move |_, (name, expect): (String, String)| {
+            let session = submit_registry
+                .get(&name)
+                .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
+            session
+                .submit(&expect)
+                .map(|outcome| match outcome {
+                    InputSubmitOutcome::Submitted => "submitted",
+                    InputSubmitOutcome::Unverified => "unverified",
+                })
+                .map_err(|error| mlua::Error::runtime(error.to_string()))
+        })?,
+    )?;
+
+    table.set(
+        "_input_type_text",
+        lua.create_function(
+            move |_, (name, text, settle): (String, String, Option<f64>)| {
+                let settle = settle.unwrap_or(0.1);
+                if !settle.is_finite() || !(0.0..=5.0).contains(&settle) {
+                    return Err(mlua::Error::runtime(
+                        "settle must be between 0 and 5 seconds",
+                    ));
+                }
+                let session = input_registry
+                    .get(&name)
+                    .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
+                session
+                    .type_text(&text, Duration::from_secs_f64(settle))
+                    .map(|outcome| match outcome {
+                        InputSubmitOutcome::Submitted => "submitted",
+                        InputSubmitOutcome::Unverified => "unverified",
+                    })
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))
+            },
+        )?,
+    )?;
+    Ok(())
+}
+
 pub fn bindings(
     lua: &Lua,
     socket: &Path,
@@ -320,7 +485,9 @@ pub fn bindings(
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
+    let input_registry = registry.clone();
     fail_binding(lua, &table, image.clone())?;
+    pending_bindings(lua, &table, image.pending_replies())?;
 
     // In-process, not a loopback: the image always runs inside the same
     // daemon this `Registry` belongs to (image.rs), so asking over the wire
@@ -336,6 +503,8 @@ pub fn bindings(
             value(lua, Response::Sessions(registry.list()))
         })?,
     )?;
+
+    session_resize_binding(lua, &table, at())?;
 
     new_binding(lua, &table, at())?;
 
@@ -359,6 +528,8 @@ pub fn bindings(
             value(lua, ask(&path, Request::Send { name, bytes })?)
         })?,
     )?;
+
+    input_bindings(lua, &table, input_registry)?;
 
     // Named keys, in Emacs's `kbd` notation. An unknown name is raised, not
     // quietly encoded as an empty burst — a script that presses nothing and
@@ -428,16 +599,7 @@ pub fn bindings(
         })?,
     )?;
 
-    // End a session — live, or already self-exited (step 006). A dead session
-    // stays listed with its last screen intact until this is called; nothing
-    // reaps it on its own, on purpose (`steps/006-lifetime.md`).
-    let path = at();
-    table.set(
-        "close",
-        lua.create_function(move |lua, name: String| {
-            value(lua, ask(&path, Request::Close { name })?)
-        })?,
-    )?;
+    close_binding(lua, &table, at())?;
 
     exec_binding(lua, &table)?;
     function_source_binding(lua, &table)?;
@@ -449,24 +611,155 @@ pub fn bindings(
     registry_bindings(lua, &table)?;
     process_bindings(lua, &table, image)?;
 
-    // Blocks the WHOLE Image, not just this call: the interpreter is pinned to
-    // one thread (image.rs), so a sleeping script stalls every other job —
-    // the REPL, `-e`, any other script — for the full duration. Not a wait or
-    // a timer primitive; remuda has no periodic-execution mechanism yet, and
-    // faking one with a sleep-and-poll loop holds the Image hostage the same way.
+    // Blocks the whole Image while this Rust call sleeps. The Lua instruction
+    // budget does not count time spent in Rust bindings, C-library functions,
+    // or Lua 5.4 `__gc` finalizers (which run with hooks disabled); it bounds
+    // Lua VM instructions only. A long `string.find` backtrack or `string.rep`
+    // can therefore still occupy the image until that call returns. Loops of
+    // cheap Rust/C binding calls take longer to reach the 200M-instruction
+    // limit too, and the hook cannot interrupt one blocking call.
+    // Each coroutine create/resume also reserves 10K instructions; this caps
+    // generators at roughly 20K such operations in one job.
+    // This is not a wait or timer primitive; remuda has no periodic-execution
+    // mechanism yet, and a sleep-and-poll loop holds the Image hostage too.
+    sleep_binding(lua, &table)?;
+
+    Ok(table)
+}
+
+fn session_resize_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
+    table.set(
+        "_session_resize",
+        lua.create_function(move |_, (name, cols, rows): (String, Value, Value)| {
+            let cols = match resize_dimension(cols) {
+                Ok(value) => value,
+                Err(error) => return Ok((Value::Nil, Some(error))),
+            };
+            let rows = match resize_dimension(rows) {
+                Ok(value) => value,
+                Err(error) => return Ok((Value::Nil, Some(error))),
+            };
+            let size = match requested_size(cols, rows) {
+                Ok(size) => size,
+                Err(error) => return Ok((Value::Nil, Some(error))),
+            };
+            match ask(&path, Request::Resize { name, size })? {
+                Response::Ok => Ok((Value::Boolean(true), None)),
+                Response::Error(reason) => Ok((Value::Nil, Some(reason))),
+                other => Ok((Value::Nil, Some(format!("unexpected response: {other:?}")))),
+            }
+        })?,
+    )
+}
+
+fn requested_size(cols: i64, rows: i64) -> Result<remuda_core::Size, String> {
+    use remuda_core::Size;
+    if !(i64::from(Size::MIN_RESIZE_COLS)..=i64::from(Size::MAX_RESIZE_COLS)).contains(&cols)
+        || !(i64::from(Size::MIN_ROWS)..=i64::from(Size::MAX_RESIZE_ROWS)).contains(&rows)
+    {
+        return Err(format!(
+            "resize dimensions must be cols {}..{}, rows {}..{}",
+            Size::MIN_RESIZE_COLS,
+            Size::MAX_RESIZE_COLS,
+            Size::MIN_ROWS,
+            Size::MAX_RESIZE_ROWS
+        ));
+    }
+    let (cols, rows) = (cols as u16, rows as u16);
+    Ok(if cols < Size::MIN_COLS {
+        Size::for_pane(cols, rows)
+    } else {
+        Size::new(cols, rows)
+    })
+}
+
+fn resize_dimension(value: Value) -> Result<i64, String> {
+    match value {
+        Value::Integer(number) => Ok(number),
+        Value::Number(number) if number.is_finite() && number.fract() == 0.0 => {
+            if number >= i64::MIN as f64 && number <= i64::MAX as f64 {
+                Ok(number as i64)
+            } else {
+                Err("resize dimensions must be whole numbers".into())
+            }
+        }
+        _ => Err("resize dimensions must be whole numbers".into()),
+    }
+}
+
+fn close_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
+    // End a session — live, or already self-exited (step 006). A dead session
+    // stays listed with its last screen intact until this is called; nothing
+    // reaps it on its own, on purpose (`steps/006-lifetime.md`).
+    table.set(
+        "close",
+        lua.create_function(move |lua, name: String| {
+            value(
+                lua,
+                ask(
+                    &path,
+                    Request::Close {
+                        name,
+                        instance_id: None,
+                        confirm: None,
+                    },
+                )?,
+            )
+        })?,
+    )
+}
+
+fn sleep_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
     table.set(
         "sleep",
         lua.create_function(|_, seconds: f64| {
-            // A negative or NaN duration would panic in `from_secs_f64`; a
-            // script asking to sleep backwards gets nothing rather than a crash.
+            // Negative or NaN durations do nothing instead of panicking in
+            // `Duration::from_secs_f64`.
             if seconds.is_finite() && seconds > 0.0 {
                 std::thread::sleep(Duration::from_secs_f64(seconds));
             }
             Ok(())
         })?,
-    )?;
+    )
+}
 
-    Ok(table)
+fn pending_bindings(
+    lua: &Lua,
+    table: &Table,
+    pending: crate::pending::PendingReplies,
+) -> mlua::Result<()> {
+    let create = pending.clone();
+    table.set(
+        "_pending_create",
+        lua.create_function(move |lua, timeout: Option<f64>| {
+            let seconds = timeout.unwrap_or(30.0);
+            if !seconds.is_finite() || seconds <= 0.0 || seconds > 300.0 {
+                return Err(mlua::Error::runtime(
+                    "pending timeout must be a positive number no greater than 300 seconds",
+                ));
+            }
+            let duration = Duration::from_secs_f64(seconds.max(0.000_000_001));
+            let (id, handle) = create.create(duration).map_err(|message| {
+                mlua::Error::external(crate::image::TypedFailure { message, code: 1 })
+            })?;
+            Ok((id, lua.create_userdata(handle)?))
+        })?,
+    )?;
+    table.set(
+        "_pending_events",
+        lua.create_function(move |lua, ()| {
+            let events = pending.drain_events();
+            let rows = lua.create_table_with_capacity(events.len(), 0)?;
+            for (index, event) in events.into_iter().enumerate() {
+                let row = lua.create_table()?;
+                row.set("id", event.id)?;
+                row.set("reason", event.reason)?;
+                rows.set(index + 1, row)?;
+            }
+            Ok(rows)
+        })?,
+    )?;
+    Ok(())
 }
 
 /// `remuda.new(name, argv, cwd, env)` — split out of `bindings` to stay under
@@ -748,6 +1041,54 @@ fn dir_bindings(
     Ok(())
 }
 
+/// Filesystem operations with explicit creation and replacement semantics.
+fn fs_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
+    let fs = lua.create_table()?;
+    fs.set(
+        "mkdir_new",
+        lua.create_function(|_, path: String| match mkdir_new(Path::new(&path), &path) {
+            Ok(()) => Ok((Some(true), None::<String>)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Ok((None::<bool>, Some("exists".to_string())))
+            }
+            Err(error) => Ok((None::<bool>, Some(error.to_string()))),
+        })?,
+    )?;
+    fs.set(
+        "write_atomic",
+        lua.create_function(|_, (path, bytes): (String, mlua::LuaString)| {
+            match crate::fs_atomic::write_atomic(Path::new(&path), &bytes.as_bytes(), 0o644) {
+                Ok(()) => Ok((Some(true), None::<String>)),
+                Err(error) => Ok((None::<bool>, Some(error.to_string()))),
+            }
+        })?,
+    )?;
+    table.set("fs", fs)
+}
+
+fn mkdir_new(path: &Path, raw_path: &str) -> std::io::Result<()> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path must be absolute",
+        ));
+    }
+    if raw_path.ends_with(std::path::MAIN_SEPARATOR) || cfg!(windows) && raw_path.ends_with('/') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path must not end with a separator",
+        ));
+    }
+
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 /// The `Ticker`'s own skip counters, read-only — no threshold or alarm here,
 /// split out of `bindings` to stay under its line cap. See `tick.rs`'s own
 /// hook-point comment for why acting on them is a separate, undecided step.
@@ -811,6 +1152,29 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
                 spawner
                     .spawn(spawn_image.clone(), argv, on_line, on_exit)
                     .map_err(mlua::Error::external)
+            },
+        )?,
+    )?;
+
+    table.set(
+        "_process_run",
+        lua.create_function(
+            |lua, (argv, stdin, timeout): (Vec<String>, Option<mlua::LuaString>, f64)| {
+                let output = crate::process::run_sync(
+                    argv,
+                    stdin.map(|value| value.as_bytes().to_vec()),
+                    timeout,
+                )
+                .map_err(mlua::Error::runtime)?;
+                let result = lua.create_table()?;
+                result.set("code", output.code)?;
+                result.set("stdout", lua.create_string(&output.stdout)?)?;
+                result.set("stderr", lua.create_string(&output.stderr)?)?;
+                result.set("timed_out", output.timed_out)?;
+                if let Some(signal) = output.signal {
+                    result.set("signal", signal)?;
+                }
+                Ok(result)
             },
         )?,
     )?;
@@ -882,6 +1246,20 @@ fn lua_env_to_wire(env: Table) -> mlua::Result<std::collections::HashMap<String,
 fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
     match response {
         Response::Ok => Ok(Value::Nil),
+        Response::Ack { .. } => Ok(Value::Nil),
+        Response::Uncertain => Err(mlua::Error::runtime(
+            "input outcome is uncertain; bytes may be partial or late",
+        )),
+        Response::WrongInstance => Err(mlua::Error::runtime("session instance changed")),
+        Response::RateLimited => Err(mlua::Error::runtime("session input rate limit exceeded")),
+        Response::SyncAtCapacity => Err(mlua::Error::runtime("Sync is at capacity; retry shortly")),
+        Response::Busy => Err(mlua::Error::runtime("session input is busy")),
+        Response::WriteTimeout => Err(mlua::Error::runtime(
+            "session PTY write timed out; delivery may be partial or late",
+        )),
+        Response::RemoteControlDisabled => {
+            Err(mlua::Error::runtime("remote control disabled on this node"))
+        }
         Response::AttachStarted { .. } | Response::AttachStatus { .. } => Err(
             mlua::Error::runtime("attach responses are not exposed to scripts"),
         ),
@@ -891,6 +1269,9 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         // adding one later is a compile error to think about, not a silent
         // fall-through that returns the wrong shape.
         Response::Value(text) => Ok(Value::String(lua.create_string(&text)?)),
+        Response::CommandResult { .. } => Err(mlua::Error::runtime(
+            "deferred command replies cannot be consumed as a Lua value",
+        )),
         Response::Sessions(list) => {
             let rows = lua.create_table()?;
             for (index, session) in list.into_iter().enumerate() {
@@ -944,6 +1325,7 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::StyledScreen { .. } => Err(mlua::Error::runtime(
             "styled capture is not exposed to scripts",
         )),
+        Response::Sync { .. } => Err(mlua::Error::runtime("Sync is not exposed to scripts")),
         Response::MouseState(_) => Err(mlua::Error::runtime(
             "mouse state is not exposed to scripts",
         )),
@@ -952,10 +1334,55 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
 
 #[cfg(test)]
 mod binding_tests {
-    use super::BINDINGS;
+    use super::{fs_bindings, lua_steps_to_wire, BINDINGS};
+    use mlua::Lua;
+    use remuda_core::protocol::Step;
 
     #[test]
     fn binding_names_are_sorted_and_unique() {
         assert!(BINDINGS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mkdir_new_creates_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir()
+            .join(format!("remuda-mkdir-new-{}-{nonce}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let lua = Lua::new();
+        let remuda = lua.create_table().unwrap();
+        fs_bindings(&lua, &remuda).unwrap();
+        lua.globals().set("remuda", remuda).unwrap();
+        lua.globals().set("target", path.as_str()).unwrap();
+
+        lua.load("assert(remuda.fs.mkdir_new(target) == true)")
+            .exec()
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(mode, 0o700, "new directories must be owner-only");
+    }
+
+    #[test]
+    fn feed_return_burst_is_the_same_byte_as_named_return() {
+        let lua = mlua::Lua::new();
+        let steps: mlua::Table = lua.load(r#"{{burst='\r'}}"#).eval().unwrap();
+        let wire = lua_steps_to_wire(steps).unwrap();
+        assert_eq!(
+            wire,
+            [Step::Burst(remuda_core::keys::RETURN_BYTES.to_vec())]
+        );
+        assert_eq!(
+            remuda_core::keys::key("RET").as_deref(),
+            Some(remuda_core::keys::RETURN_BYTES)
+        );
     }
 }

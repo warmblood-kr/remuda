@@ -107,13 +107,41 @@ pub fn wake(stream: &Stream) {
         let Stream::NamedPipe(pipe) = stream;
         // `interprocess` opens pipes FILE_FLAG_OVERLAPPED and drives them with
         // synchronous waits, so the blocked read *is* a pending overlapped
-        // operation and this is the API that cancels one.
+        // operation and this is the API that cancels one. A null OVERLAPPED
+        // cancels every pending operation for this pipe handle, so callers use
+        // wake only with the stream dedicated to the blocked reader.
         unsafe {
             windows_sys::Win32::System::IO::CancelIoEx(
                 pipe.as_handle().as_raw_handle(),
                 std::ptr::null(),
             )
         };
+    }
+}
+
+/// Check whether the connected Windows named-pipe peer has closed without
+/// changing the stream's read mode; `set_nonblocking` is unsupported there.
+#[cfg(windows)]
+pub fn peer_disconnected(stream: &Stream) -> io::Result<bool> {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
+    use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+
+    let Stream::NamedPipe(pipe) = stream;
+    let mut available = 0u32;
+    let result = unsafe {
+        PeekNamedPipe(
+            pipe.as_handle().as_raw_handle(),
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null_mut(),
+            &mut available,
+            std::ptr::null_mut(),
+        )
+    };
+    if result != 0 {
+        Ok(false)
+    } else {
+        Err(io::Error::last_os_error())
     }
 }
 

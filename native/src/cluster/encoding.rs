@@ -25,7 +25,7 @@ pub fn encode_base64(bytes: &[u8]) -> String {
     result
 }
 
-pub(super) fn decode_base64(value: &str) -> io::Result<Vec<u8>> {
+pub fn decode_base64(value: &str) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::with_capacity(value.len() * 3 / 4);
     let mut chunk = [0u8; 4];
     let mut count = 0;
@@ -80,7 +80,7 @@ pub(super) fn decode_base64(value: &str) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
-pub(super) fn fingerprint(public_key: &[u8]) -> String {
+pub fn fingerprint(public_key: &[u8]) -> String {
     use snow::resolvers::CryptoResolver;
     let params: snow::params::NoiseParams = "Noise_NN_25519_ChaChaPoly_SHA256"
         .parse()

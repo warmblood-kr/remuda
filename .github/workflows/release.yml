@@ -5,7 +5,8 @@ name: release
 # matrix matches the triples docs/install.sh offers.
 #
 #   push a tag v1.2.3  →  release "v1.2.3", marked latest      (stable)
-#   push to main       →  rolling release "nightly", prerelease (nightly)
+#   push to main       →  immutable versioned prerelease plus a rolling
+#                         `nightly` alias for older installers
 #
 # The publish job writes the new version into docs/latest.json on main, which
 # GitHub Pages serves. `paths-ignore` is what stops that commit from starting
@@ -28,7 +29,8 @@ on:
 permissions:
   contents: write
 
-# Overlapping nightly runs delete and recreate the same release, leaving it a draft.
+# Serialize publishes for a ref. Nightly builds themselves publish to immutable
+# version tags; the legacy `nightly` alias is updated only after the index moves.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -56,7 +58,9 @@ jobs:
           else
             base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
             version="$base-nightly.$(date -u +%Y%m%d%H%M%S).$(git rev-parse --short=7 HEAD)"
-            echo "tag=nightly"    >> "$GITHUB_OUTPUT"
+            # Publish the complete build under its immutable version tag. The
+            # fixed `nightly` alias is updated last for older installers.
+            echo "tag=$version"   >> "$GITHUB_OUTPUT"
             echo "channel=nightly" >> "$GITHUB_OUTPUT"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -232,27 +236,22 @@ jobs:
         # Work the two cases through from a USER's side, for the case that will
         # actually recur — the self-hosted macOS runner busy or offline:
         #
-        #   partial   nightly is a ROLLING tag, so publishing means deleting the
-        #             release and recreating it. The three assets go up, the mac
-        #             one is GONE, and latest.json advances. A mac user's next
-        #             `remuda upgrade` resolves the new version and 404s. We
-        #             took away a build they could have installed a minute ago.
-        #   strict    nothing is deleted, latest.json does not move. Every
-        #             platform keeps installing the last complete build. Linux
-        #             and Windows are one build STALE until the next push.
+        #   partial   no versioned release or index pointer is changed. Every
+        #             platform keeps installing the last complete build.
+        #   strict    a later complete build publishes all assets before the
+        #             index moves; no platform is left with a missing tarball.
         #
-        # Staleness on a rolling channel is invisible; a 404 from the one-liner
-        # the README promises is not. `check-install.py`'s standing promise is
-        # that every offered platform has an asset, and a partial publish breaks
-        # it for real people rather than in theory.
+        # An older index pointer remains installable because its release is
+        # immutable; a missing asset would still break the one-liner. The
+        # check-install.py promise is that every offered platform has an asset.
         #
         # So the strict path is the one that degrades gracefully, and what was
         # wrong on 2026-09-10 was never strictness — it was SILENCE. `publish`
         # was skipped, so nobody was told which target was missing. Hence
         # always() above and the job summary below.
         #
-        # ⚠ This reasoning depends on nightly being a rolling tag that is
-        # deleted and recreated. Change that, and revisit this decision.
+        # ⚠ This reasoning depends on latest.json moving only after every
+        # versioned release asset is public. Change that ordering, and revisit.
         env:
           EXPECTED: ${{ needs.plan.outputs.targets }}
         run: |
@@ -287,7 +286,7 @@ jobs:
           # a human in the download directory too.
           cd dist && sha256sum -- *.tar.gz > SHA256SUMS && cat SHA256SUMS
 
-      - name: publish the release
+      - name: publish the versioned release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.plan.outputs.tag }}
@@ -295,15 +294,9 @@ jobs:
         run: |
           set -eu
           if [ "${{ needs.plan.outputs.channel }}" = nightly ]; then
-            # Rolling: replace the release but MOVE the tag instead of deleting it.
-            # Deleting the tag (--cleanup-tag) finishes asynchronously and can
-            # untag the NEW release, which GitHub then turns back into a draft.
-            gh release delete "$TAG" --yes || true
-            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" \
-              -f sha="$GITHUB_SHA" -F force=true \
-              || gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
-                   -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA"
-            gh release create "$TAG" --prerelease --verify-tag \
+            # The version tag is unique and remains available after latest.json
+            # advances, so cached indexes keep resolving a complete release.
+            gh release create "$TAG" --prerelease --target "$GITHUB_SHA" \
               --title "nightly $VERSION" \
               --notes "Rolling build of main. Version \`$VERSION\`." dist/*
           else
@@ -313,7 +306,7 @@ jobs:
 
       - name: verify the release did not revert to draft
         # 2026-09-28 incident: this job's own log confirmed a clean
-        # create→upload→publish of "nightly" for commit abe80a0, but ~40s
+        # create→upload→publish of a nightly release for commit abe80a0, but ~40s
         # later something OUTSIDE this workflow flipped the release back to
         # draft:true, breaking the public download URL for 10+ minutes
         # before a human noticed. No other workflow/script/webhook in this
@@ -333,6 +326,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.plan.outputs.tag }}
           BUILT_SHA: ${{ github.sha }}
+          CHANNEL: ${{ needs.plan.outputs.channel }}
         run: |
           set -eu
           check_draft() { gh release view "$TAG" --json isDraft --jq .isDraft; }
@@ -353,9 +347,9 @@ jobs:
 
           # Concurrency retains at most one pending run, and a newer push can
           # replace that pending run while this nightly is building. Detect a
-          # stale rolling release explicitly; the latest-wins policy remains
+          # stale versioned release explicitly; the latest-wins policy remains
           # non-blocking and this warning does not fail publication.
-          if [ "$TAG" = nightly ]; then
+          if [ "$CHANNEL" = nightly ]; then
             main_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
             non_release_commits="$(gh api "repos/$GITHUB_REPOSITORY/compare/$BUILT_SHA...main" \
               --jq '[.commits[].commit.message | select(startswith("release: ") | not)] | length')"
@@ -369,26 +363,91 @@ jobs:
           verify "60s after publish"
 
       - name: publish the version index
+        id: latest_index
         env:
           CHANNEL: ${{ needs.plan.outputs.channel }}
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -eu
-          python3 - <<'PY'
-          import json, os, datetime, pathlib
-          p = pathlib.Path("docs/latest.json")
-          index = json.loads(p.read_text())
-          index[os.environ["CHANNEL"]] = os.environ["VERSION"]
-          index["updated"] = datetime.datetime.now(datetime.timezone.utc).isoformat(
-              timespec="seconds"
-          ).replace("+00:00", "Z")
-          p.write_text(json.dumps(index, indent=2) + "\n")
-          print(p.read_text())
-          PY
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/latest.json
-          git diff --cached --quiet && exit 0
-          git commit -m "release: $CHANNEL is now $VERSION"
-          git pull --rebase origin main
-          git push origin HEAD:main
+          index_tool=$(mktemp -d)
+          trap 'rm -rf "$index_tool"' EXIT
+          tar -xzf "dist/remuda-$VERSION-x86_64-unknown-linux-gnu.tar.gz" -C "$index_tool"
+          for attempt in 1 2 3; do
+            # Start each attempt from the current main pointer. A concurrent
+            # publisher can still win between fetch and push, so a rejected
+            # push retries from its newer index and rechecks ordering.
+            git fetch origin main
+            git reset --hard origin/main
+            updated=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+            result=$("$index_tool/remuda" _latest-index docs/latest.json "$CHANNEL" "$VERSION" "$updated")
+            echo "$result"
+            if [ "$result" = publish=false ]; then
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$result" = publish=already ]; then
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git add docs/latest.json
+            git commit -m "release: $CHANNEL is now $VERSION"
+            if git push origin HEAD:main; then
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "latest.json push raced with another publisher; retrying from main (attempt $attempt)" >&2
+          done
+          echo "::error::could not advance latest.json after three concurrent publish attempts"
+          exit 1
+
+      - name: prune old versioned nightlies
+        if: needs.plan.outputs.channel == 'nightly' && steps.latest_index.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP_NIGHTLY_RELEASES: 10
+          LATEST_TAG: ${{ needs.plan.outputs.version }}
+        run: |
+          set -eu
+          # This is the retention policy for immutable nightly releases. Keep
+          # the current index target explicitly even if API timestamps tie.
+          releases=$(mktemp)
+          trap 'rm -f "$releases"' EXIT
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.prerelease and (.tag_name | test("^[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\.[0-9]{14}\\.[0-9a-f]{7}$"))) | [.published_at, .tag_name] | @tsv' \
+            | sort -r > "$releases"
+          rank=0
+          while IFS="$(printf '\t')" read -r published tag; do
+            [ -n "$tag" ] || continue
+            # Reserve one of N slots for the exact latest.json target even if
+            # several releases share a publication timestamp.
+            if [ "$tag" = "$LATEST_TAG" ]; then
+              continue
+            fi
+            rank=$((rank + 1))
+            if [ "$rank" -lt "$KEEP_NIGHTLY_RELEASES" ]; then
+              continue
+            fi
+            echo "pruning old nightly release $tag (published $published)"
+            gh release delete "$tag" --yes --cleanup-tag
+          done < "$releases"
+
+      - name: update legacy nightly release for older installers
+        if: needs.plan.outputs.channel == 'nightly' && steps.latest_index.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -eu
+          # Older install.sh copies resolve the fixed `nightly` URL. Keep that
+          # alias working, but update it only after the immutable release and
+          # latest.json are ready. Old clients can see a brief 404 in this step.
+          gh release delete nightly --yes || true
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/nightly" \
+            -f sha="$GITHUB_SHA" -F force=true \
+            || gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+                 -f ref="refs/tags/nightly" -f sha="$GITHUB_SHA"
+          gh release create nightly --prerelease --verify-tag \
+            --title "nightly $VERSION" \
+            --notes "Rolling compatibility alias for $VERSION. New installers use the immutable version tag." dist/*

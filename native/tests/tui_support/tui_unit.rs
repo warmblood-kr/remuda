@@ -1,5 +1,84 @@
 use super::*;
 use remuda_core::Size;
+use std::sync::{Arc, Mutex};
+
+const REAL_OUTPUT_WAIT: Duration = Duration::from_secs(60);
+const REAL_OUTPUT_POLL: Duration = Duration::from_millis(50);
+
+#[test]
+fn paste_input_strips_escape_and_wraps_only_when_child_mode_is_enabled() {
+    assert_eq!(
+        paste_input("first\n\x1b[201~second", true),
+        b"\x1b[200~first\n[201~second\x1b[201~"
+    );
+    assert_eq!(paste_input("first\nsecond", false), b"first\nsecond");
+}
+
+#[test]
+fn paste_input_strips_c0_controls_except_tab_line_feed_and_carriage_return() {
+    assert_eq!(
+        paste_input("a\u{3}\u{4}\u{1a}\u{1c}\t\n\r\u{7f}z", false),
+        b"a\t\n\rz"
+    );
+}
+
+#[test]
+fn paste_input_strips_del_and_c1_without_corrupting_utf8() {
+    assert_eq!(paste_input("한\u{9b}글\u{7f}!", false), "한글!".as_bytes());
+}
+
+#[test]
+fn old_mouse_state_wire_shape_defaults_bracketed_paste_to_off() {
+    let state: remuda_core::agent::MouseState =
+        serde_json::from_str(r#"{"mode":"None","encoding":"Default"}"#).unwrap();
+    assert!(!state.bracketed_paste);
+}
+
+#[derive(Clone)]
+struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for SharedWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn bracketed_paste_capture_toggles_and_drop_resets_the_terminal() {
+    let output = Arc::new(Mutex::new(Vec::new()));
+    {
+        let mut capture = BracketedPasteCapture::new(SharedWriter(Arc::clone(&output)));
+        capture.set(true).unwrap();
+        capture.set(true).unwrap();
+        capture.set(false).unwrap();
+        capture.set(false).unwrap();
+        capture.set(true).unwrap();
+    }
+    assert_eq!(
+        *output.lock().unwrap(),
+        b"\x1b[?2004h\x1b[?2004l\x1b[?2004h\x1b[?2004l"
+    );
+}
+
+fn wait_for_output<T>(
+    mut check: impl FnMut() -> Option<T>,
+    timeout_message: impl FnMut() -> String,
+) -> T {
+    let deadline = Instant::now() + REAL_OUTPUT_WAIT;
+    let mut timeout_message = timeout_message;
+    loop {
+        if let Some(value) = check() {
+            return value;
+        }
+        assert!(Instant::now() < deadline, "{}", timeout_message());
+        std::thread::sleep(REAL_OUTPUT_POLL);
+    }
+}
 
 #[test]
 fn anchor_capture_retries_when_history_advances_between_captures() {
@@ -270,6 +349,55 @@ fn selected_session_stays_visible_when_the_list_exceeds_a_short_terminal() {
     assert!(
         !frame.contains("session-0"),
         "the list must have advanced rather than rendering only its initial rows"
+    );
+}
+
+#[test]
+fn clicking_the_top_visible_session_keeps_the_list_under_the_pointer() {
+    let mut ui = make_ui(
+        (0..12)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect(),
+    );
+    for _ in 0..11 {
+        ui.on_key(press(KeyCode::Down));
+    }
+
+    let before = render(&ui, "", "test", 80, 24);
+    let before_top = before.split("\x1b[2;1H").next().expect("first row exists");
+    assert!(
+        before_top.contains("session-5"),
+        "top row before click: {before_top:?}"
+    );
+
+    assert_eq!(
+        ui.on_mouse(click(5, 0), 80, 24),
+        Action::Focus("session-5".into())
+    );
+    assert_eq!(ui.selected, 5);
+
+    let after = render(&ui, "", "test", 80, 24);
+    let after_top = after.split("\x1b[2;1H").next().expect("first row exists");
+    assert!(
+        after_top.contains("session-5"),
+        "clicking the first visible row must not move the list: {after_top:?}"
+    );
+    assert!(
+        !after_top.contains("session-0"),
+        "the list must not snap back to its first row: {after_top:?}"
+    );
+
+    ui.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+    ui.on_key(press(KeyCode::Up));
+    assert_eq!(ui.selected, 4);
+    let after_navigation = render(&ui, "", "test", 80, 24);
+    let navigation_top = after_navigation
+        .split("\x1b[2;1H")
+        .next()
+        .expect("first row exists");
+    assert!(
+        navigation_top.contains("session-4"),
+        "keyboard movement should scroll just enough to keep selection visible: {navigation_top:?}"
     );
 }
 
@@ -608,18 +736,13 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     assert_eq!(response, Response::Value("stream".into()));
 
     let mut ui = make_ui(vec![row("stream", true, false)]);
-    let history_deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        capture_preview(&path, &mut ui, "stream").expect("initial live preview");
-        if ui.scrollback["stream"].history_rows >= 40 {
-            break;
-        }
-        assert!(
-            Instant::now() < history_deadline,
-            "output did not reach scrollback"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_output(
+        || {
+            capture_preview(&path, &mut ui, "stream").expect("initial live preview");
+            (ui.scrollback["stream"].history_rows >= 40).then_some(())
+        },
+        || "output did not reach scrollback".into(),
+    );
     let wheel = |kind| MouseEvent {
         kind,
         column: 19,
@@ -651,24 +774,28 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     }
     assert_eq!(ui.scrollback["stream"].offset, 0);
 
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        let (cells, _, cursor) =
-            capture_preview(&path, &mut ui, "stream").expect("capture the streaming preview");
-        let frame = render_styled(&ui, &cells, cursor, "default", 80, 25);
-        if frame.contains("newest-199") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "latest output never appeared after returning to bottom: {frame:?}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let last_frame = std::cell::RefCell::new(String::new());
+    wait_for_output(
+        || {
+            let (cells, _, cursor) =
+                capture_preview(&path, &mut ui, "stream").expect("capture the streaming preview");
+            let frame = render_styled(&ui, &cells, cursor, "default", 80, 25);
+            *last_frame.borrow_mut() = frame.clone();
+            frame.contains("newest-199").then_some(())
+        },
+        || {
+            format!(
+                "latest output never appeared after returning to bottom: {:?}",
+                last_frame.borrow()
+            )
+        },
+    );
     let _ = client::request(
         &path,
         &Request::Close {
             name: "stream".into(),
+            instance_id: None,
+            confirm: None,
         },
     );
 }
@@ -695,15 +822,13 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
     assert_eq!(response, Response::Value("stream".into()));
 
     let mut ui = make_ui(vec![row("stream", true, false)]);
-    let deadline = Instant::now() + Duration::from_secs(15);
-    loop {
-        capture_preview(&path, &mut ui, "stream").expect("capture preview");
-        if ui.scrollback["stream"].history_rows >= 3 {
-            break;
-        }
-        assert!(Instant::now() < deadline, "output did not reach scrollback");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_output(
+        || {
+            capture_preview(&path, &mut ui, "stream").expect("capture preview");
+            (ui.scrollback["stream"].history_rows >= 3).then_some(())
+        },
+        || "output did not reach scrollback".into(),
+    );
     assert_eq!(
         ui.on_mouse(
             MouseEvent {
@@ -722,32 +847,34 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
     let anchor_text = terminal_rows_text(&anchor_cells);
     let anchor_history = ui.scrollback["stream"].history_rows;
 
-    loop {
-        let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture output");
-        let state = ui.scrollback["stream"];
-        if state.history_rows >= anchor_history + 3 {
-            assert_eq!(
-                state.offset,
-                3 + (state.history_rows - anchor_history),
-                "the offset must advance with appended history rows"
-            );
-            assert_eq!(
-                terminal_rows_text(&cells),
-                anchor_text,
-                "new output must not move the scrolled content"
-            );
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "history did not grow while scrolled"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_output(
+        || {
+            let (cells, _, _) = capture_preview(&path, &mut ui, "stream").expect("capture output");
+            let state = ui.scrollback["stream"];
+            if state.history_rows >= anchor_history + 3 {
+                assert_eq!(
+                    state.offset,
+                    3 + (state.history_rows - anchor_history),
+                    "the offset must advance with appended history rows"
+                );
+                assert_eq!(
+                    terminal_rows_text(&cells),
+                    anchor_text,
+                    "new output must not move the scrolled content"
+                );
+                Some(())
+            } else {
+                None
+            }
+        },
+        || "history did not grow while scrolled".into(),
+    );
     let _ = client::request(
         &path,
         &Request::Close {
             name: "stream".into(),
+            instance_id: None,
+            confirm: None,
         },
     );
 }
@@ -847,6 +974,8 @@ fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {
         &path,
         &Request::Close {
             name: "stream".into(),
+            instance_id: None,
+            confirm: None,
         },
     );
 }
@@ -2321,9 +2450,76 @@ fn a_session_started_here_is_sized_to_the_pane_not_the_terminal() {
 }
 
 #[test]
-fn a_pane_below_the_floor_is_raised_rather_than_dropping_keystrokes() {
+fn a_narrow_pane_opts_out_of_the_default_size_floor() {
     let size = pane_size(&make_ui(vec![]), 80, 24);
-    assert_eq!((size.cols(), size.rows()), (80, 24), "Size::new's floor");
+    assert_eq!((size.cols(), size.rows()), (63, 24));
+    assert_eq!(
+        (Size::new(11, 3).cols(), Size::new(11, 3).rows()),
+        (Size::MIN_COLS, Size::MIN_ROWS),
+        "ordinary sizes keep the safety floor"
+    );
+}
+
+#[test]
+fn a_narrow_shown_list_pane_passes_its_visible_width_to_the_child() {
+    let mut ui = make_ui(vec![row("agent", true, false)]);
+    ui.set_list_width(24, 100);
+    assert_eq!(ui_layout(&ui, 100), (24, 75));
+
+    let size = pane_size(&ui, 100, 30);
+    assert_eq!(size.cols(), 75);
+    assert_eq!(size.rows(), 29);
+
+    let encoded = serde_json::to_vec(&size).expect("serialize pane size");
+    let decoded: Size = serde_json::from_slice(&encoded).expect("deserialize pane size");
+    assert_eq!(decoded, size, "the daemon must preserve the visible width");
+
+    let ordinary: Size =
+        serde_json::from_str(r#"{"cols":75,"rows":29}"#).expect("deserialize ordinary size");
+    assert_eq!(
+        ordinary.cols(),
+        Size::MIN_COLS,
+        "ordinary requests stay floored"
+    );
+}
+
+/// A list preview is observational: only an attached pane may send a Resize.
+#[test]
+fn a_narrow_preview_does_not_send_a_resize_request() {
+    let mut ui = make_ui(vec![row("background", true, false)]);
+    let shown = Some(ShownTarget::Session("background".into()));
+    let mut requests = Vec::new();
+    resize_shown_session_with(&mut ui, &shown, None, 36, 24, |name, size| {
+        requests.push((name.to_owned(), size));
+        Ok(())
+    });
+    assert!(
+        requests.is_empty(),
+        "a list preview must not resize its child PTY"
+    );
+}
+
+#[test]
+fn a_focused_narrow_attach_still_sends_its_pane_resize() {
+    let mut ui = make_ui(vec![row("agent", true, false)]);
+    ui.focus = Focus::Session;
+    let shown = Some(ShownTarget::Session("agent".into()));
+
+    let mut requests = Vec::new();
+    resize_shown_session_with(&mut ui, &shown, Some("agent"), 36, 24, |name, size| {
+        requests.push((name.to_owned(), size));
+        Ok(())
+    });
+
+    let [(name, target)] = requests.as_slice() else {
+        panic!("the focused, held session should receive one resize: {requests:?}");
+    };
+    assert_eq!(name, "agent");
+    assert_eq!(*target, pane_size(&ui, 36, 24));
+    assert!(
+        target.cols() < Size::MIN_COLS,
+        "focused pane should use its narrow width"
+    );
 }
 
 #[test]
@@ -2543,12 +2739,28 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
 
-    let dir = std::env::temp_dir().join(format!("remuda-tui-busy-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("make private busy daemon directory");
-    let socket = dir.join("s.sock");
+    struct TestDir(std::path::PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch")
+        .as_nanos();
+    let dir = TestDir(std::env::temp_dir().join(format!("r{:x}-{nonce:x}", std::process::id())));
+    std::fs::create_dir(&dir.0).expect("create unique busy daemon directory");
+    let socket = dir.0.join("s.sock");
+    assert!(
+        socket.as_os_str().len() < 104,
+        "private socket path must fit the macOS sun_path limit: {} bytes",
+        socket.as_os_str().len()
+    );
     drop(UnixListener::bind(&socket).expect("bind private endpoint"));
-    let lock_path = dir.join("s.sock.lock");
+    let lock_path = dir.0.join("s.sock.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -2594,7 +2806,6 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
     );
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     drop(lock);
-    std::fs::remove_dir_all(dir).expect("remove private busy daemon directory");
 }
 
 #[test]

@@ -114,17 +114,12 @@ fn clear_trust_dialog(socket: &Path, name: &str) {
 
     // Step 2: Down, then Enter — selects "Yes, I trust this folder" (the
     // default is "No, exit", so an unconditional Enter here would exit).
-    // One `SendLine` (raw text plus its appended `\r`) rather than two raw
-    // `Send`s: a pty is a byte stream with no keypress framing, so
-    // `"\x1b[B"` + auto-appended `\r` lands identically to Down then Enter —
-    // and it keeps this test entirely on the `SendLine`/`Capture` wire path
-    // that is already exercised elsewhere, rather than also being the first
-    // exerciser of raw `Send`'s bytes-array wire encoding.
+    // Explicit key bytes select the trust option, then Return submits it.
     client::request(
         socket,
-        &Request::SendLine {
+        &Request::Send {
             name: name.to_string(),
-            text: "\x1b[B".to_string(),
+            bytes: b"\x1b[B\r".to_vec(),
         },
     )
     .expect("send down arrow + enter");
@@ -214,7 +209,15 @@ fn typing_into_a_real_claude_session_survives_the_trust_dialog() {
         "the real claude session never answered 42:\n{screen}"
     );
 
-    client::request(&socket, &Request::Close { name: name.clone() }).expect("close");
+    client::request(
+        &socket,
+        &Request::Close {
+            name: name.clone(),
+            instance_id: None,
+            confirm: None,
+        },
+    )
+    .expect("close");
 }
 
 /// Closes 「⒟ 그 세션이 MCP 로 remuda/butler 함수를 부른다」: a real `claude` session,
@@ -358,5 +361,13 @@ fn a_real_claude_session_calls_a_lua_defined_tool_over_mcp() {
         "the sentinel file exists but was not written by this tool's run function"
     );
 
-    client::request(&socket, &Request::Close { name: session }).expect("close");
+    client::request(
+        &socket,
+        &Request::Close {
+            name: session,
+            instance_id: None,
+            confirm: None,
+        },
+    )
+    .expect("close");
 }

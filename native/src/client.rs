@@ -1,14 +1,20 @@
 //! Talking to a daemon, including handing your terminal over to one.
 
 use crate::ipc::{self, Stream, TryClone};
+use crate::reply_limit::max_reply_wire_bytes;
+#[cfg(unix)]
+use interprocess::local_socket::traits::Stream as _;
 use remuda_core::protocol::{Request, Response};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Detach key: Ctrl-\ (0x1C). Chosen because almost nothing binds it, unlike
 /// Ctrl-C/D/Z, which the attached program needs. Consumed, never forwarded.
 pub const DETACH: u8 = 0x1C;
+pub const EMPTY_REPLY_ERROR: &str = "the daemon hung up without answering";
 
 const RESET_INPUT_MODES: &[u8] =
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l";
@@ -67,7 +73,202 @@ fn trace_input_read(path: Option<&Path>, bytes: &[u8]) {
 pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
     let stream = ipc::connect(path)?;
     send(&stream, request)?;
-    read_response(&stream)
+    let timeout = match request {
+        // Deferred extension replies are capped at 300 seconds by
+        // remuda.pending; leave five seconds for delivery and scheduling.
+        Request::Eval { .. } => Duration::from_secs(305),
+        _ => Duration::from_secs(10),
+    };
+    read_response_with_timeout(path, stream, timeout)
+}
+
+#[cfg(unix)]
+fn read_response_with_timeout(
+    path: &Path,
+    stream: Stream,
+    timeout: Duration,
+) -> std::io::Result<Response> {
+    let deadline = Instant::now() + timeout;
+    let limit = max_reply_wire_bytes();
+    let mut line = Vec::with_capacity(limit.min(8192));
+    let mut bytes = [0u8; 4096];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(request_timeout(path, timeout));
+        }
+        if let Err(error) = stream.set_recv_timeout(Some(remaining)) {
+            // macOS can return EINVAL when SO_RCVTIMEO is set after the peer
+            // has already closed. In that case poll until the same deadline;
+            // queued reply bytes or EOF make the following read nonblocking.
+            if error.kind() != std::io::ErrorKind::InvalidInput {
+                return Err(error);
+            }
+            if !wait_for_socket_readable(&stream, deadline)? {
+                return Err(request_timeout(path, timeout));
+            }
+        }
+        match (&stream).read(&mut bytes) {
+            Ok(0) => break,
+            Ok(count) => {
+                let chunk = &bytes[..count];
+                let end = chunk.iter().position(|byte| *byte == b'\n');
+                let wire_count = end.map_or(count, |end| end + 1);
+                if line.len().saturating_add(wire_count) > limit {
+                    return Err(reply_too_large());
+                }
+                line.extend_from_slice(&chunk[..end.unwrap_or(count)]);
+                if end.is_some() {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(request_timeout(path, timeout));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let line = String::from_utf8(line)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(interpret(&line))
+}
+
+#[cfg(unix)]
+fn wait_for_socket_readable(stream: &Stream, deadline: Instant) -> std::io::Result<bool> {
+    use std::os::fd::{AsFd, AsRawFd};
+
+    let Stream::UdSocket(socket) = stream;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let milliseconds = remaining
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: socket.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut descriptor, 1, milliseconds) } {
+            ready if ready > 0 => return Ok(true),
+            0 => {}
+            _ => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn read_response_with_timeout(
+    path: &Path,
+    stream: Stream,
+    timeout: Duration,
+) -> std::io::Result<Response> {
+    // Named pipes do not support nonblocking reads. Keep the same handle in
+    // the reader and timeout path so CancelIoEx can release its pending read.
+    let stream = std::sync::Arc::new(stream);
+    let reader = std::sync::Arc::clone(&stream);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_stop = std::sync::Arc::clone(&stop);
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        if !reader_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = send.send(read_response(&reader));
+        }
+    });
+    match receive.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            ipc::stop_reader(&stream, &stop, || worker.is_finished());
+            let _ = worker.join();
+            Err(request_timeout(path, timeout))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = worker.join();
+            Err(std::io::Error::other(
+                "daemon response reader stopped unexpectedly",
+            ))
+        }
+    }
+}
+
+fn request_timeout(path: &Path, timeout: Duration) -> std::io::Error {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    #[cfg(unix)]
+    let pid = std::fs::read_to_string(&lock_path)
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u32>().ok());
+    #[cfg(windows)]
+    let pid: Option<u32> = None;
+    let recovery = match pid {
+        Some(pid) => format!(
+            "daemon pid {pid}; if it is stopped, run `kill -CONT {pid}` to resume it; if stuck, verify it is this daemon, run `kill {pid}`, then retry"
+        ),
+        None => format!(
+            "daemon pid unavailable (inspect {}); if it is stopped, resume it; if stuck, verify it is this daemon before killing it, then retry",
+            lock_path.display()
+        ),
+    };
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "timed out after {}s waiting for daemon response on socket {} ({recovery})",
+            timeout.as_secs(),
+            path.display()
+        ),
+    )
+}
+
+/// Send one request with a bounded wait for its local daemon reply. Waking the
+/// cloned stream interrupts the worker's pending read on Unix and Windows.
+pub fn request_with_timeout(
+    path: &Path,
+    request: &Request,
+    timeout: std::time::Duration,
+) -> std::io::Result<Response> {
+    let stream = ipc::connect(path)?;
+    let wake_stream = stream.try_clone()?;
+    let request = request.clone();
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+    let worker = std::thread::spawn(move || {
+        let result = send(&stream, &request).and_then(|()| read_response(&stream));
+        let _ = reply_tx.send(result);
+    });
+    match reply_rx.recv_timeout(timeout) {
+        Ok(result) => {
+            worker
+                .join()
+                .map_err(|_| std::io::Error::other("daemon request worker panicked"))?;
+            result
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            ipc::wake(&wake_stream);
+            let _ = worker.join();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "daemon request timed out",
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = worker.join();
+            Err(std::io::Error::other("daemon request worker stopped"))
+        }
+    }
 }
 
 fn send(mut stream: &Stream, request: &Request) -> std::io::Result<()> {
@@ -78,9 +279,47 @@ fn send(mut stream: &Stream, request: &Request) -> std::io::Result<()> {
 }
 
 fn read_response(stream: &Stream) -> std::io::Result<Response> {
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
+    let limit = max_reply_wire_bytes();
+    let mut reader = BufReader::new(stream.take(limit.saturating_add(1) as u64));
+    let mut bytes = Vec::with_capacity(8192);
+    reader.read_until(b'\n', &mut bytes)?;
+    if bytes.len() > limit {
+        return Err(reply_too_large());
+    }
+    let line = String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     Ok(interpret(&line))
+}
+
+fn reply_too_large() -> std::io::Error {
+    let limit = max_reply_wire_bytes();
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "daemon reply exceeds the {} MiB wire limit",
+            limit / (1024 * 1024)
+        ),
+    )
+}
+
+/// Read one bounded protocol line without buffering bytes beyond its newline.
+fn read_bounded_line(stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
+    let limit = max_reply_wire_bytes();
+    let mut line = Vec::with_capacity(limit.min(8192));
+    let mut byte = [0u8; 1];
+    while line.len() <= limit {
+        if stream.read(&mut byte)? == 0 {
+            break;
+        }
+        line.push(byte[0]);
+        if byte[0] == b'\n' {
+            break;
+        }
+    }
+    if line.len() > limit {
+        return Err(reply_too_large());
+    }
+    Ok(line)
 }
 
 /// What a daemon says when it cannot READ what we sent. Only the deserializer
@@ -93,7 +332,7 @@ const CANNOT_READ: &str = "bad request: ";
 /// a malformed request that is NOT skew must still say what it was.
 fn interpret(line: &str) -> Response {
     if line.trim().is_empty() {
-        return Response::error("the daemon hung up without answering");
+        return Response::error(EMPTY_REPLY_ERROR);
     }
     match serde_json::from_str::<Response>(line) {
         // We serialized that request from this binary's own `Request`, so a
@@ -114,13 +353,9 @@ fn interpret(line: &str) -> Response {
 /// this exact Windows pipe handle for the output pump so its detach wake can
 /// cancel the pending read on the same handle.
 fn read_protocol_line(stream: &mut impl Read) -> std::io::Result<String> {
-    let mut line = Vec::new();
-    let mut byte = [0u8; 1];
-    while stream.read(&mut byte)? != 0 {
-        if byte[0] == b'\n' {
-            break;
-        }
-        line.push(byte[0]);
+    let mut line = read_bounded_line(stream)?;
+    if line.last() == Some(&b'\n') {
+        line.pop();
     }
     String::from_utf8(line)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
@@ -337,15 +572,21 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                 let n = match read {
                     Ok(Some(n)) => n,
                     Ok(None) => {
-                        route_tokens(
-                            &path,
-                            &name,
-                            &mut stream,
-                            parser.flush_expired(),
-                            &mut mouse_on,
-                            &scrollback,
-                            &output_lock,
-                        );
+                        if mouse {
+                            route_tokens(
+                                &path,
+                                &name,
+                                &mut stream,
+                                parser.flush_expired(),
+                                &mut mouse_on,
+                                &scrollback,
+                                &output_lock,
+                            );
+                        } else {
+                            let paste_was_open = parser.paste_open();
+                            let _ = parser.flush_expired();
+                            let _ = close_raw_paste_if_needed(paste_was_open, &parser, &mut stream);
+                        }
                         continue;
                     }
                     Err(_) => break,
@@ -357,7 +598,8 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                     break;
                 }
                 trace_input_read(trace_input.as_deref(), &buf[..n]);
-                match buf[..n].iter().position(|&b| b == DETACH) {
+                let detach_at = detach_offset(&parser, &buf[..n]);
+                match detach_at {
                     // Forward what was typed before the detach key, then stop.
                     // Dropping those bytes would silently swallow input the
                     // user believes they sent.
@@ -373,18 +615,25 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                                 &output_lock,
                             );
                         } else if at > 0 {
+                            let _ = parser.feed(&buf[..at]);
                             let _ = stream.write_all(&buf[..at]);
                             let _ = stream.flush();
                         }
-                        route_tokens(
-                            &path,
-                            &name,
-                            &mut stream,
-                            parser.finish(),
-                            &mut mouse_on,
-                            &scrollback,
-                            &output_lock,
-                        );
+                        if mouse {
+                            route_tokens(
+                                &path,
+                                &name,
+                                &mut stream,
+                                parser.finish(),
+                                &mut mouse_on,
+                                &scrollback,
+                                &output_lock,
+                            );
+                        } else {
+                            let paste_was_open = parser.paste_open();
+                            let _ = parser.finish();
+                            let _ = close_raw_paste_if_needed(paste_was_open, &parser, &mut stream);
+                        }
                         detached.store(true, std::sync::atomic::Ordering::SeqCst);
                         break;
                     }
@@ -400,10 +649,30 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
                                 &output_lock,
                             );
                         } else {
+                            let _ = parser.feed(&buf[..n]);
                             let _ = stream.write_all(&buf[..n]);
                             let _ = stream.flush();
                         }
                     }
+                }
+            }
+            // stdin EOF/errors and child exit can end this thread mid-paste.
+            // Always restore the child parser before dropping its input pipe.
+            if parser.paste_open() {
+                if mouse {
+                    route_tokens(
+                        &path,
+                        &name,
+                        &mut stream,
+                        parser.finish(),
+                        &mut mouse_on,
+                        &scrollback,
+                        &output_lock,
+                    );
+                } else {
+                    let paste_was_open = parser.paste_open();
+                    let _ = parser.finish();
+                    let _ = close_raw_paste_if_needed(paste_was_open, &parser, &mut stream);
                 }
             }
             // Ends the screen pump below, which then returns from `attach` and
@@ -660,6 +929,31 @@ fn route_tokens(
     }
 }
 
+fn detach_offset(parser: &crate::mouse::SgrParser, bytes: &[u8]) -> Option<usize> {
+    if parser.paste_open()
+        && bytes == [DETACH]
+        && parser.paste_idle_at_least(std::time::Duration::from_secs(1))
+    {
+        // While a bracketed paste is live, Ctrl-\\ is data unless it arrives
+        // alone after the paste has gone idle.
+        Some(0)
+    } else {
+        parser.first_byte_outside_paste(bytes, DETACH)
+    }
+}
+
+fn close_raw_paste_if_needed<W: std::io::Write>(
+    was_open: bool,
+    parser: &crate::mouse::SgrParser,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    if was_open && !parser.paste_open() {
+        writer.write_all(b"\x1b[201~")?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
 fn exit_history_if_needed(
     path: &Path,
     name: &str,
@@ -791,9 +1085,9 @@ fn hold_inner(path: &Path, name: &str, drain_delay: std::time::Duration) -> std:
             name: name.to_string(),
         },
     )?;
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+    let mut reader = stream.try_clone()?;
+    let line = String::from_utf8(read_bounded_line(&mut reader)?)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     match interpret(&line) {
         Response::Ok => {}
         Response::Error(reason) => return Err(std::io::Error::other(reason)),
@@ -887,16 +1181,250 @@ impl Drop for RawMode {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
+    use super::request_with_timeout;
+    #[cfg(unix)]
     use super::trace_input_read;
+    use super::{close_raw_paste_if_needed, detach_offset, DETACH};
     use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
+    #[cfg(unix)]
+    use crate::ipc;
+    #[cfg(unix)]
+    use interprocess::local_socket::traits::ListenerExt;
+    #[cfg(unix)]
+    use remuda_core::protocol::Request;
     use remuda_core::protocol::Response;
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(unix)]
+    use std::sync::mpsc;
+    #[cfg(unix)]
+    use std::time::Instant;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn detach_inside_paste_requires_a_lone_ctrl_backslash_after_idle() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[200~payload").is_empty());
+        assert_eq!(detach_offset(&parser, &[DETACH]), None);
+        assert_eq!(detach_offset(&parser, &[b'x', DETACH]), None);
+        std::thread::sleep(Duration::from_millis(1010));
+        assert_eq!(detach_offset(&parser, &[DETACH]), Some(0));
+        assert!(
+            matches!(parser.finish().last(), Some(crate::mouse::InputToken::Paste(bytes)) if bytes.ends_with(b"\x1b[201~"))
+        );
+    }
+
+    #[test]
+    fn detach_byte_inside_single_read_paste_is_data() {
+        let parser = crate::mouse::SgrParser::default();
+        let paste = b"\x1b[200~ab\x1ccd\x1b[201~";
+        assert_eq!(detach_offset(&parser, paste), None);
+    }
+
+    #[test]
+    fn detach_byte_inside_paste_after_split_start_marker_is_data() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[20").is_empty());
+        let tail = b"0~ab\x1ccd\x1b[201~";
+        assert_eq!(detach_offset(&parser, tail), None);
+        assert!(parser
+            .feed(tail)
+            .iter()
+            .all(|token| matches!(token, crate::mouse::InputToken::Paste(_))));
+    }
+
+    #[test]
+    fn detach_after_paste_end_in_the_same_read_is_still_a_hotkey() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[200~body").is_empty());
+        let input = b"tail\x1b[201~x\x1c";
+        assert_eq!(detach_offset(&parser, input), Some(input.len() - 1));
+    }
+
+    #[test]
+    fn raw_mouse_disabled_recovery_closes_child_paste_after_timeout() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[200~raw bytes").is_empty());
+        let was_open = parser.paste_open();
+        // A timeout or detach transitions the parser to closed; raw mode has
+        // already forwarded its buffered content, so it only writes the end.
+        let _ = parser.finish();
+        let mut child_input = Vec::new();
+        close_raw_paste_if_needed(was_open, &parser, &mut child_input).unwrap();
+        assert_eq!(child_input, b"\x1b[201~");
+    }
+
+    #[cfg(unix)]
+    fn assert_request_timeout(request: Request) {
+        static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+        const TIMEOUT: Duration = Duration::from_millis(300);
+        const TEST_DEADLINE: Duration = Duration::from_secs(2);
+        let path = std::env::temp_dir().join(format!(
+            "remuda-timeout-{}-{}",
+            std::process::id(),
+            NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = ipc::listen(&path).expect("bind raw local listener");
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let stream = listener
+                .incoming()
+                .next()
+                .expect("incoming connection")
+                .expect("accept");
+            accepted_tx.send(()).expect("notify accepted");
+            release_rx.recv().expect("release silent peer");
+            drop(stream);
+        });
+
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let client_path = path.clone();
+        let client = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = request_with_timeout(&client_path, &request, TIMEOUT);
+            result_tx
+                .send((result, started.elapsed()))
+                .expect("report timed request");
+        });
+        accepted_rx
+            .recv_timeout(TEST_DEADLINE)
+            .expect("client did not connect to raw listener");
+
+        let result = result_rx.recv_timeout(TEST_DEADLINE);
+        // Release the peer even on failure: this lets a broken implementation
+        // that forgot to wake its blocked read finish before the assertion.
+        release_tx.send(()).expect("release silent peer");
+        server.join().expect("silent listener thread");
+        client.join().expect("timed request thread");
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&path);
+
+        let (result, elapsed) = result.expect("request_with_timeout exceeded test deadline");
+        let error = result.expect_err("silent listener unexpectedly produced a reply");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed >= TIMEOUT && elapsed < TEST_DEADLINE,
+            "timeout returned outside the expected window: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_timeout_wakes_a_peer_that_never_replies() {
+        assert_request_timeout(Request::Version);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_timeout_bounds_a_large_input_to_a_peer_that_never_reads() {
+        assert_request_timeout(Request::Input {
+            name: "target".into(),
+            instance_id: "instance".into(),
+            client_id: "client".into(),
+            seq: 1,
+            bytes: vec![b'x'; 64 * 1024],
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_daemon_response_wait_has_a_timeout() {
+        use interprocess::local_socket::traits::ListenerExt as _;
+        let path = std::env::temp_dir().join(format!(
+            "remuda-client-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = crate::ipc::listen(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let _stream = listener.incoming().next().unwrap().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let started = std::time::Instant::now();
+        let error =
+            request_with_timeout(&path, &Request::List, Duration::from_millis(40)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reply_reader_rejects_a_line_over_the_shared_reply_limit() {
+        use super::read_response;
+        use crate::ipc;
+        use crate::reply_limit::max_reply_wire_bytes;
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::Write;
+
+        let path = std::path::PathBuf::from(format!(
+            "/tmp/r-reply-{}-{}.sock",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = ipc::listen(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = listener.accept().unwrap();
+            let mut line = vec![b'x'; max_reply_wire_bytes() + 1];
+            line.push(b'\n');
+            let _ = stream.write_all(&line);
+        });
+        let stream = ipc::connect(&path).unwrap();
+        let result = read_response(&stream);
+        drop(stream);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert!(
+            result.is_err(),
+            "the client must reject an oversized reply line before parsing it"
+        );
+    }
 
     #[test]
     fn detach_resets_mouse_and_bracketed_paste_modes() {
         let mut output = Vec::new();
         reset_input_modes(&mut output).unwrap();
         assert_eq!(output, RESET_INPUT_MODES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_is_read_when_peer_closes_before_timeout_is_set() {
+        use super::read_response_with_timeout;
+        use crate::ipc;
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "remuda-client-close-before-timeout-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = ipc::listen(&path).unwrap();
+        let expected = Response::Value("immediate".into());
+        let server = std::thread::spawn({
+            let expected = expected.clone();
+            move || {
+                let mut stream = listener.accept().unwrap();
+                let mut line = serde_json::to_vec(&expected).unwrap();
+                line.push(b'\n');
+                stream.write_all(&line).unwrap();
+            }
+        });
+        let stream = ipc::connect(&path).unwrap();
+        server.join().unwrap();
+
+        let response = read_response_with_timeout(&path, stream, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(response, expected);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

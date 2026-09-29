@@ -97,10 +97,17 @@ every hook it thought it was replacing.
 `on`/`emit`/`clear_hooks` are general-purpose, the same way Emacs's
 `add-hook`/`run-hooks` presuppose nothing about which hook variable is being
 run — a caller may name its own events and call `emit` at whatever moment
-matters to it. remuda itself defines exactly one: `session_exited`, whose one
-positional argument is the dead session's name (a Lua string). It fires once
-per session the daemon notices has died, regardless of what triggered the
-detection — a tick, a `List`, or an `ls()` call.
+matters to it. remuda itself defines exactly one: `session_exited`. Its first
+positional argument is the dead session's name (a Lua string), preserving
+compatibility with existing one-argument handlers. The second argument is a
+table with `reason = "closed"` when an explicit Close request ended the
+session, or `reason = "exited"` when the child process ended. When known, the
+table also includes `exit_code` and/or numeric `signal` when known; a known
+signal name such as `SIGTERM` appears as `signal_name`. Explicit closes can
+terminate the child with a signal internally, but both signal fields are
+omitted when `reason` is `"closed"`. It fires once per session the daemon
+notices has died, regardless of what triggered the detection — a tick, a
+`List`, or an `ls()` call.
 
 `remuda.event_counts()` returns `{[event]=n}`, a shallow copy counting every
 `emit` call for that name, whether or not any hook is registered for it. A
@@ -153,6 +160,30 @@ lines, and buffers them; the Image only ever *receives* work, the same
 handler were already special cases of: something outside the Image posts a
 job, the Image runs it whenever its FIFO gets there, and nothing outside
 ever blocks waiting for that to happen.
+
+For short commands that need an immediate result, `remuda.process.run{argv=,
+stdin=, timeout=}` runs the executable directly, without a shell, and returns
+`{code, stdout, stderr, timed_out, signal?}`. `timeout` defaults to 5 seconds
+and cannot exceed 30; timeout kills the child and reports code 124. On Unix,
+`signal` gives the terminating signal when the child died from one. Each
+captured output stream retains up to 1 MiB of child output; if more arrives,
+the truncation marker is appended after that payload, outside the 1 MiB cap.
+This call is synchronous and blocks the daemon's single Lua Image: while it
+runs, the Image cannot serve RPCs or run hooks and schedules, so keep hook
+timeouts especially short. Keep the command short; use the
+asynchronous `remuda.process{...}` form for longer work.
+The child inherits the daemon's current working directory and full environment,
+including any credentials or secrets in that environment. On Windows and Unix,
+timeout kills the contained process tree (a Windows Job or Unix process group).
+When a leader exits with its output pipes still open, Remuda also terminates
+that tree. A descendant that escapes a Unix
+process group with `setsid` can still hold an inherited output pipe and leave
+a background reader alive after the call returns. At most 16 output-reader
+workers may be active (eight such calls); further `process.run` calls fail
+with a clear limit error until the readers finish. The call itself still
+returns by its deadline. If a Unix leader exits while a `setsid` descendant
+keeps its output pipe open, `process.run` waits until that deadline, returns
+the leader's exit code with `timed_out=false`, and may return incomplete output.
 
 The buffer between the reader thread and the Image is capped, on purpose.
 When it fills, the reader thread simply stops reading — the child's own

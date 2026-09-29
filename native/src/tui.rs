@@ -22,7 +22,6 @@ use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
 use remuda_core::Size;
 use std::collections::HashMap;
-#[cfg(not(test))]
 use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -103,6 +102,9 @@ enum WordClass {
 pub struct Ui {
     pub sessions: Vec<SessionSummary>,
     pub selected: usize,
+    /// A mouse selection can move focus without making the list scroll under
+    /// the pointer. Keyboard navigation resumes selection-following scroll.
+    list_first_visible: Option<usize>,
     pub pan: u16,
     /// `None` follows the normal content-aware width; `Some` is a user drag.
     pub list_width: Option<u16>,
@@ -163,6 +165,7 @@ impl Ui {
         Self {
             sessions,
             selected: 0,
+            list_first_visible: None,
             pan: 0,
             list_width: None,
             list_visible: true,
@@ -204,20 +207,45 @@ impl Ui {
 
     /// Keep the cursor on a real row after the herd changes underneath it.
     pub fn clamp(&mut self) {
+        let selected = self.selected;
         if self.selected >= self.sessions.len() {
             self.selected = self.sessions.len().saturating_sub(1);
         }
+        if self.selected != selected {
+            self.track_list_selection();
+        }
+    }
+
+    fn track_list_selection(&mut self) {
+        let Some(first) = self.list_first_visible else {
+            return;
+        };
+        let visible = (self.preview_rows as usize / self.session_rows).max(1);
+        let max_first = self.sessions.len().saturating_sub(visible);
+        let mut first = first.min(max_first);
+        if self.selected < first {
+            first = self.selected;
+        } else if self.selected >= first.saturating_add(visible) {
+            first = self.selected.saturating_sub(visible - 1);
+        }
+        self.list_first_visible = Some(first.min(max_first));
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
-        if self.focus == Focus::Session {
-            return self.session_key(key);
+        let selected = self.selected;
+        let action = if self.focus == Focus::Session {
+            self.session_key(key)
+        } else {
+            match self.mode.clone() {
+                Mode::Prompt(buffer) => self.prompt_key(key, buffer),
+                Mode::Confirm(name) => self.confirm_key(key, name),
+                Mode::Browse => self.browse_key(key),
+            }
+        };
+        if self.selected != selected {
+            self.track_list_selection();
         }
-        match self.mode.clone() {
-            Mode::Prompt(buffer) => self.prompt_key(key, buffer),
-            Mode::Confirm(name) => self.confirm_key(key, name),
-            Mode::Browse => self.browse_key(key),
-        }
+        action
     }
 
     /// A press in the list column switches to that row's session, even if
@@ -376,10 +404,12 @@ impl Ui {
         if row < 1 || row > body {
             return Action::Nothing;
         }
-        let index = ((row - 1) as usize / self.session_rows) + list_viewport(self, body);
+        let viewport = list_viewport(self, body);
+        let index = ((row - 1) as usize / self.session_rows) + viewport;
         if index >= self.sessions.len() {
             return Action::Nothing;
         }
+        self.list_first_visible = Some(viewport);
         self.selected = index;
         self.pan = 0;
         self.focus_session()
@@ -472,7 +502,12 @@ impl Ui {
     pub fn follow_focus(&mut self, name: Option<&str>) {
         let Some(name) = name else { return };
         match self.sessions.iter().position(|s| s.name == name && s.alive) {
-            Some(at) => self.selected = at,
+            Some(at) => {
+                if self.selected != at {
+                    self.selected = at;
+                    self.track_list_selection();
+                }
+            }
             // With sessions closing themselves on exit, this is how a ride
             // ordinarily ends: you type `exit`, and you are on the list.
             None => self.focus = Focus::List,
@@ -1527,7 +1562,9 @@ mod visual_mode_tests {
             ),
             Ok(Response::Value(_))
         ));
-        let capture_deadline = Instant::now() + Duration::from_secs(5);
+        // ConPTY can take several seconds to launch the shell and flush its
+        // first output on a loaded Windows CI worker.
+        let capture_deadline = Instant::now() + Duration::from_secs(30);
         let (cells, wrapped) = loop {
             let (cells, wrapped, _, _, _) = capture_styled(&path, name, 0).expect("real capture");
             let captured: String = cells[0].iter().map(|cell| cell.text.as_str()).collect();
@@ -1538,7 +1575,7 @@ mod visual_mode_tests {
                 Instant::now() < capture_deadline,
                 "fixture text not captured: {captured:?}"
             );
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(25));
         };
         assert_eq!(cells[0].iter().filter(|cell| cell.wide).count(), 6);
 
@@ -1568,7 +1605,14 @@ mod visual_mode_tests {
         press(&mut ui, "vb");
         assert_eq!(at(&ui), TextPoint { row: 0, col: 15 });
 
-        let _ = crate::client::request(&path, &Request::Close { name: name.into() });
+        let _ = crate::client::request(
+            &path,
+            &Request::Close {
+                name: name.into(),
+                instance_id: None,
+                confirm: None,
+            },
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2244,16 +2288,24 @@ fn list_viewport(ui: &Ui, body: u16) -> usize {
     if visible == 0 {
         return 0;
     }
-    ui.selected
-        .saturating_sub(visible - 1)
-        .min(ui.sessions.len().saturating_sub(visible))
+    let max_first = ui.sessions.len().saturating_sub(visible);
+    let follows_selection = ui.selected.saturating_sub(visible - 1).min(max_first);
+    let Some(first) = ui.list_first_visible.map(|first| first.min(max_first)) else {
+        return follows_selection;
+    };
+    if ui.selected >= first && ui.selected < first.saturating_add(visible) {
+        first
+    } else {
+        follows_selection
+    }
 }
 
-/// The current size requested for the selected session panel. `Size::new`
-/// still floors it at 80×24 so agent TUIs retain a usable compositor.
+/// The current size requested for the selected session panel. The pane opts
+/// out of the column floor so the child lays out to the visible width; the
+/// ordinary `Size::new` path keeps its 80-column safety floor.
 pub fn pane_size(ui: &Ui, cols: u16, rows: u16) -> Size {
     let (_, preview_w) = ui_layout(ui, cols);
-    Size::new(preview_w, rows.saturating_sub(1))
+    Size::for_pane(preview_w, rows.saturating_sub(1))
 }
 
 /// A row that degrades instead of being cut. When the preview claims most of
@@ -2460,7 +2512,7 @@ fn refresh(
     if !skip_list && ui.daemon_gone.is_none() {
         sync_shown_session(path, ui, shown, selection_moved);
     }
-    resize_shown_session(path, ui, shown, cols, rows);
+    resize_held_shown_session(path, ui, shown, held, cols, rows);
     let (cells, wrapped, cursor) = if ui.daemon_gone.is_some() {
         (Vec::new(), Vec::new(), hidden)
     } else {
@@ -2542,20 +2594,70 @@ fn resize_shown_session(
     path: &Path,
     ui: &mut Ui,
     shown: &Option<ShownTarget>,
+    held_name: Option<&str>,
     cols: u16,
     rows: u16,
 ) {
-    if let Some(ShownTarget::Session(name)) = shown.as_ref() {
-        let target = pane_size(ui, cols, rows);
+    resize_shown_session_with(ui, shown, held_name, cols, rows, |name, target| {
+        resize(path, name, target)
+    });
+}
+
+fn resize_held_shown_session(
+    path: &Path,
+    ui: &mut Ui,
+    shown: &Option<ShownTarget>,
+    held: &Option<(String, Hold)>,
+    cols: u16,
+    rows: u16,
+) {
+    resize_shown_session(
+        path,
+        ui,
+        shown,
+        held.as_ref().map(|(name, _)| name.as_str()),
+        cols,
+        rows,
+    );
+}
+
+fn resize_shown_session_with(
+    ui: &mut Ui,
+    shown: &Option<ShownTarget>,
+    held_name: Option<&str>,
+    cols: u16,
+    rows: u16,
+    mut send_resize: impl FnMut(&str, Size) -> Result<(), String>,
+) {
+    if let Some((name, target)) = shown_session_resize_target(ui, shown, held_name, cols, rows) {
         if ui.last_resized.as_ref() != Some(&(name.clone(), target)) {
-            match resize(path, name, target) {
-                Ok(()) => ui.last_resized = Some((name.clone(), target)),
+            match send_resize(&name, target) {
+                Ok(()) => ui.last_resized = Some((name, target)),
                 Err(e) => ui.notice = Some(format!("{name}: {e}")),
             }
         }
     } else {
         ui.last_resized = None;
     }
+}
+
+/// Only an actively held session is attached to this pane. A session shown
+/// while list-focused is a preview, so its PTY keeps its creation or last
+/// attached size even when the client itself is narrow.
+fn shown_session_resize_target(
+    ui: &Ui,
+    shown: &Option<ShownTarget>,
+    held_name: Option<&str>,
+    cols: u16,
+    rows: u16,
+) -> Option<(String, Size)> {
+    if ui.focus != Focus::Session {
+        return None;
+    }
+    let Some(ShownTarget::Session(name)) = shown.as_ref() else {
+        return None;
+    };
+    (held_name == Some(name.as_str())).then(|| (name.clone(), pane_size(ui, cols, rows)))
 }
 
 /// Enables SGR mouse reporting on construction, disables it on drop — for
@@ -2576,9 +2678,66 @@ impl Drop for MouseCapture {
     }
 }
 
+struct BracketedPasteCapture<W: Write> {
+    output: W,
+    enabled: bool,
+}
+
+impl<W: Write> BracketedPasteCapture<W> {
+    fn new(output: W) -> Self {
+        Self {
+            output,
+            enabled: false,
+        }
+    }
+
+    fn set(&mut self, enabled: bool) -> std::io::Result<()> {
+        if self.enabled == enabled {
+            return Ok(());
+        }
+        if enabled {
+            crossterm::execute!(&mut self.output, crossterm::event::EnableBracketedPaste)?;
+        } else {
+            crossterm::execute!(&mut self.output, crossterm::event::DisableBracketedPaste)?;
+        }
+        self.enabled = enabled;
+        Ok(())
+    }
+}
+
+impl<W: Write> Drop for BracketedPasteCapture<W> {
+    fn drop(&mut self) {
+        if self.enabled {
+            let _ = crossterm::execute!(&mut self.output, crossterm::event::DisableBracketedPaste);
+        }
+    }
+}
+
+fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
+    let text: String = text
+        .chars()
+        .filter(|character| {
+            let codepoint = *character as u32;
+            matches!(codepoint, 0x09 | 0x0a | 0x0d)
+                || (0x20..=0x7e).contains(&codepoint)
+                || codepoint >= 0xa0
+        })
+        .collect();
+    let mut bytes = Vec::new();
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[200~");
+    }
+    bytes.extend_from_slice(text.as_bytes());
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[201~");
+    }
+    bytes
+}
+
 /// Draw the herd until the user quits. One screen for the whole run: focus
 /// moves between the panes, and the terminal is never handed over, so the
 /// alternate screen is entered exactly once. `notice` is what stderr cannot reach.
+#[allow(clippy::too_many_lines)]
 pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result<()> {
     let _terminal = RawMode::enable()?;
     // Scoped to the herd screen, not `RawMode` itself: `attach` uses `RawMode`
@@ -2599,6 +2758,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     // The exclusive hold on the focused session, and the name it was taken on.
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
     let mut held: Option<(String, Hold)> = None;
+    let mut paste_capture = BracketedPasteCapture::new(std::io::stdout());
     // What the window last reported showing — refreshed only on a
     // non-skip_list wake, and reused as-is on a Type-forced one.
     let mut shown: Option<ShownTarget> = None;
@@ -2632,6 +2792,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 skip_list,
                 selection_moved,
             )?;
+            paste_capture.set(held.is_some())?;
             skip_list = false;
             selection_moved = false;
         }
@@ -2649,6 +2810,20 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 let action = ui.on_key(key);
                 selection_moved = ui.selected != before;
                 action
+            }
+            Event::Paste(text) => {
+                // Crossterm emits this only after finding the matching end
+                // marker; it buffers an unterminated host paste internally.
+                let Some((name, _)) = &held else { continue };
+                match client::request(path, &Request::MouseState { name: name.clone() }) {
+                    Ok(Response::MouseState(state)) => {
+                        Action::Type(paste_input(&text, state.bracketed_paste))
+                    }
+                    other => {
+                        ui.notice = Some(format!("{name}: cannot determine paste mode: {other:?}"));
+                        Action::Nothing
+                    }
+                }
             }
             Event::Mouse(m) => ui.on_mouse(m, cols, rows),
             Event::Resize(_, _) => {
@@ -3291,6 +3466,8 @@ fn resize(path: &Path, name: &str, size: Size) -> Result<(), String> {
 fn kill(path: &Path, name: &str) -> Result<(), String> {
     let request = Request::Close {
         name: name.to_string(),
+        instance_id: None,
+        confirm: None,
     };
     match client::request(path, &request) {
         Ok(Response::Ok) => Ok(()),

@@ -185,26 +185,31 @@ fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> S
 
     match client::request(socket, &request) {
         Err(e) => ok_reply(id, tool_error(&format!("{e}"))),
-        Ok(Response::Error(reason)) => {
+        Ok(response) => call_response(id, response),
+    }
+}
+
+fn call_response(id: Value, response: Response) -> String {
+    match response {
+        Response::Error(reason) => {
             let reason = crate::image::typed_failure_message(&reason)
                 .map(|(_, message)| message.to_string())
                 .unwrap_or(reason);
             ok_reply(id, tool_error(&reason))
         }
-        Ok(Response::Screen(screen)) => ok_reply(id, tool_text(&screen)),
+        Response::Screen(screen) => ok_reply(id, tool_text(&screen)),
         // No MCP tool asks for `CaptureStyled`, so this never arrives — spelled
         // out rather than a wildcard for the same reason as `Response::Value`
         // below: a real caller appearing later is a compile error to notice.
-        Ok(Response::StyledScreen { .. }) => {
+        Response::StyledScreen { .. } => {
             ok_reply(id, tool_error("styled capture is not exposed over MCP"))
         }
+        Response::Sync { .. } => ok_reply(id, tool_error("Sync is not exposed over MCP")),
         // No MCP tool asks for the directory verbs either — same reasoning.
-        Ok(Response::Entries(_)) => {
+        Response::Entries(_) => {
             ok_reply(id, tool_error("directory listing is not exposed over MCP"))
         }
-        Ok(Response::MouseState(_)) => {
-            ok_reply(id, tool_error("mouse state is not exposed over MCP"))
-        }
+        Response::MouseState(_) => ok_reply(id, tool_error("mouse state is not exposed over MCP")),
         // This arm used to say `TOOLS` exposes no eval, deliberately — because
         // MCP was the door for the agent running *inside* a session, and giving
         // it the image would let it rewrite the manager holding it. **The
@@ -214,29 +219,66 @@ fn call(socket: &Path, id: Value, params: &Value, capability: Option<&str>) -> S
         // precedent being that claude-code-ide.el offers `emacs eval` too. So
         // the arm the old comment called unreachable is now the common one, and
         // the decision it left open was made rather than dropped. `steps/013`.
-        Ok(Response::Value(value)) => ok_reply(id, tool_text(&value)),
-        Ok(Response::Ok) => ok_reply(id, tool_text("ok")),
-        Ok(Response::AttachStarted { .. } | Response::AttachStatus { .. }) => {
+        Response::Value(value) => ok_reply(id, tool_text(&value)),
+        Response::CommandResult { .. } => ok_reply(
+            id,
+            tool_error("deferred replies are not supported by MCP tool calls"),
+        ),
+        Response::Ok => ok_reply(id, tool_text("ok")),
+        Response::AttachStarted { .. } | Response::AttachStatus { .. } => {
             ok_reply(id, tool_error("attach responses are not exposed over MCP"))
         }
-        Ok(Response::Sessions(sessions)) => {
-            let rows: Vec<String> = sessions
-                .iter()
-                .map(|s| {
-                    format!(
-                        "{}\t{}x{}\talive={}\tidle={:.0}s\toutput_idle={:.0}s",
-                        s.name,
-                        s.size.cols(),
-                        s.size.rows(),
-                        s.alive,
-                        s.idle.as_secs_f64(),
-                        s.output_idle.unwrap_or(s.idle).as_secs_f64()
-                    )
-                })
-                .collect();
-            ok_reply(id, tool_text(&rows.join("\n")))
-        }
+        Response::Ack { duplicate } => ok_reply(
+            id,
+            tool_text(if duplicate {
+                "already applied"
+            } else {
+                "applied"
+            }),
+        ),
+        response @ (Response::Uncertain
+        | Response::WrongInstance
+        | Response::RateLimited
+        | Response::Busy
+        | Response::WriteTimeout
+        | Response::RemoteControlDisabled) => input_error_reply(id, input_error_message(&response)),
+        Response::SyncAtCapacity => ok_reply(id, tool_error("Sync is at capacity; retry shortly")),
+        Response::Sessions(sessions) => ok_reply(id, sessions_text(sessions)),
     }
+}
+
+fn input_error_reply(id: Value, message: &str) -> String {
+    ok_reply(id, tool_error(message))
+}
+
+fn input_error_message(response: &Response) -> &'static str {
+    match response {
+        Response::Uncertain => "input outcome is uncertain; bytes may be partial or late",
+        Response::WrongInstance => "session instance changed",
+        Response::RateLimited => "session input rate limit exceeded",
+        Response::Busy => "session input is busy",
+        Response::WriteTimeout => "session PTY write timed out; delivery may be partial or late",
+        Response::RemoteControlDisabled => "remote control disabled on this node",
+        _ => unreachable!("only input errors are passed here"),
+    }
+}
+
+fn sessions_text(sessions: Vec<remuda_core::SessionSummary>) -> Value {
+    let rows: Vec<String> = sessions
+        .iter()
+        .map(|session| {
+            format!(
+                "{}\t{}x{}\talive={}\tidle={:.0}s\toutput_idle={:.0}s",
+                session.name,
+                session.size.cols(),
+                session.size.rows(),
+                session.alive,
+                session.idle.as_secs_f64(),
+                session.output_idle.unwrap_or(session.idle).as_secs_f64()
+            )
+        })
+        .collect();
+    tool_text(&rows.join("\n"))
 }
 
 /// What `tools/list` returns: the frame's own, then the image's registry. A

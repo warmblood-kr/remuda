@@ -950,7 +950,12 @@ fn check_requirement(owner: &str, dependency: &str, constraint: &str) -> Result<
             "mod {owner} requires {dependency}, which is not installed"
         ));
     }
-    let spec = read_manifest(&path)?;
+    let spec = read_manifest(&path).map_err(|error| {
+        format!(
+            "mod {owner} requires {dependency}, but its manifest at {} is unreadable (partially installed or mid-update?): {error}",
+            path.display()
+        )
+    })?;
     let met = satisfies(&spec.version, constraint)
         .map_err(|error| format!("mod {owner} requires {dependency} {constraint}, but installed {dependency} {} is unreadable: {error}", spec.version))?;
     if !met {
