@@ -1,6 +1,29 @@
 # Two-node cluster demo
 
-Use two terminals with the same ENABLE build and separate private runtimes. Replace `$D` with a private directory under `/private/tmp`; create `$D/a` and `$D/b` with mode `700`, each with private `home`, `runtime`, `xdg-runtime`, `xdg-state`, `xdg-config`, `xdg-data`, and `xdg-cache` directories. In each terminal export `HOME`, `REMUDA_RUNTIME_DIR`, and the XDG variables to that node's corresponding directories, then use `remuda -s node-a` in A and `remuda -s node-b` in B. Initialize both nodes with `cluster init`; note A's printed node name. On A enable input with `cluster control on`, then create a `demo` session with `remuda -s node-a -e 'remuda.session.new("demo", {"sh", "-c", "while IFS= read -r line; do printf '\''FROM_B:%s\\n'\'' "$line"; done"})'`. Start `cluster listen --bind 127.0.0.1:7441` on A and `cluster listen --bind 127.0.0.1:7442` on B, each in its own terminal, and keep them running. The invite in step 1 supplies the live fingerprint and one-line invite used in step 2.
+Open two terminals with the ENABLE build on `PATH`. Paste this setup in both, choosing A's or B's directory at the last line:
+
+```sh
+D=/private/tmp/remuda-cluster-demo
+umask 077
+mkdir -p "$D/a" "$D/b"
+use_node() {
+  local node_dir=$1
+  export HOME="$node_dir/home"
+  export REMUDA_RUNTIME_DIR="$node_dir/runtime"
+  export XDG_RUNTIME_DIR="$node_dir/xdg-runtime"
+  export XDG_STATE_HOME="$node_dir/xdg-state"
+  export XDG_CONFIG_HOME="$node_dir/xdg-config"
+  export XDG_DATA_HOME="$node_dir/xdg-data"
+  export XDG_CACHE_HOME="$node_dir/xdg-cache"
+  mkdir -p "$HOME" "$REMUDA_RUNTIME_DIR" "$XDG_RUNTIME_DIR" \
+    "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
+  chmod 700 "$node_dir" "$HOME" "$REMUDA_RUNTIME_DIR" "$XDG_RUNTIME_DIR" \
+    "$XDG_STATE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME"
+}
+use_node "$D/a" # Use "$D/b" in terminal B
+```
+
+Initialize A with `remuda -s node-a cluster init` and B with `remuda -s node-b cluster init`; note A's printed node name. On A enable input with `remuda -s node-a cluster control on`, then create a `demo` session with `remuda -s node-a -e 'remuda.session.new("demo", {"sh", "-c", "while IFS= read -r line; do printf '\''FROM_B:%s\\n'\'' "$line"; done"})'`. Start `remuda -s node-a cluster listen --bind 127.0.0.1:7441` on A and `remuda -s node-b cluster listen --bind 127.0.0.1:7442` on B, each in its own terminal, and keep them running. The invite in step 1 supplies the live fingerprint and one-line invite used in step 2.
 
 1. On A, run `remuda -s node-a cluster invite --bind 127.0.0.1:7441`.
    Expected: A prints its node fingerprint and a one-line `remuda-join-v1` invite.
