@@ -12,6 +12,7 @@ pub mod cluster_remote;
 pub mod cluster_tui;
 pub mod daemon;
 pub mod dist;
+pub(crate) mod fs_atomic;
 pub mod image;
 pub mod ipc;
 pub mod json;
@@ -27,6 +28,7 @@ pub mod pty;
 pub mod remote_front;
 pub mod reply_limit;
 pub mod script;
+pub mod text;
 pub mod tick;
 pub mod tui;
 

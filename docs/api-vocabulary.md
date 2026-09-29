@@ -12,7 +12,7 @@ The proposal does not change behavior. Owner approval #206 fixes the first imple
 
 ### Core Lua surface
 
-The inventory below covers every name in `native/src/script.rs` `BINDINGS` (69 names), including the names added by `native/src/tools.lua`. Purely local Lua functions are implementation details and are outside the public `remuda.*` surface. The public table and registry should eventually be derived from these classifications.
+The inventory below covers every name in `native/src/script.rs` `BINDINGS` (76 names), including the names added by `native/src/tools.lua`. Purely local Lua functions are implementation details and are outside the public `remuda.*` surface. The public table and registry should eventually be derived from these classifications.
 
 | Current name(s) | Class | What it does / proposal |
 |---|---|---|
@@ -20,7 +20,7 @@ The inventory below covers every name in `native/src/script.rs` `BINDINGS` (69 n
 | `send`, `insert`, `key`, `click`, `feed` | Primitive | Deliver line, bytes, key, pointer, or timed input steps. Promote to `remuda.input.line/insert/key/click/feed`; `send` remains a deprecated alias for `input.line`. |
 | `capture`, `capture_styled` | Primitive | Read plain or styled terminal content. Promote to `remuda.screen.capture/styled`; styled capture includes cursor and style runs. |
 | `attach` | Primitive | Give a human the terminal connection. Promote to `remuda.session.attach`. |
-| `list_dir`, `mkdir`, `remove_dir_all` | Primitive | List, create, and recursively remove filesystem directories. Promote to `remuda.fs.list_dir/mkdir/remove_tree`; retain `remove_dir_all` alias to preserve its explicit destructive meaning. |
+| `list_dir`, `mkdir`, `remove_dir_all`, `fs.write_atomic` | Primitive | List, create, remove filesystem directories, and atomically replace a file. Promote to `remuda.fs.list_dir/mkdir/remove_tree/write_atomic`; retain `remove_dir_all` alias to preserve its explicit destructive meaning. |
 | `sleep`, `fail` | Primitive | Pause the Lua image or deliberately fail its caller. Promote to `remuda.runtime.sleep/fail`. |
 | `exec`, `reload` | Composite | Load or lifecycle-reload an installed mod. Promote to `remuda.module.exec/reload`. |
 | `type_text` | Composite | Type a string and optionally wait for settling; built on `feed`/input primitives. Promote to `remuda.input.type_text`. |
@@ -121,7 +121,7 @@ The protocol is deliberately lower than the Lua word set: Lua `send` uses `SendL
 | `remuda.session` | `list`, `new`, `close`, `attach`; callable table for `session(name)` | Session identity and lifecycle; `__call` preserves the existing handle constructor. |
 | `remuda.input` | `line`, `insert`, `key`, `click`, `feed`, `type_text` | Distinguishes input kinds and composes type-text behavior from atomic input. |
 | `remuda.screen` | `capture`, `styled`, `expect`, `expect_option` | Reading and acting on screen observations. |
-| `remuda.fs` | `list_dir`, `mkdir`, `remove_tree` | Filesystem primitives named by intent. |
+| `remuda.fs` | `list_dir`, `mkdir`, `remove_tree`, `write_atomic` | Filesystem primitives named by intent; `write_atomic` replaces one target without following a target symlink. |
 | `remuda.runtime` | `sleep`, `fail`, `registry` (read-only) | Runtime controls and supported introspection. |
 | `remuda.module` | `exec`, `reload` | Module loading and lifecycle. |
 | `remuda.hook` | `on`, `emit*`, `list`, `clear`, `counts` | Event registration and dispatch vocabulary. |
