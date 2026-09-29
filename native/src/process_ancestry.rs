@@ -73,6 +73,24 @@ pub(crate) fn resolve_caller(
     peer_pid: io::Result<Option<u32>>,
     sessions: &[(String, u32)],
 ) -> CallerOrigin {
+    #[cfg(windows)]
+    {
+        return match peer_pid {
+            Ok(Some(pid)) if pid > 1 => match process_parents() {
+                Ok(parents) => resolve_caller_with(pid, sessions, std::process::id(), |pid| {
+                    parents.get(&pid).copied().map(Some).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("process {pid} is not in the process snapshot"),
+                        )
+                    })
+                }),
+                Err(_) => CallerOrigin::Unknown,
+            },
+            Ok(Some(_)) | Ok(None) | Err(_) => CallerOrigin::Unknown,
+        };
+    }
+    #[cfg(not(windows))]
     match peer_pid {
         Ok(Some(pid)) if pid > 1 => {
             resolve_caller_with(pid, sessions, std::process::id(), parent_pid)
@@ -117,6 +135,21 @@ pub(crate) fn missing_peer_requires_refusal(self_reported_identity: bool) -> boo
 }
 
 pub(crate) fn is_self_or_descendant(pid: u32, ancestors: &[u32]) -> Ancestry {
+    #[cfg(windows)]
+    {
+        return match process_parents() {
+            Ok(parents) => walk_ancestry(pid, ancestors, std::process::id(), |pid| {
+                parents.get(&pid).copied().map(Some).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("process {pid} is not in the process snapshot"),
+                    )
+                })
+            }),
+            Err(error) => Ancestry::Unreadable { pid, error },
+        };
+    }
+    #[cfg(not(windows))]
     walk_ancestry(pid, ancestors, std::process::id(), parent_pid)
 }
 
@@ -196,8 +229,8 @@ fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
 }
 
 #[cfg(windows)]
-fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+fn process_parents() -> io::Result<std::collections::HashMap<u32, u32>> {
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
@@ -222,17 +255,18 @@ fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
     if unsafe { Process32FirstW(handle, &mut entry) } == 0 {
         return Err(io::Error::last_os_error());
     }
+    let mut parents = std::collections::HashMap::new();
     loop {
-        if entry.th32ProcessID == pid {
-            return Ok(Some(entry.th32ParentProcessID));
-        }
+        parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
         if unsafe { Process32NextW(handle, &mut entry) } == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("process {pid} is not in the process snapshot"),
-            ));
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(ERROR_NO_MORE_FILES as i32) {
+                return Err(error);
+            }
+            break;
         }
     }
+    Ok(parents)
 }
 
 #[cfg(test)]

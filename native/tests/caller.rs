@@ -17,15 +17,15 @@ fn caller_identifies_a_client_running_inside_a_managed_session() {
     let socket = daemon::socket_path_in(&runtime, "s");
     let _daemon = spawn::Daemon::spawn(&runtime);
     let result_path = runtime.join("caller.txt");
+    // Lua accepts forward slashes on Windows; raw `Path::display()` backslashes
+    // become escape sequences in the Lua string passed through the shell.
+    let result_path_lua = result_path.to_string_lossy().replace('\\', "/");
     let lua = format!(
         "remuda.caller=function() return {{kind='outside'}} end; remuda.extension_command('probe', function(_, caller) local f=assert(io.open('{}','w')); f:write(tostring(caller.session), ':', caller.kind); f:close() end); return remuda._dispatch_extension_command('probe')",
-        result_path.display()
+        result_path_lua
     );
-    let command = format!(
-        "sleep 0.2; {} -s s -e \"{lua}\"",
-        env!("CARGO_BIN_EXE_remuda"),
-        lua = lua
-    );
+    let remuda = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let command = format!("sleep 0.2; \"{remuda}\" -s s -e \"{lua}\"", lua = lua);
     assert_eq!(
         remuda_native::client::request(
             &socket,
