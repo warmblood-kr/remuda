@@ -430,7 +430,8 @@ mod tests {
                 event,
                 MouseState {
                     mode: MouseMode::Press,
-                    encoding: MouseEncoding::Sgr
+                    encoding: MouseEncoding::Sgr,
+                    bracketed_paste: false,
                 }
             ),
             None
@@ -440,7 +441,8 @@ mod tests {
                 event,
                 MouseState {
                     mode: MouseMode::PressRelease,
-                    encoding: MouseEncoding::Sgr
+                    encoding: MouseEncoding::Sgr,
+                    bracketed_paste: false,
                 }
             )
             .unwrap(),
@@ -454,7 +456,8 @@ mod tests {
                 },
                 MouseState {
                     mode: MouseMode::Press,
-                    encoding: MouseEncoding::Default
+                    encoding: MouseEncoding::Default,
+                    bracketed_paste: false,
                 }
             )
             .unwrap(),
@@ -469,7 +472,8 @@ mod tests {
                 },
                 MouseState {
                     mode: MouseMode::PressRelease,
-                    encoding: MouseEncoding::Sgr
+                    encoding: MouseEncoding::Sgr,
+                    bracketed_paste: false,
                 }
             ),
             None
@@ -511,6 +515,7 @@ mod tests {
                 MouseState {
                     mode: MouseMode::Press,
                     encoding: MouseEncoding::Sgr,
+                    bracketed_paste: false,
                 },
                 true,
                 0,
