@@ -294,6 +294,16 @@ local bad_timeout = pcall(function()
   remuda.process.run({ argv = echo_argv, timeout = 31 })
 end)
 assert(not bad_timeout, "process.run must reject a timeout above the 30-second hard cap")
+local caller = remuda.caller()
+assert(type(caller) == "table", "remuda.caller must return a table")
+local caller_kind_ok = caller.kind == "outside"
+if package.config:sub(1, 1) == "\\" then
+  -- Windows parent PIDs are advisory and can be stale/unreadable after an
+  -- ancestor exits; fail closed as unknown rather than claiming a session.
+  caller_kind_ok = caller_kind_ok or caller.kind == "unknown"
+end
+assert(caller_kind_ok, "a client outside managed sessions must not be a session; got " .. tostring(caller.kind))
+assert(caller.session == nil, "an outside caller has no managed session")
 local absent_readiness = remuda._module_readiness("api-v5-no-ready-declaration")
 assert(absent_readiness.status == "ready",
   "a missing readiness declaration must preserve immediate completion")

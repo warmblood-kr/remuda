@@ -1138,6 +1138,7 @@ fn handle(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_request(
     stream: Stream,
     reader: BufReader<Stream>,
@@ -1260,7 +1261,10 @@ fn handle_request(
         Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
         Request::RemoveDirAll { path: dir } => reply(&stream, &remove_dir_all(&dir)),
 
-        Request::Eval { code, name } => handle_eval(stream, reader, image, &code, name.as_deref()),
+        Request::Eval { code, name } => {
+            let caller = caller_context(&stream, registry);
+            handle_eval(stream, reader, image, &code, name.as_deref(), caller)
+        }
     }
 }
 
@@ -1320,8 +1324,9 @@ fn handle_eval(
     image: &Image,
     code: &str,
     name: Option<&str>,
+    caller: crate::image::CallerContext,
 ) -> std::io::Result<()> {
-    match image.eval_request(code, name) {
+    match image.eval_request(code, name, caller) {
         Ok(value) => match image.pending_replies().pending_id(&value) {
             Some(id) => deferred_reply(stream, reader, image, id),
             None if value.len() > crate::reply_limit::MAX_REPLY_BYTES => reply(
@@ -1337,6 +1342,23 @@ fn handle_eval(
         // Lua's own message, which already carries the line and a traceback —
         // the same treatment `remuda run` gives a script file.
         Err(error) => reply(&stream, &Response::error(error)),
+    }
+}
+
+fn caller_context(stream: &Stream, registry: &Registry) -> crate::image::CallerContext {
+    match process_ancestry::resolve_caller(
+        process_ancestry::peer_pid(stream),
+        &registry.live_processes(),
+    ) {
+        process_ancestry::CallerOrigin::Session(name) => crate::image::CallerContext {
+            kind: crate::image::CallerKind::Session,
+            session: Some(name),
+        },
+        process_ancestry::CallerOrigin::Outside => crate::image::CallerContext {
+            kind: crate::image::CallerKind::Outside,
+            session: None,
+        },
+        process_ancestry::CallerOrigin::Unknown => crate::image::CallerContext::default(),
     }
 }
 
