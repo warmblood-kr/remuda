@@ -13,6 +13,7 @@ pub enum QueueState {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingBatch {
+    pub remote_node: Option<String>,
     pub name: String,
     pub instance_id: String,
     pub client_id: String,
@@ -25,12 +26,19 @@ pub struct PendingBatch {
     rate_retries: u32,
 }
 
+pub struct InputTarget {
+    pub remote_node: Option<String>,
+    pub name: String,
+    pub instance_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SendOutcome {
     Ack { duplicate: bool },
     Uncertain,
     WrongInstance,
     RateLimited,
+    RemoteControlDisabled,
     Error(String),
     IoFailure(String),
 }
@@ -42,6 +50,7 @@ pub enum QueueEvent {
     Uncertain { seq: u64, reason: String },
     Dropped { seq: u64, reason: String },
     Failed { seq: u64, reason: String },
+    RemoteControlDisabled { seq: u64, node: String },
 }
 
 pub const MAX_IO_RETRIES: u8 = 3;
@@ -61,9 +70,31 @@ impl InputQueue {
         bytes: Vec<u8>,
         now: Instant,
     ) {
+        self.enqueue_target(
+            InputTarget {
+                remote_node: None,
+                name,
+                instance_id,
+            },
+            client_id,
+            seq,
+            bytes,
+            now,
+        );
+    }
+
+    pub fn enqueue_target(
+        &mut self,
+        target: InputTarget,
+        client_id: String,
+        seq: u64,
+        bytes: Vec<u8>,
+        now: Instant,
+    ) {
         self.batches.push_back(PendingBatch {
-            name,
-            instance_id,
+            remote_node: target.remote_node,
+            name: target.name,
+            instance_id: target.instance_id,
             client_id,
             seq,
             bytes,
@@ -88,6 +119,7 @@ impl InputQueue {
 
     pub fn restart_waiting_target(
         &mut self,
+        remote_node: Option<&str>,
         name: &str,
         instance_id: &str,
         client_id: &str,
@@ -95,6 +127,7 @@ impl InputQueue {
         let mut next_seq = 1;
         for batch in &mut self.batches {
             if batch.name == name
+                && batch.remote_node.as_deref() == remote_node
                 && batch.instance_id == instance_id
                 && batch.state == QueueState::Waiting
             {
@@ -104,6 +137,36 @@ impl InputQueue {
             }
         }
         next_seq
+    }
+
+    pub fn drop_waiting_target(
+        &mut self,
+        remote_node: Option<&str>,
+        name: &str,
+        instance_id: &str,
+        reason: &str,
+    ) {
+        for batch in &mut self.batches {
+            if batch.name == name
+                && batch.remote_node.as_deref() == remote_node
+                && batch.instance_id == instance_id
+                && batch.state == QueueState::Waiting
+            {
+                batch.state = QueueState::Dropped;
+                batch.status = reason.into();
+            }
+        }
+        self.prune_finished();
+    }
+
+    pub fn drop_waiting_node(&mut self, node: &str, reason: &str) {
+        for batch in &mut self.batches {
+            if batch.remote_node.as_deref() == Some(node) && batch.state == QueueState::Waiting {
+                batch.state = QueueState::Dropped;
+                batch.status = reason.into();
+            }
+        }
+        self.prune_finished();
     }
 
     pub fn begin_due(&mut self, now: Instant) -> Option<PendingBatch> {
@@ -149,6 +212,14 @@ impl InputQueue {
                 SendOutcome::RateLimited => {
                     batch.rate_retries = batch.rate_retries.saturating_add(1);
                     schedule_retry(batch, now, "rate limited; retrying")
+                }
+                SendOutcome::RemoteControlDisabled => {
+                    batch.state = QueueState::Failed;
+                    batch.status = "remote control disabled".into();
+                    Some(QueueEvent::RemoteControlDisabled {
+                        seq,
+                        node: batch.remote_node.clone().unwrap_or_default(),
+                    })
                 }
                 SendOutcome::IoFailure(detail) if batch.io_retries < MAX_IO_RETRIES => {
                     batch.io_retries += 1;
