@@ -87,6 +87,10 @@
 <p><code>fail(message, code?) -&gt; never (default code 1; valid codes are 1..255)</code> — Raise a deliberate CLI failure with a message and exit code.</p>
 <h2 id="feed">feed</h2>
 <p><code>feed(name, steps) -&gt; nil</code> — Deliver a sequence of bursts and pauses as one indivisible act.</p>
+<h2 id="fs">fs</h2>
+<p><code>table</code> — Atomic replacement of files for trusted Lua callers.</p>
+<h2 id="fs.write_atomic">fs.write_atomic</h2>
+<p><code>fs.write_atomic(path, bytes) -&gt; true, nil | nil, error</code> — Write bytes through a same-directory temporary file and atomically replace the target.</p>
 <h2 id="hook_list">hook_list</h2>
 <p><code>hook_list(event?) -&gt; {{event, group, id, depth, owner, src, errors, last_error}...}</code> — Copies of the registered hooks, for one event or all, in run order.</p>
 <h2 id="hooks">hooks</h2>
