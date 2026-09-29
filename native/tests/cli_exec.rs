@@ -102,12 +102,6 @@ fn cli_exec_waits_for_lifecycle_readiness_and_reports_failures() {
         "ready_timeout",
         &declaration("ready = function() return nil end, timeout_ms = 50,"),
     );
-    write_mod(
-        "invalid_timeout",
-        &declaration("ready = function() return nil end, timeout_ms = 0,"),
-    );
-    write_mod("timeout_without_ready", &declaration("timeout_ms = 1000,"));
-
     let remuda = |args: &[&str]| -> Output {
         Command::new(env!("CARGO_BIN_EXE_remuda"))
             .args(["-s", "s"])
@@ -169,6 +163,51 @@ fn cli_exec_waits_for_lifecycle_readiness_and_reports_failures() {
         b"mod ready_timeout did not become ready within 0.05s\n"
     );
 
+    remuda(&["stop", "-f"]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cli_exec_reports_timeout_declaration_errors_cleanly() {
+    let dir = std::env::temp_dir().join(format!("rc-ready-timeout-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    for (name, fields) in [
+        (
+            "invalid_timeout",
+            "ready = function() return nil end, timeout_ms = 0,",
+        ),
+        ("timeout_without_ready", "timeout_ms = 1000,"),
+    ] {
+        let mod_dir = dir.join(format!("data/remuda/mods/{name}"));
+        fs::create_dir_all(mod_dir.join(format!("packages/{name}"))).unwrap();
+        fs::write(
+            mod_dir.join("extension.toml"),
+            format!(
+                "name = \"{name}\"\nentry = \"packages/{name}/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(
+            mod_dir.join(format!("packages/{name}/init.lua")),
+            format!(
+                "return {{ api = \"remuda-module-v1\", state_version = 1, initialize = function() return {{}} end, {fields} }}"
+            ),
+        )
+        .unwrap();
+    }
+    let remuda = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(["-s", "s"])
+            .args(args)
+            .env("REMUDA_RUNTIME_DIR", &dir)
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("HOME", &dir)
+            .output()
+            .expect("run remuda")
+    };
+
+    let boot = remuda(&["-e", "return remuda.session.list()"]);
+    assert!(boot.status.success(), "boot private daemon: {boot:?}");
     let invalid_timeout = remuda(&["exec", "invalid_timeout"]);
     assert_eq!(
         invalid_timeout.status.code(),
@@ -179,7 +218,6 @@ fn cli_exec_waits_for_lifecycle_readiness_and_reports_failures() {
         invalid_timeout.stderr,
         b"module timeout_ms must be an integer from 1 through 240000\n"
     );
-
     let timeout_without_ready = remuda(&["exec", "timeout_without_ready"]);
     assert_eq!(
         timeout_without_ready.status.code(),
