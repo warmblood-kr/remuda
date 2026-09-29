@@ -2148,6 +2148,31 @@ fn capture_styled(path: &Path, name: &str, scrollback: usize) -> String {
     }
 }
 
+fn capture_styled_snapshot(path: &Path, name: &str, scrollback: usize) -> (String, usize, usize) {
+    match client::request(
+        path,
+        &Request::CaptureStyled {
+            name: name.to_string(),
+            scrollback,
+        },
+    ) {
+        Ok(Response::StyledScreen {
+            rows,
+            scrollback_len,
+            scrollback_total,
+            ..
+        }) => (
+            rows.into_iter()
+                .map(|row| row.into_iter().map(|run| run.text).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            scrollback_len,
+            scrollback_total,
+        ),
+        other => panic!("styled capture failed: {other:?}"),
+    }
+}
+
 fn wait_for(path: &Path, name: &str, needle: &str) -> String {
     let deadline = Instant::now() + PATIENCE;
     loop {
@@ -3179,6 +3204,74 @@ fn direct_attach_mouse_scrolls_the_full_history_and_returns_to_live_output() {
             .count()
             == 1,
         "live output should resume exactly once after the historical repaint"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_keeps_scrolled_content_anchored_as_output_arrives() {
+    let dir = scratch_dir("attach-scroll-anchor");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "i=0; while [ $i -lt 40 ]; do printf 'seed-%03d\\n' \"$i\"; i=$((i+1)); done; sleep 2; i=0; while [ $i -lt 4 ]; do printf 'burst-%03d\\n' \"$i\"; i=$((i+1)); sleep 0.15; done; sleep 2".into(),
+        },
+    )
+    .expect("start output stream");
+    wait_for(&path, "target", "seed-039");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "seed-039");
+
+    held.write_raw(b"\x1b[<64;10;10M").expect("wheel up");
+    let _ = collect_until_bytes(&output, b"[scrollback: 3 rows");
+    let anchor_line = viewer
+        .screen_text()
+        .expect("viewer screen")
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("seed-"))
+        .expect("visible seed row")
+        .to_string();
+    let (anchor_view, _, anchor_total) = capture_styled_snapshot(&path, "target", 3);
+
+    wait_for(&path, "target", "burst-003");
+    let (_, history_rows, latest_total) = capture_styled_snapshot(&path, "target", 0);
+    assert!(latest_total > anchor_total, "history did not advance");
+    let expected_offset = 3usize
+        .saturating_add(latest_total.saturating_sub(anchor_total))
+        .min(history_rows);
+    let expected_indicator = format!("[scrollback: {expected_offset} rows");
+    let _ = collect_until_bytes(&output, expected_indicator.as_bytes());
+
+    let (anchored_view, _, _) = capture_styled_snapshot(&path, "target", expected_offset);
+    assert_eq!(
+        anchored_view, anchor_view,
+        "the captured history anchor moved"
+    );
+    let visible_screen = viewer.screen_text().expect("viewer screen after output");
+    let visible_line = visible_screen
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("seed-"))
+        .expect("visible anchored seed row")
+        .to_string();
+    assert_eq!(
+        visible_line, anchor_line,
+        "direct attach moved the visible row"
     );
 }
 
