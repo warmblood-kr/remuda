@@ -149,8 +149,8 @@ fn wait_for_socket_readable(stream: &Stream, deadline: Instant) -> std::io::Resu
             return Ok(false);
         }
         let milliseconds = remaining
-            .as_millis()
-            .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
+            .as_nanos()
+            .div_ceil(1_000_000)
             .min(i32::MAX as u128) as i32;
         let mut descriptor = libc::pollfd {
             fd: socket.as_fd().as_raw_fd(),
