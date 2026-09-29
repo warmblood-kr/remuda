@@ -1221,10 +1221,36 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
 
 #[cfg(test)]
 mod binding_tests {
-    use super::BINDINGS;
+    use super::{fs_bindings, BINDINGS};
+    use mlua::Lua;
 
     #[test]
     fn binding_names_are_sorted_and_unique() {
         assert!(BINDINGS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mkdir_new_creates_a_private_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = format!("/private/tmp/remuda-mkdir-new-{}-{nonce}", std::process::id());
+        let lua = Lua::new();
+        let remuda = lua.create_table().unwrap();
+        fs_bindings(&lua, &remuda).unwrap();
+        lua.globals().set("remuda", remuda).unwrap();
+        lua.globals().set("target", path.as_str()).unwrap();
+
+        lua.load("assert(remuda.fs.mkdir_new(target) == true)")
+            .exec()
+            .unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        std::fs::remove_dir(&path).unwrap();
+        assert_eq!(mode, 0o700, "new directories must be owner-only");
     }
 }

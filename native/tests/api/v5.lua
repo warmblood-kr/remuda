@@ -292,7 +292,17 @@ local made, mkdir_error = fs.mkdir_new(mkdir_path)
 assert(made == true and mkdir_error == nil, tostring(mkdir_error))
 made, mkdir_error = fs.mkdir_new(mkdir_path)
 assert(made == nil and mkdir_error == "exists", "second mkdir_new call must report exists")
-assert(os.remove(mkdir_path), "test directory cleanup failed")
+assert(remuda.remove_dir_all(mkdir_path) == nil, "test directory cleanup failed")
+local trailing_path = os.tmpname()
+os.remove(trailing_path)
+local separator = package.config:sub(1, 1)
+local trailing_made, trailing_error = fs.mkdir_new(trailing_path .. separator)
+if trailing_made then remuda.remove_dir_all(trailing_path) end
+assert(trailing_made == nil and type(trailing_error) == "string",
+  "trailing separators must be rejected")
+local relative_made, relative_error = fs.mkdir_new(".")
+assert(relative_made == nil and type(relative_error) == "string" and relative_error ~= "exists",
+  "relative paths must be rejected")
 local file_path = os.tmpname()
 local file = assert(io.open(file_path, "wb"))
 file:close()
