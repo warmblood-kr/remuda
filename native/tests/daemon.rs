@@ -3190,7 +3190,7 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
     let dir = scratch_dir("attach-mouse-forward");
     let path = daemon::socket_path_in(&dir, "default");
     let _daemon = daemon_at(&path);
-    let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006h'; dd bs=1 count=12 2>/dev/null | od -An -tx1; printf '\\nmouse-forwarded\\n'";
+    let script = "stty raw -echo; printf '\\033[?1000h\\033[?1006h\\033[?2004h'; dd bs=1 count=12 2>/dev/null | od -An -tx1; printf '\\nmouse-forwarded\\n'";
     let created = client::request(
         &path,
         &Request::New {
@@ -3215,6 +3215,7 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
             Ok(Response::MouseState(MouseState {
                 mode: MouseMode::PressRelease,
                 encoding: MouseEncoding::Sgr,
+                bracketed_paste: true,
             })) => break,
             other => {
                 assert!(

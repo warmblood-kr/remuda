@@ -94,6 +94,15 @@ assert(type(remuda.pending) == "function", "remuda.pending is missing")
 assert(remuda._registry.pending ~= nil, "remuda.pending needs a registry entry")
 assert(remuda._pending_replies == nil, "pending manager internals must remain private")
 
+local input = remuda.input
+assert(type(input) == "table", "remuda.input is missing")
+assert(type(input.text) == "function", "remuda.input.text is missing")
+assert(type(input.submit) == "function", "remuda.input.submit is missing")
+assert(type(input.type_text) == "function", "remuda.input.type_text is missing")
+assert(remuda._registry["input.text"] ~= nil, "remuda.input.text needs a registry entry")
+assert(remuda._registry["input.submit"] ~= nil, "remuda.input.submit needs a registry entry")
+assert(remuda._registry["input.type_text"] ~= nil, "remuda.input.type_text needs a registry entry")
+
 local bad_timeout = pcall(remuda.pending, { timeout = 301 })
 assert(not bad_timeout, "pending timeout must not exceed 300 seconds")
 
@@ -108,6 +117,7 @@ end
 local name = "api-v5-" .. tostring(os.time())
 local opened = session.new(name, { "sh" })
 assert(opened == name, "session.new must preserve new's return value")
+assert(input.submit(name, "") == "submitted", "an empty input.submit must return quickly")
 local found = false
 for _, row in ipairs(session.list()) do
   if row.name == name then found = true end
