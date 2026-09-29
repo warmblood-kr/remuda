@@ -102,6 +102,11 @@ fn cli_exec_waits_for_lifecycle_readiness_and_reports_failures() {
         "ready_timeout",
         &declaration("ready = function() return nil end, timeout_ms = 50,"),
     );
+    write_mod(
+        "invalid_timeout",
+        &declaration("ready = function() return nil end, timeout_ms = 0,"),
+    );
+    write_mod("timeout_without_ready", &declaration("timeout_ms = 1000,"));
 
     let remuda = |args: &[&str]| -> Output {
         Command::new(env!("CARGO_BIN_EXE_remuda"))
@@ -162,6 +167,28 @@ fn cli_exec_waits_for_lifecycle_readiness_and_reports_failures() {
     assert_eq!(
         timed_out.stderr,
         b"mod ready_timeout did not become ready within 0.05s\n"
+    );
+
+    let invalid_timeout = remuda(&["exec", "invalid_timeout"]);
+    assert_eq!(
+        invalid_timeout.status.code(),
+        Some(1),
+        "{invalid_timeout:?}"
+    );
+    assert_eq!(
+        invalid_timeout.stderr,
+        b"module timeout_ms must be an integer from 1 through 240000\n"
+    );
+
+    let timeout_without_ready = remuda(&["exec", "timeout_without_ready"]);
+    assert_eq!(
+        timeout_without_ready.status.code(),
+        Some(1),
+        "{timeout_without_ready:?}"
+    );
+    assert_eq!(
+        timeout_without_ready.stderr,
+        b"module timeout_ms requires a ready function\n"
     );
 
     remuda(&["stop", "-f"]);

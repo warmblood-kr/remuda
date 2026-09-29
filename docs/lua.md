@@ -213,6 +213,9 @@ readiness deadline; it defaults to 30000 and must be an integer from 1 through
 Failure exits 1 and prints `mod NAME failed to become ready: message`; timeout
 exits 124 and prints `mod NAME did not become ready within Ns`. Keep the
 callback quick: each Eval still has the daemon's 305-second client deadline.
+Ctrl-C during this wait abandons only the CLI wait; it does not cancel startup
+or deactivate the module. `start` has already run once, and a later
+`remuda exec NAME` resumes checking readiness without running `start` again.
 Mods without `ready` keep today's immediate-success behavior. This is a
 declaration field alongside `start` and `stop`, not another `remuda.*` word:
 

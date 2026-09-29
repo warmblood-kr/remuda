@@ -1050,10 +1050,28 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
         Ok(Some(_)) => {
             let code = format!("remuda.exec({})", remuda_native::mcp::lua_string(name));
             if let Err(error) = remuda_native::script::run_source(path, "=remuda exec", &code) {
-                return fail(error);
+                return fail_exec(error);
             }
             wait_for_module_ready(path, name)
         }
+    }
+}
+
+/// Declaration mistakes are user-facing exec failures, not useful Lua
+/// tracebacks. Keep their messages stable and single-line at the CLI boundary.
+fn fail_exec(error: String) -> ExitCode {
+    const CLEAN_DECLARATION_ERRORS: [&str; 2] = [
+        "module timeout_ms must be an integer from 1 through 240000",
+        "module timeout_ms requires a ready function",
+    ];
+    if let Some(message) = CLEAN_DECLARATION_ERRORS
+        .iter()
+        .find(|message| error.contains(**message))
+    {
+        eprintln!("{message}");
+        ExitCode::FAILURE
+    } else {
+        fail(error)
     }
 }
 
