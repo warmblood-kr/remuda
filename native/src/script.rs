@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 81] = [
+pub const BINDINGS: [&str; 82] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -38,6 +38,7 @@ pub const BINDINGS: [&str; 81] = [
     "_function_source",
     "_input_submit",
     "_input_text",
+    "_input_type_text",
     "_module_readiness",
     "_pending_create",
     "_pending_events",
@@ -124,6 +125,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_input_text",
         "Deliver a normalized text burst, bracketed when enabled by the child.",
         "_input_text(name, text) -> nil",
+    ),
+    (
+        "_input_type_text",
+        "Deliver text and submit it while holding one input lock.",
+        "_input_type_text(name, text, settle?) -> nil",
     ),
     (
         "_module_readiness",
@@ -476,6 +482,26 @@ pub fn bindings(
                 .submit(&expect)
                 .map_err(|error| mlua::Error::runtime(error.to_string()))
         })?,
+    )?;
+    let type_text_registry = input_registry.clone();
+    table.set(
+        "_input_type_text",
+        lua.create_function(
+            move |_, (name, text, settle): (String, String, Option<f64>)| {
+                let settle = settle.unwrap_or(0.1);
+                if !settle.is_finite() || !(0.0..=5.0).contains(&settle) {
+                    return Err(mlua::Error::runtime(
+                        "settle must be between 0 and 5 seconds",
+                    ));
+                }
+                let session = type_text_registry
+                    .get(&name)
+                    .ok_or_else(|| mlua::Error::runtime(format!("no such session: {name}")))?;
+                session
+                    .type_text(&text, Duration::from_secs_f64(settle))
+                    .map_err(|error| mlua::Error::runtime(error.to_string()))
+            },
+        )?,
     )?;
 
     // Named keys, in Emacs's `kbd` notation. An unknown name is raised, not

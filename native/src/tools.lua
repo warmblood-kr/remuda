@@ -1799,31 +1799,22 @@ register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments
 -- separately-timed submit key after the composer shows the text.
 remuda.input = {}
 
-local function normalized_text(text)
-  return tostring(text):gsub("\r\n?", "\n"):gsub("\27", "")
-end
-
 function remuda.input.text(session, text)
-  remuda._input_text(session, normalized_text(text))
+  remuda._input_text(session, tostring(text))
 end
 
 register("input", "Terminal input words for text delivery and submission.", "table")
 register("input.text", "Deliver text as one burst, using bracketed paste when enabled by the child.", "input.text(session, text) -> nil")
 
 function remuda.input.submit(session, expect)
-  remuda._input_submit(session, normalized_text(expect))
+  remuda._input_submit(session, tostring(expect))
 end
 
 register("input.submit", "Submit visible composer text with a separate Return and at most one retry.", "input.submit(session, expect) -> nil")
 
--- Composite retained for compatibility: type text, honor the minimum settle
--- pause, then submit it through the bounded visibility check.
+-- Composite: hold the session input lock across text, settle, and submission.
 function remuda.type_text(session, text, settle)
-  local body = normalized_text(text)
-  settle = settle or 0.1
-  remuda.input.text(session, body)
-  if settle > 0 then remuda.sleep(settle) end
-  remuda.input.submit(session, body)
+  remuda._input_type_text(session, tostring(text), settle or 0.1)
 end
 remuda.input.type_text = remuda.type_text
 register("input.type_text", "Type text, honor the settle pause, then submit it.", "input.type_text(session, text, settle?) -> nil")
