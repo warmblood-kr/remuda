@@ -4,7 +4,7 @@
 
 Remuda already has the right atoms: protocol `Request` variants, Rust-bound Lua operations, pure Lua tools, and Butler workflows. Their names currently sit together on `remuda`, while reusable mod interfaces are often hidden behind `_`. Make the vocabulary visible in layers: atomic session operations under `remuda.session`, higher-level terminal interactions under `remuda.input` and `remuda.screen`, reusable framework words under `remuda.hook`, `remuda.schedule`, `remuda.process`, `remuda.module`, and `remuda.tool`, and Butler's supported interface under `remuda.butler`. Keep implementation state and dispatch machinery private. For each promotion, add the new name first, retain the old spelling as a deprecated alias with a notice, then remove only in a later breaking API version.
 
-The proposal does not change behavior. Owner approval #206 fixes the first implementation scope: the `remuda.session` table remains callable through `__call`, its established nested words join `list/new/close/attach`, and only the named Butler vocabulary in the approved list below becomes public this round.
+Owner approval #206 fixes the first implementation scope: the `remuda.session` table remains callable through `__call`, its established nested words join `list/new/close/attach`, and only the named Butler vocabulary in the approved list below becomes public this round. The resize operation is added as another `remuda.session` primitive, with bounded dimensions.
 
 ## Inventory and classification
 
@@ -12,7 +12,7 @@ The proposal does not change behavior. Owner approval #206 fixes the first imple
 
 ### Core Lua surface
 
-The inventory below covers every name in `native/src/script.rs` `BINDINGS` (76 names), including the names added by `native/src/tools.lua`. Purely local Lua functions are implementation details and are outside the public `remuda.*` surface. The public table and registry should eventually be derived from these classifications.
+The inventory below covers every name in `native/src/script.rs` `BINDINGS` (78 names), including the names added by `native/src/tools.lua`. Purely local Lua functions are implementation details and are outside the public `remuda.*` surface. The public table and registry should eventually be derived from these classifications.
 
 | Current name(s) | Class | What it does / proposal |
 |---|---|---|
@@ -27,7 +27,7 @@ The inventory below covers every name in `native/src/script.rs` `BINDINGS` (76 n
 | `expect`, `expect_option` | Composite | Observe a screen, select and perform a matching branch/action; `expect_option` selects from a screen and match set. Promote under `remuda.screen.expect` and `remuda.screen.expect_option`. |
 | `buffer`, `buffers` | Existing namespace + registry | `remuda.buffer` is already a namespace table with `new`, `set`, and `list`; `remuda.buffers` is its registry. Preserve these nested words and use them as the in-repo precedent for the proposed namespace tables. |
 | `window`, `windows` | Existing namespace + registry | `remuda.window` is already a namespace table with `current`; `remuda.windows` is its registry. Preserve these nested words and use them as the in-repo precedent for the proposed namespace tables. |
-| `session` (Lua helper) | Composite | `remuda.session(name)` returns a handle by name, with `buffer` and `is_busy` properties. It does not return Butler session detail; `session_detail` is a separate Butler hook. The approved `remuda.session` namespace is a callable table (`__call` preserves `remuda.session(name)`) with nested `list`, `new`, `close`, `attach`, and the existing session-handle words. |
+| `session` (Lua helper) | Composite | `remuda.session(name)` returns a handle by name, with `buffer` and `is_busy` properties. It does not return Butler session detail; `session_detail` is a separate Butler hook. The approved `remuda.session` namespace is a callable table (`__call` preserves `remuda.session(name)`) with nested `list`, `new`, `close`, `attach`, `resize`, and the existing session-handle words. |
 | `schedule`, `cancel`, `schedules` | Composite + registry | Register repeating work, cancel a handle, and inspect schedules. Promote to `remuda.schedule.every/cancel/registry`; `schedule` remains an alias during migration. |
 | `tool`, `tools` | Composite + registry | Register an MCP tool word and inspect tool definitions. Promote to `remuda.tool.define/registry`. |
 | `on`, `emit`, `emit_until_success`, `emit_until_failure`, `emit_filter` | Composite | Register event handlers and dispatch/broadcast/filter values. Promote to `remuda.hook.on/emit/emit_until_success/emit_until_failure/emit_filter`. |
