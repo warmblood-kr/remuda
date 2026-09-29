@@ -48,6 +48,59 @@ fn wait_screen(path: &Path, name: &str, needle: &str) -> String {
 }
 
 #[test]
+fn empty_type_text_sends_only_return_in_bracketed_paste_mode() {
+    let dir = scratch("empty-submit");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&socket, &dir);
+    let fake = dir.join("empty_agent.py");
+    std::fs::write(
+        &fake,
+        r#"import os, select, sys, termios, tty, time
+fd = sys.stdin.fileno()
+tty.setraw(fd)
+os.write(1, b'\x1b[?2004hREADY')
+data = bytearray()
+deadline = time.monotonic() + 1.0
+while time.monotonic() < deadline:
+    ready, _, _ = select.select([fd], [], [], 0.05)
+    if ready:
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        data.extend(chunk)
+if data == b'\r':
+    os.write(1, b'\r\nBARE_RETURN')
+else:
+    os.write(1, b'\r\nBYTES:' + data.hex().encode())
+time.sleep(2)
+"#,
+    )
+    .unwrap();
+
+    client::request(
+        &socket,
+        &Request::New {
+            name: Some("empty-agent".into()),
+            command: vec!["python3".into(), fake.display().to_string()],
+            size: Size::new(80, 24),
+            cwd: Some(dir.display().to_string()),
+            env: None,
+        },
+    )
+    .expect("start fake paste agent");
+    wait_screen(&socket, "empty-agent", "READY");
+
+    script::run_source(
+        &socket,
+        "input-unit-empty-submit",
+        "remuda.type_text('empty-agent', '')",
+    )
+    .expect("submit an empty body");
+    let screen = wait_screen(&socket, "empty-agent", "BARE_RETURN");
+    assert!(screen.contains("BARE_RETURN"), "unexpected bytes: {screen}");
+}
+
+#[test]
 fn type_text_submits_paste_once_and_preserves_embedded_newline() {
     let dir = scratch("submit");
     let socket = daemon::socket_path_in(&dir, "s");
