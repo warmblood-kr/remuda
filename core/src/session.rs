@@ -418,9 +418,9 @@ impl Session {
             if raw != before_raw {
                 if compact_screen(&raw) == before_compact {
                     composer_newline = true;
-                    break;
+                } else {
+                    return Ok(InputSubmitOutcome::Submitted);
                 }
-                return Ok(InputSubmitOutcome::Submitted);
             }
             let remaining = deadline.saturating_sub(self.clock.now());
             let timeout = remaining.min(Duration::from_millis(50));
