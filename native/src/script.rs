@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 79] = [
+pub const BINDINGS: [&str; 81] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -47,9 +47,11 @@ pub const BINDINGS: [&str; 79] = [
     "_registry",
     "_registry_dump",
     "_run_due_schedules",
+    "_run_schedule",
     "_schedule_fire_counts",
     "_session_resize",
     "_sync_window_shown",
+    "_take_due_schedules",
     "advice_list",
     "advice_member",
     "advise",
@@ -550,11 +552,17 @@ pub(crate) fn bindings(
     registry_bindings(lua, &table)?;
     process_bindings(lua, &table, image)?;
 
-    // Blocks the WHOLE Image, not just this call: the interpreter is pinned to
-    // one thread (image.rs), so a sleeping script stalls every other job —
-    // the REPL, `-e`, any other script — for the full duration. Not a wait or
-    // a timer primitive; remuda has no periodic-execution mechanism yet, and
-    // faking one with a sleep-and-poll loop holds the Image hostage the same way.
+    // Blocks the whole Image while this Rust call sleeps. The Lua instruction
+    // budget does not count time spent in Rust bindings, C-library functions,
+    // or Lua 5.4 `__gc` finalizers (which run with hooks disabled); it bounds
+    // Lua VM instructions only. A long `string.find` backtrack or `string.rep`
+    // can therefore still occupy the image until that call returns. Loops of
+    // cheap Rust/C binding calls take longer to reach the 200M-instruction
+    // limit too, and the hook cannot interrupt one blocking call.
+    // Each coroutine create/resume also reserves 10K instructions; this caps
+    // generators at roughly 20K such operations in one job.
+    // This is not a wait or timer primitive; remuda has no periodic-execution
+    // mechanism yet, and a sleep-and-poll loop holds the Image hostage too.
     sleep_binding(lua, &table)?;
 
     Ok(table)

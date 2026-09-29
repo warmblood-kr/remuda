@@ -7,10 +7,9 @@
 //! thread that owns it outright, and every other thread reaches it by posting a
 //! job and waiting for the answer. A thread serving a queue is an event loop.
 //!
-//! Unlike Emacs, a long-running script freezes nothing else: sessions here are
-//! not Lua objects but Rust structs behind their own locks, pumped by threads
-//! that never touch Lua. A script that loops forever makes only the *next Lua
-//! caller* wait — pty output keeps being read, `remuda ls` keeps answering.
+//! Lua work is bounded by an instruction-count hook shared by the main state
+//! and its coroutines. Rust calls and C-library functions run outside that
+//! count; sessions remain Rust structs behind their own locks.
 //!
 //! ⚠ The corollary, named now so it is not discovered as a deadlock later: an
 //! output pump may never *call into* Lua. If `on_output(session, fn)` is ever
@@ -18,9 +17,10 @@
 
 use crate::reply_limit::MAX_REPLY_BYTES;
 use crate::script;
-use mlua::Lua;
-use std::cell::RefCell;
-use std::collections::HashMap;
+use mlua::debug::Debug;
+use mlua::{HookTriggers, Lua, Thread, VmState};
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ffi::c_void;
 use std::fmt;
@@ -33,6 +33,131 @@ use std::sync::{Arc, Condvar, Mutex};
 // `Response::Error` remains a plain string on the wire. This reserved control
 // prefix carries typed failures to the CLI without changing ordinary errors.
 const TYPED_FAILURE_PREFIX: &str = "\u{1e}REMUDA_FAIL:";
+const LUA_HOOK_INTERVAL: u32 = 10_000;
+// About 0.6 seconds at the measured 360M instructions/second in release builds.
+const LUA_INSTRUCTION_LIMIT: u64 = 200_000_000;
+const LUA_EXECUTION_LIMIT_MESSAGE: &str = "Lua execution limit exceeded";
+
+#[derive(Clone, Default)]
+struct LuaExecutionBudget {
+    depth: Rc<Cell<usize>>,
+    instructions: Rc<Cell<u64>>,
+    expired: Rc<Cell<bool>>,
+    coroutines: Rc<RefCell<Vec<Thread>>>,
+    coroutine_pointers: Rc<RefCell<HashSet<usize>>>,
+}
+
+struct LuaExecutionGuard<'lua> {
+    lua: &'lua Lua,
+    depth: Rc<Cell<usize>>,
+    instructions: Rc<Cell<u64>>,
+    expired: Rc<Cell<bool>>,
+    coroutines: Rc<RefCell<Vec<Thread>>>,
+    coroutine_pointers: Rc<RefCell<HashSet<usize>>>,
+}
+
+impl Drop for LuaExecutionGuard<'_> {
+    fn drop(&mut self) {
+        let depth = self.depth.get().saturating_sub(1);
+        self.depth.set(depth);
+        if depth == 0 {
+            self.lua.remove_hook();
+            for thread in self.coroutines.borrow().iter() {
+                thread.remove_hook();
+            }
+            self.coroutines.borrow_mut().clear();
+            self.coroutine_pointers.borrow_mut().clear();
+            self.instructions.set(0);
+            self.expired.set(false);
+        }
+    }
+}
+
+impl LuaExecutionBudget {
+    fn hook(&self) -> impl Fn(&Lua, &Debug) -> mlua::Result<VmState> + 'static {
+        let instructions = Rc::clone(&self.instructions);
+        let expired = Rc::clone(&self.expired);
+        move |_, _| {
+            advance_budget(&instructions, &expired, u64::from(LUA_HOOK_INTERVAL))?;
+            Ok(VmState::Continue)
+        }
+    }
+
+    fn install_thread(&self, thread: Thread) -> mlua::Result<()> {
+        let pointer = thread.to_pointer() as usize;
+        let mut pointers = self.coroutine_pointers.borrow_mut();
+        if !pointers.insert(pointer) {
+            return Ok(());
+        }
+        drop(pointers);
+        if let Err(error) = thread.set_hook(
+            HookTriggers::new().every_nth_instruction(LUA_HOOK_INTERVAL),
+            self.hook(),
+        ) {
+            self.coroutine_pointers.borrow_mut().remove(&pointer);
+            return Err(error);
+        }
+        self.coroutines.borrow_mut().push(thread);
+        Ok(())
+    }
+
+    fn charge_coroutine(&self) -> mlua::Result<()> {
+        advance_budget(
+            &self.instructions,
+            &self.expired,
+            u64::from(LUA_HOOK_INTERVAL),
+        )
+    }
+
+    /// One outer instruction budget covers nested execution and all coroutines.
+    /// Its guard removes every hook after success, error, or unwinding.
+    fn run<T, E: ToString>(
+        &self,
+        lua: &Lua,
+        operation: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, String> {
+        let outermost = self.depth.get() == 0;
+        if outermost {
+            self.instructions.set(0);
+            self.expired.set(false);
+            let result = lua.set_hook(
+                HookTriggers::new().every_nth_instruction(LUA_HOOK_INTERVAL),
+                self.hook(),
+            );
+            if let Err(error) = result {
+                return Err(error.to_string());
+            }
+        }
+        self.depth.set(self.depth.get() + 1);
+        let _guard = LuaExecutionGuard {
+            lua,
+            depth: Rc::clone(&self.depth),
+            instructions: Rc::clone(&self.instructions),
+            expired: Rc::clone(&self.expired),
+            coroutines: Rc::clone(&self.coroutines),
+            coroutine_pointers: Rc::clone(&self.coroutine_pointers),
+        };
+        let result = operation();
+        if self.expired.get() {
+            Err(LUA_EXECUTION_LIMIT_MESSAGE.into())
+        } else {
+            result.map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn advance_budget(instructions: &Cell<u64>, expired: &Cell<bool>, amount: u64) -> mlua::Result<()> {
+    let count = instructions.get().saturating_add(amount);
+    instructions.set(count);
+    if count >= LUA_INSTRUCTION_LIMIT {
+        expired.set(true);
+        Err(mlua::Error::RuntimeError(
+            LUA_EXECUTION_LIMIT_MESSAGE.into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
 
 /// A deliberate CLI failure raised by Lua code with `remuda.fail`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +222,9 @@ enum JobKind {
         caller: CallerContext,
     },
     StopModules,
+    RunSchedules {
+        now: f64,
+    },
     HttpComplete {
         id: u64,
         result: Result<crate::net::HttpResponse, String>,
@@ -275,6 +403,7 @@ impl Image {
         std::thread::spawn(move || {
             let lua = Lua::new();
             let caller = Rc::new(RefCell::new(CallerContext::default()));
+            let budget = LuaExecutionBudget::default();
             // Everything `print` writes during one job, so it can travel back
             // to whoever asked instead of vanishing. `Rc` rather than `Arc`
             // because this never leaves the thread — the whole reason the
@@ -283,85 +412,34 @@ impl Image {
 
             // A failure here means no image at all, so every eval must say so
             // rather than the thread dying quietly and every caller hanging.
-            let ready = script::bindings(
-                &lua,
-                &socket,
-                registry,
-                counters,
-                handle.clone(),
-                Rc::clone(&caller),
-            )
-            .and_then(|table| lua.globals().set("remuda", table))
-            // The tool frame is Lua over those bindings, not a second set of
-            // them. It must load *after* the table exists and *before* any
-            // caller, so a `tools/list` on a fresh daemon is already true.
-            .and_then(|()| {
-                lua.load(include_str!("tools.lua"))
-                    .set_name("@remuda/tools.lua")
-                    .exec()
-            })
-            .and_then(|()| script::hide_module_activator(&lua))
-            .and_then(|()| capture_print(&lua, Rc::clone(&printed)))
-            .map_err(|e| e.to_string());
+            let ready = budget
+                .run(&lua, || {
+                    script::bindings(
+                        &lua,
+                        &socket,
+                        registry,
+                        counters,
+                        handle.clone(),
+                        Rc::clone(&caller),
+                    )
+                    .and_then(|table| lua.globals().set("remuda", table))
+                    .and_then(|()| install_execution_guards(&lua, budget.clone()))
+                    // The tool frame loads after bindings and guard helpers,
+                    // before any caller can access it.
+                    .and_then(|()| {
+                        lua.load(include_str!("tools.lua"))
+                            .set_name("@remuda/tools.lua")
+                            .exec()
+                    })
+                    .and_then(|()| remove_execution_guard_helpers(&lua))
+                    .and_then(|()| script::hide_module_activator(&lua))
+                    .and_then(|()| capture_print(&lua, Rc::clone(&printed)))
+                })
+                .map_err(|e| e.to_string());
 
             for job in inbox {
                 printed.borrow_mut().clear();
-                let answer = match &ready {
-                    Err(why) => Err(format!("image failed to start: {why}")),
-                    Ok(()) => match &job.kind {
-                        JobKind::Eval {
-                            code,
-                            name,
-                            allow_pending,
-                            caller: request_caller,
-                        } => {
-                            *caller.borrow_mut() = request_caller.clone();
-                            handle.pending.begin_eval();
-                            let answer = eval(&lua, code, name.as_deref()).and_then(|value| {
-                                if handle.pending.pending_id(&value).is_some() {
-                                    Ok(value)
-                                } else {
-                                    join_output(&printed.borrow(), value)
-                                }
-                            });
-                            let pending_id = answer
-                                .as_ref()
-                                .ok()
-                                .and_then(|value| handle.pending.pending_id(value));
-                            *caller.borrow_mut() = CallerContext::default();
-                            if pending_id.is_some() && !*allow_pending {
-                                handle.pending.finish_eval(None);
-                                Err("pending replies may only be returned from a daemon request"
-                                    .into())
-                            } else {
-                                handle.pending.finish_eval(pending_id);
-                                answer
-                            }
-                        }
-                        JobKind::StopModules => script::stop_modules(&lua)
-                            .map(|()| String::new())
-                            .map_err(|error| error.to_string()),
-                        JobKind::HttpComplete { id, result } => {
-                            if let Err(error) = deliver_http(&lua, *id, result.clone()) {
-                                eprintln!("remuda: HTTP callback delivery failed: {error}");
-                            }
-                            Ok(String::new())
-                        }
-                        JobKind::SessionOutput(notifier) => {
-                            let version = notifier.state.latest_version.load(Ordering::Acquire);
-                            deliver_session_output(&lua, notifier, version);
-                            notifier.finish(version);
-                            Ok(String::new())
-                        }
-                        JobKind::SessionOutputFlush(notifier) => {
-                            let version = notifier.state.latest_version.load(Ordering::Acquire);
-                            deliver_session_output(&lua, notifier, version);
-                            Ok(String::new())
-                        }
-                        #[cfg(test)]
-                        JobKind::StopImage => Ok(String::new()),
-                    },
-                };
+                let answer = process_job(&lua, &budget, &handle, &printed, &ready, &job, &caller);
                 // A caller that gave up and dropped its receiver is not an
                 // error: `remuda -e` can be Ctrl-C'd mid-evaluation, and the
                 // work still ran.
@@ -394,6 +472,22 @@ impl Image {
                     allow_pending: false,
                     caller: CallerContext::default(),
                 },
+                reply: Some(reply),
+            })
+            .map_err(|_| "the image is not running".to_string())?;
+        Ok(answer)
+    }
+
+    /// Queue a native ticker pass so each due schedule receives its own Lua
+    /// instruction budget instead of sharing the entire tick's allowance.
+    pub fn submit_due_schedules(
+        &self,
+        now: f64,
+    ) -> Result<std::sync::mpsc::Receiver<Result<String, String>>, String> {
+        let (reply, answer) = channel();
+        self.jobs
+            .send(Job {
+                kind: JobKind::RunSchedules { now },
                 reply: Some(reply),
             })
             .map_err(|_| "the image is not running".to_string())?;
@@ -540,6 +634,201 @@ impl Image {
             let _ = answer.recv_timeout(STOP_TIMEOUT);
         }
     }
+}
+
+fn process_job(
+    lua: &Lua,
+    budget: &LuaExecutionBudget,
+    handle: &Image,
+    printed: &Rc<RefCell<String>>,
+    ready: &Result<(), String>,
+    job: &Job,
+    caller: &Rc<RefCell<CallerContext>>,
+) -> Result<String, String> {
+    match ready {
+        Err(why) => Err(format!("image failed to start: {why}")),
+        Ok(()) => match &job.kind {
+            JobKind::Eval {
+                code,
+                name,
+                allow_pending,
+                caller: request_caller,
+            } => {
+                *caller.borrow_mut() = request_caller.clone();
+                handle.pending.begin_eval();
+                let answer = budget
+                    .run(lua, || eval(lua, code, name.as_deref()))
+                    .and_then(|value| {
+                        if handle.pending.pending_id(&value).is_some() {
+                            Ok(value)
+                        } else {
+                            join_output(&printed.borrow(), value)
+                        }
+                    });
+                let pending_id = answer
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| handle.pending.pending_id(value));
+                // Keep daemon-derived process identity scoped to this one Eval;
+                // schedules, module lifecycle hooks, and native jobs stay unknown.
+                *caller.borrow_mut() = CallerContext::default();
+                if pending_id.is_some() && !allow_pending {
+                    handle.pending.finish_eval(None);
+                    Err("pending replies may only be returned from a daemon request".into())
+                } else {
+                    handle.pending.finish_eval(pending_id);
+                    answer
+                }
+            }
+            JobKind::StopModules => {
+                *caller.borrow_mut() = CallerContext::default();
+                budget.run(lua, || script::stop_modules(lua).map(|()| String::new()))
+            }
+            JobKind::RunSchedules { now } => {
+                *caller.borrow_mut() = CallerContext::default();
+                run_due_schedules(lua, budget, *now)
+            }
+            JobKind::HttpComplete { id, result } => {
+                *caller.borrow_mut() = CallerContext::default();
+                if let Err(error) = budget.run(lua, || deliver_http(lua, *id, result.clone())) {
+                    eprintln!("remuda: HTTP callback delivery failed: {error}");
+                }
+                Ok(String::new())
+            }
+            JobKind::SessionOutput(notifier) => {
+                *caller.borrow_mut() = CallerContext::default();
+                let version = notifier.state.latest_version.load(Ordering::Acquire);
+                let _ = budget.run(lua, || -> mlua::Result<()> {
+                    deliver_session_output(lua, notifier, version);
+                    Ok(())
+                });
+                notifier.finish(version);
+                Ok(String::new())
+            }
+            JobKind::SessionOutputFlush(notifier) => {
+                *caller.borrow_mut() = CallerContext::default();
+                let version = notifier.state.latest_version.load(Ordering::Acquire);
+                let _ = budget.run(lua, || -> mlua::Result<()> {
+                    deliver_session_output(lua, notifier, version);
+                    Ok(())
+                });
+                Ok(String::new())
+            }
+            #[cfg(test)]
+            JobKind::StopImage => {
+                *caller.borrow_mut() = CallerContext::default();
+                Ok(String::new())
+            }
+        },
+    }
+}
+
+fn run_due_schedules(lua: &Lua, budget: &LuaExecutionBudget, now: f64) -> Result<String, String> {
+    let due = budget.run(lua, || {
+        let remuda: mlua::Table = lua.globals().get("remuda")?;
+        let take_due: mlua::Function = remuda.get("_take_due_schedules")?;
+        take_due.call::<mlua::Table>(now)
+    })?;
+    for entry in due.sequence_values::<mlua::Table>() {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name: String = entry.get("name").map_err(|error| error.to_string())?;
+        let handle: mlua::Table = entry.get("handle").map_err(|error| error.to_string())?;
+        let callback_result = budget.run(lua, || {
+            let remuda: mlua::Table = lua.globals().get("remuda")?;
+            let run_schedule: mlua::Function = remuda.get("_run_schedule")?;
+            run_schedule.call::<bool>(handle)
+        });
+        if let Err(error) = callback_result {
+            eprintln!("remuda schedule error for {name}: {error}");
+        }
+    }
+    Ok(String::new())
+}
+
+fn install_execution_guards(lua: &Lua, budget: LuaExecutionBudget) -> mlua::Result<()> {
+    let expired = budget.clone();
+    lua.globals().set(
+        "__remuda_budget_expired",
+        lua.create_function(move |_, ()| Ok(expired.expired.get()))?,
+    )?;
+    let coroutine_budget = budget.clone();
+    lua.globals().set(
+        "__remuda_install_coroutine_hook",
+        lua.create_function(move |_, thread: Thread| coroutine_budget.install_thread(thread))?,
+    )?;
+    let charge_budget = budget.clone();
+    lua.globals().set(
+        "__remuda_charge_coroutine",
+        lua.create_function(move |_, ()| charge_budget.charge_coroutine())?,
+    )?;
+    lua.load(
+        r#"
+        local budget_expired = __remuda_budget_expired
+        local install_coroutine_hook = __remuda_install_coroutine_hook
+        local charge_coroutine = __remuda_charge_coroutine
+        local pack, unpack = table.pack, table.unpack
+        local function rethrow_if_expired()
+          if budget_expired() then error("Lua execution limit exceeded", 0) end
+        end
+
+        local raw_pcall, raw_xpcall = pcall, xpcall
+        pcall = function(...)
+          local result = pack(raw_pcall(...))
+          rethrow_if_expired()
+          return unpack(result, 1, result.n)
+        end
+        xpcall = function(fn, handler, ...)
+          if type(handler) ~= "function" then
+            local result = pack(raw_xpcall(fn, handler, ...))
+            rethrow_if_expired()
+            return unpack(result, 1, result.n)
+          end
+          local function guarded_handler(err)
+            local handled = pack(raw_pcall(handler, err))
+            rethrow_if_expired()
+            if not handled[1] then error(handled[2], 0) end
+            return unpack(handled, 2, handled.n)
+          end
+          local result = pack(raw_xpcall(fn, guarded_handler, ...))
+          rethrow_if_expired()
+          return unpack(result, 1, result.n)
+        end
+
+        local co = coroutine
+        local raw_create, raw_resume = co.create, co.resume
+        co.create = function(fn)
+          charge_coroutine()
+          return raw_create(fn)
+        end
+        co.resume = function(thread, ...)
+          charge_coroutine()
+          install_coroutine_hook(thread)
+          local result = pack(raw_resume(thread, ...))
+          if not result[1] then rethrow_if_expired() end
+          return unpack(result, 1, result.n)
+        end
+        co.wrap = function(fn)
+          local thread = co.create(fn)
+          return function(...)
+            local result = pack(co.resume(thread, ...))
+            if not result[1] then error(result[2], 0) end
+            return unpack(result, 2, result.n)
+          end
+        end
+        "#,
+    )
+    .exec()?;
+    Ok(())
+}
+
+fn remove_execution_guard_helpers(lua: &Lua) -> mlua::Result<()> {
+    lua.globals()
+        .set("__remuda_budget_expired", mlua::Value::Nil)?;
+    lua.globals()
+        .set("__remuda_install_coroutine_hook", mlua::Value::Nil)?;
+    lua.globals()
+        .set("__remuda_charge_coroutine", mlua::Value::Nil)?;
+    Ok(())
 }
 
 fn deliver_http(
