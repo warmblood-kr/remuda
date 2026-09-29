@@ -418,6 +418,17 @@ mod tests {
     }
 
     #[test]
+    fn bracketed_paste_is_one_intact_token() {
+        let mut parser = SgrParser::default();
+        assert_eq!(
+            parser.feed(b"\x1b[200~first line\nsecond line\x1b[201~"),
+            vec![InputToken::Paste(
+                b"\x1b[200~first line\nsecond line\x1b[201~".to_vec()
+            )]
+        );
+    }
+
+    #[test]
     fn encodes_events_in_the_child_encoding_and_omits_unrequested_releases() {
         let event = SgrMouse {
             button: 0,
