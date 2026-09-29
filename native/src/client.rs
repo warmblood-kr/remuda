@@ -79,7 +79,23 @@ pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
         Request::Eval { .. } => Duration::from_secs(305),
         _ => Duration::from_secs(10),
     };
-    read_response_with_timeout(path, stream, timeout)
+    read_response_with_timeout(path, stream, client_timeout(timeout))
+}
+
+/// Extension launchers can cap any local round trip, including the version
+/// probe that runs before extension command dispatch. Ignore invalid values.
+fn client_timeout(default: Duration) -> Duration {
+    client_timeout_from(
+        default,
+        std::env::var("REMUDA_CLIENT_TIMEOUT_MS").ok().as_deref(),
+    )
+}
+
+fn client_timeout_from(default: Duration, value: Option<&str>) -> Duration {
+    match value.and_then(|value| value.parse::<u64>().ok()) {
+        Some(milliseconds @ 1..=305_000) => default.min(Duration::from_millis(milliseconds)),
+        _ => default,
+    }
 }
 
 #[cfg(unix)]
@@ -1125,7 +1141,9 @@ mod tests {
     use super::request_with_timeout;
     #[cfg(unix)]
     use super::trace_input_read;
-    use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
+    use super::{
+        client_timeout_from, interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES,
+    };
     #[cfg(unix)]
     use crate::ipc;
     #[cfg(unix)]
@@ -1140,6 +1158,34 @@ mod tests {
     #[cfg(unix)]
     use std::time::Instant;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[test]
+    fn extension_deadline_caps_version_and_eval_round_trips() {
+        assert_eq!(
+            client_timeout_from(Duration::from_secs(10), Some("500")),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            client_timeout_from(Duration::from_secs(305), Some("500")),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            client_timeout_from(Duration::from_secs(10), Some("20000")),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            client_timeout_from(Duration::from_secs(305), None),
+            Duration::from_secs(305)
+        );
+        assert_eq!(
+            client_timeout_from(Duration::from_secs(305), Some("0")),
+            Duration::from_secs(305)
+        );
+        assert_eq!(
+            client_timeout_from(Duration::from_secs(305), Some("305001")),
+            Duration::from_secs(305)
+        );
+    }
 
     #[cfg(unix)]
     fn assert_request_timeout(request: Request) {
