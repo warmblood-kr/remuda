@@ -589,6 +589,10 @@ impl AgentProcess for PtyAgent {
         self.child.kill().map_err(io)?;
         let status = self.child.wait().map_err(io)?;
         self.record_exit_status(status);
+        // ConPTY can keep the output reader alive after the child exits until
+        // ClosePseudoConsole runs. Close the master here so output monitors
+        // can flush before the caller waits for their final notification.
+        self.master.take();
         Ok(())
     }
 
