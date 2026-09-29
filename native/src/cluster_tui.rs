@@ -1341,7 +1341,7 @@ fn select_target_with_remote_wait(
 
 #[cfg(test)]
 mod tests {
-    use super::queue::QueueState;
+    use super::queue::{QueueEvent, QueueState};
     use super::{
         is_attention, remote_state_label, render_badge, select_target_with_remote_wait,
         AttentionSignals, Badge, ClusterUi, RemoteSelection, RemoteSource,
@@ -1605,6 +1605,34 @@ mod tests {
         assert!(ui
             .render(80, 24, "", &clock)
             .contains("no sessions need attention"));
+    }
+
+    #[test]
+    fn sent_input_clears_the_sending_notice() {
+        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], Duration::ZERO);
+        ui.notice = Some(("sending input to dev".into(), Duration::ZERO));
+        ui.handle_send_event(
+            Some(QueueEvent::Sent {
+                seq: 1,
+                duplicate: false,
+            }),
+            Duration::ZERO,
+        );
+        assert!(ui.notice.is_none());
+    }
+
+    #[test]
+    fn uncertain_input_clears_the_sending_notice() {
+        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], Duration::ZERO);
+        ui.notice = Some(("sending input to dev".into(), Duration::ZERO));
+        ui.handle_send_event(
+            Some(QueueEvent::Uncertain {
+                seq: 1,
+                reason: "delivery uncertain".into(),
+            }),
+            Duration::ZERO,
+        );
+        assert!(ui.notice.is_none());
     }
 
     #[test]
