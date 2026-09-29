@@ -474,6 +474,17 @@ mod tests {
     }
 
     #[test]
+    fn finishing_unterminated_paste_closes_child_paste_mode() {
+        let mut parser = SgrParser::default();
+        assert!(parser.feed(b"\x1b[200~unfinished").is_empty());
+
+        assert_eq!(
+            parser.finish(),
+            vec![InputToken::Paste(b"\x1b[200~unfinished\x1b[201~".to_vec())]
+        );
+    }
+
+    #[test]
     fn unterminated_paste_flushes_at_the_buffer_limit() {
         let mut parser = SgrParser::default();
         let limit = 1024 * 1024;

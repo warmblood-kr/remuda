@@ -13,6 +13,21 @@ fn paste_input_strips_escape_and_wraps_only_when_child_mode_is_enabled() {
     assert_eq!(paste_input("first\nsecond", false), b"first\nsecond");
 }
 
+#[test]
+fn paste_input_strips_c0_controls_except_tab_line_feed_and_carriage_return() {
+    assert_eq!(
+        paste_input("a\u{3}\u{4}\u{1a}\u{1c}\t\n\r\u{7f}z", false),
+        b"a\t\n\r\x7fz"
+    );
+}
+
+#[test]
+fn old_mouse_state_wire_shape_defaults_bracketed_paste_to_off() {
+    let state: remuda_core::agent::MouseState =
+        serde_json::from_str(r#"{"mode":"None","encoding":"Default"}"#).unwrap();
+    assert!(!state.bracketed_paste);
+}
+
 fn wait_for_output<T>(
     mut check: impl FnMut() -> Option<T>,
     timeout_message: impl FnMut() -> String,
