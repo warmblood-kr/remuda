@@ -477,27 +477,7 @@ fn driver_hosted_remote_tui_capture_shows_live_output_with_trailing_blanks() {
     let result = driver_node.command().args(["-e", lua]).output().unwrap();
     assert!(result.status.success(), "remuda.insert failed: {result:?}");
 
-    let request_deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let output = server_node
-            .command()
-            .args(["-e", "print(remuda.request_counts().capture_styled)"])
-            .output()
-            .unwrap();
-        assert!(output.status.success(), "request count failed: {output:?}");
-        let count = String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse::<u64>()
-            .unwrap_or_default();
-        if count > 0 {
-            break;
-        }
-        assert!(
-            Instant::now() < request_deadline,
-            "remote pane never requested a screen capture"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_capture_request(&server_node);
     std::thread::sleep(Duration::from_millis(500));
 
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -516,6 +496,30 @@ fn driver_hosted_remote_tui_capture_shows_live_output_with_trailing_blanks() {
         screen.contains("PR8-MARKER"),
         "driver-hosted 80x24 screen pane omitted the live marker:\n{screen}"
     );
+}
+
+fn wait_for_capture_request(server_node: &Node) {
+    let request_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = server_node
+            .command()
+            .args(["-e", "print(remuda.request_counts().capture_styled)"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "request count failed: {output:?}");
+        let count = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<u64>()
+            .unwrap_or_default();
+        if count > 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < request_deadline,
+            "remote pane never requested a screen capture"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]
