@@ -78,7 +78,8 @@ pub struct ClusterUi {
     input_sender: InputSender,
     input_queue: InputQueue,
     notice: Option<(String, Duration)>,
-    pending_close: Option<(String, String)>,
+    pending_close: Option<PendingClose>,
+    remote_close_confirmation: Option<RemoteCloseTarget>,
     confirmation: Confirmation,
     ended: Option<EndedState>,
     last_frame: Option<EndedState>,
@@ -90,6 +91,21 @@ pub struct ClusterUi {
     remote_composer_target: Option<(String, String, String, String)>,
     remote_input_enabled: bool,
     remote_control_disabled: HashSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingClose {
+    remote_target: Option<(String, String)>,
+    name: String,
+    display_name: String,
+    instance_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteCloseTarget {
+    registry_key: String,
+    label: String,
+    wire_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,6 +162,7 @@ impl ClusterUi {
             input_queue: InputQueue::default(),
             notice: None,
             pending_close: None,
+            remote_close_confirmation: None,
             confirmation: Confirmation::default(),
             ended: None,
             last_frame: None,
@@ -422,20 +439,41 @@ impl ClusterUi {
         self.last_frame = None;
     }
 
-    fn send_close_pending(&mut self, path: &Path, now: Duration) {
-        let Some((name, instance_id)) = self.pending_close.take() else {
+    fn send_close_pending(
+        &mut self,
+        path: &Path,
+        remote_input: Option<&dyn RemoteInputTransport>,
+        now: Duration,
+    ) {
+        let Some(pending) = self.pending_close.take() else {
             return;
         };
-        let response = client::request_with_timeout(
-            path,
-            &confirmed_close(name.clone(), instance_id.clone()),
-            UI_REQUEST_TIMEOUT,
+        let request = confirmed_close(pending.name.clone(), pending.instance_id.clone());
+        let response = if let Some((registry_key, _)) = &pending.remote_target {
+            match remote_input {
+                Some(transport) => transport.send_close(registry_key, &request),
+                None => Err(io::Error::other("remote Close transport is unavailable")),
+            }
+        } else {
+            client::request_with_timeout(path, &request, UI_REQUEST_TIMEOUT)
+        };
+        self.close_completed(
+            pending
+                .remote_target
+                .as_ref()
+                .map(|(_, label)| label.as_str()),
+            pending.display_name,
+            pending.name,
+            pending.instance_id,
+            response,
+            now,
         );
-        self.close_completed(name, instance_id, response, now);
     }
 
     fn close_completed(
         &mut self,
+        remote_label: Option<&str>,
+        display_name: String,
         name: String,
         instance_id: String,
         response: io::Result<Response>,
@@ -443,6 +481,10 @@ impl ClusterUi {
     ) {
         match response {
             Ok(Response::Ok) => {
+                if remote_label.is_some() {
+                    self.notice = Some((format!("Close sent to {display_name}"), now));
+                    return;
+                }
                 if let Some(frame) = self.last_frame.as_ref().filter(|frame| {
                     frame.summary.name == name
                         && frame.summary.instance_id.as_deref() == Some(instance_id.as_str())
@@ -451,6 +493,13 @@ impl ClusterUi {
                 } else {
                     self.notice = Some(("session closed; final frame was unavailable".into(), now));
                 }
+            }
+            Ok(Response::RemoteControlDisabled) => {
+                let notice = remote_label.map_or_else(
+                    || "remote control disabled".to_owned(),
+                    |label| format!("remote control disabled on {label}"),
+                );
+                self.notice = Some((notice, now));
             }
             Ok(Response::Error(reason)) => self.notice = Some((reason, now)),
             Ok(other) => self.notice = Some((format!("unexpected Close response: {other:?}"), now)),
@@ -688,10 +737,23 @@ impl ClusterUi {
         if let Some(decision) = self.confirmation.handle(event.code) {
             match decision {
                 Decision::Confirmed { name, instance_id } => {
-                    self.pending_close = Some((name.clone(), instance_id));
+                    let remote = self.remote_close_confirmation.take();
+                    self.pending_close = Some(PendingClose {
+                        remote_target: remote
+                            .as_ref()
+                            .map(|target| (target.registry_key.clone(), target.label.clone())),
+                        name: remote
+                            .as_ref()
+                            .map_or_else(|| name.clone(), |target| target.wire_name.clone()),
+                        display_name: name.clone(),
+                        instance_id,
+                    });
                     self.notice = Some((format!("closing {name}"), now));
                 }
-                Decision::Cancelled => self.notice = Some(("close cancelled".into(), now)),
+                Decision::Cancelled => {
+                    self.remote_close_confirmation = None;
+                    self.notice = Some(("close cancelled".into(), now));
+                }
             }
             return false;
         }
@@ -741,12 +803,45 @@ impl ClusterUi {
     fn handle_close_key(&mut self, now: Duration) {
         if self.ended.is_some() {
             self.clear_ended();
+        } else if let Some(RemoteSelection::Session {
+            node,
+            name,
+            instance_id,
+        }) = self.remote_selected.clone()
+        {
+            let selected = self.remote_session(&RemoteSelection::Session {
+                node: node.clone(),
+                name: name.clone(),
+                instance_id: instance_id.clone(),
+            });
+            if let Some((node_snapshot, session)) = selected {
+                if !session.alive {
+                    self.notice = Some((
+                        format!("{}/{} has already ended", node_snapshot.name, name),
+                        now,
+                    ));
+                } else {
+                    let label = node_snapshot.name.clone();
+                    let wire_name = session.wire_name.clone();
+                    self.remote_close_confirmation = Some(RemoteCloseTarget {
+                        registry_key: node,
+                        label: label.clone(),
+                        wire_name,
+                    });
+                    self.confirmation
+                        .begin(format!("{label}/{name}"), instance_id);
+                }
+            } else {
+                self.notice = Some(("remote session is no longer listed".into(), now));
+            }
         } else if self.remote_selected.is_some() {
-            self.notice = Some(("remote sessions are read-only".into(), now));
+            self.remote_close_confirmation = None;
+            self.notice = Some(("select a remote session to close".into(), now));
         } else if let Some(session) = self.sessions.get(self.selected) {
             if session.alive {
                 if let Some(instance_id) = session.instance_id.clone() {
                     self.active = self.selected;
+                    self.remote_close_confirmation = None;
                     self.confirmation.begin(session.name.clone(), instance_id);
                 } else {
                     self.notice = Some(("cannot close: session identity is missing".into(), now));
@@ -1591,7 +1686,7 @@ fn run_loop(
         )?;
         write!(io::stdout(), "{frame}")?;
         io::stdout().flush()?;
-        ui.send_close_pending(path, clock.now());
+        ui.send_close_pending(path, remote_input, clock.now());
         ui.send_pending(path, clock.now(), remote_input);
         ui.start_pending(clock.now());
         if crossterm::event::poll(Duration::from_millis(250))? {
@@ -1602,7 +1697,7 @@ fn run_loop(
                 if ui.key_event(key, clock.now()) {
                     return Ok(());
                 }
-                ui.send_close_pending(path, clock.now());
+                ui.send_close_pending(path, remote_input, clock.now());
             }
         }
     }
@@ -2002,7 +2097,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_session_keeps_its_last_screen_when_unreachable_and_is_read_only() {
+    fn remote_session_keeps_its_last_screen_when_unreachable_and_close_can_be_cancelled() {
         let clock = ManualClock::new();
         let source = FakeRemoteSource(Mutex::new(remote_snapshot(
             RemoteState::Reachable,
@@ -2029,8 +2124,11 @@ mod tests {
         let frame = ui.render(100, 24, "", &clock);
         assert!(frame.contains("laptop · unreachable"));
         assert!(frame.contains("last good screen"));
-        assert!(frame.contains("Remote session is read-only"));
-        assert!(!frame.contains("kill build?"));
+        assert!(frame.contains("kill laptop/build? it is running — y / n"));
+        ui.key(crossterm::event::KeyCode::Char('n'));
+        assert!(!ui
+            .render(100, 24, "", &clock)
+            .contains("kill laptop/build?"));
     }
 
     #[test]
@@ -2075,6 +2173,54 @@ mod tests {
 
         let error = ui.select_target(Some("laptop/build")).unwrap_err();
         assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn x_on_highlighted_remote_session_opens_the_close_confirmation() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        snapshot.nodes[0].sessions[0].wire_name = "wire-build".into();
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_selected = Some(RemoteSelection::Session {
+            node: "fp-laptop".into(),
+            name: "build".into(),
+            instance_id: "remote-instance".into(),
+        });
+
+        ui.key(crossterm::event::KeyCode::Char('x'));
+
+        assert!(ui
+            .render(100, 24, "", &clock)
+            .contains("kill laptop/build? it is running — y / n"));
+
+        ui.key(crossterm::event::KeyCode::Char('y'));
+        let transport = FakeRemoteInput::new(Response::RemoteControlDisabled);
+        ui.send_close_pending(
+            std::path::Path::new("unused"),
+            Some(&transport),
+            clock.now(),
+        );
+
+        assert_eq!(
+            transport.requests.lock().unwrap().as_slice(),
+            &[(
+                "fp-laptop".into(),
+                Request::Close {
+                    name: "wire-build".into(),
+                    instance_id: Some("remote-instance".into()),
+                    confirm: Some(true),
+                }
+            )]
+        );
+        assert_eq!(
+            ui.notice.as_ref().unwrap().0,
+            "remote control disabled on laptop"
+        );
     }
 
     #[test]
@@ -2465,12 +2611,20 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('x'));
         ui.key(crossterm::event::KeyCode::Char('y'));
         assert!(ui.render(80, 24, "", &clock).contains("closing dev"));
-        let (name, instance_id) = ui.pending_close.take().unwrap();
+        let pending = ui.pending_close.take().unwrap();
         assert_eq!(
-            (name.clone(), instance_id.clone()),
+            (pending.name.clone(), pending.instance_id.clone()),
             ("dev".into(), "instance-dev".into())
         );
-        ui.close_completed(name, instance_id, Ok(Response::Ok), clock.now());
+        assert!(pending.remote_target.is_none());
+        ui.close_completed(
+            None,
+            pending.display_name,
+            pending.name,
+            pending.instance_id,
+            Ok(Response::Ok),
+            clock.now(),
+        );
         let final_frame = ui.ended.as_ref().unwrap().screen.clone();
         let frame = ui.render(80, 24, &final_frame, &clock);
         assert!(frame.contains("studio / dev · ended · final snapshot"));
