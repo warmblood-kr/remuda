@@ -3340,6 +3340,58 @@ fn a_session_exited_hook_fires_once_when_a_session_is_closed() {
 }
 
 #[test]
+fn a_late_session_exited_event_carries_the_closed_instance_id() {
+    let path = scratch("session-exited-reused-name");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda._closed_instance_ids = {}
+            remuda.on("session_exited", function(name, details)
+                if name == "reused" then
+                    table.insert(remuda._closed_instance_ids, details.instance_id or "")
+                end
+            end)
+        "#,
+    );
+    new_session(&path, "reused");
+    let old_instance_id = match client::request(&path, &Request::List).expect("list old session") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "reused")
+            .and_then(|session| session.instance_id)
+            .expect("old instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+    let closed = client::request(
+        &path,
+        &Request::Close {
+            name: "reused".into(),
+            instance_id: Some(old_instance_id.clone()),
+            confirm: Some(true),
+        },
+    )
+    .expect("close old instance");
+    assert_eq!(closed, Response::Ok);
+    new_session(&path, "reused");
+
+    let event_id = "return remuda._closed_instance_ids[1] or ''";
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let observed = eval(&path, event_id);
+        if !observed.is_empty() {
+            assert_eq!(observed, old_instance_id);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "late session_exited event did not include the closed instance id"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
 fn confirmed_close_refuses_a_mismatched_instance_and_keeps_the_session() {
     let path = scratch("close-wrong-instance");
     let _daemon = daemon_at(&path);

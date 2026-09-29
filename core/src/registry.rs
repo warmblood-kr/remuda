@@ -193,12 +193,14 @@ impl Registry {
     pub fn reap(&self) -> Vec<String> {
         self.reap_with_exit_info()
             .into_iter()
-            .map(|(name, _, _, _)| name)
+            .map(|(name, _, _, _, _)| name)
             .collect()
     }
 
     /// Drop exited sessions and retain any status their backend observed.
-    pub fn reap_with_exit_info(&self) -> Vec<(String, String, &'static str, Option<ExitInfo>)> {
+    pub fn reap_with_exit_info(
+        &self,
+    ) -> Vec<(String, String, String, &'static str, Option<ExitInfo>)> {
         let mut sessions = self.lock();
         let dead: Vec<_> = sessions
             .iter()
@@ -207,6 +209,7 @@ impl Registry {
                 (
                     name.clone(),
                     session.id().to_string(),
+                    session.instance_id().to_string(),
                     if session.is_closing() {
                         "closed"
                     } else {
@@ -216,12 +219,14 @@ impl Registry {
                 )
             })
             .collect();
-        for (name, _, _, _) in &dead {
+        for (name, _, _, _, _) in &dead {
             sessions.remove(name);
         }
         drop(sessions);
         dead.into_iter()
-            .map(|(name, id, reason, session)| (name, id, reason, session.exit_info()))
+            .map(|(name, id, instance_id, reason, session)| {
+                (name, id, instance_id, reason, session.exit_info())
+            })
             .collect()
     }
 

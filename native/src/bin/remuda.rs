@@ -826,6 +826,7 @@ fn report_cluster_pushes() {
         println!("Registry push: no configured peers.");
         return;
     }
+    let needs_retry = peers.iter().any(|peer| !peer.reached);
     for peer in peers {
         if peer.reached {
             println!("Registry push reached peer {}.", peer.peer_fp);
@@ -835,6 +836,12 @@ fn report_cluster_pushes() {
                 peer.peer_fp, peer.detail
             );
         }
+    }
+    if needs_retry {
+        // The synchronous CLI push is bounded. Keep a failed admission or
+        // revocation queued so anti-entropy does not have to wait for its
+        // much slower periodic pass to retry it.
+        remuda_native::cluster::registry_changed();
     }
 }
 

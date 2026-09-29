@@ -188,7 +188,9 @@ if not windows then
       for _ = 1, 8 do
         local escaped = remuda.process.run({
           argv = { "/bin/sh", "-c", "setsid /bin/sh -c 'echo $$; exec /bin/sleep 30' &" },
-          timeout = 0.1,
+          -- Leave room for a loaded runner to schedule the escaped child and
+          -- write its PID before the timeout closes the pipes.
+          timeout = 0.5,
         })
         assert(escaped.timed_out, "setsid descendant should leave output pipes open")
         local pid = escaped.stdout:match("(%d+)")

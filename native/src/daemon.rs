@@ -770,10 +770,10 @@ const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 /// notifying anywhere else would race it and silently drop the event.
 pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String> {
     let dead = registry.reap_with_exit_info();
-    for (name, id, reason, exit_info) in &dead {
-        notify_exited(image, name, id, reason, exit_info.as_ref());
+    for (name, id, instance_id, reason, exit_info) in &dead {
+        notify_exited(image, name, id, instance_id, reason, exit_info.as_ref());
     }
-    dead.into_iter().map(|(name, _, _, _)| name).collect()
+    dead.into_iter().map(|(name, _, _, _, _)| name).collect()
 }
 
 fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<()>> {
@@ -786,6 +786,7 @@ fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<(
             image,
             name,
             session.id(),
+            session.instance_id(),
             "closed",
             session.exit_info().as_ref(),
         );
@@ -799,6 +800,7 @@ fn notify_exited(
     image: &Image,
     name: &str,
     id: &str,
+    instance_id: &str,
     reason: &str,
     exit_info: Option<&remuda_core::agent::ExitInfo>,
 ) {
@@ -820,6 +822,10 @@ fn notify_exited(
             }
         }
     }
+    fields.push(format!(
+        "instance_id={}",
+        crate::mcp::lua_string(instance_id)
+    ));
     let details = format!("{{{}}}", fields.join(", "));
     let _ = image.submit(
         &format!(
@@ -1292,9 +1298,17 @@ fn close_instance(
         let image = image.clone();
         let name = name.to_owned();
         let id = session.id().to_owned();
+        let instance_id = session.instance_id().to_owned();
         let exit_info = session.exit_info();
         std::thread::spawn(move || {
-            notify_exited(&image, &name, &id, "closed", exit_info.as_ref());
+            notify_exited(
+                &image,
+                &name,
+                &id,
+                &instance_id,
+                "closed",
+                exit_info.as_ref(),
+            );
         });
     }
     Some(closed.map(drop))
