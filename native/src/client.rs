@@ -88,14 +88,25 @@ fn read_response_with_timeout(
     stream: Stream,
     timeout: Duration,
 ) -> std::io::Result<Response> {
-    stream.set_nonblocking(true)?;
     let deadline = Instant::now() + timeout;
     let limit = max_reply_wire_bytes();
     let mut line = Vec::with_capacity(limit.min(8192));
     let mut bytes = [0u8; 4096];
     loop {
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(request_timeout(path, timeout));
+        }
+        if let Err(error) = stream.set_recv_timeout(Some(remaining)) {
+            // macOS can return EINVAL when SO_RCVTIMEO is set after the peer
+            // has already closed. In that case poll until the same deadline;
+            // queued reply bytes or EOF make the following read nonblocking.
+            if error.kind() != std::io::ErrorKind::InvalidInput {
+                return Err(error);
+            }
+            if !wait_for_socket_readable(&stream, deadline)? {
+                return Err(request_timeout(path, timeout));
+            }
         }
         match (&stream).read(&mut bytes) {
             Ok(0) => break,
@@ -111,8 +122,13 @@ fn read_response_with_timeout(
                     break;
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(10));
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(request_timeout(path, timeout));
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
@@ -121,6 +137,38 @@ fn read_response_with_timeout(
     let line = String::from_utf8(line)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     Ok(interpret(&line))
+}
+
+#[cfg(unix)]
+fn wait_for_socket_readable(stream: &Stream, deadline: Instant) -> std::io::Result<bool> {
+    use std::os::fd::{AsFd, AsRawFd};
+
+    let Stream::UdSocket(socket) = stream;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        let milliseconds = remaining
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as i32;
+        let mut descriptor = libc::pollfd {
+            fd: socket.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        match unsafe { libc::poll(&mut descriptor, 1, milliseconds) } {
+            ready if ready > 0 => return Ok(true),
+            0 => {}
+            _ => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1231,6 +1279,39 @@ mod tests {
         let mut output = Vec::new();
         reset_input_modes(&mut output).unwrap();
         assert_eq!(output, RESET_INPUT_MODES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_is_read_when_peer_closes_before_timeout_is_set() {
+        use super::read_response_with_timeout;
+        use crate::ipc;
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "remuda-client-close-before-timeout-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = ipc::listen(&path).unwrap();
+        let expected = Response::Value("immediate".into());
+        let server = std::thread::spawn({
+            let expected = expected.clone();
+            move || {
+                let mut stream = listener.accept().unwrap();
+                let mut line = serde_json::to_vec(&expected).unwrap();
+                line.push(b'\n');
+                stream.write_all(&line).unwrap();
+            }
+        });
+        let stream = ipc::connect(&path).unwrap();
+        server.join().unwrap();
+
+        let response = read_response_with_timeout(&path, stream, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(response, expected);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
