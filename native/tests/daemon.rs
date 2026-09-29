@@ -4638,7 +4638,9 @@ fn a_sigkilled_daemon_reaps_a_codex_app_server_in_its_session() {
     let deadline = Instant::now() + PATIENCE;
     let app_server_pid = loop {
         if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-            break pid.trim().parse::<i32>().unwrap();
+            if let Ok(pid) = pid.trim().parse::<i32>() {
+                break pid;
+            }
         }
         assert!(Instant::now() < deadline, "stub app-server never started");
         std::thread::sleep(Duration::from_millis(20));
