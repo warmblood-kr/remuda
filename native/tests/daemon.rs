@@ -1290,24 +1290,26 @@ fn attach_eof_drains_input_already_read_by_the_key_pump() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    let mut stream = raw_attach(&socket, "target");
+    let mut stream = ipc::connect(&socket).expect("connect attach client");
+    let mut request = serde_json::to_vec(&Request::Attach {
+        name: "target".to_string(),
+    })
+    .expect("serialize Attach");
+    request.push(b'\n');
+    stream.write_all(&request).expect("send Attach");
+    // The daemon's acknowledgement and initial screen paint now encounter
+    // EPIPE, while the client can still send input on the other half.
+    let ipc::Stream::UdSocket(unix_socket) = &stream;
+    use std::os::fd::{AsFd, AsRawFd};
+    nix::sys::socket::shutdown(
+        unix_socket.as_fd().as_raw_fd(),
+        nix::sys::socket::Shutdown::Read,
+    )
+    .expect("shut down attach output half");
     let expected = vec![b'y'; 12_288];
     stream
         .write_all(&expected)
-        .expect("send keys before detach");
-
-    // A successful socket write only proves that the local kernel accepted
-    // the bytes. Wait until the daemon has forwarded an initial block into the
-    // PTY before closing the socket, so EOF races with queued input instead of
-    // racing with the key pump's very first read.
-    let first_block_deadline = Instant::now() + PATIENCE;
-    while std::fs::metadata(&capture_path).map_or(true, |metadata| metadata.len() < 1024) {
-        assert!(
-            Instant::now() < first_block_deadline,
-            "key pump did not forward the first block before detach"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+        .expect("send keys after shutting down output half");
     drop(stream);
 
     let deadline = Instant::now() + PATIENCE;

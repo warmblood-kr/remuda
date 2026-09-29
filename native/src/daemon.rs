@@ -1713,14 +1713,17 @@ fn attach(
     } else {
         Response::Ok
     };
-    reply(&stream, &acknowledgement)?;
+    // A client can detach immediately after sending input. A failed response
+    // write must not discard those bytes before the input pump starts.
+    let _ = reply(&stream, &acknowledgement);
 
     // Paint what is already on screen before streaming anything new, or the
     // viewer sees a blank terminal until the program next redraws.
     let mut out = stream.try_clone()?;
     if let Ok(painted) = held.screen_bytes() {
-        out.write_all(&painted)?;
-        out.flush()?;
+        // The initial paint is best-effort for the same reason as the
+        // acknowledgement: output failure does not make queued input unsafe.
+        let _ = out.write_all(&painted).and_then(|()| out.flush());
     }
 
     // The socket reader and PTY writer are separate pumps. The bounded handoff
@@ -1786,6 +1789,7 @@ fn attach(
         let write_thread = scope
             .spawn(move || pump_attach_input(keys_rx, held, done, stop, reader_eof, input_failed));
 
+        let mut process_gone = false;
         if let Some(rx) = held.subscribe() {
             while !done.load(std::sync::atomic::Ordering::SeqCst) {
                 if held.is_displaced() {
@@ -1803,7 +1807,10 @@ fn attach(
                         continue;
                     }
                     // The sender is gone: the process exited.
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        process_gone = true;
+                        break;
+                    }
                 }
             }
         }
@@ -1820,7 +1827,7 @@ fn attach(
         // sending keys. Let the socket reader observe EOF and the PTY pump
         // drain its queue before stopping it. Takeover and process exit still
         // cancel input immediately because there is nowhere safe to deliver it.
-        if held.is_displaced() || !held.session().is_alive() {
+        if held.is_displaced() || process_gone || !held.session().is_alive() {
             stop.store(true, std::sync::atomic::Ordering::SeqCst);
             ipc::stop_reader(&stream, stop, || key_thread.is_finished());
         }
