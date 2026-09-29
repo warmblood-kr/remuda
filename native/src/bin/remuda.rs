@@ -73,7 +73,7 @@ fn main() -> ExitCode {
         ["upgrade", rest @ ..] => run_upgrade(rest),
 
         // Not part of the user-facing set: this is what the auto-start spawns.
-        ["daemon"] => match daemon::serve(&path) {
+        ["daemon"] => match daemon::serve_with_runtime(&path, &daemon::runtime_dir()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(format!("daemon: {e}")),
         },
@@ -1223,6 +1223,8 @@ fn daemon_start_error(path: &Path, stderr_path: &Path, offset: u64, separator: &
 /// through — a bare `remuda daemon` re-derives `"default"` and never matches.
 fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
+    daemon::prepare_socket_path(path, Some(&daemon::runtime_dir()))
+        .map_err(|e| format!("cannot prepare daemon socket directory: {e}"))?;
     // Keep stderr in a file beside the socket. The daemon outlives this client,
     // so a pipe reader would be dropped on successful startup and a later
     // diagnostic could kill the daemon with SIGPIPE. The file also preserves
@@ -1243,15 +1245,7 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     // Append, so the previous daemon's post-mortem survives this start; rotate
     // once past 1 MiB so it cannot grow forever.
     #[cfg(unix)]
-    let stderr_file = {
-        if fs::metadata(&stderr_path).is_ok_and(|m| m.len() > 1_048_576) {
-            let _ = fs::rename(&stderr_path, stderr_path.with_extension("log.1"));
-        }
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&stderr_path)
-    };
+    let stderr_file = open_unix_daemon_log(&stderr_path);
     #[cfg(windows)]
     let stderr_file = fs::File::create(&stderr_path);
     let stderr_file = stderr_file
@@ -1349,6 +1343,22 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
         offset,
         &separator_line,
     ))
+}
+
+#[cfg(unix)]
+fn open_unix_daemon_log(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if fs::metadata(path).is_ok_and(|m| m.len() > 1_048_576) {
+        let _ = fs::rename(path, path.with_extension("log.1"));
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
 /// The three-line list a person reads; also what `remuda ls` was inlining
