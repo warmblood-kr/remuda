@@ -90,15 +90,44 @@ pub(super) fn create_private_directory(dir: &Path) -> io::Result<()> {
 #[cfg(windows)]
 pub(super) fn verify_directory(dir: &Path) -> io::Result<()> {
     let file = super::windows_security::open_for_check(dir, true, true)?;
+    super::windows_security::validate_open_object(&file, dir, true)?;
+    secure_known_children(dir)?;
     super::windows_security::secure_or_upgrade(&file, dir, true)?;
     Ok(())
 }
 
 #[cfg(windows)]
-pub(super) fn check_directory_type(dir: &Path) -> io::Result<()> {
-    let file = super::windows_security::open_for_check(dir, true, true)?;
-    super::windows_security::secure_or_upgrade(&file, dir, true)?;
+fn secure_known_children(dir: &Path) -> io::Result<()> {
+    for name in [
+        "identity.key",
+        "identity.lock",
+        "settings.json",
+        "authorized_nodes.json",
+        "join_tokens.json",
+    ] {
+        let path = dir.join(name);
+        match super::windows_security::open_for_check(&path, false, true) {
+            Ok(file) => {
+                super::windows_security::secure_or_upgrade(&file, &path, false)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if dir.file_name().is_some_and(|name| name == "remuda") {
+        let cluster = dir.join("cluster");
+        match fs::symlink_metadata(&cluster) {
+            Ok(_) => verify_directory(&cluster)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
     Ok(())
+}
+
+#[cfg(windows)]
+pub(super) fn check_directory_type(dir: &Path) -> io::Result<()> {
+    verify_directory(dir)
 }
 
 #[cfg(windows)]

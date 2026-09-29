@@ -129,7 +129,7 @@ fn read_identity_material_at(dir: &Path) -> io::Result<Zeroizing<[u8; 64]>> {
     let path = dir.join(IDENTITY_FILE);
     #[cfg(windows)]
     let mut file = {
-        let file = super::windows_security::open_for_check(&path, false, true)?;
+        let file = super::windows_security::open_for_read(&path)?;
         storage::check_private_file(&file, "cluster identity", &path)?;
         file
     };

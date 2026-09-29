@@ -56,7 +56,7 @@ pub fn enabled_at(dir: &Path) -> io::Result<bool> {
         }
     };
     #[cfg(windows)]
-    let file = match super::windows_security::open_for_check(&path, false, true) {
+    let file = match super::windows_security::open_for_read(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
         Err(error) => return Err(error),

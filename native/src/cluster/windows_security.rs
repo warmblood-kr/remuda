@@ -15,9 +15,9 @@ use windows_sys::Win32::Security::Authorization::{
 };
 use windows_sys::Win32::Security::{
     EqualSid, GetAce, GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-    GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION,
+    GetTokenInformation, TokenOwner, TokenUser, ACCESS_ALLOWED_ACE, ACL_SIZE_INFORMATION,
     DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
-    SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    SE_DACL_PROTECTED, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, GetFileInformationByHandleEx, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
@@ -57,8 +57,10 @@ impl Drop for LocalMemory {
 
 /// Current process user's SID, kept in an aligned buffer for the borrowed SID pointer.
 struct UserSid {
-    _buffer: Vec<usize>,
+    _user_buffer: Vec<usize>,
+    _owner_buffer: Vec<usize>,
     sid: *mut c_void,
+    token_owner_sid: *mut c_void,
     text: Vec<u16>,
 }
 
@@ -69,30 +71,12 @@ impl UserSid {
             return Err(last_error());
         }
         let token = Handle(token);
-        let mut needed = 0;
-        unsafe {
-            GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut needed);
-        }
-        if needed == 0 {
-            return Err(last_error());
-        }
-        let words =
-            (needed as usize + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
-        let mut buffer = vec![0usize; words];
-        if unsafe {
-            GetTokenInformation(
-                token.0,
-                TokenUser,
-                buffer.as_mut_ptr().cast(),
-                needed,
-                &mut needed,
-            )
-        } == 0
-        {
-            return Err(last_error());
-        }
-        let token_user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
+        let user_buffer = token_information(token.0, TokenUser)?;
+        let owner_buffer = token_information(token.0, TokenOwner)?;
+        let token_user = unsafe { &*(user_buffer.as_ptr().cast::<TOKEN_USER>()) };
+        let token_owner = unsafe { &*(owner_buffer.as_ptr().cast::<TOKEN_OWNER>()) };
         let sid = token_user.User.Sid;
+        let token_owner_sid = token_owner.Owner;
         let mut sid_text = ptr::null_mut();
         if unsafe { ConvertSidToStringSidW(sid, &mut sid_text) } == 0 {
             return Err(last_error());
@@ -107,10 +91,19 @@ impl UserSid {
         let text = unsafe { std::slice::from_raw_parts(sid_text, len + 1) }.to_vec();
         drop(sid_text_mem);
         Ok(Self {
-            _buffer: buffer,
+            _user_buffer: user_buffer,
+            _owner_buffer: owner_buffer,
             sid,
+            token_owner_sid,
             text,
         })
+    }
+
+    #[cfg(test)]
+    fn accepts_owner(&self, owner: *mut c_void) -> bool {
+        !owner.is_null()
+            && (unsafe { EqualSid(owner, self.sid) } != 0
+                || unsafe { EqualSid(owner, self.token_owner_sid) } != 0)
     }
 
     fn security(&self) -> io::Result<OwnerOnlySecurity> {
@@ -133,6 +126,29 @@ impl UserSid {
         }
         Ok(OwnerOnlySecurity { descriptor })
     }
+}
+
+fn token_information(token: HANDLE, class: i32) -> io::Result<Vec<usize>> {
+    let mut needed = 0;
+    unsafe { GetTokenInformation(token, class, ptr::null_mut(), 0, &mut needed) };
+    if needed == 0 {
+        return Err(last_error());
+    }
+    let words = (needed as usize + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
+    let mut buffer = vec![0usize; words];
+    if unsafe {
+        GetTokenInformation(
+            token,
+            class,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    Ok(buffer)
 }
 
 pub(super) struct OwnerOnlySecurity {
@@ -229,30 +245,12 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 pub(crate) fn create_or_open_lock(path: &Path) -> io::Result<File> {
-    use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, OPEN_ALWAYS};
+    use windows_sys::Win32::Storage::FileSystem::{CREATE_NEW, OPEN_EXISTING};
     let user = UserSid::current()?;
     let security = user.security()?;
     let path = wide(path);
-    let mut handle = unsafe {
-        CreateFileW(
-            path.as_ptr(),
-            FILE_GENERIC_READ
-                | FILE_GENERIC_WRITE
-                | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
-                | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            &security.attributes(),
-            CREATE_NEW,
-            FILE_FLAG_OPEN_REPARSE_POINT,
-            ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        let error = last_error();
-        if error.kind() != io::ErrorKind::AlreadyExists {
-            return Err(error);
-        }
-        handle = unsafe {
+    loop {
+        let handle = unsafe {
             CreateFileW(
                 path.as_ptr(),
                 FILE_GENERIC_READ
@@ -260,14 +258,43 @@ pub(crate) fn create_or_open_lock(path: &Path) -> io::Result<File> {
                     | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
                     | windows_sys::Win32::Storage::FileSystem::WRITE_DAC,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                ptr::null(),
-                OPEN_ALWAYS,
+                &security.attributes(),
+                CREATE_NEW,
                 FILE_FLAG_OPEN_REPARSE_POINT,
                 ptr::null_mut(),
             )
         };
+        if handle != INVALID_HANDLE_VALUE {
+            return file_from_handle(handle);
+        }
+        let error = last_error();
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+        let existing = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                FILE_GENERIC_READ
+                    | FILE_GENERIC_WRITE
+                    | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                    | windows_sys::Win32::Storage::FileSystem::WRITE_DAC
+                    | windows_sys::Win32::Storage::FileSystem::WRITE_OWNER,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                ptr::null_mut(),
+            )
+        };
+        if existing != INVALID_HANDLE_VALUE {
+            return file_from_handle(existing);
+        }
+        let error = last_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            continue;
+        }
+        return Err(error);
     }
-    file_from_handle(handle)
 }
 
 fn file_from_handle(handle: HANDLE) -> io::Result<File> {
@@ -279,17 +306,11 @@ fn file_from_handle(handle: HANDLE) -> io::Result<File> {
 
 pub(super) fn open_for_check(path: &Path, directory: bool, write_dac: bool) -> io::Result<File> {
     let path = wide(path);
-    let access = FILE_READ_ATTRIBUTES
-        | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+    let access = windows_sys::Win32::Storage::FileSystem::READ_CONTROL
         | if write_dac {
             windows_sys::Win32::Storage::FileSystem::WRITE_DAC
         } else {
             0
-        }
-        | if directory {
-            FILE_GENERIC_READ
-        } else {
-            FILE_GENERIC_READ
         };
     let flags = FILE_FLAG_OPEN_REPARSE_POINT
         | if directory {
@@ -311,8 +332,60 @@ pub(super) fn open_for_check(path: &Path, directory: bool, write_dac: bool) -> i
     file_from_handle(handle)
 }
 
+fn open_for_owner_update(path: &Path, directory: bool) -> io::Result<File> {
+    let path = wide(path);
+    let flags = FILE_FLAG_OPEN_REPARSE_POINT
+        | if directory {
+            FILE_FLAG_BACKUP_SEMANTICS
+        } else {
+            0
+        };
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            FILE_READ_ATTRIBUTES
+                | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                | windows_sys::Win32::Storage::FileSystem::WRITE_DAC
+                | windows_sys::Win32::Storage::FileSystem::WRITE_OWNER,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            flags,
+            ptr::null_mut(),
+        )
+    };
+    file_from_handle(handle)
+}
+
+/// Open state for reading only after any legacy ACL has been repaired through a metadata handle.
+pub(super) fn open_for_read(path: &Path) -> io::Result<File> {
+    let checked = open_for_check(path, false, true)?;
+    secure_or_upgrade(&checked, path, false)?;
+    drop(checked);
+
+    let path_wide = wide(path);
+    let access = FILE_GENERIC_READ
+        | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+        | windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+    let handle = unsafe {
+        CreateFileW(
+            path_wide.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            ptr::null_mut(),
+        )
+    };
+    let file = file_from_handle(handle)?;
+    secure_or_upgrade(&file, path, false)?;
+    Ok(file)
+}
+
 /// Verify or migrate an opened object. Returns whether a legacy ACL was repaired.
 pub(super) fn secure_or_upgrade(file: &File, path: &Path, directory: bool) -> io::Result<bool> {
+    validate_open_object(file, path, directory)?;
     let user = UserSid::current()?;
     let handle = file.as_raw_handle();
     let mut tag = FILE_ATTRIBUTE_TAG_INFO {
@@ -348,7 +421,10 @@ pub(super) fn secure_or_upgrade(file: &File, path: &Path, directory: bool) -> io
 
     // Ownership mismatch is the only ACL migration refusal. Reparse points were rejected above.
     let (owner, _sd) = security_descriptor(handle)?;
-    if owner.is_null() || unsafe { EqualSid(owner, user.sid) } == 0 {
+    let owner_matches_user = !owner.is_null() && unsafe { EqualSid(owner, user.sid) } != 0;
+    let owner_matches_token_owner =
+        !owner.is_null() && unsafe { EqualSid(owner, user.token_owner_sid) } != 0;
+    if !owner_matches_user && !owner_matches_token_owner {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("{} is owned by another SID; refusing", path.display()),
@@ -364,12 +440,30 @@ pub(super) fn secure_or_upgrade(file: &File, path: &Path, directory: bool) -> io
     {
         return Err(last_error());
     }
+    let owner_update = if owner_matches_user {
+        None
+    } else {
+        let update = open_for_owner_update(path, directory)?;
+        validate_open_object(&update, path, directory)?;
+        Some(update)
+    };
+    let update_handle = owner_update
+        .as_ref()
+        .map_or(handle, |update| update.as_raw_handle());
+    let mut security_info = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
+    if !owner_matches_user {
+        security_info |= windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+    }
     let result = unsafe {
         SetSecurityInfo(
-            handle,
+            update_handle,
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
+            security_info,
+            if owner_matches_user {
+                ptr::null_mut()
+            } else {
+                user.sid
+            },
             ptr::null_mut(),
             dacl,
             ptr::null_mut(),
@@ -378,7 +472,7 @@ pub(super) fn secure_or_upgrade(file: &File, path: &Path, directory: bool) -> io
     if result != 0 {
         return Err(io::Error::from_raw_os_error(result as i32));
     }
-    if !dacl_conforms(handle, user.sid)? {
+    if !dacl_conforms(update_handle, user.sid)? {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "failed to secure cluster state ACL",
@@ -389,6 +483,38 @@ pub(super) fn secure_or_upgrade(file: &File, path: &Path, directory: bool) -> io
         path.display()
     );
     Ok(true)
+}
+
+pub(super) fn validate_open_object(file: &File, path: &Path, directory: bool) -> io::Result<()> {
+    let handle = file.as_raw_handle();
+    let mut tag = FILE_ATTRIBUTE_TAG_INFO {
+        FileAttributes: 0,
+        ReparseTag: 0,
+    };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            windows_sys::Win32::Storage::FileSystem::FileAttributeTagInfo,
+            (&mut tag as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+            std::mem::size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a reparse point; refusing", path.display()),
+        ));
+    }
+    if (tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} has the wrong file type", path.display()),
+        ));
+    }
+    Ok(())
 }
 
 fn security_descriptor(handle: HANDLE) -> io::Result<(*mut c_void, LocalMemory)> {
@@ -475,10 +601,103 @@ pub(crate) fn is_owner_acl_conforming(file: &File) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    fn owner_sid_from_sddl(sddl: &str) -> io::Result<(*mut c_void, LocalMemory)> {
+        let wide: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor = ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        let descriptor = LocalMemory(descriptor.cast());
+        let mut owner = ptr::null_mut();
+        if unsafe {
+            windows_sys::Win32::Security::GetSecurityDescriptorOwner(
+                descriptor.0.cast(),
+                &mut owner,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        Ok((owner, descriptor))
+    }
+
+    fn set_owner_from_sddl(file: &File, sddl: &str) -> io::Result<()> {
+        let (owner, _descriptor) = owner_sid_from_sddl(sddl)?;
+        let result = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION,
+                owner,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+        Ok(())
+    }
+
+    fn set_extra_world_allow(file: &File, user: &UserSid) -> io::Result<()> {
+        let user_text = String::from_utf16_lossy(&user.text[..user.text.len() - 1]);
+        let sddl: Vec<u16> = format!("O:{user_text}D:P(A;;FA;;;{user_text})(A;;FA;;;WD)")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut descriptor = ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        let descriptor = LocalMemory(descriptor.cast());
+        let mut present = 0;
+        let mut dacl = ptr::null_mut();
+        let mut defaulted = 0;
+        if unsafe {
+            GetSecurityDescriptorDacl(descriptor.0.cast(), &mut present, &mut dacl, &mut defaulted)
+        } == 0
+        {
+            return Err(last_error());
+        }
+        let result = unsafe {
+            SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                dacl,
+                ptr::null_mut(),
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+        Ok(())
+    }
 
     #[test]
     fn loading_legacy_default_acl_file_tightens_acl_and_preserves_data() {
@@ -519,5 +738,99 @@ mod tests {
         drop(file);
         drop(directory);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn refuses_an_object_owned_by_an_unrelated_sid() {
+        let path = std::env::temp_dir().join(format!(
+            "remuda-cluster-other-owner-{}-{}.key",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = create_new_file(&path).unwrap();
+        file.write_all(b"test").unwrap();
+        drop(file);
+        let file = open_for_owner_update(&path, false).unwrap();
+        let user = UserSid::current().unwrap();
+        let mut assigned = false;
+        let mut last_error = None;
+        for candidate in ["O:SY", "O:BG", "O:BA"] {
+            let (sid, _descriptor) = owner_sid_from_sddl(candidate).unwrap();
+            if user.accepts_owner(sid) {
+                continue;
+            }
+            match set_owner_from_sddl(&file, candidate) {
+                Ok(()) => {
+                    assigned = true;
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if !assigned {
+            eprintln!("skipping unrelated-owner ACL test: runner cannot assign a non-token owner (likely lacks SeRestorePrivilege): {}", last_error.map_or_else(|| "all candidate SIDs are token owners".to_owned(), |error| error.to_string()));
+            drop(file);
+            std::fs::remove_file(path).unwrap();
+            return;
+        }
+        let error = secure_or_upgrade(&file, &path, false).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn repairs_a_protected_dacl_with_an_extra_world_allow_ace() {
+        let path = std::env::temp_dir().join(format!(
+            "remuda-cluster-extra-ace-{}-{}.key",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        drop(create_new_file(&path).unwrap());
+        let file = open_for_check(&path, false, true).unwrap();
+        let user = UserSid::current().unwrap();
+        set_extra_world_allow(&file, &user).unwrap();
+        assert!(secure_or_upgrade(&file, &path, false).unwrap());
+        assert!(is_owner_acl_conforming(&file).unwrap());
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn refuses_file_and_cluster_directory_reparse_points() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let base = std::env::temp_dir().join(format!(
+            "remuda-cluster-reparse-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&base).unwrap();
+        let file_target = base.join("target.key");
+        let file_link = base.join("identity.key");
+        std::fs::write(&file_target, b"target").unwrap();
+        match symlink_file(&file_target, &file_link) {
+            Ok(()) => {
+                let error = open_for_read(&file_link).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            }
+            Err(error) => eprintln!(
+                "skipping file reparse check: cannot create symlink on this runner: {error}"
+            ),
+        }
+
+        let dir_target = base.join("target-dir");
+        let dir_link = base.join("cluster");
+        std::fs::create_dir(&dir_target).unwrap();
+        match symlink_dir(&dir_target, &dir_link) {
+            Ok(()) => {
+                let error = super::super::storage::verify_directory(&dir_link).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            }
+            Err(error) => eprintln!(
+                "skipping directory reparse check: cannot create symlink on this runner: {error}"
+            ),
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

@@ -179,7 +179,7 @@ fn load_state(directory: &Path, now: u64) -> io::Result<TokenState> {
         options.open(&path)?
     };
     #[cfg(windows)]
-    let mut file = super::windows_security::open_for_check(&path, false, true)?;
+    let mut file = super::windows_security::open_for_read(&path)?;
     storage::check_private_file(&file, "join token state", &path)?;
     let mut bytes = Vec::new();
     file.by_ref()

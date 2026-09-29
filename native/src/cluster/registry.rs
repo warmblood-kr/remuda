@@ -325,7 +325,7 @@ pub fn registry_revision_token() -> io::Result<String> {
             .join(REGISTRY_FILE);
         #[cfg(windows)]
         let metadata = {
-            let file = match super::windows_security::open_for_check(&path, false, true) {
+            let file = match super::windows_security::open_for_read(&path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     return Ok("missing".to_owned());
@@ -408,7 +408,7 @@ pub(super) fn load_registry_at(dir: &Path) -> io::Result<Registry> {
         }
     };
     #[cfg(windows)]
-    let file = match super::windows_security::open_for_check(&path, false, true) {
+    let file = match super::windows_security::open_for_read(&path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Registry::default()),
         Err(error) => return Err(error),
