@@ -16,6 +16,28 @@ notices, set `REMUDA_SUPPRESS_DEPRECATIONS=1` in the daemon's environment when
 the daemon starts; setting it only on a CLI process cannot change the
 environment of a running daemon.
 
+## Screen capture
+
+`remuda.capture(name)` returns the current screen as plain text.
+`remuda.capture_styled(name)` returns screen rows as arrays of `{text, dim}`
+spans, plus a `cursor` table with `row`, `col`, and `visible` fields:
+
+```lua
+local screen = remuda.capture_styled("work")
+local cursor = screen.cursor
+-- row and col are 1-based; visible says whether the terminal displays the cursor.
+print(cursor.row, cursor.col, cursor.visible)
+for _, row in ipairs(screen.rows) do
+  for _, span in ipairs(row) do
+    print(span.text, span.dim)
+  end
+end
+```
+
+The `dim` field preserves terminal dim styling, which can identify placeholder
+or suggestion text. Cursor position and styled spans are observations only;
+mods interpret them according to the prompt or terminal application they know.
+
 ## Generate the reference
 
 ```sh
