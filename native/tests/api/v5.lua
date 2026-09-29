@@ -219,6 +219,9 @@ local bad_timeout = pcall(function()
   remuda.process.run({ argv = echo_argv, timeout = 31 })
 end)
 assert(not bad_timeout, "process.run must reject a timeout above the 30-second hard cap")
+local absent_readiness = remuda._module_readiness("api-v5-no-ready-declaration")
+assert(absent_readiness.status == "ready",
+  "a missing readiness declaration must preserve immediate completion")
 local json = remuda.json
 assert(type(json) == "table", "remuda.json is missing from the v5 surface")
 local decoded, decode_error = json.decode('{"values":[true,null]}')
