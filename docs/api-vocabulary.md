@@ -21,7 +21,7 @@ The inventory below covers every name in `native/src/script.rs` `BINDINGS` (79 n
 | `caller` | Primitive/query | Return `{kind = "session"|"outside"|"unknown", session = name?}` from the daemon's socket peer PID and managed-session ancestry. `session` means positive ancestry evidence; `outside` is unauthenticated and does not imply operator identity; missing, unreadable, or exited peers are `unknown`. This is ADVISORY only: same-UID Lua callers can invoke `remuda -e` or otherwise spoof Lua state, and Windows parent PIDs have the same limitation. Butler policy must not treat this as an authentication boundary. |
 | `capture`, `capture_styled` | Primitive | Read plain or styled terminal content. Promote to `remuda.screen.capture/styled`; styled capture includes cursor and style runs. |
 | `attach` | Primitive | Give a human the terminal connection. Promote to `remuda.session.attach`. |
-| `list_dir`, `mkdir`, `remove_dir_all`, `fs.write_atomic` | Primitive | List, create, remove filesystem directories, and atomically replace a file. Promote to `remuda.fs.list_dir/mkdir/remove_tree/write_atomic`; retain `remove_dir_all` alias to preserve its explicit destructive meaning. |
+| `list_dir`, `mkdir`, `remove_dir_all`, `fs.write_atomic`, `fs.mkdir_new` | Primitive | List, create, remove filesystem directories, and atomically replace a file. `fs.mkdir_new` creates one directory only when the target does not exist and does not create parents. Promote to `remuda.fs.list_dir/mkdir/mkdir_new/remove_tree/write_atomic`; retain `remove_dir_all` alias to preserve its explicit destructive meaning. |
 | `sleep`, `fail` | Primitive | Pause the Lua image or deliberately fail its caller. Promote to `remuda.runtime.sleep/fail`. |
 | `exec`, `reload` | Composite | Load or lifecycle-reload an installed mod. Promote to `remuda.module.exec/reload`. |
 | `input.text`, `input.submit` | Primitive | Deliver one text burst (bracketed paste when mode 2004 is enabled) and submit visible composer text with a separate Return and one bounded retry. |
@@ -123,7 +123,7 @@ The protocol is deliberately lower than the Lua word set: Lua `send` uses `SendL
 | `remuda.session` | `list`, `new`, `close`, `attach`; callable table for `session(name)` | Session identity and lifecycle; `__call` preserves the existing handle constructor. |
 | `remuda.input` | `text`, `submit`, `type_text` | Names text delivery and submission as units, with type-text retained as their composite. |
 | `remuda.screen` | `capture`, `styled`, `expect`, `expect_option` | Reading and acting on screen observations. |
-| `remuda.fs` | `list_dir`, `mkdir`, `remove_tree`, `write_atomic` | Filesystem primitives named by intent; `write_atomic` replaces one target without following a target symlink. |
+| `remuda.fs` | `list_dir`, `mkdir`, `mkdir_new`, `remove_tree`, `write_atomic` | Filesystem primitives named by intent; `mkdir_new` creates exactly one new directory from an absolute path without a trailing separator, and `write_atomic` replaces one target without following a target symlink. |
 | `remuda.runtime` | `sleep`, `fail`, `registry` (read-only) | Runtime controls and supported introspection. |
 | `remuda.module` | `exec`, `reload` | Module loading and lifecycle. |
 | `remuda.hook` | `on`, `emit*`, `list`, `clear`, `counts` | Event registration and dispatch vocabulary. |
