@@ -19,6 +19,9 @@ io . popen ("new prohibited call")
 os [ "execute" ] ("another new prohibited call")
 os . execute ("spacing variant")
 io["popen"]("bracketed popen")
+local e = os.execute
+os.execute "without parentheses"
+os.execute[[long-bracket call]]
 EOF
 git -C "$fixture" init -q
 git -C "$fixture" add .
@@ -27,7 +30,7 @@ if sh "$fixture/scripts/check-no-shell-lua.sh" "$fixture" >"$fixture/red.log" 2>
   echo 'guard accepted a new io.popen call' >&2
   exit 1
 fi
-if ! grep -F 'unapproved shell call: src/new.lua' "$fixture/red.log" >/dev/null; then
+if ! grep -F 'unapproved shell call: src/new.lua (7 occurrence(s), not allowlisted)' "$fixture/red.log" >/dev/null; then
   cat "$fixture/red.log" >&2
   echo 'guard failed without identifying the new shell call' >&2
   exit 1

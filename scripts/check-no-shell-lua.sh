@@ -1,5 +1,8 @@
 #!/bin/sh
 # Freeze existing Lua shell calls; additions and stale exceptions fail CI.
+# This is a per-line text scan of git-tracked *.lua; comments may be false positives.
+# It misses table aliases (`local o = os`), package.loaded["os"], _G/_ENV lookups,
+# load(), split references, and package.loadlib/ffi; code review covers those.
 set -eu
 
 ROOT=${1:-$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)}
@@ -18,10 +21,10 @@ count_calls() {
   awk '
     {
       line = $0
-      calls += gsub(/os[[:space:]]*[.][[:space:]]*execute[[:space:]]*[(]/, "", line)
-      calls += gsub(/io[[:space:]]*[.][[:space:]]*popen[[:space:]]*[(]/, "", line)
-      calls += gsub(/os[[:space:]]*\[[[:space:]]*[\042\047]execute[\042\047][[:space:]]*\][[:space:]]*\(/, "", line)
-      calls += gsub(/io[[:space:]]*\[[[:space:]]*[\042\047]popen[\042\047][[:space:]]*\][[:space:]]*\(/, "", line)
+      calls += gsub(/os[[:space:]]*[.][[:space:]]*execute/, "", line)
+      calls += gsub(/io[[:space:]]*[.][[:space:]]*popen/, "", line)
+      calls += gsub(/os[[:space:]]*\[[[:space:]]*[\042\047]execute[\042\047][[:space:]]*\]/, "", line)
+      calls += gsub(/io[[:space:]]*\[[[:space:]]*[\042\047]popen[\042\047][[:space:]]*\]/, "", line)
     }
     END { print calls + 0 }
   ' "$file"
