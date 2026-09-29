@@ -733,6 +733,8 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
         &path,
         &Request::Close {
             name: "stream".into(),
+            instance_id: None,
+            confirm: None,
         },
     );
 }
@@ -810,6 +812,8 @@ fn real_preview_keeps_scrolled_content_anchored_while_output_arrives() {
         &path,
         &Request::Close {
             name: "stream".into(),
+            instance_id: None,
+            confirm: None,
         },
     );
 }
@@ -909,6 +913,8 @@ fn real_preview_keeps_content_anchored_after_scrollback_reaches_its_cap() {
         &path,
         &Request::Close {
             name: "stream".into(),
+            instance_id: None,
+            confirm: None,
         },
     );
 }
