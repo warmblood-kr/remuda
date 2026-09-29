@@ -3017,13 +3017,7 @@ fn anchor_offset_to_new_history(
     current_total: usize,
     current_rows: usize,
 ) -> usize {
-    if offset == 0 {
-        0
-    } else {
-        offset
-            .saturating_add(current_total.saturating_sub(previous_total))
-            .min(current_rows)
-    }
+    crate::mouse::anchor_offset_to_new_history(offset, previous_total, current_total, current_rows)
 }
 
 /// Capture at the offset computed from the history total in that capture.
