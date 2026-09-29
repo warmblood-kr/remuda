@@ -229,6 +229,26 @@ fn remote_request(
     serde_json::from_slice(&plaintext).unwrap()
 }
 
+fn start_proof_session(server: &Node) -> String {
+    use remuda_core::protocol::{Request, Response};
+
+    let start = server
+        .command()
+        .args(["-e", "remuda.new('proof', {'/bin/sh', '-c', 'sleep 30'})"])
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "session start failed: {start:?}");
+    let daemon = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
+    match remuda_native::client::request(&daemon, &Request::List).unwrap() {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "proof")
+            .and_then(|session| session.instance_id)
+            .expect("proof instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    }
+}
+
 #[test]
 fn cluster_call_lists_and_captures_through_the_black_box_cli() {
     let client = Node::start("client");
@@ -287,21 +307,8 @@ fn remote_close_uses_the_local_control_gate_and_daemon_instance_check() {
     admit_pair(&client, &server);
     let (_listener, addr) = listener(&server);
 
-    let start = server
-        .command()
-        .args(["-e", "remuda.new('proof', {'/bin/sh', '-c', 'sleep 30'})"])
-        .output()
-        .unwrap();
-    assert!(start.status.success(), "session start failed: {start:?}");
+    let instance_id = start_proof_session(&server);
     let daemon = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
-    let instance_id = match remuda_native::client::request(&daemon, &Request::List).unwrap() {
-        Response::Sessions(sessions) => sessions
-            .into_iter()
-            .find(|session| session.name == "proof")
-            .and_then(|session| session.instance_id)
-            .expect("proof instance id"),
-        other => panic!("unexpected List response: {other:?}"),
-    };
 
     let off = server
         .command()
@@ -339,13 +346,26 @@ fn remote_close_uses_the_local_control_gate_and_daemon_instance_check() {
     );
     assert_eq!(legacy, Response::error("remote front refuses Close"));
 
+    let closed_previous = remuda_native::client::request(
+        &daemon,
+        &Request::Close {
+            name: "proof".into(),
+            instance_id: Some(instance_id.clone()),
+            confirm: Some(true),
+        },
+    )
+    .unwrap();
+    assert_eq!(closed_previous, Response::Ok);
+    let replacement_instance = start_proof_session(&server);
+    assert_ne!(replacement_instance, instance_id);
+
     let stale = remote_request(
         &client,
         &server,
         addr,
         &Request::Close {
             name: "proof".into(),
-            instance_id: Some(format!("stale-{instance_id}")),
+            instance_id: Some(instance_id),
             confirm: Some(true),
         },
     );
@@ -364,7 +384,7 @@ fn remote_close_uses_the_local_control_gate_and_daemon_instance_check() {
         addr,
         &Request::Close {
             name: "proof".into(),
-            instance_id: Some(instance_id),
+            instance_id: Some(replacement_instance),
             confirm: Some(true),
         },
     );

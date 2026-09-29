@@ -1514,6 +1514,8 @@ fn sync_waiter_wakes_when_child_exits() {
                 &socket,
                 &Request::Close {
                     name: "versioned".into(),
+                    instance_id: None,
+                    confirm: None,
                 },
             ),
             Ok(Response::Ok)
@@ -1557,6 +1559,8 @@ fn sync_rechecks_instance_after_close_and_relaunch_during_wait() {
             &socket,
             &Request::Close {
                 name: "versioned".into(),
+                instance_id: None,
+                confirm: None,
             },
         ),
         Ok(Response::Ok)

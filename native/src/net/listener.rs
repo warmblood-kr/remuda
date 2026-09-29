@@ -1337,14 +1337,20 @@ mod tests {
         assert!(validate_bind_address("0.0.0.0:0".parse().unwrap(), true).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn remote_input_obeys_local_control_setting_and_close_stays_refused() {
-        assert!(authorize_remote_request(&Request::List).is_ok());
-        let close_error = authorize_remote_request(&Request::Close {
-            name: "session".into(),
-            instance_id: None,
-            confirm: None,
-        })
+        let settings = TestControlSettings::new(br#"{"allow_remote_control":true}"#);
+        let control_source = settings.source();
+        assert!(authorize_remote_request_with_source(&Request::List, &control_source).is_ok());
+        let close_error = authorize_remote_request_with_source(
+            &Request::Close {
+                name: "session".into(),
+                instance_id: None,
+                confirm: None,
+            },
+            &control_source,
+        )
         .unwrap_err();
         assert_eq!(close_error, Response::error("remote front refuses Close"));
         let input = Request::Input {
@@ -1354,7 +1360,7 @@ mod tests {
             seq: 1,
             bytes: b"hello\r".to_vec(),
         };
-        assert!(authorize_remote_request_with_control(&input, true).is_ok());
+        assert!(authorize_remote_request_with_source(&input, &control_source).is_ok());
         let close_error = authorize_remote_request_with_control(
             &Request::Close {
                 name: "session".into(),
