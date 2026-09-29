@@ -262,6 +262,13 @@ A hook that raises an error is logged with its group and id, and counted on that
 
 `remuda.hook_list(event?)` returns copies of `{event, group, id, depth, owner, src, errors, last_error}` in run order. Use it to inspect hooks.
 
+The daemon emits `session_output(name, details)` after terminal output changes.
+`details.version` is the session's output version. Notifications are coalesced
+for up to 50 ms per active session, and a busy Lua image keeps only the latest
+pending wake for each session. `remuda.expect` uses this event to check matching
+sessions promptly; its periodic tick remains the fallback for deadlines and
+sessions whose backend cannot stream output.
+
 `remuda.hooks` is deprecated for reading, and will become read-only once no mod edits it by hand.
 
 ```lua
