@@ -62,6 +62,56 @@ pub(crate) enum Ancestry {
     Unreadable { pid: u32, error: io::Error },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CallerOrigin {
+    Session(String),
+    Outside,
+    Unknown,
+}
+
+pub(crate) fn resolve_caller(
+    peer_pid: io::Result<Option<u32>>,
+    sessions: &[(String, u32)],
+) -> CallerOrigin {
+    match peer_pid {
+        Ok(Some(pid)) if pid > 1 => {
+            resolve_caller_with(pid, sessions, std::process::id(), parent_pid)
+        }
+        Ok(Some(_)) | Ok(None) | Err(_) => CallerOrigin::Unknown,
+    }
+}
+
+fn resolve_caller_with<F>(
+    mut pid: u32,
+    sessions: &[(String, u32)],
+    daemon_pid: u32,
+    mut parent: F,
+) -> CallerOrigin
+where
+    F: FnMut(u32) -> io::Result<Option<u32>>,
+{
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        // The first matching session while walking upward is the innermost
+        // one, even when registry iteration order is different.
+        if let Some((name, _)) = sessions.iter().find(|(_, session_pid)| *session_pid == pid) {
+            return CallerOrigin::Session(name.clone());
+        }
+        // A process reparented to launchd/init has left every session tree.
+        // This says nothing about whether its owner is an operator.
+        if pid == daemon_pid || pid <= 1 {
+            return CallerOrigin::Outside;
+        }
+        if !visited.insert(pid) {
+            return CallerOrigin::Unknown;
+        }
+        match parent(pid) {
+            Ok(Some(next)) if next != pid => pid = next,
+            Ok(Some(_)) | Ok(None) | Err(_) => return CallerOrigin::Unknown,
+        }
+    }
+}
+
 pub(crate) fn missing_peer_requires_refusal(self_reported_identity: bool) -> bool {
     self_reported_identity
 }
@@ -232,5 +282,46 @@ mod tests {
     fn missing_peer_pid_refuses_only_with_self_reported_identity() {
         assert!(missing_peer_requires_refusal(true));
         assert!(!missing_peer_requires_refusal(false));
+    }
+
+    #[test]
+    fn missing_unreadable_and_exited_callers_are_unknown() {
+        assert_eq!(resolve_caller(Ok(None), &[]), CallerOrigin::Unknown);
+        assert_eq!(
+            resolve_caller(Err(io::Error::other("peer credentials unavailable")), &[]),
+            CallerOrigin::Unknown
+        );
+        let unreadable = |_: u32| Err(io::Error::new(io::ErrorKind::NotFound, "exited"));
+        assert_eq!(
+            resolve_caller_with(40, &[], 1, unreadable),
+            CallerOrigin::Unknown
+        );
+    }
+
+    #[test]
+    fn a_peer_reparented_to_launchd_is_outside() {
+        let parent = |pid| match pid {
+            40 => Ok(Some(1)),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            resolve_caller_with(40, &[], 99, parent),
+            CallerOrigin::Outside
+        );
+    }
+
+    #[test]
+    fn nested_session_ancestry_returns_the_innermost_session() {
+        let parent = |pid| match pid {
+            50 => Ok(Some(40)),
+            40 => Ok(Some(30)),
+            30 => Ok(Some(1)),
+            _ => unreachable!(),
+        };
+        let sessions = vec![("outer".into(), 30), ("inner".into(), 40)];
+        assert_eq!(
+            resolve_caller_with(50, &sessions, 99, parent),
+            CallerOrigin::Session("inner".into())
+        );
     }
 }

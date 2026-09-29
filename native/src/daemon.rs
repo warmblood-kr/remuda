@@ -1242,31 +1242,19 @@ fn handle_eval(
 }
 
 fn caller_context(stream: &Stream, registry: &Registry) -> crate::image::CallerContext {
-    let peer_pid = match process_ancestry::peer_pid(stream) {
-        Ok(Some(pid)) => pid,
-        Ok(None) | Err(_) => {
-            return crate::image::CallerContext {
-                session: None,
-                inside: true,
-            };
-        }
-    };
-    let mut unreadable = false;
-    for (name, session_pid) in registry.live_processes() {
-        match process_ancestry::is_self_or_descendant(peer_pid, &[session_pid]) {
-            process_ancestry::Ancestry::Inside => {
-                return crate::image::CallerContext {
-                    session: Some(name),
-                    inside: true,
-                };
-            }
-            process_ancestry::Ancestry::Outside => {}
-            process_ancestry::Ancestry::Unreadable { .. } => unreadable = true,
-        }
-    }
-    crate::image::CallerContext {
-        session: None,
-        inside: unreadable,
+    match process_ancestry::resolve_caller(
+        process_ancestry::peer_pid(stream),
+        &registry.live_processes(),
+    ) {
+        process_ancestry::CallerOrigin::Session(name) => crate::image::CallerContext {
+            kind: crate::image::CallerKind::Session,
+            session: Some(name),
+        },
+        process_ancestry::CallerOrigin::Outside => crate::image::CallerContext {
+            kind: crate::image::CallerKind::Outside,
+            session: None,
+        },
+        process_ancestry::CallerOrigin::Unknown => crate::image::CallerContext::default(),
     }
 }
 

@@ -1,6 +1,9 @@
 use remuda_core::protocol::{Request, Response};
+use remuda_core::Registry;
 use remuda_core::Size;
-use remuda_native::daemon;
+use remuda_native::{daemon, image::Image, tick::Counters};
+use std::path::Path;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,10 +18,14 @@ fn caller_identifies_a_client_running_inside_a_managed_session() {
     let socket = daemon::socket_path_in(&runtime, "s");
     let _daemon = spawn::Daemon::spawn(&runtime);
     let result_path = runtime.join("caller.txt");
-    let command = format!(
-        "sleep 0.2; {} -s s -e \"remuda.extension_command('probe', function() local c=remuda.caller(); local f=assert(io.open('{}','w')); f:write(tostring(c.session), ':', tostring(c.inside)); f:close() end); return remuda._dispatch_extension_command('probe')\"",
-        env!("CARGO_BIN_EXE_remuda"),
+    let lua = format!(
+        "remuda.caller=function() return {{kind='outside'}} end; remuda.extension_command('probe', function(_, caller) local f=assert(io.open('{}','w')); f:write(tostring(caller.session), ':', caller.kind); f:close() end); return remuda._dispatch_extension_command('probe')",
         result_path.display()
+    );
+    let command = format!(
+        "sleep 0.2; {} -s s -e \"{lua}\"",
+        env!("CARGO_BIN_EXE_remuda"),
+        lua = lua
     );
     assert_eq!(
         remuda_native::client::request(
@@ -46,5 +53,67 @@ fn caller_identifies_a_client_running_inside_a_managed_session() {
         );
         thread::sleep(Duration::from_millis(20));
     };
-    assert_eq!(result, "caller-probe:true");
+    assert_eq!(result, "caller-probe:session");
+}
+
+#[test]
+fn in_process_evaluations_and_schedules_have_unknown_callers() {
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-caller-in-process.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    assert_eq!(
+        image.eval("return remuda.caller().kind", None).unwrap(),
+        "unknown"
+    );
+    image
+        .eval(
+            "remuda.schedule({every = 1, run = function() scheduled_caller_kind = remuda.caller().kind end})",
+            None,
+        )
+        .unwrap();
+    image
+        .eval("remuda._run_due_schedules(10.0)", None)
+        .expect("run due schedule");
+    assert_eq!(
+        image.eval("return scheduled_caller_kind", None).unwrap(),
+        "unknown"
+    );
+}
+
+#[test]
+fn pending_cancellation_callback_has_unknown_caller() {
+    let runtime = std::env::temp_dir().join(format!("r-caller-pending-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&runtime);
+    std::fs::create_dir_all(&runtime).expect("create runtime");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let _daemon = spawn::Daemon::spawn(&runtime);
+
+    let response = remuda_native::client::request(
+        &socket,
+        &Request::Eval {
+            code: "return remuda.pending({timeout = 0.1, on_cancel = function() pending_caller_kind = remuda.caller().kind end})".into(),
+            name: None,
+        },
+    )
+    .expect("pending request response");
+    assert!(matches!(response, Response::Error(_)));
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let response = remuda_native::client::request(
+            &socket,
+            &Request::Eval {
+                code: "return pending_caller_kind or 'waiting'".into(),
+                name: None,
+            },
+        )
+        .expect("read cancellation callback result");
+        if response == Response::Value("unknown".into()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "pending callback did not run");
+        thread::sleep(Duration::from_millis(25));
+    }
 }

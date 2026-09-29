@@ -107,11 +107,27 @@ enum JobKind {
     StopImage,
 }
 
-/// Kernel-derived origin of one daemon Eval request.
-#[derive(Clone, Debug, Default)]
+/// How much the daemon can say about the process that submitted this Eval.
+#[derive(Clone, Debug)]
 pub(crate) struct CallerContext {
+    pub kind: CallerKind,
     pub session: Option<String>,
-    pub inside: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum CallerKind {
+    Session,
+    Outside,
+    Unknown,
+}
+
+impl Default for CallerContext {
+    fn default() -> Self {
+        Self {
+            kind: CallerKind::Unknown,
+            session: None,
+        }
+    }
 }
 
 struct SessionOutputState {

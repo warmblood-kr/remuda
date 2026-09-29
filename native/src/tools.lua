@@ -43,14 +43,19 @@ function remuda.extension_command(name, handler)
   extension_command_owners[name] = current_owner
 end
 -- The handler's `caller.env` holds forwarded CLI environment values and must
--- not be used for authorization. `remuda.caller()` reports daemon-derived
--- session ancestry for operator-versus-agent decisions.
+-- not be used for authorization. Capture the native word before user Lua can
+-- replace remuda.caller; its result is merged into the handler's caller data.
+local native_caller = remuda.caller
 function remuda._dispatch_extension_command(name, args, caller)
   local handler = remuda._extension_commands[name]
   if not handler then
     error("mod command " .. tostring(name) .. " is not loaded; run `remuda " .. tostring(name) .. "` first", 2)
   end
-  return handler(args or {}, caller or {})
+  local context = native_caller()
+  local caller_data = type(caller) == "table" and caller or {}
+  caller_data.kind = context.kind
+  caller_data.session = context.session
+  return handler(args or {}, caller_data)
 end
 
 -- One row per word, Rust's own bindings included (`script.rs`'s `WORDS`

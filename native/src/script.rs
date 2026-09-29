@@ -115,8 +115,8 @@ pub const BINDINGS: [&str; 79] = [
 const WORDS: &[(&str, &str, &str)] = &[
     (
         "caller",
-        "Return the daemon's peer-credential-derived caller session and whether the caller is inside a managed session.",
-        "caller() -> {session: string|nil, inside: boolean}",
+        "Advisory daemon classification of a peer as a managed session, outside, or unknown.",
+        "caller() -> {kind: 'session'|'outside'|'unknown', session?: string}",
     ),
     (
         "_module_readiness",
@@ -394,6 +394,28 @@ fn new_request(
     }
 }
 
+fn caller_binding(
+    lua: &Lua,
+    table: &Table,
+    caller: Rc<RefCell<crate::image::CallerContext>>,
+) -> mlua::Result<()> {
+    table.set(
+        "caller",
+        lua.create_function(move |lua, ()| {
+            let caller = caller.borrow().clone();
+            let value = lua.create_table()?;
+            let kind = match caller.kind {
+                crate::image::CallerKind::Session => "session",
+                crate::image::CallerKind::Outside => "outside",
+                crate::image::CallerKind::Unknown => "unknown",
+            };
+            value.set("kind", kind)?;
+            value.set("session", caller.session)?;
+            Ok(value)
+        })?,
+    )
+}
+
 pub(crate) fn bindings(
     lua: &Lua,
     socket: &Path,
@@ -406,17 +428,7 @@ pub(crate) fn bindings(
     let at = || socket.to_path_buf();
     fail_binding(lua, &table, image.clone())?;
     pending_bindings(lua, &table, image.pending_replies())?;
-
-    table.set(
-        "caller",
-        lua.create_function(move |lua, ()| {
-            let caller = caller.borrow().clone();
-            let value = lua.create_table()?;
-            value.set("session", caller.session)?;
-            value.set("inside", caller.inside)?;
-            Ok(value)
-        })?,
-    )?;
+    caller_binding(lua, &table, caller)?;
 
     // In-process, not a loopback: the image always runs inside the same
     // daemon this `Registry` belongs to (image.rs), so asking over the wire
