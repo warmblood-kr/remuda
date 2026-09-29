@@ -184,7 +184,7 @@ fn shell_quote(path: &Path) -> String {
 /// Semver-ish ordering: the numeric triple first, then a release outranks any
 /// prerelease, then prerelease strings compare lexically — which is why the
 /// nightly suffix is `YYYYMMDD.<sha>` and not `<sha>`.
-fn is_newer(candidate: &str, current: &str) -> bool {
+pub fn is_newer(candidate: &str, current: &str) -> bool {
     rank(candidate) > rank(current)
 }
 

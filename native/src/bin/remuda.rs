@@ -24,6 +24,8 @@ use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
@@ -36,6 +38,11 @@ fn main() -> ExitCode {
         Err(error) => return fail(error),
     };
     let argv: Vec<&str> = rest.iter().map(String::as_str).collect();
+
+    if let Some(exit) = run_internal_command(&argv) {
+        return exit;
+    }
+
     let path = daemon::socket_path(server);
 
     let skew = match prepare_command(&argv, &path) {
@@ -87,16 +94,7 @@ fn main() -> ExitCode {
 
         ["run", rest @ ..] => run_session(server, &path, rest),
 
-        ["send", name, text @ ..] => {
-            let text = text.join(" ");
-            with_daemon(server, &path, |path| {
-                let request = Request::SendLine {
-                    name: name.to_string(),
-                    text: text.clone(),
-                };
-                simple_request(path, request)
-            })
-        }
+        ["send", name, text @ ..] => send_command(server, &path, name, text),
 
         ["attach", name] => with_daemon(server, &path, |path| ride(path, name)),
         ["attach", name, "--mouse=false"] => {
@@ -1264,6 +1262,86 @@ fn run_upgrade(args: &[&str]) -> ExitCode {
     }
 }
 
+fn send_command(server: &str, path: &Path, name: &str, text: &[&str]) -> ExitCode {
+    let text = text.join(" ");
+    with_daemon(server, path, |path| {
+        let request = Request::SendLine {
+            name: name.to_string(),
+            text: text.clone(),
+        };
+        simple_request(path, request)
+    })
+}
+
+/// Commands used by release automation must not start a daemon or run update checks.
+fn run_internal_command(argv: &[&str]) -> Option<ExitCode> {
+    match argv {
+        ["_latest-index", args @ ..] => Some(run_latest_index(args)),
+        _ => None,
+    }
+}
+
+/// Internal release-workflow command. Reuse dist::is_newer so publication and
+/// update notices order channel versions identically.
+fn run_latest_index(args: &[&str]) -> ExitCode {
+    let [file, channel, version, updated] = args else {
+        return fail("usage: remuda _latest-index FILE CHANNEL VERSION UPDATED");
+    };
+    let (file, channel, version, updated) = (*file, *channel, *version, *updated);
+    if !dist::is_channel(channel) {
+        return fail(format!("unknown channel {channel:?} — stable or nightly"));
+    }
+
+    let result = (|| -> Result<&'static str, String> {
+        let path = Path::new(file);
+        let text = fs::read_to_string(path)
+            .map_err(|error| format!("cannot read latest index {}: {error}", path.display()))?;
+        let mut index: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|error| format!("cannot parse latest index {}: {error}", path.display()))?;
+        let object = index
+            .as_object_mut()
+            .ok_or_else(|| "latest index must be a JSON object".to_string())?;
+        let current = object
+            .get(channel)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        if version == current {
+            eprintln!("remuda: latest.json {channel} already points to {version}");
+            return Ok("publish=already");
+        }
+        if !dist::is_newer(version, current) {
+            eprintln!(
+                "remuda: latest.json {channel} is already {current}; skipping stale candidate {version}"
+            );
+            return Ok("publish=false");
+        }
+
+        object.insert(
+            channel.to_string(),
+            serde_json::Value::String(version.to_string()),
+        );
+        object.insert(
+            "updated".to_string(),
+            serde_json::Value::String(updated.to_string()),
+        );
+        let mut output = serde_json::to_vec_pretty(&index)
+            .map_err(|error| format!("cannot encode latest index: {error}"))?;
+        output.push(b'\n');
+        fs::write(path, output)
+            .map_err(|error| format!("cannot write latest index {}: {error}", path.display()))?;
+        Ok("publish=true")
+    })();
+
+    match result {
+        Ok(status) => {
+            println!("{status}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(error),
+    }
+}
+
 /// `--channel <name>` or nothing, in which case the installed channel file
 /// decides. An unknown flag is refused rather than ignored.
 fn upgrade_channel<'a>(args: &[&'a str]) -> Result<Option<&'a str>, String> {
@@ -1357,10 +1435,87 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
         // The wrapper gets its own chunk name; the mod's frames keep theirs.
         Ok(Some(_)) => {
             let code = format!("remuda.exec({})", remuda_native::mcp::lua_string(name));
-            match remuda_native::script::run_source(path, "=remuda exec", &code) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(e),
+            if let Err(error) = remuda_native::script::run_source(path, "=remuda exec", &code) {
+                return fail_exec(error);
             }
+            wait_for_module_ready(path, name)
+        }
+    }
+}
+
+/// Declaration mistakes are user-facing exec failures, not useful Lua
+/// tracebacks. Keep their messages stable and single-line at the CLI boundary.
+fn fail_exec(error: String) -> ExitCode {
+    const CLEAN_DECLARATION_ERRORS: [&str; 2] = [
+        "module timeout_ms must be an integer from 1 through 240000",
+        "module timeout_ms requires a ready function",
+    ];
+    if let Some(message) = CLEAN_DECLARATION_ERRORS
+        .iter()
+        .find(|message| error.contains(**message))
+    {
+        eprintln!("{message}");
+        ExitCode::FAILURE
+    } else {
+        fail(error)
+    }
+}
+
+fn wait_for_module_ready(path: &Path, name: &str) -> ExitCode {
+    let source = format!(
+        "return remuda.json.encode(remuda._module_readiness({}))",
+        remuda_native::mcp::lua_string(name)
+    );
+    let mut deadline = None;
+    loop {
+        let checked_at = Instant::now();
+        let output =
+            match remuda_native::script::eval_source(path, "=remuda exec readiness", &source) {
+                Ok(output) => output,
+                Err(error) => return fail(error),
+            };
+        let json = output
+            .trim_end_matches('\n')
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default();
+        let result: serde_json::Value = match serde_json::from_str(json) {
+            Ok(result) => result,
+            Err(error) => {
+                return fail(format!(
+                    "remuda exec readiness probe returned invalid data ({error}): {output}"
+                ));
+            }
+        };
+        match result.get("status").and_then(serde_json::Value::as_str) {
+            Some("ready") => return ExitCode::SUCCESS,
+            Some("failed") => {
+                let message = result
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("readiness callback failed");
+                eprintln!("mod {name} failed to become ready: {message}");
+                return ExitCode::FAILURE;
+            }
+            Some("pending") => {
+                let timeout_ms = match result.get("timeout_ms").and_then(serde_json::Value::as_u64)
+                {
+                    Some(timeout_ms @ 1..=240_000) => timeout_ms,
+                    _ => return fail("module readiness returned an invalid timeout_ms"),
+                };
+                let wait_until =
+                    *deadline.get_or_insert_with(|| checked_at + Duration::from_millis(timeout_ms));
+                let now = Instant::now();
+                if now >= wait_until {
+                    eprintln!(
+                        "mod {name} did not become ready within {}s",
+                        timeout_ms as f64 / 1000.0
+                    );
+                    return ExitCode::from(124);
+                }
+                thread::sleep(Duration::from_millis(250).min(wait_until - now));
+            }
+            _ => return fail("module readiness returned an unknown status"),
         }
     }
 }
