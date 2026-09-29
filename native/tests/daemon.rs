@@ -900,6 +900,7 @@ fn new_byte_capture_session(
     byte_count: usize,
     wait_for_marker: Option<&Path>,
     slow_reader: bool,
+    ready_marker: Option<&Path>,
 ) {
     let reader = if wait_for_marker.is_some() {
         "while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; ".to_string()
@@ -915,13 +916,21 @@ fn new_byte_capture_session(
         "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,$n); last unless $r; print $f $b; $n-=$r}'"
             .to_string()
     };
-    let script = format!("stty raw -echo; printf READY; {reader}");
+    let ready_wait = if ready_marker.is_some() {
+        "while [ ! -e \"$READY_MARKER\" ]; do sleep 0.02; done; "
+    } else {
+        ""
+    };
+    let script = format!("stty raw -echo; {ready_wait}printf READY; {reader}");
     let mut env = std::collections::HashMap::from([
         ("CAPTURE_PATH".into(), capture_path.display().to_string()),
         ("BYTE_COUNT".into(), byte_count.to_string()),
     ]);
     if let Some(marker) = wait_for_marker {
         env.insert("READER_MARKER".into(), marker.display().to_string());
+    }
+    if let Some(marker) = ready_marker {
+        env.insert("READY_MARKER".into(), marker.display().to_string());
     }
     let response = client::request(
         path,
@@ -970,24 +979,11 @@ fn wait_for_cli_exit(viewer: &Session, name: &str) {
 }
 
 #[cfg(unix)]
-fn stop_attach_test_daemon(path: &Path) {
-    let _ = client::request(
-        path,
-        &Request::Shutdown {
-            requester_daemon_id: None,
-            requester_session_id: None,
-            requester_session_name: None,
-            override_hosted: false,
-        },
-    );
-}
-
-#[cfg(unix)]
 #[test]
 fn attach_detach_during_stalled_input_reports_loss_and_exits() {
     let runtime = scratch_dir("attach-detach-stalled-input");
     let path = daemon::socket_path_in(&runtime, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = Daemon::spawn(&runtime);
     let capture_path = runtime.join("captured");
     let marker = runtime.join("start-reading");
     let name = "target";
@@ -999,6 +995,7 @@ fn attach_detach_during_stalled_input_reports_loss_and_exits() {
         flood.len(),
         Some(&marker),
         false,
+        None,
     );
 
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
@@ -1027,7 +1024,6 @@ fn attach_detach_during_stalled_input_reports_loss_and_exits() {
         escaped_tail(&output)
     );
     std::fs::write(&marker, b"start").expect("release child for cleanup");
-    stop_attach_test_daemon(&path);
 }
 
 #[cfg(unix)]
@@ -1035,12 +1031,21 @@ fn attach_detach_during_stalled_input_reports_loss_and_exits() {
 fn attach_keys_before_detach_in_one_read_reach_the_child() {
     let runtime = scratch_dir("attach-detach-prefix");
     let path = daemon::socket_path_in(&runtime, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = Daemon::spawn(&runtime);
     let prefix = b"prefix!\r";
     for run in 0..5 {
         let name = format!("target-{run}");
         let capture_path = runtime.join(format!("captured-{run}"));
-        new_byte_capture_session(&path, &name, &capture_path, prefix.len(), None, false);
+        let ready_marker = runtime.join(format!("ready-{run}"));
+        new_byte_capture_session(
+            &path,
+            &name,
+            &capture_path,
+            prefix.len(),
+            None,
+            false,
+            Some(&ready_marker),
+        );
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
         command.args(["-s", "s", "attach", &name]);
         command.env("REMUDA_RUNTIME_DIR", &runtime);
@@ -1051,6 +1056,7 @@ fn attach_keys_before_detach_in_one_read_reach_the_child() {
         );
         let held = viewer.attach();
         wait_until_attached(&path, &name);
+        std::fs::write(&ready_marker, b"attached").expect("release child readiness");
         wait_for_session_screen(&viewer, "READY");
 
         let mut input = prefix.to_vec();
@@ -1067,7 +1073,6 @@ fn attach_keys_before_detach_in_one_read_reach_the_child() {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    stop_attach_test_daemon(&path);
 }
 
 #[cfg(unix)]
@@ -1075,11 +1080,11 @@ fn attach_keys_before_detach_in_one_read_reach_the_child() {
 fn attach_large_paste_survives_a_slow_but_reading_child() {
     let runtime = scratch_dir("attach-295-slow-reader-paste");
     let path = daemon::socket_path_in(&runtime, "s");
-    let _daemon = daemon_at(&path);
+    let _daemon = Daemon::spawn(&runtime);
     let name = "target";
     let capture_path = runtime.join("captured");
     let paste = vec![b'p'; 256 * 1024];
-    new_byte_capture_session(&path, name, &capture_path, paste.len(), None, true);
+    new_byte_capture_session(&path, name, &capture_path, paste.len(), None, true, None);
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
     command.args(["-s", "s", "attach", name]);
     command.env("REMUDA_RUNTIME_DIR", &runtime);
@@ -1103,7 +1108,6 @@ fn attach_large_paste_survives_a_slow_but_reading_child() {
     }
     let _ = held.write_raw(&[client::DETACH]);
     wait_for_cli_exit(&viewer, name);
-    stop_attach_test_daemon(&path);
 }
 
 #[test]
