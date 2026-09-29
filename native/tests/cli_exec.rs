@@ -381,3 +381,22 @@ fn extension_commands_accept_binary_stdin_only_when_requested() {
     assert_eq!(output.stdout, b"<nil>\n");
     cleanup_stdin_fixture(&dir);
 }
+
+#[test]
+fn extension_command_rejects_trailing_stdin_flag_with_usage_hint() {
+    let dir = setup_stdin_fixture();
+    let output = stdin_cli(&dir, &["sample", "--stdin"])
+        .output()
+        .expect("run extension command with misplaced stdin flag");
+    assert!(
+        !output.status.success(),
+        "misplaced --stdin should be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("usage: remuda --stdin MOD [ARGS…]")
+            && stderr.contains("put --stdin before the mod command"),
+        "misplaced --stdin should show a usage hint: {output:?}"
+    );
+    cleanup_stdin_fixture(&dir);
+}

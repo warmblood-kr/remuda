@@ -69,7 +69,9 @@ pub fn run_sync(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     child_guard::harden(&mut command);
-    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("start process.run program {program:?}: {error}"))?;
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
     let child_stdin = child.stdin.take().expect("stdin was piped");
@@ -186,6 +188,7 @@ fn wait_for_process_io(
     stdin_done: &AtomicBool,
 ) -> Result<(std::process::ExitStatus, bool), String> {
     let mut child_status = None;
+    let mut process_group_killed = false;
     loop {
         if child_status.is_none() {
             match child.try_wait() {
@@ -206,14 +209,23 @@ fn wait_for_process_io(
             terminate_child(child);
             return Err(format!("read process.run stderr: {error}"));
         }
+        // A naturally exited leader can leave ordinary background children
+        // holding its pipes. Keep the leader's status, but close its process
+        // group so both readers can finish and release their permits.
+        if child_status.is_some()
+            && (!stdout_reader.done() || !stderr_reader.done())
+            && !process_group_killed
+        {
+            kill_process_tree(child);
+            process_group_killed = true;
+        }
         if stdout_reader.done() && stderr_reader.done() && stdin_done.load(Ordering::Acquire) {
             if let Some(status) = child_status.take() {
                 return Ok((status, false));
             }
         }
         if Instant::now() >= deadline {
-            // Only signal a process group while its direct leader is known to
-            // be alive. Once reaped, its pgid may have been reused.
+            let timed_out = child_status.is_none();
             let status = match child_status {
                 Some(status) => status,
                 None => match child.try_wait() {
@@ -230,7 +242,7 @@ fn wait_for_process_io(
                     }
                 },
             };
-            return Ok((status, true));
+            return Ok((status, timed_out));
         }
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -250,8 +262,7 @@ struct BoundedCapture {
 
 impl BoundedCapture {
     fn push(&mut self, bytes: &[u8]) {
-        let retained_limit = RUN_OUTPUT_LIMIT - RUN_OUTPUT_MARKER.len();
-        let retain = retained_limit
+        let retain = RUN_OUTPUT_LIMIT
             .saturating_sub(self.bytes.len())
             .min(bytes.len());
         self.bytes.extend_from_slice(&bytes[..retain]);
@@ -327,7 +338,8 @@ mod run_tests {
             super::ReaderState::new(),
         );
         let output = capture.lock().unwrap().snapshot();
-        assert_eq!(output.len(), RUN_OUTPUT_LIMIT);
+        assert_eq!(output.len(), RUN_OUTPUT_LIMIT + RUN_OUTPUT_MARKER.len());
+        assert_eq!(output[..RUN_OUTPUT_LIMIT], vec![b'x'; RUN_OUTPUT_LIMIT]);
         assert!(output.ends_with(RUN_OUTPUT_MARKER));
     }
 }

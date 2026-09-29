@@ -979,6 +979,12 @@ fn split_stdin_flag(args: &[String]) -> Result<(bool, &[String]), &'static str> 
         [flag, ..] if flag == "--stdin" => {
             Err("--stdin is only valid before an installed mod command")
         }
+        [command, rest @ ..]
+            if remuda_native::packages::has_subcommand(command)
+                && rest.iter().any(|arg| arg == "--stdin") =>
+        {
+            Err("usage: remuda --stdin MOD [ARGS…] (put --stdin before the mod command)")
+        }
         _ => Ok((false, args)),
     }
 }
