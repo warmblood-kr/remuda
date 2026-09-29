@@ -17,6 +17,78 @@ use std::sync::{Arc, Condvar, Mutex};
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
+fn input_tail(text: &str) -> String {
+    let compact: Vec<char> = normalize_input_text(text)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    compact
+        .into_iter()
+        .rev()
+        .take(20)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
+fn normalize_input_text(text: &str) -> String {
+    text.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .chars()
+        .filter(|ch| {
+            *ch == '\t'
+                || *ch == '\n'
+                || !matches!(*ch as u32, 0x00..=0x08 | 0x0b..=0x1f | 0x7f | 0x80..=0x9f)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod input_text_tests {
+    use super::{normalize_input_text, occurrence_count};
+
+    #[test]
+    fn strips_terminal_controls_by_unicode_character_and_preserves_korean() {
+        assert_eq!(
+            normalize_input_text("a\x01\tb\r\nc\x7f\u{0085}\u{009b}한글"),
+            "a\tb\nc한글"
+        );
+    }
+
+    #[test]
+    fn occurrence_count_counts_visible_tail_matches() {
+        assert_eq!(occurrence_count("old: abc / new: abc", "abc"), 2);
+        assert_eq!(occurrence_count("old: abc", "missing"), 0);
+        assert_eq!(occurrence_count("anything", ""), 0);
+    }
+}
+
+fn occurrence_count(screen: &str, tail: &str) -> usize {
+    if tail.is_empty() {
+        0
+    } else {
+        screen.match_indices(tail).count()
+    }
+}
+
+fn compact_screen(screen: &str) -> String {
+    screen.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputSubmitOutcome {
+    /// The screen changed after Return, or the Return-only operation was sent.
+    Submitted,
+    /// Return was sent, but the visible screen did not verify submission.
+    Unverified,
+}
+
+struct PendingInput {
+    tail: String,
+    baseline_occurrences: usize,
+}
+
 /// A running agent, addressable by name.
 pub struct Session {
     id: String,
@@ -51,6 +123,7 @@ pub struct Session {
     /// pause, when the `agent` lock is briefly free. See [`Self::feed`].
     input_lock: Mutex<bool>,
     input_ready: Condvar,
+    pending_input: Mutex<Option<PendingInput>>,
     /// Bounded retry history for remote byte batches, kept per session.
     input_dedup: Mutex<InputDeduplicator>,
     /// Per-session byte budget, checked before taking `input_lock`.
@@ -161,6 +234,7 @@ impl Session {
             next_attach_generation: AtomicU64::new(1),
             input_lock: Mutex::new(false),
             input_ready: Condvar::new(),
+            pending_input: Mutex::new(None),
             input_dedup: Mutex::new(InputDeduplicator::new()),
             input_rate: Mutex::new(InputRateLimiter::default()),
         }
@@ -221,13 +295,197 @@ impl Session {
     }
 
     /// Deliver one instruction: the text, then Enter, as one indivisible act.
-    /// Carriage return, not newline — canonical mode takes CR as submit, and
-    /// raw-key TUIs expect the byte a real Enter produces. Decided only here.
+    /// The complete text/submit sequence shares one input lock. Backends
+    /// without a rendered screen keep the historical single-burst behavior.
     pub fn send_line(&self, text: &str) -> Result<()> {
-        let mut line = Vec::with_capacity(text.len() + 1);
-        line.extend_from_slice(text.as_bytes());
-        line.push(b'\r');
-        self.send(&line)
+        self.type_text(text, Duration::ZERO).map(|_| ())
+    }
+
+    /// Deliver a normalized text burst, bracketed when the child enabled mode
+    /// 2004. The burst contains no submit key.
+    pub fn input_text(&self, text: &str) -> Result<()> {
+        let body = normalize_input_text(text);
+        let tail = input_tail(&body);
+        let _held = self.acquire_input_lock()?;
+        if let Ok(mut pending) = self.pending_input.lock() {
+            *pending = None;
+        }
+        let baseline = self.tail_occurrences(&tail);
+        self.input_text_locked(&body)?;
+        if let Ok(mut pending) = self.pending_input.lock() {
+            *pending = Some(PendingInput {
+                tail,
+                baseline_occurrences: baseline,
+            });
+        }
+        Ok(())
+    }
+
+    fn input_text_locked(&self, body: &str) -> Result<()> {
+        let bracketed = self.mouse_state().bracketed_paste;
+        let burst = if bracketed {
+            let mut bytes = Vec::with_capacity(body.len() + 12);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(body.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            bytes
+        } else {
+            body.as_bytes().to_vec()
+        };
+        self.write_one_burst(&burst)
+    }
+
+    /// Submit with a separate Return after the text is visible. A changed
+    /// screen after Return means it was submitted; an unchanged screen after
+    /// the bounded observation means Return became a composer newline.
+    pub fn submit(&self, expect: &str) -> Result<InputSubmitOutcome> {
+        let _held = self.acquire_input_lock()?;
+        let tail = input_tail(expect);
+        let baseline = self
+            .pending_input
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
+            .filter(|pending| pending.tail == tail)
+            .map(|pending| pending.baseline_occurrences)
+            .unwrap_or_else(|| self.tail_occurrences(&tail).saturating_sub(1));
+        self.submit_locked(&tail, baseline)
+    }
+
+    /// Deliver TEXT and submit it as one act. This is the composite used by
+    /// type_text and SendLine; no other input sender can split the two units.
+    pub fn type_text(&self, text: &str, settle: Duration) -> Result<InputSubmitOutcome> {
+        let body = normalize_input_text(text);
+        if body.is_empty() {
+            let _held = self.acquire_input_lock()?;
+            if let Ok(mut pending) = self.pending_input.lock() {
+                *pending = None;
+            }
+            self.write_one_burst(crate::keys::RETURN_BYTES)?;
+            return Ok(InputSubmitOutcome::Submitted);
+        }
+        if self.output_version().is_none() || self.screen_text().is_err() {
+            let mut bytes = body.into_bytes();
+            bytes.extend_from_slice(crate::keys::RETURN_BYTES);
+            let _held = self.acquire_input_lock()?;
+            self.write_one_burst(&bytes)?;
+            return Ok(InputSubmitOutcome::Submitted);
+        }
+
+        let tail = input_tail(&body);
+        let _held = self.acquire_input_lock()?;
+        if let Ok(mut pending) = self.pending_input.lock() {
+            *pending = None;
+        }
+        let baseline = self.tail_occurrences(&tail);
+        self.input_text_locked(&body)?;
+        if !settle.is_zero() {
+            self.clock.sleep(settle);
+        }
+        self.submit_locked(&tail, baseline)
+    }
+
+    fn submit_locked(&self, tail: &str, baseline_occurrences: usize) -> Result<InputSubmitOutcome> {
+        if tail.is_empty() {
+            self.write_one_burst(crate::keys::RETURN_BYTES)?;
+            return Ok(InputSubmitOutcome::Submitted);
+        }
+        let Some(mut version) = self.output_version() else {
+            self.write_one_burst(crate::keys::RETURN_BYTES)?;
+            return Ok(InputSubmitOutcome::Submitted);
+        };
+        if self.screen_text().is_err() {
+            self.write_one_burst(crate::keys::RETURN_BYTES)?;
+            return Ok(InputSubmitOutcome::Submitted);
+        }
+        let visible = self.wait_for_visible_tail(tail, baseline_occurrences, &mut version);
+        self.wait_for_screen_quiet(&mut version);
+        let before_raw = self.screen_text().unwrap_or_default();
+        let before_compact = compact_screen(&before_raw);
+        let before_version = self.output_version().unwrap_or(version);
+        self.write_one_burst(crate::keys::RETURN_BYTES)?;
+        if !visible {
+            return Ok(InputSubmitOutcome::Unverified);
+        }
+
+        version = before_version;
+        let deadline = self.clock.now() + Duration::from_secs(1);
+        let mut composer_newline = false;
+        while self.clock.now() < deadline {
+            if !self.is_alive() {
+                return Ok(InputSubmitOutcome::Unverified);
+            }
+            let raw = self.screen_text().unwrap_or_default();
+            if raw != before_raw {
+                if compact_screen(&raw) == before_compact {
+                    composer_newline = true;
+                } else {
+                    return Ok(InputSubmitOutcome::Submitted);
+                }
+            }
+            let remaining = deadline.saturating_sub(self.clock.now());
+            let timeout = remaining.min(Duration::from_millis(50));
+            if let Ok(snapshot) = self.wait_for_output_after(version, timeout) {
+                version = snapshot.output_version.unwrap_or(version);
+            }
+        }
+        if !composer_newline {
+            return Ok(InputSubmitOutcome::Unverified);
+        }
+
+        // The first Return inserted a composer newline. A single retry is
+        // justified; after sending it, report that delivery is unverified
+        // because the screen did not prove whether the child submitted it.
+        self.write_one_burst(crate::keys::RETURN_BYTES)?;
+        Ok(InputSubmitOutcome::Unverified)
+    }
+
+    fn wait_for_visible_tail(
+        &self,
+        tail: &str,
+        baseline_occurrences: usize,
+        version: &mut u64,
+    ) -> bool {
+        let deadline = self.clock.now() + Duration::from_secs(2);
+        while self.clock.now() < deadline {
+            if self
+                .compact_screen()
+                .is_some_and(|screen| occurrence_count(&screen, tail) > baseline_occurrences)
+            {
+                return true;
+            }
+            let remaining = deadline.saturating_sub(self.clock.now());
+            let timeout = remaining.min(Duration::from_millis(50));
+            match self.wait_for_output_after(*version, timeout) {
+                Ok(snapshot) => *version = snapshot.output_version.unwrap_or(*version),
+                Err(_) => return false,
+            }
+        }
+        self.compact_screen()
+            .is_some_and(|screen| occurrence_count(&screen, tail) > baseline_occurrences)
+    }
+
+    fn tail_occurrences(&self, tail: &str) -> usize {
+        self.compact_screen()
+            .map_or(0, |screen| occurrence_count(&screen, tail))
+    }
+
+    fn wait_for_screen_quiet(&self, version: &mut u64) {
+        let deadline = self.clock.now() + Duration::from_millis(300);
+        while self.clock.now() < deadline {
+            let remaining = deadline.saturating_sub(self.clock.now());
+            let timeout = remaining.min(Duration::from_millis(75));
+            match self.wait_for_output_after(*version, timeout) {
+                Ok(snapshot) => *version = snapshot.output_version.unwrap_or(*version),
+                Err(_) => return,
+            }
+        }
+    }
+
+    fn compact_screen(&self) -> Option<String> {
+        self.screen_text()
+            .ok()
+            .map(|screen| compact_screen(&screen))
     }
 
     /// Deliver a burst of input as one indivisible act, appending nothing — the
@@ -246,6 +504,8 @@ impl Session {
             .map_err(|_| InputError::Unavailable)?;
         rate.check_rate(self.clock.now(), bytes)
     }
+
+    /* old block removed below */
 
     fn refund_rate(&self, bytes: usize) {
         if let Ok(mut rate) = self.input_rate.lock() {
@@ -476,6 +736,7 @@ impl Session {
             .input_lock
             .lock()
             .map_err(|_| AgentError::Io("session input lock poisoned".into()))?;
+        let deadline = self.clock.now() + Duration::from_millis(500);
         loop {
             if !*locked {
                 *locked = true;
@@ -484,9 +745,13 @@ impl Session {
             if self.input_writer_timed_out()? {
                 return Err(AgentError::Busy);
             }
+            let remaining = deadline.saturating_sub(self.clock.now());
+            if remaining.is_zero() {
+                return Err(AgentError::Busy);
+            }
             locked = self
                 .input_ready
-                .wait_timeout(locked, Duration::from_millis(10))
+                .wait_timeout(locked, remaining.min(Duration::from_millis(10)))
                 .map_err(|_| AgentError::Io("session input lock poisoned".into()))?
                 .0;
         }

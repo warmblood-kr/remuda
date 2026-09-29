@@ -20,10 +20,11 @@ The inventory below covers every name in `native/src/script.rs` `BINDINGS` (78 n
 | `send`, `insert`, `key`, `click`, `feed` | Primitive | Deliver line, bytes, key, pointer, or timed input steps. Promote to `remuda.input.line/insert/key/click/feed`; `send` remains a deprecated alias for `input.line`. |
 | `capture`, `capture_styled` | Primitive | Read plain or styled terminal content. Promote to `remuda.screen.capture/styled`; styled capture includes cursor and style runs. |
 | `attach` | Primitive | Give a human the terminal connection. Promote to `remuda.session.attach`. |
-| `list_dir`, `mkdir`, `remove_dir_all`, `fs.write_atomic` | Primitive | List, create, remove filesystem directories, and atomically replace a file. Promote to `remuda.fs.list_dir/mkdir/remove_tree/write_atomic`; retain `remove_dir_all` alias to preserve its explicit destructive meaning. |
+| `list_dir`, `mkdir`, `remove_dir_all`, `fs.write_atomic`, `fs.mkdir_new` | Primitive | List, create, remove filesystem directories, and atomically replace a file. `fs.mkdir_new` creates one directory only when the target does not exist and does not create parents. Promote to `remuda.fs.list_dir/mkdir/mkdir_new/remove_tree/write_atomic`; retain `remove_dir_all` alias to preserve its explicit destructive meaning. |
 | `sleep`, `fail` | Primitive | Pause the Lua image or deliberately fail its caller. Promote to `remuda.runtime.sleep/fail`. |
 | `exec`, `reload` | Composite | Load or lifecycle-reload an installed mod. Promote to `remuda.module.exec/reload`. |
-| `type_text` | Composite | Type a string and optionally wait for settling; built on `feed`/input primitives. Promote to `remuda.input.type_text`. |
+| `input.text`, `input.submit` | Primitive | Deliver one text burst (bracketed paste when mode 2004 is enabled) and submit visible composer text with a separate Return and one bounded retry. |
+| `type_text` | Composite | Type text, wait for the minimum settle pause, and submit it through `input.text` and `input.submit`. |
 | `expect`, `expect_option` | Composite | Observe a screen, select and perform a matching branch/action; `expect_option` selects from a screen and match set. Promote under `remuda.screen.expect` and `remuda.screen.expect_option`. |
 | `buffer`, `buffers` | Existing namespace + registry | `remuda.buffer` is already a namespace table with `new`, `set`, and `list`; `remuda.buffers` is its registry. Preserve these nested words and use them as the in-repo precedent for the proposed namespace tables. |
 | `window`, `windows` | Existing namespace + registry | `remuda.window` is already a namespace table with `current`; `remuda.windows` is its registry. Preserve these nested words and use them as the in-repo precedent for the proposed namespace tables. |
@@ -119,9 +120,9 @@ The protocol is deliberately lower than the Lua word set: Lua `send` uses `SendL
 | Namespace | Words | Rationale |
 |---|---|---|
 | `remuda.session` | `list`, `new`, `close`, `attach`; callable table for `session(name)` | Session identity and lifecycle; `__call` preserves the existing handle constructor. |
-| `remuda.input` | `line`, `insert`, `key`, `click`, `feed`, `type_text` | Distinguishes input kinds and composes type-text behavior from atomic input. |
+| `remuda.input` | `text`, `submit`, `type_text` | Names text delivery and submission as units, with type-text retained as their composite. |
 | `remuda.screen` | `capture`, `styled`, `expect`, `expect_option` | Reading and acting on screen observations. |
-| `remuda.fs` | `list_dir`, `mkdir`, `remove_tree`, `write_atomic` | Filesystem primitives named by intent; `write_atomic` replaces one target without following a target symlink. |
+| `remuda.fs` | `list_dir`, `mkdir`, `mkdir_new`, `remove_tree`, `write_atomic` | Filesystem primitives named by intent; `mkdir_new` creates exactly one new directory from an absolute path without a trailing separator, and `write_atomic` replaces one target without following a target symlink. |
 | `remuda.runtime` | `sleep`, `fail`, `registry` (read-only) | Runtime controls and supported introspection. |
 | `remuda.module` | `exec`, `reload` | Module loading and lifecycle. |
 | `remuda.hook` | `on`, `emit*`, `list`, `clear`, `counts` | Event registration and dispatch vocabulary. |
@@ -145,8 +146,9 @@ Rust Request / host boundary
 ├── List, New, Close, Attach, Resize
 │   └── remuda.session.list / new / close / attach
 ├── SendLine, Send, Feed
-│   └── remuda.input.line / insert / feed
-│       └── remuda.input.type_text = insert/feed + optional settle pause
+│   ├── remuda.input.text = one burst, bracketed when mode 2004 is enabled
+│   ├── remuda.input.submit = visible composer + separate Return + one retry
+│   └── remuda.input.type_text = text + optional settle pause + submit
 ├── Capture, CaptureStyled
 │   └── remuda.screen.capture / styled
 │       └── remuda.screen.expect = capture + match + selected action

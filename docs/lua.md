@@ -85,6 +85,18 @@ and the file uses the normal inherited ACL.
 This word does not restrict paths: the Lua runtime already provides trusted
 scripts with `io.open` and `os.rename`.
 
+## New directory creation
+
+`remuda.fs.mkdir_new(path)` creates one directory without creating its parent.
+The path must be absolute and must not end in a path separator. On Unix, new
+directories use mode `0700`.
+
+The function returns `true` only when this call created the directory. It
+returns `nil, "exists"` if the target already exists, including when it is any
+kind of symlink; treat that result as **not Butler-created**. The caller must
+also check that the path is under its own home before trusting the directory.
+Other failures return `nil, error`.
+
 ## JSON values
 
 `remuda.json.decode(text)` reads at most 8 MiB of UTF-8 JSON and returns
