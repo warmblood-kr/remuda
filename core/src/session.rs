@@ -325,7 +325,7 @@ impl Session {
 
     fn ensure_writer_idle(&self) -> core::result::Result<(), InputError> {
         if self
-            .input_writer_busy()
+            .input_writer_timed_out()
             .map_err(|_| InputError::Unavailable)?
         {
             Err(InputError::Busy)
@@ -436,7 +436,7 @@ impl Session {
                 *locked = true;
                 return Ok(InputActGuard { session: self });
             }
-            if self.input_writer_busy()? {
+            if self.input_writer_timed_out()? {
                 return Err(AgentError::Busy);
             }
             locked = self
@@ -447,12 +447,14 @@ impl Session {
         }
     }
 
-    fn input_writer_busy(&self) -> Result<bool> {
+    fn input_writer_timed_out(&self) -> Result<bool> {
         let mut agent = self
             .agent
             .lock()
             .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-        Ok(agent.input_writer().is_some_and(|writer| writer.is_busy()))
+        Ok(agent
+            .input_writer()
+            .is_some_and(|writer| writer.is_timed_out()))
     }
 
     pub fn screen_text(&self) -> Result<String> {

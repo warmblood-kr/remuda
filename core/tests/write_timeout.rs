@@ -18,6 +18,7 @@ fn capture_completes_while_an_agent_write_is_stalled() {
                 started: Mutex::new(Some(started_tx)),
                 release: Mutex::new(release_rx),
                 busy: AtomicBool::new(false),
+                timed_out: AtomicBool::new(false),
                 fail: false,
                 refusal_once: AtomicUsize::new(0),
                 writes: AtomicUsize::new(0),
@@ -54,13 +55,14 @@ fn capture_completes_while_an_agent_write_is_stalled() {
 }
 
 #[test]
-fn interactive_send_refuses_a_second_write_while_the_first_is_stalled() {
+fn interactive_send_queues_a_second_write_behind_a_healthy_write() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let writer = Arc::new(BlockingWriter {
         started: Mutex::new(Some(started_tx)),
         release: Mutex::new(release_rx),
         busy: AtomicBool::new(false),
+        timed_out: AtomicBool::new(false),
         fail: false,
         refusal_once: AtomicUsize::new(0),
         writes: AtomicUsize::new(0),
@@ -83,15 +85,56 @@ fn interactive_send_refuses_a_second_write_while_the_first_is_stalled() {
     let second = thread::spawn(move || {
         let _ = second_tx.send(second_session.send(b"second"));
     });
-    let second_result = second_rx.recv_timeout(Duration::from_millis(100));
-
-    // Keep the regression case bounded too: if the second call queued behind
-    // the first, the extra release lets it drain before the assertion fails.
+    assert!(second_rx.recv_timeout(Duration::from_millis(25)).is_err());
     release_tx.send(()).unwrap();
     release_tx.send(()).unwrap();
     first.join().unwrap().unwrap();
+    let second_result = second_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     second.join().unwrap();
-    assert!(matches!(second_result, Ok(Err(AgentError::Busy))));
+    assert!(second_result.is_ok());
+    assert_eq!(writer.writes.load(Ordering::Acquire), 2);
+}
+
+#[test]
+fn interactive_send_returns_busy_only_after_the_writer_deadline() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer = Arc::new(BlockingWriter {
+        started: Mutex::new(Some(started_tx)),
+        release: Mutex::new(release_rx),
+        busy: AtomicBool::new(false),
+        timed_out: AtomicBool::new(false),
+        fail: false,
+        refusal_once: AtomicUsize::new(0),
+        writes: AtomicUsize::new(0),
+    });
+    let session = Arc::new(Session::new(
+        "timed-out-writer",
+        Box::new(BlockingAgent {
+            writer: Arc::clone(&writer),
+        }),
+        Arc::new(ManualClock::new()),
+    ));
+    let first_session = Arc::clone(&session);
+    let first = thread::spawn(move || first_session.send(b"first"));
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first write started");
+
+    let second_session = Arc::clone(&session);
+    let (second_tx, second_rx) = mpsc::channel();
+    let second = thread::spawn(move || {
+        let _ = second_tx.send(second_session.send(b"second"));
+    });
+    assert!(second_rx.recv_timeout(Duration::from_millis(25)).is_err());
+    writer.timed_out.store(true, Ordering::Release);
+    assert!(matches!(
+        second_rx.recv_timeout(Duration::from_secs(1)),
+        Ok(Err(AgentError::Busy))
+    ));
+    release_tx.send(()).unwrap();
+    first.join().unwrap().unwrap();
+    second.join().unwrap();
     assert_eq!(writer.writes.load(Ordering::Acquire), 1);
 }
 
@@ -103,6 +146,7 @@ fn takeover_wakes_an_attached_write_without_holding_the_attach_slot() {
         started: Mutex::new(Some(started_tx)),
         release: Mutex::new(release_rx),
         busy: AtomicBool::new(false),
+        timed_out: AtomicBool::new(false),
         fail: false,
         refusal_once: AtomicUsize::new(0),
         writes: AtomicUsize::new(0),
@@ -130,8 +174,57 @@ fn takeover_wakes_an_attached_write_without_holding_the_attach_slot() {
         result_rx.recv_timeout(Duration::from_millis(100)),
         Ok(Err(AgentError::Attached))
     ));
+    assert!(session.is_attached());
     release_tx.send(()).unwrap();
     old_write.join().unwrap();
+    assert!(
+        session.is_attached(),
+        "old guard drop must not clear its successor"
+    );
+    drop(current);
+    assert!(!session.is_attached());
+}
+
+#[test]
+fn cancelled_attach_write_drops_the_current_attachment() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let session = Arc::new(Session::new(
+        "detached-writer",
+        Box::new(BlockingAgent {
+            writer: Arc::new(BlockingWriter {
+                started: Mutex::new(Some(started_tx)),
+                release: Mutex::new(release_rx),
+                busy: AtomicBool::new(false),
+                timed_out: AtomicBool::new(false),
+                fail: false,
+                refusal_once: AtomicUsize::new(0),
+                writes: AtomicUsize::new(0),
+            }),
+        }),
+        Arc::new(ManualClock::new()),
+    ));
+    let detached = Arc::new(AtomicBool::new(false));
+    let thread_session = Arc::clone(&session);
+    let thread_detached = Arc::clone(&detached);
+    let (result_tx, result_rx) = mpsc::channel();
+    let write = thread::spawn(move || {
+        let held = thread_session.attach();
+        let result = held.write_raw_while(b"key", &|| thread_detached.load(Ordering::Acquire));
+        let _ = result_tx.send(result);
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("attached write started");
+    detached.store(true, Ordering::Release);
+    let result = result_rx.recv_timeout(Duration::from_secs(1));
+    let _ = release_tx.send(());
+    write.join().unwrap();
+    assert!(matches!(result, Ok(Err(AgentError::Attached))));
+    assert!(
+        !session.is_attached(),
+        "disconnect cancellation releases the slot"
+    );
 }
 
 #[test]
@@ -142,6 +235,7 @@ fn failed_batch_retry_is_uncertain_while_writer_is_stalled_without_a_second_writ
         started: Mutex::new(Some(started_tx)),
         release: Mutex::new(release_rx),
         busy: AtomicBool::new(false),
+        timed_out: AtomicBool::new(false),
         fail: true,
         refusal_once: AtomicUsize::new(0),
         writes: AtomicUsize::new(0),
@@ -191,6 +285,7 @@ fn definitely_refused_batch_reservations_are_released_for_retry() {
         started: Mutex::new(Some(started_tx)),
         release: Mutex::new(release_rx),
         busy: AtomicBool::new(false),
+        timed_out: AtomicBool::new(false),
         fail: false,
         refusal_once: AtomicUsize::new(1),
         writes: AtomicUsize::new(0),
@@ -288,13 +383,15 @@ fn late_success_after_timeout_does_not_turn_a_batch_retry_into_an_ack() {
 }
 
 #[test]
-fn busy_remote_input_keeps_its_sequence_and_does_not_consume_rate_budget() {
+#[allow(clippy::too_many_lines)]
+fn remote_input_waits_for_a_healthy_write_and_consumes_rate_budget_once() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let writer = Arc::new(BlockingWriter {
         started: Mutex::new(Some(started_tx)),
         release: Mutex::new(release_rx),
         busy: AtomicBool::new(false),
+        timed_out: AtomicBool::new(false),
         fail: false,
         refusal_once: AtomicUsize::new(0),
         writes: AtomicUsize::new(0),
@@ -331,18 +428,19 @@ fn busy_remote_input_keeps_its_sequence_and_does_not_consume_rate_budget() {
         });
         let _ = rejected_tx.send(result);
     });
-    let rejected_result = rejected_rx.recv_timeout(Duration::from_millis(100));
+    assert!(rejected_rx.recv_timeout(Duration::from_millis(25)).is_err());
 
-    // Four max-sized accepted batches exhaust the rate window. If the Busy
-    // rejection charged it, one of these would be refused. Extra releases
-    // bound the regression path if the rejected input queued behind the first.
-    for _ in 0..6 {
+    // A healthy write completes, then the queued batch lands once.
+    for _ in 0..2 {
         release_tx.send(()).unwrap();
     }
     send.join().unwrap().unwrap();
     rejected.join().unwrap();
-    assert_eq!(rejected_result, Ok(Err(InputError::Busy)));
-    for seq in 1..=4 {
+    assert_eq!(
+        rejected_rx.try_recv().unwrap(),
+        Ok(InputOutcome::Ack { duplicate: false })
+    );
+    for seq in 2..=4 {
         release_tx.send(()).unwrap();
         assert_eq!(
             session.apply_input_batch(InputBatch { seq, ..batch }),
@@ -350,11 +448,15 @@ fn busy_remote_input_keeps_its_sequence_and_does_not_consume_rate_budget() {
         );
     }
     assert_eq!(writer.writes.load(Ordering::Acquire), 5);
+    assert_eq!(
+        session.apply_input_batch(InputBatch { seq: 5, ..batch }),
+        Err(InputError::RateLimited)
+    );
 }
 
 #[test]
 #[allow(clippy::too_many_lines)] // Exercises the feed-pause-to-stalled-write race end to end.
-fn input_waiting_during_feed_pause_refuses_when_the_next_burst_stalls() {
+fn input_waiting_during_feed_pause_queues_behind_healthy_feed_write() {
     let (pause_started_tx, pause_started_rx) = mpsc::channel();
     let (pause_release_tx, pause_release_rx) = mpsc::channel();
     let clock = Arc::new(PausingClock {
@@ -367,6 +469,7 @@ fn input_waiting_during_feed_pause_refuses_when_the_next_burst_stalls() {
         started: Mutex::new(Some(write_started_tx)),
         release: Mutex::new(write_release_rx),
         busy: AtomicBool::new(false),
+        timed_out: AtomicBool::new(false),
         fail: false,
         refusal_once: AtomicUsize::new(0),
         writes: AtomicUsize::new(0),
@@ -417,17 +520,19 @@ fn input_waiting_during_feed_pause_refuses_when_the_next_burst_stalls() {
     write_started_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("feed burst is stalled in the writer");
-    let input_result = input_result_rx.recv_timeout(Duration::from_millis(100));
+    assert!(input_result_rx
+        .recv_timeout(Duration::from_millis(25))
+        .is_err());
 
-    // Release enough writes to cleanly finish even if a regression queued the
-    // remote batch behind the feed act instead of refusing it as Busy.
+    // Release the feed burst and the queued remote batch in order.
     write_release_tx.send(()).unwrap();
     write_release_tx.send(()).unwrap();
     feed.join().unwrap().unwrap();
     input.join().unwrap();
-    assert_eq!(input_result, Ok(Err(InputError::Busy)));
-
-    write_release_tx.send(()).unwrap();
+    assert_eq!(
+        input_result_rx.try_recv().unwrap(),
+        Ok(InputOutcome::Ack { duplicate: false })
+    );
     assert_eq!(
         session.apply_input_batch(InputBatch {
             instance_id: session.instance_id(),
@@ -435,7 +540,7 @@ fn input_waiting_during_feed_pause_refuses_when_the_next_burst_stalls() {
             seq: 1,
             bytes: b"remote batch",
         }),
-        Ok(InputOutcome::Ack { duplicate: false })
+        Ok(InputOutcome::Ack { duplicate: true })
     );
     assert_eq!(writer.writes.load(Ordering::Acquire), 2);
 }
@@ -448,6 +553,7 @@ struct BlockingWriter {
     started: Mutex<Option<Sender<()>>>,
     release: Mutex<Receiver<()>>,
     busy: AtomicBool,
+    timed_out: AtomicBool,
     fail: bool,
     /// Test-only refusals returned before a write is accepted: 1 = Busy,
     /// 2 = Exited.
@@ -510,6 +616,10 @@ impl AgentWriter for BlockingWriter {
 
     fn is_busy(&self) -> bool {
         self.busy.load(Ordering::Acquire)
+    }
+
+    fn is_timed_out(&self) -> bool {
+        self.timed_out.load(Ordering::Acquire)
     }
 }
 

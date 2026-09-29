@@ -24,10 +24,10 @@ use remuda_core::agent::{
     MouseState, Result, ScreenSnapshot, Size, StyledCell, VersionedSnapshot,
 };
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Live viewers of one pty's output. Shared with the reader thread, which is
 /// the only producer; every consumer holds the other end of a channel.
@@ -48,29 +48,33 @@ struct WriteTask {
 /// time and never holds the process or screen lock while its write blocks.
 struct PtyInputWriter {
     sender: SyncSender<WriteTask>,
-    busy: Arc<AtomicBool>,
+    active_since: Arc<Mutex<Option<Instant>>>,
     timeout: Duration,
 }
 
 impl PtyInputWriter {
     fn spawn(writer: SharedWriter, timeout: Duration) -> std::io::Result<Self> {
         let (sender, receiver) = sync_channel::<WriteTask>(1);
-        let busy = Arc::new(AtomicBool::new(false));
-        let worker_busy = Arc::clone(&busy);
+        let active_since = Arc::new(Mutex::new(None));
+        let worker_active_since = Arc::clone(&active_since);
         std::thread::Builder::new()
             .name("remuda-pty-writer".into())
-            .spawn(move || run_writer(receiver, writer, worker_busy))?;
+            .spawn(move || run_writer(receiver, writer, worker_active_since))?;
         Ok(Self {
             sender,
-            busy,
+            active_since,
             timeout,
         })
     }
 
     fn submit(&self, bytes: &[u8]) -> Result<Receiver<Result<()>>> {
-        self.busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| AgentError::Busy)?;
+        {
+            let mut active_since = self.active_since.lock().unwrap_or_else(|p| p.into_inner());
+            if active_since.is_some() {
+                return Err(AgentError::Busy);
+            }
+            *active_since = Some(Instant::now());
+        }
         let (result, receiver) = channel();
         let task = WriteTask {
             bytes: bytes.to_vec(),
@@ -79,20 +83,24 @@ impl PtyInputWriter {
         match self.sender.try_send(task) {
             Ok(()) => Ok(receiver),
             Err(TrySendError::Full(_)) => {
-                self.busy.store(false, Ordering::Release);
+                *self.active_since.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 Err(AgentError::Busy)
             }
             Err(TrySendError::Disconnected(_)) => {
-                self.busy.store(false, Ordering::Release);
+                *self.active_since.lock().unwrap_or_else(|p| p.into_inner()) = None;
                 Err(AgentError::Io("pty writer worker stopped".into()))
             }
         }
     }
 }
 
-fn run_writer(receiver: Receiver<WriteTask>, writer: SharedWriter, busy: Arc<AtomicBool>) {
+fn run_writer(
+    receiver: Receiver<WriteTask>,
+    writer: SharedWriter,
+    active_since: Arc<Mutex<Option<Instant>>>,
+) {
     while let Ok(task) = receiver.recv() {
-        let reset_busy = BusyReset(&busy);
+        let reset_busy = BusyReset(&active_since);
         let result =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match writer.lock() {
                 Ok(mut writer) => writer
@@ -107,17 +115,29 @@ fn run_writer(receiver: Receiver<WriteTask>, writer: SharedWriter, busy: Arc<Ato
     }
 }
 
-struct BusyReset<'a>(&'a AtomicBool);
+struct BusyReset<'a>(&'a Mutex<Option<Instant>>);
 
 impl Drop for BusyReset<'_> {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 }
 
 impl AgentWriter for PtyInputWriter {
     fn write_bounded(&self, bytes: &[u8]) -> Result<()> {
-        match self.submit(bytes)?.recv_timeout(self.timeout) {
+        let receiver = loop {
+            match self.submit(bytes) {
+                Ok(receiver) => break receiver,
+                Err(AgentError::Busy) if self.is_timed_out() => {
+                    return Err(AgentError::WriteTimeout {
+                        timeout: self.timeout,
+                    });
+                }
+                Err(AgentError::Busy) => std::thread::sleep(Duration::from_millis(10)),
+                Err(error) => return Err(error),
+            }
+        };
+        match receiver.recv_timeout(self.timeout) {
             Ok(result) => result,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(AgentError::WriteTimeout {
                 timeout: self.timeout,
@@ -144,12 +164,22 @@ impl AgentWriter for PtyInputWriter {
                     }
                     match receiver.recv_timeout(Duration::from_millis(10)) {
                         Ok(result) => return result,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) if self.is_timed_out() => {
+                            return Err(AgentError::WriteTimeout {
+                                timeout: self.timeout,
+                            });
+                        }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                             return Err(AgentError::Io("pty writer worker stopped".into()));
                         }
                     }
                 },
+                Err(AgentError::Busy) if self.is_timed_out() => {
+                    return Err(AgentError::WriteTimeout {
+                        timeout: self.timeout,
+                    });
+                }
                 Err(AgentError::Busy) => std::thread::sleep(Duration::from_millis(10)),
                 Err(error) => return Err(error),
             }
@@ -157,7 +187,17 @@ impl AgentWriter for PtyInputWriter {
     }
 
     fn is_busy(&self) -> bool {
-        self.busy.load(Ordering::Acquire)
+        self.active_since
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some()
+    }
+
+    fn is_timed_out(&self) -> bool {
+        self.active_since
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some_and(|started| started.elapsed() >= self.timeout)
     }
 }
 
@@ -664,14 +704,14 @@ mod input_writer_tests {
         let first = std::thread::spawn(move || first_writer.write_bounded(b"first"));
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
 
-        let started_at = std::time::Instant::now();
-        assert!(matches!(
-            writer.write_bounded(b"second"),
-            Err(AgentError::Busy)
-        ));
-        assert!(started_at.elapsed() < Duration::from_millis(80));
+        let second_writer = Arc::clone(&writer);
+        let second = std::thread::spawn(move || second_writer.write_bounded(b"second"));
         assert!(matches!(
             first.join().unwrap(),
+            Err(AgentError::WriteTimeout { .. })
+        ));
+        assert!(matches!(
+            second.join().unwrap(),
             Err(AgentError::WriteTimeout { .. })
         ));
         assert!(writer.is_busy());

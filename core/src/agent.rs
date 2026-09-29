@@ -195,6 +195,11 @@ pub trait AgentWriter: Send + Sync {
         self.write_to_completion(bytes)
     }
     fn is_busy(&self) -> bool;
+    /// Whether an active write has exceeded its backend's bounded-write deadline.
+    /// Healthy writes remain busy but callers may wait for them to finish.
+    fn is_timed_out(&self) -> bool {
+        false
+    }
 }
 
 /// Exit information retained by a process-backed agent after it is reaped.
