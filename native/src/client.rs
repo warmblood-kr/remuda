@@ -1124,7 +1124,8 @@ mod tests {
     #[cfg(unix)]
     use super::trace_input_read;
     use super::{
-        interpret, request_with_timeout, reset_input_modes, write_input_trace, RESET_INPUT_MODES,
+        interpret, read_response_with_timeout, request_with_timeout, reset_input_modes,
+        write_input_trace, RESET_INPUT_MODES,
     };
     #[cfg(unix)]
     use crate::ipc;
@@ -1240,6 +1241,37 @@ mod tests {
             result.is_err(),
             "the client must reject an oversized reply line before parsing it"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn response_is_read_when_peer_closes_before_timeout_is_set() {
+        use crate::ipc;
+        use std::io::Write;
+
+        let path = std::env::temp_dir().join(format!(
+            "remuda-client-close-before-timeout-{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let listener = ipc::listen(&path).unwrap();
+        let expected = Response::Value("immediate".into());
+        let server = std::thread::spawn({
+            let expected = expected.clone();
+            move || {
+                let mut stream = listener.accept().unwrap();
+                let mut line = serde_json::to_vec(&expected).unwrap();
+                line.push(b'\n');
+                stream.write_all(&line).unwrap();
+            }
+        });
+        let stream = ipc::connect(&path).unwrap();
+        server.join().unwrap();
+
+        let response = read_response_with_timeout(&path, stream, Duration::from_secs(1)).unwrap();
+
+        assert_eq!(response, expected);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

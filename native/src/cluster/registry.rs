@@ -1666,7 +1666,7 @@ mod tests {
     }
 
     #[test]
-    fn relayed_admission_refuses_unknown_or_tombstoned_origins() {
+    fn update_drops_revoked_attribution_and_non_sender_new_admission() {
         let sender = admitted_sender();
         for origin_state in [Some(NodeState::Revoked), None] {
             let mut registry = registry_with_sender(&sender);
