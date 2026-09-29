@@ -941,7 +941,7 @@ mod tests {
             human_idle: None,
             mouse_tracking: false,
         };
-        assert!(previous_session(&listed, &[old.clone()]).is_none());
+        assert!(previous_session(&listed, std::slice::from_ref(&old)).is_none());
         let fresh = unpolled_session_snapshot(listed, None).unwrap();
         assert!(fresh.screen.is_none());
         assert_eq!(fresh.output_version, Some(8));

@@ -586,14 +586,11 @@ impl ClusterUi {
                             instance_id: session.instance_id.clone(),
                         });
                     frame.push(format!(
-                        "{}    {:<12} {}",
+                        "{}    {:<12} {}{}",
                         if is_selected { ">" } else { " " },
                         session.name,
-                        format!(
-                            "{}{}",
-                            if session.alive { "live" } else { "ended" },
-                            session_error_suffix(session.last_error.as_deref())
-                        )
+                        if session.alive { "live" } else { "ended" },
+                        session_error_suffix(session.last_error.as_deref())
                     ));
                 }
             }
@@ -1304,7 +1301,7 @@ fn select_target_with_remote_wait(
         return ui.select_target(Some(target));
     };
     match ui.select_target(Some(target)) {
-        Ok(()) => return Ok(()),
+        Ok(()) => Ok(()),
         Err(error) if node != ui.node => {
             let deadline = Instant::now() + timeout;
             while Instant::now() < deadline {
