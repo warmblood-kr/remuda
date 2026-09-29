@@ -27,6 +27,9 @@ pub const MAX_JOIN_ATTEMPTS_PER_IP: usize = 10;
 const JOIN_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
 const MAX_JOIN_ATTEMPT_IPS: usize = 4096;
 pub const MAX_HELD_REQUEST: Duration = Duration::from_secs(30);
+const MAX_REGISTRY_UPDATE_JSON_BYTES: usize = 48 * 1024;
+const MAX_REGISTRY_PAGE_ENTRIES: usize = 32;
+const MAX_REGISTRY_RATE_BUCKETS: usize = cluster::registry::MAX_REGISTRY_ENTRIES;
 const SOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_READ_TIME: Duration = Duration::from_secs(5);
 const LOCAL_DAEMON_REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
@@ -66,8 +69,8 @@ pub struct Listener {
 }
 
 type MemberAuthorizer = Arc<dyn Fn(&[u8]) -> io::Result<()> + Send + Sync>;
-type FrameDispatcher = Arc<dyn Fn(&[u8]) -> io::Result<Vec<u8>> + Send + Sync>;
 type JoinAdmitter = Arc<dyn Fn(&[u8], Option<&str>) -> io::Result<()> + Send + Sync>;
+type FrameDispatcher = Arc<dyn Fn(&[u8], &[u8]) -> io::Result<Vec<u8>> + Send + Sync>;
 
 struct ListenerState {
     responder_private: Zeroizing<Vec<u8>>,
@@ -110,6 +113,12 @@ struct RequestLimiter {
     active_peers: Mutex<HashMap<String, usize>>,
     remote_inputs: Mutex<RemoteInputRateLimiter>,
     join_attempts: Mutex<HashMap<std::net::IpAddr, VecDeque<Instant>>>,
+    registry_requests: Mutex<HashMap<String, RegistryTokenBucket>>,
+}
+
+struct RegistryTokenBucket {
+    tokens: f64,
+    last_refill: Instant,
 }
 
 #[derive(Default)]
@@ -226,15 +235,23 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
     let dispatch_path = daemon_path.to_path_buf();
     let control_source = ControlSource::DefaultStateDir;
     let dispatch_control_source = control_source.clone();
-    let dispatch: FrameDispatcher = Arc::new(move |payload| {
-        dispatch_payload_with_control_source(payload, &dispatch_path, &dispatch_control_source)
+    let request_limiter = Arc::new(RequestLimiter::default());
+    let dispatch_limiter = request_limiter.clone();
+    let dispatch: FrameDispatcher = Arc::new(move |payload, peer_static| {
+        dispatch_payload_with_control_source(
+            payload,
+            peer_static,
+            &dispatch_path,
+            &dispatch_control_source,
+            &dispatch_limiter,
+        )
     });
     Ok(Listener {
         socket,
         state: Arc::new(ListenerState {
             responder_private,
             replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
-            limiter: Arc::new(RequestLimiter::default()),
+            limiter: request_limiter,
             join_tokens,
             admit_join: Arc::new(cluster::admit_join_locked),
         }),
@@ -254,7 +271,7 @@ impl Listener {
         self.socket.local_addr()
     }
 
-    /// Run until stopped; token rollback/expiry state is observed every five seconds.
+    /// Run until stopped; token state and registry changes are observed every five seconds.
     pub fn serve_until(&self, stop: &AtomicBool) -> io::Result<()> {
         std::thread::scope(|scope| {
             let (observe_error_tx, observe_error_rx) = std::sync::mpsc::channel::<io::Error>();
@@ -264,6 +281,13 @@ impl Listener {
                     let _ = observe_error_tx.send(error);
                     return;
                 }
+                let mut observed_registry = match cluster::registry::registry_revision_token() {
+                    Ok(revision) => Some(revision),
+                    Err(error) => {
+                        eprintln!("remuda: unable to inspect cluster registry revision: {error}");
+                        None
+                    }
+                };
                 loop {
                     match observer_stop_rx.recv_timeout(OBSERVE_INTERVAL) {
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -271,6 +295,16 @@ impl Listener {
                             if let Err(error) = self.state.join_tokens.observe() {
                                 let _ = observe_error_tx.send(error);
                                 break;
+                            }
+                            match cluster::registry::registry_revision_token() {
+                                Ok(revision) if observed_registry.as_ref() != Some(&revision) => {
+                                    observed_registry = Some(revision);
+                                    cluster::replication::registry_changed();
+                                }
+                                Ok(revision) => observed_registry = Some(revision),
+                                Err(error) => eprintln!(
+                                    "remuda: unable to inspect cluster registry revision: {error}"
+                                ),
                             }
                         }
                     }
@@ -379,6 +413,35 @@ fn log_listener_error(context: &str, error: &io::Error) {
 }
 
 impl RequestLimiter {
+    fn acquire_registry_request(&self, fingerprint: &str) -> bool {
+        const BURST: f64 = 10.0;
+        const REFILL_PER_SECOND: f64 = 1.0;
+        let now = Instant::now();
+        let mut buckets = self
+            .registry_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        buckets
+            .retain(|_, bucket| now.duration_since(bucket.last_refill) < Duration::from_secs(60));
+        if !buckets.contains_key(fingerprint) && buckets.len() >= MAX_REGISTRY_RATE_BUCKETS {
+            return false;
+        }
+        let bucket = buckets
+            .entry(fingerprint.to_owned())
+            .or_insert(RegistryTokenBucket {
+                tokens: BURST,
+                last_refill: now,
+            });
+        let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+        bucket.tokens = (bucket.tokens + elapsed * REFILL_PER_SECOND).min(BURST);
+        bucket.last_refill = now;
+        if bucket.tokens < 1.0 {
+            return false;
+        }
+        bucket.tokens -= 1.0;
+        true
+    }
+
     fn acquire_ip(self: &Arc<Self>, address: std::net::IpAddr) -> Option<Arc<IpPermit>> {
         let mut ips = self
             .active_ips
@@ -670,8 +733,14 @@ fn decode_authorized_request_with_source(
     payload: &[u8],
     control_source: &ControlSource,
 ) -> Result<Request, Response> {
-    let request = crate::remote_front::decode_frame(payload).map_err(Response::error)?;
-    authorize_remote_request_with_source(&request, control_source)?;
+    let request: Request =
+        serde_json::from_slice(payload).map_err(|_| Response::error("invalid cluster request"))?;
+    if !matches!(
+        &request,
+        Request::ClusterRegistrySync { .. } | Request::ClusterRegistryUpdate { .. }
+    ) {
+        authorize_remote_request_with_source(&request, control_source)?;
+    }
     Ok(request)
 }
 
@@ -756,20 +825,92 @@ where
 
 fn dispatch_payload_with_control_source(
     payload: &[u8],
+    peer_static: &[u8],
     daemon_path: &Path,
     control_source: &ControlSource,
+    limiter: &RequestLimiter,
 ) -> io::Result<Vec<u8>> {
-    let request = crate::remote_front::decode_frame(payload)
-        .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
-    if let Err(response) = authorize_remote_request_with_source(&request, control_source) {
-        return serde_json::to_vec(&response).map_err(io::Error::other);
+    let request: Request = serde_json::from_slice(payload)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid cluster request"))?;
+    match request {
+        Request::ClusterRegistrySync { digest, offset } => {
+            let peer_fp = cluster::encoding::fingerprint(peer_static);
+            if !limiter.acquire_registry_request(&peer_fp) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "registry replication rate limit exceeded",
+                ));
+            }
+            let (identity, registry) = cluster::nodes()?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized")
+            })?;
+            let current_digest = registry.digest()?;
+            let unchanged = digest.as_deref() == Some(current_digest.as_str());
+            if offset > registry.authorized_nodes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "registry page offset is out of bounds",
+                ));
+            }
+            let start = offset.min(registry.authorized_nodes.len());
+            let end = start
+                .saturating_add(MAX_REGISTRY_PAGE_ENTRIES)
+                .min(registry.authorized_nodes.len());
+            let page = if unchanged {
+                Vec::new()
+            } else {
+                registry.authorized_nodes[start..end].to_vec()
+            };
+            let entries_json = cluster::registry::RegistryUpdate::encode_entries_json(&page)?;
+            let next_offset = (!unchanged && end < registry.authorized_nodes.len()).then_some(end);
+            serde_json::to_vec(&Response::ClusterRegistryPage {
+                sender_fp: identity.node_fp,
+                digest: current_digest,
+                offset,
+                entries_json,
+                next_offset,
+                unchanged,
+            })
+            .map_err(|_| io::Error::other("registry response encode failed"))
+        }
+        Request::ClusterRegistryUpdate { update_json } => {
+            let peer_fp = cluster::encoding::fingerprint(peer_static);
+            if !limiter.acquire_registry_request(&peer_fp) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "registry replication rate limit exceeded",
+                ));
+            }
+            if update_json.len() > MAX_REGISTRY_UPDATE_JSON_BYTES {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "registry update exceeds page byte cap",
+                ));
+            }
+            let update = cluster::registry::RegistryUpdate::decode(update_json.as_bytes())?;
+            let outcome = cluster::registry::apply_registry_update(&update, peer_static)?;
+            let (_, registry) = cluster::nodes()?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized")
+            })?;
+            serde_json::to_vec(&Response::ClusterRegistryAck {
+                digest: registry.digest()?,
+                applied: !outcome.applied.is_empty(),
+            })
+            .map_err(|_| io::Error::other("registry acknowledgement encode failed"))
+        }
+        request => {
+            if let Err(response) = authorize_remote_request_with_source(&request, control_source) {
+                return serde_json::to_vec(&response).map_err(io::Error::other);
+            }
+            crate::remote_front::authorize(&request).map_err(io::Error::other)?;
+            crate::remote_front::forward_frame_with_timeout(
+                daemon_path,
+                payload,
+                LOCAL_DAEMON_REQUEST_TIMEOUT.min(MAX_HELD_REQUEST),
+            )
+            .map_err(|reason| io::Error::other(format!("local request failed: {reason}")))
+        }
     }
-    crate::remote_front::forward_frame_with_timeout(
-        daemon_path,
-        payload,
-        LOCAL_DAEMON_REQUEST_TIMEOUT.min(MAX_HELD_REQUEST),
-    )
-    .map_err(|reason| io::Error::other(format!("local request failed: {reason}")))
 }
 
 fn spawn_connection_handler(
@@ -805,6 +946,7 @@ fn spawn_connection_handler(
         .map(|_| ())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connection_with(
     stream: TcpStream,
     remote_addr: SocketAddr,
@@ -876,7 +1018,7 @@ fn handle_connection_with(
                 &peer_static,
                 |key| authorize_worker(key),
                 limits.post_dispatch_hold,
-                || dispatch_worker(&payload),
+                || dispatch_worker(&payload, &peer_static),
             );
             let _ = reply_tx.send(result);
         });
@@ -936,6 +1078,9 @@ fn handle_unknown_peer_join(
         .verify_consume_with(&request.join.token, || {
             (state.admit_join)(&opened.peer_static, request.join.endpoint.as_deref())
         });
+    if result.is_ok() {
+        cluster::registry_changed();
+    }
     let response = if result.is_ok() {
         b"{\"joined\":true}".as_slice()
     } else {
@@ -1274,7 +1419,7 @@ mod tests {
 
     #[cfg(unix)]
     fn socket_server(
-        dispatch: impl Fn(&[u8]) -> io::Result<Vec<u8>> + Send + Sync + 'static,
+        dispatch: impl Fn(&[u8], &[u8]) -> io::Result<Vec<u8>> + Send + Sync + 'static,
         held_timeout: Duration,
         post_dispatch_hold_limit: Duration,
         idle_timeout: Duration,
@@ -1290,6 +1435,10 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: crate::cluster::encoding::fingerprint(&peer.public),
                 static_pubkey: crate::cluster::encoding::encode_base64(&peer.public),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -1327,7 +1476,7 @@ mod tests {
             responder.private,
             responder.public,
             Arc::new(|_| Ok(())),
-            Arc::new(|_| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
+            Arc::new(|_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
         );
         (server, peer)
     }
@@ -1412,8 +1561,10 @@ mod tests {
             workers.push(std::thread::spawn(move || {
                 dispatch_payload_with_control_source(
                     &payload,
+                    &[],
                     &daemon_path,
                     &ControlSource::DefaultStateDir,
+                    &RequestLimiter::default(),
                 )
             }));
         }
@@ -1421,8 +1572,10 @@ mod tests {
 
         let ninth = dispatch_payload_with_control_source(
             &payload,
+            &[],
             &daemon_path,
             &ControlSource::DefaultStateDir,
+            &RequestLimiter::default(),
         )
         .unwrap();
         let response: Response = serde_json::from_slice(&ninth).unwrap();
@@ -1743,6 +1896,10 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: fingerprint.clone(),
                 static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -1843,15 +2000,27 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn registry_requests_allow_ten_burst_per_peer() {
+        let limiter = RequestLimiter::default();
+        for _ in 0..10 {
+            assert!(limiter.acquire_registry_request("peer-a"));
+        }
+        assert!(!limiter.acquire_registry_request("peer-a"));
+        assert!(limiter.acquire_registry_request("peer-b"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn socket_accepts_a_fresh_ik_request_and_refuses_its_replay() {
         let (server, peer, _) = socket_server(
-            |payload| {
+            |payload, peer| {
                 dispatch_payload_with_control_source(
                     payload,
+                    peer,
                     Path::new("unused-daemon-path"),
                     &ControlSource::DefaultStateDir,
+                    &RequestLimiter::default(),
                 )
             },
             socket_test_timeout(),
@@ -1895,7 +2064,7 @@ mod tests {
             responder.private,
             responder.public,
             Arc::new(|_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "unknown"))),
-            Arc::new(|_| panic!("Join must not reach daemon dispatch")),
+            Arc::new(|_, _| panic!("Join must not reach daemon dispatch")),
             ConnectionLimits {
                 outer_hold: socket_test_timeout(),
                 post_dispatch_hold: socket_test_timeout(),
@@ -1946,7 +2115,7 @@ mod tests {
         let dispatched = Arc::new(AtomicUsize::new(0));
         let dispatched_for_worker = dispatched.clone();
         let (server, peer, registry) = socket_server(
-            move |_| {
+            move |_, _| {
                 dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
                 Ok(serde_json::to_vec(&Response::Ok).unwrap())
             },
@@ -2036,7 +2205,7 @@ mod tests {
         let (status, response) = server.exchange(malformed);
         assert_eq!(status, 200);
         let response = String::from_utf8(response).unwrap();
-        assert!(response.contains("invalid remote request"));
+        assert!(response.contains("invalid cluster request"));
         assert!(!response.contains(secret));
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
@@ -2056,7 +2225,7 @@ mod tests {
             responder.private,
             responder.public,
             Arc::new(|_| Err(permission_denied())),
-            Arc::new(|_| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
+            Arc::new(|_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
         );
         let token_path = server.state_dir.join("join_tokens.json");
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -2110,7 +2279,7 @@ mod tests {
             responder.private,
             responder.public,
             Arc::new(|_| Ok(())),
-            Arc::new(move |payload| {
+            Arc::new(move |payload, _peer| {
                 let request = crate::remote_front::decode_frame(payload)
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 assert_eq!(request, expected_request);
@@ -2143,7 +2312,7 @@ mod tests {
             responder.private,
             responder.public,
             Arc::new(|_| Ok(())),
-            Arc::new(move |_| {
+            Arc::new(move |_, _peer| {
                 dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
                 Ok(serde_json::to_vec(&Response::Ack { duplicate: false }).unwrap())
             }),
@@ -2190,7 +2359,7 @@ mod tests {
             responder.private,
             responder.public,
             Arc::new(|_| Ok(())),
-            Arc::new(move |_payload| {
+            Arc::new(move |_payload, _peer| {
                 dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
                 Ok(serde_json::to_vec(&Response::Ack { duplicate: false }).unwrap())
             }),
@@ -2235,7 +2404,7 @@ mod tests {
             responder.private,
             responder.public,
             Arc::new(|_| Ok(())),
-            Arc::new(move |_| {
+            Arc::new(move |_, _peer| {
                 dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
                 Ok(payload.clone())
             }),
@@ -2346,7 +2515,7 @@ mod tests {
         let release_rx = Arc::new(Mutex::new(release_rx));
         let worker_release_rx = release_rx.clone();
         let (server, peer, registry) = socket_server(
-            move |_| {
+            move |_, _| {
                 entered_tx.send(()).unwrap();
                 worker_release_rx.lock().unwrap().recv().unwrap();
                 Ok(serde_json::to_vec(&Response::Value("held secret".into())).unwrap())
@@ -2382,7 +2551,7 @@ mod tests {
     #[test]
     fn socket_held_requests_obey_outer_deadline_and_post_dispatch_hold_check() {
         let (server, peer, _) = socket_server(
-            |_| {
+            |_, _| {
                 std::thread::sleep(Duration::from_millis(250));
                 Ok(serde_json::to_vec(&Response::Ok).unwrap())
             },
@@ -2398,7 +2567,7 @@ mod tests {
         assert!(matches!(response, Response::Error(message) if message.contains("timed out")));
 
         let (server, peer, _) = socket_server(
-            |_| {
+            |_, _| {
                 std::thread::sleep(Duration::from_millis(80));
                 Ok(serde_json::to_vec(&Response::Ok).unwrap())
             },
@@ -2418,7 +2587,7 @@ mod tests {
     #[test]
     fn socket_http_requires_content_length_and_rejects_an_over_cap_body() {
         let (server, _peer, _) = socket_server(
-            |_| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
             socket_test_timeout(),
             socket_test_timeout(),
             socket_test_timeout(),
@@ -2453,7 +2622,7 @@ mod tests {
     #[test]
     fn socket_idle_read_deadline_closes_a_slowloris_request() {
         let (server, _peer, _) = socket_server(
-            |_| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
             socket_test_timeout(),
             socket_test_timeout(),
             Duration::from_millis(80),
@@ -2476,7 +2645,7 @@ mod tests {
     #[test]
     fn socket_total_read_deadline_stops_a_slow_drip_that_beats_idle_timeout() {
         let (server, _peer, _) = socket_server(
-            |_| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
             socket_test_timeout(),
             socket_test_timeout(),
             Duration::from_millis(150),
@@ -2509,6 +2678,10 @@ mod tests {
         registry.authorized_nodes.push(AuthorizedNode {
             node_fp: fingerprint.clone(),
             static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+            delivered_by: None,
+            format_major: 1,
+            format_minor: 0,
+            optional_fields: std::collections::BTreeMap::new(),
             endpoint: None,
             state: NodeState::Admitted,
             version: 1,
@@ -2530,6 +2703,10 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: fingerprint.clone(),
                 static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,

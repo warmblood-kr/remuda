@@ -483,6 +483,7 @@ fn parse_cluster_call(target: &str, operation: &str, args: &[&str]) -> ClusterCo
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     match parse_cluster_command(args) {
         ClusterCommand::Status => match remuda_native::cluster::status() {
@@ -494,6 +495,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                 println!("Node: {}", identity.node_name);
                 println!("Fingerprint: {}", identity.node_fp);
                 println!("Members: {members}");
+                println!("Authority: Any admitted member can admit new keys and revoke any member cluster-wide (see #282).");
                 match remuda_native::cluster::control::enabled() {
                     Ok(enabled) => {
                         let (setting, trust) = remote_control_status_lines(enabled);

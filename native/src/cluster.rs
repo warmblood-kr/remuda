@@ -6,11 +6,13 @@ pub mod identity;
 pub mod join_line;
 pub mod join_token;
 pub mod registry;
+pub mod replication;
 #[cfg(not(windows))]
 mod storage;
 
 pub use identity::NodeIdentity;
 pub use registry::{load_registry, save_registry, AuthorizedNode, NodeState, Registry};
+pub use replication::registry_changed;
 
 use std::io;
 use std::net::SocketAddr;
@@ -35,6 +37,10 @@ pub fn init() -> io::Result<(NodeIdentity, bool)> {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: node.node_fp.clone(),
                 static_pubkey: encoding::encode_base64(&node.static_pubkey),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -74,6 +80,115 @@ pub fn status() -> io::Result<Option<(NodeIdentity, usize)>> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(error),
         }
+    }
+}
+
+/// Record the issuer and this node's optional advertised endpoint after a
+/// pinned join exchange succeeds.
+pub fn record_join_success(
+    issuer_static_pubkey: &[u8],
+    issuer_addr: std::net::SocketAddr,
+    local_endpoint: Option<std::net::SocketAddr>,
+) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let _ = (issuer_static_pubkey, issuer_addr, local_endpoint);
+        return Err(identity::windows_storage_error());
+    }
+    #[cfg(not(windows))]
+    {
+        if issuer_static_pubkey.len() != 32 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid issuer key",
+            ));
+        }
+        join_line::validate_endpoint(issuer_addr)?;
+        if let Some(endpoint) = local_endpoint {
+            join_line::validate_endpoint(endpoint)?;
+        }
+        let dir = storage::cluster_state_dir()?.join("cluster");
+        let guard = storage::StateLock::acquire(&dir)?;
+        let self_node = identity::load_identity_at(&dir)?;
+        let mut registry = registry::load_registry_at(&dir)?;
+        let issuer_fp = encoding::fingerprint(issuer_static_pubkey);
+        let issuer_key = encoding::encode_base64(issuer_static_pubkey);
+        let mut changed = false;
+
+        if let Some(issuer) = registry
+            .authorized_nodes
+            .iter_mut()
+            .find(|entry| entry.node_fp == issuer_fp)
+        {
+            if issuer.static_pubkey != issuer_key || issuer.state != NodeState::Admitted {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "join issuer is not an admitted registry member",
+                ));
+            }
+            let endpoint = issuer_addr.to_string();
+            if issuer.endpoint.as_deref() != Some(endpoint.as_str()) {
+                issuer.endpoint = Some(endpoint);
+                issuer.version = issuer.version.saturating_add(1);
+                changed = true;
+            }
+        } else {
+            registry.authorized_nodes.push(AuthorizedNode {
+                node_fp: issuer_fp.clone(),
+                static_pubkey: issuer_key,
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
+                endpoint: Some(issuer_addr.to_string()),
+                state: NodeState::Admitted,
+                version: 1,
+                by: issuer_fp.clone(),
+            });
+            changed = true;
+        }
+
+        let self_entry = registry
+            .authorized_nodes
+            .iter_mut()
+            .find(|entry| entry.node_fp == self_node.node_fp)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "local registry entry is missing",
+                )
+            })?;
+        if self_entry.static_pubkey != encoding::encode_base64(&self_node.static_pubkey)
+            || self_entry.state != NodeState::Admitted
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "local node is not admitted in its registry",
+            ));
+        }
+        let newly_joined = self_entry.by == self_node.node_fp && issuer_fp != self_node.node_fp;
+        if newly_joined {
+            self_entry.by = issuer_fp;
+            changed = true;
+        }
+        if let Some(endpoint) = local_endpoint {
+            let endpoint = endpoint.to_string();
+            if self_entry.endpoint.as_deref() != Some(endpoint.as_str()) {
+                self_entry.endpoint = Some(endpoint);
+                if !newly_joined {
+                    self_entry.version = self_entry.version.saturating_add(1);
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            registry::save_registry_at(&dir, &registry)?;
+        }
+        drop(guard);
+        if changed {
+            replication::registry_changed();
+        }
+        Ok(())
     }
 }
 
@@ -143,6 +258,10 @@ fn admit_join_locked_at(
         authorized_nodes: vec![AuthorizedNode {
             node_fp: fp,
             static_pubkey: encoding::encode_base64(peer_static),
+            delivered_by: None,
+            format_major: 1,
+            format_minor: 0,
+            optional_fields: std::collections::BTreeMap::new(),
             endpoint: endpoint.map(str::to_owned),
             state: NodeState::Admitted,
             version: 1,
@@ -315,7 +434,11 @@ pub fn revoke(_target: &str) -> io::Result<RevokeOutcome> {
     #[cfg(not(windows))]
     {
         let dir = storage::cluster_state_dir()?.join("cluster");
-        revoke_at(&dir, _target)
+        let outcome = revoke_at(&dir, _target)?;
+        if outcome == RevokeOutcome::Revoked {
+            replication::registry_changed();
+        }
+        Ok(outcome)
     }
 }
 
@@ -415,6 +538,10 @@ mod nodes_revoke_tests {
                 authorized_nodes: vec![AuthorizedNode {
                     node_fp: issuer.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&issuer.static_pubkey),
+                    delivered_by: None,
+                    format_major: 1,
+                    format_minor: 0,
+                    optional_fields: std::collections::BTreeMap::new(),
                     endpoint: None,
                     state: NodeState::Admitted,
                     version: 1,
@@ -446,6 +573,10 @@ mod nodes_revoke_tests {
                 AuthorizedNode {
                     node_fp: self_node.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+                    delivered_by: None,
+                    format_major: 1,
+                    format_minor: 0,
+                    optional_fields: std::collections::BTreeMap::new(),
                     endpoint: None,
                     state: NodeState::Admitted,
                     version: 1,
@@ -454,6 +585,10 @@ mod nodes_revoke_tests {
                 AuthorizedNode {
                     node_fp: target.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                    delivered_by: None,
+                    format_major: 1,
+                    format_minor: 0,
+                    optional_fields: std::collections::BTreeMap::new(),
                     endpoint: None,
                     state: NodeState::Admitted,
                     version: 7,
@@ -488,6 +623,10 @@ mod nodes_revoke_tests {
                     AuthorizedNode {
                         node_fp: self_node.node_fp.clone(),
                         static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+                        delivered_by: None,
+                        format_major: 1,
+                        format_minor: 0,
+                        optional_fields: std::collections::BTreeMap::new(),
                         endpoint: None,
                         state: NodeState::Admitted,
                         version: 1,
@@ -496,6 +635,10 @@ mod nodes_revoke_tests {
                     AuthorizedNode {
                         node_fp: sender.node_fp.clone(),
                         static_pubkey: encoding::encode_base64(&sender.static_pubkey),
+                        delivered_by: None,
+                        format_major: 1,
+                        format_minor: 0,
+                        optional_fields: std::collections::BTreeMap::new(),
                         endpoint: None,
                         state: NodeState::Admitted,
                         version: 1,
@@ -509,6 +652,10 @@ mod nodes_revoke_tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: target.node_fp.clone(),
                 static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: u64::MAX,
@@ -551,6 +698,10 @@ mod nodes_revoke_tests {
                 authorized_nodes: vec![AuthorizedNode {
                     node_fp: self_node.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+                    delivered_by: None,
+                    format_major: 1,
+                    format_minor: 0,
+                    optional_fields: std::collections::BTreeMap::new(),
                     endpoint: None,
                     state: NodeState::Admitted,
                     version: 1,
@@ -574,6 +725,10 @@ mod nodes_revoke_tests {
                 authorized_nodes: vec![AuthorizedNode {
                     node_fp: target.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                    delivered_by: None,
+                    format_major: 1,
+                    format_minor: 0,
+                    optional_fields: std::collections::BTreeMap::new(),
                     endpoint: None,
                     state: NodeState::Revoked,
                     version: 12,
@@ -598,6 +753,10 @@ mod nodes_revoke_tests {
             AuthorizedNode {
                 node_fp: "SHA256:abcdefgh-one".into(),
                 static_pubkey: String::new(),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -606,6 +765,10 @@ mod nodes_revoke_tests {
             AuthorizedNode {
                 node_fp: "SHA256:abcdefgh-two".into(),
                 static_pubkey: String::new(),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -634,6 +797,10 @@ mod nodes_revoke_tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: identity.node_fp.clone(),
                 static_pubkey: String::new(),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -668,6 +835,10 @@ mod nodes_revoke_tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: "SHA256:other".into(),
                 static_pubkey: String::new(),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -697,6 +868,10 @@ mod nodes_revoke_tests {
         let mut entries = vec![AuthorizedNode {
             node_fp: self_node.node_fp.clone(),
             static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+            delivered_by: None,
+            format_major: 1,
+            format_minor: 0,
+            optional_fields: std::collections::BTreeMap::new(),
             endpoint: None,
             state: NodeState::Admitted,
             version: 1,
@@ -709,6 +884,10 @@ mod nodes_revoke_tests {
             entries.push(AuthorizedNode {
                 node_fp: target.node_fp.clone(),
                 static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 3,

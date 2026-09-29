@@ -238,6 +238,9 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     let listener = prepare_unix_listener(listener, path)?;
     #[cfg(windows)]
     let listener = listener;
+    let _ = std::thread::Builder::new()
+        .name("remuda-cluster-startup-sync".into())
+        .spawn(crate::cluster::replication::startup_sync);
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
 
     let registry = Arc::new(Registry::new());
@@ -1024,6 +1027,7 @@ fn capture_styled(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle(
     stream: Stream,
     registry: &Registry,
@@ -1050,6 +1054,15 @@ fn handle(
         }
 
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
+
+        Request::ClusterRegistrySync { .. } => reply(
+            &stream,
+            &Response::error("remote front refuses ClusterRegistrySync"),
+        ),
+        Request::ClusterRegistryUpdate { .. } => reply(
+            &stream,
+            &Response::error("remote front refuses ClusterRegistryUpdate"),
+        ),
 
         // Answer before going. A client left guessing from a hung-up socket
         // cannot tell "it stopped" from "it never heard me".

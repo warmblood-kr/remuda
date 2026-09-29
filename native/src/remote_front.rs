@@ -274,6 +274,8 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::Mkdir { .. } => Err(refusal("Mkdir")),
         Request::RemoveDirAll { .. } => Err(refusal("RemoveDirAll")),
         Request::Version => Err(refusal("Version")),
+        Request::ClusterRegistrySync { .. } => Err(refusal("ClusterRegistrySync")),
+        Request::ClusterRegistryUpdate { .. } => Err(refusal("ClusterRegistryUpdate")),
         Request::Shutdown { .. } => Err(refusal("Shutdown")),
         Request::Eval { .. } => Err(refusal("Eval")),
     }
@@ -434,6 +436,13 @@ mod tests {
             Request::Mkdir { path: "/".into() },
             Request::RemoveDirAll { path: "/".into() },
             Request::Version,
+            Request::ClusterRegistrySync {
+                digest: None,
+                offset: 0,
+            },
+            Request::ClusterRegistryUpdate {
+                update_json: "private-registry-update".into(),
+            },
             Request::Shutdown {
                 requester_daemon_id: None,
                 requester_session_id: None,
@@ -465,6 +474,22 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error, "remote front refuses Send");
+
+        assert_eq!(
+            authorize(&Request::ClusterRegistrySync {
+                digest: Some("private-digest".into()),
+                offset: 12,
+            })
+            .unwrap_err(),
+            "remote front refuses ClusterRegistrySync"
+        );
+        assert_eq!(
+            authorize(&Request::ClusterRegistryUpdate {
+                update_json: "private-registry-update".into(),
+            })
+            .unwrap_err(),
+            "remote front refuses ClusterRegistryUpdate"
+        );
     }
 
     #[test]

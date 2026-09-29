@@ -244,6 +244,10 @@ fn call_response(id: Value, response: Response) -> String {
         | Response::RemoteControlDisabled) => input_error_reply(id, input_error_message(&response)),
         Response::SyncAtCapacity => ok_reply(id, tool_error("Sync is at capacity; retry shortly")),
         Response::Sessions(sessions) => ok_reply(id, sessions_text(sessions)),
+        Response::ClusterRegistryPage { .. } | Response::ClusterRegistryAck { .. } => ok_reply(
+            id,
+            tool_error("cluster registry responses are not exposed over MCP"),
+        ),
     }
 }
 
