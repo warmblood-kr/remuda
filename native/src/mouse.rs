@@ -73,10 +73,9 @@ pub fn route_mouse_event(
 pub enum InputToken {
     Bytes(Vec<u8>),
     Mouse(SgrMouse),
-    /// Bytes between bracketed-paste markers, including both markers. They
-    /// bypass mouse parsing and attach hotkeys verbatim. In direct attach,
-    /// an embedded end marker retains its terminal meaning and closes the
-    /// child's paste early, as it does in a regular terminal.
+    /// A bracketed paste, markers included; it bypasses mouse parsing and
+    /// hotkeys. An embedded end marker closes the child's paste early, as
+    /// it does in a regular terminal.
     Paste(Vec<u8>),
 }
 
