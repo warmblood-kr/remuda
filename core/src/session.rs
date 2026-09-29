@@ -432,25 +432,10 @@ impl Session {
             return Ok(InputSubmitOutcome::Unverified);
         }
 
-        let newline_raw = self.screen_text().unwrap_or_default();
-        let newline_compact = compact_screen(&newline_raw);
+        // The first Return inserted a composer newline. A single retry is
+        // justified; after sending it, report that delivery is unverified
+        // because the screen did not prove whether the child submitted it.
         self.write_one_burst(crate::keys::RETURN_BYTES)?;
-        version = self.output_version().unwrap_or(version);
-        let retry_deadline = self.clock.now() + Duration::from_secs(1);
-        while self.clock.now() < retry_deadline {
-            if !self.is_alive() {
-                return Ok(InputSubmitOutcome::Unverified);
-            }
-            let raw = self.screen_text().unwrap_or_default();
-            if raw != newline_raw && compact_screen(&raw) != newline_compact {
-                return Ok(InputSubmitOutcome::Submitted);
-            }
-            let remaining = retry_deadline.saturating_sub(self.clock.now());
-            let timeout = remaining.min(Duration::from_millis(50));
-            if let Ok(snapshot) = self.wait_for_output_after(version, timeout) {
-                version = snapshot.output_version.unwrap_or(version);
-            }
-        }
         Ok(InputSubmitOutcome::Unverified)
     }
 
