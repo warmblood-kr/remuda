@@ -1074,17 +1074,26 @@ impl Drop for RawMode {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
+    use super::request_with_timeout;
+    #[cfg(unix)]
     use super::trace_input_read;
-    use super::{
-        interpret, request_with_timeout, reset_input_modes, write_input_trace, RESET_INPUT_MODES,
-    };
+    use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
+    #[cfg(unix)]
     use crate::ipc;
+    #[cfg(unix)]
     use interprocess::local_socket::traits::ListenerExt;
-    use remuda_core::protocol::{Request, Response};
+    #[cfg(unix)]
+    use remuda_core::protocol::Request;
+    use remuda_core::protocol::Response;
+    #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(unix)]
     use std::sync::mpsc;
-    use std::time::{Duration, Instant, UNIX_EPOCH};
+    #[cfg(unix)]
+    use std::time::Instant;
+    use std::time::{Duration, UNIX_EPOCH};
 
+    #[cfg(unix)]
     fn assert_request_timeout(request: Request) {
         static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
         const TIMEOUT: Duration = Duration::from_millis(300);
@@ -1139,11 +1148,13 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn request_timeout_wakes_a_peer_that_never_replies() {
         assert_request_timeout(Request::Version);
     }
 
+    #[cfg(unix)]
     #[test]
     fn request_timeout_bounds_a_large_input_to_a_peer_that_never_reads() {
         assert_request_timeout(Request::Input {

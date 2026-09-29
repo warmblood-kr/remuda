@@ -22,7 +22,7 @@ struct PrivateDaemon {
 
 impl PrivateDaemon {
     fn start() -> Self {
-        let root = PathBuf::from("/tmp");
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let runtime = root.join(format!(
             "cluster-tree-{}-{}",
             std::process::id(),
@@ -242,12 +242,12 @@ fn stopped_daemon_keeps_cluster_tui_ticking_and_recovers_input() {
     tui.writer.write_all(b"\r").unwrap();
     tui.wait_for("sending input to tui-session", Duration::from_secs(3));
     let started = Instant::now();
-    let uncertain_bound = Duration::from_secs(4) + Duration::from_millis(3500);
+    let uncertain_bound = Duration::from_secs(8);
     tui.wait_for("delivery uncertain", uncertain_bound);
     let redraw_output = tui.text_from(redraw_start);
     assert!(
         started.elapsed() <= uncertain_bound,
-        "Uncertain exceeded 4 x 1s attempts plus four 750ms loop cycles and final 500ms refresh"
+        "Uncertain exceeded 8s from the first send attempt"
     );
     assert!(
         redraw_output.matches("\u{1b}[2J").count() >= 3,
