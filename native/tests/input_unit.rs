@@ -55,7 +55,7 @@ fn type_text_submits_paste_once_and_preserves_embedded_newline() {
     let fake = dir.join("paste_agent.py");
     std::fs::write(
         &fake,
-        r#"import os, select, sys, termios, tty, time
+        r#"import os, queue, select, sys, termios, tty, time, threading
 fd = sys.stdin.fileno()
 tty.setraw(fd)
 os.write(1, b'\x1b[?2004hREADY\r\n> \r\nSTATUS ONE\r\nSTATUS TWO')
@@ -64,18 +64,28 @@ last = 0.0
 paste = False
 submitted = 0
 returns = 0
+transcript = bytearray()
+incoming = queue.Queue()
+
+def read_input():
+    while True:
+        data = os.read(fd, 4096)
+        if not data:
+            break
+        incoming.put((data, time.monotonic()))
+
+threading.Thread(target=read_input, daemon=True).start()
 
 def redraw():
     display = bytes(buf).replace(b'\n', b'\r\n  ')
-    os.write(1, b'\x1b[H\x1b[2JREADY\r\n> ' + display + b'\r\nSTATUS ONE\r\nSTATUS TWO')
+    changed_status = b'\r\nPASTE NEWLINE' if transcript and buf.endswith(b'\n') else b''
+    os.write(1, b'\x1b[H\x1b[2JREADY\r\n' + bytes(transcript) + b'\r\n> ' + display + b'\r\nSTATUS ONE\r\nSTATUS TWO' + changed_status)
 
 while True:
-    ready, _, _ = select.select([fd], [], [], 5)
-    if not ready:
+    try:
+        data, arrived = incoming.get(timeout=5)
+    except queue.Empty:
         continue
-    data = os.read(fd, 4096)
-    if not data:
-        break
     i = 0
     while i < len(data):
         if data.startswith(b'\x1b[200~', i):
@@ -87,20 +97,24 @@ while True:
             i += 6
             continue
         b = data[i]
-        now = time.monotonic()
+        now = arrived
         if b == 13:
             returns += 1
-            if paste or (last and now - last < 0.5):
+            if paste or (last and now - last < 0.15):
                 buf.extend(b'\n')
                 redraw()
             else:
                 submitted += 1
                 display = bytes(buf).replace(b'\n', b'\\n')
-                os.write(1, b'\r\nSUBMITTED:' + display + b'\r\nCOUNT:' + str(submitted).encode() + b'\r\nRETURNS:' + str(returns).encode() + b'\r\n')
+                record = b'SUBMITTED:' + display + b'\r\nCOUNT:' + str(submitted).encode() + b'\r\nRETURNS:' + str(returns).encode() + b'\r\n'
+                transcript.extend(record)
+                os.write(1, b'\r\n' + record)
                 buf.clear()
         else:
             buf.append(b)
             redraw()
+            if transcript:
+                time.sleep(0.02)
         last = now
         i += 1
 "#,
@@ -145,6 +159,26 @@ while True:
     assert!(
         screen.contains("RETURNS:2"),
         "the first Return should become a composer newline and one retry should submit: {screen}"
+    );
+
+    script::run_source(
+        &socket,
+        "input-unit-repeat",
+        "remuda.type_text('paste-agent', 'alpha\\nbeta')",
+    )
+    .expect("repeat the same text after its transcript remains visible");
+    let repeated = wait_screen(&socket, "paste-agent", "COUNT:2");
+    assert!(
+        repeated.contains("COUNT:2"),
+        "repeat did not submit: {repeated}"
+    );
+    assert!(
+        !repeated.contains("COUNT:3"),
+        "one repeated notice must submit exactly once: {repeated}"
+    );
+    assert!(
+        repeated.contains("RETURNS:3"),
+        "the repeated tail must not trigger an early Return: {repeated}"
     );
 }
 
