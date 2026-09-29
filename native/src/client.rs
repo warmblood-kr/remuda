@@ -926,6 +926,7 @@ fn route_tokens(
                 }
             }
             InputToken::Paste(bytes) => {
+                exit_history_if_needed(path, name, stream, &[], scrollback, output_lock);
                 let _ = stream.write_all(&bytes);
                 let _ = stream.flush();
             }
@@ -1038,9 +1039,9 @@ fn exit_history_if_needed(
     output_lock: &std::sync::Mutex<()>,
 ) {
     use std::sync::atomic::Ordering;
+    let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
     let old = scrollback.offset.load(Ordering::SeqCst);
     if old != 0 {
-        let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
         if bytes == b"q" || bytes == b"\x1b" || bytes == b"\x1bq" {
             scrollback.offset.store(0, Ordering::SeqCst);
             if let Some((_, total)) = paint_history(path, name, 0) {
@@ -1053,6 +1054,7 @@ fn exit_history_if_needed(
             scrollback.history_total.store(total, Ordering::SeqCst);
         }
     }
+    drop(_guard);
     let _ = stream.write_all(bytes);
     let _ = stream.flush();
 }
@@ -1696,5 +1698,97 @@ mod tests {
         let short = truncate_terminal_text(indicator, 40);
         assert_eq!(unicode_width::UnicodeWidthStr::width(short.as_str()), 40);
         assert_eq!(truncate_terminal_text(indicator, 80), indicator);
+    }
+
+    #[cfg(unix)]
+    fn output_stream() -> (
+        std::path::PathBuf,
+        ipc::Stream,
+        std::thread::JoinHandle<Vec<u8>>,
+    ) {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::Read as _;
+
+        static NEXT_STREAM: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "r-client-stream-{}-{}.sock",
+            std::process::id(),
+            NEXT_STREAM.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = ipc::listen(&path).expect("bind child input collector");
+        let collector = std::thread::spawn(move || {
+            let mut peer = listener.accept().expect("accept child input");
+            let mut bytes = Vec::new();
+            peer.read_to_end(&mut bytes).expect("read child input");
+            bytes
+        });
+        let stream = ipc::connect(&path).expect("connect child input");
+        (path, stream, collector)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_key_is_forwarded_if_another_action_returned_live_under_the_lock() {
+        let (stream_path, stream, collector) = output_stream();
+        let daemon_path =
+            std::env::temp_dir().join(format!("r-no-daemon-{}.sock", std::process::id()));
+        let scrollback = std::sync::Arc::new(super::AttachScrollback::default());
+        scrollback.offset.store(3, Ordering::SeqCst);
+        let output_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let held_lock = output_lock.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn({
+            let scrollback = std::sync::Arc::clone(&scrollback);
+            let output_lock = std::sync::Arc::clone(&output_lock);
+            let daemon_path = daemon_path.clone();
+            move || {
+                let mut stream = stream;
+                started_tx.send(()).expect("signal exit-key routing");
+                super::exit_history_if_needed(
+                    &daemon_path,
+                    "target",
+                    &mut stream,
+                    b"q",
+                    &scrollback,
+                    &output_lock,
+                );
+            }
+        });
+        started_rx.recv().expect("exit-key worker started");
+        std::thread::sleep(Duration::from_millis(50));
+        scrollback.offset.store(0, Ordering::SeqCst);
+        drop(held_lock);
+        worker.join().expect("exit-key worker");
+        let received = collector.join().expect("collect child input");
+        let _ = std::fs::remove_file(stream_path);
+        assert_eq!(received, b"q", "q must reach the child if history is live");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paste_while_scrolled_returns_live_and_reaches_child_unchanged() {
+        use crate::mouse::InputToken;
+
+        let (stream_path, mut stream, collector) = output_stream();
+        let daemon_path =
+            std::env::temp_dir().join(format!("r-no-daemon-{}.sock", std::process::id()));
+        let scrollback = super::AttachScrollback::default();
+        scrollback.offset.store(7, Ordering::SeqCst);
+        let paste = b"\x1b[200~typed paste\x1b[201~".to_vec();
+        let mut mouse_on = false;
+        super::route_tokens(
+            &daemon_path,
+            "target",
+            &mut stream,
+            vec![InputToken::Paste(paste.clone())],
+            &mut mouse_on,
+            &scrollback,
+            &std::sync::Mutex::new(()),
+        );
+        drop(stream);
+        let received = collector.join().expect("collect pasted child input");
+        let _ = std::fs::remove_file(stream_path);
+        assert_eq!(scrollback.offset.load(Ordering::SeqCst), 0);
+        assert_eq!(received, paste);
     }
 }
