@@ -63,6 +63,7 @@ buf = bytearray()
 last = 0.0
 paste = False
 submitted = 0
+returns = 0
 
 def redraw():
     os.write(1, b'\x1b[2A\r\x1b[2K> ' + bytes(buf) + b'\r\nSTATUS ONE\r\nSTATUS TWO')
@@ -87,12 +88,13 @@ while True:
         b = data[i]
         now = time.monotonic()
         if b == 13:
-            if paste or (last and now - last < 0.15):
+            returns += 1
+            if paste or (last and now - last < 0.5):
                 buf.extend(b'\n')
                 redraw()
             else:
                 submitted += 1
-                os.write(1, b'\r\nSUBMITTED:' + bytes(buf) + b'\r\nCOUNT:' + str(submitted).encode() + b'\r\n')
+                os.write(1, b'\r\nSUBMITTED:' + bytes(buf) + b'\r\nCOUNT:' + str(submitted).encode() + b'\r\nRETURNS:' + str(returns).encode() + b'\r\n')
                 buf.clear()
         else:
             buf.append(b)
@@ -135,6 +137,10 @@ while True:
     assert!(
         !screen.contains("COUNT:2"),
         "the visible transcript must not be mistaken for an active composer: {screen}"
+    );
+    assert!(
+        screen.contains("RETURNS:2"),
+        "the first Return should become a composer newline and one retry should submit: {screen}"
     );
 }
 
