@@ -229,6 +229,15 @@ fn stopped_daemon_keeps_cluster_tui_ticking_and_recovers_input() {
     )
     .unwrap();
     assert!(matches!(response, Response::Value(name) if name == "tui-session"));
+    let instance_id = match remuda_native::client::request(&daemon.path(), &Request::List).unwrap()
+    {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "tui-session")
+            .and_then(|session| session.instance_id)
+            .expect("the session instance id is listed"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
 
     let mut tui = TuiPty::start(&daemon.runtime);
     tui.wait_for("tui-session", Duration::from_secs(5));
@@ -261,6 +270,8 @@ fn stopped_daemon_keeps_cluster_tui_ticking_and_recovers_input() {
         &daemon.path(),
         &Request::Close {
             name: "tui-session".into(),
+            instance_id: Some(instance_id),
+            confirm: Some(true),
         },
     )
     .unwrap();
