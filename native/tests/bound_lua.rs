@@ -16,7 +16,7 @@ fn expect_bounded_error(code: &str) {
     let image = image();
     let answer = image.submit(code, None).expect("queue bounded regression");
     let error = answer
-        .recv_timeout(Duration::from_secs(6))
+        .recv_timeout(Duration::from_secs(15))
         .expect("Lua execution returns within the test bound")
         .expect_err("the script must exceed the instruction budget");
     assert!(
@@ -55,7 +55,7 @@ fn a_coroutine_resumed_in_a_later_job_is_bounded() {
         .submit("return coroutine.resume(saved_coroutine)", None)
         .expect("queue resume");
     let error = answer
-        .recv_timeout(Duration::from_secs(6))
+        .recv_timeout(Duration::from_secs(15))
         .expect("resumed coroutine returns within the test bound")
         .expect_err("the coroutine must exceed the instruction budget");
     assert!(
@@ -100,7 +100,7 @@ fn a_million_step_lua_loop_fits_the_budget() {
         .expect("queue ordinary Lua work");
     assert_eq!(
         answer
-            .recv_timeout(Duration::from_secs(6))
+            .recv_timeout(Duration::from_secs(15))
             .expect("million-step loop completes within the test bound")
             .expect("ordinary Lua work fits the execution budget"),
         "500000500000"

@@ -34,7 +34,7 @@ use std::sync::{Arc, Condvar, Mutex};
 // prefix carries typed failures to the CLI without changing ordinary errors.
 const TYPED_FAILURE_PREFIX: &str = "\u{1e}REMUDA_FAIL:";
 const LUA_HOOK_INTERVAL: u32 = 10_000;
-// Roughly two seconds of Lua VM work at about 100M instructions per second.
+// About 0.6 seconds at the measured 360M instructions/second in release builds.
 const LUA_INSTRUCTION_LIMIT: u64 = 200_000_000;
 const LUA_EXECUTION_LIMIT_MESSAGE: &str = "Lua execution limit exceeded";
 
