@@ -812,7 +812,7 @@ fn real_preview_follows_output_after_wheel_returns_to_bottom() {
     }
     assert!(ui.scrollback["stream"].offset >= 30);
 
-    for _ in 0..30 {
+    for _ in 0..60 {
         assert_eq!(
             ui.on_mouse(wheel(MouseEventKind::ScrollDown), 80, 24),
             Action::Scroll(-3)

@@ -39,7 +39,6 @@ const DAEMON_FAILURES_BEFORE_GONE: u8 = 3;
 /// than `TICK` so a keypress is never left waiting to be noticed. Used to
 /// also be the redraw cadence; see steps/017 for why that was the bug.
 const TICK_TYPING: Duration = Duration::from_millis(40);
-const SCROLL_DOWN_SETTLE: Duration = Duration::from_millis(1500);
 const MAX_ANCHOR_CAPTURES: usize = 3;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -155,7 +154,6 @@ struct ScrollState {
     /// Total corresponding to `offset`; can lag `history_total` when output
     /// keeps arriving through the bounded capture retries.
     anchor_total: usize,
-    last_scroll_down: Option<Instant>,
     scroll_direction: i8,
     recent_up_output: usize,
 }
@@ -3000,7 +2998,6 @@ fn scroll_state(state: &mut ScrollState, delta: i16) {
             state.recent_up_output = 0;
         }
         state.scroll_direction = -1;
-        state.last_scroll_down = Some(Instant::now());
         state.offset = state.offset.saturating_sub(delta.unsigned_abs() as usize);
     }
 }
@@ -3051,22 +3048,12 @@ fn capture_anchored<T>(
 /// Keep a scrolled preview on the same history rows as output pushes new rows.
 fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCapture, String> {
     let state = ui.scrollback.entry(name.to_string()).or_default();
-    let scrolling_down = state
-        .last_scroll_down
-        .is_some_and(|last| last.elapsed() < SCROLL_DOWN_SETTLE);
-    let (cells, wrapped, cursor, history_rows, history_total, anchored, anchor_total) =
-        if scrolling_down {
-            let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, state.offset)?;
-            (cells, wrapped, cursor, rows, total, state.offset, total)
-        } else {
-            let (capture, rows, total, anchored, anchor_total) =
-                capture_anchored(state.offset, state.anchor_total, |offset| {
-                    let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, offset)?;
-                    Ok(((cells, wrapped, cursor), rows, total))
-                })?;
-            let (cells, wrapped, cursor) = capture;
-            (cells, wrapped, cursor, rows, total, anchored, anchor_total)
-        };
+    let (capture, history_rows, history_total, anchored, anchor_total) =
+        capture_anchored(state.offset, state.anchor_total, |offset| {
+            let (cells, wrapped, cursor, rows, total) = capture_styled(path, name, offset)?;
+            Ok(((cells, wrapped, cursor), rows, total))
+        })?;
+    let (cells, wrapped, cursor) = capture;
     state.offset = anchored;
     if state.scroll_direction == 1 {
         state.recent_up_output = state
