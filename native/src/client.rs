@@ -399,6 +399,12 @@ enum AttachAck {
     Refused(String),
 }
 
+#[derive(Default)]
+struct AttachScrollback {
+    offset: std::sync::atomic::AtomicUsize,
+    history_total: std::sync::atomic::AtomicUsize,
+}
+
 fn attach_ack(line: &str) -> AttachAck {
     match interpret(line) {
         Response::AttachStarted { generation } => AttachAck::Tracked(generation),
@@ -472,7 +478,7 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
     let output_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let trace_input = std::env::var_os("REMUDA_TRACE_INPUT").map(PathBuf::from);
     let trace_attach_exit = std::env::var_os("REMUDA_TRACE_ATTACH_EXIT").is_some();
-    let scrollback = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let scrollback = std::sync::Arc::new(AttachScrollback::default());
     let output_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
     let attach_path = path.to_path_buf();
     let attach_name = name.to_string();
@@ -697,7 +703,8 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
             Err(error) => break format!("read error: {error}"),
         };
         let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if scrollback.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        if scrollback.offset.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            sync_scrollback_anchor(path, name, &scrollback);
             continue;
         }
         if stdout.write_all(&buf[..n]).is_err() || stdout.flush().is_err() {
@@ -837,7 +844,7 @@ fn route_tokens(
     stream: &mut Stream,
     tokens: Vec<crate::mouse::InputToken>,
     mouse_on: &mut bool,
-    scrollback: &std::sync::atomic::AtomicUsize,
+    scrollback: &AttachScrollback,
     output_lock: &std::sync::Mutex<()>,
 ) {
     use crate::mouse::{route_mouse_event, InputToken, MouseAction};
@@ -855,34 +862,31 @@ fn route_tokens(
                 } else {
                     MouseState::default()
                 };
-                match route_mouse_event(event, state, *mouse_on, scrollback.load(Ordering::SeqCst))
+                if *mouse_on
+                    && state.mode == remuda_core::agent::MouseMode::None
+                    && route_scrollback_wheel(path, name, event, scrollback, output_lock)
                 {
+                    continue;
+                }
+                let current = scrollback.offset.load(Ordering::SeqCst);
+                match route_mouse_event(event, state, *mouse_on, current) {
                     MouseAction::Forward(bytes) => {
                         let _ = stream.write_all(&bytes);
                         let _ = stream.flush();
                     }
                     MouseAction::Scroll(next) => {
                         let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
-                        scrollback.store(next, Ordering::SeqCst);
-                        paint_history(path, name, next);
+                        scrollback.offset.store(next, Ordering::SeqCst);
+                        if let Some((_, total)) = paint_history(path, name, next) {
+                            scrollback.history_total.store(total, Ordering::SeqCst);
+                        }
                     }
                     MouseAction::Ignore => {}
                 }
             }
             InputToken::Bytes(bytes) => {
-                if *mouse_on && (bytes == b"\x1b[5~" || bytes == b"\x1b[6~") {
-                    let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
-                    let old = scrollback.load(Ordering::SeqCst);
-                    let next = if bytes == b"\x1b[5~" {
-                        (old + 24).min(10_000)
-                    } else {
-                        old.saturating_sub(24)
-                    };
-                    if next != 0 || old != 0 {
-                        scrollback.store(next, Ordering::SeqCst);
-                        paint_history(path, name, next);
-                        continue;
-                    }
+                if route_scrollback_page(path, name, &bytes, *mouse_on, scrollback, output_lock) {
+                    continue;
                 }
                 let mut start = 0;
                 for (at, &byte) in bytes.iter().enumerate() {
@@ -922,11 +926,83 @@ fn route_tokens(
                 }
             }
             InputToken::Paste(bytes) => {
+                exit_history_if_needed(path, name, stream, &[], scrollback, output_lock);
                 let _ = stream.write_all(&bytes);
                 let _ = stream.flush();
             }
         }
     }
+}
+
+/// Handle PageUp/PageDown locally only when the child has not enabled mouse
+/// reporting. At live offset zero, leave the key for the child.
+fn route_scrollback_page(
+    path: &Path,
+    name: &str,
+    bytes: &[u8],
+    mouse_on: bool,
+    scrollback: &AttachScrollback,
+    output_lock: &std::sync::Mutex<()>,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    if !mouse_on || (bytes != b"\x1b[5~" && bytes != b"\x1b[6~") {
+        return false;
+    }
+    let child_tracks_mouse = matches!(
+        request(path, &Request::MouseState { name: name.into() }),
+        Ok(Response::MouseState(state)) if state.mode != remuda_core::agent::MouseMode::None
+    );
+    if child_tracks_mouse {
+        return false;
+    }
+
+    let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
+    sync_scrollback_anchor(path, name, scrollback);
+    let old = scrollback.offset.load(Ordering::SeqCst);
+    let history_rows = history_metadata(path, name).map_or(0, |(rows, _)| rows);
+    let next = if bytes == b"\x1b[5~" {
+        old.saturating_add(24).min(history_rows)
+    } else {
+        old.saturating_sub(24)
+    };
+    if next != old {
+        scrollback.offset.store(next, Ordering::SeqCst);
+        if let Some((_, total)) = paint_history(path, name, next) {
+            scrollback.history_total.store(total, Ordering::SeqCst);
+        }
+        return true;
+    }
+    old != 0
+}
+
+fn route_scrollback_wheel(
+    path: &Path,
+    name: &str,
+    event: crate::mouse::SgrMouse,
+    scrollback: &AttachScrollback,
+    output_lock: &std::sync::Mutex<()>,
+) -> bool {
+    use crate::mouse::{scroll_offset, wheel_delta};
+    use std::sync::atomic::Ordering;
+
+    let Some(delta) = wheel_delta(event) else {
+        return false;
+    };
+    let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
+    sync_scrollback_anchor(path, name, scrollback);
+    let current = scrollback.offset.load(Ordering::SeqCst);
+    let Some((history_rows, _)) = history_metadata(path, name) else {
+        return true;
+    };
+    let next = scroll_offset(current, delta, history_rows);
+    if next != current {
+        scrollback.offset.store(next, Ordering::SeqCst);
+        if let Some((_, total)) = paint_history(path, name, next) {
+            scrollback.history_total.store(total, Ordering::SeqCst);
+        }
+    }
+    true
 }
 
 fn detach_offset(parser: &crate::mouse::SgrParser, bytes: &[u8]) -> Option<usize> {
@@ -959,36 +1035,48 @@ fn exit_history_if_needed(
     name: &str,
     stream: &mut Stream,
     bytes: &[u8],
-    scrollback: &std::sync::atomic::AtomicUsize,
+    scrollback: &AttachScrollback,
     output_lock: &std::sync::Mutex<()>,
 ) {
     use std::sync::atomic::Ordering;
-    let old = scrollback.load(Ordering::SeqCst);
+    let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let old = scrollback.offset.load(Ordering::SeqCst);
     if old != 0 {
-        let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
         if bytes == b"q" || bytes == b"\x1b" || bytes == b"\x1bq" {
-            scrollback.store(0, Ordering::SeqCst);
-            paint_history(path, name, 0);
+            scrollback.offset.store(0, Ordering::SeqCst);
+            if let Some((_, total)) = paint_history(path, name, 0) {
+                scrollback.history_total.store(total, Ordering::SeqCst);
+            }
             return;
         }
-        scrollback.store(0, Ordering::SeqCst);
-        paint_history(path, name, 0);
+        scrollback.offset.store(0, Ordering::SeqCst);
+        if let Some((_, total)) = paint_history(path, name, 0) {
+            scrollback.history_total.store(total, Ordering::SeqCst);
+        }
     }
+    drop(_guard);
     let _ = stream.write_all(bytes);
     let _ = stream.flush();
 }
 
 /// Paint one captured frame while the caller holds the output lock.
-fn paint_history(path: &Path, name: &str, offset: usize) {
+fn paint_history(path: &Path, name: &str, offset: usize) -> Option<(usize, usize)> {
     use remuda_core::agent::Color;
-    let Ok(Response::StyledScreen { rows, cursor, .. }) = request(
+    let Ok(Response::StyledScreen {
+        rows,
+        cursor,
+        scrollback_len,
+        scrollback_total,
+        ..
+    }) = request(
         path,
         &Request::CaptureStyled {
             name: name.into(),
             scrollback: offset,
         },
-    ) else {
-        return;
+    )
+    else {
+        return None;
     };
     let mut stdout = std::io::stdout();
     let _ = stdout.write_all(b"\x1b[H\x1b[2J");
@@ -1027,11 +1115,12 @@ fn paint_history(path: &Path, name: &str, offset: usize) {
         }
     }
     if offset != 0 {
-        let _ = write!(
-            stdout,
-            "\x1b[{};1H\x1b[2K[scrollback: {offset} rows — PgUp/PgDn, q/Esc returns]",
-            rows.len().max(1)
+        let columns = crossterm::terminal::size().map_or(80, |(columns, _)| usize::from(columns));
+        let indicator = truncate_terminal_text(
+            &format!("[scrollback: {offset} rows · q/Esc exit · keys go live]"),
+            columns,
         );
+        let _ = write!(stdout, "\x1b[{};1H\x1b[2K{indicator}", rows.len().max(1),);
     }
     if offset == 0 {
         let _ = if cursor.visible {
@@ -1048,6 +1137,89 @@ fn paint_history(path: &Path, name: &str, offset: usize) {
         let _ = stdout.write_all(b"\x1b[?25l");
     }
     let _ = stdout.flush();
+    Some((scrollback_len, scrollback_total))
+}
+
+fn truncate_terminal_text(text: &str, max_columns: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut result = String::new();
+    let mut columns = 0;
+    for character in text.chars() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width > max_columns.saturating_sub(columns) {
+            break;
+        }
+        result.push(character);
+        columns += width;
+    }
+    result
+}
+
+fn history_metadata(path: &Path, name: &str) -> Option<(usize, usize)> {
+    match request(
+        path,
+        &Request::CaptureStyled {
+            name: name.into(),
+            scrollback: 0,
+        },
+    ) {
+        Ok(Response::StyledScreen {
+            scrollback_len,
+            scrollback_total,
+            ..
+        }) => Some((scrollback_len, scrollback_total)),
+        _ => None,
+    }
+}
+
+/// Advance a paused direct-attach view with output while keeping its absolute
+/// history rows in view. The caller holds the output lock.
+fn sync_scrollback_anchor(path: &Path, name: &str, scrollback: &AttachScrollback) {
+    use std::sync::atomic::Ordering;
+
+    let offset = scrollback.offset.load(Ordering::SeqCst);
+    if offset == 0 {
+        return;
+    }
+    let previous_total = scrollback.history_total.load(Ordering::SeqCst);
+    let Some((history_rows, current_total)) = history_metadata(path, name) else {
+        return;
+    };
+    let next = crate::mouse::anchor_offset_to_new_history(
+        offset,
+        previous_total,
+        current_total,
+        history_rows,
+    );
+    scrollback.offset.store(next, Ordering::SeqCst);
+    scrollback
+        .history_total
+        .store(current_total, Ordering::SeqCst);
+    if current_total == previous_total && next == offset {
+        return;
+    }
+
+    if let Some((paint_rows, painted_total)) = paint_history(path, name, next) {
+        let anchored = crate::mouse::anchor_offset_to_new_history(
+            next,
+            current_total,
+            painted_total,
+            paint_rows,
+        );
+        if anchored != next {
+            scrollback.offset.store(anchored, Ordering::SeqCst);
+            if let Some((_, final_total)) = paint_history(path, name, anchored) {
+                scrollback
+                    .history_total
+                    .store(final_total, Ordering::SeqCst);
+            }
+        } else {
+            scrollback
+                .history_total
+                .store(painted_total, Ordering::SeqCst);
+        }
+    }
 }
 
 /// A session held for a human typing into a pane rather than into the whole
@@ -1184,7 +1356,8 @@ mod tests {
     use super::trace_input_read;
     use super::{
         close_raw_paste_if_needed, detach_offset, interpret, read_response_with_timeout,
-        request_with_timeout, reset_input_modes, write_input_trace, DETACH, RESET_INPUT_MODES,
+        request_with_timeout, reset_input_modes, truncate_terminal_text, write_input_trace, DETACH,
+        RESET_INPUT_MODES,
     };
     #[cfg(unix)]
     use crate::ipc;
@@ -1517,5 +1690,105 @@ mod tests {
     #[test]
     fn a_normal_reply_still_arrives_as_itself() {
         assert_eq!(interpret(r#""Ok""#), Response::Ok);
+    }
+
+    #[test]
+    fn scrollback_indicator_truncates_at_terminal_display_width() {
+        let indicator = "[scrollback: 24 rows · q/Esc exit · keys go live]";
+        let short = truncate_terminal_text(indicator, 40);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(short.as_str()), 40);
+        assert_eq!(truncate_terminal_text(indicator, 80), indicator);
+    }
+
+    #[cfg(unix)]
+    fn output_stream() -> (
+        std::path::PathBuf,
+        ipc::Stream,
+        std::thread::JoinHandle<Vec<u8>>,
+    ) {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::Read as _;
+
+        static NEXT_STREAM: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "r-client-stream-{}-{}.sock",
+            std::process::id(),
+            NEXT_STREAM.fetch_add(1, Ordering::Relaxed)
+        ));
+        let listener = ipc::listen(&path).expect("bind child input collector");
+        let collector = std::thread::spawn(move || {
+            let mut peer = listener.accept().expect("accept child input");
+            let mut bytes = Vec::new();
+            peer.read_to_end(&mut bytes).expect("read child input");
+            bytes
+        });
+        let stream = ipc::connect(&path).expect("connect child input");
+        (path, stream, collector)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_key_is_forwarded_if_another_action_returned_live_under_the_lock() {
+        let (stream_path, stream, collector) = output_stream();
+        let daemon_path =
+            std::env::temp_dir().join(format!("r-no-daemon-{}.sock", std::process::id()));
+        let scrollback = std::sync::Arc::new(super::AttachScrollback::default());
+        scrollback.offset.store(3, Ordering::SeqCst);
+        let output_lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+        let held_lock = output_lock.lock().unwrap();
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn({
+            let scrollback = std::sync::Arc::clone(&scrollback);
+            let output_lock = std::sync::Arc::clone(&output_lock);
+            let daemon_path = daemon_path.clone();
+            move || {
+                let mut stream = stream;
+                started_tx.send(()).expect("signal exit-key routing");
+                super::exit_history_if_needed(
+                    &daemon_path,
+                    "target",
+                    &mut stream,
+                    b"q",
+                    &scrollback,
+                    &output_lock,
+                );
+            }
+        });
+        started_rx.recv().expect("exit-key worker started");
+        std::thread::sleep(Duration::from_millis(50));
+        scrollback.offset.store(0, Ordering::SeqCst);
+        drop(held_lock);
+        worker.join().expect("exit-key worker");
+        let received = collector.join().expect("collect child input");
+        let _ = std::fs::remove_file(stream_path);
+        assert_eq!(received, b"q", "q must reach the child if history is live");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paste_while_scrolled_returns_live_and_reaches_child_unchanged() {
+        use crate::mouse::InputToken;
+
+        let (stream_path, mut stream, collector) = output_stream();
+        let daemon_path =
+            std::env::temp_dir().join(format!("r-no-daemon-{}.sock", std::process::id()));
+        let scrollback = super::AttachScrollback::default();
+        scrollback.offset.store(7, Ordering::SeqCst);
+        let paste = b"\x1b[200~typed paste\x1b[201~".to_vec();
+        let mut mouse_on = false;
+        super::route_tokens(
+            &daemon_path,
+            "target",
+            &mut stream,
+            vec![InputToken::Paste(paste.clone())],
+            &mut mouse_on,
+            &scrollback,
+            &std::sync::Mutex::new(()),
+        );
+        drop(stream);
+        let received = collector.join().expect("collect pasted child input");
+        let _ = std::fs::remove_file(stream_path);
+        assert_eq!(scrollback.offset.load(Ordering::SeqCst), 0);
+        assert_eq!(received, paste);
     }
 }

@@ -2148,6 +2148,31 @@ fn capture_styled(path: &Path, name: &str, scrollback: usize) -> String {
     }
 }
 
+fn capture_styled_snapshot(path: &Path, name: &str, scrollback: usize) -> (String, usize, usize) {
+    match client::request(
+        path,
+        &Request::CaptureStyled {
+            name: name.to_string(),
+            scrollback,
+        },
+    ) {
+        Ok(Response::StyledScreen {
+            rows,
+            scrollback_len,
+            scrollback_total,
+            ..
+        }) => (
+            rows.into_iter()
+                .map(|row| row.into_iter().map(|run| run.text).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            scrollback_len,
+            scrollback_total,
+        ),
+        other => panic!("styled capture failed: {other:?}"),
+    }
+}
+
 fn wait_for(path: &Path, name: &str, needle: &str) -> String {
     let deadline = Instant::now() + PATIENCE;
     loop {
@@ -3179,6 +3204,346 @@ fn direct_attach_mouse_scrolls_the_full_history_and_returns_to_live_output() {
             .count()
             == 1,
         "live output should resume exactly once after the historical repaint"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_keeps_scrolled_content_anchored_as_output_arrives() {
+    let dir = scratch_dir("attach-scroll-anchor");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "i=0; while [ $i -lt 40 ]; do printf 'seed-%03d\\n' \"$i\"; i=$((i+1)); done; sleep 2; i=0; while [ $i -lt 4 ]; do printf 'burst-%03d\\n' \"$i\"; i=$((i+1)); sleep 0.15; done; sleep 2".into(),
+        },
+    )
+    .expect("start output stream");
+    wait_for(&path, "target", "seed-039");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "seed-039");
+
+    held.write_raw(b"\x1b[<64;10;10M").expect("wheel up");
+    let _ = collect_until_bytes(&output, b"[scrollback: 3 rows");
+    let anchor_line = viewer
+        .screen_text()
+        .expect("viewer screen")
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("seed-"))
+        .expect("visible seed row")
+        .to_string();
+    let (anchor_view, _, anchor_total) = capture_styled_snapshot(&path, "target", 3);
+
+    wait_for(&path, "target", "burst-003");
+    let (_, history_rows, latest_total) = capture_styled_snapshot(&path, "target", 0);
+    assert!(latest_total > anchor_total, "history did not advance");
+    let expected_offset = 3usize
+        .saturating_add(latest_total.saturating_sub(anchor_total))
+        .min(history_rows);
+    let expected_indicator = format!("[scrollback: {expected_offset} rows");
+    let _ = collect_until_bytes(&output, expected_indicator.as_bytes());
+
+    let (anchored_view, _, _) = capture_styled_snapshot(&path, "target", expected_offset);
+    assert_eq!(
+        anchored_view, anchor_view,
+        "the captured history anchor moved"
+    );
+    let visible_screen = viewer.screen_text().expect("viewer screen after output");
+    let visible_line = visible_screen
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("seed-"))
+        .expect("visible anchored seed row")
+        .to_string();
+    assert_eq!(
+        visible_line, anchor_line,
+        "direct attach moved the visible row"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_clears_stale_scrollback_indicator_when_history_is_clamped_to_zero() {
+    let dir = scratch_dir("a-clamp");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+    client::request(
+        &path,
+        &Request::SendLine {
+            name: "target".into(),
+            text: "i=0; while [ $i -lt 40 ]; do printf 'clearseed-%03d\\n' \"$i\"; i=$((i+1)); done; sleep 2; printf '\\033[?1049h'; sleep 2".into(),
+        },
+    )
+    .expect("start history then enter alternate screen");
+    wait_for(&path, "target", "clearseed-039");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "clearseed-039");
+    held.write_raw(b"\x1b[<64;10;10M").expect("wheel up");
+    collect_until_bytes(&output, b"[scrollback: 3 rows");
+    let (_, before_rows, before_total) = capture_styled_snapshot(&path, "target", 0);
+    assert!(before_rows > 0, "test requires retained history");
+
+    // The running child enters the alternate screen without adding any
+    // history rows, clamping retained history to zero while total stays fixed.
+    std::thread::sleep(Duration::from_millis(2200));
+    let alternate_screen = capture(&path, "target");
+    let (_, after_rows, after_total) = capture_styled_snapshot(&path, "target", 0);
+    assert_eq!(
+        after_total, before_total,
+        "alternate screen adds no history"
+    );
+    assert_eq!(
+        after_rows, 0,
+        "alternate screen should clamp history to zero"
+    );
+    assert!(before_rows > after_rows);
+    let screen = viewer
+        .screen_text()
+        .expect("viewer screen after history clear");
+    assert!(
+        !screen.contains("[scrollback:"),
+        "the stale scrollback indicator should be repainted away: {screen:?}; target={alternate_screen:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_wheel_up_with_no_history_does_not_enter_scrollback() {
+    let dir = scratch_dir("a-empty");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    new_session(&path, "target");
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    collect_until_bytes(&output, b"$ ");
+    held.write_raw(b"\x1b[<64;10;10M")
+        .expect("wheel up with no history");
+    std::thread::sleep(Duration::from_millis(200));
+    let screen = viewer.screen_text().expect("viewer screen");
+    assert!(
+        !screen.contains("[scrollback:"),
+        "empty history must not enter a scrollback frame: {screen:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_forwards_pagedown_at_live_bottom_to_the_child() {
+    let dir = scratch_dir("a-pgdn-live");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw -echo; printf 'pgdn-ready\\n'; dd bs=1 count=4 2>/dev/null | od -An -tx1; printf '\\npgdn-forwarded\\n'; sleep 1".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start raw child");
+    assert_eq!(created, Response::Value("target".into()));
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "pgdn-ready");
+    held.write_raw(b"\x1b[6~").expect("PageDown at live bottom");
+    let received = collect_until_bytes(&output, b"pgdn-forwarded");
+    let received_hex: String = String::from_utf8_lossy(&received)
+        .split_whitespace()
+        .collect();
+    assert!(
+        received_hex.contains("1b5b367e"),
+        "the live PageDown bytes did not reach the child: {received:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_forwards_paging_keys_when_the_child_tracks_mouse() {
+    use remuda_core::agent::{MouseEncoding, MouseMode, MouseState};
+
+    let dir = scratch_dir("a-pg-mouse");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw -echo; printf '\\033[?1000h\\033[?1006h'; printf 'mouse-page-ready\\n'; dd bs=1 count=4 2>/dev/null | od -An -tx1; printf '\\nmouse-page-forwarded\\n'; sleep 1".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start mouse-reporting child");
+    assert_eq!(created, Response::Value("target".into()));
+    wait_for(&path, "target", "mouse-page-ready");
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        match client::request(
+            &path,
+            &Request::MouseState {
+                name: "target".into(),
+            },
+        ) {
+            Ok(Response::MouseState(MouseState {
+                mode: MouseMode::PressRelease,
+                encoding: MouseEncoding::Sgr,
+                ..
+            })) => break,
+            other => {
+                assert!(
+                    Instant::now() < deadline,
+                    "child mouse mode not observed: {other:?}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(80, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "mouse-page-ready");
+    held.write_raw(b"\x1b[5~")
+        .expect("PageUp with child mouse mode");
+    let received = collect_until_bytes(&output, b"mouse-page-forwarded");
+    let received_hex: String = String::from_utf8_lossy(&received)
+        .split_whitespace()
+        .collect();
+    assert!(
+        received_hex.contains("1b5b357e"),
+        "the child did not receive PageUp: {received:?}"
+    );
+    assert!(!viewer.screen_text().unwrap().contains("[scrollback:"));
+}
+
+#[cfg(unix)]
+#[test]
+fn direct_attach_history_exit_keys_are_swallowed_and_other_keys_pass_through() {
+    let dir = scratch_dir("a-history-keys");
+    let path = daemon::socket_path_in(&dir, "default");
+    let _daemon = daemon_at(&path);
+    let created = client::request(
+        &path,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "i=0; while [ $i -lt 80 ]; do printf 'keyhistory-%03d\\n' \"$i\"; i=$((i+1)); done; stty raw -echo; printf 'history-key-ready\\n'; dd bs=1 count=1 2>/dev/null | od -An -tx1; printf '\\nforwarded-key\\n'; sleep 1".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start history child");
+    assert_eq!(created, Response::Value("target".into()));
+
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    cmd.args(["attach", "target"]);
+    cmd.env("REMUDA_RUNTIME_DIR", &dir);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(cmd, Size::new(40, 24)).expect("spawn viewer")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture viewer output");
+    wait_for_session_screen(&viewer, "history-key-ready");
+    let _ = collect_until_bytes(&output, b"history-key-ready");
+    let expected_history = capture_styled_snapshot(&path, "target", 24).0;
+    let expected_top = expected_history.lines().next().unwrap().trim().to_string();
+
+    held.write_raw(b"\x1b[5~").expect("PageUp into history");
+    let _ = collect_until_bytes(&output, b"[scrollback: 24 rows");
+    let indicator = viewer.screen_text().expect("history indicator");
+    assert!(
+        indicator.contains("q/Esc exit · keys go live"),
+        "short indicator must explain exit and key routing: {indicator:?}"
+    );
+    assert_eq!(
+        indicator.lines().next().unwrap().trim(),
+        expected_top,
+        "the indicator must not wrap and scroll history off the top"
+    );
+
+    held.write_raw(b"q").expect("exit history with q");
+    let _ = collect_until_bytes(&output, b"history-key-ready");
+    assert!(!viewer.screen_text().unwrap().contains("[scrollback:"));
+    held.write_raw(b"\x1b[5~")
+        .expect("PageUp into history again");
+    let _ = collect_until_bytes(&output, b"[scrollback: 24 rows");
+    held.write_raw(b"\x1b").expect("exit history with Escape");
+    let _ = collect_until_bytes(&output, b"history-key-ready");
+    assert!(!viewer.screen_text().unwrap().contains("[scrollback:"));
+
+    held.write_raw(b"x")
+        .expect("send ordinary key after exiting history");
+    let received = collect_until_bytes(&output, b"forwarded-key");
+    assert!(
+        received.windows(b"78".len()).any(|w| w == b"78"),
+        "ordinary key was not passed to the child: {received:?}"
     );
 }
 
