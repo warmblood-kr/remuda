@@ -979,11 +979,13 @@ fn split_stdin_flag(args: &[String]) -> Result<(bool, &[String]), &'static str> 
         [flag, ..] if flag == "--stdin" => {
             Err("--stdin is only valid before an installed mod command")
         }
-        [command, rest @ ..]
-            if remuda_native::packages::has_subcommand(command)
-                && rest.iter().any(|arg| arg == "--stdin") =>
-        {
-            Err("usage: remuda --stdin MOD [ARGS…] (put --stdin before the mod command)")
+        [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
+            let options = rest.split(|arg| arg == "--").next().unwrap_or(rest);
+            if options.iter().any(|arg| arg == "--stdin") {
+                Err("usage: remuda --stdin MOD [ARGS…] (put --stdin before the mod command)")
+            } else {
+                Ok((false, args))
+            }
         }
         _ => Ok((false, args)),
     }
@@ -1067,14 +1069,23 @@ fn extension_command(
         Ok(None) => return fail(format!("no installed mod provides command {command}")),
         Err(error) => return fail(error),
     };
-    let launch = match args {
-        [] => Some((false, None)),
-        ["--headless"] => Some((true, None)),
-        ["--agent", agent] => Some((false, Some(*agent))),
-        ["--agent", agent, "--headless"] | ["--headless", "--agent", agent] => {
-            Some((true, Some(*agent)))
+    let separator = args.iter().position(|argument| *argument == "--");
+    let (option_args, literal_args) = match separator {
+        Some(index) => (&args[..index], &args[index + 1..]),
+        None => (args, &[][..]),
+    };
+    let launch = if literal_args.is_empty() {
+        match option_args {
+            [] => Some((false, None)),
+            ["--headless"] => Some((true, None)),
+            ["--agent", agent] => Some((false, Some(*agent))),
+            ["--agent", agent, "--headless"] | ["--headless", "--agent", agent] => {
+                Some((true, Some(*agent)))
+            }
+            _ => None,
         }
-        _ => None,
+    } else {
+        None
     };
     if stdin_enabled && launch.is_some() {
         return fail("--stdin requires a mod command handler, not a mod launch");
@@ -1105,13 +1116,14 @@ fn extension_command(
             }
         });
     }
-    let arguments = args
+    let arguments = option_args
         .iter()
+        .chain(literal_args.iter())
         .map(|argument| serde_json::to_string(argument).expect("argument serializes"))
         .collect::<Vec<_>>()
         .join(", ");
     let env = caller_env(std::env::vars());
-    let stdin_opted_in = stdin_enabled || args.contains(&"-");
+    let stdin_opted_in = stdin_enabled || option_args.contains(&"-") || literal_args.contains(&"-");
     let stdin = if stdin_opted_in {
         const MAX_CALLER_STDIN: usize = 1024 * 1024;
         let mut bytes = Vec::new();
