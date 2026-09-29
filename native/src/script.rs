@@ -415,29 +415,7 @@ pub fn bindings(
         })?,
     )?;
 
-    let path = at();
-    table.set(
-        "_session_resize",
-        lua.create_function(move |_, (name, cols, rows): (String, Value, Value)| {
-            let cols = match resize_dimension(cols) {
-                Ok(value) => value,
-                Err(error) => return Ok((Value::Nil, Some(error))),
-            };
-            let rows = match resize_dimension(rows) {
-                Ok(value) => value,
-                Err(error) => return Ok((Value::Nil, Some(error))),
-            };
-            let size = match requested_size(cols, rows) {
-                Ok(size) => size,
-                Err(error) => return Ok((Value::Nil, Some(error))),
-            };
-            match ask(&path, Request::Resize { name, size })? {
-                Response::Ok => Ok((Value::Boolean(true), None)),
-                Response::Error(reason) => Ok((Value::Nil, Some(reason))),
-                other => Ok((Value::Nil, Some(format!("unexpected response: {other:?}")))),
-            }
-        })?,
-    )?;
+    session_resize_binding(lua, &table, at())?;
 
     new_binding(lua, &table, at())?;
 
@@ -552,11 +530,50 @@ pub fn bindings(
     Ok(table)
 }
 
+fn session_resize_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
+    table.set(
+        "_session_resize",
+        lua.create_function(move |_, (name, cols, rows): (String, Value, Value)| {
+            let cols = match resize_dimension(cols) {
+                Ok(value) => value,
+                Err(error) => return Ok((Value::Nil, Some(error))),
+            };
+            let rows = match resize_dimension(rows) {
+                Ok(value) => value,
+                Err(error) => return Ok((Value::Nil, Some(error))),
+            };
+            let size = match requested_size(cols, rows) {
+                Ok(size) => size,
+                Err(error) => return Ok((Value::Nil, Some(error))),
+            };
+            match ask(&path, Request::Resize { name, size })? {
+                Response::Ok => Ok((Value::Boolean(true), None)),
+                Response::Error(reason) => Ok((Value::Nil, Some(reason))),
+                other => Ok((Value::Nil, Some(format!("unexpected response: {other:?}")))),
+            }
+        })?,
+    )
+}
+
 fn requested_size(cols: i64, rows: i64) -> Result<remuda_core::Size, String> {
-    if !(20..=1000).contains(&cols) || !(5..=500).contains(&rows) {
-        return Err("resize dimensions must be cols 20..1000 and rows 5..500".into());
+    use remuda_core::Size;
+    if !(i64::from(Size::MIN_RESIZE_COLS)..=i64::from(Size::MAX_RESIZE_COLS)).contains(&cols)
+        || !(i64::from(Size::MIN_ROWS)..=i64::from(Size::MAX_RESIZE_ROWS)).contains(&rows)
+    {
+        return Err(format!(
+            "resize dimensions must be cols {}..{}, rows {}..{}",
+            Size::MIN_RESIZE_COLS,
+            Size::MAX_RESIZE_COLS,
+            Size::MIN_ROWS,
+            Size::MAX_RESIZE_ROWS
+        ));
     }
-    Ok(remuda_core::Size::requested(cols as u16, rows as u16))
+    let (cols, rows) = (cols as u16, rows as u16);
+    Ok(if cols < Size::MIN_COLS {
+        Size::for_pane(cols, rows)
+    } else {
+        Size::new(cols, rows)
+    })
 }
 
 fn resize_dimension(value: Value) -> Result<i64, String> {

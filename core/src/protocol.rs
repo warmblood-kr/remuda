@@ -323,16 +323,16 @@ pub fn expand_runs(runs: &[StyledRun]) -> Vec<StyledCell> {
         .collect()
 }
 
-// `Size::new` clamps ordinary terminal sizes. Explicit resize requests and
-// pane sizes carry an opt-in to preserve the dimensions their caller needs.
+// `Size::new` clamps to a floor below which real TUIs silently drop
+// keystrokes. Ordinary wire sizes take that same path. Pane sizes carry an
+// explicit opt-in because their child must lay out at the width actually
+// visible beside the list.
 #[derive(Serialize, Deserialize)]
 struct SizeWire {
     cols: u16,
     rows: u16,
     #[serde(default, skip_serializing_if = "is_false")]
     allow_narrow: bool,
-    #[serde(default, skip_serializing_if = "is_false")]
-    allow_custom: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -344,8 +344,7 @@ impl Serialize for Size {
         SizeWire {
             cols: self.cols(),
             rows: self.rows(),
-            allow_narrow: self.cols() < Size::MIN_COLS || self.rows() < Size::MIN_ROWS,
-            allow_custom: self.rows() < Size::MIN_ROWS,
+            allow_narrow: self.cols() < Size::MIN_COLS,
         }
         .serialize(s)
     }
@@ -354,16 +353,7 @@ impl Serialize for Size {
 impl<'de> Deserialize<'de> for Size {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let wire = SizeWire::deserialize(d)?;
-        if wire.allow_custom
-            && (!(20..=1000).contains(&wire.cols) || !(5..=500).contains(&wire.rows))
-        {
-            return Err(serde::de::Error::custom(
-                "custom size must have cols 20..1000 and rows 5..500",
-            ));
-        }
-        Ok(if wire.allow_custom {
-            Size::requested(wire.cols, wire.rows)
-        } else if wire.allow_narrow {
+        Ok(if wire.allow_narrow {
             Size::for_pane(wire.cols, wire.rows)
         } else {
             Size::new(wire.cols, wire.rows)

@@ -409,7 +409,7 @@ session.new
 session.resize
 --------------
 
-``session.resize(name, cols, rows) -> true | nil, err`` — Resize a session's terminal. Columns must be 20 through 1000 and rows 5 through 500.
+``session.resize(name, cols, rows) -> true | nil, err`` — Resize a session's terminal. Columns must be 20 through 1000 and rows 24 through 500.
 
 sleep
 -----
