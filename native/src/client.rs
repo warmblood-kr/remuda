@@ -889,18 +889,19 @@ fn route_tokens(
                     let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
                     sync_scrollback_anchor(path, name, scrollback);
                     let old = scrollback.offset.load(Ordering::SeqCst);
+                    let history_rows = history_metadata(path, name).map_or(0, |(rows, _)| rows);
                     let next = if bytes == b"\x1b[5~" {
-                        (old + 24).min(10_000)
+                        old.saturating_add(24).min(history_rows)
                     } else {
                         old.saturating_sub(24)
                     };
-                    if next != 0 || old != 0 {
+                    if next != old {
                         scrollback.offset.store(next, Ordering::SeqCst);
                         if let Some((_, total)) = paint_history(path, name, next) {
                             scrollback.history_total.store(total, Ordering::SeqCst);
                         }
-                        continue;
                     }
+                    continue;
                 }
                 let mut start = 0;
                 for (at, &byte) in bytes.iter().enumerate() {
@@ -963,7 +964,10 @@ fn route_scrollback_wheel(
     let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
     sync_scrollback_anchor(path, name, scrollback);
     let current = scrollback.offset.load(Ordering::SeqCst);
-    let next = scroll_offset(current, delta, 10_000);
+    let Some((history_rows, _)) = history_metadata(path, name) else {
+        return true;
+    };
+    let next = scroll_offset(current, delta, history_rows);
     if next != current {
         scrollback.offset.store(next, Ordering::SeqCst);
         if let Some((_, total)) = paint_history(path, name, next) {
@@ -1146,7 +1150,7 @@ fn sync_scrollback_anchor(path: &Path, name: &str, scrollback: &AttachScrollback
     scrollback
         .history_total
         .store(current_total, Ordering::SeqCst);
-    if current_total == previous_total {
+    if current_total == previous_total && next == offset {
         return;
     }
 
