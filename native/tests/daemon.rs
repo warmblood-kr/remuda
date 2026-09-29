@@ -1201,8 +1201,6 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let drop_notice = b"dropping input until the writer recovers";
-        let recovery_notice = b"input writer recovered; queued input resumed";
         let mut last_total = None;
         let mut stable_since = Instant::now();
         let sent = flood.len() as u64;
@@ -1226,14 +1224,6 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
             if let Ok(chunk) = output.recv_timeout(Duration::from_millis(20)) {
                 seen.extend_from_slice(&chunk);
             }
-            let last_drop = seen
-                .windows(drop_notice.len())
-                .rposition(|window| window == drop_notice);
-            let last_recovery = seen
-                .windows(recovery_notice.len())
-                .rposition(|window| window == recovery_notice);
-            let recovered =
-                last_recovery.is_some_and(|at| last_drop.is_none_or(|drop_at| at > drop_at));
             let total = std::fs::metadata(&child_input_path)
                 .ok()
                 .map(|metadata| metadata.len());
@@ -1247,10 +1237,23 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
             let drained = total
                 .zip(dropped)
                 .is_some_and(|(total, dropped)| dropped <= sent && total == sent - dropped);
-            if recovered && drained && stable_since.elapsed() >= Duration::from_millis(500) {
+            if drained && stable_since.elapsed() >= Duration::from_millis(500) {
                 break;
             }
         }
+
+        let drop_notice = b"dropping input until the writer recovers";
+        let recovery_notice = b"input writer recovered; queued input resumed";
+        let last_drop = seen
+            .windows(drop_notice.len())
+            .rposition(|window| window == drop_notice);
+        let last_recovery = seen
+            .windows(recovery_notice.len())
+            .rposition(|window| window == recovery_notice);
+        assert!(
+            last_recovery.is_some_and(|at| last_drop.is_none_or(|drop_at| at > drop_at)),
+            "input writer recovery notice was not printed after the latest drop notice"
+        );
 
         let barrier = b"DRAINED-BARRIER\n";
         held.write_raw(barrier)
