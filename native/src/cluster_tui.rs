@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 
 pub mod close_request;
 const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+const REMOTE_PASTE_FAILURE_NOTICE: &str =
+    "remote paste stopped after a failed chunk; remaining paste chunks dropped";
 pub mod composer;
 pub mod confirm;
 pub mod ended;
@@ -975,7 +977,13 @@ impl ClusterUi {
         self.input_sender
             .begin_due(&mut self.input_queue, Instant::now());
         if let Some(batch) = self.input_queue.sending_batch() {
-            self.notice = Some((format!("sending input to {}", batch.name), now));
+            if !self
+                .notice
+                .as_ref()
+                .is_some_and(|(notice, _)| notice == REMOTE_PASTE_FAILURE_NOTICE)
+            {
+                self.notice = Some((format!("sending input to {}", batch.name), now));
+            }
         }
     }
 
@@ -1015,6 +1023,9 @@ impl ClusterUi {
         match event {
             Some(QueueEvent::Sent { .. } | QueueEvent::Uncertain { .. }) => {
                 self.clear_sending_notice();
+            }
+            Some(QueueEvent::PasteAborted { .. }) => {
+                self.notice = Some((REMOTE_PASTE_FAILURE_NOTICE.into(), now));
             }
             Some(QueueEvent::Dropped { reason, .. }) | Some(QueueEvent::Failed { reason, .. }) => {
                 let mut draft_discarded = false;
@@ -1638,7 +1649,7 @@ fn select_target_with_remote_wait(
 
 #[cfg(test)]
 mod tests {
-    use super::queue::{QueueEvent, QueueState};
+    use super::queue::{QueueEvent, QueueState, MAX_IO_RETRIES};
     use super::{
         is_attention, remote_state_label, render_badge, select_target_with_remote_wait,
         AttentionSignals, Badge, ClusterUi, RemoteInputTransport, RemoteSelection, RemoteSource,
@@ -2309,6 +2320,96 @@ mod tests {
             "remote control disabled on laptop"
         );
         assert!(transport.requests.lock().unwrap().len() == 1);
+    }
+
+    #[test]
+    fn failed_remote_paste_chunk_drops_later_chunks_with_one_notice() {
+        let clock = ManualClock::new();
+        let limit = crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES;
+        let oversize = Response::Error(format!("remote Input batch exceeds {limit} bytes"));
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        let mut other = snapshot.nodes[0].clone();
+        other.registry_key = "fp-tablet".into();
+        other.name = "tablet".into();
+        other.sessions[0].instance_id = "tablet-instance".into();
+        snapshot.nodes.push(other);
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        ui.enter_selected(clock.now());
+        ui.enqueue_remote_draft(vec![b'x'; limit * 2 + 7], clock.now());
+        ui.enqueue_remote_draft(b"later\r".to_vec(), clock.now());
+        ui.select_target(Some("fp-tablet/build")).unwrap();
+        ui.enter_selected(clock.now());
+        ui.enqueue_remote_draft(b"other\r".to_vec(), clock.now());
+        let transport = FakeRemoteInput::new(oversize.clone());
+
+        for attempt in 0..=MAX_IO_RETRIES {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            *transport.response.lock().unwrap() = Some(oversize.clone());
+            ui.start_pending(clock.now());
+            ui.send_pending(
+                std::path::Path::new("unused"),
+                clock.now(),
+                Some(&transport),
+            );
+        }
+
+        let requests = transport.requests.lock().unwrap();
+        let first_request = requests
+            .first()
+            .expect("first paste chunk was sent")
+            .1
+            .clone();
+        let Request::Input {
+            client_id: first_client,
+            bytes: first_bytes,
+            ..
+        } = &first_request
+        else {
+            panic!("remote composer sent a non-Input request");
+        };
+        assert!(
+            requests.iter().all(|(_, request)| !matches!(
+                request,
+                Request::Input { client_id, bytes, .. }
+                    if bytes.iter().all(|byte| *byte == b'x')
+                        && bytes.len() <= first_bytes.len()
+                        && client_id != first_client
+            )),
+            "a later paste chunk was sent after the first chunk failed"
+        );
+        drop(requests);
+
+        for _ in 0..2 {
+            *transport.response.lock().unwrap() = Some(Response::Ack { duplicate: false });
+            ui.start_pending(clock.now());
+            ui.send_pending(
+                std::path::Path::new("unused"),
+                clock.now(),
+                Some(&transport),
+            );
+        }
+        let notice = ui.notice.as_ref().map(|(notice, _)| notice.as_str());
+        assert!(notice.is_some_and(|notice| notice.contains("remaining paste chunks")));
+        let frame = ui.render(100, 24, "", &clock);
+        assert_eq!(frame.matches(notice.unwrap()).count(), 1);
+        let requests = transport.requests.lock().unwrap();
+        assert!(requests.iter().any(|(node, request)| {
+            node == "fp-laptop"
+                && matches!(request, Request::Input { bytes, .. } if bytes == b"later\r")
+        }));
+        assert!(requests.iter().any(|(node, request)| {
+            node == "fp-tablet"
+                && matches!(request, Request::Input { bytes, .. } if bytes == b"other\r")
+        }));
     }
 
     #[test]
