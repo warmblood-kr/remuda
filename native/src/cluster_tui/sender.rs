@@ -786,7 +786,10 @@ mod tests {
                     Some(QueueEvent::RetryScheduled { seq: 1, .. })
                 ));
             } else {
-                assert!(matches!(result, Some(QueueEvent::RemoteTargetFailed { seq: 1, .. })));
+                assert!(matches!(
+                    result,
+                    Some(QueueEvent::RemoteTargetFailed { seq: 1, .. })
+                ));
             }
         }
         let later = queue.items().next_back().unwrap();
