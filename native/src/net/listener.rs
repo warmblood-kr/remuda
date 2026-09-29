@@ -1001,7 +1001,8 @@ fn handle_connection_with(
     }
     if let Request::Input { bytes, .. } = &request {
         if !state.limiter.allow_remote_input(&peer_fp, bytes.len()) {
-            let response = encode_error("remote Input rate limit exceeded");
+            let response =
+                serde_json::to_vec(&Response::RateLimited).unwrap_or_else(|_| b"null".to_vec());
             return send_encrypted_response(stream, opened, &response);
         }
     }
@@ -1222,6 +1223,7 @@ mod tests {
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<io::Result<()>>>,
         state_dir: PathBuf,
+        state: Arc<ListenerState>,
     }
 
     #[cfg(unix)]
@@ -1301,6 +1303,7 @@ mod tests {
             });
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = stop.clone();
+            let thread_state = state.clone();
             let thread = std::thread::spawn(move || {
                 serve_socket_until(
                     &listener,
@@ -1310,7 +1313,7 @@ mod tests {
                         spawn_connection_handler(
                             stream,
                             remote_addr,
-                            state.clone(),
+                            thread_state.clone(),
                             authorize.clone(),
                             dispatch.clone(),
                             ConnectionPolicy {
@@ -1328,6 +1331,7 @@ mod tests {
                 stop,
                 thread: Some(thread),
                 state_dir,
+                state,
             }
         }
 
@@ -1375,9 +1379,10 @@ mod tests {
                 join_tokens,
                 admit_join: Arc::new(cluster::admit_join_locked),
             });
+            let test_state = state.clone();
             let listener = Listener {
                 socket: listener,
-                state,
+                state: state.clone(),
                 authorize,
                 dispatch,
                 control_source,
@@ -1392,7 +1397,16 @@ mod tests {
                 stop,
                 thread: Some(thread),
                 state_dir,
+                state: test_state,
             }
+        }
+
+        fn exhaust_remote_input_budget(&self, peer_public: &[u8]) {
+            let peer_fp = cluster::encoding::fingerprint(peer_public);
+            assert!(self
+                .state
+                .limiter
+                .allow_remote_input(&peer_fp, REMOTE_INPUT_BYTES_PER_SECOND));
         }
 
         fn exchange(&self, sealed: frame::SealedRequest) -> (u16, Vec<u8>) {
@@ -1835,6 +1849,46 @@ mod tests {
                 "remote Input batch exceeds {} bytes",
                 crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES
             ))
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_refuses_rate_limited_input_with_typed_error() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let seen = dispatched.clone();
+        let settings = TestControlSettings::new(br#"{"allow_remote_control":true}"#);
+        let server = SocketTestServer::start_production_with_control_source(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Ok(())),
+            Arc::new(move |_, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::to_vec(&Response::Ack { duplicate: false }).unwrap())
+            }),
+            settings.source(),
+        );
+        server.exhaust_remote_input_budget(&peer.public);
+        let request = Request::Input {
+            name: "session".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
+            bytes: b"x".to_vec(),
+        };
+        let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
+        let (status, response) = server.exchange(sealed);
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Response>(&response).unwrap(),
+            Response::RateLimited
         );
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
