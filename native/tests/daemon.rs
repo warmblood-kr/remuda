@@ -1272,7 +1272,7 @@ fn attach_eof_drains_input_already_read_by_the_key_pump() {
             command: vec![
                 "sh".into(),
                 "-c".into(),
-                "stty raw -echo; : >\"$READY_PATH\"; sleep 0.1; head -c 12288 >\"$CAPTURE_PATH\"; while :; do sleep 1; done".into(),
+                "stty raw echo; : >\"$READY_PATH\"; i=0; while [ \"$i\" -lt 12 ]; do dd bs=1024 count=1 iflag=fullblock 2>/dev/null >>\"$CAPTURE_PATH\"; i=$((i+1)); sleep 0.05; done; while :; do sleep 1; done".into(),
             ],
             size: Size::new(80, 24),
             cwd: None,
@@ -1304,7 +1304,9 @@ fn attach_eof_drains_input_already_read_by_the_key_pump() {
         }
         assert!(
             Instant::now() < deadline,
-            "EOF discarded buffered attach keys"
+            "EOF discarded buffered attach keys (captured {} of {} bytes)",
+            std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+            expected.len()
         );
         std::thread::sleep(Duration::from_millis(10));
     }

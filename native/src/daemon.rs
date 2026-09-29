@@ -1672,10 +1672,18 @@ fn attach(
         if input_failed.load(std::sync::atomic::Ordering::SeqCst) {
             let _ = report_attach_input_failure(&mut out);
         }
-        done.store(true, std::sync::atomic::Ordering::SeqCst);
-        // Unblocks the key thread's read so the scope can close.
-        ipc::stop_reader(&stream, stop, || key_thread.is_finished());
+        // A failed output write can simply mean the client detached after
+        // sending keys. Let the socket reader observe EOF and the PTY pump
+        // drain its queue before stopping it. Takeover and process exit still
+        // cancel input immediately because there is nowhere safe to deliver it.
+        if held.is_displaced() || !held.session().is_alive() {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            ipc::stop_reader(&stream, stop, || key_thread.is_finished());
+        }
         let _ = write_thread.join();
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Unblocks the key thread if the input pump ended without socket EOF.
+        ipc::stop_reader(&stream, stop, || key_thread.is_finished());
     });
     Ok(())
 }
@@ -1693,8 +1701,7 @@ fn pump_attach_input(
 ) {
     while let Ok(bytes) = keys.recv() {
         let stopping = || {
-            done.load(std::sync::atomic::Ordering::SeqCst)
-                || stop.load(std::sync::atomic::Ordering::SeqCst)
+            stop.load(std::sync::atomic::Ordering::SeqCst)
                 || held.is_displaced()
                 || (reader_eof.load(std::sync::atomic::Ordering::SeqCst)
                     && held.is_writer_timed_out())
