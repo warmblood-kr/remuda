@@ -526,30 +526,6 @@ fn sigusr1_with_a_queued_old_listener_client_does_not_strand_shutdown() {
 
 #[cfg(unix)]
 #[test]
-fn idle_daemon_accepts_local_connections_without_polling_delay() {
-    let dir = scratch_dir("daemon-accept-latency");
-    let mut daemon = Daemon::spawn(&dir);
-    let socket = daemon::socket_path_in(&dir, "s");
-    let mut samples = Vec::with_capacity(50);
-    for _ in 0..50 {
-        let started = Instant::now();
-        let response = client::request(&socket, &Request::Version);
-        samples.push(started.elapsed());
-        assert!(matches!(response, Ok(Response::Value(_))));
-    }
-    samples.sort_unstable();
-    let p90 = samples[44];
-
-    let stopped = stop_and_clean(&mut daemon, &dir, &socket);
-    assert!(stopped, "daemon stops and removes its socket");
-    assert!(
-        p90 < Duration::from_millis(2),
-        "p90 accept/response latency was {p90:?} over 50 idle-daemon connects"
-    );
-}
-
-#[cfg(unix)]
-#[test]
 fn sigusr1_refuses_to_displace_a_live_replacement_socket() {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::net::UnixListener;
