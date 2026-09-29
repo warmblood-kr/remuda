@@ -17,13 +17,22 @@ struct Node {
     state: PathBuf,
     name: String,
     public: Vec<u8>,
+    private: Vec<u8>,
     daemon: Child,
 }
 
 impl Node {
     fn start(label: &str) -> Self {
         let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-        let root = std::env::temp_dir().join(format!("rccall-{}-{serial}", std::process::id()));
+        let temp = if Path::new("/private/tmp").is_dir() {
+            PathBuf::from("/private/tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let root = temp
+            .canonicalize()
+            .unwrap()
+            .join(format!("rc{}-{serial}", std::process::id()));
         let runtime = root.join("runtime");
         let state = root.join("state");
         let home = root.join("home");
@@ -50,6 +59,7 @@ impl Node {
             state,
             name,
             public: key[32..].to_vec(),
+            private: key[..32].to_vec(),
             daemon,
         };
         node.wait_ready();
@@ -169,6 +179,76 @@ fn listener(server: &Node) -> (Listener, SocketAddr) {
     }
 }
 
+fn remote_request(
+    peer: &Node,
+    server: &Node,
+    addr: SocketAddr,
+    request: &remuda_core::protocol::Request,
+) -> remuda_core::protocol::Response {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let payload = serde_json::to_vec(request).unwrap();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let sealed =
+        remuda_native::net::frame::seal_request(&peer.private, &server.public, timestamp, &payload)
+            .unwrap();
+    let mut stream = TcpStream::connect(addr).unwrap();
+    write!(
+        stream,
+        "POST /cluster HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        sealed.message.len()
+    )
+    .unwrap();
+    stream.write_all(&sealed.message).unwrap();
+    stream.flush().unwrap();
+    let mut response = BufReader::new(stream);
+    let mut status_line = String::new();
+    response.read_line(&mut status_line).unwrap();
+    assert!(
+        status_line.contains(" 200 "),
+        "unexpected HTTP response: {status_line}"
+    );
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        response.read_line(&mut line).unwrap();
+        if line == "\r\n" || line.is_empty() {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_length = Some(value.trim().parse::<usize>().unwrap());
+        }
+    }
+    let mut ciphertext = vec![0; content_length.expect("response content length")];
+    response.read_exact(&mut ciphertext).unwrap();
+    let plaintext = remuda_native::net::frame::open_response(sealed, &ciphertext).unwrap();
+    serde_json::from_slice(&plaintext).unwrap()
+}
+
+fn start_proof_session(server: &Node) -> String {
+    use remuda_core::protocol::{Request, Response};
+
+    let start = server
+        .command()
+        .args(["-e", "remuda.new('proof', {'/bin/sh', '-c', 'sleep 30'})"])
+        .output()
+        .unwrap();
+    assert!(start.status.success(), "session start failed: {start:?}");
+    let daemon = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
+    match remuda_native::client::request(&daemon, &Request::List).unwrap() {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "proof")
+            .and_then(|session| session.instance_id)
+            .expect("proof instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    }
+}
+
 #[test]
 fn cluster_call_lists_and_captures_through_the_black_box_cli() {
     let client = Node::start("client");
@@ -216,6 +296,103 @@ fn cluster_call_lists_and_captures_through_the_black_box_cli() {
     assert!(json.status.success(), "json list failed: {json:?}");
     let parsed: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
     assert!(parsed.get("Sessions").is_some());
+}
+
+#[test]
+fn remote_close_uses_the_local_control_gate_and_daemon_instance_check() {
+    use remuda_core::protocol::{Request, Response};
+
+    let client = Node::start("close-client");
+    let server = Node::start("close-server");
+    admit_pair(&client, &server);
+    let (_listener, addr) = listener(&server);
+
+    let instance_id = start_proof_session(&server);
+    let daemon = remuda_native::daemon::socket_path_in(&server.runtime, &server.name);
+
+    let off = server
+        .command()
+        .args(["cluster", "control", "off"])
+        .output()
+        .unwrap();
+    assert!(off.status.success(), "control off failed: {off:?}");
+    let disabled = remote_request(
+        &client,
+        &server,
+        addr,
+        &Request::Close {
+            name: "proof".into(),
+            instance_id: Some(instance_id.clone()),
+            confirm: Some(true),
+        },
+    );
+    assert_eq!(disabled, Response::RemoteControlDisabled);
+
+    let on = server
+        .command()
+        .args(["cluster", "control", "on"])
+        .output()
+        .unwrap();
+    assert!(on.status.success(), "control on failed: {on:?}");
+    let legacy = remote_request(
+        &client,
+        &server,
+        addr,
+        &Request::Close {
+            name: "proof".into(),
+            instance_id: None,
+            confirm: None,
+        },
+    );
+    assert_eq!(legacy, Response::error("remote front refuses Close"));
+
+    let closed_previous = remuda_native::client::request(
+        &daemon,
+        &Request::Close {
+            name: "proof".into(),
+            instance_id: Some(instance_id.clone()),
+            confirm: Some(true),
+        },
+    )
+    .unwrap();
+    assert_eq!(closed_previous, Response::Ok);
+    let replacement_instance = start_proof_session(&server);
+    assert_ne!(replacement_instance, instance_id);
+
+    let stale = remote_request(
+        &client,
+        &server,
+        addr,
+        &Request::Close {
+            name: "proof".into(),
+            instance_id: Some(instance_id),
+            confirm: Some(true),
+        },
+    );
+    assert!(
+        matches!(stale, Response::Error(_)),
+        "stale Close: {stale:?}"
+    );
+    assert!(matches!(
+        remuda_native::client::request(&daemon, &Request::List),
+        Ok(Response::Sessions(sessions)) if sessions.iter().any(|session| session.name == "proof")
+    ));
+
+    let closed = remote_request(
+        &client,
+        &server,
+        addr,
+        &Request::Close {
+            name: "proof".into(),
+            instance_id: Some(replacement_instance),
+            confirm: Some(true),
+        },
+    );
+    assert_eq!(closed, Response::Ok);
+    assert!(matches!(
+        remuda_native::client::request(&daemon, &Request::List),
+        Ok(Response::Sessions(sessions)) if sessions.iter().all(|session| session.name != "proof")
+    ));
 }
 
 #[test]
