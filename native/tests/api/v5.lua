@@ -119,7 +119,15 @@ for _, row in ipairs(remuda.ls()) do
   if row.name == name then resized = row.cols == 91 and row.rows == 31 end
 end
 assert(resized, "session.resize must update dimensions reported by remuda.ls")
-for _, dimensions in ipairs({ { 0, 24 }, { 19, 24 }, { 1001, 24 }, { 80, 4 }, { 80, 501 }, { -1, 30 } }) do
+assert(session.resize(name, 30, 24) == true, "session.resize must accept a pane-width session")
+local narrow = false
+for _, row in ipairs(remuda.ls()) do
+  if row.name == name then narrow = row.cols == 30 and row.rows == 24 end
+end
+assert(narrow, "session.resize must preserve sub-80 widths reported by remuda.ls")
+for _, dimensions in ipairs({
+  { 0, 24 }, { 19, 24 }, { 1001, 24 }, { 80, 0 }, { 80, 23 }, { 80, 501 },
+}) do
   local ok, err = session.resize(name, dimensions[1], dimensions[2])
   assert(ok == nil and type(err) == "string", "session.resize must reject out-of-bounds dimensions")
 end

@@ -32,9 +32,21 @@ fn resize_command_updates_session_and_rejects_bad_requests() {
     let dimensions = run(&dir, &["-e", "for _,s in ipairs(remuda.ls()) do if s.name == 'resize-cli' then assert(s.cols == 97 and s.rows == 33) end end"]);
     assert!(dimensions.status.success(), "dimensions: {dimensions:?}");
 
+    let narrow = run(&dir, &["resize", "resize-cli", "30", "24"]);
+    assert!(narrow.status.success(), "narrow resize: {narrow:?}");
+    let dimensions = run(&dir, &["-e", "for _,s in ipairs(remuda.ls()) do if s.name == 'resize-cli' then assert(s.cols == 30 and s.rows == 24) end end"]);
+    assert!(
+        dimensions.status.success(),
+        "narrow dimensions: {dimensions:?}"
+    );
+
     for args in [
         &["resize", "resize-cli", "19", "24"][..],
+        &["resize", "resize-cli", "1001", "24"][..],
+        &["resize", "resize-cli", "80", "0"][..],
+        &["resize", "resize-cli", "80", "23"][..],
         &["resize", "resize-cli", "80", "501"][..],
+        &["resize", "resize-cli", "nope", "24"][..],
         &["resize", "absent", "80", "24"][..],
     ] {
         let output = run(&dir, args);
