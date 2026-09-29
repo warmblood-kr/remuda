@@ -751,6 +751,21 @@ fn dispatch_payload(
             .map_err(|_| io::Error::other("registry acknowledgement encode failed"))
         }
         request => {
+            if matches!(&request, Request::Close { .. }) {
+                match cluster::control::enabled() {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return serde_json::to_vec(&Response::RemoteControlDisabled)
+                            .map_err(|_| io::Error::other("response encode failed"));
+                    }
+                    Err(error) => {
+                        return serde_json::to_vec(&Response::error(format!(
+                            "remote control setting unavailable; refusing Close: {error}"
+                        )))
+                        .map_err(|_| io::Error::other("response encode failed"));
+                    }
+                }
+            }
             authorize_remote_request(&request)?;
             crate::remote_front::forward_frame_with_timeout(
                 daemon_path,
