@@ -794,38 +794,6 @@ fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<(
     Some(closed.map(drop))
 }
 
-fn close_instance(
-    registry: &Registry,
-    image: &Image,
-    name: &str,
-    instance_id: &str,
-) -> Option<AgentResult<()>> {
-    let session = registry.get(name)?;
-    let closed = registry.close_instance(name, instance_id)?;
-    if let Ok(true) = closed {
-        // Closing the process can leave its PTY output monitor draining the
-        // final bytes. Keep the output-before-exit ordering, but don't make
-        // the close RPC wait for that monitor (notably, ConPTY can take
-        // longer to report EOF after Ctrl+\\ detach).
-        let image = image.clone();
-        let name = name.to_owned();
-        let id = session.id().to_owned();
-        let instance_id = session.instance_id().to_owned();
-        let exit_info = session.exit_info();
-        std::thread::spawn(move || {
-            notify_exited(
-                &image,
-                &name,
-                &id,
-                &instance_id,
-                "closed",
-                exit_info.as_ref(),
-            );
-        });
-    }
-    Some(closed.map(drop))
-}
-
 /// `close` stops tracking a session itself, so the reaper never sees it die:
 /// whichever of the two removes the entry fires the one `session_exited`.
 fn notify_exited(
@@ -869,7 +837,7 @@ fn notify_exited(
     );
 }
 
-/// Wake the image once a period with `remuda._run_due_schedules(now)`, and
+/// Wake the image once a period to run due schedules in separate bounded jobs, and
 /// reap dead sessions, firing `session_exited` for each. Its own thread, so a
 /// wedged schedule stalls only the tick, never the listener loop.
 fn spawn_ticker(image: Image, counters: Arc<crate::tick::Counters>, registry: Arc<Registry>) {
@@ -882,7 +850,7 @@ fn spawn_ticker(image: Image, counters: Arc<crate::tick::Counters>, registry: Ar
                 if !keep_exited() {
                     reap_and_notify(&registry, &image);
                 }
-                image.submit(&format!("remuda._run_due_schedules({now})"), None)
+                image.submit_due_schedules(now)
             },
             clock,
             TICK_PERIOD,
@@ -1170,6 +1138,7 @@ fn handle(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_request(
     stream: Stream,
     reader: BufReader<Stream>,
@@ -1216,7 +1185,11 @@ fn handle_request(
             },
         ),
 
-        Request::SendLine { name, text } => send_line(&stream, registry, &name, &text),
+        Request::SendLine { name, text } => {
+            respond(&stream, &name, registry.send_line(&name, &text), |()| {
+                Response::Ok
+            })
+        }
 
         Request::Input {
             name,
@@ -1288,7 +1261,10 @@ fn handle_request(
         Request::Mkdir { path: dir } => reply(&stream, &mkdir(&dir)),
         Request::RemoveDirAll { path: dir } => reply(&stream, &remove_dir_all(&dir)),
 
-        Request::Eval { code, name } => handle_eval(stream, reader, image, &code, name.as_deref()),
+        Request::Eval { code, name } => {
+            let caller = caller_context(&stream, registry);
+            handle_eval(stream, reader, image, &code, name.as_deref(), caller)
+        }
     }
 }
 
@@ -1310,14 +1286,47 @@ fn handle_close(
     respond(stream, name, result, |()| Response::Ok)
 }
 
+fn close_instance(
+    registry: &Registry,
+    image: &Image,
+    name: &str,
+    instance_id: &str,
+) -> Option<AgentResult<()>> {
+    let session = registry.get(name)?;
+    let closed = registry.close_instance(name, instance_id)?;
+    if let Ok(true) = closed {
+        // Closing the process can leave its PTY output monitor draining the
+        // final bytes. Keep the output-before-exit ordering, but don't make
+        // the close RPC wait for that monitor (notably, ConPTY can take
+        // longer to report EOF after Ctrl+\\ detach).
+        let image = image.clone();
+        let name = name.to_owned();
+        let id = session.id().to_owned();
+        let instance_id = session.instance_id().to_owned();
+        let exit_info = session.exit_info();
+        std::thread::spawn(move || {
+            notify_exited(
+                &image,
+                &name,
+                &id,
+                &instance_id,
+                "closed",
+                exit_info.as_ref(),
+            );
+        });
+    }
+    Some(closed.map(drop))
+}
+
 fn handle_eval(
     stream: Stream,
     reader: BufReader<Stream>,
     image: &Image,
     code: &str,
     name: Option<&str>,
+    caller: crate::image::CallerContext,
 ) -> std::io::Result<()> {
-    match image.eval_request(code, name) {
+    match image.eval_request(code, name, caller) {
         Ok(value) => match image.pending_replies().pending_id(&value) {
             Some(id) => deferred_reply(stream, reader, image, id),
             None if value.len() > crate::reply_limit::MAX_REPLY_BYTES => reply(
@@ -1333,6 +1342,23 @@ fn handle_eval(
         // Lua's own message, which already carries the line and a traceback —
         // the same treatment `remuda run` gives a script file.
         Err(error) => reply(&stream, &Response::error(error)),
+    }
+}
+
+fn caller_context(stream: &Stream, registry: &Registry) -> crate::image::CallerContext {
+    match process_ancestry::resolve_caller(
+        process_ancestry::peer_pid(stream),
+        &registry.live_processes(),
+    ) {
+        process_ancestry::CallerOrigin::Session(name) => crate::image::CallerContext {
+            kind: crate::image::CallerKind::Session,
+            session: Some(name),
+        },
+        process_ancestry::CallerOrigin::Outside => crate::image::CallerContext {
+            kind: crate::image::CallerKind::Outside,
+            session: None,
+        },
+        process_ancestry::CallerOrigin::Unknown => crate::image::CallerContext::default(),
     }
 }
 
@@ -1725,12 +1751,6 @@ fn input(
             reply(stream, &Response::error("session exited"))
         }
     }
-}
-
-fn send_line(stream: &Stream, registry: &Registry, name: &str, text: &str) -> std::io::Result<()> {
-    respond(stream, name, registry.send_line(name, text), |()| {
-        Response::Ok
-    })
 }
 
 fn mouse_state(stream: &Stream, registry: &Registry, name: &str) -> std::io::Result<()> {

@@ -31,6 +31,11 @@ buffers
 
 ``table`` — The `remuda.buffer` registry table, keyed by buffer name.
 
+caller
+------
+
+``caller() -> {kind: 'session'|'outside'|'unknown', session?: string}`` — ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run ``remuda -e`` and wrap ``_dispatch_extension_command``; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.
+
 cancel
 ------
 
@@ -114,7 +119,7 @@ expect_option
 extension_command
 -----------------
 
-``extension_command(name, handler(args, caller)) -> nil`` — Register a handler for an installed mod command.
+``extension_command(name, handler(args, caller)) -> nil`` — Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.
 
 fail
 ----
@@ -130,6 +135,11 @@ fs
 --
 
 ``table`` — Atomic replacement of files for trusted Lua callers.
+
+fs.mkdir_new
+------------
+
+``fs.mkdir_new(path) -> true | nil, 'exists' | nil, error`` — Create one new directory without creating parents or trusting an existing path.
 
 fs.write_atomic
 ---------------
@@ -150,6 +160,26 @@ http
 ----
 
 ``http.request(options) -> {cancel()}`` — Start an asynchronous bounded HTTP request; completion is delivered on the Lua image queue.
+
+input
+-----
+
+``table`` — Terminal input words for text delivery and submission.
+
+input.submit
+------------
+
+``input.submit(session, expect) -> status`` — Submit visible composer text; returns 'submitted' or 'unverified'.
+
+input.text
+----------
+
+``input.text(session, text) -> nil`` — Deliver text as one burst, using bracketed paste when enabled by the child.
+
+input.type_text
+---------------
+
+``input.type_text(session, text, settle?) -> status`` — Type text, honor the settle pause, then return 'submitted' or 'unverified'.
 
 insert
 ------
@@ -329,7 +359,7 @@ tools
 type_text
 ---------
 
-``type_text(session, text, settle?) -> nil`` — Type text into a session and submit it with Return.
+``type_text(session, text, settle?) -> status`` — Type text into a session and submit it with Return; returns 'submitted' or 'unverified'.
 
 unadvise
 --------

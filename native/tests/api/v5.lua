@@ -94,6 +94,15 @@ assert(type(remuda.pending) == "function", "remuda.pending is missing")
 assert(remuda._registry.pending ~= nil, "remuda.pending needs a registry entry")
 assert(remuda._pending_replies == nil, "pending manager internals must remain private")
 
+local input = remuda.input
+assert(type(input) == "table", "remuda.input is missing")
+assert(type(input.text) == "function", "remuda.input.text is missing")
+assert(type(input.submit) == "function", "remuda.input.submit is missing")
+assert(type(input.type_text) == "function", "remuda.input.type_text is missing")
+assert(remuda._registry["input.text"] ~= nil, "remuda.input.text needs a registry entry")
+assert(remuda._registry["input.submit"] ~= nil, "remuda.input.submit needs a registry entry")
+assert(remuda._registry["input.type_text"] ~= nil, "remuda.input.type_text needs a registry entry")
+
 local bad_timeout = pcall(remuda.pending, { timeout = 301 })
 assert(not bad_timeout, "pending timeout must not exceed 300 seconds")
 
@@ -108,11 +117,25 @@ end
 local name = "api-v5-" .. tostring(os.time())
 local opened = session.new(name, { "sh" })
 assert(opened == name, "session.new must preserve new's return value")
+assert(input.submit(name, "") == "submitted", "an empty input.submit must return quickly")
 local found = false
 for _, row in ipairs(session.list()) do
-  if row.name == name then found = true end
+  if row.name == name then
+    found = true
+    assert(type(row.instance_id) == "string" and #row.instance_id > 0,
+      "session.list must include the live session instance_id")
+  end
 end
 assert(found, "session.list must include the session created by session.new")
+local legacy_found_instance = false
+for _, row in ipairs(remuda.ls()) do
+  if row.name == name then
+    legacy_found_instance = true
+    assert(type(row.instance_id) == "string" and #row.instance_id > 0,
+      "remuda.ls must include the live session instance_id")
+  end
+end
+assert(legacy_found_instance, "remuda.ls must include the session created by session.new")
 assert(session.resize(name, 91, 31) == true, "session.resize must report success")
 local resized = false
 for _, row in ipairs(remuda.ls()) do
@@ -271,6 +294,16 @@ local bad_timeout = pcall(function()
   remuda.process.run({ argv = echo_argv, timeout = 31 })
 end)
 assert(not bad_timeout, "process.run must reject a timeout above the 30-second hard cap")
+local caller = remuda.caller()
+assert(type(caller) == "table", "remuda.caller must return a table")
+local caller_kind_ok = caller.kind == "outside"
+if package.config:sub(1, 1) == "\\" then
+  -- Windows parent PIDs are advisory and can be stale/unreadable after an
+  -- ancestor exits; fail closed as unknown rather than claiming a session.
+  caller_kind_ok = caller_kind_ok or caller.kind == "unknown"
+end
+assert(caller_kind_ok, "a client outside managed sessions must not be a session; got " .. tostring(caller.kind))
+assert(caller.session == nil, "an outside caller has no managed session")
 local absent_readiness = remuda._module_readiness("api-v5-no-ready-declaration")
 assert(absent_readiness.status == "ready",
   "a missing readiness declaration must preserve immediate completion")
@@ -287,6 +320,35 @@ assert(limited == nil and type(limit_error) == "string", "JSON depth limit must 
 
 local fs = remuda.fs
 assert(type(fs) == "table", "remuda.fs is missing")
+assert(type(fs.mkdir_new) == "function", "remuda.fs.mkdir_new is missing")
+local mkdir_path = os.tmpname()
+os.remove(mkdir_path)
+local made, mkdir_error = fs.mkdir_new(mkdir_path)
+assert(made == true and mkdir_error == nil, tostring(mkdir_error))
+made, mkdir_error = fs.mkdir_new(mkdir_path)
+assert(made == nil and mkdir_error == "exists", "second mkdir_new call must report exists")
+assert(remuda.remove_dir_all(mkdir_path) == nil, "test directory cleanup failed")
+local trailing_path = os.tmpname()
+os.remove(trailing_path)
+local separator = package.config:sub(1, 1)
+local trailing_made, trailing_error = fs.mkdir_new(trailing_path .. separator)
+if trailing_made then remuda.remove_dir_all(trailing_path) end
+assert(trailing_made == nil and type(trailing_error) == "string",
+  "trailing separators must be rejected")
+local relative_made, relative_error = fs.mkdir_new(".")
+assert(relative_made == nil and type(relative_error) == "string" and relative_error ~= "exists",
+  "relative paths must be rejected")
+local file_path = os.tmpname()
+local file = assert(io.open(file_path, "wb"))
+file:close()
+local file_made, file_error = fs.mkdir_new(file_path)
+assert(file_made == nil and file_error == "exists", "a file at the target must report exists")
+os.remove(file_path)
+local missing_parent = os.tmpname()
+os.remove(missing_parent)
+missing_parent = missing_parent .. "/child"
+local parent_made, parent_error = fs.mkdir_new(missing_parent)
+assert(parent_made == nil and type(parent_error) == "string", "missing parent must return an error")
 assert(type(fs.write_atomic) == "function", "remuda.fs.write_atomic is missing")
 local write_path = os.tmpname()
 os.remove(write_path)

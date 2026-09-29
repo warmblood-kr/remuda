@@ -217,13 +217,8 @@ remuda — a pty manager you can attach to
   remuda cluster init             create this node's cluster identity
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
-  remuda cluster control on|off   allow or refuse remote control
-  remuda cluster remote [node/session] open the cluster session tree
+  remuda cluster remote [node/session] open the read-only cluster tree
   remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
-  remuda cluster call NODE list --addr HOST:PORT [--json]  list a remote node's sessions
-  remuda cluster call NODE capture SESSION --addr HOST:PORT [--json]  capture a remote screen
-                                  exits: 0 success, 2 usage, 3 unreachable/timeout,
-                                  4 refused/unknown/revoked, 5 crypto/bad response
                                   [::] may accept IPv4 too on dual-stack systems
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
@@ -297,13 +292,8 @@ remuda — terminal orchestration for coding agents
   remuda cluster init            create this node's cluster identity
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
-  remuda cluster control on|off   allow or refuse remote control
-  remuda cluster remote [node/session] open the cluster session tree
+  remuda cluster remote [node/session] open the read-only cluster tree
   remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
-  remuda cluster call NODE list --addr HOST:PORT [--json]  list a remote node's sessions
-  remuda cluster call NODE capture SESSION --addr HOST:PORT [--json]  capture a remote screen
-                                  exits: 0 success, 2 usage, 3 unreachable/timeout,
-                                  4 refused/unknown/revoked, 5 crypto/bad response
                                   [::] may accept IPv4 too on dual-stack systems
 
   remuda doc | repl | -e CODE    use the persistent Lua runtime
@@ -382,27 +372,29 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
             .unwrap_or(ClusterCommand::Invalid),
         ["join", fingerprint, line] => remuda_native::cluster::join_line::JoinLine::decode(line)
             .map(|invitation| ClusterCommand::Join {
-                fingerprint: (*fingerprint).into(),
+                fingerprint: (*fingerprint).to_owned(),
                 invitation,
                 bind_addr: None,
             })
             .unwrap_or(ClusterCommand::Invalid),
-        ["join", fingerprint, line, "--bind", address] => match (
-            remuda_native::cluster::join_line::JoinLine::decode(line),
-            address
-                .parse::<std::net::SocketAddr>()
-                .ok()
-                .filter(|address| {
-                    remuda_native::cluster::join_line::validate_endpoint(*address).is_ok()
-                }),
-        ) {
-            (Ok(invitation), Some(bind_addr)) => ClusterCommand::Join {
-                fingerprint: (*fingerprint).into(),
-                invitation,
-                bind_addr: Some(bind_addr),
-            },
-            _ => ClusterCommand::Invalid,
-        },
+        ["join", fingerprint, line, "--bind", address] => {
+            match (
+                remuda_native::cluster::join_line::JoinLine::decode(line),
+                address
+                    .parse::<std::net::SocketAddr>()
+                    .ok()
+                    .filter(|address| {
+                        remuda_native::cluster::join_line::validate_endpoint(*address).is_ok()
+                    }),
+            ) {
+                (Ok(invitation), Some(bind_addr)) => ClusterCommand::Join {
+                    fingerprint: (*fingerprint).to_owned(),
+                    invitation,
+                    bind_addr: Some(bind_addr),
+                },
+                _ => ClusterCommand::Invalid,
+            }
+        }
         ["nodes"] => ClusterCommand::Nodes,
         ["control", "on"] => ClusterCommand::Control(true),
         ["control", "off"] => ClusterCommand::Control(false),
@@ -483,28 +475,7 @@ fn parse_cluster_call(target: &str, operation: &str, args: &[&str]) -> ClusterCo
 
 fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     match parse_cluster_command(args) {
-        ClusterCommand::Status => match remuda_native::cluster::status() {
-            Ok(None) => {
-                println!("This node is not in a cluster; run `remuda cluster init`.");
-                ExitCode::SUCCESS
-            }
-            Ok(Some((identity, members))) => {
-                println!("Node: {}", identity.node_name);
-                println!("Fingerprint: {}", identity.node_fp);
-                println!("Members: {members}");
-                println!("Authority: Any admitted member can admit new keys and revoke any member cluster-wide (see #282).");
-                match remuda_native::cluster::control::enabled() {
-                    Ok(enabled) => {
-                        let (setting, trust) = remote_control_status_lines(enabled);
-                        println!("{setting}");
-                        println!("{trust}");
-                        ExitCode::SUCCESS
-                    }
-                    Err(error) => fail(format!("cluster status: {error}")),
-                }
-            }
-            Err(error) => fail(format!("cluster status: {error}")),
-        },
+        ClusterCommand::Status => cluster_status(),
         ClusterCommand::Init => match remuda_native::cluster::init() {
             Ok((identity, created)) => {
                 println!("{}", cluster_init_message(created));
@@ -580,12 +551,40 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     }
 }
 
-fn cluster_invite(bind_addr: std::net::SocketAddr) -> ExitCode {
-    match remuda_native::cluster::mint_join_line(bind_addr).and_then(|line| line.encode()) {
-        Ok(line) => {
-            println!("Join line (expires in 10 minutes):\n{line}");
+fn cluster_status() -> ExitCode {
+    match remuda_native::cluster::status() {
+        Ok(None) => {
+            println!("This node is not in a cluster; run `remuda cluster init`.");
             ExitCode::SUCCESS
         }
+        Ok(Some((identity, members))) => {
+            println!("Node: {}", identity.node_name);
+            println!("Fingerprint: {}", identity.node_fp);
+            println!("Members: {members}");
+            println!("Authority: Any admitted member can admit new keys and revoke any member cluster-wide (see #282).");
+            match remuda_native::cluster::control::enabled() {
+                Ok(enabled) => {
+                    let (setting, trust) = remote_control_status_lines(enabled);
+                    println!("{setting}");
+                    println!("{trust}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(format!("cluster status: {error}")),
+            }
+        }
+        Err(error) => fail(format!("cluster status: {error}")),
+    }
+}
+
+fn cluster_invite(bind_addr: std::net::SocketAddr) -> ExitCode {
+    match remuda_native::cluster::mint_join_line(bind_addr) {
+        Ok(line) => match line.encode() {
+            Ok(line) => {
+                println!("Join line (expires in 10 minutes):\n{line}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("cluster invite: {error}")),
+        },
         Err(error) => fail(format!("cluster invite: {error}")),
     }
 }
@@ -870,9 +869,7 @@ fn report_cluster_pushes() {
         }
     }
     if needs_retry {
-        // The synchronous CLI push is bounded. Keep a failed admission or
-        // revocation queued so anti-entropy does not have to wait for its
-        // much slower periodic pass to retry it.
+        // Requeue failed synchronous pushes so anti-entropy can retry sooner.
         remuda_native::cluster::registry_changed();
     }
 }
@@ -979,6 +976,12 @@ mod cluster_cli_tests {
         assert_eq!(parse_cluster_command(&[]), ClusterCommand::Status);
         assert_eq!(parse_cluster_command(&["init"]), ClusterCommand::Init);
         assert_eq!(parse_cluster_command(&["join"]), ClusterCommand::Invalid);
+        assert_eq!(
+            parse_cluster_command(&["invite", "--bind", "192.0.2.4:9443"]),
+            ClusterCommand::Invite {
+                bind_addr: "192.0.2.4:9443".parse().unwrap()
+            }
+        );
     }
 
     #[test]
@@ -1014,7 +1017,6 @@ mod cluster_cli_tests {
         );
     }
 
-    #[cfg(unix)]
     #[cfg(unix)]
     #[test]
     #[allow(clippy::disallowed_types)]
