@@ -109,6 +109,8 @@ impl ClusterClient {
         request: &Request,
     ) -> Result<Response, ClientError> {
         let deadline = Instant::now() + self.timeouts.total;
+        frame::reject_low_order_dh(our_static_private, pinned_peer_static)
+            .map_err(|_| ClientError::Crypto)?;
         let payload = serde_json::to_vec(request).map_err(|_| ClientError::BadResponse)?;
         let timestamp = self.clock.unix_seconds().min(i64::MAX as u64) as i64;
         let sealed =
@@ -187,7 +189,13 @@ struct HttpResponse {
 
 fn read_http_response(stream: &TcpStream) -> Result<HttpResponse, ClientError> {
     let mut reader = BufReader::new(stream.try_clone().map_err(map_io)?);
-    let status_line = read_line(&mut reader)?;
+    read_http_response_from(&mut reader)
+}
+
+fn read_http_response_from<R: Read>(
+    reader: &mut BufReader<R>,
+) -> Result<HttpResponse, ClientError> {
+    let status_line = read_line(reader)?;
     let status_text = std::str::from_utf8(&status_line).map_err(|_| ClientError::BadResponse)?;
     let mut status_parts = status_text.split_ascii_whitespace();
     if status_parts.next() != Some("HTTP/1.1") {
@@ -204,7 +212,7 @@ fn read_http_response(stream: &TcpStream) -> Result<HttpResponse, ClientError> {
     let mut header_count = 0;
     let mut content_length = None;
     loop {
-        let line = read_line(&mut reader)?;
+        let line = read_line(reader)?;
         header_bytes = header_bytes.saturating_add(line.len() + 2);
         if header_bytes > MAX_HEADER_BYTES {
             return Err(ClientError::BadResponse);
@@ -245,7 +253,7 @@ fn read_http_response(stream: &TcpStream) -> Result<HttpResponse, ClientError> {
     Ok(HttpResponse { status, body })
 }
 
-fn read_line(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, ClientError> {
+fn read_line<R: Read>(reader: &mut BufReader<R>) -> Result<Vec<u8>, ClientError> {
     let mut line = Vec::new();
     let count = (&mut *reader)
         .take((MAX_REQUEST_LINE_BYTES + 1) as u64)
@@ -273,5 +281,44 @@ fn map_io(error: io::Error) -> ClientError {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => ClientError::Timeout,
         io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => ClientError::BadResponse,
         _ => ClientError::Unreachable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{read_http_response_from, ClientError, MAX_BODY_BYTES};
+    use std::io::{BufReader, Cursor, Read};
+
+    struct CountedReader {
+        source: Cursor<Vec<u8>>,
+        bytes_read: usize,
+    }
+
+    impl Read for CountedReader {
+        fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.source.read(bytes)?;
+            self.bytes_read += count;
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn oversized_content_length_is_refused_without_reading_the_body() {
+        let mut response = b"HTTP/1.1 200 OK\r\nContent-Length: 70000\r\n\r\n".to_vec();
+        response.extend(std::iter::repeat_n(b'x', 70_000));
+        let counted = CountedReader {
+            source: Cursor::new(response),
+            bytes_read: 0,
+        };
+        let mut reader = BufReader::new(counted);
+        assert!(matches!(
+            read_http_response_from(&mut reader),
+            Err(ClientError::BadResponse)
+        ));
+        assert!(
+            reader.get_ref().bytes_read <= MAX_BODY_BYTES,
+            "read {} bytes before refusing an oversized response",
+            reader.get_ref().bytes_read
+        );
     }
 }

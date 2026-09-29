@@ -2639,12 +2639,28 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
 
-    let dir = std::env::temp_dir().join(format!("remuda-tui-busy-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("make private busy daemon directory");
-    let socket = dir.join("s.sock");
+    struct TestDir(std::path::PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock is after the Unix epoch")
+        .as_nanos();
+    let dir = TestDir(std::env::temp_dir().join(format!("r{:x}-{nonce:x}", std::process::id())));
+    std::fs::create_dir(&dir.0).expect("create unique busy daemon directory");
+    let socket = dir.0.join("s.sock");
+    assert!(
+        socket.as_os_str().len() < 104,
+        "private socket path must fit the macOS sun_path limit: {} bytes",
+        socket.as_os_str().len()
+    );
     drop(UnixListener::bind(&socket).expect("bind private endpoint"));
-    let lock_path = dir.join("s.sock.lock");
+    let lock_path = dir.0.join("s.sock.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -2690,7 +2706,6 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
     );
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     drop(lock);
-    std::fs::remove_dir_all(dir).expect("remove private busy daemon directory");
 }
 
 #[test]

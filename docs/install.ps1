@@ -6,10 +6,8 @@
 #   $env:REMUDA_CHANNEL     stable|nightly  default: the channel already installed, else stable
 #   $env:REMUDA_INSTALL_DIR <dir>           default: ~\.local\bin
 #
-# This mirrors docs/install.sh line for line, INCLUDING its two bugs-found-by-
-# installing: the checksum name is compared as a string (a `./` prefix from
-# sha256sum is stripped first, never pattern-matched), and the download is
-# landed on disk and checked before anything runs it.
+# This mirrors docs/install.sh: resolve the channel version first, then verify
+# its checksum before installing the binary.
 
 $ErrorActionPreference = 'Stop'
 
@@ -24,11 +22,18 @@ function Die($message) {
 # `-UseBasicParsing` for Windows PowerShell 5.1, which is what a fresh machine
 # has. With $ErrorActionPreference = 'Stop' a 404 raises rather than writing an
 # error page to the output file — the shell script's `curl | sh` bug, avoided.
-function Fetch($url, $outFile) {
+function TryFetch($url, $outFile) {
     try {
         Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $outFile
+        return $true
     } catch {
-        Die "cannot download $url — $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Fetch($url, $outFile) {
+    if (-not (TryFetch $url $outFile)) {
+        Die "cannot download $url"
     }
 }
 
@@ -83,21 +88,21 @@ try {
         Die "no '$channel' version published at $Index"
     }
 
-    $tag = if ($channel -eq 'stable') { "v$version" } else { 'nightly' }
+    $tag = if ($channel -eq 'stable') { "v$version" } else { $version }
     $base = "https://github.com/$Repo/releases/download/$tag"
 
-    Fetch "$base/SHA256SUMS" (Join-Path $tmp 'SHA256SUMS')
-
-    if ($channel -eq 'nightly') {
-        # nightly's tag is fixed and every release replaces its assets, so a
-        # version read from latest.json's cached copy (cache-control:
-        # max-age=600) can already name a build whose assets no longer exist
-        # under that name - for up to ten minutes after every push to main.
-        # SHA256SUMS lives on the tag itself and lists exactly what is
-        # published right now, so derive the asset name (and the version to
-        # report) from that instead of constructing it from the index.
+    $manifestPath = Join-Path $tmp 'SHA256SUMS'
+    if (TryFetch "$base/SHA256SUMS" $manifestPath) {
+        $asset = "remuda-$version-$target.tar.gz"
+    } elseif ($channel -eq 'nightly') {
+        # Migration bridge for indexes published before nightly releases became
+        # immutable version tags. New indexes resolve above; old ones keep
+        # working through the rolling compatibility alias.
+        $tag = 'nightly'
+        $base = "https://github.com/$Repo/releases/download/$tag"
+        Fetch "$base/SHA256SUMS" $manifestPath
         $asset = $null
-        foreach ($line in Get-Content (Join-Path $tmp 'SHA256SUMS')) {
+        foreach ($line in Get-Content $manifestPath) {
             $fields = $line -split '\s+', 2
             if ($fields.Count -lt 2) { continue }
             $name = $fields[1].Trim() -replace '^\./', ''
@@ -106,7 +111,7 @@ try {
         if (-not $asset) { Die "no nightly build published for $target" }
         $version = $asset -replace "^remuda-(.*)-$target\.tar\.gz$", '$1'
     } else {
-        $asset = "remuda-$version-$target.tar.gz"
+        Die "cannot download $base/SHA256SUMS"
     }
 
     Write-Host "install.ps1: fetching remuda $version ($channel, $target)"

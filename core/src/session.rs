@@ -49,7 +49,8 @@ pub struct Session {
     /// Held for the whole of one input act — every `Burst` **and** every
     /// `Pause` between them — so a second sender cannot land a write during a
     /// pause, when the `agent` lock is briefly free. See [`Self::feed`].
-    input_lock: Mutex<()>,
+    input_lock: Mutex<bool>,
+    input_ready: Condvar,
     /// Bounded retry history for remote byte batches, kept per session.
     input_dedup: Mutex<InputDeduplicator>,
     /// Per-session byte budget, checked before taking `input_lock`.
@@ -139,7 +140,8 @@ impl Session {
             closing: AtomicBool::new(false),
             attach_slot: Mutex::new(None),
             next_attach_generation: AtomicU64::new(1),
-            input_lock: Mutex::new(()),
+            input_lock: Mutex::new(false),
+            input_ready: Condvar::new(),
             input_dedup: Mutex::new(InputDeduplicator::new()),
             input_rate: Mutex::new(InputRateLimiter::default()),
         }
@@ -203,10 +205,7 @@ impl Session {
     /// one-`Burst` case of [`Self::feed`]. Holds `input_lock`, so it cannot
     /// land inside a `feed` act's pause, nor a `feed` act land inside it.
     pub fn send(&self, bytes: &[u8]) -> Result<()> {
-        let _held = self
-            .input_lock
-            .lock()
-            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        let _held = self.acquire_input_lock()?;
         self.write_one_burst(bytes)
     }
 
@@ -219,6 +218,12 @@ impl Session {
         rate.check_rate(self.clock.now(), bytes)
     }
 
+    fn refund_rate(&self, bytes: usize) {
+        if let Ok(mut rate) = self.input_rate.lock() {
+            rate.refund_rate(self.clock.now(), bytes);
+        }
+    }
+
     /// Apply a bounded remote batch once for this exact session instance.
     /// Local input shares `input_lock`, so each complete batch stays atomic.
     pub fn apply_input_batch(
@@ -228,22 +233,121 @@ impl Session {
         if batch.seq == 0 {
             return Err(InputError::InvalidSequence);
         }
-        self.check_rate(batch.bytes.len())?;
-        let Ok(_held) = self.input_lock.lock() else {
-            return Ok(InputOutcome::Uncertain);
-        };
         if !self.is_alive() {
             return Ok(InputOutcome::Exited);
         }
         if batch.instance_id != self.instance_id {
             return Ok(InputOutcome::WrongInstance);
         }
-        let Ok(mut deduplicator) = self.input_dedup.lock() else {
-            return Ok(InputOutcome::Uncertain);
+        if let Some(outcome) = self.batch_result(batch.client_id, batch.seq)? {
+            return Ok(outcome);
+        }
+        self.ensure_writer_idle()?;
+        self.check_rate(batch.bytes.len())?;
+        let _held = match self.acquire_input_lock() {
+            Ok(held) => held,
+            Err(AgentError::Busy) => {
+                self.refund_rate(batch.bytes.len());
+                return Err(InputError::Busy);
+            }
+            Err(_) => return Err(InputError::Unavailable),
         };
-        Ok(deduplicator.apply(batch.client_id, batch.seq, || {
-            self.write_one_burst(batch.bytes)
-        }))
+        if !self.is_alive() {
+            self.refund_rate(batch.bytes.len());
+            return Ok(InputOutcome::Exited);
+        }
+        if batch.instance_id != self.instance_id {
+            self.refund_rate(batch.bytes.len());
+            return Ok(InputOutcome::WrongInstance);
+        }
+        if let Err(error) = self.ensure_writer_idle() {
+            self.refund_rate(batch.bytes.len());
+            return Err(error);
+        }
+        if let Some(outcome) = self.reserve_batch(batch.client_id, batch.seq)? {
+            self.refund_rate(batch.bytes.len());
+            return Ok(outcome);
+        }
+        self.finish_input_batch(batch, self.write_one_burst(batch.bytes))
+    }
+
+    fn batch_result(
+        &self,
+        client_id: [u8; 16],
+        seq: u64,
+    ) -> core::result::Result<Option<InputOutcome>, InputError> {
+        self.input_dedup
+            .lock()
+            .map(|mut deduplicator| deduplicator.lookup(client_id, seq))
+            .map_err(|_| InputError::Unavailable)
+    }
+
+    fn reserve_batch(
+        &self,
+        client_id: [u8; 16],
+        seq: u64,
+    ) -> core::result::Result<Option<InputOutcome>, InputError> {
+        let Ok(mut deduplicator) = self.input_dedup.lock() else {
+            return Ok(Some(InputOutcome::Uncertain));
+        };
+        if let Some(outcome) = deduplicator.lookup(client_id, seq) {
+            return Ok(Some(outcome));
+        }
+        if deduplicator.reserve(client_id, seq) {
+            Ok(None)
+        } else {
+            Ok(Some(
+                deduplicator
+                    .lookup(client_id, seq)
+                    .unwrap_or(InputOutcome::Uncertain),
+            ))
+        }
+    }
+
+    fn finish_input_batch(
+        &self,
+        batch: InputBatch<'_>,
+        result: Result<()>,
+    ) -> core::result::Result<InputOutcome, InputError> {
+        match result {
+            Ok(()) => {
+                if let Ok(mut deduplicator) = self.input_dedup.lock() {
+                    deduplicator.complete(batch.client_id, batch.seq, true);
+                }
+                Ok(InputOutcome::Ack { duplicate: false })
+            }
+            Err(AgentError::Busy) => {
+                if let Ok(mut deduplicator) = self.input_dedup.lock() {
+                    deduplicator.release(batch.client_id, batch.seq);
+                }
+                self.refund_rate(batch.bytes.len());
+                Err(InputError::Busy)
+            }
+            Err(AgentError::Exited) => {
+                if let Ok(mut deduplicator) = self.input_dedup.lock() {
+                    deduplicator.release(batch.client_id, batch.seq);
+                }
+                self.refund_rate(batch.bytes.len());
+                Ok(InputOutcome::Exited)
+            }
+            Err(_) => {
+                if let Ok(mut deduplicator) = self.input_dedup.lock() {
+                    deduplicator.complete(batch.client_id, batch.seq, false);
+                }
+                Ok(InputOutcome::Uncertain)
+            }
+        }
+    }
+
+    fn ensure_writer_idle(&self) -> core::result::Result<(), InputError> {
+        if self
+            .input_writer_busy()
+            .map_err(|_| InputError::Unavailable)?
+        {
+            Err(InputError::Busy)
+        } else {
+            Ok(())
+        }
     }
 
     /// Above this, a `feed` act is refused rather than executed — a caller's
@@ -269,10 +373,7 @@ impl Session {
             });
         }
 
-        let _held = self
-            .input_lock
-            .lock()
-            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        let _held = self.acquire_input_lock()?;
         for step in steps {
             match step {
                 Step::Burst(bytes) => self.write_one_burst(bytes)?,
@@ -282,16 +383,56 @@ impl Session {
         Ok(())
     }
 
-    /// The one place that actually touches the pty. Callers hold `input_lock`
-    /// before calling this — it does not take that lock itself, since `feed`
-    /// needs to call it once per burst without releasing it in between.
+    /// The one place that touches the backend. PTY handles wait without the
+    /// process mutex; callers hold `input_lock` except an attachment writer.
     fn write_one_burst(&self, bytes: &[u8]) -> Result<()> {
-        let mut agent = self
-            .agent
-            .lock()
-            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        self.write_one_burst_with(bytes, false, &|| false)
+    }
 
-        agent.write(bytes)?;
+    fn write_one_burst_to_completion_while(
+        &self,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        self.write_one_burst_with(bytes, true, cancelled)
+    }
+
+    fn write_one_burst_with(
+        &self,
+        bytes: &[u8],
+        wait_to_completion: bool,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<()> {
+        let writer = {
+            let mut agent = self
+                .agent
+                .lock()
+                .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+            if !agent.is_alive() {
+                return Err(AgentError::Exited);
+            }
+            agent.input_writer()
+        };
+        let result = if let Some(writer) = writer {
+            if wait_to_completion {
+                writer.write_to_completion_while(bytes, cancelled)
+            } else {
+                writer.write_bounded(bytes)
+            }
+        } else {
+            let mut agent = self
+                .agent
+                .lock()
+                .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+            agent.write(bytes)
+        };
+        if let Err(error) = result {
+            return if matches!(error, AgentError::Exited) || !self.is_alive() {
+                Err(AgentError::Exited)
+            } else {
+                Err(error)
+            };
+        }
 
         // Recorded only after the write lands, so a failed write does not look
         // like delivered input.
@@ -299,6 +440,35 @@ impl Session {
             *at = self.clock.now();
         }
         Ok(())
+    }
+
+    fn acquire_input_lock(&self) -> Result<InputActGuard<'_>> {
+        let mut locked = self
+            .input_lock
+            .lock()
+            .map_err(|_| AgentError::Io("session input lock poisoned".into()))?;
+        loop {
+            if !*locked {
+                *locked = true;
+                return Ok(InputActGuard { session: self });
+            }
+            if self.input_writer_busy()? {
+                return Err(AgentError::Busy);
+            }
+            locked = self
+                .input_ready
+                .wait_timeout(locked, Duration::from_millis(10))
+                .map_err(|_| AgentError::Io("session input lock poisoned".into()))?
+                .0;
+        }
+    }
+
+    fn input_writer_busy(&self) -> Result<bool> {
+        let mut agent = self
+            .agent
+            .lock()
+            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+        Ok(agent.input_writer().is_some_and(|writer| writer.is_busy()))
     }
 
     pub fn screen_text(&self) -> Result<String> {
@@ -557,6 +727,22 @@ impl Session {
     }
 }
 
+struct InputActGuard<'a> {
+    session: &'a Session,
+}
+
+impl Drop for InputActGuard<'_> {
+    fn drop(&mut self) {
+        let mut locked = self
+            .session
+            .input_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *locked = false;
+        self.session.input_ready.notify_all();
+    }
+}
+
 /// Current viewer's hold: the only guard that can write raw bytes. A displaced
 /// guard cannot write or release its successor.
 pub struct Attached<'a> {
@@ -579,24 +765,29 @@ impl Attached<'_> {
     /// Type exactly these bytes. No Enter is appended: the human sends their
     /// own, and inventing one here would submit a half-typed line.
     pub fn write_raw(&self, bytes: &[u8]) -> Result<()> {
-        let slot = self
-            .session
-            .attach_slot
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        if self.is_displaced()
-            || !slot
-                .as_ref()
-                .is_some_and(|(generation, _)| *generation == self.generation)
+        self.write_raw_while(bytes, &|| false)
+    }
+
+    /// Type bytes unless displaced or cancelled; the slot is released while waiting.
+    /// A takeover may still let one pending buffer land after `attach()` returns.
+    /// Single-flight writes do not interleave, and the buffer is never replayed.
+    pub fn write_raw_while(&self, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
         {
-            return Err(AgentError::Attached);
+            let slot = self
+                .session
+                .attach_slot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if self.is_displaced()
+                || !slot
+                    .as_ref()
+                    .is_some_and(|(generation, _)| *generation == self.generation)
+            {
+                return Err(AgentError::Attached);
+            }
         }
-        let mut agent = self
-            .session
-            .agent
-            .lock()
-            .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-        agent.write(bytes)?;
+        self.session
+            .write_one_burst_to_completion_while(bytes, &|| self.is_displaced() || cancelled())?;
         // Only after the write lands, as `last_input_at` is.
         if let Ok(mut at) = self.session.last_human_input_at.lock() {
             *at = Some(self.session.clock.now());

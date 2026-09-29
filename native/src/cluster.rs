@@ -1,5 +1,6 @@
 //! Cluster vocabulary composed from identity and membership registry units.
 
+pub mod control;
 pub mod encoding;
 pub mod identity;
 pub mod join_line;
@@ -132,10 +133,8 @@ pub struct ResolvedTarget {
 }
 
 /// Resolve a node label to its admitted pin and routing address.
-///
-/// The address is a caller-provided hint until registry endpoints land. The
-/// Noise pin always comes from the local registry; routing never changes the
-/// identity being authenticated.
+/// An address override controls routing only; authentication always uses
+/// the key pinned in the local registry.
 pub fn resolve_target(
     target: &str,
     addr_override: Option<SocketAddr>,

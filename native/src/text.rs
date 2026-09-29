@@ -2,11 +2,8 @@
 
 use std::borrow::Cow;
 
-/// Remove terminal control characters from untrusted text before display.
-///
-/// `char::is_control` covers C0, C1, and DEL, including ESC. No controls are
-/// needed in session names or terminal cell text, so dropping them avoids
-/// escape sequence injection while preserving ordinary Unicode text.
+/// Remove control characters from untrusted text before terminal output.
+/// Covers C0, C1, and DEL (including ESC) while preserving Unicode.
 pub fn strip_terminal_controls(text: &str) -> Cow<'_, str> {
     if !text.chars().any(char::is_control) {
         return Cow::Borrowed(text);

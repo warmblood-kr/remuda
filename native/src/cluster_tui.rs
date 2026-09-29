@@ -21,6 +21,8 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+
 pub mod close_request;
 pub mod composer;
 pub mod confirm;
@@ -859,17 +861,31 @@ impl ClusterUi {
                 .send_started(&mut self.input_queue, Instant::now(), |request| {
                     crate::client::request_with_timeout(path, request, sender::INPUT_SEND_TIMEOUT)
                 });
+        self.handle_send_event(event, now);
+    }
+
+    fn handle_send_event(&mut self, event: Option<QueueEvent>, now: Duration) {
         match event {
-            Some(QueueEvent::Sent { .. }) => {}
-            Some(QueueEvent::Uncertain { reason, .. })
-            | Some(QueueEvent::Dropped { reason, .. })
-            | Some(QueueEvent::Failed { reason, .. }) => {
+            Some(QueueEvent::Sent { .. } | QueueEvent::Uncertain { .. }) => {
+                self.clear_sending_notice();
+            }
+            Some(QueueEvent::Dropped { reason, .. }) | Some(QueueEvent::Failed { reason, .. }) => {
                 if reason.contains("session restarted") {
                     self.composer_target = None;
                 }
                 self.notice = Some((reason, now));
             }
             Some(QueueEvent::RetryScheduled { .. }) | None => {}
+        }
+    }
+
+    fn clear_sending_notice(&mut self) {
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.starts_with("sending input to "))
+        {
+            self.notice = None;
         }
     }
 
@@ -1115,7 +1131,9 @@ fn session_status(status: &str, pending_count: usize) -> String {
 }
 
 fn list(path: &Path) -> io::Result<Vec<SessionSummary>> {
-    match client::request(path, &Request::List).map_err(io::Error::other)? {
+    match client::request_with_timeout(path, &Request::List, UI_REQUEST_TIMEOUT)
+        .map_err(io::Error::other)?
+    {
         Response::Sessions(sessions) => Ok(sessions),
         Response::Error(error) => Err(io::Error::other(error)),
         other => Err(io::Error::other(format!(
@@ -1129,12 +1147,13 @@ fn screen(
     name: &str,
     clock: &dyn Clock,
 ) -> io::Result<(String, Duration, Option<String>)> {
-    let response = client::request(
+    let response = client::request_with_timeout(
         path,
         &Request::CaptureStyled {
             name: name.into(),
             scrollback: 0,
         },
+        UI_REQUEST_TIMEOUT,
     )
     .map_err(io::Error::other)?;
     let captured_at = clock.now();

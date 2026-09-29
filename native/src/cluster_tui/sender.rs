@@ -147,7 +147,8 @@ impl InputSender {
     }
 }
 
-pub const INPUT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Uncertain is bounded by 8s: four 1s attempts plus retry and UI-loop overhead.
+pub const INPUT_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 pub fn input_request(batch: &PendingBatch) -> Request {
     Request::Input {

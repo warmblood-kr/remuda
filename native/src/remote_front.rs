@@ -11,15 +11,19 @@ use std::path::Path;
 pub const MAX_FRAME_BYTES: usize = 512 * 1024;
 /// Maximum bytes accepted in one atomic input batch (64 KiB).
 pub const MAX_INPUT_BYTES: usize = remuda_core::input::MAX_INPUT_BYTES;
+/// Maximum bytes accepted in one remote Input batch (12 KiB).
+pub const MAX_REMOTE_INPUT_BATCH_BYTES: usize = 12 * 1024;
 /// Maximum simultaneous local front connections.
 pub const MAX_CONNECTIONS: usize = 8;
 /// Time allowed to submit a single request frame or complete an ordinary request.
 pub const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const SYNC_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 /// Keep at least half of the daemon's 16 Sync slots available to local callers.
-const MAX_REMOTE_SYNCS: usize = 8;
+pub(crate) const MAX_REMOTE_SYNCS: usize = 8;
 const _: () = assert!(MAX_REMOTE_SYNCS * 2 <= crate::daemon::MAX_CONCURRENT_SYNCS);
 static ACTIVE_REMOTE_SYNCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static SYNC_CAPACITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct RemoteSyncPermit;
 
@@ -58,8 +62,7 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, String> {
 /// Forward an authorized frame to the existing local daemon and encode its
 /// typed response afresh. Request bytes are never copied to the daemon socket.
 pub fn forward_frame(path: &std::path::Path, frame: &[u8]) -> Result<Vec<u8>, String> {
-    let request = decode_frame(frame)?;
-    forward_request(path, &request)
+    forward_frame_with_timeout(path, frame, std::time::Duration::from_secs(30))
 }
 
 /// Forward a frame with an explicit bound on the local daemon response wait.
@@ -70,10 +73,6 @@ pub fn forward_frame_with_timeout(
 ) -> Result<Vec<u8>, String> {
     let request = decode_frame(frame)?;
     forward_request_with_timeout(path, &request, timeout)
-}
-
-fn forward_request(path: &Path, request: &Request) -> Result<Vec<u8>, String> {
-    forward_request_with_timeout(path, request, std::time::Duration::from_secs(30))
 }
 
 fn forward_request_with_timeout(
@@ -247,7 +246,14 @@ pub fn authorize(request: &Request) -> Result<(), String> {
             seq,
             bytes,
             ..
-        } => validate_batch(client_id, *seq, bytes).map(|_| ()),
+        } => {
+            if bytes.len() > MAX_REMOTE_INPUT_BATCH_BYTES {
+                return Err(format!(
+                    "remote Input batch exceeds {MAX_REMOTE_INPUT_BATCH_BYTES} bytes"
+                ));
+            }
+            validate_batch(client_id, *seq, bytes).map(|_| ())
+        }
         Request::New { .. } => Err(refusal("New")),
         Request::SendLine { .. } => Err(refusal("SendLine")),
         Request::Send { .. } => Err(refusal("Send")),
@@ -284,6 +290,7 @@ mod tests {
 
     #[test]
     fn remote_sync_capacity_refusal_is_typed_on_wire() {
+        let _lock = SYNC_CAPACITY_TEST_LOCK.lock().unwrap();
         let permits: Vec<_> = (0..MAX_REMOTE_SYNCS)
             .map(|_| RemoteSyncPermit::acquire().expect("permit within remote sub-cap"))
             .collect();
@@ -461,7 +468,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_oversize_frames_and_batches() {
+    fn rejects_oversize_frames_and_remote_batches() {
         assert!(decode_frame(&vec![b' '; MAX_FRAME_BYTES + 1])
             .unwrap_err()
             .contains("exceeds"));
@@ -474,7 +481,7 @@ mod tests {
         };
         assert!(decode_frame(&serde_json::to_vec(&oversized).unwrap())
             .unwrap_err()
-            .contains("input"));
+            .contains("remote Input batch exceeds"));
         let empty = Request::Input {
             name: "dev".into(),
             instance_id: "instance".into(),
@@ -485,6 +492,26 @@ mod tests {
         assert!(decode_frame(&serde_json::to_vec(&empty).unwrap())
             .unwrap_err()
             .contains("input"));
+    }
+
+    #[test]
+    fn remote_input_batch_limit_accepts_12288_and_refuses_12289() {
+        let request = |length| Request::Input {
+            name: "dev".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
+            bytes: vec![u8::MAX; length],
+        };
+        assert!(
+            decode_frame(&serde_json::to_vec(&request(MAX_REMOTE_INPUT_BATCH_BYTES)).unwrap())
+                .is_ok()
+        );
+        assert_eq!(
+            decode_frame(&serde_json::to_vec(&request(MAX_REMOTE_INPUT_BATCH_BYTES + 1)).unwrap())
+                .unwrap_err(),
+            format!("remote Input batch exceeds {MAX_REMOTE_INPUT_BATCH_BYTES} bytes")
+        );
     }
 
     #[test]

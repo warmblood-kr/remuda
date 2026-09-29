@@ -176,6 +176,12 @@ pub enum Response {
     },
     /// A Sync request was refused because the daemon or remote-front limit is full.
     SyncAtCapacity,
+    /// Another write is already in flight; this request was not queued.
+    Busy,
+    /// The bounded PTY write deadline elapsed; delivery may be partial or late.
+    WriteTimeout,
+    /// The receiving cluster node has disabled remote Input locally.
+    RemoteControlDisabled,
     /// A styled screen, answering [`Request::CaptureStyled`] — as runs, not
     /// cells; see [`StyledRun`]. `cursor` rides the same round trip, so the
     /// pane's caret and its content are always the same frame. See steps/027.

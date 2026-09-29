@@ -17,11 +17,12 @@ struct PrivateDaemon {
     child: Child,
     root: PathBuf,
     runtime: PathBuf,
+    stopped: bool,
 }
 
 impl PrivateDaemon {
     fn start() -> Self {
-        let root = PathBuf::from("/tmp");
+        let root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let runtime = root.join(format!(
             "cluster-tree-{}-{}",
             std::process::id(),
@@ -48,6 +49,7 @@ impl PrivateDaemon {
             child,
             root,
             runtime,
+            stopped: false,
         }
     }
 
@@ -65,6 +67,18 @@ impl PrivateDaemon {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+
+    #[cfg(unix)]
+    fn stop(&mut self) {
+        assert_eq!(unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGSTOP) }, 0);
+        self.stopped = true;
+    }
+
+    #[cfg(unix)]
+    fn resume(&mut self) {
+        assert_eq!(unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGCONT) }, 0);
+        self.stopped = false;
+    }
 }
 
 impl Drop for PrivateDaemon {
@@ -73,10 +87,168 @@ impl Drop for PrivateDaemon {
             self.runtime.starts_with(&self.root),
             "daemon runtime must be scratch"
         );
+        if self.stopped {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(self.child.id() as libc::pid_t, libc::SIGCONT);
+            }
+            self.stopped = false;
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.runtime);
     }
+}
+
+#[cfg(unix)]
+struct TuiPty {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    pid: u32,
+    writer: Box<dyn std::io::Write + Send>,
+    output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl TuiPty {
+    fn start(runtime: &std::path::Path) -> Self {
+        use std::io::Read;
+        let pty = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 24,
+                cols: 100,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+        command.args(["-s", "cluster-tree", "cluster", "remote"]);
+        command.env("REMUDA_RUNTIME_DIR", runtime);
+        command.env("HOME", runtime.join("home"));
+        command.env("XDG_CONFIG_HOME", runtime.join("config"));
+        command.env("XDG_DATA_HOME", runtime.join("data"));
+        command.env("XDG_CACHE_HOME", runtime.join("cache"));
+        command.env("XDG_STATE_HOME", runtime.join("state"));
+        let child = pty.slave.spawn_command(command).expect("spawn cluster TUI");
+        let pid = child.process_id().expect("cluster TUI child PID");
+        drop(pty.slave);
+        let writer = pty.master.take_writer().unwrap();
+        let mut reader = pty.master.try_clone_reader().unwrap();
+        let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let reader_output = output.clone();
+        let reader = std::thread::spawn(move || {
+            let mut buffer = [0; 2048];
+            while let Ok(count) = reader.read(&mut buffer) {
+                if count == 0 {
+                    break;
+                }
+                reader_output.lock().unwrap().extend_from_slice(&buffer[..count]);
+            }
+        });
+        Self {
+            child,
+            pid,
+            writer,
+            output,
+            reader: Some(reader),
+        }
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
+    }
+
+    fn output_len(&self) -> usize {
+        self.output.lock().unwrap().len()
+    }
+
+    fn text_from(&self, offset: usize) -> String {
+        let output = self.output.lock().unwrap();
+        String::from_utf8_lossy(&output[offset.min(output.len())..]).into_owned()
+    }
+
+    fn wait_for(&self, needle: &str, timeout: Duration) -> String {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let output = self.text();
+            if output.contains(needle) {
+                return output;
+            }
+            assert!(Instant::now() < deadline, "TUI did not render {needle:?}: {output}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TuiPty {
+    fn drop(&mut self) {
+        assert_eq!(self.child.process_id(), Some(self.pid));
+        unsafe {
+            libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = self.child.wait();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn stopped_daemon_keeps_cluster_tui_ticking_and_recovers_input() {
+    use std::io::Write;
+
+    let mut daemon = PrivateDaemon::start();
+    daemon.wait_ready();
+    let response = remuda_native::client::request(
+        &daemon.path(),
+        &Request::New {
+            name: Some("tui-session".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty -echo; while IFS= read -r line; do printf 'got:%s\\n' \"$line\"; done".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, Response::Value(name) if name == "tui-session"));
+
+    let mut tui = TuiPty::start(&daemon.runtime);
+    tui.wait_for("tui-session", Duration::from_secs(5));
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("$ tui-session> ▏", Duration::from_secs(3));
+    tui.writer.write_all(b"first line").unwrap();
+    tui.wait_for("first line▏", Duration::from_secs(5));
+
+    daemon.stop();
+    let redraw_start = tui.output_len();
+    tui.writer.write_all(b"\r").unwrap();
+    tui.wait_for("sending input to tui-session", Duration::from_secs(3));
+    let started = Instant::now();
+    let uncertain_bound = Duration::from_secs(8);
+    tui.wait_for("delivery uncertain", uncertain_bound);
+    let redraw_output = tui.text_from(redraw_start);
+    assert!(started.elapsed() <= uncertain_bound, "Uncertain exceeded 8s from the first send attempt");
+    assert!(redraw_output.matches("\u{1b}[2J").count() >= 3, "expected repeated redraws while daemon was SIGSTOPped");
+
+    daemon.resume();
+    tui.writer.write_all(b"second line\r").unwrap();
+    tui.wait_for("got:second line", Duration::from_secs(10));
+    let close = remuda_native::client::request(
+        &daemon.path(),
+        &Request::Close {
+            name: "tui-session".into(),
+            instance_id: None,
+            confirm: None,
+        },
+    )
+    .unwrap();
+    assert!(matches!(close, Response::Ok));
 }
 
 #[test]
