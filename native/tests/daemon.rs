@@ -1130,6 +1130,72 @@ fn start_shell_session(socket: &Path, script: &str) {
     assert!(matches!(response, Response::Value(_)));
 }
 
+#[cfg(unix)]
+#[test]
+fn session_output_wakes_coalesce_while_lua_is_busy_and_list_stays_responsive() {
+    let path = scratch("session-output-coalescing");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda._session_output_test_calls = 0
+            remuda.on("session_output", function(name)
+                if name == "chatty" then
+                    remuda._session_output_test_calls = remuda._session_output_test_calls + 1
+                    if remuda._session_output_test_calls == 1 then remuda.sleep(0.5) end
+                end
+            end, { group = "session-output-test", id = "coalesce" })
+        "#,
+    );
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("chatty".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "yes x & writer=$!; sleep 0.4; kill $writer 2>/dev/null; wait $writer 2>/dev/null; sleep 5".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start chatty session");
+    assert_eq!(response, Response::Value("chatty".into()));
+
+    let until = Instant::now() + Duration::from_millis(750);
+    let mut max_list_latency = Duration::ZERO;
+    while Instant::now() < until {
+        let started = Instant::now();
+        let response = client::request(&path, &Request::List).expect("list during output hook");
+        max_list_latency = max_list_latency.max(started.elapsed());
+        assert!(matches!(response, Response::Sessions(_)));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        max_list_latency < Duration::from_millis(100),
+        "session list stalled behind output hook: {max_list_latency:?}"
+    );
+    let calls: u32 = eval(&path, "return remuda._session_output_test_calls")
+        .parse()
+        .expect("output hook call count");
+    assert!(
+        (1..=2).contains(&calls),
+        "chatty output queued redundant Lua wakes: {calls} calls"
+    );
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::Close {
+                name: "chatty".into(),
+            },
+        )
+        .expect("close chatty session"),
+        Response::Ok
+    );
+}
+
 fn listed_session(socket: &Path) -> remuda_core::SessionSummary {
     match client::request(socket, &Request::List).expect("list session") {
         Response::Sessions(sessions) => sessions

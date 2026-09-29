@@ -25,6 +25,7 @@ use std::ffi::c_void;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 
@@ -98,8 +99,69 @@ enum JobKind {
         id: u64,
         result: Result<crate::net::HttpResponse, String>,
     },
+    SessionOutput(SessionOutputNotifier),
     #[cfg(test)]
     StopImage,
+}
+
+struct SessionOutputState {
+    name: String,
+    latest_version: AtomicU64,
+    queued: AtomicBool,
+    active: AtomicBool,
+}
+
+/// A coalescing wake for one session's output hook.
+#[derive(Clone)]
+pub struct SessionOutputNotifier {
+    jobs: Sender<Job>,
+    state: Arc<SessionOutputState>,
+}
+
+impl SessionOutputNotifier {
+    pub fn notify(&self, version: u64) {
+        if !self.state.active.load(Ordering::Acquire) {
+            return;
+        }
+        self.state.latest_version.store(version, Ordering::Release);
+        self.enqueue();
+    }
+
+    pub fn deactivate(&self) {
+        self.state.active.store(false, Ordering::Release);
+    }
+
+    fn enqueue(&self) {
+        if !self.state.active.load(Ordering::Acquire)
+            || self
+                .state
+                .queued
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return;
+        }
+        if self
+            .jobs
+            .send(Job {
+                kind: JobKind::SessionOutput(self.clone()),
+                reply: None,
+            })
+            .is_err()
+        {
+            self.state.active.store(false, Ordering::Release);
+            self.state.queued.store(false, Ordering::Release);
+        }
+    }
+
+    fn finish(&self, delivered_version: u64) {
+        self.state.queued.store(false, Ordering::Release);
+        if self.state.active.load(Ordering::Acquire)
+            && self.state.latest_version.load(Ordering::Acquire) != delivered_version
+        {
+            self.enqueue();
+        }
+    }
 }
 
 /// A handle to the daemon's Lua image. Cloneable and `Send`; the interpreter
@@ -196,6 +258,20 @@ impl Image {
                             }
                             Ok(String::new())
                         }
+                        JobKind::SessionOutput(notifier) => {
+                            let version = notifier.state.latest_version.load(Ordering::Acquire);
+                            if notifier.state.active.load(Ordering::Acquire) {
+                                let code = format!(
+                                    "remuda.emit('session_output', {}, {{version={version}}})",
+                                    crate::mcp::lua_string(&notifier.state.name)
+                                );
+                                if let Err(error) = eval(&lua, &code, None) {
+                                    eprintln!("remuda session_output hook error: {error}");
+                                }
+                            }
+                            notifier.finish(version);
+                            Ok(String::new())
+                        }
                         #[cfg(test)]
                         JobKind::StopImage => Ok(String::new()),
                     },
@@ -239,6 +315,18 @@ impl Image {
 
     pub fn pending_replies(&self) -> crate::pending::PendingReplies {
         self.pending.clone()
+    }
+
+    pub fn session_output_notifier(&self, name: &str) -> SessionOutputNotifier {
+        SessionOutputNotifier {
+            jobs: self.jobs.clone(),
+            state: Arc::new(SessionOutputState {
+                name: name.to_string(),
+                latest_version: AtomicU64::new(0),
+                queued: AtomicBool::new(false),
+                active: AtomicBool::new(true),
+            }),
+        }
     }
 
     /// Notify every deferred caller before modules and the Lua runtime stop.

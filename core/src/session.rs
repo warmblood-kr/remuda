@@ -151,6 +151,11 @@ impl Session {
             .and_then(|mut agent| agent.output_version())
     }
 
+    /// Subscribe to the agent's output stream, when this backend supports it.
+    pub fn subscribe(&self) -> Option<Receiver<Vec<u8>>> {
+        self.agent.lock().ok()?.subscribe()
+    }
+
     /// The current terminal size.
     pub fn size(&self) -> Size {
         self.size.lock().map(|size| *size).unwrap_or_default()

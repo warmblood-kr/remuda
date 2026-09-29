@@ -2,12 +2,45 @@
 -- v1-v4 remain frozen; v5 remains open until the next tagged release.
 remuda._api_v5_exit_events = {}
 remuda._api_v5_legacy_exit_names = {}
+remuda._api_v5_output_events = {}
+remuda._api_v5_legacy_output_names = {}
 remuda.on("session_exited", function(name, details)
   table.insert(remuda._api_v5_exit_events, { name = name, details = details })
 end)
 remuda.on("session_exited", function(name)
   table.insert(remuda._api_v5_legacy_exit_names, name)
 end)
+remuda.on("session_output", function(name, details)
+  table.insert(remuda._api_v5_output_events, { name = name, details = details })
+end)
+remuda.on("session_output", function(name)
+  table.insert(remuda._api_v5_legacy_output_names, name)
+end)
+
+function remuda._api_v5_output_seen(name)
+  for _, event in ipairs(remuda._api_v5_output_events) do
+    if event.name == name then return true end
+  end
+  return false
+end
+
+function remuda._api_v5_assert_output(name)
+  local event
+  for _, candidate in ipairs(remuda._api_v5_output_events) do
+    if candidate.name == name then event = candidate; break end
+  end
+  assert(event, "session_output did not include " .. name)
+  assert(type(event.name) == "string" and event.name == name,
+    "session_output's first argument must be the session name")
+  assert(type(event.details) == "table", "session_output must provide a details table")
+  assert(type(event.details.version) == "number" and event.details.version > 0,
+    "session_output details.version must be a positive number")
+  local legacy_received_name = false
+  for _, legacy_name in ipairs(remuda._api_v5_legacy_output_names) do
+    if legacy_name == name then legacy_received_name = true; break end
+  end
+  assert(legacy_received_name, "one-argument session_output handlers must receive the name")
+end
 
 function remuda._api_v5_exit_seen(name)
   for _, event in ipairs(remuda._api_v5_exit_events) do

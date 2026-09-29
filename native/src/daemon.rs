@@ -821,7 +821,18 @@ fn handle(
             size,
             cwd,
             env,
-        } => handle_new(stream, registry, name, command, size, cwd, env),
+        } => handle_new(
+            stream,
+            registry,
+            image,
+            NewSessionRequest {
+                name,
+                command,
+                size,
+                cwd,
+                env,
+            },
+        ),
 
         Request::SendLine { name, text } => {
             respond(&stream, &name, registry.send_line(&name, &text), |()| {
@@ -1052,15 +1063,27 @@ fn refuse_hosted_shutdown(stream: &Stream, identity: &str) -> std::io::Result<()
     )
 }
 
-fn handle_new(
-    stream: Stream,
-    registry: &Registry,
+struct NewSessionRequest {
     name: Option<String>,
     command: Vec<String>,
     size: Size,
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
+}
+
+fn handle_new(
+    stream: Stream,
+    registry: &Registry,
+    image: &Image,
+    request: NewSessionRequest,
 ) -> std::io::Result<()> {
+    let NewSessionRequest {
+        name,
+        command,
+        size,
+        cwd,
+        env,
+    } = request;
     let name = match name {
         Some(given) => given,
         None => registry.unique_name(&remuda_core::registry::slug(
@@ -1085,10 +1108,50 @@ fn handle_new(
     ) {
         Err(e) => reply(&stream, &Response::error(e)),
         Ok(session) => match registry.register(session) {
-            Ok(_) => reply(&stream, &Response::Value(name)),
+            Ok(session) => {
+                if let Some(output) = session.subscribe() {
+                    monitor_session_output(session, output, image.session_output_notifier(&name));
+                }
+                reply(&stream, &Response::Value(name))
+            }
             Err(_) => reply(&stream, &Response::error(format!("name taken: {name}"))),
         },
     }
+}
+
+/// Wait for PTY output, then submit one coalesced wake into the Lua image.
+/// The deadline starts with the first chunk so continuous output cannot starve
+/// a notification by continually restarting a quiet-period timer.
+fn monitor_session_output(
+    session: Arc<Session>,
+    output: std::sync::mpsc::Receiver<Vec<u8>>,
+    notifier: crate::image::SessionOutputNotifier,
+) {
+    const COALESCE: std::time::Duration = std::time::Duration::from_millis(50);
+    std::thread::spawn(move || loop {
+        if output.recv().is_err() {
+            notifier.deactivate();
+            break;
+        }
+        let deadline = std::time::Instant::now() + COALESCE;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match output.recv_timeout(remaining) {
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    notifier.deactivate();
+                    return;
+                }
+            }
+        }
+        if let Some(version) = session.output_version() {
+            notifier.notify(version);
+        }
+    });
 }
 
 fn read_request(
