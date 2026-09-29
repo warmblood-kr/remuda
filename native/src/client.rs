@@ -2,10 +2,14 @@
 
 use crate::ipc::{self, Stream, TryClone};
 use crate::reply_limit::max_reply_wire_bytes;
+#[cfg(unix)]
+use interprocess::local_socket::traits::Stream as _;
 use remuda_core::protocol::{Request, Response};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Detach key: Ctrl-\ (0x1C). Chosen because almost nothing binds it, unlike
 /// Ctrl-C/D/Z, which the attached program needs. Consumed, never forwarded.
@@ -68,7 +72,150 @@ fn trace_input_read(path: Option<&Path>, bytes: &[u8]) {
 pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
     let stream = ipc::connect(path)?;
     send(&stream, request)?;
-    read_response(&stream)
+    let timeout = match request {
+        // Deferred extension replies are capped at 300 seconds by
+        // remuda.pending; leave five seconds for delivery and scheduling.
+        Request::Eval { .. } => Duration::from_secs(305),
+        _ => Duration::from_secs(10),
+    };
+    read_response_with_timeout(path, stream, timeout)
+}
+
+#[cfg(unix)]
+fn read_response_with_timeout(
+    path: &Path,
+    stream: Stream,
+    timeout: Duration,
+) -> std::io::Result<Response> {
+    stream.set_nonblocking(true)?;
+    let deadline = Instant::now() + timeout;
+    let limit = max_reply_wire_bytes();
+    let mut line = Vec::with_capacity(limit.min(8192));
+    let mut bytes = [0u8; 4096];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(request_timeout(path, timeout));
+        }
+        match (&stream).read(&mut bytes) {
+            Ok(0) => break,
+            Ok(count) => {
+                let chunk = &bytes[..count];
+                let end = chunk.iter().position(|byte| *byte == b'\n');
+                let wire_count = end.map_or(count, |end| end + 1);
+                if line.len().saturating_add(wire_count) > limit {
+                    return Err(reply_too_large());
+                }
+                line.extend_from_slice(&chunk[..end.unwrap_or(count)]);
+                if end.is_some() {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let line = String::from_utf8(line)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok(interpret(&line))
+}
+
+#[cfg(windows)]
+fn read_response_with_timeout(
+    path: &Path,
+    stream: Stream,
+    timeout: Duration,
+) -> std::io::Result<Response> {
+    // Named pipes do not support nonblocking reads. Keep the same handle in
+    // the reader and timeout path so CancelIoEx can release its pending read.
+    let stream = std::sync::Arc::new(stream);
+    let reader = std::sync::Arc::clone(&stream);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_stop = std::sync::Arc::clone(&stop);
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        if !reader_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = send.send(read_response(&reader));
+        }
+    });
+    match receive.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            ipc::stop_reader(&stream, &stop, || worker.is_finished());
+            let _ = worker.join();
+            Err(request_timeout(path, timeout))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = worker.join();
+            Err(std::io::Error::other(
+                "daemon response reader stopped unexpectedly",
+            ))
+        }
+    }
+}
+
+fn request_timeout(path: &Path, timeout: Duration) -> std::io::Error {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    #[cfg(unix)]
+    let pid = std::fs::read_to_string(&lock_path)
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u32>().ok());
+    #[cfg(windows)]
+    let pid: Option<u32> = None;
+    let recovery = match pid {
+        Some(pid) => format!(
+            "daemon pid {pid}; if it is stopped, run `kill -CONT {pid}` to resume it; if stuck, verify it is this daemon, run `kill {pid}`, then retry"
+        ),
+        None => format!(
+            "daemon pid unavailable (inspect {}); if it is stopped, resume it; if stuck, verify it is this daemon before killing it, then retry",
+            lock_path.display()
+        ),
+    };
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "timed out after {}s waiting for daemon response on socket {} ({recovery})",
+            timeout.as_secs(),
+            path.display()
+        ),
+    )
+}
+
+/// Send one request and stop waiting when the daemon exceeds the supplied
+/// response deadline.
+pub fn request_with_timeout(
+    path: &Path,
+    request: &Request,
+    timeout: std::time::Duration,
+) -> std::io::Result<Response> {
+    let stream = ipc::connect(path)?;
+    send(&stream, request)?;
+    let wake_stream = stream.try_clone()?;
+    let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+    let reader = std::thread::Builder::new()
+        .name("remuda-local-request-reader".into())
+        .spawn(move || {
+            let _ = reply_tx.send(read_response(&stream));
+        })?;
+    let result = match reply_rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            ipc::wake(&wake_stream);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "local daemon request timed out",
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other(
+            "local daemon request reader stopped unexpectedly",
+        )),
+    };
+    let _ = reader.join();
+    result
 }
 
 fn send(mut stream: &Stream, request: &Request) -> std::io::Result<()> {
@@ -84,17 +231,22 @@ fn read_response(stream: &Stream) -> std::io::Result<Response> {
     let mut bytes = Vec::with_capacity(8192);
     reader.read_until(b'\n', &mut bytes)?;
     if bytes.len() > limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "daemon reply exceeds the {} MiB wire limit",
-                limit / (1024 * 1024)
-            ),
-        ));
+        return Err(reply_too_large());
     }
     let line = String::from_utf8(bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     Ok(interpret(&line))
+}
+
+fn reply_too_large() -> std::io::Error {
+    let limit = max_reply_wire_bytes();
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!(
+            "daemon reply exceeds the {} MiB wire limit",
+            limit / (1024 * 1024)
+        ),
+    )
 }
 
 /// Read one bounded protocol line without buffering bytes beyond its newline.
@@ -112,13 +264,7 @@ fn read_bounded_line(stream: &mut impl Read) -> std::io::Result<Vec<u8>> {
         }
     }
     if line.len() > limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "daemon reply exceeds the {} MiB wire limit",
-                limit / (1024 * 1024)
-            ),
-        ));
+        return Err(reply_too_large());
     }
     Ok(line)
 }
@@ -924,8 +1070,10 @@ impl Drop for RawMode {
 mod tests {
     #[cfg(unix)]
     use super::trace_input_read;
-    use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
-    use remuda_core::protocol::Response;
+    use super::{
+        interpret, request_with_timeout, reset_input_modes, write_input_trace, RESET_INPUT_MODES,
+    };
+    use remuda_core::protocol::{Request, Response};
     use std::time::{Duration, UNIX_EPOCH};
 
     #[cfg(unix)]
@@ -967,6 +1115,32 @@ mod tests {
         let mut output = Vec::new();
         reset_input_modes(&mut output).unwrap();
         assert_eq!(output, RESET_INPUT_MODES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_daemon_response_wait_has_a_timeout() {
+        use interprocess::local_socket::traits::ListenerExt as _;
+        let path = std::env::temp_dir().join(format!(
+            "remuda-client-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = crate::ipc::listen(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let _stream = listener.incoming().next().unwrap().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let started = std::time::Instant::now();
+        let error =
+            request_with_timeout(&path, &Request::List, Duration::from_millis(40)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

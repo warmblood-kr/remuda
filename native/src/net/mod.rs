@@ -1,6 +1,10 @@
 //! Network boundary for the native host. Socket access is confined to this module.
 
+pub mod cluster_client;
+pub mod frame;
 pub mod http_client;
+pub mod listener;
+pub mod replay;
 
 pub use http_client::{HttpClient, HttpRequest, HttpResponse, HttpTask};
 
