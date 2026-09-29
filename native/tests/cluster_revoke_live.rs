@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::Zeroizing;
@@ -243,6 +243,67 @@ impl Drop for ListenerProcess {
     }
 }
 
+struct BlackholePeer {
+    address: SocketAddr,
+    stop: std::sync::Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl BlackholePeer {
+    fn start(address: SocketAddr) -> Self {
+        let listener = TcpListener::bind(address).expect("bind stalled peer endpoint");
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let thread = thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(50)))
+                            .unwrap();
+                        let mut buffer = [0; 4096];
+                        while !thread_stop.load(Ordering::Acquire) {
+                            match stream.read(&mut buffer) {
+                                Ok(0) => break,
+                                Ok(_) => {}
+                                Err(error)
+                                    if matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::WouldBlock
+                                            | std::io::ErrorKind::TimedOut
+                                    ) => {}
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept stalled peer connection: {error}"),
+                }
+            }
+        });
+        Self {
+            address,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for BlackholePeer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect_timeout(&self.address, Duration::from_millis(100));
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .expect("stalled peer thread should stop cleanly");
+        }
+    }
+}
+
 fn successful(output: Output, operation: &str) -> String {
     assert!(
         output.status.success(),
@@ -406,6 +467,51 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
         .find(|line| line.contains(&b_fingerprint))
         .expect("node B row in nodes table");
     assert!(row.contains("revoked"), "node B row is not revoked: {row}");
+}
+
+#[test]
+fn joiner_succeeds_when_an_existing_peer_stalls() {
+    let _serial = live_test_guard();
+    let a = PrivateNode::start("join-stalled-a");
+    let b = PrivateNode::start("join-stalled-b");
+    let c = PrivateNode::start("join-stalled-c");
+    successful(a.run(&["cluster", "init"]), "initialize node A");
+    successful(b.run(&["cluster", "init"]), "initialize node B");
+    successful(c.run(&["cluster", "init"]), "initialize node C");
+    let a_identity = a.identity();
+    let a_listener = ListenerProcess::start(&a);
+    let mut b_listener = ListenerProcess::start(&b);
+    let c_listener = ListenerProcess::start(&c);
+
+    join_member(&a, &b, &a_identity, a_listener.address, b_listener.address);
+    b_listener.stop();
+    let _stalled_peer = BlackholePeer::start(b_listener.address);
+
+    let invitation = successful(
+        a.run(&[
+            "cluster",
+            "invite",
+            "--bind",
+            &a_listener.address.to_string(),
+        ]),
+        "mint invitation while an existing peer is stalled",
+    );
+    let started = Instant::now();
+    let joined = c.run(&[
+        "cluster",
+        "join",
+        &identity_fingerprint(&a_identity),
+        invitation.lines().nth(1).unwrap(),
+        "--bind",
+        &c_listener.address.to_string(),
+    ]);
+    successful(joined, "join C while existing peer B is stalled");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "join reply waited on an existing peer for {:?}",
+        started.elapsed()
+    );
+    assert_joiner_stores_issuer(&c, &a_identity, a_listener.address);
 }
 
 fn join_member(
@@ -651,7 +757,7 @@ fn revoke_topology(
 #[test]
 fn revoke_cli_pushes_tombstone_across_a_b_c_join_chain() {
     let _serial = live_test_guard();
-    let (a, _b, c, _a_listener, _b_listener, _c_listener, _a_fp, b_fp, _c_fp) =
+    let (a, _b, c, _a_listener, _b_listener, _c_listener, _a_fp, b_fp, c_fp) =
         revoke_topology("revoke-fast-path");
     let started = Instant::now();
     let output = a.run(&["cluster", "revoke", &b_fp, "--yes"]);
@@ -662,6 +768,13 @@ fn revoke_cli_pushes_tombstone_across_a_b_c_join_chain() {
         String::from_utf8_lossy(&output.stderr)
     );
     wait_for_revocation_on_until(&c, &b_fp, started + Duration::from_secs(30));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains(&format!("Registry push reached peer {c_fp}.")),
+        "CLI revoke did not push the tombstone to peer C: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
         started.elapsed() < Duration::from_secs(30),
         "revocation did not converge within the 30 second bound"

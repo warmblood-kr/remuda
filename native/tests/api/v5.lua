@@ -110,9 +110,22 @@ local opened = session.new(name, { "sh" })
 assert(opened == name, "session.new must preserve new's return value")
 local found = false
 for _, row in ipairs(session.list()) do
-  if row.name == name then found = true end
+  if row.name == name then
+    found = true
+    assert(type(row.instance_id) == "string" and #row.instance_id > 0,
+      "session.list must include the live session instance_id")
+  end
 end
 assert(found, "session.list must include the session created by session.new")
+local legacy_found_instance = false
+for _, row in ipairs(remuda.ls()) do
+  if row.name == name then
+    legacy_found_instance = true
+    assert(type(row.instance_id) == "string" and #row.instance_id > 0,
+      "remuda.ls must include the live session instance_id")
+  end
+end
+assert(legacy_found_instance, "remuda.ls must include the session created by session.new")
 assert(session.resize(name, 91, 31) == true, "session.resize must report success")
 local resized = false
 for _, row in ipairs(remuda.ls()) do
