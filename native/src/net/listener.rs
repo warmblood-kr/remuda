@@ -1343,16 +1343,12 @@ mod tests {
         let settings = TestControlSettings::new(br#"{"allow_remote_control":true}"#);
         let control_source = settings.source();
         assert!(authorize_remote_request_with_source(&Request::List, &control_source).is_ok());
-        let close_error = authorize_remote_request_with_source(
-            &Request::Close {
-                name: "session".into(),
-                instance_id: None,
-                confirm: None,
-            },
-            &control_source,
-        )
-        .unwrap_err();
-        assert_eq!(close_error, Response::error("remote front refuses Close"));
+        let confirmed_close = Request::Close {
+            name: "session".into(),
+            instance_id: Some("instance".into()),
+            confirm: Some(true),
+        };
+        assert!(authorize_remote_request_with_source(&confirmed_close, &control_source).is_ok());
         let input = Request::Input {
             name: "session".into(),
             instance_id: "instance".into(),
@@ -1361,16 +1357,9 @@ mod tests {
             bytes: b"hello\r".to_vec(),
         };
         assert!(authorize_remote_request_with_source(&input, &control_source).is_ok());
-        let close_error = authorize_remote_request_with_control(
-            &Request::Close {
-                name: "session".into(),
-                instance_id: None,
-                confirm: None,
-            },
-            true,
-        )
-        .unwrap_err();
-        assert_eq!(close_error, Response::error("remote front refuses Close"));
+        let close_error =
+            authorize_remote_request_with_control(&confirmed_close, false).unwrap_err();
+        assert_eq!(close_error, Response::RemoteControlDisabled);
         assert_eq!(
             authorize_remote_request_with_control(&input, false),
             Err(Response::RemoteControlDisabled)
@@ -2047,6 +2036,23 @@ mod tests {
             close,
             Response::Ok,
             Response::Ok,
+            1,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_stale_confirmed_close_reaches_daemon_and_is_refused() {
+        let close = Request::Close {
+            name: "session".into(),
+            instance_id: Some("stale-instance".into()),
+            confirm: Some(true),
+        };
+        production_socket_close_response(
+            br#"{"allow_remote_control":true}"#,
+            close,
+            Response::error("session restarted; close was refused"),
+            Response::error("session restarted; close was refused"),
             1,
         );
     }
