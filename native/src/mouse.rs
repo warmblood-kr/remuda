@@ -396,17 +396,15 @@ mod tests {
     fn split_bracketed_paste_preserves_sgr_and_hotkey_bytes() {
         let mut parser = SgrParser::default();
         assert!(parser.feed(b"\x1b[20").is_empty());
-        assert_eq!(
-            parser.feed(b"0~\x1b[<64;1;2M\x1d\x1b[20"),
-            vec![
-                InputToken::Paste(b"\x1b[200~".to_vec()),
-                InputToken::Paste(b"\x1b[<64;1;2M\x1d".to_vec())
-            ]
-        );
+        assert!(parser
+            .feed(b"0~\x1b[<64;1;2M\x1d\x1b[20")
+            .is_empty());
         assert_eq!(
             parser.feed(b"1~\x1b[<64;2;3M"),
             vec![
-                InputToken::Paste(b"\x1b[201~".to_vec()),
+                InputToken::Paste(
+                    b"\x1b[200~\x1b[<64;1;2M\x1d\x1b[201~".to_vec()
+                ),
                 InputToken::Mouse(SgrMouse {
                     button: 64,
                     x: 2,
