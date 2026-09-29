@@ -5,7 +5,7 @@ use super::{frame, replay};
 use crate::cluster::{self, identity, join_token::JoinTokenStore, NodeState};
 use remuda_core::protocol::{Request, Response};
 use remuda_core::WallClock;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
@@ -23,6 +23,9 @@ pub const MAX_BODY_BYTES: usize = 65_535;
 pub const MAX_GLOBAL_REQUESTS: usize = 64;
 pub const MAX_PEER_REQUESTS: usize = 8;
 pub const MAX_PREAUTH_PER_IP: usize = 4;
+pub const MAX_JOIN_ATTEMPTS_PER_IP: usize = 10;
+const JOIN_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
+const MAX_JOIN_ATTEMPT_IPS: usize = 4096;
 pub const MAX_HELD_REQUEST: Duration = Duration::from_secs(30);
 const SOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_READ_TIME: Duration = Duration::from_secs(5);
@@ -64,12 +67,14 @@ pub struct Listener {
 
 type MemberAuthorizer = Arc<dyn Fn(&[u8]) -> io::Result<()> + Send + Sync>;
 type FrameDispatcher = Arc<dyn Fn(&[u8]) -> io::Result<Vec<u8>> + Send + Sync>;
+type JoinAdmitter = Arc<dyn Fn(&[u8], Option<&str>) -> io::Result<()> + Send + Sync>;
 
 struct ListenerState {
     responder_private: Zeroizing<Vec<u8>>,
     replay: Mutex<replay::ReplayWindow>,
     limiter: Arc<RequestLimiter>,
     join_tokens: JoinTokenStore,
+    admit_join: JoinAdmitter,
 }
 
 #[derive(Clone)]
@@ -104,6 +109,7 @@ struct RequestLimiter {
     active_ips: Mutex<HashMap<std::net::IpAddr, usize>>,
     active_peers: Mutex<HashMap<String, usize>>,
     remote_inputs: Mutex<RemoteInputRateLimiter>,
+    join_attempts: Mutex<HashMap<std::net::IpAddr, VecDeque<Instant>>>,
 }
 
 #[derive(Default)]
@@ -230,6 +236,7 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
             replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
             limiter: Arc::new(RequestLimiter::default()),
             join_tokens,
+            admit_join: Arc::new(cluster::admit_join_locked),
         }),
         authorize,
         dispatch,
@@ -418,6 +425,37 @@ impl RequestLimiter {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .check(fingerprint, bytes, Instant::now())
+    }
+
+    fn allow_join_attempt(&self, address: std::net::IpAddr, now: Instant) -> bool {
+        let mut attempts = self
+            .join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attempts.retain(|_, times| {
+            while times
+                .front()
+                .is_some_and(|time| now.saturating_duration_since(*time) >= JOIN_ATTEMPT_WINDOW)
+            {
+                times.pop_front();
+            }
+            !times.is_empty()
+        });
+        if !attempts.contains_key(&address) && attempts.len() >= MAX_JOIN_ATTEMPT_IPS {
+            if let Some(oldest_ip) = attempts
+                .iter()
+                .min_by_key(|(_, times)| times.front().copied())
+                .map(|(ip, _)| *ip)
+            {
+                attempts.remove(&oldest_ip);
+            }
+        }
+        let bucket = attempts.entry(address).or_default();
+        if bucket.len() >= MAX_JOIN_ATTEMPTS_PER_IP {
+            return false;
+        }
+        bucket.push_back(now);
+        true
     }
 }
 
@@ -755,6 +793,7 @@ fn spawn_connection_handler(
             let _ip_permit = ip_permit;
             handle_connection_with(
                 stream,
+                remote_addr,
                 state,
                 global_permit,
                 authorize,
@@ -768,6 +807,7 @@ fn spawn_connection_handler(
 
 fn handle_connection_with(
     stream: TcpStream,
+    remote_addr: SocketAddr,
     state: Arc<ListenerState>,
     global_permit: Arc<GlobalPermit>,
     authorize: MemberAuthorizer,
@@ -786,9 +826,7 @@ fn handle_connection_with(
         Err(_) => return ignore_response_error(write_http_response(stream, 400, b"bad frame")),
     };
     let peer_fp = cluster::encoding::fingerprint(&opened.peer_static);
-    if authorize(&opened.peer_static).is_err() {
-        return ignore_response_error(write_http_response(stream, 403, b"not admitted"));
-    }
+    let admitted = authorize(&opened.peer_static).is_ok();
     let now = crate::SystemWallClock::new().unix_seconds() as i64;
     let replay = state
         .replay
@@ -797,6 +835,9 @@ fn handle_connection_with(
         .check_and_insert(&peer_fp, opened.ephemeral, opened.timestamp_seconds, now);
     if replay.is_err() {
         return ignore_response_error(write_http_response(stream, 409, b"replayed or stale frame"));
+    }
+    if !admitted {
+        return handle_unknown_peer_join(stream, remote_addr, state, opened);
     }
     let Some(peer_permit) = state.limiter.acquire_peer(&peer_fp) else {
         return ignore_response_error(write_http_response(
@@ -856,6 +897,51 @@ fn handle_connection_with(
         return send_encrypted_response(stream, opened, &refused);
     }
     send_encrypted_response(stream, opened, &response)
+}
+
+fn handle_unknown_peer_join(
+    stream: TcpStream,
+    remote_addr: SocketAddr,
+    state: Arc<ListenerState>,
+    opened: frame::OpenedRequest,
+) {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct JoinRequest {
+        join: JoinToken,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct JoinToken {
+        token: String,
+        #[serde(default)]
+        endpoint: Option<String>,
+    }
+    let request: JoinRequest = match serde_json::from_slice(&opened.payload) {
+        Ok(request) => request,
+        Err(_) => return ignore_response_error(write_http_response(stream, 403, b"not admitted")),
+    };
+    if !state
+        .limiter
+        .allow_join_attempt(remote_addr.ip(), Instant::now())
+    {
+        return ignore_response_error(write_http_response(
+            stream,
+            429,
+            b"join attempt rate limit reached",
+        ));
+    }
+    let result = state
+        .join_tokens
+        .verify_consume_with(&request.join.token, || {
+            (state.admit_join)(&opened.peer_static, request.join.endpoint.as_deref())
+        });
+    let response = if result.is_ok() {
+        b"{\"joined\":true}".as_slice()
+    } else {
+        b"{\"joined\":false}".as_slice()
+    };
+    send_encrypted_response(stream, opened, response);
 }
 
 fn encode_error(reason: &str) -> Vec<u8> {
@@ -964,6 +1050,29 @@ mod tests {
             dispatch: FrameDispatcher,
             limits: ConnectionLimits,
         ) -> Self {
+            Self::start_with_admitter(
+                responder_private,
+                responder_public,
+                authorize,
+                dispatch,
+                limits,
+                Arc::new(|_, _| {
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "admission refused",
+                    ))
+                }),
+            )
+        }
+
+        fn start_with_admitter(
+            responder_private: Vec<u8>,
+            responder_public: Vec<u8>,
+            authorize: MemberAuthorizer,
+            dispatch: FrameDispatcher,
+            limits: ConnectionLimits,
+            admit_join: JoinAdmitter,
+        ) -> Self {
             use std::os::unix::fs::PermissionsExt;
             let responder_private_for_test = responder_private.clone();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -984,6 +1093,7 @@ mod tests {
                 replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
+                admit_join,
             });
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = stop.clone();
@@ -1057,6 +1167,7 @@ mod tests {
                 replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
+                admit_join: Arc::new(cluster::admit_join_locked),
             });
             let listener = Listener {
                 socket: listener,
@@ -1179,6 +1290,7 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: crate::cluster::encoding::fingerprint(&peer.public),
                 static_pubkey: crate::cluster::encoding::encode_base64(&peer.public),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: "test".into(),
@@ -1631,6 +1743,7 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: fingerprint.clone(),
                 static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: fingerprint,
@@ -1713,6 +1826,23 @@ mod tests {
         assert!(limiter.acquire_ip(source).is_some());
     }
 
+    #[test]
+    fn request_limiter_caps_join_attempts_per_ip_for_a_monotonic_minute() {
+        let limiter = RequestLimiter::default();
+        let address = "192.0.2.44".parse().unwrap();
+        let start = Instant::now();
+        for attempt in 0..MAX_JOIN_ATTEMPTS_PER_IP {
+            assert!(
+                limiter.allow_join_attempt(address, start + Duration::from_secs(attempt as u64))
+            );
+        }
+        assert!(!limiter.allow_join_attempt(address, start + Duration::from_secs(20)));
+        assert!(limiter.allow_join_attempt(
+            address,
+            start + JOIN_ATTEMPT_WINDOW + Duration::from_secs(1)
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn socket_accepts_a_fresh_ik_request_and_refuses_its_replay() {
@@ -1748,6 +1878,66 @@ mod tests {
             .send_raw(&duplicate_body, content_length.as_bytes())
             .unwrap();
         assert_eq!(status, 409);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_admits_unknown_join_once_and_passes_optional_endpoint() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let admissions = Arc::new(Mutex::new(Vec::new()));
+        let recorded = admissions.clone();
+        let server = SocketTestServer::start_with_admitter(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "unknown"))),
+            Arc::new(|_| panic!("Join must not reach daemon dispatch")),
+            ConnectionLimits {
+                outer_hold: socket_test_timeout(),
+                post_dispatch_hold: socket_test_timeout(),
+                idle_read: socket_test_timeout(),
+                total_read: socket_test_timeout(),
+            },
+            Arc::new(move |key, endpoint| {
+                recorded.lock().unwrap().push((
+                    cluster::encoding::fingerprint(key),
+                    endpoint.map(str::to_owned),
+                ));
+                Ok(())
+            }),
+        );
+        let token_store =
+            JoinTokenStore::open_at(&server.state_dir, Arc::new(crate::SystemWallClock::new()))
+                .unwrap();
+        let minted = token_store.mint().unwrap();
+        let make_payload = || {
+            serde_json::to_vec(&serde_json::json!({
+                "join": {
+                    "token": minted.token.as_str(),
+                    "endpoint": "198.51.100.20:9443"
+                }
+            }))
+            .unwrap()
+        };
+        let first = sealed_payload_request(&peer, &server, &make_payload());
+        let (status, response) = server.exchange(first);
+        assert_eq!(status, 200);
+        assert_eq!(response, b"{\"joined\":true}");
+        let reused = sealed_payload_request(&peer, &server, &make_payload());
+        let (status, response) = server.exchange(reused);
+        assert_eq!(status, 200);
+        assert_eq!(response, b"{\"joined\":false}");
+        assert_eq!(
+            admissions.lock().unwrap().as_slice(),
+            &[(
+                cluster::encoding::fingerprint(&peer.public),
+                Some("198.51.100.20:9443".into())
+            )]
+        );
     }
 
     #[cfg(unix)]
@@ -1849,6 +2039,51 @@ mod tests {
         assert!(response.contains("invalid remote request"));
         assert!(!response.contains(secret));
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bad_join_tokens_are_rate_limited_without_writing_token_state() {
+        use std::os::unix::fs::MetadataExt;
+
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let server = SocketTestServer::start_production(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Err(permission_denied())),
+            Arc::new(|_| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
+        );
+        let token_path = server.state_dir.join("join_tokens.json");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !token_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let initial_bytes =
+            std::fs::read(&token_path).expect("listener startup observes token state");
+        let initial_inode = std::fs::metadata(&token_path).unwrap().ino();
+        let request = serde_json::json!({
+            "join": { "token": crate::cluster::encoding::encode_base64(&[9; 32]) }
+        });
+        let payload = serde_json::to_vec(&request).unwrap();
+        for _ in 0..MAX_JOIN_ATTEMPTS_PER_IP {
+            let sealed = sealed_payload_request(&peer, &server, &payload);
+            let (status, response) = server.exchange(sealed);
+            assert_eq!(status, 200);
+            assert_eq!(response, b"{\"joined\":false}");
+        }
+        let too_many = sealed_payload_request(&peer, &server, &payload);
+        assert_eq!(server.exchange(too_many).0, 429);
+        assert_eq!(std::fs::read(&token_path).unwrap(), initial_bytes);
+        assert_eq!(
+            std::fs::metadata(&token_path).unwrap().ino(),
+            initial_inode,
+            "bad tokens must not replace token state"
+        );
     }
 
     #[cfg(unix)]
@@ -2274,6 +2509,7 @@ mod tests {
         registry.authorized_nodes.push(AuthorizedNode {
             node_fp: fingerprint.clone(),
             static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+            endpoint: None,
             state: NodeState::Admitted,
             version: 1,
             by: fingerprint,
@@ -2294,6 +2530,7 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: fingerprint.clone(),
                 static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: fingerprint,

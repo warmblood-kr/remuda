@@ -3,6 +3,7 @@
 pub mod cluster_client;
 pub mod frame;
 pub mod http_client;
+pub mod join;
 pub mod listener;
 pub mod replay;
 

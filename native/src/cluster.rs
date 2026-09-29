@@ -35,6 +35,7 @@ pub fn init() -> io::Result<(NodeIdentity, bool)> {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: node.node_fp.clone(),
                 static_pubkey: encoding::encode_base64(&node.static_pubkey),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: node.node_fp.clone(),
@@ -74,6 +75,81 @@ pub fn status() -> io::Result<Option<(NodeIdentity, usize)>> {
             Err(error) => Err(error),
         }
     }
+}
+
+/// Mint a join line for an explicitly selected listener endpoint.
+pub fn mint_join_line(address: std::net::SocketAddr) -> io::Result<join_line::JoinLine> {
+    #[cfg(windows)]
+    {
+        let _ = address;
+        return Err(identity::windows_storage_error());
+    }
+    #[cfg(not(windows))]
+    {
+        let dir = storage::cluster_state_dir()?.join("cluster");
+        let node = identity::load_identity_at(&dir)?;
+        let token_store = join_token::JoinTokenStore::open_at(
+            &dir,
+            std::sync::Arc::new(crate::SystemWallClock::new()),
+        )?;
+        let token = token_store.mint()?;
+        Ok(join_line::JoinLine {
+            issuer_addr: address,
+            issuer_fingerprint: node.node_fp,
+            issuer_static_pubkey: node.static_pubkey.try_into().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid local identity key")
+            })?,
+            token: token.token,
+        })
+    }
+}
+
+/// Admit a peer while the caller holds this node's cluster state lock.
+#[cfg(not(windows))]
+pub(crate) fn admit_join_locked(peer_static: &[u8], endpoint: Option<&str>) -> io::Result<()> {
+    let dir = storage::cluster_state_dir()?.join("cluster");
+    admit_join_locked_at(&dir, peer_static, endpoint)
+}
+
+#[cfg(windows)]
+pub(crate) fn admit_join_locked(_peer_static: &[u8], _endpoint: Option<&str>) -> io::Result<()> {
+    Err(identity::windows_storage_error())
+}
+
+#[cfg(not(windows))]
+fn admit_join_locked_at(
+    dir: &std::path::Path,
+    peer_static: &[u8],
+    endpoint: Option<&str>,
+) -> io::Result<()> {
+    let mut registry = registry::load_registry_at(dir)?;
+    let fp = encoding::fingerprint(peer_static);
+    if let Some(existing) = registry
+        .authorized_nodes
+        .iter()
+        .find(|entry| entry.node_fp == fp)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            if existing.state == NodeState::Revoked {
+                "join key is revoked"
+            } else {
+                "join key is already admitted"
+            },
+        ));
+    }
+    let self_node = identity::load_identity_at(dir)?;
+    registry.merge(&Registry {
+        authorized_nodes: vec![AuthorizedNode {
+            node_fp: fp,
+            static_pubkey: encoding::encode_base64(peer_static),
+            endpoint: endpoint.map(str::to_owned),
+            state: NodeState::Admitted,
+            version: 1,
+            by: self_node.node_fp,
+        }],
+    })?;
+    registry::save_registry_at(dir, &registry)
 }
 
 /// Load the local identity and complete local membership registry.
@@ -330,6 +406,37 @@ mod nodes_revoke_tests {
     }
 
     #[test]
+    fn join_admission_records_the_advertised_endpoint_and_issuer() {
+        let dir = temp_dir();
+        let (issuer, _) = identity::init_identity_at(&dir).unwrap();
+        registry::save_registry_at(
+            &dir,
+            &Registry {
+                authorized_nodes: vec![AuthorizedNode {
+                    node_fp: issuer.node_fp.clone(),
+                    static_pubkey: encoding::encode_base64(&issuer.static_pubkey),
+                    endpoint: None,
+                    state: NodeState::Admitted,
+                    version: 1,
+                    by: issuer.node_fp.clone(),
+                }],
+            },
+        )
+        .unwrap();
+        let (joiner, _) = identity::init_identity_at(&dir.join("joiner")).unwrap();
+        admit_join_locked_at(&dir, &joiner.static_pubkey, Some("192.0.2.40:9443")).unwrap();
+        let registry = registry::load_registry_at(&dir).unwrap();
+        let admitted = registry
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == joiner.node_fp)
+            .unwrap();
+        assert_eq!(admitted.endpoint.as_deref(), Some("192.0.2.40:9443"));
+        assert_eq!(admitted.by, issuer.node_fp);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn revoke_records_local_fingerprint_and_increments_version() {
         let dir = temp_dir();
         let (self_node, _) = identity::init_identity_at(&dir).unwrap();
@@ -339,6 +446,7 @@ mod nodes_revoke_tests {
                 AuthorizedNode {
                     node_fp: self_node.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+                    endpoint: None,
                     state: NodeState::Admitted,
                     version: 1,
                     by: self_node.node_fp.clone(),
@@ -346,6 +454,7 @@ mod nodes_revoke_tests {
                 AuthorizedNode {
                     node_fp: target.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                    endpoint: None,
                     state: NodeState::Admitted,
                     version: 7,
                     by: self_node.node_fp.clone(),
@@ -379,6 +488,7 @@ mod nodes_revoke_tests {
                     AuthorizedNode {
                         node_fp: self_node.node_fp.clone(),
                         static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+                        endpoint: None,
                         state: NodeState::Admitted,
                         version: 1,
                         by: self_node.node_fp.clone(),
@@ -386,6 +496,7 @@ mod nodes_revoke_tests {
                     AuthorizedNode {
                         node_fp: sender.node_fp.clone(),
                         static_pubkey: encoding::encode_base64(&sender.static_pubkey),
+                        endpoint: None,
                         state: NodeState::Admitted,
                         version: 1,
                         by: self_node.node_fp.clone(),
@@ -398,6 +509,7 @@ mod nodes_revoke_tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: target.node_fp.clone(),
                 static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: u64::MAX,
                 by: sender.node_fp.clone(),
@@ -439,6 +551,7 @@ mod nodes_revoke_tests {
                 authorized_nodes: vec![AuthorizedNode {
                     node_fp: self_node.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+                    endpoint: None,
                     state: NodeState::Admitted,
                     version: 1,
                     by: self_node.node_fp.clone(),
@@ -461,6 +574,7 @@ mod nodes_revoke_tests {
                 authorized_nodes: vec![AuthorizedNode {
                     node_fp: target.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                    endpoint: None,
                     state: NodeState::Revoked,
                     version: 12,
                     by: self_node.node_fp.clone(),
@@ -484,6 +598,7 @@ mod nodes_revoke_tests {
             AuthorizedNode {
                 node_fp: "SHA256:abcdefgh-one".into(),
                 static_pubkey: String::new(),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: String::new(),
@@ -491,6 +606,7 @@ mod nodes_revoke_tests {
             AuthorizedNode {
                 node_fp: "SHA256:abcdefgh-two".into(),
                 static_pubkey: String::new(),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: String::new(),
@@ -518,6 +634,7 @@ mod nodes_revoke_tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: identity.node_fp.clone(),
                 static_pubkey: String::new(),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: identity.node_fp.clone(),
@@ -551,6 +668,7 @@ mod nodes_revoke_tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: "SHA256:other".into(),
                 static_pubkey: String::new(),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
                 by: "SHA256:bad\x1b\nvalue".into(),
@@ -579,6 +697,7 @@ mod nodes_revoke_tests {
         let mut entries = vec![AuthorizedNode {
             node_fp: self_node.node_fp.clone(),
             static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+            endpoint: None,
             state: NodeState::Admitted,
             version: 1,
             by: self_node.node_fp.clone(),
@@ -590,6 +709,7 @@ mod nodes_revoke_tests {
             entries.push(AuthorizedNode {
                 node_fp: target.node_fp.clone(),
                 static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                endpoint: None,
                 state: NodeState::Admitted,
                 version: 3,
                 by: self_node.node_fp.clone(),

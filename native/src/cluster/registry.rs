@@ -23,6 +23,8 @@ pub const MAX_REGISTRY_ENTRIES: usize = 1024;
 pub struct AuthorizedNode {
     pub node_fp: String,
     pub static_pubkey: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
     pub state: NodeState,
     pub version: u64,
     pub by: String,
@@ -144,11 +146,31 @@ fn validate_entry(entry: &AuthorizedNode) -> io::Result<Vec<u8>> {
             "registry fingerprint does not match public key",
         ));
     }
+    crate::net::frame::validate_static_public_key(&public_key).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "registry static public key is a low-order X25519 point",
+        )
+    })?;
     if !valid_fingerprint(&entry.by) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "registry by is not a valid SHA256 fingerprint",
         ));
+    }
+    if let Some(endpoint) = &entry.endpoint {
+        let parsed: std::net::SocketAddr = endpoint.parse().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registry endpoint must be host:port",
+            )
+        })?;
+        if parsed.to_string() != *endpoint || super::join_line::validate_endpoint(parsed).is_err() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registry endpoint must be a canonical unicast host:port",
+            ));
+        }
     }
     Ok(public_key)
 }
@@ -231,17 +253,35 @@ pub(super) fn apply_update(
                 "registry entry is attributed to a revoked member",
             ));
         }
-        let exists = current
+        let known = current
             .authorized_nodes
             .iter()
-            .any(|known| known.node_fp == entry.node_fp);
+            .find(|known| known.node_fp == entry.node_fp);
+        let exists = known.is_some();
+        let endpoint_admission =
+            !exists && entry.state == NodeState::Admitted && entry.by == update.sender_fp;
         if !exists && entry.state == NodeState::Admitted && entry.by != update.sender_fp {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "new admission must be vouched for by the update sender",
             ));
         }
-        accepted.push(entry.clone());
+        let mut accepted_entry = entry.clone();
+        if let Some(known) = known {
+            let endpoint_changed = known.endpoint != entry.endpoint;
+            let wins = prefer(entry, known);
+            if endpoint_changed
+                && wins
+                && entry.state == NodeState::Admitted
+                && entry.node_fp != update.sender_fp
+                && !endpoint_admission
+            {
+                // Endpoint hints are owned by their node, but an untrusted
+                // hint must not block an otherwise winning registry update.
+                accepted_entry.endpoint = known.endpoint.clone();
+            }
+        }
+        accepted.push(accepted_entry);
     }
     let received = Registry {
         authorized_nodes: accepted,
@@ -473,6 +513,7 @@ mod tests {
         AuthorizedNode {
             node_fp: actual_fp,
             static_pubkey: encoding::encode_base64(&key),
+            endpoint: None,
             state,
             version,
             by: origin(by),
@@ -525,6 +566,10 @@ mod tests {
             authorized_nodes: vec![second, first],
         };
         assert_eq!(left.digest().unwrap(), right.digest().unwrap());
+
+        let mut endpoint = left.clone();
+        endpoint.authorized_nodes[0].endpoint = Some("192.0.2.4:9443".into());
+        assert_ne!(left.digest().unwrap(), endpoint.digest().unwrap());
 
         let mut unpadded = left.authorized_nodes[0].clone();
         unpadded.static_pubkey = unpadded.static_pubkey.trim_end_matches('=').into();
@@ -877,6 +922,7 @@ mod tests {
         initial.authorized_nodes.push(AuthorizedNode {
             node_fp: receiver.node_fp.clone(),
             static_pubkey: encoding::encode_base64(&receiver.static_pubkey),
+            endpoint: None,
             state: NodeState::Admitted,
             version: 1,
             by: sender.node_fp.clone(),
@@ -915,11 +961,169 @@ mod tests {
     #[test]
     fn registry_round_trips_per_entry_fields() {
         let dir = temp_dir();
+        let mut joined = entry("fp-a", NodeState::Admitted, 1, "fp-a");
+        joined.endpoint = Some("192.0.2.4:9443".into());
         let registry = Registry {
-            authorized_nodes: vec![entry("fp-a", NodeState::Admitted, 1, "fp-a")],
+            authorized_nodes: vec![joined],
         };
         save_registry_at(&dir, &registry).unwrap();
         assert_eq!(load_registry_at(&dir).unwrap(), registry);
+    }
+
+    #[test]
+    fn old_registry_entries_without_endpoint_still_load() {
+        let dir = temp_dir();
+        let mut entry = entry("old-node", NodeState::Admitted, 1, "old-node");
+        entry.endpoint = Some("192.0.2.4:9443".into());
+        let mut value = serde_json::to_value(Registry {
+            authorized_nodes: vec![entry],
+        })
+        .unwrap();
+        value["authorized_nodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("endpoint");
+        storage::atomic_write(
+            &dir.join(REGISTRY_FILE),
+            &serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            load_registry_at(&dir).unwrap().authorized_nodes[0].endpoint,
+            None
+        );
+    }
+
+    #[test]
+    fn registry_rejects_invalid_endpoint_hints() {
+        let mut invalid = entry("bad-endpoint", NodeState::Admitted, 1, "node");
+        invalid.endpoint = Some("0.0.0.0:9443".into());
+        assert!(Registry {
+            authorized_nodes: vec![invalid]
+        }
+        .digest()
+        .is_err());
+    }
+
+    #[test]
+    fn registry_rejects_known_low_order_x25519_points() {
+        let mut low_order = [0u8; 32];
+        low_order[0] = 1;
+        let invalid = AuthorizedNode {
+            node_fp: encoding::fingerprint(&low_order),
+            static_pubkey: encoding::encode_base64(&low_order),
+            endpoint: None,
+            state: NodeState::Admitted,
+            version: 1,
+            by: origin("node"),
+        };
+        assert!(Registry {
+            authorized_nodes: vec![invalid]
+        }
+        .digest()
+        .is_err());
+    }
+
+    #[test]
+    fn non_owner_endpoint_change_is_dropped_without_rejecting_update() {
+        let sender = admitted_sender();
+        let mut target = entry("endpoint-target", NodeState::Admitted, 1, "sender");
+        target.endpoint = Some("192.0.2.10:9443".into());
+        let mut registry = Registry {
+            authorized_nodes: vec![sender.clone(), target.clone()],
+        };
+        let mut forged = target.clone();
+        forged.endpoint = Some("192.0.2.20:9443".into());
+        forged.version += 1;
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![forged],
+        };
+        apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+        let updated = registry
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == target.node_fp)
+            .unwrap();
+        assert_eq!(updated.version, target.version + 1);
+        assert_eq!(updated.endpoint.as_deref(), Some("192.0.2.10:9443"));
+
+        let mut self_update = sender.clone();
+        self_update.endpoint = Some("192.0.2.10:9443".into());
+        self_update.version += 1;
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![self_update],
+        };
+        apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+        assert_eq!(
+            registry
+                .authorized_nodes
+                .iter()
+                .find(|entry| entry.node_fp == sender.node_fp)
+                .unwrap()
+                .endpoint
+                .as_deref(),
+            Some("192.0.2.10:9443")
+        );
+    }
+
+    #[test]
+    fn probe_revoke_is_not_blocked_by_endpoint_mismatch() {
+        let sender = admitted_sender();
+        let mut target = entry("revoked-endpoint-target", NodeState::Admitted, 4, "sender");
+        target.endpoint = Some("192.0.2.10:9443".into());
+        let mut registry = Registry {
+            authorized_nodes: vec![sender.clone(), target.clone()],
+        };
+        let mut tombstone = target.clone();
+        tombstone.state = NodeState::Revoked;
+        tombstone.version += 1;
+        tombstone.by = sender.node_fp.clone();
+        tombstone.endpoint = None;
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![tombstone],
+        };
+        apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+        let revoked = registry
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == target.node_fp)
+            .unwrap();
+        assert_eq!(revoked.state, NodeState::Revoked);
+        assert_eq!(revoked.endpoint, None);
+    }
+
+    #[test]
+    fn probe_stale_relayed_entry_with_old_endpoint_does_not_reject_update() {
+        let sender = admitted_sender();
+        let mut target = entry("stale-endpoint-target", NodeState::Admitted, 5, "sender");
+        target.endpoint = Some("192.0.2.20:9443".into());
+        let mut registry = Registry {
+            authorized_nodes: vec![sender.clone(), target.clone()],
+        };
+        let mut stale = target.clone();
+        stale.version -= 1;
+        stale.endpoint = Some("192.0.2.10:9443".into());
+        let mut unrelated = entry("unrelated-admission", NodeState::Admitted, 1, "sender");
+        unrelated.by = sender.node_fp.clone();
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![stale, unrelated.clone()],
+        };
+        apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+        let retained = registry
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == target.node_fp)
+            .unwrap();
+        assert_eq!(retained.version, target.version);
+        assert_eq!(retained.endpoint.as_deref(), Some("192.0.2.20:9443"));
+        assert!(registry
+            .authorized_nodes
+            .iter()
+            .any(|entry| entry.node_fp == unrelated.node_fp));
     }
 
     #[test]
@@ -1007,6 +1211,7 @@ mod tests {
         let invalid = AuthorizedNode {
             node_fp: encoding::fingerprint(&short_key),
             static_pubkey: encoding::encode_base64(&short_key),
+            endpoint: None,
             state: NodeState::Admitted,
             version: 1,
             by: origin("node"),

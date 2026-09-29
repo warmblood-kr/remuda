@@ -118,6 +118,11 @@ pub(super) fn reject_low_order_dh(private_key: &[u8], public_key: &[u8]) -> io::
     Ok(())
 }
 
+/// Refuse a static X25519 public key that produces the all-zero DH result.
+pub fn validate_static_public_key(public_key: &[u8]) -> io::Result<()> {
+    reject_low_order_dh(&[0x42; 32], public_key)
+}
+
 #[cfg(test)]
 pub(super) fn request_with_low_order_key(
     responder_static: &[u8],
