@@ -1122,17 +1122,16 @@ impl Drop for RawMode {
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use super::request_with_timeout;
-    #[cfg(unix)]
     use super::trace_input_read;
-    use super::{interpret, reset_input_modes, write_input_trace, RESET_INPUT_MODES};
+    use super::{
+        interpret, read_response_with_timeout, request_with_timeout, reset_input_modes,
+        write_input_trace, RESET_INPUT_MODES,
+    };
     #[cfg(unix)]
     use crate::ipc;
     #[cfg(unix)]
-    use interprocess::local_socket::traits::ListenerExt;
-    #[cfg(unix)]
-    use remuda_core::protocol::Request;
-    use remuda_core::protocol::Response;
+    use interprocess::local_socket::traits::Listener as _;
+    use remuda_core::protocol::{Request, Response};
     #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(unix)]
@@ -1155,11 +1154,7 @@ mod tests {
         let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
-            let stream = listener
-                .incoming()
-                .next()
-                .expect("incoming connection")
-                .expect("accept");
+            let stream = listener.accept().expect("accept");
             accepted_tx.send(()).expect("notify accepted");
             release_rx.recv().expect("release silent peer");
             drop(stream);
@@ -1216,32 +1211,6 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn local_daemon_response_wait_has_a_timeout() {
-        use interprocess::local_socket::traits::ListenerExt as _;
-        let path = std::env::temp_dir().join(format!(
-            "remuda-client-timeout-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let listener = crate::ipc::listen(&path).unwrap();
-        let server = std::thread::spawn(move || {
-            let _stream = listener.incoming().next().unwrap().unwrap();
-            std::thread::sleep(Duration::from_millis(250));
-        });
-        let started = std::time::Instant::now();
-        let error =
-            request_with_timeout(&path, &Request::List, Duration::from_millis(40)).unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < Duration::from_millis(200));
-        server.join().unwrap();
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[cfg(unix)]
-    #[test]
     fn reply_reader_rejects_a_line_over_the_shared_reply_limit() {
         use super::read_response;
         use crate::ipc;
@@ -1274,19 +1243,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn detach_resets_mouse_and_bracketed_paste_modes() {
-        let mut output = Vec::new();
-        reset_input_modes(&mut output).unwrap();
-        assert_eq!(output, RESET_INPUT_MODES);
-    }
-
     #[cfg(unix)]
     #[test]
     fn response_is_read_when_peer_closes_before_timeout_is_set() {
-        use super::read_response_with_timeout;
         use crate::ipc;
-        use interprocess::local_socket::traits::Listener as _;
         use std::io::Write;
 
         let path = std::env::temp_dir().join(format!(
@@ -1311,6 +1271,39 @@ mod tests {
         let response = read_response_with_timeout(&path, stream, Duration::from_secs(1)).unwrap();
 
         assert_eq!(response, expected);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn detach_resets_mouse_and_bracketed_paste_modes() {
+        let mut output = Vec::new();
+        reset_input_modes(&mut output).unwrap();
+        assert_eq!(output, RESET_INPUT_MODES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_daemon_response_wait_has_a_timeout() {
+        use interprocess::local_socket::traits::ListenerExt as _;
+        let path = std::env::temp_dir().join(format!(
+            "remuda-client-timeout-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = crate::ipc::listen(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let _stream = listener.incoming().next().unwrap().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+        let started = std::time::Instant::now();
+        let error =
+            request_with_timeout(&path, &Request::List, Duration::from_millis(40)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(200));
+        server.join().unwrap();
         let _ = std::fs::remove_file(path);
     }
 

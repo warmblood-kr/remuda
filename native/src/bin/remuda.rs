@@ -338,6 +338,14 @@ fn help_command() -> ExitCode {
 enum ClusterCommand {
     Status,
     Init,
+    Invite {
+        bind_addr: std::net::SocketAddr,
+    },
+    Join {
+        fingerprint: String,
+        invitation: remuda_native::cluster::join_line::JoinLine,
+        bind_addr: Option<std::net::SocketAddr>,
+    },
     Nodes,
     Control(bool),
     Revoke {
@@ -368,6 +376,33 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
     match args {
         [] => ClusterCommand::Status,
         ["init"] => ClusterCommand::Init,
+        ["invite", "--bind", address] => address
+            .parse()
+            .map(|bind_addr| ClusterCommand::Invite { bind_addr })
+            .unwrap_or(ClusterCommand::Invalid),
+        ["join", fingerprint, line] => remuda_native::cluster::join_line::JoinLine::decode(line)
+            .map(|invitation| ClusterCommand::Join {
+                fingerprint: (*fingerprint).into(),
+                invitation,
+                bind_addr: None,
+            })
+            .unwrap_or(ClusterCommand::Invalid),
+        ["join", fingerprint, line, "--bind", address] => match (
+            remuda_native::cluster::join_line::JoinLine::decode(line),
+            address
+                .parse::<std::net::SocketAddr>()
+                .ok()
+                .filter(|address| {
+                    remuda_native::cluster::join_line::validate_endpoint(*address).is_ok()
+                }),
+        ) {
+            (Ok(invitation), Some(bind_addr)) => ClusterCommand::Join {
+                fingerprint: (*fingerprint).into(),
+                invitation,
+                bind_addr: Some(bind_addr),
+            },
+            _ => ClusterCommand::Invalid,
+        },
         ["nodes"] => ClusterCommand::Nodes,
         ["control", "on"] => ClusterCommand::Control(true),
         ["control", "off"] => ClusterCommand::Control(false),
@@ -457,6 +492,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                 println!("Node: {}", identity.node_name);
                 println!("Fingerprint: {}", identity.node_fp);
                 println!("Members: {members}");
+                println!("Authority: Any admitted member can admit new keys and revoke any member cluster-wide (see #282).");
                 match remuda_native::cluster::control::enabled() {
                     Ok(enabled) => {
                         let (setting, trust) = remote_control_status_lines(enabled);
@@ -478,6 +514,12 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             }
             Err(error) => fail(format!("cluster init: {error}")),
         },
+        ClusterCommand::Invite { bind_addr } => cluster_invite(bind_addr),
+        ClusterCommand::Join {
+            fingerprint,
+            invitation,
+            bind_addr,
+        } => cluster_join_command(&fingerprint, &invitation, bind_addr),
         ClusterCommand::Nodes => match remuda_native::cluster::nodes() {
             Ok(Some((identity, registry))) => {
                 let mut stdout = std::io::stdout().lock();
@@ -532,9 +574,34 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             json,
         } => cluster_call(&target, address, action, json),
         ClusterCommand::Invalid => {
-            eprintln!("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | control on|off | remote [node/session] | listen --bind ADDR [--allow-public] | call NODE (list | capture SESSION) --addr HOST:PORT [--json]]");
+            eprintln!("usage: remuda cluster [init | invite --bind ADDR | join <fingerprint> <join-line> [--bind ADDR] | nodes | revoke <node|fingerprint> [--yes] | control on|off | remote [node/session] | listen --bind ADDR [--allow-public] | call NODE (list | capture SESSION) --addr HOST:PORT [--json]]");
             ExitCode::from(2)
         }
+    }
+}
+
+fn cluster_invite(bind_addr: std::net::SocketAddr) -> ExitCode {
+    match remuda_native::cluster::mint_join_line(bind_addr).and_then(|line| line.encode()) {
+        Ok(line) => {
+            println!("Join line (expires in 10 minutes):\n{line}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(format!("cluster invite: {error}")),
+    }
+}
+
+fn cluster_join_command(
+    fingerprint: &str,
+    invitation: &remuda_native::cluster::join_line::JoinLine,
+    bind_addr: Option<std::net::SocketAddr>,
+) -> ExitCode {
+    match cluster_join(fingerprint, invitation, bind_addr) {
+        Ok(()) => {
+            println!("Joined cluster.");
+            report_cluster_pushes();
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(format!("cluster join: {error}")),
     }
 }
 
@@ -771,11 +838,10 @@ fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
         Ok(true) => {}
         Err(error) => return fail(format!("cluster revoke: {error}")),
     }
-    match remuda_native::cluster::revoke(&fingerprint) {
+    match remuda_native::cluster::revoke_local(&fingerprint) {
         Ok(remuda_native::cluster::RevokeOutcome::Revoked) => {
-            println!(
-                "Node {label} revoked locally; propagates when the cluster transport is enabled."
-            );
+            println!("Node {label} revoked locally.");
+            report_cluster_pushes();
             ExitCode::SUCCESS
         }
         Ok(remuda_native::cluster::RevokeOutcome::AlreadyRevoked) => {
@@ -784,6 +850,56 @@ fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
         }
         Err(error) => fail(format!("cluster revoke: {error}")),
     }
+}
+
+fn report_cluster_pushes() {
+    let peers = remuda_native::cluster::push_now();
+    if peers.is_empty() {
+        println!("Registry push: no configured peers.");
+        return;
+    }
+    let needs_retry = peers.iter().any(|peer| !peer.reached);
+    for peer in peers {
+        if peer.reached {
+            println!("Registry push reached peer {}.", peer.peer_fp);
+        } else {
+            eprintln!(
+                "Registry push did not reach peer {}: {}.",
+                peer.peer_fp, peer.detail
+            );
+        }
+    }
+    if needs_retry {
+        // The synchronous CLI push is bounded. Keep a failed admission or
+        // revocation queued so anti-entropy does not have to wait for its
+        // much slower periodic pass to retry it.
+        remuda_native::cluster::registry_changed();
+    }
+}
+
+fn cluster_join(
+    shown_fingerprint: &str,
+    invitation: &remuda_native::cluster::join_line::JoinLine,
+    bind_addr: Option<std::net::SocketAddr>,
+) -> std::io::Result<()> {
+    cluster_join_with_private_loader(shown_fingerprint, invitation, bind_addr, || {
+        remuda_native::cluster::identity::load_static_private_key()
+    })
+}
+
+fn cluster_join_with_private_loader(
+    shown_fingerprint: &str,
+    invitation: &remuda_native::cluster::join_line::JoinLine,
+    bind_addr: Option<std::net::SocketAddr>,
+    load_private: impl FnOnce() -> std::io::Result<zeroize::Zeroizing<Vec<u8>>>,
+) -> std::io::Result<()> {
+    invitation.verify_pin(shown_fingerprint)?;
+    let private = load_private()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(std::io::Error::other)?
+        .as_secs() as i64;
+    remuda_native::net::join::join(invitation, &private, now, bind_addr)
 }
 
 fn revoke_confirmation(yes: bool, stdin_tty: bool, stderr_tty: bool) -> Result<bool, &'static str> {
@@ -835,17 +951,120 @@ fn cluster_init_message(created: bool) -> &'static str {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)]
 mod cluster_cli_tests {
+    #[cfg(unix)]
+    use super::cluster_join_with_private_loader;
     use super::{
         cluster_init_message, confirmation_answer_is_yes, parse_cluster_command,
         remote_control_status_lines, revoke_confirmation, write_nodes_table, ClusterCommand,
     };
+    #[cfg(unix)]
+    use remuda_native::cluster::join_line::JoinLine;
+    #[cfg(unix)]
+    use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(unix)]
+    use std::sync::Arc;
+    #[cfg(unix)]
+    use std::time::{Duration, Instant};
+    #[cfg(unix)]
+    use zeroize::Zeroizing;
 
     #[test]
     fn cluster_status_and_init_are_recognized() {
         assert_eq!(parse_cluster_command(&[]), ClusterCommand::Status);
         assert_eq!(parse_cluster_command(&["init"]), ClusterCommand::Init);
         assert_eq!(parse_cluster_command(&["join"]), ClusterCommand::Invalid);
+    }
+
+    #[test]
+    fn cluster_join_accepts_optional_client_endpoint() {
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let invitation = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.4:9443".parse().unwrap(),
+            issuer_fingerprint: fingerprint.clone(),
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        };
+        let line = invitation.encode().unwrap();
+        assert!(matches!(
+            parse_cluster_command(&["join", &fingerprint, &line]),
+            ClusterCommand::Join {
+                bind_addr: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse_cluster_command(&["join", &fingerprint, &line, "--bind", "192.0.2.8:9443"]),
+            ClusterCommand::Join {
+                bind_addr: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            parse_cluster_command(&["join", &fingerprint, &line, "--bind", "0.0.0.0:9443"]),
+            ClusterCommand::Invalid
+        );
+    }
+
+    #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::disallowed_types)]
+    fn mismatched_join_pin_fails_before_connecting() {
+        let keypair = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let expected = remuda_native::cluster::encoding::fingerprint(&keypair.public);
+        let invitation = JoinLine {
+            issuer_addr: "127.0.0.1:9".parse().unwrap(),
+            issuer_fingerprint: expected.clone(),
+            issuer_static_pubkey: keypair.public.as_slice().try_into().unwrap(),
+            token: Zeroizing::new(remuda_native::cluster::encoding::encode_base64(&[9; 32])),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let mut invitation = invitation;
+        invitation.issuer_addr = address;
+
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let count = accepts.clone();
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let mut request = [0; 1024];
+                        let _ = stream.read(&mut request);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("listener accept failed: {error}"),
+                }
+            }
+        });
+
+        let result = cluster_join_with_private_loader("SHA256:wrong", &invitation, None, || {
+            Ok(Zeroizing::new(keypair.private))
+        });
+        let error = result.unwrap_err().to_string();
+        server.join().unwrap();
+        assert!(error.contains("expected SHA256:wrong"), "{error}");
+        assert!(error.contains(&format!("received {expected}")), "{error}");
+        assert_eq!(accepts.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1377,6 +1596,14 @@ fn split_stdin_flag(args: &[String]) -> Result<(bool, &[String]), &'static str> 
         [flag, ..] if flag == "--stdin" => {
             Err("--stdin is only valid before an installed mod command")
         }
+        [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
+            let options = rest.split(|arg| arg == "--").next().unwrap_or(rest);
+            if options.iter().any(|arg| arg == "--stdin") {
+                Err("usage: remuda --stdin MOD [ARGS…] (put --stdin before the mod command)")
+            } else {
+                Ok((false, args))
+            }
+        }
         _ => Ok((false, args)),
     }
 }
@@ -1580,7 +1807,11 @@ fn extension_command(
         .collect::<Vec<_>>()
         .join(", ");
     let env = caller_env(std::env::vars());
-    let stdin_opted_in = stdin_enabled || args.contains(&"-");
+    let stdin_opted_in = stdin_enabled
+        || args
+            .iter()
+            .take_while(|argument| **argument != "--")
+            .any(|argument| *argument == "-");
     let stdin = if stdin_opted_in {
         const MAX_CALLER_STDIN: usize = 1024 * 1024;
         let mut bytes = Vec::new();
@@ -2554,6 +2785,10 @@ fn simple_request(path: &Path, request: Request) -> ExitCode {
 fn describe(response: std::io::Result<Response>) -> String {
     match response {
         Ok(Response::Error(reason)) => reason,
+        Ok(Response::Busy) => "session input is busy".into(),
+        Ok(Response::WriteTimeout) => {
+            "session PTY write timed out; delivery may be partial or late".into()
+        }
         Ok(other) => format!("unexpected response: {other:?}"),
         Err(e) => e.to_string(),
     }
@@ -2594,6 +2829,15 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_timeout_has_a_user_facing_diagnostic() {
+        assert_eq!(
+            describe(Ok(Response::WriteTimeout)),
+            "session PTY write timed out; delivery may be partial or late"
+        );
+        assert_eq!(describe(Ok(Response::Busy)), "session input is busy");
+    }
 
     #[test]
     fn a_failed_daemon_start_includes_its_stderr() {

@@ -94,22 +94,41 @@ impl JoinTokenStore {
 
     /// Verify and durably consume a token; all later uses are refused.
     pub fn verify_and_consume(&self, token: &str) -> io::Result<()> {
-        {
-            let hash = token_hash(token)?;
-            let _guard = storage::StateLock::acquire(&self.directory)?;
-            let now = self.clock.unix_seconds();
-            let mut state = load_state(&self.directory, now)?;
-            state.observe(now);
-            let position = state.tokens.iter().position(|record| {
-                record.expires_at_unix_seconds > now && hashes_equal(&record.hash, &hash)
-            });
-            if let Some(position) = position {
-                state.tokens.remove(position);
-                save_state(&self.directory, &state)?;
-                Ok(())
-            } else {
-                save_state(&self.directory, &state)?;
-                Err(refused_token())
+        self.verify_consume_with(token, || Ok(()))
+    }
+
+    /// Persist token consumption before admission while holding the state lock.
+    /// If admission refuses, restore the token before releasing the lock.
+    pub fn verify_consume_with<T>(
+        &self,
+        token: &str,
+        admit: impl FnOnce() -> io::Result<T>,
+    ) -> io::Result<T> {
+        let hash = token_hash(token)?;
+        let _guard = storage::StateLock::acquire(&self.directory)?;
+        let now = self.clock.unix_seconds();
+        let mut state = load_state(&self.directory, now)?;
+        state.observe(now);
+        let position = state.tokens.iter().position(|record| {
+            record.expires_at_unix_seconds > now && hashes_equal(&record.hash, &hash)
+        });
+        let Some(position) = position else {
+            // Do not let invalid-token traffic rewrite the persistent file.
+            return Err(refused_token());
+        };
+        let consumed = state.tokens.remove(position);
+        save_state(&self.directory, &state)?;
+        match admit() {
+            Ok(result) => Ok(result),
+            Err(admission_error) => {
+                state.tokens.push(consumed);
+                if let Err(restore_error) = save_state(&self.directory, &state) {
+                    return Err(io::Error::other(format!(
+                        "join admission failed ({}); token restoration failed ({restore_error})",
+                        admission_error
+                    )));
+                }
+                Err(admission_error)
             }
         }
     }

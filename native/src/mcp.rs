@@ -236,6 +236,11 @@ fn call_response(id: Value, response: Response) -> String {
                 "applied"
             }),
         ),
+        Response::ClusterRegistryPage { .. } | Response::ClusterRegistryAck { .. } => ok_reply(
+            id,
+            tool_error("cluster registry responses are not exposed over MCP"),
+        ),
+        Response::Sessions(sessions) => ok_reply(id, sessions_text(sessions)),
         response @ (Response::Uncertain
         | Response::WrongInstance
         | Response::RateLimited
@@ -243,7 +248,6 @@ fn call_response(id: Value, response: Response) -> String {
         | Response::WriteTimeout
         | Response::RemoteControlDisabled) => input_error_reply(id, input_error_message(&response)),
         Response::SyncAtCapacity => ok_reply(id, tool_error("Sync is at capacity; retry shortly")),
-        Response::Sessions(sessions) => ok_reply(id, sessions_text(sessions)),
     }
 }
 
@@ -258,8 +262,8 @@ fn input_error_message(response: &Response) -> &'static str {
         Response::RateLimited => "session input rate limit exceeded",
         Response::Busy => "session input is busy",
         Response::WriteTimeout => "session PTY write timed out; delivery may be partial or late",
-        Response::RemoteControlDisabled => "remote control disabled on this node",
-        _ => unreachable!("only input errors are passed here"),
+        Response::RemoteControlDisabled => "remote control is disabled on the target node",
+        _ => "input was refused",
     }
 }
 

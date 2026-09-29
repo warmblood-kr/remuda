@@ -133,9 +133,14 @@ fn admit_pair(left: &Node, right: &Node) {
                 .map(|member| AuthorizedNode {
                     node_fp: member.fingerprint(),
                     static_pubkey: encoding::encode_base64(&member.public),
+                    format_major: remuda_native::cluster::registry::REGISTRY_FORMAT_MAJOR,
+                    format_minor: remuda_native::cluster::registry::REGISTRY_FORMAT_MINOR,
+                    endpoint: None,
+                    delivered_by: None,
                     state: NodeState::Admitted,
                     version: 1,
                     by: left.fingerprint(),
+                    optional_fields: Default::default(),
                 })
                 .collect(),
         };

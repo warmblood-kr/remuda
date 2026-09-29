@@ -163,8 +163,8 @@ impl RemoteSelection {
     }
 }
 
-/// Build poll targets from the cluster registry. PR9 adds the registry endpoint
-/// field; until then these targets have no route and the TUI reports that fact.
+/// Build poll targets from admitted registry entries. The shared target resolver
+/// uses each entry's endpoint for routing and its pinned key for authentication.
 pub fn registry_targets(
     registry: &crate::cluster::Registry,
     local_fingerprint: &str,
@@ -1038,6 +1038,11 @@ mod tests {
                 crate::cluster::AuthorizedNode {
                     node_fp: "admitted-fingerprint".into(),
                     static_pubkey: String::new(),
+                    format_major: 1,
+                    format_minor: 0,
+                    endpoint: None,
+                    delivered_by: None,
+                    optional_fields: Default::default(),
                     state: crate::cluster::NodeState::Admitted,
                     version: 1,
                     by: "local".into(),
@@ -1045,6 +1050,11 @@ mod tests {
                 crate::cluster::AuthorizedNode {
                     node_fp: "revoked-fingerprint".into(),
                     static_pubkey: String::new(),
+                    format_major: 1,
+                    format_minor: 0,
+                    endpoint: None,
+                    delivered_by: None,
+                    optional_fields: Default::default(),
                     state: crate::cluster::NodeState::Revoked,
                     version: 1,
                     by: "local".into(),

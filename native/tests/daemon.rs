@@ -1179,6 +1179,167 @@ fn attached_keystrokes_survive_a_pty_write_timeout_without_detaching() {
 
 #[cfg(unix)]
 #[test]
+fn attached_slow_reader_accepts_a_paste_larger_than_the_input_queue() {
+    let runtime = scratch_dir("attach-slow-reader-paste");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&socket);
+    let capture_path = runtime.join("typed-bytes");
+    let ready_path = runtime.join("reader-ready");
+    let mut env = std::collections::HashMap::new();
+    env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    env.insert("READY_PATH".into(), ready_path.display().to_string());
+    let response = client::request(
+        &socket,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw -echo; : >\"$READY_PATH\"; i=0; while [ \"$i\" -lt 192 ]; do dd bs=64 count=1 2>/dev/null >>\"$CAPTURE_PATH\"; i=$((i+1)); sleep 0.05; done; while :; do sleep 1; done".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start slow raw reader");
+    assert!(matches!(response, Response::Value(_)));
+    let ready_deadline = Instant::now() + PATIENCE;
+    while !ready_path.exists() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "slow reader did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut stream = raw_attach(&socket, "target");
+    let expected = vec![b'x'; 12_288];
+    stream
+        .write_all(&expected)
+        .expect("paste into attached session");
+    assert_eq!(target_row(&socket, "r.attached"), "true");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if std::fs::read(&capture_path).ok().as_deref() == Some(expected.as_slice()) {
+            break;
+        }
+        assert_eq!(
+            target_row(&socket, "r.attached"),
+            "true",
+            "slow input must not tear down the healthy attachment"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "slow reader did not receive the paste (captured {} of {} bytes)",
+            std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+            expected.len()
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        std::fs::read(&capture_path).expect("read captured paste"),
+        expected,
+        "every byte arrives in order"
+    );
+    drop(stream);
+    let detach_deadline = Instant::now() + PATIENCE;
+    while target_row(&socket, "r.attached") == "true" {
+        assert!(
+            Instant::now() < detach_deadline,
+            "EOF did not release attach"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_eof_drains_input_already_read_by_the_key_pump() {
+    let runtime = scratch_dir("attach-eof-drains-keys");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&socket);
+    let capture_path = runtime.join("typed-bytes");
+    let ready_path = runtime.join("reader-ready");
+    let mut env = std::collections::HashMap::new();
+    env.insert("CAPTURE_PATH".into(), capture_path.display().to_string());
+    env.insert("READY_PATH".into(), ready_path.display().to_string());
+    let response = client::request(
+        &socket,
+        &Request::New {
+            name: Some("target".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "stty raw echo; : >\"$READY_PATH\"; i=0; while [ \"$i\" -lt 12 ]; do dd bs=1024 count=1 iflag=fullblock 2>/dev/null >>\"$CAPTURE_PATH\"; i=$((i+1)); sleep 0.05; done; while :; do sleep 1; done".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start gated raw reader");
+    assert!(matches!(response, Response::Value(_)));
+    let ready_deadline = Instant::now() + PATIENCE;
+    while !ready_path.exists() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "gated reader did not become ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let mut stream = ipc::connect(&socket).expect("connect attach client");
+    let mut request = serde_json::to_vec(&Request::Attach {
+        name: "target".to_string(),
+    })
+    .expect("serialize Attach");
+    request.push(b'\n');
+    stream.write_all(&request).expect("send Attach");
+    // The daemon's acknowledgement and initial screen paint now encounter
+    // EPIPE, while the client can still send input on the other half.
+    let ipc::Stream::UdSocket(unix_socket) = &stream;
+    use std::os::fd::{AsFd, AsRawFd};
+    nix::sys::socket::shutdown(
+        unix_socket.as_fd().as_raw_fd(),
+        nix::sys::socket::Shutdown::Read,
+    )
+    .expect("shut down attach output half");
+    let expected = vec![b'y'; 12_288];
+    stream
+        .write_all(&expected)
+        .expect("send keys after shutting down output half");
+    drop(stream);
+
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if std::fs::read(&capture_path).ok().as_deref() == Some(expected.as_slice()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "EOF discarded buffered attach keys (captured {} of {} bytes)",
+            std::fs::metadata(&capture_path).map_or(0, |metadata| metadata.len()),
+            expected.len()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        std::fs::read(&capture_path).expect("read bytes delivered before detach"),
+        expected
+    );
+    while target_row(&socket, "r.attached") == "true" {
+        assert!(
+            Instant::now() < deadline,
+            "drained EOF did not release attach"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
     let runtime = unique_scratch_dir("probe-attach-stall");
     let socket = daemon::socket_path_in(&runtime, "s");
@@ -3340,6 +3501,58 @@ fn a_session_exited_hook_fires_once_when_a_session_is_closed() {
 }
 
 #[test]
+fn a_late_session_exited_event_carries_the_closed_instance_id() {
+    let path = scratch("session-exited-reused-name");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda._closed_instance_ids = {}
+            remuda.on("session_exited", function(name, details)
+                if name == "reused" then
+                    table.insert(remuda._closed_instance_ids, details.instance_id or "")
+                end
+            end)
+        "#,
+    );
+    new_session(&path, "reused");
+    let old_instance_id = match client::request(&path, &Request::List).expect("list old session") {
+        Response::Sessions(sessions) => sessions
+            .into_iter()
+            .find(|session| session.name == "reused")
+            .and_then(|session| session.instance_id)
+            .expect("old instance id"),
+        other => panic!("unexpected List response: {other:?}"),
+    };
+    let closed = client::request(
+        &path,
+        &Request::Close {
+            name: "reused".into(),
+            instance_id: Some(old_instance_id.clone()),
+            confirm: Some(true),
+        },
+    )
+    .expect("close old instance");
+    assert_eq!(closed, Response::Ok);
+    new_session(&path, "reused");
+
+    let event_id = "return remuda._closed_instance_ids[1] or ''";
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let observed = eval(&path, event_id);
+        if !observed.is_empty() {
+            assert_eq!(observed, old_instance_id);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "late session_exited event did not include the closed instance id"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
 fn confirmed_close_refuses_a_mismatched_instance_and_keeps_the_session() {
     let path = scratch("close-wrong-instance");
     let _daemon = daemon_at(&path);
@@ -4638,7 +4851,9 @@ fn a_sigkilled_daemon_reaps_a_codex_app_server_in_its_session() {
     let deadline = Instant::now() + PATIENCE;
     let app_server_pid = loop {
         if let Ok(pid) = std::fs::read_to_string(&pid_file) {
-            break pid.trim().parse::<i32>().unwrap();
+            if let Ok(pid) = pid.trim().parse::<i32>() {
+                break pid;
+            }
         }
         assert!(Instant::now() < deadline, "stub app-server never started");
         std::thread::sleep(Duration::from_millis(20));
