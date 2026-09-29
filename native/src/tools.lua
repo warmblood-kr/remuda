@@ -273,7 +273,7 @@ end
 -- One step is kept separate from the wake-up source: the current driver is
 -- the one-second clock below, and a future PTY output event can call this same
 -- function without changing remuda.expect's API.
-local function expect_step(handle, now)
+local function expect_step(handle, now, force)
   local state, options = handle.state, handle.options
   if state.status ~= "pending" then return state.status, state.branch, state.screen end
   state.last_result = nil
@@ -290,9 +290,9 @@ local function expect_step(handle, now)
   if not state.deadline then
     state.deadline = now + handle.timeout
     state.next_at = now + (tonumber(options.interval) or 1)
-    return "waiting"
+    if not force then return "waiting" end
   end
-  if now < state.next_at then return "waiting" end
+  if not force and now < state.next_at then return "waiting" end
   local capture = options.capture or remuda.capture
   local captured, screen = pcall(capture, handle.session)
   if not captured then
@@ -408,6 +408,24 @@ local function expect_tick(now)
   end
   pending_expects = keep
 end
+
+local function expect_output(name)
+  local keep = {}
+  for _, handle in ipairs(pending_expects) do
+    if handle.state.status == "pending" then
+      if handle.session == name then
+        local ok, err = pcall(expect_step, handle, expect_clock_now, true)
+        if not ok then
+          handle.state.status, handle.state.error = "error", err
+          if handle.options.on_error then pcall(handle.options.on_error, err, handle) end
+        end
+      end
+      if handle.state.status == "pending" then keep[#keep + 1] = handle end
+    end
+  end
+  pending_expects = keep
+end
+
 function remuda.expect_option(screen, matches)
   if type(screen) ~= "string" or type(matches) ~= "function" then return nil end
   local found
@@ -539,6 +557,9 @@ function remuda.on(event, fn, opts)
     src = source_of(fn), errors = 0, owner = current_owner })
 end
 register("on", "Register a callback to run when an event fires. `opts`: `group`, `id` (same group+id replaces), `depth` (-100..100, lower first).", "on(event, fn, opts?) -> nil")
+
+remuda.on("session_output", function(name) expect_output(name) end,
+  { group = "remuda.expect", id = "session-output" })
 
 -- A snapshot, not a live reference to `remuda.hooks[event]` — a hook that
 -- calls `clear_hooks` on its own group must not skip or re-run a sibling
@@ -1030,6 +1051,18 @@ function remuda._activate_module(name, candidate, reactivate)
   if candidate.stop ~= nil and type(candidate.stop) ~= "function" then
     error("module stop must be a function", 0)
   end
+  if candidate.ready ~= nil and type(candidate.ready) ~= "function" then
+    error("module ready must be a function", 0)
+  end
+  local timeout_ms = candidate.timeout_ms
+  if timeout_ms == nil then timeout_ms = 30000 end
+  if candidate.ready ~= nil and (type(timeout_ms) ~= "number" or timeout_ms % 1 ~= 0
+    or timeout_ms < 1 or timeout_ms > 240000) then
+    error("module timeout_ms must be an integer from 1 through 240000", 0)
+  end
+  if candidate.ready == nil and candidate.timeout_ms ~= nil then
+    error("module timeout_ms requires a ready function", 0)
+  end
 
   local hooks = candidate.hooks or {}
   local hook_count = array_length(hooks, "module hooks")
@@ -1283,6 +1316,9 @@ function remuda._activate_module(name, candidate, reactivate)
   local start = candidate.start and function(started_state)
     return with_owner(name, candidate.start, started_state)
   end
+  local ready = candidate.ready and function(ready_state)
+    return with_owner(name, candidate.ready, ready_state)
+  end
   local activation = {
     version = version,
     state = state,
@@ -1292,6 +1328,8 @@ function remuda._activate_module(name, candidate, reactivate)
     contributions = declared_contributions,
     stop = stop,
     start = start,
+    ready = ready,
+    timeout_ms = timeout_ms,
     stopped = false,
   }
   for index = 1, advice_count do
@@ -1422,6 +1460,28 @@ function remuda._stop_modules()
     stop_module_activation(name, module)
   end
 end
+
+-- The CLI polls this small lifecycle result between Eval requests. Keep the
+-- readiness callback in the declaration table, not as another public remuda
+-- word; an absent callback preserves today's immediate exec completion.
+function remuda._module_readiness(name)
+  local module = modules[name]
+  if not module or not module.ready then return { status = "ready" } end
+  local ok, ready, message = pcall(module.ready, module.state)
+  if not ok then return { status = "failed", message = tostring(ready) } end
+  if ready == true and message == nil then return { status = "ready" } end
+  if ready == nil and message == nil then
+    return { status = "pending", timeout_ms = module.timeout_ms }
+  end
+  if ready == nil and type(message) == "string" then
+    return { status = "failed", message = message }
+  end
+  return {
+    status = "failed",
+    message = "ready must return true, nil, or nil, message",
+  }
+end
+register("_module_readiness", "Internal readiness poll for remuda exec.", "_module_readiness(name) -> {status, timeout_ms?, message?}")
 
 local escapes = {
   ['"'] = '\\"',

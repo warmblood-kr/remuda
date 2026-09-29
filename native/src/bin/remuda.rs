@@ -24,6 +24,8 @@ use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::ExitCode;
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
@@ -214,7 +216,8 @@ remuda — a pty manager you can attach to
   remuda cluster init             create this node's cluster identity
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
-  remuda cluster remote [node/session] open the read-only cluster tree
+  remuda cluster control on|off   allow or refuse remote control
+  remuda cluster remote [node/session] open the cluster session tree
   remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
   remuda cluster call NODE list --addr HOST:PORT [--json]  list a remote node's sessions
   remuda cluster call NODE capture SESSION --addr HOST:PORT [--json]  capture a remote screen
@@ -292,7 +295,8 @@ remuda — terminal orchestration for coding agents
   remuda cluster init            create this node's cluster identity
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
-  remuda cluster remote [node/session] open the read-only cluster tree
+  remuda cluster control on|off   allow or refuse remote control
+  remuda cluster remote [node/session] open the cluster session tree
   remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
   remuda cluster call NODE list --addr HOST:PORT [--json]  list a remote node's sessions
   remuda cluster call NODE capture SESSION --addr HOST:PORT [--json]  capture a remote screen
@@ -333,6 +337,7 @@ enum ClusterCommand {
     Status,
     Init,
     Nodes,
+    Control(bool),
     Revoke {
         target: String,
         yes: bool,
@@ -362,6 +367,8 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
         [] => ClusterCommand::Status,
         ["init"] => ClusterCommand::Init,
         ["nodes"] => ClusterCommand::Nodes,
+        ["control", "on"] => ClusterCommand::Control(true),
+        ["control", "off"] => ClusterCommand::Control(false),
         ["revoke", target] => ClusterCommand::Revoke {
             target: (*target).to_string(),
             yes: false,
@@ -448,7 +455,15 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                 println!("Node: {}", identity.node_name);
                 println!("Fingerprint: {}", identity.node_fp);
                 println!("Members: {members}");
-                ExitCode::SUCCESS
+                match remuda_native::cluster::control::enabled() {
+                    Ok(enabled) => {
+                        let (setting, trust) = remote_control_status_lines(enabled);
+                        println!("{setting}");
+                        println!("{trust}");
+                        ExitCode::SUCCESS
+                    }
+                    Err(error) => fail(format!("cluster status: {error}")),
+                }
             }
             Err(error) => fail(format!("cluster status: {error}")),
         },
@@ -473,6 +488,15 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             Err(error) => fail(format!("cluster nodes: {error}")),
         },
         ClusterCommand::Revoke { target, yes } => cluster_revoke(&target, yes),
+        ClusterCommand::Control(enabled) => {
+            match remuda_native::cluster::control::set_enabled(enabled) {
+                Ok(()) => {
+                    println!("Remote control {}.", remote_control_label(enabled));
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(format!("cluster control: {error}")),
+            }
+        }
         ClusterCommand::Remote(target) => {
             let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into());
             with_daemon(server, path, |path| {
@@ -511,10 +535,30 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             json,
         } => cluster_call(&target, address, action, json),
         ClusterCommand::Invalid => {
-            eprintln!("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | remote [node/session] | listen --bind ADDR [--allow-public] | call NODE (list | capture SESSION) --addr HOST:PORT [--json]]");
+            eprintln!("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | control on|off | remote [node/session] | listen --bind ADDR [--allow-public] | call NODE (list | capture SESSION) --addr HOST:PORT [--json]]");
             ExitCode::from(2)
         }
     }
+}
+
+fn remote_control_label(enabled: bool) -> &'static str {
+    if enabled {
+        "enabled"
+    } else {
+        "disabled"
+    }
+}
+
+fn remote_control_status_lines(enabled: bool) -> (&'static str, &'static str) {
+    let setting = if enabled {
+        "Remote control: enabled"
+    } else {
+        "Remote control: disabled"
+    };
+    (
+        setting,
+        "Trust if enabled: a compromised admitted node can type into and close every session.",
+    )
 }
 
 fn cluster_call(
@@ -759,7 +803,7 @@ fn cluster_init_message(created: bool) -> &'static str {
 mod cluster_cli_tests {
     use super::{
         cluster_init_message, confirmation_answer_is_yes, parse_cluster_command,
-        revoke_confirmation, write_nodes_table, ClusterCommand,
+        remote_control_status_lines, revoke_confirmation, write_nodes_table, ClusterCommand,
     };
 
     #[test]
@@ -811,6 +855,34 @@ mod cluster_cli_tests {
     #[test]
     fn cluster_nodes_is_recognized() {
         assert_eq!(parse_cluster_command(&["nodes"]), ClusterCommand::Nodes);
+    }
+
+    #[test]
+    fn cluster_control_requires_an_explicit_on_or_off_value() {
+        assert_eq!(
+            parse_cluster_command(&["control", "on"]),
+            ClusterCommand::Control(true)
+        );
+        assert_eq!(
+            parse_cluster_command(&["control", "off"]),
+            ClusterCommand::Control(false)
+        );
+        assert_eq!(
+            parse_cluster_command(&["control", "yes"]),
+            ClusterCommand::Invalid
+        );
+    }
+
+    #[test]
+    fn cluster_status_explains_remote_control_trust() {
+        let (setting, trust) = remote_control_status_lines(true);
+        assert_eq!(setting, "Remote control: enabled");
+        assert!(trust.contains("compromised admitted node"));
+        assert!(trust.contains("close every session"));
+        assert_eq!(
+            remote_control_status_lines(false).0,
+            "Remote control: disabled"
+        );
     }
 
     #[test]
@@ -1330,10 +1402,87 @@ fn exec_command(path: &Path, name: &str) -> ExitCode {
         // The wrapper gets its own chunk name; the mod's frames keep theirs.
         Ok(Some(_)) => {
             let code = format!("remuda.exec({})", remuda_native::mcp::lua_string(name));
-            match remuda_native::script::run_source(path, "=remuda exec", &code) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => fail(e),
+            if let Err(error) = remuda_native::script::run_source(path, "=remuda exec", &code) {
+                return fail_exec(error);
             }
+            wait_for_module_ready(path, name)
+        }
+    }
+}
+
+/// Declaration mistakes are user-facing exec failures, not useful Lua
+/// tracebacks. Keep their messages stable and single-line at the CLI boundary.
+fn fail_exec(error: String) -> ExitCode {
+    const CLEAN_DECLARATION_ERRORS: [&str; 2] = [
+        "module timeout_ms must be an integer from 1 through 240000",
+        "module timeout_ms requires a ready function",
+    ];
+    if let Some(message) = CLEAN_DECLARATION_ERRORS
+        .iter()
+        .find(|message| error.contains(**message))
+    {
+        eprintln!("{message}");
+        ExitCode::FAILURE
+    } else {
+        fail(error)
+    }
+}
+
+fn wait_for_module_ready(path: &Path, name: &str) -> ExitCode {
+    let source = format!(
+        "return remuda.json.encode(remuda._module_readiness({}))",
+        remuda_native::mcp::lua_string(name)
+    );
+    let mut deadline = None;
+    loop {
+        let checked_at = Instant::now();
+        let output =
+            match remuda_native::script::eval_source(path, "=remuda exec readiness", &source) {
+                Ok(output) => output,
+                Err(error) => return fail(error),
+            };
+        let json = output
+            .trim_end_matches('\n')
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default();
+        let result: serde_json::Value = match serde_json::from_str(json) {
+            Ok(result) => result,
+            Err(error) => {
+                return fail(format!(
+                    "remuda exec readiness probe returned invalid data ({error}): {output}"
+                ));
+            }
+        };
+        match result.get("status").and_then(serde_json::Value::as_str) {
+            Some("ready") => return ExitCode::SUCCESS,
+            Some("failed") => {
+                let message = result
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("readiness callback failed");
+                eprintln!("mod {name} failed to become ready: {message}");
+                return ExitCode::FAILURE;
+            }
+            Some("pending") => {
+                let timeout_ms = match result.get("timeout_ms").and_then(serde_json::Value::as_u64)
+                {
+                    Some(timeout_ms @ 1..=240_000) => timeout_ms,
+                    _ => return fail("module readiness returned an invalid timeout_ms"),
+                };
+                let wait_until =
+                    *deadline.get_or_insert_with(|| checked_at + Duration::from_millis(timeout_ms));
+                let now = Instant::now();
+                if now >= wait_until {
+                    eprintln!(
+                        "mod {name} did not become ready within {}s",
+                        timeout_ms as f64 / 1000.0
+                    );
+                    return ExitCode::from(124);
+                }
+                thread::sleep(Duration::from_millis(250).min(wait_until - now));
+            }
+            _ => return fail("module readiness returned an unknown status"),
         }
     }
 }

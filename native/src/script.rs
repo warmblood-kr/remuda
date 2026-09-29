@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 76] = [
+pub const BINDINGS: [&str; 77] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -36,6 +36,7 @@ pub const BINDINGS: [&str; 76] = [
     "_event_counts",
     "_extension_commands",
     "_function_source",
+    "_module_readiness",
     "_pending_create",
     "_pending_events",
     "_process_drain",
@@ -110,6 +111,11 @@ pub const BINDINGS: [&str; 76] = [
 /// name, about, signature — one row per Rust-bound word. `tools.lua` adds its
 /// own rows for the words it defines in pure Lua, into the same table.
 const WORDS: &[(&str, &str, &str)] = &[
+    (
+        "_module_readiness",
+        "Internal readiness poll for remuda exec.",
+        "_module_readiness(name) -> {status, timeout_ms?, message?}",
+    ),
     (
         "_pending_create",
         "Create a private bounded reply handle for remuda.pending.",
@@ -329,21 +335,23 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
 /// chunk with no file on disk. `name` becomes the chunk name, so a traceback
 /// still names it.
 pub fn run_source(socket: &Path, name: &str, source: &str) -> Result<(), String> {
+    let output = eval_source(socket, name, source)?;
+    if !output.is_empty() {
+        println!("{output}");
+    }
+    Ok(())
+}
+
+/// Evaluate source in the daemon's image and return captured output without
+/// relaying it. The CLI uses this for private status probes between user-facing
+/// commands.
+pub fn eval_source(socket: &Path, name: &str, source: &str) -> Result<String, String> {
     let request = Request::Eval {
         code: source.to_string(),
         name: Some(name.to_string()),
     };
     match client::request(socket, &request).map_err(|e| e.to_string())? {
-        // Whatever the script printed comes back in the same string (the
-        // daemon's own stdout is /dev/null, so `print` is captured rather than
-        // written) and is relayed here. Empty means it printed nothing and
-        // returned nothing, which should stay silent.
-        Response::Value(output) => {
-            if !output.is_empty() {
-                println!("{output}");
-            }
-            Ok(())
-        }
+        Response::Value(output) => Ok(output),
         Response::Error(reason) => Err(reason),
         other => Err(format!("unexpected response: {other:?}")),
     }
@@ -1035,10 +1043,14 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         )),
         Response::WrongInstance => Err(mlua::Error::runtime("session instance changed")),
         Response::RateLimited => Err(mlua::Error::runtime("session input rate limit exceeded")),
+        Response::SyncAtCapacity => Err(mlua::Error::runtime("Sync is at capacity; retry shortly")),
         Response::Busy => Err(mlua::Error::runtime("session input is busy")),
         Response::WriteTimeout => Err(mlua::Error::runtime(
             "session PTY write timed out; delivery may be partial or late",
         )),
+        Response::RemoteControlDisabled => {
+            Err(mlua::Error::runtime("remote control disabled on this node"))
+        }
         Response::AttachStarted { .. } | Response::AttachStatus { .. } => Err(
             mlua::Error::runtime("attach responses are not exposed to scripts"),
         ),
@@ -1104,6 +1116,7 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::StyledScreen { .. } => Err(mlua::Error::runtime(
             "styled capture is not exposed to scripts",
         )),
+        Response::Sync { .. } => Err(mlua::Error::runtime("Sync is not exposed to scripts")),
         Response::MouseState(_) => Err(mlua::Error::runtime(
             "mouse state is not exposed to scripts",
         )),

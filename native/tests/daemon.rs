@@ -1320,6 +1320,155 @@ fn start_shell_session(socket: &Path, script: &str) {
     assert!(matches!(response, Response::Value(_)));
 }
 
+#[cfg(unix)]
+#[test]
+fn session_output_wakes_coalesce_while_lua_is_busy_and_list_stays_responsive() {
+    let path = scratch("session-output-coalescing");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda._session_output_test_calls = 0
+            remuda.on("session_output", function(name)
+                if name == "chatty" then
+                    remuda._session_output_test_calls = remuda._session_output_test_calls + 1
+                    if remuda._session_output_test_calls == 1 then remuda.sleep(0.5) end
+                end
+            end, { group = "session-output-test", id = "coalesce" })
+        "#,
+    );
+    let response = client::request(
+        &path,
+        &Request::New {
+            name: Some("chatty".into()),
+            command: vec![
+                "sh".into(),
+                "-c".into(),
+                "yes x & writer=$!; sleep 0.4; kill $writer 2>/dev/null; wait $writer 2>/dev/null; sleep 5".into(),
+            ],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start chatty session");
+    assert_eq!(response, Response::Value("chatty".into()));
+
+    let until = Instant::now() + Duration::from_millis(750);
+    let mut max_list_latency = Duration::ZERO;
+    while Instant::now() < until {
+        let started = Instant::now();
+        let response = client::request(&path, &Request::List).expect("list during output hook");
+        max_list_latency = max_list_latency.max(started.elapsed());
+        assert!(matches!(response, Response::Sessions(_)));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        max_list_latency < Duration::from_millis(100),
+        "session list stalled behind output hook: {max_list_latency:?}"
+    );
+    let calls: u32 = eval(&path, "return remuda._session_output_test_calls")
+        .parse()
+        .expect("output hook call count");
+    assert!(
+        (1..=2).contains(&calls),
+        "chatty output queued redundant Lua wakes: {calls} calls"
+    );
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::Close {
+                name: "chatty".into(),
+            },
+        )
+        .expect("close chatty session"),
+        Response::Ok
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn final_session_output_is_notified_once_before_session_exit() {
+    let path = scratch("session-output-before-exit");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda._final_output_order = {}
+            remuda.on("session_output", function(name, details)
+                if name == "last-before-exit" then
+                    table.insert(remuda._final_output_order, "output:" .. tostring(details.version))
+                end
+            end, { group = "final-output-test", id = "output" })
+            remuda.on("session_exited", function(name)
+                if name == "last-before-exit" then
+                    table.insert(remuda._final_output_order, "exit")
+                end
+            end, { group = "final-output-test", id = "exit" })
+        "#,
+    );
+
+    assert_eq!(
+        client::request(
+            &path,
+            &Request::New {
+                name: Some("last-before-exit".into()),
+                command: vec!["sh".into(), "-c".into(), "sleep 0.1; printf BYE".into()],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            },
+        )
+        .expect("start short output session"),
+        Response::Value("last-before-exit".into())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let sessions = match client::request(&path, &Request::List).expect("reap short session") {
+            Response::Sessions(sessions) => sessions,
+            other => panic!("unexpected list response: {other:?}"),
+        };
+        if !sessions
+            .iter()
+            .any(|session| session.name == "last-before-exit")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "short output session did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let order = eval(
+        &path,
+        "return table.concat(remuda._final_output_order, ',')",
+    );
+    let events: Vec<_> = order.split(',').collect();
+    assert_eq!(
+        events.len(),
+        2,
+        "expected one final output and one exit: {order:?}"
+    );
+    assert!(
+        events[0].starts_with("output:"),
+        "final output event came after exit: {order:?}"
+    );
+    let version: u64 = events[0]["output:".len()..]
+        .parse()
+        .expect("final output version");
+    assert!(
+        version > 0,
+        "final output version must include BYE: {order:?}"
+    );
+    assert_eq!(
+        events[1], "exit",
+        "session_exited must follow final output: {order:?}"
+    );
+}
+
 fn listed_session(socket: &Path) -> remuda_core::SessionSummary {
     match client::request(socket, &Request::List).expect("list session") {
         Response::Sessions(sessions) => sessions
@@ -1352,6 +1501,269 @@ fn capture_version(socket: &Path) -> u64 {
     }
 }
 
+#[test]
+fn sync_returns_immediately_when_since_is_older_than_current_output() {
+    let runtime = scratch_dir("sync-immediate");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "printf ready; sleep 30");
+    let current = wait_for_quiet_output_version(&socket);
+    assert!(current > 0, "fixture must produce a versioned frame");
+    let started = Instant::now();
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: None,
+            since: current - 1,
+            timeout_ms: 30_000,
+        },
+    )
+    .expect("sync response");
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "new output must return immediately"
+    );
+    assert!(matches!(response, Response::Sync { output_version, .. } if output_version == current));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_waits_for_output_and_returns_the_new_snapshot() {
+    let runtime = scratch_dir("sync-output");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let trigger = runtime.join("release-sync-output");
+    let trigger_arg = shell_test_path(&trigger);
+    let script =
+        format!("while [ ! -e {trigger_arg} ]; do sleep 0.02; done; printf after-sync; sleep 30");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, &script);
+    let since = wait_for_quiet_output_version(&socket);
+    let request_socket = socket.clone();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: None,
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response")
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !request.is_finished(),
+        "sync should wait while the version is unchanged"
+    );
+    let triggered_at = Instant::now();
+    std::fs::write(&trigger, b"go").expect("release shell output");
+    let response = request.join().expect("sync worker");
+    assert!(
+        matches!(response, Response::Sync { output_version, snapshot, .. }
+        if output_version > since && snapshot.rows.iter().flatten().any(|run| run.text.contains("after-sync")))
+    );
+    assert!(
+        triggered_at.elapsed() < Duration::from_secs(1),
+        "output notification should wake Sync well before its 5s timeout"
+    );
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_waiter_wakes_when_session_is_resized() {
+    let runtime = scratch_dir("sync-resize");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let since = wait_for_quiet_output_version(&socket);
+    let request_socket = socket.clone();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: None,
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response after resize")
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(matches!(
+        client::request(
+            &socket,
+            &Request::Resize {
+                name: "versioned".into(),
+                size: Size::new(100, 30),
+            },
+        ),
+        Ok(Response::Ok)
+    ));
+    let triggered_at = Instant::now();
+    let response = request.join().expect("sync worker");
+    assert!(matches!(response, Response::Sync { output_version, .. } if output_version > since));
+    assert!(
+        triggered_at.elapsed() < Duration::from_secs(1),
+        "resize notification should wake Sync well before its 5s timeout"
+    );
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_times_out_with_the_current_unchanged_frame() {
+    let runtime = scratch_dir("sync-timeout");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let current = wait_for_quiet_output_version(&socket);
+    let started = Instant::now();
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: None,
+            since: current,
+            timeout_ms: 60,
+        },
+    )
+    .expect("sync timeout response");
+    assert!(started.elapsed() >= Duration::from_millis(40));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert!(matches!(response, Response::Sync { output_version, .. } if output_version == current));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_waiter_wakes_when_child_exits() {
+    let runtime = scratch_dir("sync-child-exit");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let since = wait_for_quiet_output_version(&socket);
+    let request_socket = socket.clone();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: None,
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response after child exit")
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        matches!(
+            client::request(
+                &socket,
+                &Request::Close {
+                    name: "versioned".into(),
+                },
+            ),
+            Ok(Response::Ok)
+        ),
+        "closing the child must succeed while Sync is waiting"
+    );
+    let triggered_at = Instant::now();
+    let response = request.join().expect("sync worker");
+    assert!(
+        triggered_at.elapsed() < Duration::from_secs(1),
+        "child exit must wake the waiter before its Sync timeout"
+    );
+    assert!(matches!(response, Response::Error(message) if message.contains("exited")));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_rechecks_instance_after_close_and_relaunch_during_wait() {
+    let runtime = scratch_dir("sync-relaunch");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let old_instance = listed_session(&socket).instance_id.expect("instance id");
+    let since = wait_for_quiet_output_version(&socket);
+    let request_socket = socket.clone();
+    let request = std::thread::spawn(move || {
+        client::request(
+            &request_socket,
+            &Request::Sync {
+                name: "versioned".into(),
+                instance_id: Some(old_instance),
+                since,
+                timeout_ms: 5_000,
+            },
+        )
+        .expect("sync response after relaunch")
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(matches!(
+        client::request(
+            &socket,
+            &Request::Close {
+                name: "versioned".into(),
+            },
+        ),
+        Ok(Response::Ok)
+    ));
+    start_shell_session(&socket, "sleep 30");
+    let triggered_at = Instant::now();
+    let response = request.join().expect("sync worker");
+    assert_eq!(response, Response::WrongInstance);
+    assert!(
+        triggered_at.elapsed() < Duration::from_secs(1),
+        "post-wait instance check should return promptly"
+    );
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+#[test]
+fn sync_rejects_a_wrong_instance_without_waiting() {
+    let runtime = scratch_dir("sync-wrong-instance");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let started = Instant::now();
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: Some("old-session-instance".into()),
+            since: 0,
+            timeout_ms: 30_000,
+        },
+    )
+    .expect("wrong-instance response");
+    assert_eq!(response, Response::WrongInstance);
+    assert!(started.elapsed() < Duration::from_secs(1));
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
+fn stop_daemon(runtime: &Path, socket: &Path, running: &mut spawn::Daemon) {
+    assert_eq!(
+        socket,
+        daemon::socket_path_in(runtime, "s"),
+        "only stop the private daemon created under this test's scratch runtime"
+    );
+    let _ = client::request(
+        socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    assert!(
+        running.left_on_its_own(),
+        "private daemon should stop cleanly"
+    );
+}
+
 fn wait_for_output_version(socket: &Path, original: u64) {
     let deadline = Instant::now() + PATIENCE;
     while capture_version(socket) <= original {
@@ -1362,17 +1774,41 @@ fn wait_for_output_version(socket: &Path, original: u64) {
 
 fn wait_for_quiet_output_version(socket: &Path) -> u64 {
     let deadline = Instant::now() + PATIENCE;
+    let mut version = capture_version(socket);
+    let mut quiet_since = Instant::now();
     loop {
-        let version = capture_version(socket);
         assert!(
             Instant::now() < deadline,
             "output version did not become quiet"
         );
-        std::thread::sleep(Duration::from_millis(100));
-        if capture_version(socket) == version {
+        std::thread::sleep(Duration::from_millis(200));
+        let next = capture_version(socket);
+        if next != version {
+            version = next;
+            quiet_since = Instant::now();
+        } else if quiet_since.elapsed() >= Duration::from_millis(400) {
             return version;
         }
     }
+}
+
+fn shell_test_path(path: &Path) -> String {
+    #[cfg(windows)]
+    let value = {
+        let value = path.to_string_lossy().replace('\\', "/");
+        if let Some((drive, rest)) = value.split_once(':') {
+            format!(
+                "/{}/{}",
+                drive.to_ascii_lowercase(),
+                rest.trim_start_matches('/')
+            )
+        } else {
+            value
+        }
+    };
+    #[cfg(not(windows))]
+    let value = path.to_string_lossy().into_owned();
+    format!("\"{}\"", value.replace('"', "\\\""))
 }
 
 #[test]
@@ -3310,6 +3746,30 @@ fn the_daemon_names_the_build_it_was_started_from() {
         Response::Value(said) => assert_eq!(said, remuda_native::dist::BUILD_VERSION),
         other => panic!("unexpected: {other:?}"),
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn idle_daemon_version_requests_do_not_wait_for_a_poll_interval() {
+    let dir = scratch_dir("version-latency");
+    let path = daemon::socket_path_in(&dir, "s");
+    let daemon = Daemon::spawn(&dir);
+    let mut samples = Vec::with_capacity(50);
+
+    for _ in 0..50 {
+        let started = Instant::now();
+        match client::request(&path, &Request::Version).expect("version") {
+            Response::Value(said) => assert_eq!(said, remuda_native::dist::BUILD_VERSION),
+            other => panic!("unexpected: {other:?}"),
+        }
+        samples.push(started.elapsed());
+    }
+
+    samples.sort_unstable();
+    let p50 = samples[samples.len() / 2];
+    assert!(p50 < Duration::from_millis(5), "Version p50 was {p50:?}");
+    drop(daemon);
+    std::fs::remove_dir_all(dir).expect("remove isolated runtime directory");
 }
 
 // Unix only: the regression is SIGPIPE, and `true` is not a Windows command.

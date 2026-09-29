@@ -204,6 +204,7 @@ fn call_response(id: Value, response: Response) -> String {
         Response::StyledScreen { .. } => {
             ok_reply(id, tool_error("styled capture is not exposed over MCP"))
         }
+        Response::Sync { .. } => ok_reply(id, tool_error("Sync is not exposed over MCP")),
         // No MCP tool asks for the directory verbs either — same reasoning.
         Response::Entries(_) => {
             ok_reply(id, tool_error("directory listing is not exposed over MCP"))
@@ -239,7 +240,9 @@ fn call_response(id: Value, response: Response) -> String {
         | Response::WrongInstance
         | Response::RateLimited
         | Response::Busy
-        | Response::WriteTimeout) => input_error_reply(id, input_error_message(&response)),
+        | Response::WriteTimeout
+        | Response::RemoteControlDisabled) => input_error_reply(id, input_error_message(&response)),
+        Response::SyncAtCapacity => ok_reply(id, tool_error("Sync is at capacity; retry shortly")),
         Response::Sessions(sessions) => ok_reply(id, sessions_text(sessions)),
     }
 }
@@ -255,6 +258,7 @@ fn input_error_message(response: &Response) -> &'static str {
         Response::RateLimited => "session input rate limit exceeded",
         Response::Busy => "session input is busy",
         Response::WriteTimeout => "session PTY write timed out; delivery may be partial or late",
+        Response::RemoteControlDisabled => "remote control disabled on this node",
         _ => unreachable!("only input errors are passed here"),
     }
 }
