@@ -304,7 +304,15 @@ fn hook_list_reports_each_hook_and_its_errors_as_a_copy() {
         assert(tostring(bad.last_error):find("first", 1, true), tostring(bad.last_error))
         assert(type(bad.src) == "string" and bad.src ~= "", "src names where the hook was defined")
         assert(list[1].errors == 0 and list[1].depth == 0)
-        assert(#remuda.hook_list() == 3, "no event means every event")
+        local all = remuda.hook_list()
+        assert(#all == 4, "no event means every event, including the built-in session_output hook")
+        local found_output_hook = false
+        for _, hook in ipairs(all) do
+          if hook.event == "session_output" and hook.group == "remuda.expect" then
+            found_output_hook = true
+          end
+        end
+        assert(found_output_hook, "remuda.expect installs its session_output hook")
 
         bad.errors, bad.fn = 99, nil
         assert(remuda.hook_list("e")[2].errors == 2, "hook_list hands out copies")

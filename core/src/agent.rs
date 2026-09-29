@@ -11,8 +11,77 @@
 
 use core::fmt;
 use serde::{Deserialize, Serialize};
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvError, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
+
+/// A coalesced wake signal for consumers that only need to know that output
+/// changed. The PTY reader stores the latest version separately, so wakeups
+/// never need to copy output bytes.
+pub struct OutputSignal {
+    sender: SyncSender<()>,
+    pending: Arc<AtomicBool>,
+}
+
+impl OutputSignal {
+    /// Notify a subscriber once until it acknowledges the wake. `false` means
+    /// its receiver has gone away and the watcher can be removed.
+    pub fn wake(&self) -> bool {
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return true;
+        }
+        match self.sender.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => true,
+            Err(mpsc::TrySendError::Disconnected(())) => {
+                self.pending.store(false, Ordering::Release);
+                false
+            }
+        }
+    }
+}
+
+/// Receiver for coalesced output wakes. Call `version_after_wake` after
+/// handling a wake to reopen the single pending slot and sample the latest
+/// output generation without losing a concurrent update.
+pub struct OutputWakeup {
+    receiver: Receiver<()>,
+    pending: Arc<AtomicBool>,
+    output_version: Arc<AtomicU64>,
+}
+
+impl OutputWakeup {
+    pub fn pair(output_version: Arc<AtomicU64>) -> (OutputSignal, Self) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let pending = Arc::new(AtomicBool::new(false));
+        (
+            OutputSignal {
+                sender,
+                pending: Arc::clone(&pending),
+            },
+            Self {
+                receiver,
+                pending,
+                output_version,
+            },
+        )
+    }
+
+    pub fn recv(&self) -> core::result::Result<(), RecvError> {
+        self.receiver.recv()
+    }
+
+    pub fn recv_timeout(
+        &self,
+        timeout: std::time::Duration,
+    ) -> core::result::Result<(), RecvTimeoutError> {
+        self.receiver.recv_timeout(timeout)
+    }
+
+    pub fn version_after_wake(&self) -> u64 {
+        self.pending.store(false, Ordering::Release);
+        self.output_version.load(Ordering::Acquire)
+    }
+}
 
 /// Terminal dimensions, normally clamped to the smallest usable interactive
 /// terminal. A pane may explicitly retain its narrower visible width.
@@ -338,6 +407,12 @@ pub trait AgentProcess: Send {
     /// viewers can consume it without screen polling. `None` means this backend
     /// cannot stream, so viewers fall back to `screen_bytes`.
     fn subscribe(&mut self) -> Option<Receiver<Vec<u8>>> {
+        None
+    }
+
+    /// Subscribe to coalesced notifications of output changes. The backend
+    /// owns the shared output version and updates it before waking subscribers.
+    fn subscribe_output_wakeup(&mut self) -> Option<OutputWakeup> {
         None
     }
 
