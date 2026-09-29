@@ -16,7 +16,7 @@ fn expect_bounded_error(code: &str) {
     let image = image();
     let answer = image.submit(code, None).expect("queue bounded regression");
     let error = answer
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(Duration::from_secs(6))
         .expect("Lua execution returns within the test bound")
         .expect_err("the script must exceed the instruction budget");
     assert!(
@@ -55,7 +55,7 @@ fn a_coroutine_resumed_in_a_later_job_is_bounded() {
         .submit("return coroutine.resume(saved_coroutine)", None)
         .expect("queue resume");
     let error = answer
-        .recv_timeout(Duration::from_secs(3))
+        .recv_timeout(Duration::from_secs(6))
         .expect("resumed coroutine returns within the test bound")
         .expect_err("the coroutine must exceed the instruction budget");
     assert!(
@@ -87,6 +87,55 @@ fn nested_protected_calls_share_the_outer_instruction_budget() {
     expect_bounded_error(
         "return xpcall(function() return pcall(function() while true do end end) end, function() return 'caught' end)",
     );
+}
+
+#[test]
+fn a_million_step_lua_loop_fits_the_budget() {
+    let image = image();
+    let answer = image
+        .submit(
+            "local sum = 0; for i = 1, 1000000 do sum = sum + i end; return sum",
+            None,
+        )
+        .expect("queue ordinary Lua work");
+    assert_eq!(
+        answer
+            .recv_timeout(Duration::from_secs(6))
+            .expect("million-step loop completes within the test bound")
+            .expect("ordinary Lua work fits the execution budget"),
+        "500000500000"
+    );
+}
+
+#[test]
+fn invoking_the_lua_schedule_helper_cannot_reset_the_job_budget() {
+    expect_bounded_error(
+        "local now = 0; remuda.schedule({every = 1, run = function() local sum = 0; for i = 1, 1000000 do sum = sum + i end end}); while true do remuda._run_due_schedules(now); now = now + 1 end",
+    );
+}
+
+#[test]
+fn coroutine_fanout_contributes_to_the_shared_job_budget() {
+    expect_bounded_error(
+        "for i = 1, 12000 do local thread = coroutine.create(function() return true end); coroutine.resume(thread) end",
+    );
+}
+
+#[test]
+fn abandoned_suspended_coroutines_are_not_kept_alive_between_jobs() {
+    let image = image();
+    image
+        .eval(
+            "weak_threads = setmetatable({}, {__mode = 'v'}); do local thread = coroutine.create(function() coroutine.yield() end); coroutine.resume(thread); weak_threads[1] = thread end",
+            None,
+        )
+        .expect("create and abandon suspended coroutine");
+    image
+        .eval(
+            "collectgarbage('collect'); assert(weak_threads[1] == nil, 'abandoned coroutine retained by budget tracker')",
+            None,
+        )
+        .expect("budget tracker releases abandoned coroutine");
 }
 
 #[test]

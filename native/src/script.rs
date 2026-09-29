@@ -513,9 +513,10 @@ pub fn bindings(
     process_bindings(lua, &table, image)?;
 
     // Blocks the whole Image while this Rust call sleeps. The Lua instruction
-    // budget does not count time spent in Rust bindings or C-library functions;
-    // it bounds Lua VM instructions only. A long `string.find` backtrack or
-    // `string.rep` can therefore still occupy the image until that call returns.
+    // budget does not count time spent in Rust bindings, C-library functions,
+    // or Lua 5.4 `__gc` finalizers (which run with hooks disabled); it bounds
+    // Lua VM instructions only. A long `string.find` backtrack or `string.rep`
+    // can therefore still occupy the image until that call returns.
     // This is not a wait or timer primitive; remuda has no periodic-execution
     // mechanism yet, and a sleep-and-poll loop holds the Image hostage too.
     sleep_binding(lua, &table)?;

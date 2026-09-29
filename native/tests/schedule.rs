@@ -81,7 +81,7 @@ fn each_due_schedule_gets_a_fresh_instruction_budget() {
     eval(
         &image,
         r#"
-        local total = 0
+        total = 0
         for _ = 1, 4 do
           remuda.schedule({
             every = 1,
@@ -92,8 +92,16 @@ fn each_due_schedule_gets_a_fresh_instruction_budget() {
             end,
           })
         end
-        remuda._run_due_schedules(10)
-        assert(total == 20000200000, "each due callback should complete within its own budget")
         "#,
+    );
+    image
+        .submit_due_schedules(10.0)
+        .expect("queue native schedule tick")
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("native schedule tick completes")
+        .expect("schedule preparation succeeds");
+    eval(
+        &image,
+        "assert(total == 20000200000, 'each due callback should complete within its own budget')",
     );
 }
