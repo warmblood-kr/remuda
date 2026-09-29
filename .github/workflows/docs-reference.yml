@@ -12,6 +12,8 @@ on:
       - scripts/generate-lua-reference.sh
       - docs/lua-reference.rst
       - docs/lua-reference.html
+  pull_request:
+  merge_group:
   workflow_dispatch:
 
 jobs:
