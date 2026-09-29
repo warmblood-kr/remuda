@@ -360,6 +360,61 @@ mod run_tests {
         assert!(output.ends_with(RUN_OUTPUT_MARKER));
     }
 
+    #[test]
+    fn resume_suspended_thread_drains_all_suspend_counts() {
+        let mut returned_counts = [3, 2, 1].into_iter();
+        let mut calls = 0;
+        super::resume_suspended_thread(|| {
+            calls += 1;
+            Ok(returned_counts.next().expect("expected resume call"))
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn resume_suspended_thread_rejects_an_already_running_thread() {
+        let error = super::resume_suspended_thread(|| Ok(0)).unwrap_err();
+        assert!(error.to_string().contains("already running"));
+    }
+
+    #[test]
+    fn resume_suspended_thread_propagates_resume_errors() {
+        let error = super::resume_suspended_thread(|| Err(std::io::Error::other("resume failed")))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "resume failed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn synchronous_process_starts_and_echoes_within_two_seconds() {
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let output = super::run_sync(
+            vec![
+                "cmd.exe".into(),
+                "/d".into(),
+                "/c".into(),
+                "echo remuda-process-ready".into(),
+            ],
+            None,
+            2.0,
+        )
+        .expect("the child should start and exit before its deadline");
+
+        assert!(
+            !output.timed_out,
+            "the child remained suspended until timeout"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("remuda-process-ready"),
+            "child output was not captured: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     #[cfg(windows)]
     #[test]
     fn synchronous_process_timeout_kills_grandchild_holding_pipes() {
@@ -622,25 +677,22 @@ impl KillOnCloseJob {
                     }
                     // SAFETY: `thread` is an owned handle with the required
                     // suspend/resume access right.
-                    let previous = unsafe { ResumeThread(thread) };
-                    let resume_error = if previous == u32::MAX {
-                        Some(std::io::Error::last_os_error())
-                    } else if previous == 0 {
-                        Some(std::io::Error::other(
-                            "the suspended process thread was already running",
-                        ))
-                    } else {
-                        None
-                    };
+                    let resumed = resume_suspended_thread(|| {
+                        let previous = unsafe { ResumeThread(thread) };
+                        if previous == u32::MAX {
+                            Err(std::io::Error::last_os_error())
+                        } else {
+                            Ok(previous)
+                        }
+                    });
                     // SAFETY: this handle was returned by OpenThread above.
                     unsafe { CloseHandle(thread) };
-                    if let Some(error) = resume_error {
-                        return Err(error);
-                    }
+                    resumed?;
                     return Ok(());
                 }
 
                 // SAFETY: `entry` and `snapshot` remain valid for the call.
+                entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
                 if unsafe { Thread32Next(snapshot, &mut entry) } == 0 {
                     // ERROR_NO_MORE_FILES is the normal end of the snapshot.
                     // SAFETY: GetLastError reads the calling thread's error.
@@ -667,6 +719,29 @@ impl KillOnCloseJob {
         // empty or terminated, in which case this best-effort call is benign.
         unsafe { TerminateJobObject(self.0, RUN_TIMEOUT_EXIT_CODE as u32) };
     }
+}
+
+#[cfg(any(windows, test))]
+fn resume_suspended_thread(
+    mut resume_thread: impl FnMut() -> std::io::Result<u32>,
+) -> std::io::Result<()> {
+    let mut previous = resume_thread()?;
+    if previous == 0 {
+        return Err(std::io::Error::other(
+            "the suspended process thread was already running",
+        ));
+    }
+    // CREATE_SUSPENDED contributes one suspend count, but Windows may report
+    // additional counts. ResumeThread decrements only one count per call;
+    // treating any positive return as success can leave the child suspended.
+    while previous > 1 {
+        previous = resume_thread()?;
+        if previous == 0 {
+            // Another resumer cleared the final count between our calls.
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
