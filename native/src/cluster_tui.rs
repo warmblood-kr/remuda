@@ -858,17 +858,31 @@ impl ClusterUi {
                 .send_started(&mut self.input_queue, Instant::now(), |request| {
                     crate::client::request_with_timeout(path, request, sender::INPUT_SEND_TIMEOUT)
                 });
+        self.handle_send_event(event, now);
+    }
+
+    fn handle_send_event(&mut self, event: Option<QueueEvent>, now: Duration) {
         match event {
-            Some(QueueEvent::Sent { .. }) => {}
-            Some(QueueEvent::Uncertain { reason, .. })
-            | Some(QueueEvent::Dropped { reason, .. })
-            | Some(QueueEvent::Failed { reason, .. }) => {
+            Some(QueueEvent::Sent { .. } | QueueEvent::Uncertain { .. }) => {
+                self.clear_sending_notice();
+            }
+            Some(QueueEvent::Dropped { reason, .. }) | Some(QueueEvent::Failed { reason, .. }) => {
                 if reason.contains("session restarted") {
                     self.composer_target = None;
                 }
                 self.notice = Some((reason, now));
             }
             Some(QueueEvent::RetryScheduled { .. }) | None => {}
+        }
+    }
+
+    fn clear_sending_notice(&mut self) {
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(notice, _)| notice.starts_with("sending input to "))
+        {
+            self.notice = None;
         }
     }
 
@@ -1231,7 +1245,7 @@ fn run_loop(
 
 #[cfg(test)]
 mod tests {
-    use super::queue::QueueState;
+    use super::queue::{QueueEvent, QueueState};
     use super::{is_attention, render_badge, AttentionSignals, Badge, ClusterUi, RemoteSource};
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
@@ -1489,6 +1503,34 @@ mod tests {
         assert!(ui
             .render(80, 24, "", &clock)
             .contains("no sessions need attention"));
+    }
+
+    #[test]
+    fn sent_input_clears_the_sending_notice() {
+        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], Duration::ZERO);
+        ui.notice = Some(("sending input to dev".into(), Duration::ZERO));
+        ui.handle_send_event(
+            Some(QueueEvent::Sent {
+                seq: 1,
+                duplicate: false,
+            }),
+            Duration::ZERO,
+        );
+        assert!(ui.notice.is_none());
+    }
+
+    #[test]
+    fn uncertain_input_clears_the_sending_notice() {
+        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], Duration::ZERO);
+        ui.notice = Some(("sending input to dev".into(), Duration::ZERO));
+        ui.handle_send_event(
+            Some(QueueEvent::Uncertain {
+                seq: 1,
+                reason: "delivery uncertain".into(),
+            }),
+            Duration::ZERO,
+        );
+        assert!(ui.notice.is_none());
     }
 
     #[test]
