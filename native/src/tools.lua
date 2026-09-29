@@ -42,14 +42,20 @@ function remuda.extension_command(name, handler)
   remuda._extension_commands[name] = handler
   extension_command_owners[name] = current_owner
 end
--- `caller` is what the CLI knows and the daemon does not: `caller.env` holds
--- the caller's `REMUDA_*` variables (`os.getenv` here reads the daemon's).
+-- The handler's `caller.env` holds forwarded CLI environment values and must
+-- not be used for authorization. Capture the native word before user Lua can
+-- replace remuda.caller; its result is merged into the handler's caller data.
+local native_caller = remuda.caller
 function remuda._dispatch_extension_command(name, args, caller)
   local handler = remuda._extension_commands[name]
   if not handler then
     error("mod command " .. tostring(name) .. " is not loaded; run `remuda " .. tostring(name) .. "` first", 2)
   end
-  return handler(args or {}, caller or {})
+  local context = native_caller()
+  local caller_data = type(caller) == "table" and caller or {}
+  caller_data.kind = context.kind
+  caller_data.session = context.session
+  return handler(args or {}, caller_data)
 end
 
 -- One row per word, Rust's own bindings included (`script.rs`'s `WORDS`
@@ -59,7 +65,7 @@ local function register(name, about, signature)
 end
 register("tools", "The `remuda.tool` registry table, keyed by tool name.", "table")
 register("_extension_commands", "Handlers registered for installed mod commands.", "table")
-register("extension_command", "Register a handler for an installed mod command.", "extension_command(name, handler(args, caller)) -> nil")
+register("extension_command", "Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.", "extension_command(name, handler(args, caller)) -> nil")
 register("_dispatch_extension_command", "Dispatch arguments and caller context to a loaded mod command handler.", "_dispatch_extension_command(name, args, caller) -> value")
 register("pending", "Return a bounded handle for an extension command's deferred result.", "pending({timeout?, on_cancel?}) -> handle")
 register("_pending_create", "Create a private pending reply handle.", "_pending_create(timeout?) -> id, handle")

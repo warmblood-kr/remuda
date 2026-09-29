@@ -21,7 +21,7 @@ use mlua::{Lua, Table, Value};
 use remuda_core::keys;
 use remuda_core::protocol::{Request, Response, Step};
 use remuda_core::InputSubmitOutcome;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::Duration;
@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 84] = [
+pub const BINDINGS: [&str; 85] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -62,6 +62,7 @@ pub const BINDINGS: [&str; 84] = [
     "attach",
     "buffer",
     "buffers",
+    "caller",
     "cancel",
     "capture",
     "capture_styled",
@@ -133,6 +134,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_input_type_text",
         "Deliver text and submit it while holding one input lock; returns 'submitted' or 'unverified'.",
         "_input_type_text(name, text, settle?) -> status",
+    ),
+    (
+        "caller",
+        "ADVISORY only: peer ancestry identifies a managed session, outside, or unknown; outside does not prove operator identity. Same-UID Lua can run ``remuda -e`` and wrap ``_dispatch_extension_command``; Windows parent PIDs may be stale or chosen, so this is not an authentication boundary.",
+        "caller() -> {kind: 'session'|'outside'|'unknown', session?: string}",
     ),
     (
         "_module_readiness",
@@ -415,6 +421,28 @@ fn new_request(
     }
 }
 
+fn caller_binding(
+    lua: &Lua,
+    table: &Table,
+    caller: Rc<RefCell<crate::image::CallerContext>>,
+) -> mlua::Result<()> {
+    table.set(
+        "caller",
+        lua.create_function(move |lua, ()| {
+            let caller = caller.borrow().clone();
+            let value = lua.create_table()?;
+            let kind = match caller.kind {
+                crate::image::CallerKind::Session => "session",
+                crate::image::CallerKind::Outside => "outside",
+                crate::image::CallerKind::Unknown => "unknown",
+            };
+            value.set("kind", kind)?;
+            value.set("session", caller.session)?;
+            Ok(value)
+        })?,
+    )
+}
+
 fn input_bindings(
     lua: &Lua,
     table: &Table,
@@ -476,18 +504,20 @@ fn input_bindings(
     Ok(())
 }
 
-pub fn bindings(
+pub(crate) fn bindings(
     lua: &Lua,
     socket: &Path,
     registry: std::sync::Arc<remuda_core::Registry>,
     counters: std::sync::Arc<crate::tick::Counters>,
     image: crate::image::Image,
+    caller: Rc<RefCell<crate::image::CallerContext>>,
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
     let input_registry = registry.clone();
     fail_binding(lua, &table, image.clone())?;
     pending_bindings(lua, &table, image.pending_replies())?;
+    caller_binding(lua, &table, caller)?;
 
     // In-process, not a loopback: the image always runs inside the same
     // daemon this `Registry` belongs to (image.rs), so asking over the wire
@@ -1303,6 +1333,7 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
             for (index, session) in list.into_iter().enumerate() {
                 let row = lua.create_table()?;
                 row.set("name", session.name)?;
+                row.set("instance_id", session.instance_id.as_deref())?;
                 row.set("alive", session.alive)?;
                 row.set("idle", session.idle.as_secs_f64())?;
                 row.set(
@@ -1355,6 +1386,9 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::MouseState(_) => Err(mlua::Error::runtime(
             "mouse state is not exposed to scripts",
         )),
+        Response::ClusterRegistryPage { .. } | Response::ClusterRegistryAck { .. } => Err(
+            mlua::Error::runtime("cluster registry responses are not exposed to scripts"),
+        ),
     }
 }
 

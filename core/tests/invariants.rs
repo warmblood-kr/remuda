@@ -761,6 +761,16 @@ fn advance_until_finished<T>(
     );
 }
 
+fn retry_busy<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    for _ in 0..100_000 {
+        match operation() {
+            Err(AgentError::Busy) => std::thread::yield_now(),
+            result => return result,
+        }
+    }
+    Err(AgentError::Busy)
+}
+
 #[test]
 fn feed_bursts_and_pauses_are_one_indivisible_act() {
     let writes = Arc::new(Mutex::new(Vec::new()));
@@ -771,13 +781,14 @@ fn feed_bursts_and_pauses_are_one_indivisible_act() {
     let feeder = {
         let session = session.clone();
         std::thread::spawn(move || {
-            session
-                .feed(&[
+            retry_busy(|| {
+                session.feed(&[
                     Step::Burst(b"first".to_vec()),
                     Step::Pause(1000),
                     Step::Burst(b"second".to_vec()),
                 ])
-                .unwrap();
+            })
+            .unwrap();
         })
     };
 
@@ -792,7 +803,7 @@ fn feed_bursts_and_pauses_are_one_indivisible_act() {
         let barrier = barrier.clone();
         std::thread::spawn(move || {
             barrier.wait();
-            session.send(b"interloper").unwrap();
+            retry_busy(|| session.send(b"interloper")).unwrap();
         })
     };
     barrier.wait();
