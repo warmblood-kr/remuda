@@ -135,6 +135,8 @@ fn pair() -> (PrivateNode, PrivateNode) {
         registry.authorized_nodes.push(AuthorizedNode {
             node_fp: node.fingerprint(),
             static_pubkey: encoding::encode_base64(&node.public),
+            delivered_by: None,
+            endpoint: None,
             state: NodeState::Admitted,
             version: 1,
             by: server.fingerprint(),

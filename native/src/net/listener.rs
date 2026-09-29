@@ -179,9 +179,6 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
         authorize,
         dispatch,
     };
-    let _ = std::thread::Builder::new()
-        .name("remuda-cluster-startup-sync".into())
-        .spawn(cluster::replication::startup_sync);
     Ok(listener)
 }
 
@@ -205,7 +202,13 @@ impl Listener {
                     let _ = observe_error_tx.send(error);
                     return;
                 }
-                let mut observed_registry = cluster::registry::registry_revision_token().ok();
+                let mut observed_registry = match cluster::registry::registry_revision_token() {
+                    Ok(revision) => Some(revision),
+                    Err(error) => {
+                        eprintln!("remuda: unable to inspect cluster registry revision: {error}");
+                        None
+                    }
+                };
                 loop {
                     match observer_stop_rx.recv_timeout(OBSERVE_INTERVAL) {
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -220,10 +223,9 @@ impl Listener {
                                     cluster::replication::registry_changed();
                                 }
                                 Ok(revision) => observed_registry = Some(revision),
-                                Err(error) => {
-                                    let _ = observe_error_tx.send(error);
-                                    break;
-                                }
+                                Err(error) => eprintln!(
+                                    "remuda: unable to inspect cluster registry revision: {error}"
+                                ),
                             }
                         }
                     }
@@ -713,9 +715,7 @@ fn dispatch_payload(
             } else {
                 registry.authorized_nodes[start..end].to_vec()
             };
-            let entries_json = serde_json::to_string(&page).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "registry encode failed")
-            })?;
+            let entries_json = cluster::registry::RegistryUpdate::encode_entries_json(&page)?;
             let next_offset = (!unchanged && end < registry.authorized_nodes.len()).then_some(end);
             serde_json::to_vec(&Response::ClusterRegistryPage {
                 sender_fp: identity.node_fp,
@@ -1214,6 +1214,7 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: crate::cluster::encoding::fingerprint(&peer.public),
                 static_pubkey: crate::cluster::encoding::encode_base64(&peer.public),
+                delivered_by: None,
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -1518,6 +1519,7 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: fingerprint.clone(),
                 static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+                delivered_by: None,
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -1814,7 +1816,7 @@ mod tests {
         let (status, response) = server.exchange(malformed);
         assert_eq!(status, 200);
         let response = String::from_utf8(response).unwrap();
-        assert!(response.contains("invalid remote request"));
+        assert!(response.contains("invalid cluster request"));
         assert!(!response.contains(secret));
     }
 
@@ -2073,6 +2075,7 @@ mod tests {
         registry.authorized_nodes.push(AuthorizedNode {
             node_fp: fingerprint.clone(),
             static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+            delivered_by: None,
             endpoint: None,
             state: NodeState::Admitted,
             version: 1,
@@ -2094,6 +2097,7 @@ mod tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: fingerprint.clone(),
                 static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+                delivered_by: None,
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,

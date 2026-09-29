@@ -35,6 +35,7 @@ pub fn init() -> io::Result<(NodeIdentity, bool)> {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: node.node_fp.clone(),
                 static_pubkey: encoding::encode_base64(&node.static_pubkey),
+                delivered_by: None,
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -130,10 +131,11 @@ pub fn record_join_success(
             registry.authorized_nodes.push(AuthorizedNode {
                 node_fp: issuer_fp.clone(),
                 static_pubkey: issuer_key,
+                delivered_by: None,
                 endpoint: Some(issuer_addr.to_string()),
                 state: NodeState::Admitted,
                 version: 1,
-                by: issuer_fp,
+                by: issuer_fp.clone(),
             });
             changed = true;
         }
@@ -156,11 +158,18 @@ pub fn record_join_success(
                 "local node is not admitted in its registry",
             ));
         }
+        let newly_joined = self_entry.by == self_node.node_fp && issuer_fp != self_node.node_fp;
+        if newly_joined {
+            self_entry.by = issuer_fp;
+            changed = true;
+        }
         if let Some(endpoint) = local_endpoint {
             let endpoint = endpoint.to_string();
             if self_entry.endpoint.as_deref() != Some(endpoint.as_str()) {
                 self_entry.endpoint = Some(endpoint);
-                self_entry.version = self_entry.version.saturating_add(1);
+                if !newly_joined {
+                    self_entry.version = self_entry.version.saturating_add(1);
+                }
                 changed = true;
             }
         }
@@ -241,6 +250,7 @@ fn admit_join_locked_at(
         authorized_nodes: vec![AuthorizedNode {
             node_fp: fp,
             static_pubkey: encoding::encode_base64(peer_static),
+            delivered_by: None,
             endpoint: endpoint.map(str::to_owned),
             state: NodeState::Admitted,
             version: 1,
@@ -473,6 +483,7 @@ mod nodes_revoke_tests {
                 authorized_nodes: vec![AuthorizedNode {
                     node_fp: issuer.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&issuer.static_pubkey),
+                    delivered_by: None,
                     endpoint: None,
                     state: NodeState::Admitted,
                     version: 1,
@@ -504,6 +515,7 @@ mod nodes_revoke_tests {
                 AuthorizedNode {
                     node_fp: self_node.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+                    delivered_by: None,
                     endpoint: None,
                     state: NodeState::Admitted,
                     version: 1,
@@ -512,6 +524,7 @@ mod nodes_revoke_tests {
                 AuthorizedNode {
                     node_fp: target.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                    delivered_by: None,
                     endpoint: None,
                     state: NodeState::Admitted,
                     version: 7,
@@ -546,6 +559,7 @@ mod nodes_revoke_tests {
                     AuthorizedNode {
                         node_fp: self_node.node_fp.clone(),
                         static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+                        delivered_by: None,
                         endpoint: None,
                         state: NodeState::Admitted,
                         version: 1,
@@ -554,6 +568,7 @@ mod nodes_revoke_tests {
                     AuthorizedNode {
                         node_fp: sender.node_fp.clone(),
                         static_pubkey: encoding::encode_base64(&sender.static_pubkey),
+                        delivered_by: None,
                         endpoint: None,
                         state: NodeState::Admitted,
                         version: 1,
@@ -567,6 +582,7 @@ mod nodes_revoke_tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: target.node_fp.clone(),
                 static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                delivered_by: None,
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: u64::MAX,
@@ -609,6 +625,7 @@ mod nodes_revoke_tests {
                 authorized_nodes: vec![AuthorizedNode {
                     node_fp: self_node.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+                    delivered_by: None,
                     endpoint: None,
                     state: NodeState::Admitted,
                     version: 1,
@@ -632,6 +649,7 @@ mod nodes_revoke_tests {
                 authorized_nodes: vec![AuthorizedNode {
                     node_fp: target.node_fp.clone(),
                     static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                    delivered_by: None,
                     endpoint: None,
                     state: NodeState::Revoked,
                     version: 12,
@@ -656,6 +674,7 @@ mod nodes_revoke_tests {
             AuthorizedNode {
                 node_fp: "SHA256:abcdefgh-one".into(),
                 static_pubkey: String::new(),
+                delivered_by: None,
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -664,6 +683,7 @@ mod nodes_revoke_tests {
             AuthorizedNode {
                 node_fp: "SHA256:abcdefgh-two".into(),
                 static_pubkey: String::new(),
+                delivered_by: None,
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -692,6 +712,7 @@ mod nodes_revoke_tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: identity.node_fp.clone(),
                 static_pubkey: String::new(),
+                delivered_by: None,
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -726,6 +747,7 @@ mod nodes_revoke_tests {
             authorized_nodes: vec![AuthorizedNode {
                 node_fp: "SHA256:other".into(),
                 static_pubkey: String::new(),
+                delivered_by: None,
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 1,
@@ -755,6 +777,7 @@ mod nodes_revoke_tests {
         let mut entries = vec![AuthorizedNode {
             node_fp: self_node.node_fp.clone(),
             static_pubkey: encoding::encode_base64(&self_node.static_pubkey),
+            delivered_by: None,
             endpoint: None,
             state: NodeState::Admitted,
             version: 1,
@@ -767,6 +790,7 @@ mod nodes_revoke_tests {
             entries.push(AuthorizedNode {
                 node_fp: target.node_fp.clone(),
                 static_pubkey: encoding::encode_base64(&target.static_pubkey),
+                delivered_by: None,
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 3,

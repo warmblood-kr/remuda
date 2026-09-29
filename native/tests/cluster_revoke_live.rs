@@ -1,4 +1,4 @@
-//! Live revocation coverage across two isolated cluster daemons.
+//! Live replication and revocation coverage across isolated cluster daemons.
 
 #![cfg(unix)]
 // This integration test deliberately exercises the real loopback cluster wire.
@@ -7,7 +7,7 @@
 use remuda_core::protocol::{Request, Response};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
@@ -18,6 +18,7 @@ static NEXT_NODE_ID: AtomicUsize = AtomicUsize::new(0);
 
 struct PrivateNode {
     child: Child,
+    pid: u32,
     root: PathBuf,
     runtime: PathBuf,
     name: String,
@@ -34,8 +35,10 @@ impl PrivateNode {
         std::fs::create_dir_all(&home).unwrap();
         let name = format!("c{}-{id}", std::process::id());
         let child = spawn_daemon(&name, &runtime, &root);
+        let pid = child.id();
         let mut node = Self {
             child,
+            pid,
             root,
             runtime,
             name,
@@ -51,10 +54,17 @@ impl PrivateNode {
     fn restart_daemon(&mut self) {
         self.stop_daemon();
         self.child = spawn_daemon(&self.name, &self.runtime, &self.root);
+        self.pid = self.child.id();
         self.wait_ready();
     }
 
     fn stop_daemon(&mut self) {
+        assert!(self.runtime.starts_with(&self.root));
+        assert_eq!(
+            self.child.id(),
+            self.pid,
+            "stop only the recorded daemon PID"
+        );
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -91,7 +101,7 @@ impl PrivateNode {
     }
 }
 
-fn spawn_daemon(name: &str, runtime: &PathBuf, root: &PathBuf) -> Child {
+fn spawn_daemon(name: &str, runtime: &Path, root: &Path) -> Child {
     Command::new(env!("CARGO_BIN_EXE_remuda"))
         .args(["-s", name, "daemon"])
         .env("REMUDA_RUNTIME_DIR", runtime)
@@ -110,6 +120,11 @@ fn spawn_daemon(name: &str, runtime: &PathBuf, root: &PathBuf) -> Child {
 impl Drop for PrivateNode {
     fn drop(&mut self) {
         assert!(self.runtime.starts_with(&self.root));
+        assert_eq!(
+            self.child.id(),
+            self.pid,
+            "drop only the recorded daemon PID"
+        );
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_dir_all(&self.root);
@@ -118,7 +133,10 @@ impl Drop for PrivateNode {
 
 struct ListenerProcess {
     child: Child,
+    pid: u32,
     address: SocketAddr,
+    root: PathBuf,
+    runtime: PathBuf,
 }
 
 impl ListenerProcess {
@@ -144,10 +162,17 @@ impl ListenerProcess {
             .env("XDG_CACHE_HOME", node.root.join("cache"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap();
-        let mut listener = Self { child, address };
+        let pid = child.id();
+        let mut listener = Self {
+            child,
+            pid,
+            address,
+            root: node.root.clone(),
+            runtime: node.runtime.clone(),
+        };
         listener.wait_ready();
         listener
     }
@@ -169,6 +194,13 @@ impl ListenerProcess {
 
 impl Drop for ListenerProcess {
     fn drop(&mut self) {
+        assert!(self.runtime.starts_with(&self.root));
+        assert!(self.pid > 0);
+        assert_eq!(
+            self.child.id(),
+            self.pid,
+            "drop only the recorded listener PID"
+        );
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -198,6 +230,7 @@ fn authorized_node(
         node_fp,
         static_pubkey: remuda_native::cluster::encoding::encode_base64(public),
         endpoint: endpoint.map(str::to_owned),
+        delivered_by: None,
         state: remuda_native::cluster::NodeState::Admitted,
         version: 1,
         by: by.to_owned(),
@@ -258,9 +291,8 @@ fn assert_list_refused(peer: &[u8], server: &[u8], address: SocketAddr, attempt:
     }
 }
 
-// TODO after #254 merges: add a two-daemon revoke-during-held-Sync integration
-// check, then assert the following Sync poll fails. The listener socket test
-// covers the held-response authorization recheck until the Sync API exists.
+// Registry replication uses bounded one-shot pages; listener tests cover the
+// authorization recheck for any held response.
 #[test]
 fn revoking_a_live_member_is_seen_by_all_other_daemons() {
     let a = PrivateNode::start("a");
@@ -276,72 +308,16 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
     let listener = ListenerProcess::start(&a);
     let b_listener = ListenerProcess::start(&b);
     let c_listener = ListenerProcess::start(&c);
-    let address = listener.address.to_string();
-    let invite = successful(
-        a.run(&["cluster", "invite", "--bind", &address]),
-        "mint join invitation",
+    join_member(&a, &b, &a_identity, listener.address, b_listener.address);
+    assert_joiner_stores_issuer(&b, &a_identity, listener.address);
+    join_member(&a, &c, &a_identity, listener.address, c_listener.address);
+    wait_for_member_and_probe(
+        &c,
+        &b_fingerprint,
+        &b_identity,
+        &c.identity(),
+        c_listener.address,
     );
-    let join_line = invite.lines().nth(1).unwrap();
-    successful(
-        b.run(&[
-            "cluster",
-            "join",
-            &identity_fingerprint(&a_identity),
-            join_line,
-            "--bind",
-            &b_listener.address.to_string(),
-        ]),
-        "join node B to node A",
-    );
-
-    let b_registry: remuda_native::cluster::Registry = serde_json::from_slice(
-        &std::fs::read(b.root.join("state/remuda/cluster/authorized_nodes.json")).unwrap(),
-    )
-    .unwrap();
-    let recorded_issuer = b_registry
-        .authorized_nodes
-        .iter()
-        .find(|entry| entry.node_fp == identity_fingerprint(&a_identity))
-        .expect("joiner stores the pinned issuer");
-    assert_eq!(
-        recorded_issuer.state,
-        remuda_native::cluster::NodeState::Admitted
-    );
-    assert_eq!(recorded_issuer.endpoint.as_deref(), Some(address.as_str()));
-
-    let invite = successful(
-        a.run(&["cluster", "invite", "--bind", &address]),
-        "mint join invitation for node C",
-    );
-    let join_line = invite.lines().nth(1).unwrap();
-    successful(
-        c.run(&[
-            "cluster",
-            "join",
-            &identity_fingerprint(&a_identity),
-            join_line,
-            "--bind",
-            &c_listener.address.to_string(),
-        ]),
-        "join node C to node A",
-    );
-
-    let sync_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let members = successful(c.run(&["cluster", "nodes"]), "read C's nodes table");
-        if members.contains(&b_fingerprint) {
-            assert!(matches!(
-                list_from(&b_identity, &c.identity(), c_listener.address),
-                Response::Sessions(_)
-            ));
-            break;
-        }
-        assert!(
-            Instant::now() < sync_deadline,
-            "node B did not reach C before revocation: {members}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
 
     assert!(matches!(
         list_from(&b_identity, &a_identity, listener.address),
@@ -367,19 +343,7 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
         "node B's new connection to A",
     );
 
-    let revoke_sync_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let members = successful(c.run(&["cluster", "nodes"]), "read C's revoked nodes table");
-        let row = members.lines().find(|line| line.contains(&b_fingerprint));
-        if row.is_some_and(|row| row.contains("revoked")) {
-            break;
-        }
-        assert!(
-            Instant::now() < revoke_sync_deadline,
-            "node C did not receive B's tombstone: {members}"
-        );
-        thread::sleep(Duration::from_millis(50));
-    }
+    wait_for_revocation_on(&c, &b_fingerprint);
     assert_list_refused(
         &b_identity,
         &c.identity(),
@@ -394,6 +358,111 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
         .find(|line| line.contains(&b_fingerprint))
         .expect("node B row in nodes table");
     assert!(row.contains("revoked"), "node B row is not revoked: {row}");
+}
+
+fn join_member(
+    issuer: &PrivateNode,
+    joiner: &PrivateNode,
+    issuer_identity: &[u8],
+    issuer_address: SocketAddr,
+    joiner_address: SocketAddr,
+) {
+    let address = issuer_address.to_string();
+    let invite = successful(
+        issuer.run(&["cluster", "invite", "--bind", &address]),
+        "mint join invitation",
+    );
+    let join_line = invite.lines().nth(1).unwrap();
+    successful(
+        joiner.run(&[
+            "cluster",
+            "join",
+            &identity_fingerprint(issuer_identity),
+            join_line,
+            "--bind",
+            &joiner_address.to_string(),
+        ]),
+        "join member to issuer",
+    );
+}
+
+fn assert_joiner_stores_issuer(
+    joiner: &PrivateNode,
+    issuer_identity: &[u8],
+    issuer_address: SocketAddr,
+) {
+    let registry: remuda_native::cluster::Registry = serde_json::from_slice(
+        &std::fs::read(
+            joiner
+                .root
+                .join("state/remuda/cluster/authorized_nodes.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let issuer = registry
+        .authorized_nodes
+        .iter()
+        .find(|entry| entry.node_fp == identity_fingerprint(issuer_identity))
+        .expect("joiner stores the pinned issuer");
+    assert_eq!(issuer.state, remuda_native::cluster::NodeState::Admitted);
+    assert_eq!(
+        issuer.endpoint.as_deref(),
+        Some(issuer_address.to_string().as_str())
+    );
+    let self_fp = identity_fingerprint(&joiner.identity());
+    let self_entry = registry
+        .authorized_nodes
+        .iter()
+        .find(|entry| entry.node_fp == self_fp)
+        .expect("joiner keeps its own registry entry");
+    assert_eq!(self_entry.by, issuer.node_fp);
+}
+
+fn wait_for_member_and_probe(
+    receiver: &PrivateNode,
+    member_fp: &str,
+    member_identity: &[u8],
+    receiver_identity: &[u8],
+    receiver_address: SocketAddr,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let members = successful(receiver.run(&["cluster", "nodes"]), "read nodes table");
+        if members.contains(member_fp) {
+            assert!(matches!(
+                list_from(member_identity, receiver_identity, receiver_address),
+                Response::Sessions(_)
+            ));
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "member did not converge: {members}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_revocation_on(receiver: &PrivateNode, member_fp: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let members = successful(
+            receiver.run(&["cluster", "nodes"]),
+            "read revoked nodes table",
+        );
+        if members
+            .lines()
+            .any(|line| line.contains(member_fp) && line.contains("revoked"))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "tombstone did not converge: {members}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]

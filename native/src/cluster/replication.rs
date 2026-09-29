@@ -9,10 +9,13 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
 
 const WORKERS: usize = 4;
+const MAX_FETCH_PAGES: usize =
+    registry::MAX_REGISTRY_ENTRIES.div_ceil(crate::net::REGISTRY_REPLICATION_PAGE_ENTRIES) + 8;
+const REPLICATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Default)]
 struct WorkState {
@@ -26,6 +29,13 @@ struct WorkPool {
     wake: Condvar,
 }
 
+struct PeerMaterial {
+    endpoint: SocketAddr,
+    peer_key: Vec<u8>,
+    local_private: Zeroizing<Vec<u8>>,
+    registry: Registry,
+}
+
 static POOL: OnceLock<Arc<WorkPool>> = OnceLock::new();
 static CHANGE_PENDING: AtomicBool = AtomicBool::new(false);
 static CHANGE_SCHEDULER_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -37,14 +47,12 @@ pub fn registry_changed() {
     if CHANGE_SCHEDULER_RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
-    {
-        if thread::Builder::new()
+        && thread::Builder::new()
             .name("remuda-cluster-replication-queue".into())
             .spawn(schedule_changes)
             .is_err()
-        {
-            CHANGE_SCHEDULER_RUNNING.store(false, Ordering::Release);
-        }
+    {
+        CHANGE_SCHEDULER_RUNNING.store(false, Ordering::Release);
     }
 }
 
@@ -162,7 +170,7 @@ fn worker_loop(pool: Arc<WorkPool>) {
     }
 }
 
-fn peer_material(peer_fp: &str) -> io::Result<(SocketAddr, Vec<u8>, Zeroizing<Vec<u8>>, Registry)> {
+fn peer_material(peer_fp: &str) -> io::Result<PeerMaterial> {
     let (_, registry) = super::nodes()?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized"))?;
     let peer = registry
@@ -178,17 +186,27 @@ fn peer_material(peer_fp: &str) -> io::Result<(SocketAddr, Vec<u8>, Zeroizing<Ve
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "peer endpoint is invalid"))?;
     let public = super::encoding::decode_base64(&peer.static_pubkey)?;
     let private = identity::load_static_private_key()?;
-    Ok((endpoint, public, private, registry))
+    Ok(PeerMaterial {
+        endpoint,
+        peer_key: public,
+        local_private: private,
+        registry,
+    })
 }
 
 fn replicate_peer(peer_fp: &str, push: bool) -> io::Result<()> {
-    let (endpoint, peer_key, local_private, local_registry) = peer_material(peer_fp)?;
-    let client = ClusterClient::system();
+    let deadline = Instant::now() + REPLICATION_OPERATION_TIMEOUT;
+    let material = peer_material(peer_fp)?;
+    let endpoint = material.endpoint;
+    let peer_key = material.peer_key;
+    let local_private = material.local_private;
+    let local_registry = material.registry;
     if push {
         let (identity, _) = super::nodes()?
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized"))?;
-        let entries = attest_snapshot(&local_registry.authorized_nodes, &identity.node_fp);
+        let entries = snapshot_for_wire(&local_registry.authorized_nodes);
         for chunk in entries.chunks(crate::net::REGISTRY_REPLICATION_PAGE_ENTRIES) {
+            ensure_peer_admitted(peer_fp)?;
             let update = registry::RegistryUpdate {
                 sender_fp: identity.node_fp.clone(),
                 entries: chunk.to_vec(),
@@ -204,13 +222,18 @@ fn replicate_peer(peer_fp: &str, push: bool) -> io::Result<()> {
                 ));
             }
             match request_with_rate_retry(
-                &client,
                 endpoint,
                 &peer_key,
                 &local_private,
                 &Request::ClusterRegistryUpdate { update_json },
+                deadline,
             ) {
                 Ok(Response::ClusterRegistryAck { .. }) => {}
+                Ok(Response::Error(reason)) => {
+                    return Err(io::Error::other(format!(
+                        "peer refused registry update: {reason}"
+                    )))
+                }
                 Ok(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -222,44 +245,63 @@ fn replicate_peer(peer_fp: &str, push: bool) -> io::Result<()> {
         }
     }
     fetch_peer(
-        &client,
         endpoint,
         &peer_key,
         &local_private,
         peer_fp,
         &local_registry,
+        deadline,
     )
 }
 
-fn fetch_peer(
-    client: &ClusterClient,
-    endpoint: SocketAddr,
-    peer_key: &[u8],
-    local_private: &[u8],
-    peer_fp: &str,
-    local_registry: &Registry,
-) -> io::Result<()> {
-    let known_digest = local_registry.digest()?;
-    let mut offset = 0usize;
-    let mut snapshot_digest: Option<String> = None;
-    loop {
-        let digest = if offset == 0 {
-            Some(known_digest.clone())
-        } else {
-            None
-        };
-        let response = request_with_rate_retry(
-            client,
-            endpoint,
-            peer_key,
-            local_private,
-            &Request::ClusterRegistrySync { digest, offset },
-        )
-        .map_err(io::Error::other)?;
+fn ensure_peer_admitted(peer_fp: &str) -> io::Result<()> {
+    let (_, registry) = super::nodes()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized"))?;
+    if registry.authorized_nodes.iter().any(|node| {
+        node.node_fp == peer_fp && node.state == NodeState::Admitted && node.endpoint.is_some()
+    }) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "peer is no longer admitted for registry replication",
+        ))
+    }
+}
+
+struct FetchAccumulator {
+    known_digest: String,
+    offset: usize,
+    snapshot_digest: Option<String>,
+    entries: Vec<AuthorizedNode>,
+    pages: usize,
+    unchanged: bool,
+}
+
+impl FetchAccumulator {
+    fn new(known_digest: String) -> Self {
+        Self {
+            known_digest,
+            offset: 0,
+            snapshot_digest: None,
+            entries: Vec::new(),
+            pages: 0,
+            unchanged: false,
+        }
+    }
+
+    fn accept(&mut self, response: Response, peer_fp: &str) -> io::Result<bool> {
+        self.pages += 1;
+        if self.pages > MAX_FETCH_PAGES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registry sync exceeded its page limit",
+            ));
+        }
         let Response::ClusterRegistryPage {
             sender_fp,
             digest,
-            offset: response_offset,
+            offset,
             entries_json,
             next_offset,
             unchanged,
@@ -276,13 +318,14 @@ fn fetch_peer(
                 "sync page exceeds byte cap",
             ));
         }
-        if sender_fp != peer_fp || response_offset != offset {
+        if sender_fp != peer_fp || offset != self.offset {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "sync peer or offset mismatch",
             ));
         }
-        if snapshot_digest
+        if self
+            .snapshot_digest
             .as_ref()
             .is_some_and(|known| known != &digest)
         {
@@ -291,57 +334,141 @@ fn fetch_peer(
                 "peer registry changed during sync",
             ));
         }
-        snapshot_digest = Some(digest);
+        self.snapshot_digest = Some(digest.clone());
         if unchanged {
-            if offset != 0 {
+            if self.offset != 0 || digest != self.known_digest || entries_json != "[]" {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "invalid unchanged sync page",
                 ));
             }
-            return Ok(());
+            self.unchanged = true;
+            return Ok(true);
         }
-        let entries: Vec<AuthorizedNode> = serde_json::from_str(&entries_json)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid sync entries"))?;
-        if entries.len() > crate::net::REGISTRY_REPLICATION_PAGE_ENTRIES {
+        let page_entries = registry::RegistryUpdate::decode_entries_json(&entries_json)?;
+        if page_entries.len() > crate::net::REGISTRY_REPLICATION_PAGE_ENTRIES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "sync page exceeds entry cap",
             ));
         }
-        let accepted = attest_snapshot(&entries, peer_fp);
-        if !accepted.is_empty() {
-            let update = registry::RegistryUpdate {
-                sender_fp: peer_fp.to_owned(),
-                entries: accepted,
-            };
-            registry::apply_registry_update(&update, peer_key)?;
+        if page_entries.len() > registry::MAX_REGISTRY_ENTRIES.saturating_sub(self.entries.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registry sync exceeds total entry cap",
+            ));
         }
+        let page_len = page_entries.len();
+        self.entries.extend(page_entries);
         match next_offset {
-            Some(next) if next > offset => offset = next,
-            Some(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "sync offset did not advance",
-                ))
+            Some(next) if next == self.offset.saturating_add(page_len) && page_len > 0 => {
+                self.offset = next;
+                Ok(false)
             }
-            None => return Ok(()),
+            Some(_) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sync offset does not match page length",
+            )),
+            None => {
+                let snapshot = Registry {
+                    authorized_nodes: self.entries.clone(),
+                };
+                if Some(snapshot.digest()?) != self.snapshot_digest {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "registry sync digest did not match its pages",
+                    ));
+                }
+                Ok(true)
+            }
         }
     }
 }
 
+fn fetch_peer(
+    endpoint: SocketAddr,
+    peer_key: &[u8],
+    local_private: &[u8],
+    peer_fp: &str,
+    local_registry: &Registry,
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut fetched = FetchAccumulator::new(local_registry.digest()?);
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "registry replication operation timed out",
+            ));
+        }
+        ensure_peer_admitted(peer_fp)?;
+        let digest = if fetched.offset == 0 {
+            Some(fetched.known_digest.clone())
+        } else {
+            None
+        };
+        let response = request_with_rate_retry(
+            endpoint,
+            peer_key,
+            local_private,
+            &Request::ClusterRegistrySync {
+                digest,
+                offset: fetched.offset,
+            },
+            deadline,
+        )
+        .map_err(io::Error::other)?;
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "registry replication operation timed out",
+            ));
+        }
+        if !fetched.accept(response, peer_fp)? {
+            continue;
+        }
+        if fetched.unchanged {
+            return Ok(());
+        }
+        if !fetched.entries.is_empty() {
+            let update = registry::RegistryUpdate {
+                sender_fp: peer_fp.to_owned(),
+                entries: std::mem::take(&mut fetched.entries),
+            };
+            registry::apply_registry_update(&update, peer_key)?;
+        }
+        return Ok(());
+    }
+}
+
 fn request_with_rate_retry(
-    client: &ClusterClient,
     endpoint: SocketAddr,
     peer_key: &[u8],
     local_private: &[u8],
     request: &Request,
+    deadline: Instant,
 ) -> Result<Response, crate::net::cluster_client::ClientError> {
     for _ in 0..60 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(crate::net::cluster_client::ClientError::Timeout);
+        }
+        let client = ClusterClient::with_timeouts(
+            Arc::new(crate::SystemWallClock::new()),
+            crate::net::cluster_client::ClientTimeouts {
+                connect: remaining.min(Duration::from_secs(5)),
+                read: remaining.min(Duration::from_secs(5)),
+                total: remaining,
+            },
+        );
         let response = client.request(endpoint, peer_key, local_private, request)?;
         if matches!(&response, Response::Error(reason) if reason == "registry replication rate limit exceeded")
         {
-            thread::sleep(Duration::from_secs(1));
+            thread::sleep(
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(1)),
+            );
             continue;
         }
         return Ok(response);
@@ -349,15 +476,12 @@ fn request_with_rate_retry(
     Err(crate::net::cluster_client::ClientError::Timeout)
 }
 
-fn attest_snapshot(entries: &[AuthorizedNode], sender_fp: &str) -> Vec<AuthorizedNode> {
+fn snapshot_for_wire(entries: &[AuthorizedNode]) -> Vec<AuthorizedNode> {
     entries
         .iter()
         .cloned()
         .map(|mut entry| {
-            // The authenticated relay vouches for every row in its full
-            // snapshot. `by` therefore records the latest attesting member;
-            // this is deliberately forgeable by a compromised current member.
-            entry.by = sender_fp.to_owned();
+            entry.delivered_by = None;
             entry
         })
         .collect()
@@ -368,11 +492,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn relayed_snapshot_keeps_every_entry_and_attributes_it_to_sender() {
+    fn relayed_snapshot_keeps_origin_attribution_and_tombstones() {
         let entries = vec![
             AuthorizedNode {
                 node_fp: "SHA256:entry-a".into(),
                 static_pubkey: "key-a".into(),
+                delivered_by: None,
                 endpoint: None,
                 state: NodeState::Admitted,
                 version: 3,
@@ -381,15 +506,20 @@ mod tests {
             AuthorizedNode {
                 node_fp: "SHA256:entry-b".into(),
                 static_pubkey: "key-b".into(),
+                delivered_by: None,
                 endpoint: None,
                 state: NodeState::Revoked,
                 version: 1,
                 by: "SHA256:origin-b".into(),
             },
         ];
-        let relayed = attest_snapshot(&entries, "SHA256:relay");
+        let mut local = entries.clone();
+        local[0].delivered_by = Some("SHA256:old-relay".into());
+        let relayed = snapshot_for_wire(&local);
         assert_eq!(relayed.len(), entries.len());
-        assert!(relayed.iter().all(|entry| entry.by == "SHA256:relay"));
+        assert_eq!(relayed[0].by, "SHA256:origin-a");
+        assert_eq!(relayed[1].by, "SHA256:origin-b");
+        assert_eq!(relayed[0].delivered_by, None);
         assert_eq!(relayed[0].state, NodeState::Admitted);
         assert_eq!(relayed[1].state, NodeState::Revoked);
     }
@@ -414,5 +544,60 @@ mod tests {
             state.ready.push_back("peer-a".into());
         }
         assert_eq!(state.ready, VecDeque::from(["peer-a".to_owned()]));
+    }
+
+    #[test]
+    fn fetch_accumulator_stops_at_its_page_cap() {
+        let mut fetched = FetchAccumulator::new("digest".into());
+        let entry = AuthorizedNode {
+            node_fp: "SHA256:entry".into(),
+            static_pubkey: "key".into(),
+            endpoint: None,
+            delivered_by: None,
+            state: NodeState::Admitted,
+            version: 1,
+            by: "SHA256:origin".into(),
+        };
+        for offset in 0..MAX_FETCH_PAGES {
+            let response = Response::ClusterRegistryPage {
+                sender_fp: "peer".into(),
+                digest: "digest".into(),
+                offset,
+                entries_json: registry::RegistryUpdate::encode_entries_json(std::slice::from_ref(
+                    &entry,
+                ))
+                .unwrap(),
+                next_offset: Some(offset + 1),
+                unchanged: false,
+            };
+            assert!(!fetched.accept(response, "peer").unwrap());
+        }
+        let extra = Response::ClusterRegistryPage {
+            sender_fp: "peer".into(),
+            digest: "digest".into(),
+            offset: MAX_FETCH_PAGES,
+            entries_json: "[]".into(),
+            next_offset: None,
+            unchanged: false,
+        };
+        assert!(fetched.accept(extra, "peer").is_err());
+    }
+
+    #[test]
+    fn expired_operation_deadline_prevents_another_request_attempt() {
+        let result = request_with_rate_retry(
+            "127.0.0.1:1".parse().unwrap(),
+            &[],
+            &[],
+            &Request::ClusterRegistrySync {
+                digest: None,
+                offset: 0,
+            },
+            Instant::now() - Duration::from_millis(1),
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            crate::net::cluster_client::ClientError::Timeout
+        );
     }
 }
