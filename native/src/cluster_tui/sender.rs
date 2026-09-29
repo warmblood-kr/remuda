@@ -1,4 +1,5 @@
-use super::queue::{InputQueue, PendingBatch, QueueEvent, SendOutcome};
+use super::queue::{InputQueue, InputTarget, PendingBatch, QueueEvent, SendOutcome};
+use crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES;
 use remuda_core::input::MAX_INPUT_BYTES;
 use remuda_core::protocol::{Request, Response};
 use std::collections::HashMap;
@@ -8,8 +9,8 @@ use std::time::Instant;
 
 pub struct InputSender {
     client_id: [u8; 16],
-    next_seq: HashMap<(String, String), u64>,
-    target_client_ids: HashMap<(String, String), [u8; 16]>,
+    next_seq: HashMap<(Option<String>, String, String), u64>,
+    target_client_ids: HashMap<(Option<String>, String, String), [u8; 16]>,
 }
 
 impl InputSender {
@@ -35,6 +36,20 @@ impl InputSender {
         bytes: Vec<u8>,
         now: Instant,
     ) -> io::Result<u64> {
+        self.enqueue_one(queue, None, name, instance_id, bytes, now)
+    }
+
+    /// Queue a remote line as ordered batches within the listener's tighter cap.
+    pub fn enqueue_remote(
+        &mut self,
+        queue: &mut InputQueue,
+        node: &str,
+        name: &str,
+        instance_id: &str,
+        bytes: Vec<u8>,
+        now: Instant,
+    ) -> io::Result<Vec<u64>> {
+        let max_batch_bytes = MAX_REMOTE_INPUT_BATCH_BYTES;
         if bytes.len() > MAX_INPUT_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -47,7 +62,46 @@ impl InputSender {
                 "input must contain at least one byte",
             ));
         }
-        let target = (name.to_owned(), instance_id.to_owned());
+        let mut seqs = Vec::with_capacity(bytes.len().div_ceil(max_batch_bytes));
+        for chunk in bytes.chunks(max_batch_bytes) {
+            seqs.push(self.enqueue_one(
+                queue,
+                Some(node),
+                name,
+                instance_id,
+                chunk.to_vec(),
+                now,
+            )?);
+        }
+        Ok(seqs)
+    }
+
+    fn enqueue_one(
+        &mut self,
+        queue: &mut InputQueue,
+        remote_node: Option<&str>,
+        name: &str,
+        instance_id: &str,
+        bytes: Vec<u8>,
+        now: Instant,
+    ) -> io::Result<u64> {
+        if bytes.len() > MAX_INPUT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("line too long ({} bytes, max 64 KiB)", bytes.len()),
+            ));
+        }
+        if bytes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "input must contain at least one byte",
+            ));
+        }
+        let target = (
+            remote_node.map(str::to_owned),
+            name.to_owned(),
+            instance_id.to_owned(),
+        );
         let client_id = *self
             .target_client_ids
             .entry(target.clone())
@@ -57,9 +111,12 @@ impl InputSender {
         *next_seq = seq
             .checked_add(1)
             .ok_or_else(|| io::Error::other("input sequence exhausted"))?;
-        queue.enqueue(
-            name.into(),
-            instance_id.into(),
+        queue.enqueue_target(
+            InputTarget {
+                remote_node: remote_node.map(str::to_owned),
+                name: name.into(),
+                instance_id: instance_id.into(),
+            },
             format_client_id(&client_id),
             seq,
             bytes,
@@ -106,18 +163,82 @@ impl InputSender {
             Ok(other) => SendOutcome::Error(format!("unexpected Input response: {other:?}")),
             Err(error) => SendOutcome::IoFailure(error.to_string()),
         };
+        self.finish(queue, &batch, outcome, now)
+    }
+
+    /// Send a prepared remote batch. Listener errors are ambiguous because they
+    /// can race a dispatch, so this path retries the identical request.
+    pub fn send_remote_started<F>(
+        &mut self,
+        queue: &mut InputQueue,
+        now: Instant,
+        mut send: F,
+    ) -> Option<QueueEvent>
+    where
+        F: FnMut(&str, &Request) -> io::Result<Response>,
+    {
+        let batch = queue.sending_batch()?;
+        let request = input_request(&batch);
+        let Some(node) = batch.remote_node.as_deref() else {
+            return self.finish(
+                queue,
+                &batch,
+                SendOutcome::Error("remote target is missing".into()),
+                now,
+            );
+        };
+        let outcome = match send(node, &request) {
+            Ok(Response::Ack { duplicate }) => SendOutcome::Ack { duplicate },
+            Ok(Response::Uncertain) => SendOutcome::Uncertain,
+            Ok(Response::WrongInstance) => SendOutcome::WrongInstance,
+            Ok(Response::RateLimited) => SendOutcome::RateLimited,
+            Ok(Response::RemoteControlDisabled) => SendOutcome::RemoteControlDisabled,
+            Ok(Response::Error(reason)) if reason == remote_oversize_error() => {
+                SendOutcome::Error(format!("bug: {reason}"))
+            }
+            Ok(Response::Error(reason)) => SendOutcome::IoFailure(reason),
+            Ok(other) => {
+                SendOutcome::IoFailure(format!("unexpected remote Input response: {other:?}"))
+            }
+            Err(error) => SendOutcome::IoFailure(error.to_string()),
+        };
+        self.finish(queue, &batch, outcome, now)
+    }
+
+    fn finish(
+        &mut self,
+        queue: &mut InputQueue,
+        batch: &PendingBatch,
+        outcome: SendOutcome,
+        now: Instant,
+    ) -> Option<QueueEvent> {
         let event = queue.finish(batch.seq, outcome, now);
         if matches!(
             event,
             Some(QueueEvent::Uncertain { .. } | QueueEvent::Failed { .. })
         ) {
-            self.rotate_target(queue, &batch.name, &batch.instance_id);
+            self.rotate_target(queue, batch);
+        } else if matches!(event, Some(QueueEvent::Dropped { .. })) {
+            queue.drop_waiting_target(
+                batch.remote_node.as_deref(),
+                &batch.name,
+                &batch.instance_id,
+                "session restarted; input dropped",
+            );
+        } else if matches!(event, Some(QueueEvent::RemoteControlDisabled { .. })) {
+            if let Some(node) = batch.remote_node.as_deref() {
+                queue.drop_waiting_node(node, "remote control disabled");
+            }
         }
         event
     }
 
-    fn rotate_target(&mut self, queue: &mut InputQueue, name: &str, instance_id: &str) {
-        let target = (name.to_owned(), instance_id.to_owned());
+    fn rotate_target(&mut self, queue: &mut InputQueue, batch: &PendingBatch) {
+        let target = (
+            batch.remote_node.clone(),
+            batch.name.clone(),
+            batch.instance_id.clone(),
+        );
         let previous = self
             .target_client_ids
             .get(&target)
@@ -128,7 +249,12 @@ impl InputSender {
             client_id = increment_client_id(previous);
         }
         let client_id_text = format_client_id(&client_id);
-        let next_seq = queue.restart_waiting_target(name, instance_id, &client_id_text);
+        let next_seq = queue.restart_waiting_target(
+            batch.remote_node.as_deref(),
+            &batch.name,
+            &batch.instance_id,
+            &client_id_text,
+        );
         self.target_client_ids.insert(target.clone(), client_id);
         self.next_seq.insert(target, next_seq);
     }
@@ -145,6 +271,10 @@ impl InputSender {
         queue.begin_due(now)?;
         self.send_started(queue, now, send)
     }
+}
+
+fn remote_oversize_error() -> String {
+    format!("remote Input batch exceeds {MAX_REMOTE_INPUT_BATCH_BYTES} bytes")
 }
 
 /// Uncertain is bounded by 8s: four 1s attempts plus retry and UI-loop overhead.
@@ -188,6 +318,16 @@ mod tests {
     use std::collections::HashSet;
     use std::io;
     use std::time::{Duration, Instant};
+
+    fn remote_queued(bytes: Vec<u8>) -> (InputSender, InputQueue, Instant) {
+        let now = Instant::now();
+        let mut sender = InputSender::with_client_id([7; 16]);
+        let mut queue = InputQueue::default();
+        sender
+            .enqueue_remote(&mut queue, "laptop", "build", "remote-instance", bytes, now)
+            .unwrap();
+        (sender, queue, now)
+    }
 
     fn queued() -> (InputSender, InputQueue, Instant) {
         let now = Instant::now();
@@ -455,5 +595,205 @@ mod tests {
             .is_none());
         assert_eq!(calls.get(), 4);
         assert_eq!(queue.items().next().unwrap().state, QueueState::Uncertain);
+    }
+
+    #[test]
+    fn remote_line_is_chunked_to_the_listener_limit() {
+        let now = Instant::now();
+        let mut sender = InputSender::with_client_id([7; 16]);
+        let mut queue = InputQueue::default();
+        let limit = crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES;
+        let seqs = sender
+            .enqueue_remote(
+                &mut queue,
+                "laptop",
+                "build",
+                "remote-instance",
+                vec![b'x'; limit * 2 + 7],
+                now,
+            )
+            .unwrap();
+        assert_eq!(seqs, [1, 2, 3]);
+        let batches = queue.items().collect::<Vec<_>>();
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.bytes.len())
+                .collect::<Vec<_>>(),
+            [limit, limit, 7]
+        );
+        assert!(batches
+            .iter()
+            .all(|batch| batch.remote_node.as_deref() == Some("laptop")));
+    }
+
+    #[test]
+    fn remote_listener_errors_retry_identically_then_uncertain_rotates_target() {
+        let (mut sender, mut queue, now) = remote_queued(b"first\r".to_vec());
+        let first_client = queue.items().next().unwrap().client_id.clone();
+        sender
+            .enqueue_remote(
+                &mut queue,
+                "laptop",
+                "build",
+                "remote-instance",
+                b"next\r".to_vec(),
+                now,
+            )
+            .unwrap();
+        let mut first_request = None;
+        for attempt in 0..=super::super::queue::MAX_IO_RETRIES {
+            let at = now + Duration::from_secs(10 * u64::from(attempt));
+            assert!(queue.begin_due(at).is_some());
+            let result = sender.send_remote_started(&mut queue, at, |node, request| {
+                assert_eq!(node, "laptop");
+                if let Some(first) = &first_request {
+                    assert_eq!(first, request);
+                } else {
+                    first_request = Some(request.clone());
+                }
+                if attempt == 0 {
+                    Ok(Response::Error("listener dispatch error".into()))
+                } else {
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "listener timeout"))
+                }
+            });
+            if attempt < super::super::queue::MAX_IO_RETRIES {
+                assert!(matches!(
+                    result,
+                    Some(QueueEvent::RetryScheduled { seq: 1, .. })
+                ));
+            } else {
+                assert!(matches!(result, Some(QueueEvent::Uncertain { seq: 1, .. })));
+            }
+        }
+        let waiting = queue.items().next_back().unwrap();
+        assert_eq!(waiting.state, QueueState::Waiting);
+        assert_eq!(waiting.seq, 1);
+        assert_ne!(waiting.client_id, first_client);
+    }
+
+    #[test]
+    fn remote_control_disabled_stops_target_without_rotating() {
+        let (mut sender, mut queue, now) = remote_queued(b"first\r".to_vec());
+        let client_id = queue.items().next().unwrap().client_id.clone();
+        sender
+            .enqueue_remote(
+                &mut queue,
+                "laptop",
+                "build",
+                "remote-instance",
+                b"next\r".to_vec(),
+                now,
+            )
+            .unwrap();
+        assert!(queue.begin_due(now).is_some());
+        assert!(matches!(
+            sender.send_remote_started(&mut queue, now, |_, _| {
+                Ok(Response::RemoteControlDisabled)
+            }),
+            Some(QueueEvent::RemoteControlDisabled { node, .. }) if node == "laptop"
+        ));
+        assert!(queue
+            .items()
+            .all(|batch| batch.state != QueueState::Waiting));
+        assert_eq!(queue.items().next().unwrap().client_id, client_id);
+    }
+
+    #[test]
+    fn remote_control_disabled_drops_every_queued_session_on_that_node() {
+        let now = Instant::now();
+        let mut sender = InputSender::with_client_id([7; 16]);
+        let mut queue = InputQueue::default();
+        for (node, name) in [
+            ("laptop", "build"),
+            ("laptop", "logs"),
+            ("desktop", "build"),
+        ] {
+            sender
+                .enqueue_remote(
+                    &mut queue,
+                    node,
+                    name,
+                    "remote-instance",
+                    b"line\r".to_vec(),
+                    now,
+                )
+                .unwrap();
+        }
+        assert!(queue.begin_due(now).is_some());
+        assert!(matches!(
+            sender.send_remote_started(&mut queue, now, |_, _| {
+                Ok(Response::RemoteControlDisabled)
+            }),
+            Some(QueueEvent::RemoteControlDisabled { node, .. }) if node == "laptop"
+        ));
+        let waiting: Vec<_> = queue
+            .items()
+            .filter(|batch| batch.state == QueueState::Waiting)
+            .map(|batch| batch.remote_node.as_deref())
+            .collect();
+        assert_eq!(waiting, [Some("desktop")]);
+    }
+
+    #[test]
+    fn remote_rate_limit_retries_the_same_batch() {
+        let (mut sender, mut queue, now) = remote_queued(b"line\r".to_vec());
+        let mut first = None;
+        assert!(queue.begin_due(now).is_some());
+        assert!(matches!(
+            sender.send_remote_started(&mut queue, now, |_, request| {
+                first = Some(request.clone());
+                Ok(Response::RateLimited)
+            }),
+            Some(QueueEvent::RetryScheduled { seq: 1, .. })
+        ));
+        let retry_at = now + Duration::from_secs(1);
+        assert!(queue.begin_due(retry_at).is_some());
+        assert!(matches!(
+            sender.send_remote_started(&mut queue, retry_at, |_, request| {
+                assert_eq!(Some(request.clone()), first);
+                Ok(Response::Ack { duplicate: false })
+            }),
+            Some(QueueEvent::Sent { seq: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn remote_wrong_instance_drops_all_queued_chunks() {
+        let (mut sender, mut queue, now) = remote_queued(b"first\r".to_vec());
+        sender
+            .enqueue_remote(
+                &mut queue,
+                "laptop",
+                "build",
+                "remote-instance",
+                b"next\r".to_vec(),
+                now,
+            )
+            .unwrap();
+        assert!(queue.begin_due(now).is_some());
+        assert!(matches!(
+            sender.send_remote_started(&mut queue, now, |_, _| Ok(Response::WrongInstance)),
+            Some(QueueEvent::Dropped { seq: 1, .. })
+        ));
+        assert!(queue
+            .items()
+            .all(|batch| batch.state == QueueState::Dropped));
+    }
+
+    #[test]
+    fn remote_oversize_refusal_is_a_visible_bug_failure() {
+        let (mut sender, mut queue, now) = remote_queued(b"line\r".to_vec());
+        assert!(queue.begin_due(now).is_some());
+        assert!(matches!(
+            sender.send_remote_started(&mut queue, now, |_, _| {
+                Ok(Response::Error(format!(
+                    "remote Input batch exceeds {} bytes",
+                    crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES
+                )))
+            }),
+            Some(QueueEvent::Failed { reason, .. }) if reason.starts_with("bug:")
+        ));
     }
 }

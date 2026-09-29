@@ -3,8 +3,9 @@
 
 use crate::client::{self, RawMode};
 use crate::cluster_remote::{
-    RemoteNodeSnapshot, RemoteSelection as RemotePollSelection, RemoteSessionSnapshot,
-    RemoteSnapshot, RemoteSource, RemoteState,
+    ClusterRemoteInput, RemoteInputTransport, RemoteNodeSnapshot,
+    RemoteSelection as RemotePollSelection, RemoteSessionSnapshot, RemoteSnapshot, RemoteSource,
+    RemoteState,
 };
 use close_request::confirmed_close;
 use composer::{ComposerAction, LineComposer};
@@ -21,9 +22,8 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
-
 pub mod close_request;
+const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 pub mod composer;
 pub mod confirm;
 pub mod ended;
@@ -86,6 +86,9 @@ pub struct ClusterUi {
     remote_expanded: HashSet<String>,
     remote_selected: Option<RemoteSelection>,
     remote_active: Option<RemoteSelection>,
+    remote_composer_target: Option<(String, String, String)>,
+    remote_input_enabled: bool,
+    remote_control_disabled: HashSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -149,6 +152,9 @@ impl ClusterUi {
             remote_expanded: HashSet::new(),
             remote_selected: None,
             remote_active: None,
+            remote_composer_target: None,
+            remote_input_enabled: false,
+            remote_control_disabled: HashSet::new(),
         }
     }
 
@@ -417,7 +423,11 @@ impl ClusterUi {
         let Some((name, instance_id)) = self.pending_close.take() else {
             return;
         };
-        let response = client::request(path, &confirmed_close(name.clone(), instance_id.clone()));
+        let response = client::request_with_timeout(
+            path,
+            &confirmed_close(name.clone(), instance_id.clone()),
+            UI_REQUEST_TIMEOUT,
+        );
         self.close_completed(name, instance_id, response, now);
     }
 
@@ -537,6 +547,9 @@ impl ClusterUi {
         frame.extend(queue_rows.into_iter().rev().map(queue_line));
         if let Some(prompt) = self.confirmation.prompt() {
             frame.push(prompt);
+        } else if self.remote_active.is_some() && self.composer_focused {
+            frame.push(self.composer_line());
+            frame.push("Enter send · Ctrl-C clear · Ctrl-\\ list".into());
         } else if self.remote_active.is_some() {
             frame.push("Remote session is read-only · q detach".into());
         } else if self.ended.is_some() {
@@ -577,7 +590,7 @@ impl ClusterUi {
                 if is_selected { ">" } else { " " },
                 if is_expanded { "▼" } else { "▶" },
                 node.name,
-                remote_state_label(node.state, node.last_sync_age, node.last_error.as_deref())
+                remote_state_label(node.state, node.last_sync_age)
             ));
             if is_expanded {
                 for session in visible_sessions {
@@ -588,11 +601,10 @@ impl ClusterUi {
                             instance_id: session.instance_id.clone(),
                         });
                     frame.push(format!(
-                        "{}    {:<12} {}{}",
+                        "{}    {:<12} {}",
                         if is_selected { ">" } else { " " },
                         session.name,
-                        if session.alive { "live" } else { "ended" },
-                        session_error_suffix(session.last_error.as_deref())
+                        if session.alive { "live" } else { "ended" }
                     ));
                 }
             }
@@ -608,12 +620,8 @@ impl ClusterUi {
                         node.name,
                         session.name,
                         if session.alive { "live" } else { "ended" },
-                        remote_state_label(
-                            node.state,
-                            node.last_sync_age,
-                            node.last_error.as_deref()
-                        )
-                    ) + &session_error_suffix(session.last_error.as_deref()),
+                        remote_state_label(node.state, node.last_sync_age)
+                    ),
                     session
                         .screen
                         .as_ref()
@@ -729,7 +737,7 @@ impl ClusterUi {
                     self.notice = Some(("cannot close: session identity is missing".into(), now));
                 }
             } else {
-                self.notice = Some((format!("{} has already ended", session.name), now));
+                self.notice = Some((format!("{} has already ended.", session.name), now));
             }
         }
     }
@@ -749,12 +757,22 @@ impl ClusterUi {
                 instance_id,
             } => {
                 self.query = None;
+                self.composer_target = None;
+                let can_send = self.remote_input_enabled
+                    && self
+                        .remote_session(&RemoteSelection::Session {
+                            node: node.clone(),
+                            name: name.clone(),
+                            instance_id: instance_id.clone(),
+                        })
+                        .is_some_and(|(_, session)| session.alive);
                 self.remote_active = Some(RemoteSelection::Session {
-                    node,
-                    name,
-                    instance_id,
+                    node: node.clone(),
+                    name: name.clone(),
+                    instance_id: instance_id.clone(),
                 });
-                self.composer_focused = false;
+                self.composer_focused = can_send;
+                self.remote_composer_target = can_send.then_some((node, name, instance_id));
             }
             TreeSelection::LocalSession(selected) => {
                 if self
@@ -768,6 +786,7 @@ impl ClusterUi {
                 self.expanded = true;
                 self.active = selected;
                 self.remote_active = None;
+                self.remote_composer_target = None;
                 self.composer_focused = true;
                 self.bind_composer_target();
             }
@@ -775,17 +794,25 @@ impl ClusterUi {
     }
 
     fn handle_composer_event(&mut self, event: crossterm::event::KeyEvent, now: Duration) {
-        if self.composer_target.is_none() {
+        if self.composer_target.is_none() && self.remote_composer_target.is_none() {
             self.bind_composer_target();
         }
         match self.composer.handle_key(event) {
             ComposerAction::None => {}
             ComposerAction::Cleared => {
-                self.composer_target = None;
+                if self.remote_composer_target.is_none() {
+                    self.composer_target = None;
+                }
                 self.notice = Some(("draft cleared".into(), now));
             }
             ComposerAction::Detach => self.composer_focused = false,
-            ComposerAction::Submit(bytes) => self.enqueue_draft(bytes, now),
+            ComposerAction::Submit(bytes) => {
+                if self.remote_composer_target.is_some() {
+                    self.enqueue_remote_draft(bytes, now);
+                } else {
+                    self.enqueue_draft(bytes, now);
+                }
+            }
         }
     }
 
@@ -840,6 +867,53 @@ impl ClusterUi {
         }
     }
 
+    fn enqueue_remote_draft(&mut self, bytes: Vec<u8>, now: Duration) {
+        let Some((node, name, instance_id)) = self.remote_composer_target.clone() else {
+            return;
+        };
+        if self.remote_control_disabled.contains(&node) {
+            self.restore_draft(&bytes);
+            self.notice = Some((format!("remote control disabled on {node}"), now));
+            return;
+        }
+        let selection = RemoteSelection::Session {
+            node: node.clone(),
+            name: name.clone(),
+            instance_id: instance_id.clone(),
+        };
+        let Some((_, session)) = self.remote_session(&selection) else {
+            self.restore_draft(&bytes);
+            self.notice = Some((
+                format!("remote input unavailable: {node}/{name} is no longer listed"),
+                now,
+            ));
+            return;
+        };
+        let wire_name = session.wire_name.clone();
+        if !session.alive {
+            self.restore_draft(&bytes);
+            self.notice = Some((
+                format!("remote input disabled: {node}/{name} has ended"),
+                now,
+            ));
+            return;
+        }
+        match self.input_sender.enqueue_remote(
+            &mut self.input_queue,
+            &node,
+            &wire_name,
+            &instance_id,
+            bytes.clone(),
+            Instant::now(),
+        ) {
+            Ok(_) => self.notice = None,
+            Err(error) => {
+                self.restore_draft(&bytes);
+                self.notice = Some((format!("remote input not queued: {error}"), now));
+            }
+        }
+    }
+
     fn restore_draft(&mut self, bytes: &[u8]) {
         let draft = bytes.strip_suffix(b"\r").unwrap_or(bytes);
         if let Ok(text) = std::str::from_utf8(draft) {
@@ -855,12 +929,35 @@ impl ClusterUi {
         }
     }
 
-    fn send_pending(&mut self, path: &Path, now: Duration) {
-        let event =
+    fn send_pending(
+        &mut self,
+        path: &Path,
+        now: Duration,
+        remote_input: Option<&dyn RemoteInputTransport>,
+    ) {
+        let remote_node = self
+            .input_queue
+            .sending_batch()
+            .and_then(|batch| batch.remote_node);
+        let event = if remote_node.is_some() {
+            match remote_input {
+                Some(remote_input) => self.input_sender.send_remote_started(
+                    &mut self.input_queue,
+                    Instant::now(),
+                    |node, request| remote_input.send_input(node, request),
+                ),
+                None => self.input_sender.send_remote_started(
+                    &mut self.input_queue,
+                    Instant::now(),
+                    |_, _| Err(io::Error::other("remote input transport is unavailable")),
+                ),
+            }
+        } else {
             self.input_sender
                 .send_started(&mut self.input_queue, Instant::now(), |request| {
                     crate::client::request_with_timeout(path, request, sender::INPUT_SEND_TIMEOUT)
-                });
+                })
+        };
         self.handle_send_event(event, now);
     }
 
@@ -871,9 +968,18 @@ impl ClusterUi {
             }
             Some(QueueEvent::Dropped { reason, .. }) | Some(QueueEvent::Failed { reason, .. }) => {
                 if reason.contains("session restarted") {
-                    self.composer_target = None;
+                    if self.remote_composer_target.is_some() {
+                        self.remote_composer_target = None;
+                        self.composer_focused = false;
+                    } else {
+                        self.composer_target = None;
+                    }
                 }
                 self.notice = Some((reason, now));
+            }
+            Some(QueueEvent::RemoteControlDisabled { node, .. }) => {
+                self.remote_control_disabled.insert(node.clone());
+                self.notice = Some((format!("remote control disabled on {node}"), now));
             }
             Some(QueueEvent::RetryScheduled { .. }) | None => {}
         }
@@ -979,10 +1085,14 @@ impl ClusterUi {
         let cursor = self.composer.cursor();
         let before: String = self.composer.text().chars().take(cursor).collect();
         let after: String = self.composer.text().chars().skip(cursor).collect();
-        let target = self
-            .composer_target
-            .as_ref()
-            .map_or_else(String::new, |(name, _)| format!("{name}> "));
+        let target = self.composer_target.as_ref().map_or_else(
+            || {
+                self.remote_composer_target
+                    .as_ref()
+                    .map_or_else(String::new, |(node, name, _)| format!("{node}/{name}> "))
+            },
+            |(name, _)| format!("{name}> "),
+        );
         format!("$ {target}{before}▏{after}")
     }
 
@@ -1031,64 +1141,19 @@ fn age_seconds(now: Duration, since: Duration) -> u64 {
     now.saturating_sub(since).as_secs()
 }
 
-fn remote_state_label(
-    state: RemoteState,
-    last_sync_age: Option<Duration>,
-    last_error: Option<&str>,
-) -> String {
-    let reason = last_error.map(|error| {
-        if error.contains("supply --addr") {
-            "no address known".to_owned()
-        } else {
-            crate::text::strip_terminal_controls(error)
-                .chars()
-                .take(80)
-                .collect()
-        }
-    });
+fn remote_state_label(state: RemoteState, last_sync_age: Option<Duration>) -> String {
     match state {
         RemoteState::Reachable => "reachable".into(),
         RemoteState::Stale => last_sync_age.map_or_else(
-            || {
-                format!(
-                    "stale · sync age unknown{}",
-                    reason_suffix(reason.as_deref())
-                )
-            },
-            |age| {
-                format!(
-                    "stale · sync {}s ago{}",
-                    age.as_secs(),
-                    reason_suffix(reason.as_deref())
-                )
-            },
+            || "stale · sync age unknown".into(),
+            |age| format!("stale · sync {}s ago", age.as_secs()),
         ),
         RemoteState::Reconnecting => last_sync_age.map_or_else(
-            || format!("reconnecting{}", reason_suffix(reason.as_deref())),
-            |age| {
-                format!(
-                    "reconnecting · last sync {}s ago{}",
-                    age.as_secs(),
-                    reason_suffix(reason.as_deref())
-                )
-            },
+            || "reconnecting".into(),
+            |age| format!("reconnecting · last sync {}s ago", age.as_secs()),
         ),
-        RemoteState::Unreachable => format!("unreachable{}", reason_suffix(reason.as_deref())),
+        RemoteState::Unreachable => "unreachable".into(),
     }
-}
-
-fn reason_suffix(reason: Option<&str>) -> String {
-    reason.map_or_else(String::new, |reason| format!(" · {reason}"))
-}
-
-fn session_error_suffix(error: Option<&str>) -> String {
-    error.map_or_else(String::new, |error| {
-        let safe: String = crate::text::strip_terminal_controls(error)
-            .chars()
-            .take(80)
-            .collect();
-        format!(" · {safe}")
-    })
 }
 
 fn remote_screen_text(screen: &remuda_core::agent::ScreenSnapshot) -> String {
@@ -1187,19 +1252,22 @@ pub fn run(path: &Path, node: &str, target: Option<&str>) -> io::Result<()> {
     run_with_remote_source(path, node, target, &EmptyRemoteSource)
 }
 
-/// Run the cluster tree with a read-only remote snapshot source. Its snapshot
-/// method must return promptly; transport polling belongs outside the TUI loop.
+/// Run the cluster tree with a remote snapshot source and the cluster Input client.
+/// Its snapshot method must return promptly; polling belongs outside the TUI loop.
 pub fn run_with_remote_source(
     path: &Path,
     node: &str,
     target: Option<&str>,
     source: &dyn RemoteSource,
 ) -> io::Result<()> {
-    run_with_remote_selection(path, node, target, source, &RemotePollSelection::default())
+    let remote_input = ClusterRemoteInput::system().ok();
+    let remote_input = remote_input
+        .as_ref()
+        .map(|input| input as &dyn RemoteInputTransport);
+    run_with_remote_input(path, node, target, source, remote_input)
 }
 
-/// Run the cluster tree with a read-only snapshot source and a separate
-/// selection signal for transport-owned polling.
+/// Run with a remote selection signal so the poller can prioritize the active session.
 pub fn run_with_remote_selection(
     path: &Path,
     node: &str,
@@ -1207,9 +1275,36 @@ pub fn run_with_remote_selection(
     source: &dyn RemoteSource,
     selection: &RemotePollSelection,
 ) -> io::Result<()> {
+    let remote_input = ClusterRemoteInput::system().ok();
+    let remote_input = remote_input
+        .as_ref()
+        .map(|input| input as &dyn RemoteInputTransport);
     let terminal_mode = RawMode::enable()?;
     let clock = crate::SystemClock::new();
-    let result = run_loop(path, node, target, &clock, source, selection);
+    let result = run_loop(path, node, target, &clock, source, remote_input, selection);
+    drop(terminal_mode);
+    result
+}
+
+/// Run the cluster tree with remote snapshots and optional remote input.
+pub fn run_with_remote_input(
+    path: &Path,
+    node: &str,
+    target: Option<&str>,
+    source: &dyn RemoteSource,
+    remote_input: Option<&dyn RemoteInputTransport>,
+) -> io::Result<()> {
+    let terminal_mode = RawMode::enable()?;
+    let clock = crate::SystemClock::new();
+    let result = run_loop(
+        path,
+        node,
+        target,
+        &clock,
+        source,
+        remote_input,
+        &RemotePollSelection::default(),
+    );
     drop(terminal_mode);
     result
 }
@@ -1242,11 +1337,24 @@ fn run_loop(
     target: Option<&str>,
     clock: &dyn Clock,
     remote_source: &dyn RemoteSource,
+    remote_input: Option<&dyn RemoteInputTransport>,
     remote_selection: &RemotePollSelection,
 ) -> io::Result<()> {
     let mut ui = ClusterUi::with_sender(node, list(path)?, clock.now(), InputSender::random()?);
+    ui.remote_input_enabled = remote_input.is_some();
     ui.remote_synced(remote_source);
-    select_target_with_remote_wait(&mut ui, target, remote_source, Duration::from_secs(5))?;
+    ui.select_target(target)?;
+    if ui.remote_input_enabled {
+        if let Some(RemoteSelection::Session {
+            node,
+            name,
+            instance_id,
+        }) = ui.remote_active.clone()
+        {
+            ui.remote_composer_target = Some((node, name, instance_id));
+            ui.composer_focused = true;
+        }
+    }
     loop {
         if let Ok(current) = list(path) {
             ui.sessions_synced(current, clock.now());
@@ -1293,7 +1401,7 @@ fn run_loop(
         write!(io::stdout(), "{frame}")?;
         io::stdout().flush()?;
         ui.send_close_pending(path, clock.now());
-        ui.send_pending(path, clock.now());
+        ui.send_pending(path, clock.now(), remote_input);
         ui.start_pending(clock.now());
         if crossterm::event::poll(Duration::from_millis(250))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
@@ -1309,51 +1417,48 @@ fn run_loop(
     }
 }
 
-fn select_target_with_remote_wait(
-    ui: &mut ClusterUi,
-    target: Option<&str>,
-    source: &dyn RemoteSource,
-    timeout: Duration,
-) -> io::Result<()> {
-    let Some(target) = target else { return Ok(()) };
-    let Some((node, _)) = target.split_once('/') else {
-        return ui.select_target(Some(target));
-    };
-    match ui.select_target(Some(target)) {
-        Ok(()) => Ok(()),
-        Err(error) if node != ui.node => {
-            let deadline = Instant::now() + timeout;
-            while Instant::now() < deadline {
-                ui.remote_synced(source);
-                if ui.select_target(Some(target)).is_ok() {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(error)
-        }
-        Err(error) => Err(error),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::queue::QueueState;
+    use super::queue::{QueueEvent, QueueState};
     use super::{
-        is_attention, remote_state_label, render_badge, select_target_with_remote_wait,
-        AttentionSignals, Badge, ClusterUi, RemoteSelection, RemoteSource,
+        is_attention, render_badge, AttentionSignals, Badge, ClusterUi, RemoteInputTransport,
+        RemoteSelection, RemoteSource,
     };
     use crate::cluster_remote::{
         RemoteNodeSnapshot, RemoteSessionSnapshot, RemoteSnapshot, RemoteState,
     };
     use remuda_core::agent::{Color, Cursor, ScreenSnapshot, StyledCell};
     use remuda_core::clock::{Clock, ManualClock};
-    use remuda_core::protocol::Response;
+    use remuda_core::protocol::{Request, Response};
     use remuda_core::{SessionSummary, Size};
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     struct FakeRemoteSource(Mutex<RemoteSnapshot>);
+
+    struct FakeRemoteInput {
+        response: Mutex<Option<Response>>,
+        requests: Mutex<Vec<(String, Request)>>,
+    }
+
+    impl FakeRemoteInput {
+        fn new(response: Response) -> Self {
+            Self {
+                response: Mutex::new(Some(response)),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RemoteInputTransport for FakeRemoteInput {
+        fn send_input(&self, node: &str, request: &Request) -> std::io::Result<Response> {
+            self.requests
+                .lock()
+                .unwrap()
+                .push((node.into(), request.clone()));
+            Ok(self.response.lock().unwrap().take().unwrap())
+        }
+    }
 
     impl FakeRemoteSource {
         fn replace(&self, snapshot: RemoteSnapshot) {
@@ -1605,6 +1710,34 @@ mod tests {
     }
 
     #[test]
+    fn sent_input_clears_the_sending_notice() {
+        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], Duration::ZERO);
+        ui.notice = Some(("sending input to dev".into(), Duration::ZERO));
+        ui.handle_send_event(
+            Some(QueueEvent::Sent {
+                seq: 1,
+                duplicate: false,
+            }),
+            Duration::ZERO,
+        );
+        assert!(ui.notice.is_none());
+    }
+
+    #[test]
+    fn uncertain_input_clears_the_sending_notice() {
+        let mut ui = ClusterUi::new("studio", vec![session("dev", true)], Duration::ZERO);
+        ui.notice = Some(("sending input to dev".into(), Duration::ZERO));
+        ui.handle_send_event(
+            Some(QueueEvent::Uncertain {
+                seq: 1,
+                reason: "delivery uncertain".into(),
+            }),
+            Duration::ZERO,
+        );
+        assert!(ui.notice.is_none());
+    }
+
+    #[test]
     fn empty_attention_filter_has_clear_message_and_badges_remain_visible() {
         let clock = ManualClock::new();
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
@@ -1681,42 +1814,88 @@ mod tests {
     }
 
     #[test]
-    fn remote_target_waits_for_first_session_list() {
-        let source = std::sync::Arc::new(FakeRemoteSource(Mutex::new(RemoteSnapshot::default())));
-        let producer = std::sync::Arc::clone(&source);
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            producer.replace(remote_snapshot(
-                RemoteState::Reachable,
-                Duration::ZERO,
-                Some(remote_screen("ready")),
-            ));
+    fn remote_composer_sends_a_chunk_through_the_remote_input_transport() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        snapshot.nodes[0].sessions[0].wire_name = "wire-build".into();
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_input_enabled = true;
+        ui.remote_expanded.insert("laptop".into());
+        ui.remote_selected = Some(RemoteSelection::Session {
+            node: "laptop".into(),
+            name: "build".into(),
+            instance_id: "remote-instance".into(),
         });
-        let mut ui = ClusterUi::new("studio", Vec::new(), Duration::ZERO);
-        ui.remote_synced(source.as_ref());
-        select_target_with_remote_wait(
-            &mut ui,
-            Some("laptop/build"),
-            source.as_ref(),
-            Duration::from_millis(250),
-        )
-        .unwrap();
+        ui.enter_selected();
+        assert!(ui.composer_focused);
+        ui.enqueue_remote_draft(b"echo hi\r".to_vec(), clock.now());
+        ui.start_pending(clock.now());
+
+        let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let sent = transport.requests.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "laptop");
         assert!(matches!(
-            ui.remote_active,
-            Some(RemoteSelection::Session { .. })
+            &sent[0].1,
+            Request::Input { name, instance_id, bytes, .. }
+                if name == "wire-build" && instance_id == "remote-instance" && bytes == b"echo hi\r"
         ));
+        assert_eq!(
+            ui.input_queue.items().next().unwrap().state,
+            QueueState::Sent
+        );
     }
 
     #[test]
-    fn unreachable_remote_label_explains_missing_registry_address() {
-        assert_eq!(
-            remote_state_label(
-                RemoteState::Unreachable,
-                None,
-                Some("supply --addr HOST:PORT"),
-            ),
-            "unreachable · no address known"
+    fn remote_control_disabled_is_shown_and_stops_future_target_sends() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        ))));
+        ui.remote_input_enabled = true;
+        ui.remote_expanded.insert("laptop".into());
+        ui.remote_selected = Some(RemoteSelection::Session {
+            node: "laptop".into(),
+            name: "build".into(),
+            instance_id: "remote-instance".into(),
+        });
+        ui.enter_selected();
+        ui.enqueue_remote_draft(b"first\r".to_vec(), clock.now());
+        ui.start_pending(clock.now());
+        let transport = FakeRemoteInput::new(Response::RemoteControlDisabled);
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
         );
+        assert_eq!(
+            ui.notice.as_ref().unwrap().0,
+            "remote control disabled on laptop"
+        );
+        let count = ui.input_queue.items().count();
+
+        ui.enqueue_remote_draft(b"second\r".to_vec(), clock.now());
+
+        assert_eq!(ui.input_queue.items().count(), count);
+        assert_eq!(
+            ui.notice.as_ref().unwrap().0,
+            "remote control disabled on laptop"
+        );
+        assert!(transport.requests.lock().unwrap().len() == 1);
     }
 
     #[test]
@@ -1917,7 +2096,7 @@ mod tests {
         ui.key(crossterm::event::KeyCode::Char('x'));
 
         let frame = ui.render(80, 24, "", &clock);
-        assert!(frame.contains("dev has already ended"));
+        assert!(frame.contains("dev has already ended."));
         assert!(!frame.contains("kill dev?"));
     }
 
