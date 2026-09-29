@@ -235,8 +235,8 @@ fn stopped_daemon_keeps_cluster_tui_ticking_and_recovers_input() {
             .into_iter()
             .find(|session| session.name == "tui-session")
             .and_then(|session| session.instance_id)
-            .expect("the session instance id is listed"),
-        other => panic!("unexpected List response: {other:?}"),
+            .expect("session instance id"),
+        response => panic!("unexpected response: {response:?}"),
     };
 
     let mut tui = TuiPty::start(&daemon.runtime);

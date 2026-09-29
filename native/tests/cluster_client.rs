@@ -135,6 +135,11 @@ fn pair() -> (PrivateNode, PrivateNode) {
         registry.authorized_nodes.push(AuthorizedNode {
             node_fp: node.fingerprint(),
             static_pubkey: encoding::encode_base64(&node.public),
+            format_major: 1,
+            format_minor: 0,
+            endpoint: None,
+            delivered_by: None,
+            optional_fields: std::collections::BTreeMap::new(),
             state: NodeState::Admitted,
             version: 1,
             by: server.fingerprint(),

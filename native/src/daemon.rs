@@ -869,9 +869,10 @@ fn close_instance(
     name: &str,
     instance_id: &str,
 ) -> Option<AgentResult<()>> {
+    let session = registry.get(name)?;
     let closed = registry.close_instance(name, instance_id)?;
     if let Ok(true) = closed {
-        notify_exited(image, name, "closed", None);
+        notify_exited(image, name, "closed", session.exit_info().as_ref());
     }
     Some(closed.map(drop))
 }
@@ -1078,11 +1079,7 @@ fn handle(
             env,
         } => handle_new(stream, registry, name, command, size, cwd, env),
 
-        Request::SendLine { name, text } => {
-            respond(&stream, &name, registry.send_line(&name, &text), |()| {
-                Response::Ok
-            })
-        }
+        Request::SendLine { name, text } => send_line(&stream, registry, &name, &text),
 
         Request::Input {
             name,
@@ -1488,6 +1485,12 @@ fn input(
             reply(stream, &Response::error("session exited"))
         }
     }
+}
+
+fn send_line(stream: &Stream, registry: &Registry, name: &str, text: &str) -> std::io::Result<()> {
+    respond(stream, name, registry.send_line(name, text), |()| {
+        Response::Ok
+    })
 }
 
 fn mouse_state(stream: &Stream, registry: &Registry, name: &str) -> std::io::Result<()> {

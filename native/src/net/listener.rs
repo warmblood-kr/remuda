@@ -2162,7 +2162,7 @@ mod tests {
         let dispatched = Arc::new(AtomicUsize::new(0));
         let dispatched_for_worker = dispatched.clone();
         let (server, peer, _) = socket_server(
-            move |payload| {
+            move |payload, _peer| {
                 let request =
                     crate::remote_front::decode_frame(payload).map_err(io::Error::other)?;
                 authorize_remote_request(&request).map_err(authorization_error)?;
