@@ -679,15 +679,9 @@ impl Attached<'_> {
         self.write_raw_while(bytes, &|| false)
     }
 
-    /// Type these bytes unless this attachment is displaced or the caller
-    /// stops waiting. The attachment slot is held only for generation
-    /// validation, never across a potentially stalled PTY write.
-    ///
-    /// Releasing the slot before submission creates a check-then-act window:
-    /// a takeover can happen after validation while this buffer is in flight,
-    /// so that one buffer may land after `attach()` returns. The single-flight
-    /// PTY writer keeps it from interleaving with another write, and this path
-    /// never replays it.
+    /// Type bytes unless displaced or cancelled; the slot is released while waiting.
+    /// A takeover may still let one pending buffer land after `attach()` returns.
+    /// Single-flight writes do not interleave, and the buffer is never replayed.
     pub fn write_raw_while(&self, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
         {
             let slot = self
