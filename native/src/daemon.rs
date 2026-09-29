@@ -60,8 +60,16 @@ impl Drop for NewRequestInFlight {
 }
 
 fn wait_for_new_requests() {
-    while ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) != 0 {
-        std::thread::yield_now();
+    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
+    while ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let still_in_flight = ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst);
+    if still_in_flight != 0 {
+        eprintln!(
+            "remuda: continuing shutdown with {still_in_flight} New request(s) still in flight"
+        );
     }
 }
 
@@ -1054,7 +1062,17 @@ fn handle(
     };
 
     record_request(counters, &request);
+    handle_request(stream, reader, registry, image, socket_owner, request)
+}
 
+fn handle_request(
+    stream: Stream,
+    reader: BufReader<Stream>,
+    registry: &Registry,
+    image: &Image,
+    socket_owner: Arc<SocketOwnership>,
+    request: Request,
+) -> std::io::Result<()> {
     match request {
         // Where a session that ended stops being listed. Here rather than on a
         // timer because listing is the only moment the answer is looked at, and
