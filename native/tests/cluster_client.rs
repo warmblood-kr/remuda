@@ -135,6 +135,11 @@ fn pair() -> (PrivateNode, PrivateNode) {
         registry.authorized_nodes.push(AuthorizedNode {
             node_fp: node.fingerprint(),
             static_pubkey: encoding::encode_base64(&node.public),
+            delivered_by: None,
+            format_major: remuda_native::cluster::registry::REGISTRY_FORMAT_MAJOR,
+            format_minor: remuda_native::cluster::registry::REGISTRY_FORMAT_MINOR,
+            optional_fields: std::collections::BTreeMap::new(),
+            endpoint: None,
             state: NodeState::Admitted,
             version: 1,
             by: server.fingerprint(),
@@ -281,6 +286,36 @@ fn test_server(
     (address, responder, task)
 }
 
+fn http_response(body: &[u8]) -> Vec<u8> {
+    let mut response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    response.extend_from_slice(body);
+    response
+}
+
+fn read_request_body(stream: &TcpStream) -> Vec<u8> {
+    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+    let mut length = 0;
+    loop {
+        let mut line = Vec::new();
+        reader.read_until(b'\n', &mut line).unwrap();
+        if line == b"\r\n" || line == b"\n" {
+            break;
+        }
+        if let Ok(line) = std::str::from_utf8(&line) {
+            if line.to_ascii_lowercase().starts_with("content-length:") {
+                length = line.split_once(':').unwrap().1.trim().parse().unwrap();
+            }
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    body
+}
+
 fn capture_proxy(target: SocketAddr) -> (SocketAddr, std::thread::JoinHandle<Vec<u8>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -345,9 +380,8 @@ fn client_obeys_total_timeout() {
 
 #[test]
 fn client_rejects_plaintext_200_as_crypto() {
-    let body = br#"{"Sessions":[]}"#;
-    let response = http_response(body);
-    let (address, responder, task) = test_server(response, Duration::ZERO);
+    let (address, responder, task) =
+        test_server(http_response(br#"{"Sessions":[]}"#), Duration::ZERO);
     let initiator = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
         .generate_keypair()
         .unwrap();
@@ -363,7 +397,21 @@ fn client_rejects_plaintext_200_as_crypto() {
 
 #[test]
 fn client_rejects_a_tampered_noise_message_two() {
-    let (address, responder, task) = tampered_msg2_server();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+        .generate_keypair()
+        .unwrap();
+    let private = responder.private.clone();
+    let task = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_request_body(&stream);
+        let opened = remuda_native::net::frame::open_request(&private, &request).unwrap();
+        let payload = serde_json::to_vec(&Response::Sessions(Vec::new())).unwrap();
+        let mut body = remuda_native::net::frame::seal_response(opened, &payload).unwrap();
+        *body.last_mut().unwrap() ^= 1;
+        stream.write_all(&http_response(&body)).unwrap();
+    });
     let initiator = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
         .generate_keypair()
         .unwrap();
@@ -551,57 +599,8 @@ fn client_total_deadline_wins_over_a_slow_drip_below_the_read_timeout() {
     assert!(matches!(result, Err(ClientError::Timeout)), "{result:?}");
     assert!(
         (Duration::from_millis(500)..Duration::from_millis(900)).contains(&elapsed),
-        "expected the 600ms total deadline, got {elapsed:?}"
+        "deadline elapsed {elapsed:?}"
     );
-}
-
-fn http_response(body: &[u8]) -> Vec<u8> {
-    let mut response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    response.extend_from_slice(body);
-    response
-}
-
-fn tampered_msg2_server() -> (SocketAddr, snow::Keypair, std::thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
-        .generate_keypair()
-        .unwrap();
-    let private = responder.private.clone();
-    let task = std::thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let request = read_request_body(&stream);
-        let opened = remuda_native::net::frame::open_request(&private, &request).unwrap();
-        let payload = serde_json::to_vec(&Response::Sessions(Vec::new())).unwrap();
-        let mut body = remuda_native::net::frame::seal_response(opened, &payload).unwrap();
-        *body.last_mut().unwrap() ^= 1;
-        stream.write_all(&http_response(&body)).unwrap();
-    });
-    (address, responder, task)
-}
-
-fn read_request_body(stream: &TcpStream) -> Vec<u8> {
-    let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
-    let mut length = 0;
-    loop {
-        let mut line = Vec::new();
-        reader.read_until(b'\n', &mut line).unwrap();
-        if line == b"\r\n" || line == b"\n" {
-            break;
-        }
-        if let Ok(line) = std::str::from_utf8(&line) {
-            if line.to_ascii_lowercase().starts_with("content-length:") {
-                length = line.split_once(':').unwrap().1.trim().parse().unwrap();
-            }
-        }
-    }
-    let mut body = vec![0; length];
-    reader.read_exact(&mut body).unwrap();
-    body
 }
 
 #[test]

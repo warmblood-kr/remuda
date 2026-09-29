@@ -979,6 +979,11 @@ mod tests {
                 crate::cluster::AuthorizedNode {
                     node_fp: "admitted-fingerprint".into(),
                     static_pubkey: String::new(),
+                    format_major: 1,
+                    format_minor: 0,
+                    endpoint: None,
+                    delivered_by: None,
+                    optional_fields: Default::default(),
                     state: crate::cluster::NodeState::Admitted,
                     version: 1,
                     by: "local".into(),
@@ -986,6 +991,11 @@ mod tests {
                 crate::cluster::AuthorizedNode {
                     node_fp: "revoked-fingerprint".into(),
                     static_pubkey: String::new(),
+                    format_major: 1,
+                    format_minor: 0,
+                    endpoint: None,
+                    delivered_by: None,
+                    optional_fields: Default::default(),
                     state: crate::cluster::NodeState::Revoked,
                     version: 1,
                     by: "local".into(),
