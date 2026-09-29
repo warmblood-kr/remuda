@@ -8,6 +8,13 @@ fn keypair() -> snow::Keypair {
 }
 
 #[test]
+fn static_public_key_validation_rejects_a_known_low_order_point() {
+    let mut low_order = [0u8; 32];
+    low_order[0] = 1;
+    assert!(frame::validate_static_public_key(&low_order).is_err());
+}
+
+#[test]
 fn frame_noise_ik_round_trip_authenticates_and_protects_payloads() {
     let initiator = keypair();
     let responder = keypair();
