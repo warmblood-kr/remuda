@@ -16,9 +16,14 @@ use crate::image::Image;
 use crate::ipc::{self, Listener, Stream, TryClone};
 use crate::process_ancestry;
 use crate::pty::PtyAgent;
+#[cfg(unix)]
+use interprocess::local_socket::traits::Listener as _;
+#[cfg(windows)]
 use interprocess::local_socket::traits::ListenerExt;
 #[cfg(unix)]
 use interprocess::local_socket::traits::Stream as LocalStream;
+#[cfg(unix)]
+use interprocess::local_socket::ListenerNonblockingMode;
 use remuda_core::agent::Result as AgentResult;
 use remuda_core::protocol::{collapse_runs, Request, Response};
 use remuda_core::{Clock, Registry, Session, Size};
@@ -26,6 +31,8 @@ use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
 
 use crate::SystemClock;
 use portable_pty::CommandBuilder;
@@ -180,10 +187,14 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     }
     // Before the bind: once a client can see the socket, a signal must find
     // the handler, not the default action. Signals queue in the pair until
-    // `stop_on_signals` below starts reading.
+    // `serve_unix` polls this together with the listener.
     #[cfg(unix)]
     let signals = catch_signals()?;
     let listener: Listener = ipc::listen(path)?;
+    #[cfg(unix)]
+    let listener = prepare_unix_listener(listener)?;
+    #[cfg(windows)]
+    let listener = listener;
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
 
     let registry = Arc::new(Registry::new());
@@ -215,19 +226,203 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     }
     spawn_ticker(image.clone(), Arc::clone(&counters), Arc::clone(&registry));
     #[cfg(unix)]
-    stop_on_signals(signals, image.clone(), Arc::clone(&socket_owner));
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        let registry = Arc::clone(&registry);
-        let image = image.clone();
-        let counters = Arc::clone(&counters);
-        let socket_owner = Arc::clone(&socket_owner);
-        std::thread::spawn(move || {
-            let _ = handle(stream, &registry, &image, &counters, socket_owner);
-        });
+    {
+        serve_unix(
+            listener,
+            path,
+            signals,
+            registry,
+            image,
+            counters,
+            socket_owner,
+        )
     }
-    socket_owner.cleanup();
-    Ok(())
+    #[cfg(windows)]
+    {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            spawn_connection(stream, &registry, &image, &counters, &socket_owner);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn serve_unix(
+    mut listener: Listener,
+    path: &Path,
+    mut signals: std::os::unix::net::UnixStream,
+    registry: Arc<Registry>,
+    image: Image,
+    counters: Arc<crate::tick::Counters>,
+    socket_owner: Arc<SocketOwnership>,
+) -> ! {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd;
+
+    // Auto-started (#107), the daemon leads its own session and a HUP is a
+    // stray one. Run by hand in a terminal it does not, and a HUP means that
+    // terminal really hung up — stop in order rather than write to a dead tty.
+    // SAFETY: getsid/getpid only read this process's ids.
+    let detached = unsafe { libc::getsid(0) == libc::getpid() };
+    let mut signal_bytes = [0u8; 1];
+    'poll_loop: loop {
+        let mut watched = [
+            libc::pollfd {
+                fd: unix_listener_fd(&listener),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: signals.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: `watched` points to two initialized pollfd values for the
+        // duration of this blocking call. A negative timeout waits indefinitely.
+        let ready = unsafe { libc::poll(watched.as_mut_ptr(), watched.len() as _, -1) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            eprintln!("remuda daemon: poll failed: {error}");
+            continue;
+        }
+
+        // Handle signals first when both descriptors are ready. In particular,
+        // SIGUSR1 can replace the listener before accepting a queued probe.
+        if watched[1].revents & libc::POLLIN != 0 {
+            match signals.read(&mut signal_bytes) {
+                Ok(0) => continue,
+                Ok(count) => {
+                    for byte in &signal_bytes[..count] {
+                        let signal = libc::c_int::from(*byte);
+                        if signal == libc::SIGUSR1 {
+                            rebind_after_sigusr1(&mut listener, path, &socket_owner);
+                            // The old listener's readiness bits cannot describe
+                            // the replacement listener. Poll both fds again.
+                            continue 'poll_loop;
+                        }
+                        let name = match signal {
+                            libc::SIGTERM => "SIGTERM",
+                            libc::SIGINT => "SIGINT",
+                            _ if detached => {
+                                let _ = writeln!(
+                                    std::io::stderr(),
+                                    "remuda daemon: SIGHUP ignored — use `remuda stop` to stop it"
+                                );
+                                continue;
+                            }
+                            _ => "SIGHUP",
+                        };
+                        let _ = writeln!(std::io::stderr(), "remuda daemon: {name}, shutting down");
+                        reap_processes_before_exit(&image);
+                        socket_owner.cleanup();
+                        std::process::exit(0);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    eprintln!("remuda daemon: signal socket read failed: {error}");
+                    continue;
+                }
+            }
+        }
+
+        if watched[0].revents & libc::POLLIN != 0 {
+            match listener.accept() {
+                Ok(stream) => {
+                    if let Err(error) = stream.set_nonblocking(false) {
+                        eprintln!("remuda daemon: could not restore blocking client mode: {error}");
+                        continue;
+                    }
+                    spawn_connection(stream, &registry, &image, &counters, &socket_owner);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::ConnectionAborted
+                    ) => {}
+                Err(error) => eprintln!("remuda daemon: accept failed: {error}"),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn prepare_unix_listener(mut listener: Listener) -> std::io::Result<Listener> {
+    // SocketOwnership performs inode-conditional cleanup, so an old listener
+    // must never unlink a replacement path when it is dropped.
+    listener.do_not_reclaim_name_on_drop();
+    listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
+    Ok(listener)
+}
+
+#[cfg(unix)]
+fn unix_listener_fd(listener: &Listener) -> std::os::fd::RawFd {
+    use std::os::fd::AsRawFd;
+    match listener {
+        interprocess::local_socket::Listener::UdSocket(listener) => listener.inner().as_raw_fd(),
+    }
+}
+
+#[cfg(unix)]
+fn rebind_after_sigusr1(listener: &mut Listener, path: &Path, socket_owner: &SocketOwnership) {
+    // Our current listener already owns this exact path, so rebinding it would
+    // only perform an unnecessary self-connect and report a misleading error.
+    if socket_owner.owns_path() {
+        return;
+    }
+    match ipc::listen(path) {
+        Ok(replacement) => {
+            let replacement = match prepare_unix_listener(replacement) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    eprintln!(
+                        "remuda daemon: could not prepare rebound socket at {}: {error}",
+                        path.display()
+                    );
+                    return;
+                }
+            };
+            let refreshed = socket_owner.refresh();
+            *listener = replacement;
+            match refreshed {
+                Ok(()) => eprintln!(
+                    "remuda daemon: rebound socket at {} after SIGUSR1",
+                    path.display()
+                ),
+                Err(error) => eprintln!(
+                    "remuda daemon: could not record rebound socket at {}: {error}",
+                    path.display()
+                ),
+            }
+        }
+        Err(error) => eprintln!(
+            "remuda daemon: could not rebind socket at {} after SIGUSR1: {error}",
+            path.display()
+        ),
+    }
+}
+
+fn spawn_connection(
+    stream: Stream,
+    registry: &Arc<Registry>,
+    image: &Image,
+    counters: &Arc<crate::tick::Counters>,
+    socket_owner: &Arc<SocketOwnership>,
+) {
+    let registry = Arc::clone(registry);
+    let image = image.clone();
+    let counters = Arc::clone(counters);
+    let socket_owner = Arc::clone(socket_owner);
+    std::thread::spawn(move || {
+        let _ = handle(stream, &registry, &image, &counters, socket_owner);
+    });
 }
 
 /// Serialize stale-socket removal and bind for one daemon name. The lock file
@@ -342,7 +537,7 @@ fn socket_lock_timeout_message(lock_path: &Path, holder: Option<u32>) -> String 
 struct SocketOwnership {
     path: PathBuf,
     #[cfg(unix)]
-    identity: (u64, u64),
+    identity: Mutex<(u64, u64)>,
 }
 
 impl SocketOwnership {
@@ -353,7 +548,7 @@ impl SocketOwnership {
             let metadata = std::fs::symlink_metadata(path)?;
             Ok(Self {
                 path: path.to_path_buf(),
-                identity: (metadata.dev(), metadata.ino()),
+                identity: Mutex::new((metadata.dev(), metadata.ino())),
             })
         }
         #[cfg(windows)]
@@ -370,12 +565,37 @@ impl SocketOwnership {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            let Ok(identity) = self.identity.lock() else {
+                return;
+            };
             if std::fs::symlink_metadata(&self.path)
-                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.identity)
+                .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == *identity)
             {
                 let _ = std::fs::remove_file(&self.path);
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn refresh(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(&self.path)?;
+        let mut identity = self
+            .identity
+            .lock()
+            .map_err(|_| std::io::Error::other("socket ownership lock poisoned"))?;
+        *identity = (metadata.dev(), metadata.ino());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn owns_path(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(identity) = self.identity.lock() else {
+            return false;
+        };
+        std::fs::symlink_metadata(&self.path)
+            .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == *identity)
     }
 }
 
@@ -482,9 +702,8 @@ fn record_request(counters: &crate::tick::Counters, request: &Request) {
     }
 }
 
-/// SIGTERM/SIGINT: log, reap like `Shutdown`, remove the socket, exit 0. SIGHUP: ignored
-/// when detached (#106), else the same. Caught, never SIG_IGN (pty children would inherit
-/// it); the handler only writes the signal number to a socketpair.
+/// The handler writes signal numbers to a socketpair polled with the listener.
+/// Catching signals preserves default dispositions in pty children.
 #[cfg(unix)]
 fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     use std::os::fd::AsRawFd;
@@ -504,7 +723,7 @@ fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
     let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
     WRITE_FD.store(writer.as_raw_fd(), Ordering::Relaxed);
     std::mem::forget(writer);
-    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGUSR1] {
         // SAFETY: installs a handler that only calls write(2).
         unsafe {
             libc::signal(
@@ -514,45 +733,6 @@ fn catch_signals() -> std::io::Result<std::os::unix::net::UnixStream> {
         };
     }
     Ok(reader)
-}
-
-/// The other half of `catch_signals`: act on what the handler wrote.
-#[cfg(unix)]
-fn stop_on_signals(
-    mut reader: std::os::unix::net::UnixStream,
-    image: Image,
-    socket_owner: Arc<SocketOwnership>,
-) {
-    use std::io::Read;
-    // Auto-started (#107), the daemon leads its own session and a HUP is a
-    // stray one. Run by hand in a terminal it does not, and a HUP means that
-    // terminal really hung up — stop in order rather than write to a dead tty.
-    // SAFETY: getsid/getpid only read this process's ids.
-    let detached = unsafe { libc::getsid(0) == libc::getpid() };
-    std::thread::spawn(move || {
-        use std::io::Write;
-        let mut byte = [0u8];
-        while reader.read_exact(&mut byte).is_ok() {
-            // `writeln!`, not `eprintln!`: stderr may be a dead tty (EIO), and
-            // a panic here would leave every later signal unhandled.
-            let name = match libc::c_int::from(byte[0]) {
-                libc::SIGTERM => "SIGTERM",
-                libc::SIGINT => "SIGINT",
-                _ if detached => {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "remuda daemon: SIGHUP ignored — use `remuda stop` to stop it"
-                    );
-                    continue;
-                }
-                _ => "SIGHUP",
-            };
-            let _ = writeln!(std::io::stderr(), "remuda daemon: {name}, shutting down");
-            reap_processes_before_exit(&image);
-            socket_owner.cleanup();
-            std::process::exit(0);
-        }
-    });
 }
 
 /// Best-effort group-wide reap before a clean `Request::Shutdown` exits —
