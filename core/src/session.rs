@@ -292,33 +292,39 @@ impl Session {
             return self.write_one_burst(crate::keys::RETURN_BYTES);
         }
 
-        let mut waited = Duration::ZERO;
-        while waited < Duration::from_secs(2) {
-            if self
-                .compact_screen()
-                .is_some_and(|screen| screen.contains(tail))
-            {
-                break;
+        let mut visible = false;
+        for poll in 0..40 {
+            match self.compact_screen() {
+                Some(screen) if screen.contains(tail) => {
+                    visible = true;
+                    break;
+                }
+                // A backend with no screen output cannot reveal a composer.
+                // Give it a short grace period, then use the bounded fallback.
+                Some(screen) if screen.is_empty() && poll >= 3 => break,
+                _ => {}
             }
-            let step = Duration::from_millis(50);
-            self.clock.sleep(step);
-            waited += step;
+            if poll < 39 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
 
         let before = self.compact_screen().unwrap_or_default();
         self.write_one_burst(crate::keys::RETURN_BYTES)?;
+        if !visible {
+            return Ok(());
+        }
 
-        waited = Duration::ZERO;
-        while waited < Duration::from_secs(1) {
+        for poll in 0..20 {
             if !self.is_alive() {
                 return Ok(());
             }
             if self.compact_screen().is_some_and(|screen| screen != before) {
                 return Ok(());
             }
-            let step = Duration::from_millis(50);
-            self.clock.sleep(step);
-            waited += step;
+            if poll < 19 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
         }
         if self.is_alive() && self.compact_screen().as_deref() == Some(before.as_str()) {
             self.write_one_burst(crate::keys::RETURN_BYTES)?;
@@ -349,6 +355,8 @@ impl Session {
             .map_err(|_| InputError::Unavailable)?;
         rate.check_rate(self.clock.now(), bytes)
     }
+
+    /* old block removed below */
 
     fn refund_rate(&self, bytes: usize) {
         if let Ok(mut rate) = self.input_rate.lock() {
