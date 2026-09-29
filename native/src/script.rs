@@ -961,10 +961,25 @@ fn fs_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
         "write_atomic",
         lua.create_function(
             |_, (path, bytes, options): (String, mlua::LuaString, Option<Table>)| {
-                let private = match options {
-                    Some(options) => options.get::<Option<bool>>("private")?.unwrap_or(false),
-                    None => false,
-                };
+                let mut private = false;
+                if let Some(options) = options {
+                    for pair in options.pairs::<String, mlua::Value>() {
+                        let (key, value) = pair?;
+                        if key != "private" {
+                            return Err(mlua::Error::RuntimeError(format!(
+                                "unknown write_atomic option: {key}"
+                            )));
+                        }
+                        private = match value {
+                            mlua::Value::Boolean(private) => private,
+                            _ => {
+                                return Err(mlua::Error::RuntimeError(
+                                    "write_atomic option 'private' must be a boolean".into(),
+                                ));
+                            }
+                        };
+                    }
+                }
                 let result = if private {
                     crate::fs_atomic::write_atomic_lua_private(Path::new(&path), &bytes.as_bytes())
                 } else {

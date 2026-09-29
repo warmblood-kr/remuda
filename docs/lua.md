@@ -79,7 +79,9 @@ On success the function returns `true, nil`; on an I/O error it returns
 process umask, and existing regular-file permissions are preserved. Pass
 `{ private = true }` to create a file with mode `0600` on Unix, including when
 replacing an existing file; the mode is applied at temporary-file creation.
-On Windows, `private` is ignored and the file uses the normal inherited ACL.
+The options table accepts only the boolean `private` key; unknown keys or a
+non-boolean value raise a Lua argument error. On Windows, `private` is ignored
+and the file uses the normal inherited ACL.
 This word does not restrict paths: the Lua runtime already provides trusted
 scripts with `io.open` and `os.rename`.
 

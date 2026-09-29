@@ -186,15 +186,24 @@ mod tests {
     fn private_write_is_atomic_and_stays_owner_only_under_umask_022() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+        const CHILD: &str = "REMUDA_PRIVATE_WRITE_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "fs_atomic::tests::private_write_is_atomic_and_stays_owner_only_under_umask_022",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .expect("run isolated umask test child");
+            assert!(status.success(), "isolated umask test child failed");
+            return;
+        }
+
         let scratch = Scratch::new();
         let target = scratch.0.join("private-state");
-        struct UmaskGuard(libc::mode_t);
-        impl Drop for UmaskGuard {
-            fn drop(&mut self) {
-                unsafe { libc::umask(self.0) };
-            }
-        }
-        let _umask = UmaskGuard(unsafe { libc::umask(0o022) });
+        unsafe { libc::umask(0o022) };
         super::write_atomic_lua_private(&target, b"first").unwrap();
         let first = fs::metadata(&target).unwrap();
         assert_eq!(first.permissions().mode() & 0o777, 0o600);

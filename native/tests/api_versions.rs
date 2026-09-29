@@ -285,25 +285,25 @@ fn frozen_api_fixtures_v1_through_v4_and_new_v5_surface_run() {
         let mut private_daemon = spawn::Daemon::spawn(&dir);
         let fixture = dir.join(format!("{version}.lua"));
         if version == "v5" {
-            let _private_path = dir.join("private-atomic-write");
-            std::fs::write(&_private_path, b"old contents").unwrap();
+            let private_path = dir.join("private-atomic-write");
+            std::fs::write(&private_path, b"old contents").unwrap();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&_private_path, std::fs::Permissions::from_mode(0o644))
+                std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(0o644))
                     .unwrap();
             }
             eval(
                 &path,
                 &format!(
                     "remuda._api_v5_private_write_path = {:?}",
-                    _private_path.to_string_lossy()
+                    private_path.to_string_lossy()
                 ),
             );
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                let original_inode = std::fs::metadata(&_private_path).unwrap().ino();
+                let original_inode = std::fs::metadata(&private_path).unwrap().ino();
                 std::fs::write(
                     dir.join("private-atomic-write.ino"),
                     original_inode.to_string(),
