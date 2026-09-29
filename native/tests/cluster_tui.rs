@@ -70,13 +70,19 @@ impl PrivateDaemon {
 
     #[cfg(unix)]
     fn stop(&mut self) {
-        assert_eq!(unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGSTOP) }, 0);
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGSTOP) },
+            0
+        );
         self.stopped = true;
     }
 
     #[cfg(unix)]
     fn resume(&mut self) {
-        assert_eq!(unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGCONT) }, 0);
+        assert_eq!(
+            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGCONT) },
+            0
+        );
         self.stopped = false;
     }
 }
@@ -142,7 +148,10 @@ impl TuiPty {
                 if count == 0 {
                     break;
                 }
-                reader_output.lock().unwrap().extend_from_slice(&buffer[..count]);
+                reader_output
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&buffer[..count]);
             }
         });
         Self {
@@ -174,7 +183,10 @@ impl TuiPty {
             if output.contains(needle) {
                 return output;
             }
-            assert!(Instant::now() < deadline, "TUI did not render {needle:?}: {output}");
+            assert!(
+                Instant::now() < deadline,
+                "TUI did not render {needle:?}: {output}"
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -233,8 +245,14 @@ fn stopped_daemon_keeps_cluster_tui_ticking_and_recovers_input() {
     let uncertain_bound = Duration::from_secs(8);
     tui.wait_for("delivery uncertain", uncertain_bound);
     let redraw_output = tui.text_from(redraw_start);
-    assert!(started.elapsed() <= uncertain_bound, "Uncertain exceeded 8s from the first send attempt");
-    assert!(redraw_output.matches("\u{1b}[2J").count() >= 3, "expected repeated redraws while daemon was SIGSTOPped");
+    assert!(
+        started.elapsed() <= uncertain_bound,
+        "Uncertain exceeded 8s from the first send attempt"
+    );
+    assert!(
+        redraw_output.matches("\u{1b}[2J").count() >= 3,
+        "expected repeated redraws while daemon was SIGSTOPped"
+    );
 
     daemon.resume();
     tui.writer.write_all(b"second line\r").unwrap();
