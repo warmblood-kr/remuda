@@ -100,6 +100,22 @@ impl Registry {
             .map(|session| session.apply_input_batch(batch))
     }
 
+    pub fn apply_remote_input_batch(
+        &self,
+        name: &str,
+        batch: InputBatch<'_>,
+    ) -> Option<core::result::Result<InputOutcome, InputError>> {
+        self.get(name)
+            .map(|session| session.apply_remote_input_batch(batch))
+    }
+
+    /// Change the local cluster-input policy for one tracked session.
+    pub fn set_remote_input_opt_out(&self, name: &str, opted_out: bool) -> Option<()> {
+        self.get(name).map(|session| {
+            session.set_remote_input_opt_out(opted_out);
+        })
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

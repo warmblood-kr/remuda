@@ -175,6 +175,8 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::AttachTracked { .. } => Err(refusal("AttachTracked")),
         Request::AttachStatus { .. } => Err(refusal("AttachStatus")),
         Request::Close { .. } => Err(refusal("Close")),
+        Request::RemoteInput { .. } => Err(refusal("RemoteInput")),
+        Request::SetRemoteInputOptOut { .. } => Err(refusal("SetRemoteInputOptOut")),
         Request::ListDir { .. } => Err(refusal("ListDir")),
         Request::Mkdir { .. } => Err(refusal("Mkdir")),
         Request::RemoveDirAll { .. } => Err(refusal("RemoveDirAll")),
@@ -271,6 +273,17 @@ mod tests {
                 "unexpectedly authorized {request:?}"
             );
         }
+    }
+
+    #[test]
+    fn remote_peer_cannot_set_session_remote_input_opt_out() {
+        let request = Request::SetRemoteInputOptOut {
+            name: "sensitive".into(),
+            opted_out: true,
+        };
+        let frame = serde_json::to_vec(&request).unwrap();
+        let error = decode_frame(&frame).unwrap_err();
+        assert_eq!(error, "remote front refuses SetRemoteInputOptOut");
     }
 
     #[test]

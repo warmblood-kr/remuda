@@ -1013,6 +1013,9 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::RemoteControlDisabled => {
             Err(mlua::Error::runtime("remote control disabled on this node"))
         }
+        Response::RemoteSessionInputDisabled => Err(mlua::Error::runtime(
+            "remote input disabled for this session",
+        )),
         Response::AttachStarted { .. } | Response::AttachStatus { .. } => Err(
             mlua::Error::runtime("attach responses are not exposed to scripts"),
         ),

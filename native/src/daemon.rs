@@ -649,21 +649,13 @@ fn handle(
             })
         }
 
-        Request::Input {
-            name,
-            instance_id,
-            client_id,
-            seq,
-            bytes,
-        } => input(
-            &stream,
-            registry,
-            &name,
-            &instance_id,
-            &client_id,
-            seq,
-            &bytes,
-        ),
+        request @ (Request::Input { .. } | Request::RemoteInput { .. }) => {
+            input(&stream, registry, request)
+        }
+
+        Request::SetRemoteInputOptOut { name, opted_out } => {
+            set_remote_input_opt_out(&stream, registry, &name, opted_out)
+        }
 
         Request::Send { name, bytes } => {
             respond(&stream, &name, registry.send(&name, &bytes), |()| {
@@ -928,34 +920,48 @@ fn read_request(
     }
 }
 
-fn input(
-    stream: &Stream,
-    registry: &Registry,
-    name: &str,
-    instance_id: &str,
-    client_id: &str,
-    seq: u64,
-    bytes: &[u8],
-) -> std::io::Result<()> {
-    let client_id = match remuda_core::input::validate_batch(client_id, seq, bytes) {
-        Ok(client_id) => client_id,
-        Err(error) => return reply(stream, &Response::error(error)),
-    };
-    let result = registry.apply_input_batch(
-        name,
-        remuda_core::input::InputBatch {
+fn input(stream: &Stream, registry: &Registry, request: Request) -> std::io::Result<()> {
+    let (name, instance_id, client_id, seq, bytes, remote) = match request {
+        Request::Input {
+            name,
             instance_id,
             client_id,
             seq,
             bytes,
-        },
-    );
+        } => (name, instance_id, client_id, seq, bytes, false),
+        Request::RemoteInput {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        } => (name, instance_id, client_id, seq, bytes, true),
+        _ => unreachable!("only input requests reach input"),
+    };
+    let client_id = match remuda_core::input::validate_batch(&client_id, seq, &bytes) {
+        Ok(client_id) => client_id,
+        Err(error) => return reply(stream, &Response::error(error)),
+    };
+    let batch = remuda_core::input::InputBatch {
+        instance_id: &instance_id,
+        client_id,
+        seq,
+        bytes: &bytes,
+    };
+    let result = if remote {
+        registry.apply_remote_input_batch(&name, batch)
+    } else {
+        registry.apply_input_batch(&name, batch)
+    };
     match result {
         None => reply(stream, &Response::error(format!("no such session: {name}"))),
         Some(Err(remuda_core::input::InputError::RateLimited)) => {
             reply(stream, &Response::RateLimited)
         }
         Some(Err(remuda_core::input::InputError::Busy)) => reply(stream, &Response::Busy),
+        Some(Err(remuda_core::input::InputError::RemoteInputDisabled)) => {
+            reply(stream, &Response::RemoteSessionInputDisabled)
+        }
         Some(Err(error)) => reply(stream, &Response::error(error.to_string())),
         Some(Ok(remuda_core::input::InputOutcome::Ack { duplicate })) => {
             reply(stream, &Response::Ack { duplicate })
@@ -969,6 +975,18 @@ fn input(
         Some(Ok(remuda_core::input::InputOutcome::Exited)) => {
             reply(stream, &Response::error("session exited"))
         }
+    }
+}
+
+fn set_remote_input_opt_out(
+    stream: &Stream,
+    registry: &Registry,
+    name: &str,
+    opted_out: bool,
+) -> std::io::Result<()> {
+    match registry.set_remote_input_opt_out(name, opted_out) {
+        Some(()) => reply(stream, &Response::Ok),
+        None => reply(stream, &Response::error(format!("no such session: {name}"))),
     }
 }
 

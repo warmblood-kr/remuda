@@ -17,6 +17,7 @@ pub enum InputError {
     RateLimited,
     Busy,
     Unavailable,
+    RemoteInputDisabled,
 }
 
 impl fmt::Display for InputError {
@@ -27,6 +28,7 @@ impl fmt::Display for InputError {
             Self::RateLimited => "session input rate limit exceeded",
             Self::Busy => "a session input write is already in flight",
             Self::Unavailable => "session input rate check unavailable",
+            Self::RemoteInputDisabled => "remote input disabled for this session",
         };
         formatter.write_str(message)
     }

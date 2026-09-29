@@ -3,7 +3,7 @@ use remuda_core::input::{
     validate_batch, InputBatch, InputDeduplicator, InputOutcome, INPUT_RATE_BYTES_PER_SECOND,
     INPUT_RING_CAPACITY, MAX_INPUT_BYTES,
 };
-use remuda_core::{ManualClock, Session};
+use remuda_core::{ManualClock, Registry, Session};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
@@ -170,6 +170,109 @@ fn a_rate_limited_batch_does_not_enter_dedup_history() {
         Ok(InputOutcome::Ack { duplicate: false })
     );
     assert_eq!(writes.lock().unwrap().len(), 5);
+}
+
+#[test]
+fn remote_input_opt_out_is_per_session_and_does_not_block_local_input() {
+    let opted_writes = Arc::new(Mutex::new(Vec::new()));
+    let other_writes = Arc::new(Mutex::new(Vec::new()));
+    let opted = input_session(Arc::clone(&opted_writes), true);
+    let other = Session::new(
+        "other-session",
+        Box::new(InputRecordingAgent {
+            writes: Arc::clone(&other_writes),
+            alive: true,
+            fail_write: false,
+            event_tx: None,
+        }),
+        Arc::new(ManualClock::new()),
+    );
+    let opted_instance = opted.instance_id().to_string();
+    let other_instance = other.instance_id().to_string();
+    let registry = Registry::new();
+    registry.register(opted).unwrap();
+    registry.register(other).unwrap();
+    assert_eq!(
+        registry.set_remote_input_opt_out("input-test", true),
+        Some(())
+    );
+
+    let opted_batch = InputBatch {
+        instance_id: &opted_instance,
+        client_id: [31; 16],
+        seq: 1,
+        bytes: b"remote",
+    };
+    assert_eq!(
+        registry.apply_remote_input_batch("input-test", opted_batch),
+        Some(Err(remuda_core::input::InputError::RemoteInputDisabled))
+    );
+    assert_eq!(
+        registry.apply_input_batch("input-test", opted_batch),
+        Some(Ok(InputOutcome::Ack { duplicate: false }))
+    );
+    assert_eq!(
+        registry.apply_remote_input_batch(
+            "other-session",
+            InputBatch {
+                instance_id: &other_instance,
+                client_id: [32; 16],
+                seq: 1,
+                bytes: b"remote",
+            }
+        ),
+        Some(Ok(InputOutcome::Ack { duplicate: false }))
+    );
+    assert_eq!(
+        opted_writes.lock().unwrap().as_slice(),
+        [b"remote".to_vec()]
+    );
+    assert_eq!(
+        other_writes.lock().unwrap().as_slice(),
+        [b"remote".to_vec()]
+    );
+}
+
+#[test]
+fn clearing_remote_input_opt_out_reenables_the_unconsumed_sequence() {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let session = input_session(Arc::clone(&writes), true);
+    let instance_id = session.instance_id().to_string();
+    let registry = Registry::new();
+    registry.register(session).unwrap();
+    assert_eq!(
+        registry.set_remote_input_opt_out("input-test", true),
+        Some(())
+    );
+    assert_eq!(
+        registry.apply_remote_input_batch(
+            "input-test",
+            InputBatch {
+                instance_id: &instance_id,
+                client_id: [33; 16],
+                seq: 1,
+                bytes: b"remote",
+            }
+        ),
+        Some(Err(remuda_core::input::InputError::RemoteInputDisabled))
+    );
+    assert_eq!(
+        registry.set_remote_input_opt_out("input-test", false),
+        Some(())
+    );
+    assert_eq!(
+        registry.apply_remote_input_batch(
+            "input-test",
+            InputBatch {
+                instance_id: &instance_id,
+                client_id: [33; 16],
+                seq: 1,
+                bytes: b"remote",
+            }
+        ),
+        Some(Ok(InputOutcome::Ack { duplicate: false }))
+    );
+    assert_eq!(writes.lock().unwrap().as_slice(), [b"remote".to_vec()]);
 }
 
 #[test]

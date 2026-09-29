@@ -49,6 +49,18 @@ pub enum Request {
         seq: u64,
         bytes: Vec<u8>,
     },
+    /// Deliver an authenticated cluster batch. Local daemon request only;
+    /// the network listener creates this after decoding a remote `Input`.
+    RemoteInput {
+        name: String,
+        instance_id: String,
+        client_id: String,
+        seq: u64,
+        bytes: Vec<u8>,
+    },
+    /// Set the session's local opt-out from authenticated remote input.
+    /// This request is refused by the remote front.
+    SetRemoteInputOptOut { name: String, opted_out: bool },
     /// Deliver a burst of input bytes as an indivisible act, appending nothing —
     /// the primitive [`Request::SendLine`] is made of. Indivisible is the
     /// load-bearing word; an attached terminal does not block it.
@@ -152,6 +164,8 @@ pub enum Response {
     WriteTimeout,
     /// The receiving cluster node has disabled remote Input locally.
     RemoteControlDisabled,
+    /// The target session has opted out of remote input.
+    RemoteSessionInputDisabled,
     /// A styled screen, answering [`Request::CaptureStyled`] — as runs, not
     /// cells; see [`StyledRun`]. `cursor` rides the same round trip, so the
     /// pane's caret and its content are always the same frame. See steps/027.

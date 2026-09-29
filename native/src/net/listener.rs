@@ -720,12 +720,33 @@ fn dispatch_payload_with_control_source(
     if let Err(response) = authorize_remote_request_with_source(&request, control_source) {
         return serde_json::to_vec(&response).map_err(io::Error::other);
     }
-    crate::remote_front::forward_frame_with_timeout(
+    let local_request = remote_dispatch_request(request);
+    let response = crate::client::request_with_timeout(
         daemon_path,
-        payload,
+        &local_request,
         LOCAL_DAEMON_REQUEST_TIMEOUT.min(MAX_HELD_REQUEST),
     )
-    .map_err(|reason| io::Error::other(format!("local request failed: {reason}")))
+    .map_err(|error| io::Error::other(format!("local request failed: {error}")))?;
+    serde_json::to_vec(&response).map_err(io::Error::other)
+}
+
+fn remote_dispatch_request(request: Request) -> Request {
+    match request {
+        Request::Input {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        } => Request::RemoteInput {
+            name,
+            instance_id,
+            client_id,
+            seq,
+            bytes,
+        },
+        request => request,
+    }
 }
 
 fn spawn_connection_handler(
@@ -1791,6 +1812,66 @@ mod tests {
         let response: Response = serde_json::from_slice(&response).unwrap();
         assert_eq!(response, Response::Ack { duplicate: false });
         assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_remote_peer_cannot_set_a_session_input_opt_out() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let settings = TestControlSettings::new(br#"{"allow_remote_control":true}"#);
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let dispatched_for_worker = dispatched.clone();
+        let server = SocketTestServer::start_production_with_control_source(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Ok(())),
+            Arc::new(move |_| {
+                dispatched_for_worker.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::to_vec(&Response::Ok).unwrap())
+            }),
+            settings.source(),
+        );
+        for opted_out in [true, false] {
+            let request = Request::SetRemoteInputOptOut {
+                name: "sensitive".into(),
+                opted_out,
+            };
+            let sealed =
+                sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
+            let (status, response) = server.exchange(sealed);
+            assert_eq!(status, 200);
+            assert_eq!(
+                serde_json::from_slice::<Response>(&response).unwrap(),
+                Response::Error("remote front refuses SetRemoteInputOptOut".into())
+            );
+        }
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn remote_input_is_marked_before_local_daemon_dispatch() {
+        let request = Request::Input {
+            name: "session".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
+            bytes: b"hello".to_vec(),
+        };
+        assert_eq!(
+            remote_dispatch_request(request),
+            Request::RemoteInput {
+                name: "session".into(),
+                instance_id: "instance".into(),
+                client_id: "00000000000000000000000000000001".into(),
+                seq: 1,
+                bytes: b"hello".to_vec(),
+            }
+        );
     }
 
     #[cfg(unix)]

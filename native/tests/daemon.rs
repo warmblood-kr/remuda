@@ -463,6 +463,78 @@ fn input_batches_acknowledge_duplicates_and_check_instance_before_deduplication(
 
 #[cfg(unix)]
 #[test]
+fn session_remote_input_opt_out_is_typed_local_only_and_reversible() {
+    let runtime = scratch_dir("remote-input-opt-out");
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(&socket, "sleep 30");
+    let session = listed_session(&socket);
+    let instance_id = session.instance_id.expect("instance identity");
+    assert_eq!(
+        client::request(
+            &socket,
+            &Request::SetRemoteInputOptOut {
+                name: "versioned".into(),
+                opted_out: true,
+            }
+        )
+        .expect("set per-session opt-out"),
+        Response::Ok
+    );
+    let batch = |seq| Request::RemoteInput {
+        name: "versioned".into(),
+        instance_id: instance_id.clone(),
+        client_id: "02020202020202020202020202020202".into(),
+        seq,
+        bytes: b"remote batch\r".to_vec(),
+    };
+    assert_eq!(
+        client::request(&socket, &batch(1)).expect("remote input response"),
+        Response::RemoteSessionInputDisabled
+    );
+    assert_eq!(
+        client::request(
+            &socket,
+            &Request::Input {
+                name: "versioned".into(),
+                instance_id: instance_id.clone(),
+                client_id: "03030303030303030303030303030303".into(),
+                seq: 1,
+                bytes: b"local batch\r".to_vec(),
+            }
+        )
+        .expect("local input remains available"),
+        Response::Ack { duplicate: false }
+    );
+    assert_eq!(
+        client::request(
+            &socket,
+            &Request::SetRemoteInputOptOut {
+                name: "versioned".into(),
+                opted_out: false,
+            }
+        )
+        .expect("clear per-session opt-out"),
+        Response::Ok
+    );
+    assert_eq!(
+        client::request(&socket, &batch(1)).expect("remote input after opt-in"),
+        Response::Ack { duplicate: false }
+    );
+    let _ = client::request(
+        &socket,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+    assert!(running.left_on_its_own(), "daemon should stop cleanly");
+}
+
+#[cfg(unix)]
+#[test]
 fn stalled_pty_write_times_out_without_blocking_reads_and_recovers() {
     let runtime = scratch_dir("pty-write-timeout");
     let socket = daemon::socket_path_in(&runtime, "s");

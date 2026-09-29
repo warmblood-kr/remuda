@@ -240,7 +240,10 @@ fn call_response(id: Value, response: Response) -> String {
         | Response::RateLimited
         | Response::Busy
         | Response::WriteTimeout
-        | Response::RemoteControlDisabled) => input_error_reply(id, input_error_message(&response)),
+        | Response::RemoteControlDisabled
+        | Response::RemoteSessionInputDisabled) => {
+            input_error_reply(id, input_error_message(&response))
+        }
         Response::Sessions(sessions) => ok_reply(id, sessions_text(sessions)),
     }
 }
@@ -257,6 +260,7 @@ fn input_error_message(response: &Response) -> &'static str {
         Response::Busy => "session input is busy",
         Response::WriteTimeout => "session PTY write timed out; delivery may be partial or late",
         Response::RemoteControlDisabled => "remote control disabled on this node",
+        Response::RemoteSessionInputDisabled => "remote input disabled for this session",
         _ => unreachable!("only input errors are passed here"),
     }
 }

@@ -51,6 +51,9 @@ pub struct Session {
     input_dedup: Mutex<InputDeduplicator>,
     /// Per-session byte budget, checked before taking `input_lock`.
     input_rate: Mutex<InputRateLimiter>,
+    /// Local policy for authenticated cluster input. Kept out of session
+    /// summaries and held during remote delivery so disabling is race-free.
+    remote_input_opt_out: Mutex<bool>,
 }
 
 /// Generate a unique session-start identity from host entropy and a process counter.
@@ -129,6 +132,7 @@ impl Session {
             input_lock: Mutex::new(()),
             input_dedup: Mutex::new(InputDeduplicator::new()),
             input_rate: Mutex::new(InputRateLimiter::default()),
+            remote_input_opt_out: Mutex::new(false),
         }
     }
 
@@ -251,6 +255,42 @@ impl Session {
             return Ok(outcome);
         }
         self.finish_input_batch(batch, self.write_one_burst(batch.bytes))
+    }
+
+    /// Set whether this session refuses authenticated cluster input.
+    pub fn set_remote_input_opt_out(&self, opted_out: bool) {
+        *self
+            .remote_input_opt_out
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = opted_out;
+    }
+
+    /// Apply one authenticated cluster batch, serializing the policy check
+    /// with changes to the opt-out flag.
+    pub fn apply_remote_input_batch(
+        &self,
+        batch: InputBatch<'_>,
+    ) -> core::result::Result<InputOutcome, InputError> {
+        let opted_out = self
+            .remote_input_opt_out
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if batch.seq == 0 {
+            return Err(InputError::InvalidSequence);
+        }
+        if !self.is_alive() {
+            return Ok(InputOutcome::Exited);
+        }
+        if batch.instance_id != self.instance_id {
+            return Ok(InputOutcome::WrongInstance);
+        }
+        if let Some(outcome) = self.batch_result(batch.client_id, batch.seq)? {
+            return Ok(outcome);
+        }
+        if *opted_out {
+            return Err(InputError::RemoteInputDisabled);
+        }
+        self.apply_input_batch(batch)
     }
 
     fn batch_result(
