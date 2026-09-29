@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 75] = [
+pub const BINDINGS: [&str; 76] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -73,6 +73,7 @@ pub const BINDINGS: [&str; 75] = [
     "extension_command",
     "fail",
     "feed",
+    "fs",
     "hook_list",
     "hooks",
     "http",
@@ -123,6 +124,16 @@ const WORDS: &[(&str, &str, &str)] = &[
         "http",
         "Start an asynchronous bounded HTTP request; completion is delivered on the Lua image queue.",
         "http.request(options) -> {cancel()}",
+    ),
+    (
+        "fs",
+        "Atomic replacement of files for trusted Lua callers.",
+        "table",
+    ),
+    (
+        "fs.write_atomic",
+        "Write bytes through a same-directory temporary file and atomically replace the target.",
+        "fs.write_atomic(path, bytes) -> true, nil | nil, error",
     ),
     (
         "ls",
@@ -310,6 +321,7 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
         registry.set(*name, row)?;
     }
     table.set("json", crate::json::bindings(lua)?)?;
+    fs_bindings(lua, table)?;
     table.set("_registry", registry)
 }
 
@@ -843,6 +855,23 @@ fn dir_bindings(
     Ok(())
 }
 
+/// `remuda.fs` currently exposes one atomic write word. The Lua runtime is
+/// trusted and already has arbitrary `io.open`/`os.rename`; this bundles the
+/// durability and replacement guarantees into a single named operation.
+fn fs_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
+    let fs = lua.create_table()?;
+    fs.set(
+        "write_atomic",
+        lua.create_function(|_, (path, bytes): (String, mlua::LuaString)| {
+            match crate::fs_atomic::write_atomic(Path::new(&path), &bytes.as_bytes(), 0o644) {
+                Ok(()) => Ok((Some(true), None::<String>)),
+                Err(error) => Ok((None::<bool>, Some(error.to_string()))),
+            }
+        })?,
+    )?;
+    table.set("fs", fs)
+}
+
 /// The `Ticker`'s own skip counters, read-only — no threshold or alarm here,
 /// split out of `bindings` to stay under its line cap. See `tick.rs`'s own
 /// hook-point comment for why acting on them is a separate, undecided step.
@@ -1001,10 +1030,16 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
     match response {
         Response::Ok => Ok(Value::Nil),
         Response::Ack { .. } => Ok(Value::Nil),
-        Response::Uncertain => Err(mlua::Error::runtime("input outcome is uncertain")),
+        Response::Uncertain => Err(mlua::Error::runtime(
+            "input outcome is uncertain; bytes may be partial or late",
+        )),
         Response::WrongInstance => Err(mlua::Error::runtime("session instance changed")),
         Response::RateLimited => Err(mlua::Error::runtime("session input rate limit exceeded")),
         Response::SyncAtCapacity => Err(mlua::Error::runtime("Sync is at capacity; retry shortly")),
+        Response::Busy => Err(mlua::Error::runtime("session input is busy")),
+        Response::WriteTimeout => Err(mlua::Error::runtime(
+            "session PTY write timed out; delivery may be partial or late",
+        )),
         Response::AttachStarted { .. } | Response::AttachStatus { .. } => Err(
             mlua::Error::runtime("attach responses are not exposed to scripts"),
         ),

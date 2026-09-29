@@ -17,9 +17,11 @@ pub const MAX_CONNECTIONS: usize = 8;
 pub const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const SYNC_TIMEOUT_MARGIN: std::time::Duration = std::time::Duration::from_secs(5);
 /// Keep at least half of the daemon's 16 Sync slots available to local callers.
-const MAX_REMOTE_SYNCS: usize = 8;
+pub(crate) const MAX_REMOTE_SYNCS: usize = 8;
 const _: () = assert!(MAX_REMOTE_SYNCS * 2 <= crate::daemon::MAX_CONCURRENT_SYNCS);
 static ACTIVE_REMOTE_SYNCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static SYNC_CAPACITY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct RemoteSyncPermit;
 
@@ -49,8 +51,8 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, String> {
     if frame.len() > MAX_FRAME_BYTES {
         return Err(format!("remote frame exceeds {MAX_FRAME_BYTES} bytes"));
     }
-    let request: Request = serde_json::from_slice(frame)
-        .map_err(|error| format!("invalid remote request: {error}"))?;
+    let request: Request =
+        serde_json::from_slice(frame).map_err(|_| "invalid remote request".to_owned())?;
     authorize(&request)?;
     Ok(request)
 }
@@ -58,11 +60,24 @@ pub fn decode_frame(frame: &[u8]) -> Result<Request, String> {
 /// Forward an authorized frame to the existing local daemon and encode its
 /// typed response afresh. Request bytes are never copied to the daemon socket.
 pub fn forward_frame(path: &std::path::Path, frame: &[u8]) -> Result<Vec<u8>, String> {
-    let request = decode_frame(frame)?;
-    forward_request(path, &request)
+    forward_frame_with_timeout(path, frame, std::time::Duration::from_secs(30))
 }
 
-fn forward_request(path: &std::path::Path, request: &Request) -> Result<Vec<u8>, String> {
+/// Forward a frame with an explicit bound on the local daemon response wait.
+pub fn forward_frame_with_timeout(
+    path: &std::path::Path,
+    frame: &[u8],
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, String> {
+    let request = decode_frame(frame)?;
+    forward_request_with_timeout(path, &request, timeout)
+}
+
+fn forward_request_with_timeout(
+    path: &std::path::Path,
+    request: &Request,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, String> {
     // The front cannot cancel a daemon IPC request when its peer disconnects;
     // retain this remote-only slot until the bounded daemon wait completes.
     let _remote_sync_permit = if matches!(request, Request::Sync { .. }) {
@@ -74,7 +89,8 @@ fn forward_request(path: &std::path::Path, request: &Request) -> Result<Vec<u8>,
     } else {
         None
     };
-    let response = crate::client::request(path, request).map_err(|error| error.to_string())?;
+    let response = crate::client::request_with_timeout(path, request, timeout)
+        .map_err(|error| error.to_string())?;
     serde_json::to_vec(&response).map_err(|error| error.to_string())
 }
 
@@ -177,7 +193,7 @@ fn serve_connection(mut stream: crate::ipc::Stream, daemon_path: &Path) -> std::
     };
     let timeout = request_timeout(&request);
     let (done, timer) = timeout_timer(&stream, timeout)?;
-    let reply = match forward_request(daemon_path, &request) {
+    let reply = match forward_request_with_timeout(daemon_path, &request, timeout) {
         Ok(response) => response,
         Err(reason) => serde_json::to_vec(&remuda_core::protocol::Response::error(reason))
             .expect("response serializes"),
@@ -260,6 +276,7 @@ mod tests {
 
     #[test]
     fn remote_sync_capacity_refusal_is_typed_on_wire() {
+        let _lock = SYNC_CAPACITY_TEST_LOCK.lock().unwrap();
         let permits: Vec<_> = (0..MAX_REMOTE_SYNCS)
             .map(|_| RemoteSyncPermit::acquire().expect("permit within remote sub-cap"))
             .collect();
@@ -398,6 +415,13 @@ mod tests {
                 "unexpectedly authorized {request:?}"
             );
         }
+    }
+
+    #[test]
+    fn malformed_request_errors_do_not_echo_payload_fragments() {
+        let error = decode_frame(br#"{"Eval":{"code":"SECRET_PAYLOAD_XYZ""#).unwrap_err();
+        assert_eq!(error, "invalid remote request");
+        assert!(!error.contains("SECRET_PAYLOAD_XYZ"));
     }
 
     #[test]
