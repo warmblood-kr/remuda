@@ -1150,6 +1150,7 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
     command.args(["-s", "s", "attach", "target"]);
     command.env("REMUDA_RUNTIME_DIR", &runtime);
     command.env("REMUDA_TEST_ATTACH_STALL_MS", "250");
+    command.env("REMUDA_TEST_INPUT_HOOKS", "1");
     command.env("REMUDA_TEST_ATTACH_BARRIER_RESULT", &barrier_result_path);
     command.env("REMUDA_TEST_ATTACH_DROPPED_COUNT", &dropped_count_path);
     let viewer = Session::new(

@@ -28,6 +28,11 @@ fn attach_input_stall_threshold() -> Duration {
     ATTACH_INPUT_STALL
 }
 
+#[cfg(debug_assertions)]
+fn attach_test_input_hooks_enabled() -> bool {
+    std::env::var_os("REMUDA_TEST_INPUT_HOOKS").is_some_and(|value| value == "1")
+}
+
 struct AttachInputStatus {
     last_progress: Duration,
     dropping: bool,
@@ -43,6 +48,8 @@ struct AttachInputQueue {
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     drop_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     recovery_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(debug_assertions)]
+    test_hooks_enabled: bool,
     capacity: usize,
     stall_after: Duration,
     now: std::sync::Arc<dyn Fn() -> Duration + Send + Sync>,
@@ -105,6 +112,8 @@ impl AttachInputQueue {
                 recovery_notice_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     false,
                 )),
+                #[cfg(debug_assertions)]
+                test_hooks_enabled: attach_test_input_hooks_enabled(),
                 capacity,
                 stall_after,
                 now,
@@ -365,9 +374,15 @@ fn report_attach_recovered(queue: &AttachInputQueue, output_lock: &std::sync::Mu
 
 #[cfg(debug_assertions)]
 fn report_test_attach_dropped_count(queue: &AttachInputQueue) {
-    if let Some(path) = std::env::var_os("REMUDA_TEST_ATTACH_DROPPED_COUNT") {
-        let dropped = queue.dropped.load(std::sync::atomic::Ordering::SeqCst);
-        let _ = std::fs::write(path, dropped.to_string());
+    if queue.test_hooks_enabled {
+        if let Some(path) = std::env::var_os("REMUDA_TEST_ATTACH_DROPPED_COUNT") {
+            let dropped = queue.dropped.load(std::sync::atomic::Ordering::SeqCst);
+            let path = PathBuf::from(path);
+            let temporary = path.with_extension("tmp");
+            if std::fs::write(&temporary, dropped.to_string()).is_ok() {
+                let _ = std::fs::rename(temporary, path);
+            }
+        }
     }
 }
 
@@ -1310,10 +1325,13 @@ fn exit_history_if_needed(route: &mut AttachRoute<'_>, bytes: &[u8]) {
         paint_history(route.path, route.name, 0);
     }
     let dropped = route.input.enqueue(bytes, false, false);
+    #[cfg(not(debug_assertions))]
+    let _ = dropped;
     #[cfg(debug_assertions)]
-    if bytes
-        .windows(b"DRAINED-BARRIER".len())
-        .any(|window| window == b"DRAINED-BARRIER")
+    if route.input.test_hooks_enabled
+        && bytes
+            .windows(b"DRAINED-BARRIER".len())
+            .any(|window| window == b"DRAINED-BARRIER")
     {
         if let Some(path) = std::env::var_os("REMUDA_TEST_ATTACH_BARRIER_RESULT") {
             let result: &[u8] = if dropped { b"dropped" } else { b"queued" };
