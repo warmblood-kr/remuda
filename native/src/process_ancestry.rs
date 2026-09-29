@@ -230,6 +230,8 @@ fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
 
 #[cfg(windows)]
 fn process_parents() -> io::Result<std::collections::HashMap<u32, u32>> {
+    // Toolhelp parent PIDs are advisory: Windows may retain a stale PID after
+    // its parent exits, and a later process can reuse that PID.
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
