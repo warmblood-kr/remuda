@@ -42,6 +42,36 @@ use portable_pty::CommandBuilder;
 /// polls so they cannot consume an unbounded number of daemon worker threads.
 pub(crate) const MAX_CONCURRENT_SYNCS: usize = 16;
 static ACTIVE_SYNCS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_NEW_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+
+struct NewRequestInFlight;
+
+impl NewRequestInFlight {
+    fn start() -> Self {
+        ACTIVE_NEW_REQUESTS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for NewRequestInFlight {
+    fn drop(&mut self) {
+        ACTIVE_NEW_REQUESTS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn wait_for_new_requests() {
+    const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + DRAIN_TIMEOUT;
+    while ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst) != 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let still_in_flight = ACTIVE_NEW_REQUESTS.load(Ordering::SeqCst);
+    if still_in_flight != 0 {
+        eprintln!(
+            "remuda: continuing shutdown with {still_in_flight} New request(s) still in flight"
+        );
+    }
+}
 
 struct SyncPermit;
 
@@ -843,10 +873,10 @@ const TICK_PERIOD: std::time::Duration = std::time::Duration::from_secs(1);
 /// notifying anywhere else would race it and silently drop the event.
 pub(crate) fn reap_and_notify(registry: &Registry, image: &Image) -> Vec<String> {
     let dead = registry.reap_with_exit_info();
-    for (name, reason, exit_info) in &dead {
-        notify_exited(image, name, reason, exit_info.as_ref());
+    for (name, id, reason, exit_info) in &dead {
+        notify_exited(image, name, id, reason, exit_info.as_ref());
     }
-    dead.into_iter().map(|(name, _, _)| name).collect()
+    dead.into_iter().map(|(name, _, _, _)| name).collect()
 }
 
 fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<()>> {
@@ -855,7 +885,13 @@ fn close(registry: &Registry, image: &Image, name: &str) -> Option<AgentResult<(
     if let Ok(true) = closed {
         // If the reaper removed it first, close returns false and the reaper
         // owns the single notification using the marker's `closed` reason.
-        notify_exited(image, name, "closed", session.exit_info().as_ref());
+        notify_exited(
+            image,
+            name,
+            session.id(),
+            "closed",
+            session.exit_info().as_ref(),
+        );
     }
     Some(closed.map(drop))
 }
@@ -868,7 +904,7 @@ fn close_instance(
 ) -> Option<AgentResult<()>> {
     let closed = registry.close_instance(name, instance_id)?;
     if let Ok(true) = closed {
-        notify_exited(image, name, "closed", None);
+        notify_exited(image, name, instance_id, "closed", None);
     }
     Some(closed.map(drop))
 }
@@ -878,9 +914,11 @@ fn close_instance(
 fn notify_exited(
     image: &Image,
     name: &str,
+    id: &str,
     reason: &str,
     exit_info: Option<&remuda_core::agent::ExitInfo>,
 ) {
+    image.wait_session_output_monitor(id);
     let mut fields = vec![format!("reason={}", crate::mcp::lua_string(reason))];
     if let Some(exit_info) = exit_info {
         if let Some(exit_code) = exit_info.exit_code {
@@ -1037,17 +1075,28 @@ fn handle(
     };
 
     record_request(counters, &request);
+    handle_request(stream, reader, registry, image, socket_owner, request)
+}
 
+fn handle_list(stream: &Stream, registry: &Registry, image: &Image) -> std::io::Result<()> {
+    // Where a session that ended stops being listed: a reaper thread would
+    // need a clock this layer is not given.
+    if !keep_exited() {
+        reap_and_notify(registry, image);
+    }
+    reply(stream, &Response::Sessions(registry.list()))
+}
+
+fn handle_request(
+    stream: Stream,
+    reader: BufReader<Stream>,
+    registry: &Registry,
+    image: &Image,
+    socket_owner: Arc<SocketOwnership>,
+    request: Request,
+) -> std::io::Result<()> {
     match request {
-        // Where a session that ended stops being listed. Here rather than on a
-        // timer because listing is the only moment the answer is looked at, and
-        // a reaper thread would need a clock this layer is not given.
-        Request::List => {
-            if !keep_exited() {
-                reap_and_notify(registry, image);
-            }
-            reply(&stream, &Response::Sessions(registry.list()))
-        }
+        Request::List => handle_list(&stream, registry, image),
 
         Request::Version => reply(&stream, &Response::Value(crate::dist::BUILD_VERSION.into())),
 
@@ -1063,7 +1112,18 @@ fn handle(
             size,
             cwd,
             env,
-        } => handle_new(stream, registry, name, command, size, cwd, env),
+        } => handle_new(
+            stream,
+            registry,
+            image,
+            NewSessionRequest {
+                name,
+                command,
+                size,
+                cwd,
+                env,
+            },
+        ),
 
         Request::SendLine { name, text } => {
             respond(&stream, &name, registry.send_line(&name, &text), |()| {
@@ -1363,6 +1423,10 @@ fn handle_shutdown(
     }
     image.shutdown_pending_replies();
     reply(&stream, &Response::Ok)?;
+    // A session can request this shutdown as soon as its process starts. Let
+    // every already-running New handler flush its response before the daemon
+    // exits and tears down their client connections.
+    wait_for_new_requests();
     reap_processes_before_exit(image);
     socket_owner.cleanup();
     std::process::exit(0);
@@ -1377,15 +1441,28 @@ fn refuse_hosted_shutdown(stream: &Stream, identity: &str) -> std::io::Result<()
     )
 }
 
-fn handle_new(
-    stream: Stream,
-    registry: &Registry,
+struct NewSessionRequest {
     name: Option<String>,
     command: Vec<String>,
     size: Size,
     cwd: Option<String>,
     env: Option<HashMap<String, String>>,
+}
+
+fn handle_new(
+    stream: Stream,
+    registry: &Registry,
+    image: &Image,
+    request: NewSessionRequest,
 ) -> std::io::Result<()> {
+    let _in_flight = NewRequestInFlight::start();
+    let NewSessionRequest {
+        name,
+        command,
+        size,
+        cwd,
+        env,
+    } = request;
     let name = match name {
         Some(given) => given,
         None => registry.unique_name(&remuda_core::registry::slug(
@@ -1409,11 +1486,79 @@ fn handle_new(
         Some(&session_env),
     ) {
         Err(e) => reply(&stream, &Response::error(e)),
-        Ok(session) => match registry.register(session) {
-            Ok(_) => reply(&stream, &Response::Value(name)),
-            Err(_) => reply(&stream, &Response::error(format!("name taken: {name}"))),
-        },
+        Ok(session) => {
+            let session_id = session.id().to_string();
+            let notifier = image.session_output_notifier(&name, &session_id);
+            match registry.register(session) {
+                Ok(session) => {
+                    if let Some(output) = session.subscribe_output_wakeup() {
+                        monitor_session_output(output, notifier);
+                    } else {
+                        notifier.flush(session.output_version().unwrap_or(0));
+                        notifier.finish_monitor();
+                    }
+                    reply(&stream, &Response::Value(name))
+                }
+                Err(_) => {
+                    image.discard_session_output_monitor(&session_id, &notifier);
+                    reply(&stream, &Response::error(format!("name taken: {name}")))
+                }
+            }
+        }
     }
+}
+
+/// Wait for PTY output, then submit one coalesced wake into the Lua image.
+/// The deadline starts with the first chunk so continuous output cannot starve
+/// a notification by continually restarting a quiet-period timer.
+fn monitor_session_output(
+    output: remuda_core::agent::OutputWakeup,
+    notifier: crate::image::SessionOutputNotifier,
+) {
+    const COALESCE: std::time::Duration = std::time::Duration::from_millis(50);
+    std::thread::spawn(move || {
+        // The PTY reader starts with the child, before `handle_new` can
+        // register the session and attach this monitor. Catch any output that
+        // arrived in that gap; output racing this snapshot will also leave a
+        // wake queued on `output`.
+        let mut last_notified = output.version_after_wake();
+        if last_notified > 0 {
+            notifier.notify(last_notified);
+        }
+        loop {
+            if output.recv().is_err() {
+                notifier.flush(output.version_after_wake());
+                notifier.finish_monitor();
+                return;
+            }
+            let deadline = std::time::Instant::now() + COALESCE;
+            let mut disconnected = false;
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match output.recv_timeout(remaining) {
+                    Ok(()) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
+                }
+            }
+            let version = output.version_after_wake();
+            if disconnected {
+                notifier.flush(version);
+                notifier.finish_monitor();
+                return;
+            }
+            if version > last_notified {
+                notifier.notify(version);
+                last_notified = version;
+            }
+        }
+    });
 }
 
 fn read_request(
