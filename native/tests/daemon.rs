@@ -70,13 +70,13 @@ fn scratch_dir(tag: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn wait_for_send_writer_busy(socket: &Path, send_finished: &Receiver<()>) {
+fn wait_for_send_writer_busy(socket: &Path, name: &str, send_finished: &Receiver<()>) {
     let busy_deadline = Instant::now() + Duration::from_secs(4);
     loop {
         match client::request(
             socket,
             &Request::Send {
-                name: "target".into(),
+                name: name.into(),
                 bytes: Vec::new(),
             },
         )
@@ -102,6 +102,7 @@ fn wait_for_send_writer_busy(socket: &Path, send_finished: &Receiver<()>) {
 #[cfg(unix)]
 fn spawn_stalled_send(
     socket: PathBuf,
+    name: &'static str,
     bytes: Vec<u8>,
     send_finished: std::sync::mpsc::Sender<()>,
 ) -> std::thread::JoinHandle<std::io::Result<Response>> {
@@ -110,7 +111,7 @@ fn spawn_stalled_send(
             match client::request(
                 &socket,
                 &Request::Send {
-                    name: "target".into(),
+                    name: name.into(),
                     bytes: bytes.clone(),
                 },
             ) {
@@ -999,51 +1000,21 @@ fn input_batches_acknowledge_duplicates_and_check_instance_before_deduplication(
 fn stalled_pty_write_times_out_without_blocking_reads_and_recovers() {
     let runtime = scratch_dir("pty-write-timeout");
     let socket = daemon::socket_path_in(&runtime, "s");
-    let mut running = spawn::Daemon::spawn(&runtime);
-    let reader_marker = start_reader_waiting_session(&socket, &runtime);
+    // This scenario needs the daemon service and a real PTY, but not a
+    // subprocess. Serving in-process removes child-startup scheduling from the
+    // writer race this test is meant to exercise.
+    let _server = daemon_at(&socket);
+    let (reader_marker, capture_path) = start_reader_waiting_session(&socket, &runtime);
 
     let bytes = vec![b'\n'; 1024 * 1024];
-    let send_socket = socket.clone();
-    let (sent, result) = std::sync::mpsc::channel();
+    let expected = bytes.clone();
+    let (send_finished, send_finished_rx) = std::sync::mpsc::channel();
     let started = Instant::now();
-    let sender = std::thread::spawn(move || {
-        let result = client::request(
-            &send_socket,
-            &Request::Send {
-                name: "versioned".into(),
-                bytes,
-            },
-        );
-        let _ = sent.send(result);
-    });
+    let sender = spawn_stalled_send(socket.clone(), "versioned", bytes, send_finished);
 
-    // Wait until the first writer has had time to fill the PTY, then prove an
-    // independent request can make progress and a second input is not queued.
-    let busy_deadline = Instant::now() + Duration::from_secs(4);
-    loop {
-        match client::request(
-            &socket,
-            &Request::Send {
-                name: "versioned".into(),
-                bytes: b"later\n".to_vec(),
-            },
-        )
-        .expect("second send")
-        {
-            Response::Busy => break,
-            Response::Ok => {
-                assert!(
-                    Instant::now() < busy_deadline,
-                    "the large write never occupied the session writer"
-                );
-                if let Ok(result) = result.try_recv() {
-                    panic!("large write finished before a second write was refused: {result:?}");
-                }
-            }
-            other => panic!("unexpected second send response: {other:?}"),
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    // Empty Send probes cannot take the PTY writer away from the large send.
+    // Wait for Busy instead of racing a second real write against the first.
+    wait_for_send_writer_busy(&socket, "versioned", &send_finished_rx);
 
     let read_started = Instant::now();
     let _ = listed_session(&socket);
@@ -1054,17 +1025,32 @@ fn stalled_pty_write_times_out_without_blocking_reads_and_recovers() {
     );
 
     assert_eq!(
-        result
-            .recv_timeout(Duration::from_secs(4))
-            .expect("bounded send response")
+        sender
+            .join()
+            .expect("large send client thread")
             .expect("send request"),
         Response::WriteTimeout
     );
-    sender.join().expect("send client thread");
     assert!(started.elapsed() < Duration::from_secs(6));
     std::fs::write(&reader_marker, b"read now").expect("allow child to read input");
 
     let deadline = Instant::now() + Duration::from_secs(5);
+    // Observe the child draining the entire timed-out payload before checking
+    // that a new write can use the recovered PTY writer.
+    loop {
+        let received = std::fs::metadata(&capture_path)
+            .map(|metadata| metadata.len() as usize)
+            .unwrap_or_default();
+        if received >= expected.len() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child did not drain the timed-out PTY write"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
     loop {
         match client::request(
             &socket,
@@ -1078,24 +1064,37 @@ fn stalled_pty_write_times_out_without_blocking_reads_and_recovers() {
             Response::Ok => break,
             Response::Busy => {
                 assert!(Instant::now() < deadline, "PTY writer did not recover");
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(10));
             }
             other => panic!("unexpected recovery response: {other:?}"),
         }
     }
+    let mut expected = expected;
+    expected.extend_from_slice(b"after recovery\n");
+    loop {
+        let got = std::fs::read(&capture_path).unwrap_or_default();
+        if got == expected {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "child did not capture the recovery write"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
-    let _ = client::request(
-        &socket,
-        &Request::Shutdown {
-            requester_daemon_id: None,
-            requester_session_id: None,
-            requester_session_name: None,
-            override_hosted: false,
-        },
-    );
-    assert!(
-        running.left_on_its_own(),
-        "daemon exits after shutdown request"
+    assert_eq!(
+        client::request(
+            &socket,
+            &Request::Shutdown {
+                requester_daemon_id: None,
+                requester_session_id: None,
+                requester_session_name: None,
+                override_hosted: false,
+            },
+        )
+        .expect("stop daemon"),
+        Response::Ok
     );
 }
 
@@ -1212,11 +1211,11 @@ fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
     let expected_send = send_bytes.clone();
     let started = Instant::now();
     let (send_finished_tx, send_finished_rx) = std::sync::mpsc::channel();
-    let sender = spawn_stalled_send(socket.clone(), send_bytes, send_finished_tx);
+    let sender = spawn_stalled_send(socket.clone(), "target", send_bytes, send_finished_tx);
 
     // Empty sends make safe probes: they cannot affect the captured bytes.
     // Observe Busy before attaching, rather than assuming a fixed delay.
-    wait_for_send_writer_busy(&socket, &send_finished_rx);
+    wait_for_send_writer_busy(&socket, "target", &send_finished_rx);
     let mut stream = raw_attach(&socket, "target");
     stream
         .write_all(b"HUMAN-ONE\n")
@@ -1278,12 +1277,14 @@ fn attach_during_stalled_send_preserves_human_input_before_and_after_timeout() {
 }
 
 #[cfg(unix)]
-fn start_reader_waiting_session(socket: &Path, runtime: &Path) -> PathBuf {
+fn start_reader_waiting_session(socket: &Path, runtime: &Path) -> (PathBuf, PathBuf) {
     // Keep the master unread until the test signals it, then drain input so
     // recovery is deterministic regardless of parallel test scheduling.
     let marker = runtime.join("start-reader");
+    let capture = runtime.join("captured-input");
     let mut env = std::collections::HashMap::new();
     env.insert("READER_MARKER".into(), marker.display().to_string());
+    env.insert("CAPTURE_PATH".into(), capture.display().to_string());
     assert!(matches!(
         client::request(
             socket,
@@ -1292,7 +1293,7 @@ fn start_reader_waiting_session(socket: &Path, runtime: &Path) -> PathBuf {
                 command: vec![
                     "sh".into(),
                     "-c".into(),
-                    "stty -echo; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat >/dev/null".into(),
+                    "stty raw -echo; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat >\"$CAPTURE_PATH\"".into(),
                 ],
                 size: Size::new(80, 24),
                 cwd: None,
@@ -1302,7 +1303,7 @@ fn start_reader_waiting_session(socket: &Path, runtime: &Path) -> PathBuf {
         .expect("start non-reading child"),
         Response::Value(_)
     ));
-    marker
+    (marker, capture)
 }
 
 fn start_shell_session(socket: &Path, script: &str) {
