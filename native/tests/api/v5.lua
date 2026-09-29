@@ -101,7 +101,7 @@ local session = remuda.session
 assert(type(session) == "table", "remuda.session must be a namespace table")
 assert(getmetatable(session) and type(getmetatable(session).__call) == "function",
   "remuda.session must remain callable")
-for _, word in ipairs({ "list", "new", "close", "attach" }) do
+for _, word in ipairs({ "list", "new", "close", "attach", "resize" }) do
   assert(type(session[word]) == "function", "remuda.session." .. word .. " is missing")
 end
 
@@ -113,6 +113,28 @@ for _, row in ipairs(session.list()) do
   if row.name == name then found = true end
 end
 assert(found, "session.list must include the session created by session.new")
+assert(session.resize(name, 91, 31) == true, "session.resize must report success")
+local resized = false
+for _, row in ipairs(remuda.ls()) do
+  if row.name == name then resized = row.cols == 91 and row.rows == 31 end
+end
+assert(resized, "session.resize must update dimensions reported by remuda.ls")
+assert(session.resize(name, 30, 24) == true, "session.resize must accept a pane-width session")
+local narrow = false
+for _, row in ipairs(remuda.ls()) do
+  if row.name == name then narrow = row.cols == 30 and row.rows == 24 end
+end
+assert(narrow, "session.resize must preserve sub-80 widths reported by remuda.ls")
+for _, dimensions in ipairs({
+  { 0, 24 }, { 19, 24 }, { 1001, 24 }, { 80, 0 }, { 80, 23 }, { 80, 501 },
+}) do
+  local ok, err = session.resize(name, dimensions[1], dimensions[2])
+  assert(ok == nil and type(err) == "string", "session.resize must reject out-of-bounds dimensions")
+end
+local nonnumeric, nonnumeric_err = session.resize(name, "80", 24)
+assert(nonnumeric == nil and type(nonnumeric_err) == "string", "session.resize must reject nonnumeric dimensions")
+local unknown, unknown_err = session.resize(name .. "-missing", 90, 30)
+assert(unknown == nil and type(unknown_err) == "string", "session.resize must report an unknown session")
 
 local handle = session(name)
 assert(handle.name == name, "calling remuda.session must still return a handle")

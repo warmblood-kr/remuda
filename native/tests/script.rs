@@ -188,7 +188,7 @@ fn the_bound_surface_is_exactly_the_protocols() {
         for key in pairs(remuda.session) do session_names[#session_names + 1] = key end
         table.sort(session_names)
         local session_got = table.concat(session_names, ",")
-        local session_want = "attach,close,list,new"
+        local session_want = "attach,close,list,new,resize"
         if session_got ~= session_want then
           error("session namespace is " .. session_got .. ", expected " .. session_want)
         end
@@ -489,6 +489,21 @@ fn registry_documentation_formats_are_live_and_structured() {
         .unwrap()
         .iter()
         .any(|entry| entry["name"] == "ls"));
+    assert!(document["runtime"]["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["name"] == "session.resize"));
+    for section in ["functions", "variables"] {
+        assert!(
+            document["runtime"][section]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| !entry["name"].as_str().unwrap_or_default().starts_with('_')),
+            "public reference exposed a private word in {section}"
+        );
+    }
     assert!(document["runtime"]["variables"]
         .as_array()
         .unwrap()

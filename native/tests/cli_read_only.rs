@@ -24,6 +24,7 @@ fn scratch(tag: &str) -> PathBuf {
 fn read_only_verbs_without_a_daemon_fail_without_starting_one() {
     for (tag, args) in [
         ("ls", &["ls"][..]),
+        ("resize", &["resize", "missing", "80", "24"][..]),
         ("doc", &["doc", "--format", "markdown"]),
     ] {
         let dir = scratch(tag);
