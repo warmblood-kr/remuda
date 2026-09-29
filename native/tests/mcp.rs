@@ -427,6 +427,24 @@ fn wait_for_answers_a_screen_and_refuses_a_deadline() {
     assert!(text_of(&never).contains("never matched"), "{never}");
 }
 
+#[test]
+fn wait_for_rejects_a_deadline_longer_than_the_eval_limit() {
+    let dir = scratch("waitfor-deadline-cap");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path);
+
+    let too_long = call(
+        &path,
+        "wait_for",
+        json!({"session": "anything", "pattern": "anything", "seconds": "301"}),
+    );
+    assert_eq!(too_long["result"]["isError"], true, "{too_long}");
+    assert!(
+        text_of(&too_long).contains("positive and no greater than 300"),
+        "{too_long}"
+    );
+}
+
 /// [MEASURED] `request_counts`/`schedule_skips` (steps/033's follow-up)
 /// existed as plain Lua bindings, readable from a script but not MCP — MCP's
 /// `tools/call` only reaches `remuda.tools`, a separate registry. This is

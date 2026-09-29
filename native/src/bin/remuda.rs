@@ -38,7 +38,10 @@ fn main() -> ExitCode {
     let argv: Vec<&str> = rest.iter().map(String::as_str).collect();
     let path = daemon::socket_path(server);
 
-    let skew = prepare_command(&argv, &path);
+    let skew = match prepare_command(&argv, &path) {
+        Ok(skew) => skew,
+        Err(error) => return fail(error),
+    };
 
     match argv.as_slice() {
         // The whole ask: typing the program's name opens the herd. Only when
@@ -216,6 +219,8 @@ remuda — a pty manager you can attach to
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster remote [node/session] open the read-only cluster tree
+  remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
+                                  [::] may accept IPv4 too on dual-stack systems
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
   remuda repl                   the same image, a line at a time
@@ -288,6 +293,8 @@ remuda — terminal orchestration for coding agents
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster remote [node/session] open the read-only cluster tree
+  remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
+                                  [::] may accept IPv4 too on dual-stack systems
 
   remuda doc | repl | -e CODE    use the persistent Lua runtime
   remuda --stdin MOD [ARGS…]     opt in to passing up to 1 MiB of stdin to the mod
@@ -322,8 +329,15 @@ enum ClusterCommand {
     Status,
     Init,
     Nodes,
-    Revoke { target: String, yes: bool },
+    Revoke {
+        target: String,
+        yes: bool,
+    },
     Remote(Option<String>),
+    Listen {
+        bind_addr: std::net::SocketAddr,
+        allow_public: bool,
+    },
     Invalid,
 }
 
@@ -348,6 +362,23 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
         ["remote", target] if target.contains('/') => {
             ClusterCommand::Remote(Some((*target).to_string()))
         }
+        ["listen", "--bind", address] => address
+            .parse()
+            .ok()
+            .map(|bind_addr| ClusterCommand::Listen {
+                bind_addr,
+                allow_public: false,
+            })
+            .unwrap_or(ClusterCommand::Invalid),
+        ["listen", "--bind", address, "--allow-public"]
+        | ["listen", "--allow-public", "--bind", address] => address
+            .parse()
+            .ok()
+            .map(|bind_addr| ClusterCommand::Listen {
+                bind_addr,
+                allow_public: true,
+            })
+            .unwrap_or(ClusterCommand::Invalid),
         _ => ClusterCommand::Invalid,
     }
 }
@@ -397,7 +428,26 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                 }
             })
         }
-        ClusterCommand::Invalid => fail("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | remote [node/session]]"),
+        ClusterCommand::Listen {
+            bind_addr,
+            allow_public,
+        } => with_daemon(server, path, |daemon_path| {
+            let config = remuda_native::net::listener::ListenerConfig {
+                bind_addr,
+                allow_unspecified: allow_public,
+            };
+            match remuda_native::net::listener::bind(config, daemon_path) {
+                Ok(listener) => {
+                    eprintln!("remuda: cluster listener on {}", listener.local_addr().unwrap_or(bind_addr));
+                    match listener.serve() {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(error) => fail(format!("cluster listener: {error}")),
+                    }
+                }
+                Err(error) => fail(format!("cluster listener: {error}")),
+            }
+        }),
+        ClusterCommand::Invalid => fail("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | remote [node/session] | listen --bind ADDR [--allow-public]]"),
     }
 }
 
@@ -525,6 +575,28 @@ mod cluster_cli_tests {
         assert_eq!(
             parse_cluster_command(&["remote", "studio/dev"]),
             ClusterCommand::Remote(Some("studio/dev".into()))
+        );
+    }
+
+    #[test]
+    fn cluster_listener_requires_explicit_bind_and_public_wildcard_opt_in() {
+        assert_eq!(
+            parse_cluster_command(&["listen", "--bind", "192.0.2.4:9443"]),
+            ClusterCommand::Listen {
+                bind_addr: "192.0.2.4:9443".parse().unwrap(),
+                allow_public: false,
+            }
+        );
+        assert_eq!(
+            parse_cluster_command(&["listen", "--bind", "0.0.0.0:9443", "--allow-public"]),
+            ClusterCommand::Listen {
+                bind_addr: "0.0.0.0:9443".parse().unwrap(),
+                allow_public: true,
+            }
+        );
+        assert_eq!(
+            parse_cluster_command(&["listen", "--bind", "not-an-address"]),
+            ClusterCommand::Invalid
         );
     }
 
@@ -797,7 +869,7 @@ fn stop_daemon(path: &Path, shutdown: Request) -> Result<(), String> {
 /// One line when the running daemon is not this build. A warning, not a refusal:
 /// most skews are harmless, and stranding someone mid-work behind a version
 /// string is its own incident. `None` when nothing is listening — it will be us.
-fn version_skew(argv: &[&str], path: &Path) -> Option<String> {
+fn version_skew(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
     // Help, version and upgrade must answer with no daemon at all (#115).
     if matches!(
         argv,
@@ -811,10 +883,15 @@ fn version_skew(argv: &[&str], path: &Path) -> Option<String> {
     ) || (argv.is_empty()
         && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()))
     {
-        return None;
+        return Ok(None);
     }
-    remuda_native::ipc::connect(path).ok()?;
-    skew_notice(remuda_native::client::request(path, &Request::Version))
+    if remuda_native::ipc::connect(path).is_err() {
+        return Ok(None);
+    }
+    match remuda_native::client::request(path, &Request::Version) {
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Err(error.to_string()),
+        response => Ok(skew_notice(response)),
+    }
 }
 
 /// What to say about a `Request::Version` outcome — split out of
@@ -857,15 +934,15 @@ fn announce_update(argv: &[&str]) {
     }
 }
 
-fn prepare_command(argv: &[&str], path: &Path) -> Option<String> {
+fn prepare_command(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
     announce_update(argv);
     // Ask once before dispatch. A running daemon belongs to another binary,
     // and this is the cheapest point to check for a version skew.
-    let skew = version_skew(argv, path);
+    let skew = version_skew(argv, path)?;
     if let Some(notice) = &skew {
         eprintln!("remuda: {notice}");
     }
-    skew
+    Ok(skew)
 }
 
 /// Split out of `main` for the same reason `list_sessions` was: clippy's line
@@ -1101,6 +1178,46 @@ impl Drop for StartupLogCleanup {
     }
 }
 
+fn echo_socket_lock_wait(stderr_path: &Path, offset: &mut usize, announced: &mut bool) {
+    if *announced {
+        return;
+    }
+    let Ok(bytes) = fs::read(stderr_path) else {
+        return;
+    };
+    let Some(tail) = bytes.get(*offset..) else {
+        return;
+    };
+    *offset = bytes.len();
+    let Some(start) = tail
+        .windows(b"waiting for the socket lock".len())
+        .position(|window| window == b"waiting for the socket lock")
+    else {
+        return;
+    };
+    let begin = tail[..start]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let end = tail[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(tail.len(), |index| start + index);
+    eprintln!("{}", String::from_utf8_lossy(&tail[begin..end]).trim());
+    *announced = true;
+}
+
+fn daemon_start_error(path: &Path, stderr_path: &Path, offset: u64, separator: &str) -> String {
+    let said = fs::read(stderr_path)
+        .ok()
+        .and_then(|bytes| bytes.get(offset as usize..).map(<[u8]>::to_vec))
+        .map(|bytes| String::from_utf8_lossy(&bytes).replace(separator, ""))
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "it printed nothing".into());
+    format!("daemon did not come up at {} — {said}", path.display())
+}
+
 /// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
 /// successful *connect*, not on the file existing, and pass `-s <server>`
 /// through — a bare `remuda daemon` re-derives `"default"` and never matches.
@@ -1202,7 +1319,14 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     }
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut observed_log_bytes = offset as usize;
+    let mut announced_lock_wait = false;
     while std::time::Instant::now() < deadline {
+        echo_socket_lock_wait(
+            &stderr_path,
+            &mut observed_log_bytes,
+            &mut announced_lock_wait,
+        );
         if remuda_native::ipc::connect(path).is_ok() {
             // "remuda should always come up in daemon mode" — it already did.
             // What was missing was the line saying so.
@@ -1219,16 +1343,11 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
 
     let _ = child.kill();
     let _ = child.wait();
-    let said = fs::read(&stderr_path)
-        .ok()
-        .and_then(|bytes| bytes.get(offset as usize..).map(<[u8]>::to_vec))
-        .map(|bytes| String::from_utf8_lossy(&bytes).replace(&separator_line, ""))
-        .map(|text| text.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "it printed nothing".into());
-    Err(format!(
-        "daemon did not come up at {} — {said}",
-        path.display()
+    Err(daemon_start_error(
+        path,
+        &stderr_path,
+        offset,
+        &separator_line,
     ))
 }
 

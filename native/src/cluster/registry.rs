@@ -327,6 +327,51 @@ pub fn load_registry() -> io::Result<Registry> {
     load_registry_at(&storage::cluster_state_dir()?.join("cluster"))
 }
 
+/// Return a cheap change token for the atomically replaced membership file.
+/// Listener request paths use this to invalidate a cached registry without
+/// taking the cluster state lock for every admitted peer.
+pub fn registry_revision_token() -> io::Result<String> {
+    #[cfg(windows)]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
+    ));
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use std::time::UNIX_EPOCH;
+        let path = storage::cluster_state_dir()?
+            .join("cluster")
+            .join(REGISTRY_FILE);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "cluster registry is a symlink; refusing",
+                ));
+            }
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok("missing".to_owned());
+            }
+            Err(error) => return Err(error),
+        };
+        let modified = metadata
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        Ok(format!(
+            "{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.len(),
+            modified,
+            metadata.mode() & 0o777
+        ))
+    }
+}
+
 pub fn save_registry(_registry: &Registry) -> io::Result<()> {
     #[cfg(windows)]
     return Err(io::Error::new(
