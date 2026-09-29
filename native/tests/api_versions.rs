@@ -131,20 +131,37 @@ fn exercise_expect_wakes_on_session_output(path: &std::path::Path) {
         format!("sleep 1.5; printf {marker}; sleep 5"),
     ];
     start_session(path, &name, command);
-    let initial_version = session_output_version(path, &name);
-    let output_deadline = Instant::now() + Duration::from_secs(5);
-    let output_seen_at = loop {
+    let marker_visible =
+        format!("return tostring(remuda.capture({name:?}):find({marker:?}, 1, true) ~= nil)");
+    let mut startup_wake_checked = false;
+    let marker_deadline = Instant::now() + Duration::from_secs(5);
+    let marker_seen_at = loop {
         let version = session_output_version(path, &name);
-        if version > initial_version {
+        if version > 0 && !startup_wake_checked {
+            startup_wake_checked = true;
+            let wake_deadline = Instant::now() + Duration::from_millis(750);
+            while eval(
+                path,
+                "return tostring(remuda._api_v5_expect_handle.state.last_screen ~= nil)",
+            ) != "true"
+            {
+                assert!(
+                    Instant::now() < wake_deadline,
+                    "session output before the marker did not wake the pre-registered expect"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        if eval(path, &marker_visible) == "true" {
             break Instant::now();
         }
         assert!(
-            Instant::now() < output_deadline,
-            "session output did not advance"
+            Instant::now() < marker_deadline,
+            "session output marker did not become visible"
         );
-        thread::sleep(Duration::from_millis(5));
+        thread::sleep(Duration::from_millis(10));
     };
-    let wake_deadline = output_seen_at + Duration::from_millis(750);
+    let wake_deadline = marker_seen_at + Duration::from_millis(750);
     loop {
         if eval(path, "return remuda._api_v5_expect_handle.state.status") == "matched" {
             break;
