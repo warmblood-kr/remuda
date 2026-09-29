@@ -58,10 +58,17 @@ pub fn run_sync(
     timeout_seconds: f64,
 ) -> Result<RunOutput, String> {
     validate_run(&argv, timeout_seconds)?;
+    #[cfg(test)]
+    let diagnose = argv
+        .iter()
+        .any(|argument| argument.contains("remuda-process-run-grandchild"));
+    #[cfg(not(test))]
+    let diagnose = false;
     let (stdout_permit, stderr_permit) = reserve_run_reader_workers()?;
     let process_tree = ProcessTree::new().map_err(|error| error.to_string())?;
 
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds);
+    let started_at = Instant::now();
+    let deadline = started_at + Duration::from_secs_f64(timeout_seconds);
     let (program, args) = argv.split_first().expect("argv checked above");
     let mut command = Command::new(program);
     command
@@ -94,7 +101,13 @@ pub fn run_sync(
         let state = stdout_reader.clone();
         std::thread::spawn(move || {
             let _permit = stdout_permit;
-            capture_bounded(stdout, capture, state)
+            capture_bounded(
+                stdout,
+                capture,
+                state,
+                "stdout",
+                diagnose.then_some(started_at),
+            )
         })
     };
     let stderr_reader_thread = {
@@ -102,7 +115,13 @@ pub fn run_sync(
         let state = stderr_reader.clone();
         std::thread::spawn(move || {
             let _permit = stderr_permit;
-            capture_bounded(stderr, capture, state)
+            capture_bounded(
+                stderr,
+                capture,
+                state,
+                "stderr",
+                diagnose.then_some(started_at),
+            )
         })
     };
     let stdin_done = Arc::new(AtomicBool::new(false));
@@ -125,6 +144,8 @@ pub fn run_sync(
         &stdout_reader,
         &stderr_reader,
         &stdin_done,
+        diagnose,
+        started_at,
     )?;
 
     if timed_out {
@@ -205,7 +226,11 @@ fn wait_for_process_io(
     stdout_reader: &ReaderState,
     stderr_reader: &ReaderState,
     stdin_done: &AtomicBool,
+    diagnose: bool,
+    started_at: Instant,
 ) -> Result<(std::process::ExitStatus, bool), String> {
+    #[cfg(not(windows))]
+    let _ = (diagnose, started_at);
     let mut child_status = None;
     loop {
         if child_status.is_none() {
@@ -233,6 +258,18 @@ fn wait_for_process_io(
             }
         }
         if Instant::now() >= deadline {
+            #[cfg(windows)]
+            if diagnose {
+                eprintln!(
+                    "process.run diagnostic: deadline reached at {:?}; leader exited before timeout: {}",
+                    started_at.elapsed(),
+                    child_status.is_some()
+                );
+                eprintln!(
+                    "process.run diagnostic: job accounting before termination: {:?}",
+                    process_tree.job.active_processes()
+                );
+            }
             // On Unix, only signal the process group while its direct leader
             // is known to be alive; after reap, its pgid may have been reused.
             // A Windows Job Object handle remains tied to its job after the
@@ -324,17 +361,37 @@ impl ReaderState {
     }
 }
 
-fn capture_bounded(mut reader: impl Read, capture: Arc<Mutex<BoundedCapture>>, state: ReaderState) {
+fn capture_bounded(
+    mut reader: impl Read,
+    capture: Arc<Mutex<BoundedCapture>>,
+    state: ReaderState,
+    label: &'static str,
+    diagnostic_started_at: Option<Instant>,
+) {
     let mut buffer = [0u8; 8192];
     let result = loop {
         match reader.read(&mut buffer) {
             Ok(0) => break Ok(()),
-            Ok(read) => capture.lock().unwrap().push(&buffer[..read]),
+            Ok(read) => {
+                if let Some(started_at) = diagnostic_started_at {
+                    eprintln!(
+                        "process.run diagnostic: {label} reader received {read} bytes at {:?}",
+                        started_at.elapsed()
+                    );
+                }
+                capture.lock().unwrap().push(&buffer[..read]);
+            }
             Err(error) => break Err(error.to_string()),
         }
     };
     if let Err(error) = result {
         *state.error.lock().unwrap() = Some(error);
+    }
+    if let Some(started_at) = diagnostic_started_at {
+        eprintln!(
+            "process.run diagnostic: {label} reader reached EOF at {:?}",
+            started_at.elapsed()
+        );
     }
     state.done.store(true, Ordering::Release);
 }
@@ -370,6 +427,8 @@ mod run_tests {
             Cursor::new(vec![b'x'; RUN_OUTPUT_LIMIT + 1]),
             capture.clone(),
             super::ReaderState::new(),
+            "test",
+            None,
         );
         let output = capture.lock().unwrap().snapshot();
         assert_eq!(output.len(), RUN_OUTPUT_LIMIT);
@@ -467,6 +526,15 @@ mod run_tests {
             2.0,
         )
         .expect("process.run should return at the timeout");
+        eprintln!(
+            "process.run diagnostic: test returned after {:?}; timed_out={}, code={}, stdout={:?}, stderr={:?}, started file exists={}",
+            started.elapsed(),
+            result.timed_out,
+            result.code,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr),
+            started_path.exists()
+        );
         assert!(result.timed_out, "the parent should hit its timeout");
         assert!(
             started.elapsed() < Duration::from_secs(5),
@@ -734,6 +802,31 @@ impl KillOnCloseJob {
         // SAFETY: self owns a valid Job Object handle. It may already be
         // empty or terminated, in which case this best-effort call is benign.
         unsafe { TerminateJobObject(self.0, RUN_TIMEOUT_EXIT_CODE as u32) };
+    }
+
+    fn active_processes(&self) -> std::io::Result<u32> {
+        use windows_sys::Win32::System::JobObjects::{
+            JobObjectBasicAccountingInformation, QueryInformationJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        };
+
+        let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: `accounting` is writable and its size matches the requested
+        // information class; the job handle remains live for this call.
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.0,
+                JobObjectBasicAccountingInformation,
+                (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if queried == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(accounting.ActiveProcesses)
+        }
     }
 }
 
