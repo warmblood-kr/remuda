@@ -26,6 +26,7 @@ pub mod pty;
 pub mod remote_front;
 pub mod reply_limit;
 pub mod script;
+pub mod text;
 pub mod tick;
 pub mod tui;
 
