@@ -824,7 +824,8 @@ impl ClusterUi {
                     ));
                 } else {
                     let label = node_snapshot.name.clone();
-                    let short_fingerprint = node.chars().take(6).collect::<String>();
+                    let fingerprint = node.strip_prefix("SHA256:").unwrap_or(&node);
+                    let short_fingerprint = fingerprint.chars().take(6).collect::<String>();
                     let wire_name = session.wire_name.clone();
                     self.remote_close_confirmation = Some(RemoteCloseTarget {
                         registry_key: node,
@@ -2196,10 +2197,11 @@ mod tests {
             Duration::ZERO,
             Some(remote_screen("remote")),
         );
+        snapshot.nodes[0].registry_key = "SHA256:RL+gtaJ8...".into();
         snapshot.nodes[0].sessions[0].wire_name = "wire-build".into();
         ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
         ui.remote_selected = Some(RemoteSelection::Session {
-            node: "fp-laptop".into(),
+            node: "SHA256:RL+gtaJ8...".into(),
             name: "build".into(),
             instance_id: "remote-instance".into(),
         });
@@ -2208,7 +2210,7 @@ mod tests {
 
         assert!(ui
             .render(100, 24, "", &clock)
-            .contains("kill laptop(fp-lap)/build? it is running — y / n"));
+            .contains("kill laptop(RL+gta)/build? it is running — y / n"));
 
         ui.key(crossterm::event::KeyCode::Char('y'));
         let transport = FakeRemoteInput::new(Response::RemoteControlDisabled);
@@ -2221,7 +2223,7 @@ mod tests {
         assert_eq!(
             transport.requests.lock().unwrap().as_slice(),
             &[(
-                "fp-laptop".into(),
+                "SHA256:RL+gtaJ8...".into(),
                 Request::Close {
                     name: "wire-build".into(),
                     instance_id: Some("remote-instance".into()),
