@@ -2416,6 +2416,31 @@ fn a_narrow_shown_list_pane_passes_its_visible_width_to_the_child() {
     );
 }
 
+/// A list preview is observational: only an attached pane may resize the
+/// session PTY. An absent private socket makes any attempted request fail
+/// immediately, which the current code exposes as a notice.
+#[test]
+fn a_narrow_preview_does_not_send_a_resize_request() {
+    let path = scratch_socket("narrow-preview-resize");
+    let _cleanup = ScratchSocketDir(path.parent().expect("socket parent").to_path_buf());
+    let mut ui = make_ui(vec![row("background", true, false)]);
+    let shown = Some(ShownTarget::Session("background".into()));
+    resize_shown_session(&path, &mut ui, &shown, 36, 24);
+    assert!(
+        ui.notice.is_none(),
+        "a list preview must not send a resize request for its 36-column client: {:?}",
+        ui.notice
+    );
+}
+
+struct ScratchSocketDir(std::path::PathBuf);
+
+impl Drop for ScratchSocketDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn a_squeezed_list_drops_fields_rather_than_being_cut() {
     // 80-wide terminal, 80-wide sessions: the list floors at 16. What
