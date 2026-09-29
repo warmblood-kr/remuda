@@ -38,7 +38,10 @@ fn main() -> ExitCode {
     let argv: Vec<&str> = rest.iter().map(String::as_str).collect();
     let path = daemon::socket_path(server);
 
-    let skew = prepare_command(&argv, &path);
+    let skew = match prepare_command(&argv, &path) {
+        Ok(skew) => skew,
+        Err(error) => return fail(error),
+    };
 
     match argv.as_slice() {
         // The whole ask: typing the program's name opens the herd. Only when
@@ -70,7 +73,7 @@ fn main() -> ExitCode {
         ["upgrade", rest @ ..] => run_upgrade(rest),
 
         // Not part of the user-facing set: this is what the auto-start spawns.
-        ["daemon"] => match daemon::serve(&path) {
+        ["daemon"] => match daemon::serve_with_runtime(&path, &daemon::runtime_dir()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(format!("daemon: {e}")),
         },
@@ -218,6 +221,10 @@ remuda — a pty manager you can attach to
   remuda cluster control on|off   allow or refuse remote control
   remuda cluster remote [node/session] open the cluster session tree
   remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
+  remuda cluster call NODE list --addr HOST:PORT [--json]  list a remote node's sessions
+  remuda cluster call NODE capture SESSION --addr HOST:PORT [--json]  capture a remote screen
+                                  exits: 0 success, 2 usage, 3 unreachable/timeout,
+                                  4 refused/unknown/revoked, 5 crypto/bad response
                                   [::] may accept IPv4 too on dual-stack systems
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
@@ -293,6 +300,10 @@ remuda — terminal orchestration for coding agents
   remuda cluster control on|off   allow or refuse remote control
   remuda cluster remote [node/session] open the cluster session tree
   remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
+  remuda cluster call NODE list --addr HOST:PORT [--json]  list a remote node's sessions
+  remuda cluster call NODE capture SESSION --addr HOST:PORT [--json]  capture a remote screen
+                                  exits: 0 success, 2 usage, 3 unreachable/timeout,
+                                  4 refused/unknown/revoked, 5 crypto/bad response
                                   [::] may accept IPv4 too on dual-stack systems
 
   remuda doc | repl | -e CODE    use the persistent Lua runtime
@@ -338,7 +349,19 @@ enum ClusterCommand {
         bind_addr: std::net::SocketAddr,
         allow_public: bool,
     },
+    Call {
+        target: String,
+        address: std::net::SocketAddr,
+        action: CallAction,
+        json: bool,
+    },
     Invalid,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CallAction {
+    List,
+    Capture(String),
 }
 
 fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
@@ -381,8 +404,46 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
                 allow_public: true,
             })
             .unwrap_or(ClusterCommand::Invalid),
+        ["call", target, operation, rest @ ..] => parse_cluster_call(target, operation, rest),
         _ => ClusterCommand::Invalid,
     }
+}
+
+fn parse_cluster_call(target: &str, operation: &str, args: &[&str]) -> ClusterCommand {
+    let action = match operation {
+        "list" => CallAction::List,
+        "capture" => match args.first() {
+            Some(session) if !session.starts_with('-') => CallAction::Capture((*session).into()),
+            _ => return ClusterCommand::Invalid,
+        },
+        _ => return ClusterCommand::Invalid,
+    };
+    let option_start = usize::from(matches!(action, CallAction::Capture(_)));
+    let mut address = None;
+    let mut json = false;
+    let mut index = option_start;
+    while index < args.len() {
+        match args[index] {
+            "--json" if !json => {
+                json = true;
+                index += 1;
+            }
+            "--addr" if address.is_none() && index + 1 < args.len() => {
+                address = args[index + 1].parse().ok();
+                if address.is_none() {
+                    return ClusterCommand::Invalid;
+                }
+                index += 2;
+            }
+            _ => return ClusterCommand::Invalid,
+        }
+    }
+    address.map_or(ClusterCommand::Invalid, |address| ClusterCommand::Call {
+        target: target.into(),
+        address,
+        action,
+        json,
+    })
 }
 
 fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
@@ -457,7 +518,10 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             };
             match remuda_native::net::listener::bind(config, daemon_path) {
                 Ok(listener) => {
-                    eprintln!("remuda: cluster listener on {}", listener.local_addr().unwrap_or(bind_addr));
+                    eprintln!(
+                        "remuda: cluster listener on {}",
+                        listener.local_addr().unwrap_or(bind_addr)
+                    );
                     match listener.serve() {
                         Ok(()) => ExitCode::SUCCESS,
                         Err(error) => fail(format!("cluster listener: {error}")),
@@ -466,7 +530,16 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                 Err(error) => fail(format!("cluster listener: {error}")),
             }
         }),
-        ClusterCommand::Invalid => fail("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | control on|off | remote [node/session] | listen --bind ADDR [--allow-public]]"),
+        ClusterCommand::Call {
+            target,
+            address,
+            action,
+            json,
+        } => cluster_call(&target, address, action, json),
+        ClusterCommand::Invalid => {
+            eprintln!("usage: remuda cluster [init | nodes | revoke <node|fingerprint> [--yes] | control on|off | remote [node/session] | listen --bind ADDR [--allow-public] | call NODE (list | capture SESSION) --addr HOST:PORT [--json]]");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -488,6 +561,143 @@ fn remote_control_status_lines(enabled: bool) -> (&'static str, &'static str) {
         setting,
         "Trust if enabled: a compromised admitted node can type into and close every session.",
     )
+}
+
+fn cluster_call(
+    target: &str,
+    address: std::net::SocketAddr,
+    action: CallAction,
+    json: bool,
+) -> ExitCode {
+    use remuda_core::protocol::{expand_runs, Response};
+    use remuda_native::net::cluster_client::{ClientError, ClusterClient};
+    let resolved = match remuda_native::cluster::resolve_target(target, Some(address)) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            let code = match error.kind() {
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => 4,
+                std::io::ErrorKind::InvalidInput => 2,
+                std::io::ErrorKind::InvalidData => 5,
+                _ => 1,
+            };
+            eprintln!("cluster call: {error}");
+            return ExitCode::from(code);
+        }
+    };
+    let private_key = match remuda_native::cluster::identity::load_static_private_key() {
+        Ok(key) => key,
+        Err(error) => return fail(format!("cluster call: {error}")),
+    };
+    let request = match &action {
+        CallAction::List => Request::List,
+        CallAction::Capture(session) => Request::CaptureStyled {
+            name: session.clone(),
+            scrollback: 0,
+        },
+    };
+    let response = match ClusterClient::system().request(
+        resolved.address,
+        &resolved.pinned_static_key,
+        &private_key,
+        &request,
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            let code = match error {
+                ClientError::Unreachable | ClientError::Timeout => 3,
+                ClientError::Refused(_) => 4,
+                ClientError::Crypto | ClientError::BadResponse => 5,
+            };
+            eprintln!("cluster call: {error}");
+            return ExitCode::from(code);
+        }
+    };
+    let response = sanitize_peer_response(response);
+    if let Response::Error(message) = &response {
+        eprintln!("cluster call: {message}");
+        return ExitCode::from(4);
+    }
+    if json {
+        return match serde_json::to_string_pretty(&response) {
+            Ok(value) => {
+                println!("{value}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("cluster call: {error}")),
+        };
+    }
+    match (&action, response) {
+        (CallAction::List, Response::Sessions(sessions)) => {
+            for session in sessions {
+                println!(
+                    "{}\t{}",
+                    session.name,
+                    if session.alive { "live" } else { "ended" }
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        (CallAction::Capture(_), Response::StyledScreen { rows, .. }) => {
+            for row in rows {
+                let cells = expand_runs(&row);
+                println!(
+                    "{}",
+                    cells
+                        .iter()
+                        .map(|cell| cell.text.as_str())
+                        .collect::<String>()
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("cluster call: peer returned an unexpected response");
+            ExitCode::from(5)
+        }
+    }
+}
+
+fn sanitize_peer_response(
+    mut response: remuda_core::protocol::Response,
+) -> remuda_core::protocol::Response {
+    use remuda_core::protocol::Response;
+
+    fn strip(text: &mut String) {
+        *text = remuda_native::text::strip_terminal_controls(text).into_owned();
+    }
+
+    match &mut response {
+        Response::Sessions(sessions) => {
+            for session in sessions {
+                strip(&mut session.id);
+                strip(&mut session.name);
+                if let Some(instance_id) = &mut session.instance_id {
+                    strip(instance_id);
+                }
+            }
+        }
+        Response::Screen(text) | Response::Value(text) | Response::Error(text) => strip(text),
+        Response::StyledScreen { rows, .. } => {
+            for run in rows.iter_mut().flatten() {
+                strip(&mut run.text);
+            }
+        }
+        Response::CommandResult {
+            stdout_base64,
+            stderr_base64,
+            ..
+        } => {
+            strip(stdout_base64);
+            strip(stderr_base64);
+        }
+        Response::Entries(entries) => {
+            for entry in entries {
+                strip(entry);
+            }
+        }
+        _ => {}
+    }
+    response
 }
 
 fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
@@ -936,7 +1146,7 @@ fn stop_daemon(path: &Path, shutdown: Request) -> Result<(), String> {
 /// One line when the running daemon is not this build. A warning, not a refusal:
 /// most skews are harmless, and stranding someone mid-work behind a version
 /// string is its own incident. `None` when nothing is listening — it will be us.
-fn version_skew(argv: &[&str], path: &Path) -> Option<String> {
+fn version_skew(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
     // Help, version and upgrade must answer with no daemon at all (#115).
     if matches!(
         argv,
@@ -950,10 +1160,15 @@ fn version_skew(argv: &[&str], path: &Path) -> Option<String> {
     ) || (argv.is_empty()
         && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()))
     {
-        return None;
+        return Ok(None);
     }
-    remuda_native::ipc::connect(path).ok()?;
-    skew_notice(remuda_native::client::request(path, &Request::Version))
+    if remuda_native::ipc::connect(path).is_err() {
+        return Ok(None);
+    }
+    match remuda_native::client::request(path, &Request::Version) {
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Err(error.to_string()),
+        response => Ok(skew_notice(response)),
+    }
 }
 
 /// What to say about a `Request::Version` outcome — split out of
@@ -996,15 +1211,15 @@ fn announce_update(argv: &[&str]) {
     }
 }
 
-fn prepare_command(argv: &[&str], path: &Path) -> Option<String> {
+fn prepare_command(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
     announce_update(argv);
     // Ask once before dispatch. A running daemon belongs to another binary,
     // and this is the cheapest point to check for a version skew.
-    let skew = version_skew(argv, path);
+    let skew = version_skew(argv, path)?;
     if let Some(notice) = &skew {
         eprintln!("remuda: {notice}");
     }
-    skew
+    Ok(skew)
 }
 
 /// Split out of `main` for the same reason `list_sessions` was: clippy's line
@@ -1240,11 +1455,53 @@ impl Drop for StartupLogCleanup {
     }
 }
 
+fn echo_socket_lock_wait(stderr_path: &Path, offset: &mut usize, announced: &mut bool) {
+    if *announced {
+        return;
+    }
+    let Ok(bytes) = fs::read(stderr_path) else {
+        return;
+    };
+    let Some(tail) = bytes.get(*offset..) else {
+        return;
+    };
+    *offset = bytes.len();
+    let Some(start) = tail
+        .windows(b"waiting for the socket lock".len())
+        .position(|window| window == b"waiting for the socket lock")
+    else {
+        return;
+    };
+    let begin = tail[..start]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    let end = tail[start..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(tail.len(), |index| start + index);
+    eprintln!("{}", String::from_utf8_lossy(&tail[begin..end]).trim());
+    *announced = true;
+}
+
+fn daemon_start_error(path: &Path, stderr_path: &Path, offset: u64, separator: &str) -> String {
+    let said = fs::read(stderr_path)
+        .ok()
+        .and_then(|bytes| bytes.get(offset as usize..).map(<[u8]>::to_vec))
+        .map(|bytes| String::from_utf8_lossy(&bytes).replace(separator, ""))
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| "it printed nothing".into());
+    format!("daemon did not come up at {} — {said}", path.display())
+}
+
 /// Spawn ourselves as the daemon and wait for the socket to answer. Wait on a
 /// successful *connect*, not on the file existing, and pass `-s <server>`
 /// through — a bare `remuda daemon` re-derives `"default"` and never matches.
 fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("cannot find own binary: {e}"))?;
+    daemon::prepare_socket_path(path, Some(&daemon::runtime_dir()))
+        .map_err(|e| format!("cannot prepare daemon socket directory: {e}"))?;
     // Keep stderr in a file beside the socket. The daemon outlives this client,
     // so a pipe reader would be dropped on successful startup and a later
     // diagnostic could kill the daemon with SIGPIPE. The file also preserves
@@ -1265,15 +1522,7 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     // Append, so the previous daemon's post-mortem survives this start; rotate
     // once past 1 MiB so it cannot grow forever.
     #[cfg(unix)]
-    let stderr_file = {
-        if fs::metadata(&stderr_path).is_ok_and(|m| m.len() > 1_048_576) {
-            let _ = fs::rename(&stderr_path, stderr_path.with_extension("log.1"));
-        }
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&stderr_path)
-    };
+    let stderr_file = open_unix_daemon_log(&stderr_path);
     #[cfg(windows)]
     let stderr_file = fs::File::create(&stderr_path);
     let stderr_file = stderr_file
@@ -1341,7 +1590,14 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
     }
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut observed_log_bytes = offset as usize;
+    let mut announced_lock_wait = false;
     while std::time::Instant::now() < deadline {
+        echo_socket_lock_wait(
+            &stderr_path,
+            &mut observed_log_bytes,
+            &mut announced_lock_wait,
+        );
         if remuda_native::ipc::connect(path).is_ok() {
             // "remuda should always come up in daemon mode" — it already did.
             // What was missing was the line saying so.
@@ -1358,17 +1614,28 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
 
     let _ = child.kill();
     let _ = child.wait();
-    let said = fs::read(&stderr_path)
-        .ok()
-        .and_then(|bytes| bytes.get(offset as usize..).map(<[u8]>::to_vec))
-        .map(|bytes| String::from_utf8_lossy(&bytes).replace(&separator_line, ""))
-        .map(|text| text.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "it printed nothing".into());
-    Err(format!(
-        "daemon did not come up at {} — {said}",
-        path.display()
+    Err(daemon_start_error(
+        path,
+        &stderr_path,
+        offset,
+        &separator_line,
     ))
+}
+
+#[cfg(unix)]
+fn open_unix_daemon_log(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if fs::metadata(path).is_ok_and(|m| m.len() > 1_048_576) {
+        let _ = fs::rename(path, path.with_extension("log.1"));
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(file)
 }
 
 /// The three-line list a person reads; also what `remuda ls` was inlining
@@ -1834,6 +2101,125 @@ mod mod_update_tests {
             all_reload_not_attempted_names(&manifests),
             vec!["managed", "legacy"]
         );
+    }
+}
+
+#[cfg(test)]
+mod cluster_call_tests {
+    use super::{parse_cluster_command, sanitize_peer_response, CallAction, ClusterCommand};
+    use remuda_core::agent::{Color, Cursor, Size};
+    use remuda_core::protocol::{Response, StyledRun};
+    use remuda_core::registry::SessionSummary;
+    use std::time::Duration;
+
+    #[test]
+    fn cluster_call_accepts_only_list_and_capture_with_required_address() {
+        assert_eq!(
+            parse_cluster_command(&[
+                "call",
+                "node-abc",
+                "list",
+                "--addr",
+                "127.0.0.1:9",
+                "--json"
+            ]),
+            ClusterCommand::Call {
+                target: "node-abc".into(),
+                address: "127.0.0.1:9".parse().unwrap(),
+                action: CallAction::List,
+                json: true,
+            }
+        );
+        assert_eq!(
+            parse_cluster_command(&["call", "node-abc", "capture", "build", "--addr", "[::1]:9"]),
+            ClusterCommand::Call {
+                target: "node-abc".into(),
+                address: "[::1]:9".parse().unwrap(),
+                action: CallAction::Capture("build".into()),
+                json: false,
+            }
+        );
+        for args in [
+            vec!["call", "node-abc", "list"],
+            vec![
+                "call",
+                "node-abc",
+                "input",
+                "build",
+                "--addr",
+                "127.0.0.1:9",
+            ],
+            vec!["call", "node-abc", "capture", "--addr", "127.0.0.1:9"],
+            vec!["call", "node-abc", "list", "--addr", "invalid"],
+            vec![
+                "call",
+                "node-abc",
+                "list",
+                "--addr",
+                "127.0.0.1:9",
+                "--json",
+                "--json",
+            ],
+        ] {
+            assert_eq!(
+                parse_cluster_command(&args),
+                ClusterCommand::Invalid,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_call_strips_osc52_and_osc0_from_peer_text() {
+        let sessions = sanitize_peer_response(Response::Sessions(vec![SessionSummary {
+            id: "id\u{1b}]52;c;clipboard\u{7}".into(),
+            name: "name\u{1b}]0;peer title\u{7}".into(),
+            instance_id: None,
+            output_version: None,
+            alive: true,
+            idle: Duration::ZERO,
+            output_idle: None,
+            size: Size::new(80, 24),
+            attached: false,
+            human_idle: None,
+            mouse_tracking: false,
+        }]));
+        let Response::Sessions(sessions) = sessions else {
+            panic!("expected sanitized sessions");
+        };
+        assert_eq!(sessions[0].id, "id]52;c;clipboard");
+        assert_eq!(sessions[0].name, "name]0;peer title");
+
+        let error = sanitize_peer_response(Response::Error("bad\u{1b}]52;c;clipboard\u{7}".into()));
+        assert_eq!(error, Response::Error("bad]52;c;clipboard".into()));
+
+        let capture = sanitize_peer_response(Response::StyledScreen {
+            rows: vec![vec![StyledRun {
+                text: "screen\u{1b}]0;peer title\u{7}".into(),
+                fg: Color::default(),
+                bg: Color::default(),
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                inverse: false,
+                wide: false,
+            }]],
+            instance_id: None,
+            output_version: None,
+            wrapped: vec![],
+            scrollback_len: 0,
+            scrollback_total: 0,
+            cursor: Cursor {
+                row: 0,
+                col: 0,
+                visible: true,
+            },
+        });
+        let Response::StyledScreen { rows, .. } = capture else {
+            panic!("expected sanitized capture");
+        };
+        assert_eq!(rows[0][0].text, "screen]0;peer title");
     }
 }
 

@@ -53,6 +53,24 @@ impl fmt::Display for TypedFailure {
 
 impl Error for TypedFailure {}
 
+#[derive(Debug)]
+struct CapturedPrintLimit {
+    size: usize,
+}
+
+impl fmt::Display for CapturedPrintLimit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "captured print output exceeds the {} MiB output limit (at least {} bytes)",
+            MAX_REPLY_BYTES / (1024 * 1024),
+            self.size
+        )
+    }
+}
+
+impl Error for CapturedPrintLimit {}
+
 /// Read a typed failure encoded by the image, if the response carries one.
 pub fn typed_failure_message(value: &str) -> Option<(u8, &str)> {
     let value = value.strip_prefix(TYPED_FAILURE_PREFIX)?;
@@ -364,8 +382,13 @@ fn eval(lua: &Lua, code: &str, name: Option<&str>) -> Result<String, String> {
     };
     let values = function.call::<mlua::MultiValue>(()).map_err(|error| {
         error
-            .downcast_ref::<TypedFailure>()
-            .map(TypedFailure::wire_message)
+            .downcast_ref::<CapturedPrintLimit>()
+            .map(ToString::to_string)
+            .or_else(|| {
+                error
+                    .downcast_ref::<TypedFailure>()
+                    .map(TypedFailure::wire_message)
+            })
             .unwrap_or_else(|| error.to_string())
     })?;
 
@@ -399,20 +422,43 @@ fn capture_print(lua: &Lua, into: Rc<RefCell<String>>) -> mlua::Result<()> {
         for (index, value) in values.iter().enumerate() {
             if index != 0 {
                 let next = buffer.len().saturating_add(line.len()).saturating_add(2);
-                ensure_reply_size(next).map_err(mlua::Error::runtime)?;
+                ensure_print_reply_size(next)?;
                 line.push('\t');
             }
             let used = buffer.len().saturating_add(line.len()).saturating_add(1);
             let remaining = MAX_REPLY_BYTES.saturating_sub(used);
-            line.push_str(&render_for_reply(value, remaining).map_err(mlua::Error::runtime)?);
+            match render_for_reply(value, remaining) {
+                Ok(rendered) => line.push_str(&rendered),
+                Err(_) => {
+                    let value_len = match value {
+                        mlua::Value::String(value) => value.to_string_lossy().len(),
+                        _ => render(value).len(),
+                    };
+                    return Err(mlua::Error::external(CapturedPrintLimit {
+                        size: buffer
+                            .len()
+                            .saturating_add(line.len())
+                            .saturating_add(value_len)
+                            .saturating_add(1),
+                    }));
+                }
+            }
         }
         let next = buffer.len().saturating_add(line.len()).saturating_add(1);
-        ensure_reply_size(next).map_err(mlua::Error::runtime)?;
+        ensure_print_reply_size(next)?;
         buffer.push_str(&line);
         buffer.push('\n');
         Ok(())
     })?;
     lua.globals().set("print", print)
+}
+
+fn ensure_print_reply_size(size: usize) -> mlua::Result<()> {
+    if size > MAX_REPLY_BYTES {
+        Err(mlua::Error::external(CapturedPrintLimit { size }))
+    } else {
+        Ok(())
+    }
 }
 
 /// What the caller sees: anything printed, then whatever the chunk came to.
@@ -619,12 +665,26 @@ mod tests {
         let lua = Lua::new();
         let printed = Rc::new(RefCell::new(String::new()));
         capture_print(&lua, Rc::clone(&printed)).unwrap();
-        let result = lua
-            .load(format!("print(string.rep('x', {}))", MAX_REPLY_BYTES + 1))
-            .exec();
+        let result = eval(
+            &lua,
+            &format!(
+                "print(string.rep('x', {})); print('y')",
+                MAX_REPLY_BYTES - 1
+            ),
+            None,
+        );
 
-        assert!(matches!(result, Err(error) if error.to_string().contains("16 MiB output limit")));
-        assert!(printed.borrow().is_empty());
+        let error = result.unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "captured print output exceeds the 16 MiB output limit (at least {} bytes)",
+                MAX_REPLY_BYTES + 2
+            )
+        );
+        assert!(!error.contains("runtime error:"));
+        assert!(!error.contains("stack traceback:"));
+        assert_eq!(printed.borrow().len(), MAX_REPLY_BYTES);
     }
 
     #[test]

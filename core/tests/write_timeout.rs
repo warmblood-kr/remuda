@@ -96,6 +96,45 @@ fn interactive_send_refuses_a_second_write_while_the_first_is_stalled() {
 }
 
 #[test]
+fn takeover_wakes_an_attached_write_without_holding_the_attach_slot() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer = Arc::new(BlockingWriter {
+        started: Mutex::new(Some(started_tx)),
+        release: Mutex::new(release_rx),
+        busy: AtomicBool::new(false),
+        fail: false,
+        refusal_once: AtomicUsize::new(0),
+        writes: AtomicUsize::new(0),
+    });
+    let session = Arc::new(Session::new(
+        "attached-takeover",
+        Box::new(BlockingAgent {
+            writer: Arc::clone(&writer),
+        }),
+        Arc::new(ManualClock::new()),
+    ));
+    let old_session = Arc::clone(&session);
+    let (result_tx, result_rx) = mpsc::channel();
+    let old_write = thread::spawn(move || {
+        let held = old_session.attach();
+        result_tx.send(held.write_raw(b"old key")).unwrap();
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("old attachment write started");
+
+    let current = session.attach();
+    assert!(current.generation() > 0);
+    assert!(matches!(
+        result_rx.recv_timeout(Duration::from_millis(100)),
+        Ok(Err(AgentError::Attached))
+    ));
+    release_tx.send(()).unwrap();
+    old_write.join().unwrap();
+}
+
+#[test]
 fn failed_batch_retry_is_uncertain_while_writer_is_stalled_without_a_second_write() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -434,6 +473,38 @@ impl AgentWriter for BlockingWriter {
             Err(AgentError::Io("test write failed".into()))
         } else {
             Ok(())
+        }
+    }
+
+    fn write_to_completion_while(&self, _bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
+        self.writes.fetch_add(1, Ordering::AcqRel);
+        self.busy.store(true, Ordering::Release);
+        if let Some(started) = self.started.lock().unwrap().take() {
+            started.send(()).unwrap();
+        }
+        loop {
+            if cancelled() {
+                return Err(AgentError::Attached);
+            }
+            match self
+                .release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_millis(5))
+            {
+                Ok(()) => {
+                    self.busy.store(false, Ordering::Release);
+                    return if self.fail {
+                        Err(AgentError::Io("test write failed".into()))
+                    } else {
+                        Ok(())
+                    };
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(AgentError::Io("test writer released without signal".into()));
+                }
+            }
         }
     }
 
