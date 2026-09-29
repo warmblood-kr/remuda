@@ -432,6 +432,9 @@ fn setup_stdin_fixture() -> std::path::PathBuf {
         mod_dir.join("packages/sample/init.lua"),
         r#"remuda.extension_command("sample", function(args, caller)
           if args[1] == "-" then return caller.stdin or "<missing>" end
+          if args[1] == "y" then
+            return table.concat(args, "|") .. "|" .. (caller.stdin == nil and "no-stdin" or "stdin-set")
+          end
           if args[1] == "bytes" then
             local bytes = {}
             for i = 1, #caller.stdin do bytes[#bytes + 1] = tostring(string.byte(caller.stdin, i)) end
@@ -556,5 +559,49 @@ fn extension_commands_accept_binary_stdin_only_when_requested() {
     assert!(status.success(), "no-stdin extension failed: {status:?}");
     let output = command.wait_with_output().expect("no-stdin command result");
     assert_eq!(output.stdout, b"<nil>\n");
+    cleanup_stdin_fixture(&dir);
+}
+
+#[test]
+fn extension_command_rejects_trailing_stdin_flag_with_usage_hint() {
+    let dir = setup_stdin_fixture();
+    let output = stdin_cli(&dir, &["sample", "--stdin"])
+        .output()
+        .expect("run extension command with misplaced stdin flag");
+    assert!(
+        !output.status.success(),
+        "misplaced --stdin should be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("usage: remuda --stdin MOD [ARGS…]")
+            && stderr.contains("put --stdin before the mod command"),
+        "misplaced --stdin should show a usage hint: {output:?}"
+    );
+    cleanup_stdin_fixture(&dir);
+}
+
+#[test]
+fn extension_command_separator_passes_stdin_flag_as_a_literal_argument() {
+    let dir = setup_stdin_fixture();
+    let output = stdin_cli(&dir, &["sample", "y", "--", "--stdin"])
+        .output()
+        .expect("run extension command with literal stdin flag");
+    assert!(
+        output.status.success(),
+        "literal --stdin failed: {output:?}"
+    );
+    assert_eq!(output.stdout, b"y|--|--stdin|no-stdin\n");
+    cleanup_stdin_fixture(&dir);
+}
+
+#[test]
+fn extension_command_separator_passes_dash_as_a_literal_argument() {
+    let dir = setup_stdin_fixture();
+    let output = stdin_cli(&dir, &["sample", "y", "--", "-"])
+        .output()
+        .expect("run extension command with literal dash argument");
+    assert!(output.status.success(), "literal dash failed: {output:?}");
+    assert_eq!(output.stdout, b"y|--|-|no-stdin\n");
     cleanup_stdin_fixture(&dir);
 }
