@@ -38,7 +38,10 @@ fn main() -> ExitCode {
     let argv: Vec<&str> = rest.iter().map(String::as_str).collect();
     let path = daemon::socket_path(server);
 
-    let skew = prepare_command(&argv, &path);
+    let skew = match prepare_command(&argv, &path) {
+        Ok(skew) => skew,
+        Err(error) => return fail(error),
+    };
 
     match argv.as_slice() {
         // The whole ask: typing the program's name opens the herd. Only when
@@ -797,7 +800,7 @@ fn stop_daemon(path: &Path, shutdown: Request) -> Result<(), String> {
 /// One line when the running daemon is not this build. A warning, not a refusal:
 /// most skews are harmless, and stranding someone mid-work behind a version
 /// string is its own incident. `None` when nothing is listening — it will be us.
-fn version_skew(argv: &[&str], path: &Path) -> Option<String> {
+fn version_skew(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
     // Help, version and upgrade must answer with no daemon at all (#115).
     if matches!(
         argv,
@@ -811,10 +814,15 @@ fn version_skew(argv: &[&str], path: &Path) -> Option<String> {
     ) || (argv.is_empty()
         && !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()))
     {
-        return None;
+        return Ok(None);
     }
-    remuda_native::ipc::connect(path).ok()?;
-    skew_notice(remuda_native::client::request(path, &Request::Version))
+    if remuda_native::ipc::connect(path).is_err() {
+        return Ok(None);
+    }
+    match remuda_native::client::request(path, &Request::Version) {
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Err(error.to_string()),
+        response => Ok(skew_notice(response)),
+    }
 }
 
 /// What to say about a `Request::Version` outcome — split out of
@@ -857,15 +865,15 @@ fn announce_update(argv: &[&str]) {
     }
 }
 
-fn prepare_command(argv: &[&str], path: &Path) -> Option<String> {
+fn prepare_command(argv: &[&str], path: &Path) -> Result<Option<String>, String> {
     announce_update(argv);
     // Ask once before dispatch. A running daemon belongs to another binary,
     // and this is the cheapest point to check for a version skew.
-    let skew = version_skew(argv, path);
+    let skew = version_skew(argv, path)?;
     if let Some(notice) = &skew {
         eprintln!("remuda: {notice}");
     }
-    skew
+    Ok(skew)
 }
 
 /// Split out of `main` for the same reason `list_sessions` was: clippy's line
