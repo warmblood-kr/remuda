@@ -550,15 +550,17 @@ impl SocketLock {
 
 #[cfg(unix)]
 pub fn prepare_socket_path(socket: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
+    let socket = normalize_socket_path(socket)?;
     let parent = socket.parent().unwrap_or_else(|| Path::new("."));
     let Some(runtime) = runtime else {
         std::fs::create_dir_all(parent)?;
         return validate_socket_directory(parent, unsafe { libc::geteuid() }, false);
     };
 
+    let runtime = normalize_socket_path(runtime)?;
     let managed = runtime.join("remuda");
     if parent == managed || parent.starts_with(&managed) {
-        prepare_runtime_base(runtime)?;
+        prepare_runtime_base(&runtime)?;
         prepare_managed_socket_directory(&managed)?;
         if parent != managed {
             // Nested -s paths live below our private runtime directory, but
@@ -577,20 +579,48 @@ pub fn prepare_socket_path(socket: &Path, runtime: Option<&Path>) -> std::io::Re
 
 #[cfg(unix)]
 fn prepare_runtime_base(path: &Path) -> std::io::Result<()> {
+    let path = normalize_socket_path(path)?;
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         std::fs::create_dir_all(parent)?;
     }
-    create_private_directory_if_absent(path)?;
-    validate_socket_directory(path, unsafe { libc::geteuid() }, false)
+    create_private_directory_if_absent(&path)?;
+    validate_socket_directory(&path, unsafe { libc::geteuid() }, false)
 }
 
 #[cfg(unix)]
 fn prepare_managed_socket_directory(path: &Path) -> std::io::Result<()> {
-    create_private_directory_if_absent(path)?;
-    validate_socket_directory(path, unsafe { libc::geteuid() }, true)
+    let path = normalize_socket_path(path)?;
+    create_private_directory_if_absent(&path)?;
+    validate_socket_directory(&path, unsafe { libc::geteuid() }, true)
+}
+
+/// Remove path spellings that can hide the directory actually opened by the
+/// kernel. Parent traversal is rejected so validation cannot be bypassed by
+/// comparing a path before resolving `..`.
+#[cfg(unix)]
+fn normalize_socket_path(path: &Path) -> std::io::Result<PathBuf> {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("socket path {} contains '..'; refusing", path.display()),
+                ));
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        normalized.push(".");
+    }
+    Ok(normalized)
 }
 
 #[cfg(unix)]
@@ -619,7 +649,9 @@ fn validate_socket_directory(
 ) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
-    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+    let path = normalize_socket_path(path)?;
+
+    if std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             format!("socket directory {} is a symlink; refusing", path.display()),
@@ -630,7 +662,7 @@ fn validate_socket_directory(
     options
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
-    let directory = options.open(path)?;
+    let directory = options.open(&path)?;
     let metadata = directory.metadata()?;
     if !metadata.is_dir() {
         return Err(std::io::Error::new(

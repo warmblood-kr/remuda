@@ -441,6 +441,46 @@ fn a_symlinked_runtime_directory_is_rejected_before_a_startup_log_is_created() {
 
 #[cfg(unix)]
 #[test]
+fn symlinked_runtime_base_is_rejected_with_trailing_separators_and_dot() {
+    let root = scratch_dir("symlink-runtime-base");
+    let target = root.join("target");
+    let link = root.join("link");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    for runtime in [link.clone(), root.join("link/"), root.join("link/.")] {
+        let socket = runtime.join("remuda").join("s.sock");
+        let result = daemon::prepare_socket_path(&socket, Some(&runtime));
+        assert!(result.is_err(), "accepted symlink runtime {runtime:?}");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_custom_socket_parents_are_rejected_after_path_normalization() {
+    let root = scratch_dir("symlink-custom-parent");
+    let target = root.join("target");
+    let link = root.join("link");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    for parent in [
+        link.clone(),
+        PathBuf::from(format!("{}/", link.display())),
+        PathBuf::from(format!("{}/.", link.display())),
+    ] {
+        let socket = parent.join("s.sock");
+        let result = daemon::prepare_socket_path(&socket, Some(&root.join("runtime")));
+        assert!(result.is_err(), "accepted symlink socket parent {parent:?}");
+        assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_signal_cleanup_preserves_a_replacement_socket_path() {
     use std::os::unix::fs::FileTypeExt;
 
