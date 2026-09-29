@@ -72,6 +72,10 @@ fn occurrence_count(screen: &str, tail: &str) -> usize {
     }
 }
 
+fn compact_screen(screen: &str) -> String {
+    screen.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InputSubmitOutcome {
     /// The screen changed after Return, or the Return-only operation was sent.
@@ -294,10 +298,7 @@ impl Session {
     /// The complete text/submit sequence shares one input lock. Backends
     /// without a rendered screen keep the historical single-burst behavior.
     pub fn send_line(&self, text: &str) -> Result<()> {
-        match self.type_text(text, Duration::ZERO)? {
-            InputSubmitOutcome::Submitted => Ok(()),
-            InputSubmitOutcome::Unverified => Err(AgentError::InputUnverified),
-        }
+        self.type_text(text, Duration::ZERO).map(|_| ())
     }
 
     /// Deliver a normalized text burst, bracketed when the child enabled mode
@@ -398,7 +399,8 @@ impl Session {
             return Ok(InputSubmitOutcome::Submitted);
         }
         let visible = self.wait_for_visible_tail(tail, baseline_occurrences, &mut version);
-        let before = self.compact_screen().unwrap_or_default();
+        let before_raw = self.screen_text().unwrap_or_default();
+        let before_compact = compact_screen(&before_raw);
         let before_version = self.output_version().unwrap_or(version);
         self.write_one_burst(crate::keys::RETURN_BYTES)?;
         if !visible {
@@ -406,12 +408,18 @@ impl Session {
         }
 
         version = before_version;
-        let deadline = self.clock.now() + Duration::from_millis(500);
+        let deadline = self.clock.now() + Duration::from_secs(1);
+        let mut composer_newline = false;
         while self.clock.now() < deadline {
             if !self.is_alive() {
                 return Ok(InputSubmitOutcome::Unverified);
             }
-            if self.compact_screen().is_some_and(|screen| screen != before) {
+            let raw = self.screen_text().unwrap_or_default();
+            if raw != before_raw {
+                if compact_screen(&raw) == before_compact {
+                    composer_newline = true;
+                    break;
+                }
                 return Ok(InputSubmitOutcome::Submitted);
             }
             let remaining = deadline.saturating_sub(self.clock.now());
@@ -420,8 +428,28 @@ impl Session {
                 version = snapshot.output_version.unwrap_or(version);
             }
         }
-        if self.is_alive() && self.compact_screen().as_deref() == Some(before.as_str()) {
-            self.write_one_burst(crate::keys::RETURN_BYTES)?;
+        if !composer_newline {
+            return Ok(InputSubmitOutcome::Unverified);
+        }
+
+        let newline_raw = self.screen_text().unwrap_or_default();
+        let newline_compact = compact_screen(&newline_raw);
+        self.write_one_burst(crate::keys::RETURN_BYTES)?;
+        version = self.output_version().unwrap_or(version);
+        let retry_deadline = self.clock.now() + Duration::from_secs(1);
+        while self.clock.now() < retry_deadline {
+            if !self.is_alive() {
+                return Ok(InputSubmitOutcome::Unverified);
+            }
+            let raw = self.screen_text().unwrap_or_default();
+            if raw != newline_raw && compact_screen(&raw) != newline_compact {
+                return Ok(InputSubmitOutcome::Submitted);
+            }
+            let remaining = retry_deadline.saturating_sub(self.clock.now());
+            let timeout = remaining.min(Duration::from_millis(50));
+            if let Ok(snapshot) = self.wait_for_output_after(version, timeout) {
+                version = snapshot.output_version.unwrap_or(version);
+            }
         }
         Ok(InputSubmitOutcome::Unverified)
     }
@@ -432,7 +460,7 @@ impl Session {
         baseline_occurrences: usize,
         version: &mut u64,
     ) -> bool {
-        let deadline = self.clock.now() + Duration::from_millis(500);
+        let deadline = self.clock.now() + Duration::from_secs(2);
         while self.clock.now() < deadline {
             if self
                 .compact_screen()
@@ -457,10 +485,9 @@ impl Session {
     }
 
     fn compact_screen(&self) -> Option<String> {
-        self.screen_text().ok().map(|screen| {
-            let compact: String = screen.chars().filter(|c| !c.is_whitespace()).collect();
-            compact
-        })
+        self.screen_text()
+            .ok()
+            .map(|screen| compact_screen(&screen))
     }
 
     /// Deliver a burst of input as one indivisible act, appending nothing — the

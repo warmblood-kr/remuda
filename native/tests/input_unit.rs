@@ -205,8 +205,7 @@ threading.Thread(target=read_input, daemon=True).start()
 
 def redraw():
     display = bytes(buf).replace(b'\n', b'\r\n  ')
-    changed_status = b'\r\nPASTE NEWLINE' if transcript and buf.endswith(b'\n') else b''
-    os.write(1, b'\x1b[H\x1b[2JREADY\r\n' + bytes(transcript) + b'\r\n> ' + display + b'\r\nSTATUS ONE\r\nSTATUS TWO' + changed_status)
+    os.write(1, b'\x1b[H\x1b[2JREADY\r\n' + bytes(transcript) + b'\r\n> ' + display + b'\r\nSTATUS ONE\r\nSTATUS TWO')
 
 while True:
     try:

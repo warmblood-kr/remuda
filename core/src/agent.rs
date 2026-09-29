@@ -212,8 +212,6 @@ pub enum AgentError {
     /// Someone is attached and driving this session by hand. Orchestrated
     /// input is refused rather than queued — see [`crate::session::Session`].
     Attached,
-    /// Return was sent but the rendered screen did not confirm submission.
-    InputUnverified,
     /// A previous PTY write is still active; no second write was queued.
     Busy,
     /// The bounded write deadline elapsed; bytes may still finish later.
@@ -235,9 +233,6 @@ impl fmt::Display for AgentError {
         match self {
             AgentError::Exited => write!(f, "agent process has exited"),
             AgentError::Attached => write!(f, "a human is attached to this session"),
-            AgentError::InputUnverified => {
-                write!(f, "input was sent but submission could not be verified")
-            }
             AgentError::Busy => write!(f, "a session input write is already in flight"),
             AgentError::WriteTimeout { timeout } => {
                 write!(
