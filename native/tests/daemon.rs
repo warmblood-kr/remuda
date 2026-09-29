@@ -254,6 +254,70 @@ fn daemon_lock_file_is_private() {
 
 #[cfg(unix)]
 #[test]
+fn daemon_socket_and_directory_are_private_on_first_start() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("private-socket-fresh");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create isolated runtime directory");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let daemon = Daemon::spawn(&dir);
+    let directory_mode = std::fs::metadata(socket.parent().unwrap())
+        .expect("socket directory exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    let socket_mode = std::fs::metadata(&socket)
+        .expect("daemon socket exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    drop(daemon);
+    std::fs::remove_dir_all(&dir).expect("remove isolated runtime directory");
+
+    assert_eq!(directory_mode, 0o700, "socket directory must be private");
+    assert_eq!(socket_mode, 0o600, "daemon socket must be private");
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_tightens_a_preexisting_socket_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("private-socket-existing");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create isolated runtime directory");
+    let socket = daemon::socket_path_in(&dir, "s");
+    std::fs::create_dir_all(socket.parent().unwrap()).expect("create socket directory");
+    std::fs::set_permissions(
+        socket.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("make a permissive preexisting socket directory");
+
+    let daemon = Daemon::spawn(&dir);
+    let directory_mode = std::fs::metadata(socket.parent().unwrap())
+        .expect("socket directory exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    let socket_mode = std::fs::metadata(&socket)
+        .expect("daemon socket exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    drop(daemon);
+    std::fs::remove_dir_all(&dir).expect("remove isolated runtime directory");
+
+    assert_eq!(
+        directory_mode, 0o700,
+        "existing directory must be tightened"
+    );
+    assert_eq!(socket_mode, 0o600, "daemon socket must be private");
+}
+
+#[cfg(unix)]
+#[test]
 fn daemon_signal_cleanup_preserves_a_replacement_socket_path() {
     use std::os::unix::fs::FileTypeExt;
 

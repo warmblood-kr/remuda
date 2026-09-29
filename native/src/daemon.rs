@@ -184,6 +184,13 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     let signals = catch_signals()?;
     let listener: Listener = ipc::listen(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // SocketLock creates or tightens the containing directory to 0700
+        // before bind, so no other user can observe this mode-setting step.
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
 
     let registry = Arc::new(Registry::new());
@@ -251,7 +258,12 @@ impl SocketLock {
             use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
             let parent = socket.parent().unwrap_or_else(|| Path::new("."));
-            std::fs::create_dir_all(parent)?;
+            prepare_socket_directory(parent).map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("prepare socket directory {}: {error}", parent.display()),
+                )
+            })?;
             let mut lock_name = socket.as_os_str().to_os_string();
             lock_name.push(".lock");
             let lock_path = PathBuf::from(lock_name);
@@ -315,6 +327,79 @@ impl SocketLock {
             Ok(Self {})
         }
     }
+}
+
+#[cfg(unix)]
+fn prepare_socket_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(path) {
+        Ok(()) => {
+            // DirBuilder's mode is filtered by umask. Its result is therefore
+            // never more permissive than 0700; finish the exact owner-only
+            // mode before putting either the lock or socket in the directory.
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    let directory = options.open(path)?;
+    let metadata = directory.metadata()?;
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("socket parent {} is not a directory", path.display()),
+        ));
+    }
+    // SAFETY: geteuid has no preconditions and returns the current effective uid.
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "socket directory {} is owned by uid {}, expected {}; choose a private REMUDA_RUNTIME_DIR",
+                path.display(),
+                metadata.uid(),
+                effective_uid
+            ),
+        ));
+    }
+    let mode = metadata.permissions().mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "socket directory {} is group- or world-writable (mode {mode:04o}); remove those write permissions before starting remuda",
+                path.display()
+            ),
+        ));
+    }
+    if mode != 0o700 {
+        // Tighten through the opened directory handle; this also removes any
+        // special permission bits and avoids following a replacement symlink.
+        directory
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("tighten socket directory {}: {error}", path.display()),
+                )
+            })?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
