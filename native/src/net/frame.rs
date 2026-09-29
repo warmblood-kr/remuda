@@ -13,6 +13,7 @@ const NOISE_PROLOGUE: &[u8] = b"remuda-cluster-v1";
 pub struct SealedRequest {
     pub message: Vec<u8>,
     handshake: snow::HandshakeState,
+    initiator_private: Zeroizing<Vec<u8>>,
 }
 
 /// An authenticated and decrypted request awaiting an encrypted response.
@@ -49,7 +50,11 @@ pub fn seal_request(
         .write_message(&plaintext, &mut message)
         .map_err(frame_error)?;
     message.truncate(length);
-    Ok(SealedRequest { message, handshake })
+    Ok(SealedRequest {
+        message,
+        handshake,
+        initiator_private: Zeroizing::new(initiator_private.to_vec()),
+    })
 }
 
 /// Authenticate and decrypt Noise IK message 1, retaining state for message 2.
@@ -231,9 +236,10 @@ pub fn seal_response(mut request: OpenedRequest, payload: &[u8]) -> io::Result<V
 
 /// Authenticate and decrypt Noise IK message 2 for the matching request.
 pub fn open_response(mut request: SealedRequest, message: &[u8]) -> io::Result<Vec<u8>> {
-    if message.len() > MAX_FRAME_SIZE {
+    if message.len() < 32 || message.len() > MAX_FRAME_SIZE {
         return Err(invalid_frame());
     }
+    reject_low_order_dh(&request.initiator_private, &message[..32])?;
     let mut payload = vec![0; MAX_FRAME_SIZE];
     let length = request
         .handshake
@@ -280,6 +286,22 @@ mod tests {
             let error = open_request(&responder.private, &message).err().unwrap();
             assert_eq!(error.to_string(), "low-order Noise DH result");
         }
+    }
+
+    #[test]
+    fn open_response_rejects_low_order_responder_ephemeral() {
+        let initiator = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let responder = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let sealed = seal_request(&initiator.private, &responder.public, 1000, b"request").unwrap();
+        let mut message = vec![0; 32];
+        message.extend_from_slice(&[0; 64]);
+
+        let error = open_response(sealed, &message).err().unwrap();
+        assert_eq!(error.to_string(), "low-order Noise DH result");
     }
 
     #[test]
