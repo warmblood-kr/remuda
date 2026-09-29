@@ -169,6 +169,7 @@ pub struct UpdateOutcome {
     pub dropped_origin_entries: usize,
     pub dropped_invalid_entries: usize,
     pub dropped_registry_cap_entries: usize,
+    pub compacted_optional_metadata_entries: usize,
 }
 
 impl RegistryUpdate {
@@ -317,31 +318,29 @@ fn merge_known_entry(incoming: &AuthorizedNode, current: &AuthorizedNode) -> Aut
         winner.optional_fields.clear();
         return winner;
     }
-    winner.format_minor = incoming.format_minor.max(current.format_minor);
-    let other = if incoming_wins { current } else { incoming };
-    for (key, value) in &other.optional_fields {
-        match winner.optional_fields.get(key) {
-            Some(existing)
-                if incoming.version == current.version
-                    && incoming.by == current.by
-                    && optional_field_value_wins(value, existing) =>
-            {
-                winner.optional_fields.insert(key.clone(), value.clone());
-            }
-            Some(_) => {}
-            None => {
-                winner.optional_fields.insert(key.clone(), value.clone());
-            }
-        }
+    if incoming.version == current.version
+        && incoming.by == current.by
+        && optional_fields_wins(&incoming.optional_fields, &current.optional_fields)
+    {
+        winner.optional_fields.clone_from(&incoming.optional_fields);
     }
+    winner.format_minor = incoming.format_minor.max(current.format_minor);
     winner
 }
 
-fn optional_field_value_wins(candidate: &Value, current: &Value) -> bool {
+fn optional_fields_wins(
+    candidate: &BTreeMap<String, Value>,
+    current: &BTreeMap<String, Value>,
+) -> bool {
+    if candidate.len() != current.len() {
+        return candidate.len() > current.len();
+    }
     let mut candidate_bytes = Vec::new();
     let mut current_bytes = Vec::new();
-    serde_json::to_writer(&mut candidate_bytes, candidate).expect("JSON values always serialize");
-    serde_json::to_writer(&mut current_bytes, current).expect("JSON values always serialize");
+    serde_json::to_writer(&mut candidate_bytes, candidate)
+        .expect("JSON optional fields always serialize");
+    serde_json::to_writer(&mut current_bytes, current)
+        .expect("JSON optional fields always serialize");
     candidate_bytes > current_bytes
 }
 
@@ -527,6 +526,7 @@ fn merge_update(
     let previous = current.clone();
     let mut outcome = UpdateOutcome::default();
     let mut accepted = Vec::with_capacity(update.entries.len());
+    let mut compacted_metadata = false;
     for entry in &update.entries {
         if validate_entry(entry).is_err() {
             outcome.dropped_invalid_entries += 1;
@@ -568,30 +568,34 @@ fn merge_update(
                 accepted_entry.by = known.by.clone();
             }
         }
-        accepted_entry.delivered_by = Some(update.sender_fp.clone());
-        let mut candidate = current.clone();
-        if candidate
-            .merge(&Registry {
-                authorized_nodes: vec![accepted_entry.clone()],
-            })
-            .is_err()
-        {
+        if !compacted_metadata {
+            accepted_entry.delivered_by = Some(update.sender_fp.clone());
+        }
+        let Some((candidate, compacted_entries)) = merge_update_entry(&current, &accepted_entry)?
+        else {
             outcome.dropped_registry_cap_entries += 1;
             continue;
+        };
+        if compacted_entries > 0 {
+            outcome.compacted_optional_metadata_entries += compacted_entries;
+            compacted_metadata = true;
+            accepted.clear();
         }
         current = candidate;
         accepted.push(accepted_entry);
     }
-    for incoming in &accepted {
-        if let Some(merged) = current
-            .authorized_nodes
-            .iter_mut()
-            .find(|known| known.node_fp == incoming.node_fp)
-        {
-            if same_replicated_core(merged, incoming) {
-                outcome.local_metadata_changed |=
-                    merged.delivered_by.as_deref() != Some(update.sender_fp.as_str());
-                merged.delivered_by = Some(update.sender_fp.clone());
+    if !compacted_metadata {
+        for incoming in &accepted {
+            if let Some(merged) = current
+                .authorized_nodes
+                .iter_mut()
+                .find(|known| known.node_fp == incoming.node_fp)
+            {
+                if same_replicated_core(merged, incoming) {
+                    outcome.local_metadata_changed |=
+                        merged.delivered_by.as_deref() != Some(update.sender_fp.as_str());
+                    merged.delivered_by = Some(update.sender_fp.clone());
+                }
             }
         }
     }
@@ -607,6 +611,33 @@ fn merge_update(
         .cloned()
         .collect();
     Ok((current, outcome))
+}
+
+fn merge_update_entry(
+    current: &Registry,
+    incoming: &AuthorizedNode,
+) -> io::Result<Option<(Registry, usize)>> {
+    let received = Registry {
+        authorized_nodes: vec![incoming.clone()],
+    };
+    let mut candidate = current.clone();
+    if candidate.merge(&received).is_ok() {
+        return Ok(Some((candidate, 0)));
+    }
+    if incoming.state != NodeState::Revoked {
+        return Ok(None);
+    }
+    let mut compacted = current.clone();
+    let mut stripped = 0;
+    for known in &mut compacted.authorized_nodes {
+        if !known.optional_fields.is_empty() || known.delivered_by.is_some() {
+            known.optional_fields.clear();
+            known.delivered_by = None;
+            stripped += 1;
+        }
+    }
+    compacted.merge(&received)?;
+    Ok(Some((compacted, stripped)))
 }
 
 fn same_replicated_entry(left: &AuthorizedNode, right: &AuthorizedNode) -> bool {
@@ -641,6 +672,61 @@ pub fn apply_registry_update(
         _update,
         _authenticated_sender_pubkey,
     )
+}
+
+/// Apply the pinned issuer's one-time snapshot after the local join exchange.
+/// This is crate-private and intentionally absent from all wire dispatch paths.
+pub(crate) fn apply_join_bootstrap(
+    update: &RegistryUpdate,
+    authenticated_issuer_pubkey: &[u8],
+) -> io::Result<()> {
+    #[cfg(windows)]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cluster identity storage is not yet hardened on Windows; see warmblood-kr/remuda#214",
+    ));
+    #[cfg(not(windows))]
+    apply_join_bootstrap_at(
+        &storage::cluster_state_dir()?.join("cluster"),
+        update,
+        authenticated_issuer_pubkey,
+    )
+}
+
+#[cfg(not(windows))]
+fn apply_join_bootstrap_at(
+    dir: &Path,
+    update: &RegistryUpdate,
+    authenticated_issuer_pubkey: &[u8],
+) -> io::Result<()> {
+    let guard = storage::StateLock::acquire(dir)?;
+    let mut registry = load_registry_at(dir)?;
+    let previous = registry.clone();
+    apply_join_bootstrap_snapshot(&mut registry, update, authenticated_issuer_pubkey)?;
+    if registry != previous {
+        save_registry_at(dir, &registry)?;
+        drop(guard);
+        super::replication::registry_changed();
+    }
+    Ok(())
+}
+
+fn apply_join_bootstrap_snapshot(
+    registry: &mut Registry,
+    update: &RegistryUpdate,
+    authenticated_issuer_pubkey: &[u8],
+) -> io::Result<()> {
+    validate_update(update)?;
+    let mut current = authenticated_registry(registry, update, authenticated_issuer_pubkey)?;
+    let mut snapshot = update.entries.clone();
+    for entry in &mut snapshot {
+        entry.delivered_by = Some(update.sender_fp.clone());
+    }
+    current.merge(&Registry {
+        authorized_nodes: snapshot,
+    })?;
+    registry.authorized_nodes = current.authorized_nodes;
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -690,6 +776,12 @@ fn apply_update_at(
         eprintln!(
             "remuda: cluster replication dropped {} entries exceeding registry total cap",
             outcome.dropped_registry_cap_entries
+        );
+    }
+    if outcome.compacted_optional_metadata_entries > 0 {
+        eprintln!(
+            "remuda: cluster replication cleared optional registry metadata from {} entries to retain revocations within the byte cap",
+            outcome.compacted_optional_metadata_entries
         );
     }
     drop(guard);
@@ -841,15 +933,48 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
-    fn temp_dir() -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "remuda-cluster-registry-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&path);
-        storage::create_private_directory(&path).unwrap();
-        path
+    #[derive(Clone)]
+    struct RegistryTempDir(std::sync::Arc<RegistryTempDirInner>);
+
+    struct RegistryTempDirInner(PathBuf);
+
+    impl Drop for RegistryTempDirInner {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl std::ops::Deref for RegistryTempDir {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0 .0
+        }
+    }
+
+    impl AsRef<std::path::Path> for RegistryTempDir {
+        fn as_ref(&self) -> &std::path::Path {
+            self
+        }
+    }
+
+    fn temp_dir() -> RegistryTempDir {
+        loop {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "remuda-cluster-registry-{}-{nonce}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match storage::create_private_directory(&path) {
+                Ok(()) => return RegistryTempDir(std::sync::Arc::new(RegistryTempDirInner(path))),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create test registry directory: {error}"),
+            }
+        }
     }
 
     fn entry(fp: &str, state: NodeState, version: u64, by: &str) -> AuthorizedNode {
@@ -892,6 +1017,51 @@ mod tests {
         Registry {
             authorized_nodes: vec![sender.clone()],
         }
+    }
+
+    fn near_byte_cap_registry(sender: &AuthorizedNode) -> Registry {
+        let mut entries = vec![sender.clone()];
+        for index in 0..MAX_REGISTRY_ENTRIES - 2 {
+            let mut node = entry(
+                &format!("aggregate-size-entry-{index}"),
+                NodeState::Admitted,
+                1,
+                "sender",
+            );
+            let mut seed = index as u64 + 1;
+            let mut key = [0u8; 32];
+            for byte in &mut key {
+                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                *byte = (seed >> 32) as u8;
+            }
+            node.static_pubkey = encoding::encode_base64(&key);
+            node.node_fp = encoding::fingerprint(&key);
+            node.by = sender.node_fp.clone();
+            entries.push(node);
+        }
+
+        let mut low = 1;
+        let mut high = MAX_OPTIONAL_FIELDS_BYTES - 32;
+        let mut near_cap = None;
+        while low <= high {
+            let padding_len = low + (high - low) / 2;
+            let mut candidate_entries = entries.clone();
+            for node in candidate_entries.iter_mut().skip(1) {
+                node.optional_fields
+                    .insert("padding".into(), serde_json::json!("x".repeat(padding_len)));
+            }
+            let candidate = Registry {
+                authorized_nodes: candidate_entries,
+            };
+            let encoded_len = serde_json::to_vec_pretty(&candidate).unwrap().len();
+            if encoded_len <= MAX_REGISTRY_BYTES - 200 {
+                near_cap = Some(candidate);
+                low = padding_len + 1;
+            } else {
+                high = padding_len - 1;
+            }
+        }
+        near_cap.expect("fixture should reach the registry byte cap")
     }
 
     fn apply_as_sender(
@@ -1133,48 +1303,7 @@ mod tests {
     #[test]
     fn update_over_aggregate_registry_cap_is_dropped_and_saved_registry_loads() {
         let sender = admitted_sender();
-        let mut entries = vec![sender.clone()];
-        for index in 0..MAX_REGISTRY_ENTRIES - 2 {
-            let mut node = entry(
-                &format!("aggregate-size-entry-{index}"),
-                NodeState::Admitted,
-                1,
-                "sender",
-            );
-            let mut seed = index as u64 + 1;
-            let mut key = [0u8; 32];
-            for byte in &mut key {
-                seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                *byte = (seed >> 32) as u8;
-            }
-            node.static_pubkey = encoding::encode_base64(&key);
-            node.node_fp = encoding::fingerprint(&key);
-            node.by = sender.node_fp.clone();
-            entries.push(node);
-        }
-
-        let mut low = 1;
-        let mut high = MAX_OPTIONAL_FIELDS_BYTES - 32;
-        let mut near_cap = None;
-        while low <= high {
-            let padding_len = low + (high - low) / 2;
-            let mut candidate_entries = entries.clone();
-            for node in candidate_entries.iter_mut().skip(1) {
-                node.optional_fields
-                    .insert("padding".into(), serde_json::json!("x".repeat(padding_len)));
-            }
-            let candidate = Registry {
-                authorized_nodes: candidate_entries,
-            };
-            let encoded_len = serde_json::to_vec_pretty(&candidate).unwrap().len();
-            if encoded_len <= MAX_REGISTRY_BYTES - 200 {
-                near_cap = Some(candidate);
-                low = padding_len + 1;
-            } else {
-                high = padding_len - 1;
-            }
-        }
-        let mut registry = near_cap.expect("fixture should reach the registry byte cap");
+        let mut registry = near_byte_cap_registry(&sender);
         let mut additional = entry("aggregate-cap-update", NodeState::Admitted, 1, "sender");
         additional.by = sender.node_fp.clone();
         additional
@@ -1194,7 +1323,57 @@ mod tests {
         let dir = temp_dir();
         save_registry_at(&dir, &registry).unwrap();
         assert_eq!(load_registry_at(&dir).unwrap(), registry);
-        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tombstone_compacts_optional_metadata_instead_of_exceeding_byte_cap() {
+        let sender = admitted_sender();
+        let mut registry = near_byte_cap_registry(&sender);
+        let target_index = 1;
+        registry.authorized_nodes[target_index]
+            .optional_fields
+            .clear();
+        registry.authorized_nodes[target_index].version = 9;
+        let mut remaining =
+            MAX_REGISTRY_BYTES - 1 - serde_json::to_vec_pretty(&registry).unwrap().len();
+        for node in registry.authorized_nodes.iter_mut().skip(target_index + 1) {
+            if remaining == 0 {
+                break;
+            }
+            let Some(padding) = node.optional_fields.get_mut("padding") else {
+                continue;
+            };
+            let current_len = padding.as_str().unwrap().len();
+            let added = remaining.min(MAX_OPTIONAL_FIELDS_BYTES - 64 - current_len);
+            *padding = serde_json::json!("x".repeat(current_len + added));
+            remaining -= added;
+        }
+        assert_eq!(remaining, 0, "fixture should sit one byte under the cap");
+        let mut tombstone = registry.authorized_nodes[target_index].clone();
+        tombstone.state = NodeState::Revoked;
+        tombstone.version = 10;
+        tombstone.by = sender.node_fp.clone();
+        tombstone.endpoint = Some("127.0.0.1:9443".into());
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![tombstone.clone()],
+        };
+
+        let outcome = apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+        assert!(outcome.compacted_optional_metadata_entries > 0);
+        assert_eq!(
+            registry
+                .authorized_nodes
+                .iter()
+                .find(|entry| entry.node_fp == tombstone.node_fp)
+                .unwrap()
+                .state,
+            NodeState::Revoked
+        );
+
+        let dir = temp_dir();
+        save_registry_at(&dir, &registry).unwrap();
+        assert_eq!(load_registry_at(&dir).unwrap(), registry);
     }
 
     #[test]

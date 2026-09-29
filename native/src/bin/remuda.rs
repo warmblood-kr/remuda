@@ -426,7 +426,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                 println!("Node: {}", identity.node_name);
                 println!("Fingerprint: {}", identity.node_fp);
                 println!("Members: {members}");
-                println!("Authority: Any admitted member can admit new keys and revoke any member cluster-wide.");
+                println!("Authority: Any admitted member can admit new keys and revoke any member cluster-wide (see #282).");
                 ExitCode::SUCCESS
             }
             Err(error) => fail(format!("cluster status: {error}")),

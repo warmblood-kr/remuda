@@ -65,6 +65,11 @@ pub fn join(
         invitation.issuer_addr,
         endpoint,
     )?;
+    crate::cluster::replication::bootstrap_from_join_issuer(
+        invitation.issuer_addr,
+        &invitation.issuer_static_pubkey,
+        initiator_private,
+    )?;
     Ok(())
 }
 

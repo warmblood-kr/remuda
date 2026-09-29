@@ -245,6 +245,13 @@ fn write_registry(node: &PrivateNode, registry: &remuda_native::cluster::Registr
     std::fs::write(path, serde_json::to_vec(registry).unwrap()).unwrap();
 }
 
+fn read_registry(node: &PrivateNode) -> remuda_native::cluster::Registry {
+    serde_json::from_slice(
+        &std::fs::read(node.root.join("state/remuda/cluster/authorized_nodes.json")).unwrap(),
+    )
+    .unwrap()
+}
+
 fn list_from(peer_material: &[u8], server_material: &[u8], address: SocketAddr) -> Response {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -422,6 +429,73 @@ fn assert_joiner_stores_issuer(
     assert_eq!(self_entry.by, issuer.node_fp);
 }
 
+#[test]
+fn join_via_non_founder_bootstraps_full_view_including_revoked_origins() {
+    let a = PrivateNode::start("bootstrap-a");
+    let b = PrivateNode::start("bootstrap-b");
+    let x = PrivateNode::start("bootstrap-x");
+    let c = PrivateNode::start("bootstrap-c");
+    let d = PrivateNode::start("bootstrap-d");
+    for node in [&a, &b, &x, &c, &d] {
+        successful(node.run(&["cluster", "init"]), "initialize bootstrap node");
+    }
+    let a_id = a.identity();
+    let b_id = b.identity();
+    let x_id = x.identity();
+    let c_id = c.identity();
+    let a_fp = identity_fingerprint(&a_id);
+    let b_fp = identity_fingerprint(&b_id);
+    let x_fp = identity_fingerprint(&x_id);
+    let c_fp = identity_fingerprint(&c_id);
+
+    let a_listener = ListenerProcess::start(&a);
+    let b_listener = ListenerProcess::start(&b);
+    let x_listener = ListenerProcess::start(&x);
+    let c_listener = ListenerProcess::start(&c);
+    let d_listener = ListenerProcess::start(&d);
+
+    join_member(&a, &b, &a_id, a_listener.address, b_listener.address);
+    join_member(&b, &x, &b_id, b_listener.address, x_listener.address);
+    wait_for_member_and_probe(&a, &x_fp, &x_id, &a_id, a_listener.address);
+    successful(a.run(&["cluster", "revoke", &b_fp, "--yes"]), "revoke B");
+    wait_for_revocation_on(&x, &b_fp);
+
+    // C joins after B is revoked, through the founder. D then joins through
+    // non-founder C, proving the issuer snapshot carries the complete view.
+    join_member(&a, &c, &a_id, a_listener.address, c_listener.address);
+    join_member(&c, &d, &c_id, c_listener.address, d_listener.address);
+
+    let d_registry = read_registry(&d);
+    let lookup = |fingerprint: &str| {
+        d_registry
+            .authorized_nodes
+            .iter()
+            .find(|entry| entry.node_fp == fingerprint)
+            .unwrap_or_else(|| panic!("bootstrapped registry lacks {fingerprint}"))
+    };
+    assert_eq!(
+        lookup(&a_fp).state,
+        remuda_native::cluster::NodeState::Admitted
+    );
+    assert_eq!(
+        lookup(&b_fp).state,
+        remuda_native::cluster::NodeState::Revoked
+    );
+    assert_eq!(
+        lookup(&x_fp).state,
+        remuda_native::cluster::NodeState::Admitted
+    );
+    assert_eq!(lookup(&x_fp).by, b_fp);
+    assert_eq!(
+        lookup(&c_fp).state,
+        remuda_native::cluster::NodeState::Admitted
+    );
+    assert_eq!(
+        lookup(&identity_fingerprint(&d.identity())).state,
+        remuda_native::cluster::NodeState::Admitted
+    );
+}
+
 fn wait_for_member_and_probe(
     receiver: &PrivateNode,
     member_fp: &str,
@@ -469,21 +543,27 @@ fn wait_for_revocation_on(receiver: &PrivateNode, member_fp: &str) {
 }
 
 #[test]
-fn revoke_then_new_admission_converges_across_three_daemons() {
+fn revoke_then_new_admission_converges_after_revoked_member_admitted_a_peer() {
     let a = PrivateNode::start("origin-a");
     let b = PrivateNode::start("origin-b");
+    let x = PrivateNode::start("origin-x");
     let y = PrivateNode::start("origin-y");
-    for node in [&a, &b, &y] {
+    for node in [&a, &b, &x, &y] {
         successful(node.run(&["cluster", "init"]), "initialize private node");
     }
     let a_id = a.identity();
     let b_id = b.identity();
+    let x_id = x.identity();
     let b_fp = identity_fingerprint(&b_id);
+    let x_fp = identity_fingerprint(&x_id);
     let a_listener = ListenerProcess::start(&a);
     let b_listener = ListenerProcess::start(&b);
+    let x_listener = ListenerProcess::start(&x);
     let y_listener = ListenerProcess::start(&y);
 
     join_member(&a, &b, &a_id, a_listener.address, b_listener.address);
+    join_member(&b, &x, &b_id, b_listener.address, x_listener.address);
+    wait_for_member_and_probe(&a, &x_fp, &x_id, &a_id, a_listener.address);
     successful(
         a.run(&["cluster", "revoke", &b_fp, "--yes"]),
         "revoke old origin B",
@@ -495,6 +575,12 @@ fn revoke_then_new_admission_converges_across_three_daemons() {
     wait_for_member_and_probe(&a, &y_fp, &y.identity(), &a_id, a_listener.address);
     wait_for_member_and_probe(&y, &a_fp, &a_id, &y.identity(), y_listener.address);
     wait_for_revocation_on(&y, &b_fp);
+    let y_registry = read_registry(&y);
+    assert!(y_registry.authorized_nodes.iter().any(|entry| {
+        entry.node_fp == x_fp
+            && entry.state == remuda_native::cluster::NodeState::Admitted
+            && entry.by == b_fp
+    }));
 }
 
 #[test]
@@ -506,8 +592,9 @@ fn admission_on_a_pushes_to_an_existing_peer() {
     successful(b.run(&["cluster", "init"]), "initialize node B");
     successful(c.run(&["cluster", "init"]), "initialize node C");
     let status = a.run(&["cluster"]);
-    assert!(String::from_utf8_lossy(&status.stdout)
-        .contains("Any admitted member can admit new keys and revoke any member cluster-wide."));
+    assert!(String::from_utf8_lossy(&status.stdout).contains(
+        "Any admitted member can admit new keys and revoke any member cluster-wide (see #282)."
+    ));
     let a_identity = a.identity();
     let a_fingerprint = identity_fingerprint(&a_identity);
     let a_listener = ListenerProcess::start(&a);
@@ -567,6 +654,93 @@ fn admission_on_a_pushes_to_an_existing_peer() {
         assert!(
             Instant::now() < deadline,
             "A's admission of B did not reach C: {nodes}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn relayed_push_preserves_origin_and_converges_registry_digests() {
+    let a = PrivateNode::start("push-origin-a");
+    let b = PrivateNode::start("push-origin-b");
+    let c = PrivateNode::start("push-origin-c");
+    let x = PrivateNode::start("push-origin-x");
+    for node in [&a, &b, &c, &x] {
+        successful(node.run(&["cluster", "init"]), "initialize push test node");
+    }
+    let a_id = a.identity();
+    let b_id = b.identity();
+    let x_id = x.identity();
+    let a_fp = identity_fingerprint(&a_id);
+    let b_fp = identity_fingerprint(&b_id);
+    let x_fp = identity_fingerprint(&x_id);
+    let a_listener = ListenerProcess::start(&a);
+    let b_listener = ListenerProcess::start(&b);
+    let c_listener = ListenerProcess::start(&c);
+    let x_listener = ListenerProcess::start(&x);
+
+    join_member(&a, &b, &a_id, a_listener.address, b_listener.address);
+    join_member(&a, &c, &a_id, a_listener.address, c_listener.address);
+    join_member(&a, &x, &a_id, a_listener.address, x_listener.address);
+    wait_for_member_and_probe(&b, &x_fp, &x_id, &b_id, b_listener.address);
+    wait_for_member_and_probe(&c, &x_fp, &x_id, &c.identity(), c_listener.address);
+    thread::sleep(Duration::from_millis(200));
+
+    // Make X absent at C so the subsequent full push from B exercises the
+    // new-admission path at C, where an accidental by rewrite changes digest.
+    let mut c_registry = read_registry(&c);
+    c_registry
+        .authorized_nodes
+        .retain(|entry| entry.node_fp != x_fp);
+    write_registry(&c, &c_registry);
+
+    let mut b_entry = read_registry(&b)
+        .authorized_nodes
+        .into_iter()
+        .find(|entry| entry.node_fp == b_fp)
+        .unwrap();
+    b_entry.version += 1;
+    b_entry.by = b_fp.clone();
+    let update = remuda_native::cluster::registry::RegistryUpdate {
+        sender_fp: b_fp.clone(),
+        entries: vec![b_entry],
+    };
+    let response = remuda_native::net::cluster_client::ClusterClient::system()
+        .request(
+            b_listener.address,
+            &b_id[32..],
+            &b_id[..32],
+            &Request::ClusterRegistryUpdate {
+                update_json: String::from_utf8(update.encode().unwrap()).unwrap(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(response, Response::ClusterRegistryAck { .. }));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let b_registry = read_registry(&b);
+        let c_registry = read_registry(&c);
+        if c_registry
+            .authorized_nodes
+            .iter()
+            .any(|entry| entry.node_fp == x_fp)
+            && b_registry.digest().unwrap() == c_registry.digest().unwrap()
+        {
+            assert_eq!(
+                c_registry
+                    .authorized_nodes
+                    .iter()
+                    .find(|entry| entry.node_fp == x_fp)
+                    .unwrap()
+                    .by,
+                a_fp
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "B push did not converge C's digest"
         );
         thread::sleep(Duration::from_millis(50));
     }

@@ -36,6 +36,13 @@ authenticated peer, with a burst of 10. A four worker pool keeps network work
 off the daemon thread and coalesces queued work to one latest operation per
 peer.
 
+When same-version, same-origin variants conflict, merge keeps one whole
+optional-field map (preferring more fields, then the lexicographically larger
+canonical JSON map); it never unions maps past the per-entry cap. If a
+revocation would exceed the aggregate registry byte cap, optional fields and
+receiver-local `delivered_by` metadata are cleared as needed to persist the
+tombstone.
+
 Endpoints are optional routing hints. Only a node may change its own endpoint;
 until an endpoint is known, that peer is skipped. A peer tombstone for the
 receiver's own key is dropped and logged. Tombstones merge monotonically and
@@ -56,6 +63,14 @@ for the signed admissions migration. Each receiver applies revocation when it
 receives it, so propagation can lag between nodes. Noise authentication proves
 possession of the pinned static key, not that the member's operator or machine
 remains uncompromised.
+
+At join, the new node fetches the pinned issuer's complete registry snapshot
+over the authenticated Noise channel and imports it once. The issuer is trusted
+for this initial view, including entries whose original admitter is not yet in
+the joiner's registry. The import still enforces page, entry, optional-field,
+and aggregate registry byte caps; after it completes, ordinary origin checks
+apply to all replication updates. This trust follows the join decision: an
+admitted member already has authority to admit and revoke cluster-wide.
 
 On Windows, `cluster init` and `cluster` status refuse to access identity
 storage until owner-only ACL hardening is implemented. Track that work in

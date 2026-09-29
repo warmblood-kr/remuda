@@ -179,3 +179,86 @@ fn p95_nonmember_sender_with_valid_origin_refused() {
     )
     .is_err());
 }
+
+#[test]
+fn p3_optional_field_union_stays_within_cap() {
+    let mut first = entry("p3-optional-cap", NodeState::Admitted, 4, "origin");
+    first.by = first.node_fp.clone();
+    let mut second = first.clone();
+    first.optional_fields = (0..8)
+        .map(|index| (format!("left_{index}"), serde_json::json!(index)))
+        .collect();
+    second.optional_fields = (0..8)
+        .map(|index| (format!("right_{index}"), serde_json::json!(index)))
+        .collect();
+
+    let mut forward = Registry::default();
+    forward
+        .merge(&Registry {
+            authorized_nodes: vec![first.clone(), second.clone()],
+        })
+        .unwrap();
+    let mut reverse = Registry::default();
+    reverse
+        .merge(&Registry {
+            authorized_nodes: vec![second, first],
+        })
+        .unwrap();
+
+    let merged = find(
+        &forward,
+        &entry("p3-optional-cap", NodeState::Admitted, 4, "origin").node_fp,
+    );
+    assert_eq!(merged.optional_fields.len(), 8);
+    assert_eq!(forward, reverse);
+    RegistryUpdate {
+        sender_fp: merged.node_fp.clone(),
+        entries: vec![merged.clone()],
+    }
+    .encode()
+    .expect("winner stays within the per-entry optional-field cap");
+}
+
+#[test]
+fn join_bootstrap_imports_issuer_view_once_then_uses_origin_checks() {
+    let mut issuer = entry("bootstrap-issuer", NodeState::Admitted, 1, "issuer");
+    issuer.by = issuer.node_fp.clone();
+    let mut joiner = entry("bootstrap-joiner", NodeState::Admitted, 1, "issuer");
+    joiner.by = issuer.node_fp.clone();
+    let mut inherited = entry("bootstrap-inherited", NodeState::Admitted, 1, "unknown");
+    inherited.by = entry(
+        "bootstrap-unknown-origin",
+        NodeState::Admitted,
+        1,
+        "unknown",
+    )
+    .node_fp;
+    let mut view = Registry {
+        authorized_nodes: vec![issuer.clone(), joiner.clone()],
+    };
+    let snapshot = upd(
+        &[issuer.clone(), joiner, inherited.clone()],
+        &issuer.node_fp,
+    );
+
+    apply_join_bootstrap_snapshot(&mut view, &snapshot, &public_key(&issuer)).unwrap();
+    assert!(view
+        .authorized_nodes
+        .iter()
+        .any(|known| known.node_fp == inherited.node_fp));
+
+    let mut ordinary_new = entry("bootstrap-steady-state", NodeState::Admitted, 1, "unknown");
+    ordinary_new.by = inherited.by.clone();
+    let outcome = apply_update(
+        &mut view,
+        &upd(&[ordinary_new.clone()], &issuer.node_fp),
+        &public_key(&issuer),
+        &issuer.node_fp,
+    )
+    .unwrap();
+    assert_eq!(outcome.dropped_origin_entries, 1);
+    assert!(!view
+        .authorized_nodes
+        .iter()
+        .any(|known| known.node_fp == ordinary_new.node_fp));
+}

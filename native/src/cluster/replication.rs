@@ -392,6 +392,79 @@ fn fetch_peer(
     local_registry: &Registry,
     deadline: Instant,
 ) -> io::Result<()> {
+    let Some(entries) = fetch_snapshot(
+        endpoint,
+        peer_key,
+        local_private,
+        peer_fp,
+        local_registry,
+        deadline,
+    )?
+    else {
+        return Ok(());
+    };
+    let update = registry::RegistryUpdate {
+        sender_fp: peer_fp.to_owned(),
+        entries,
+    };
+    registry::apply_registry_update(&update, peer_key)?;
+    Ok(())
+}
+
+/// Import the pinned issuer's full view once, immediately after a successful
+/// join exchange. This entry point is called only by the local Join client.
+pub(crate) fn bootstrap_from_join_issuer(
+    endpoint: SocketAddr,
+    peer_key: &[u8],
+    local_private: &[u8],
+) -> io::Result<()> {
+    let peer_fp = super::encoding::fingerprint(peer_key);
+    let (_, local_registry) = super::nodes()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized"))?;
+    let issuer = local_registry
+        .authorized_nodes
+        .iter()
+        .find(|node| node.node_fp == peer_fp && node.state == NodeState::Admitted)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "join issuer is not admitted",
+            )
+        })?;
+    if super::encoding::decode_base64(&issuer.static_pubkey)? != peer_key
+        || issuer.endpoint.as_deref() != Some(endpoint.to_string().as_str())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "join bootstrap issuer does not match the pinned join line",
+        ));
+    }
+    let deadline = Instant::now() + REPLICATION_OPERATION_TIMEOUT;
+    if let Some(entries) = fetch_snapshot(
+        endpoint,
+        peer_key,
+        local_private,
+        &peer_fp,
+        &local_registry,
+        deadline,
+    )? {
+        let update = registry::RegistryUpdate {
+            sender_fp: peer_fp,
+            entries,
+        };
+        registry::apply_join_bootstrap(&update, peer_key)?;
+    }
+    Ok(())
+}
+
+fn fetch_snapshot(
+    endpoint: SocketAddr,
+    peer_key: &[u8],
+    local_private: &[u8],
+    peer_fp: &str,
+    local_registry: &Registry,
+    deadline: Instant,
+) -> io::Result<Option<Vec<AuthorizedNode>>> {
     let mut fetched = FetchAccumulator::new(local_registry.digest()?);
     loop {
         if Instant::now() >= deadline {
@@ -427,16 +500,9 @@ fn fetch_peer(
             continue;
         }
         if fetched.unchanged {
-            return Ok(());
+            return Ok(None);
         }
-        if !fetched.entries.is_empty() {
-            let update = registry::RegistryUpdate {
-                sender_fp: peer_fp.to_owned(),
-                entries: std::mem::take(&mut fetched.entries),
-            };
-            registry::apply_registry_update(&update, peer_key)?;
-        }
-        return Ok(());
+        return Ok(Some(std::mem::take(&mut fetched.entries)));
     }
 }
 
