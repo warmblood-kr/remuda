@@ -60,6 +60,10 @@ pub trait RemoteSource: Send + Sync {
 /// Sends idempotent Input batches to a remote member. Callers own retry policy.
 pub trait RemoteInputTransport: Send + Sync {
     fn send_input(&self, node: &str, request: &Request) -> io::Result<Response>;
+
+    fn send_close(&self, node: &str, request: &Request) -> io::Result<Response> {
+        self.send_input(node, request)
+    }
 }
 
 /// One-shot Noise client used by the remote composer.
