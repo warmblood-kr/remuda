@@ -117,6 +117,12 @@ impl Size {
         }
     }
 
+    /// Construct a size already checked against an explicit resize request's
+    /// bounds. Unlike `new`, this preserves the requested dimensions exactly.
+    pub fn requested(cols: u16, rows: u16) -> Self {
+        Self { cols, rows }
+    }
+
     pub fn cols(&self) -> u16 {
         self.cols
     }

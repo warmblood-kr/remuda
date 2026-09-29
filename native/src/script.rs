@@ -28,7 +28,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 77] = [
+pub const BINDINGS: [&str; 78] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -48,6 +48,7 @@ pub const BINDINGS: [&str; 77] = [
     "_registry_dump",
     "_run_due_schedules",
     "_schedule_fire_counts",
+    "_session_resize",
     "_sync_window_shown",
     "advice_list",
     "advice_member",
@@ -125,6 +126,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_pending_events",
         "Drain deferred-reply completion and cancellation notifications for the Lua tick.",
         "_pending_events() -> {{id, reason?}...}",
+    ),
+    (
+        "_session_resize",
+        "Resize a session after validating its requested dimensions.",
+        "_session_resize(name, cols, rows) -> true, nil | nil, error",
     ),
     (
         "http",
@@ -409,6 +415,30 @@ pub fn bindings(
         })?,
     )?;
 
+    let path = at();
+    table.set(
+        "_session_resize",
+        lua.create_function(move |_, (name, cols, rows): (String, Value, Value)| {
+            let cols = match resize_dimension(cols) {
+                Ok(value) => value,
+                Err(error) => return Ok((Value::Nil, Some(error))),
+            };
+            let rows = match resize_dimension(rows) {
+                Ok(value) => value,
+                Err(error) => return Ok((Value::Nil, Some(error))),
+            };
+            let size = match requested_size(cols, rows) {
+                Ok(size) => size,
+                Err(error) => return Ok((Value::Nil, Some(error))),
+            };
+            match ask(&path, Request::Resize { name, size })? {
+                Response::Ok => Ok((Value::Boolean(true), None)),
+                Response::Error(reason) => Ok((Value::Nil, Some(reason))),
+                other => Ok((Value::Nil, Some(format!("unexpected response: {other:?}")))),
+            }
+        })?,
+    )?;
+
     new_binding(lua, &table, at())?;
 
     let path = at();
@@ -520,6 +550,27 @@ pub fn bindings(
     sleep_binding(lua, &table)?;
 
     Ok(table)
+}
+
+fn requested_size(cols: i64, rows: i64) -> Result<remuda_core::Size, String> {
+    if !(20..=1000).contains(&cols) || !(5..=500).contains(&rows) {
+        return Err("resize dimensions must be cols 20..1000 and rows 5..500".into());
+    }
+    Ok(remuda_core::Size::requested(cols as u16, rows as u16))
+}
+
+fn resize_dimension(value: Value) -> Result<i64, String> {
+    match value {
+        Value::Integer(number) => Ok(number),
+        Value::Number(number) if number.is_finite() && number.fract() == 0.0 => {
+            if number >= i64::MIN as f64 && number <= i64::MAX as f64 {
+                Ok(number as i64)
+            } else {
+                Err("resize dimensions must be whole numbers".into())
+            }
+        }
+        _ => Err("resize dimensions must be whole numbers".into()),
+    }
 }
 
 fn close_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {

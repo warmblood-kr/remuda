@@ -384,7 +384,7 @@ send
 session
 -------
 
-``session(name) -> handle; table {list, new, close, attach}`` — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close and attach.
+``session(name) -> handle; table {list, new, close, attach, resize}`` — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach and resize.
 
 session.attach
 --------------
@@ -405,6 +405,11 @@ session.new
 -----------
 
 ``session.new(name?, argv?, cwd?, env?) -> string`` — Start a session, defaulting the command to the user's shell.
+
+session.resize
+--------------
+
+``session.resize(name, cols, rows) -> true | nil, err`` — Resize a session's terminal. Columns must be 20 through 1000 and rows 5 through 500.
 
 sleep
 -----

@@ -152,7 +152,7 @@
 <h2 id="send">send</h2>
 <p><code>send(name, text) -&gt; nil</code> — Deliver a line of text to a session, with Enter appended.</p>
 <h2 id="session">session</h2>
-<p><code>session(name) -&gt; handle; table {list, new, close, attach}</code> — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close and attach.</p>
+<p><code>session(name) -&gt; handle; table {list, new, close, attach, resize}</code> — Calling remuda.session(name) returns a handle onto that named session; the namespace also provides list, new, close, attach and resize.</p>
 <h2 id="session.attach">session.attach</h2>
 <p><code>session.attach(name) -&gt; nil</code> — Enter raw mode on a session.</p>
 <h2 id="session.close">session.close</h2>
@@ -161,6 +161,8 @@
 <p><code>session.list() -&gt; {session...}</code> — List every session in the registry, reaping exited ones unless REMUDA_KEEP_EXITED is set.</p>
 <h2 id="session.new">session.new</h2>
 <p><code>session.new(name?, argv?, cwd?, env?) -&gt; string</code> — Start a session, defaulting the command to the user's shell.</p>
+<h2 id="session.resize">session.resize</h2>
+<p><code>session.resize(name, cols, rows) -&gt; true | nil, err</code> — Resize a session's terminal. Columns must be 20 through 1000 and rows 5 through 500.</p>
 <h2 id="sleep">sleep</h2>
 <p><code>sleep(seconds) -&gt; nil</code> — Block the calling image for a number of seconds.</p>
 <h2 id="tool">tool</h2>
