@@ -1,7 +1,7 @@
 #![cfg(unix)]
 #![allow(clippy::disallowed_types)]
 
-use remuda_core::protocol::Request;
+use remuda_core::protocol::{Request, Response};
 use remuda_native::cluster::{encoding, AuthorizedNode, NodeState, Registry, ResolvedTarget};
 use remuda_native::cluster_remote::{
     ClusterRemoteTransport, RemotePoller, RemoteSource, RemoteState, RemoteTarget,
@@ -136,6 +136,7 @@ fn command(name: &str, runtime: &Path, root: &Path, state: &Path, home: &Path) -
     command
         .args(["-s", name])
         .env("REMUDA_RUNTIME_DIR", runtime)
+        .env("XDG_RUNTIME_DIR", runtime)
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_DATA_HOME", root.join("data"))
@@ -398,6 +399,107 @@ fn real_remote_tui_paints_the_selected_remote_session_screen() {
     tui.writer.write_all(b"x").unwrap();
     tui.wait_for("Remote session is read-only", Duration::from_secs(3));
     tui.wait_for("PR8-MARKER", Duration::from_secs(10));
+}
+
+#[test]
+fn driver_hosted_remote_tui_capture_shows_the_bottom_marker() {
+    let client_node = Node::start("driver-remote-client");
+    let driver_node = Node::start("driver-remote-driver");
+    let server_node = Node::start("driver-remote-server");
+    let client_listener = Listener::start(&client_node);
+    let server_listener = Listener::start(&server_node);
+    let client_address = client_listener.address.to_string();
+    let invitation = client_node
+        .command()
+        .args(["cluster", "invite", "--bind", &client_address])
+        .output()
+        .unwrap();
+    assert!(
+        invitation.status.success(),
+        "cluster invite failed: {invitation:?}"
+    );
+    let join_line = String::from_utf8(invitation.stdout)
+        .unwrap()
+        .lines()
+        .nth(1)
+        .expect("invitation line")
+        .to_owned();
+    let server_address = server_listener.address.to_string();
+    let join = server_node
+        .command()
+        .args([
+            "cluster",
+            "join",
+            &client_node.fingerprint(),
+            &join_line,
+            "--bind",
+            &server_address,
+        ])
+        .output()
+        .unwrap();
+    assert!(join.status.success(), "cluster join failed: {join:?}");
+    server_node.start_session("while :; do echo PR8-MARKER; sleep 1; done");
+
+    let remote = format!(
+        "exec env REMUDA_RUNTIME_DIR={} XDG_RUNTIME_DIR={} HOME={} XDG_CONFIG_HOME={} XDG_DATA_HOME={} XDG_CACHE_HOME={} XDG_STATE_HOME={} {} -s {} cluster remote",
+        client_node.runtime.display(),
+        client_node.runtime.display(),
+        client_node.root.join("home").display(),
+        client_node.root.join("config").display(),
+        client_node.root.join("data").display(),
+        client_node.root.join("cache").display(),
+        client_node.state.display(),
+        env!("CARGO_BIN_EXE_remuda"),
+        client_node.name,
+    );
+    driver_node.start_named_session("screen", &remote);
+    driver_node.start_named_session("tree", &remote);
+    let capture = || match remuda_native::client::request(
+        &remuda_native::daemon::socket_path_in(&driver_node.runtime, &driver_node.name),
+        &Request::Capture {
+            name: "screen".into(),
+        },
+    )
+    .unwrap()
+    {
+        Response::Screen(screen) => screen,
+        other => panic!("unexpected screen capture response: {other:?}"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !capture().contains(&remuda_native::cluster::node_label(
+        &server_node.fingerprint(),
+    )) {
+        assert!(
+            Instant::now() < deadline,
+            "remote node did not render in driver PTY"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    std::thread::sleep(Duration::from_secs(3));
+    for name in ["screen", "tree"] {
+        for input in ["\\27[B", "\\27[C", "\\27[B"] {
+            let lua = format!("remuda.insert('{name}', '{input}')");
+            let result = driver_node.command().args(["-e", &lua]).output().unwrap();
+            assert!(result.status.success(), "remuda.insert failed: {result:?}");
+        }
+    }
+    let lua = "remuda.insert('screen', '\\r')";
+    let result = driver_node.command().args(["-e", lua]).output().unwrap();
+    assert!(result.status.success(), "remuda.insert failed: {result:?}");
+
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        let screen = capture();
+        assert!(
+            Instant::now() < deadline || screen.contains("PR8-MARKER"),
+            "driver-hosted 80x24 screen pane omitted bottom marker:\n{screen}"
+        );
+        if screen.contains("PR8-MARKER") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]

@@ -101,7 +101,7 @@ local session = remuda.session
 assert(type(session) == "table", "remuda.session must be a namespace table")
 assert(getmetatable(session) and type(getmetatable(session).__call) == "function",
   "remuda.session must remain callable")
-for _, word in ipairs({ "list", "new", "close", "attach" }) do
+for _, word in ipairs({ "list", "new", "close", "attach", "resize" }) do
   assert(type(session[word]) == "function", "remuda.session." .. word .. " is missing")
 end
 
@@ -113,6 +113,28 @@ for _, row in ipairs(session.list()) do
   if row.name == name then found = true end
 end
 assert(found, "session.list must include the session created by session.new")
+assert(session.resize(name, 91, 31) == true, "session.resize must report success")
+local resized = false
+for _, row in ipairs(remuda.ls()) do
+  if row.name == name then resized = row.cols == 91 and row.rows == 31 end
+end
+assert(resized, "session.resize must update dimensions reported by remuda.ls")
+assert(session.resize(name, 30, 24) == true, "session.resize must accept a pane-width session")
+local narrow = false
+for _, row in ipairs(remuda.ls()) do
+  if row.name == name then narrow = row.cols == 30 and row.rows == 24 end
+end
+assert(narrow, "session.resize must preserve sub-80 widths reported by remuda.ls")
+for _, dimensions in ipairs({
+  { 0, 24 }, { 19, 24 }, { 1001, 24 }, { 80, 0 }, { 80, 23 }, { 80, 501 },
+}) do
+  local ok, err = session.resize(name, dimensions[1], dimensions[2])
+  assert(ok == nil and type(err) == "string", "session.resize must reject out-of-bounds dimensions")
+end
+local nonnumeric, nonnumeric_err = session.resize(name, "80", 24)
+assert(nonnumeric == nil and type(nonnumeric_err) == "string", "session.resize must reject nonnumeric dimensions")
+local unknown, unknown_err = session.resize(name .. "-missing", 90, 30)
+assert(unknown == nil and type(unknown_err) == "string", "session.resize must report an unknown session")
 
 local handle = session(name)
 assert(handle.name == name, "calling remuda.session must still return a handle")
@@ -148,9 +170,27 @@ assert(result.stdout:find("remuda-process-run-v5", 1, true), "process.run should
 assert(result.stderr == "", "process.run should capture stderr separately")
 assert(result.timed_out == false, "a completed process must not be marked timed out")
 
+local missing_program = "remuda-process-run-missing-executable-267"
+local missing_ok, missing_error = pcall(function()
+  remuda.process.run({ argv = { missing_program }, timeout = 1 })
+end)
+assert(not missing_ok, "process.run should fail for a missing executable")
+assert(tostring(missing_error):find(missing_program, 1, true),
+  "missing executable error should name the program")
+
 local async_id = remuda.process({ argv = echo_argv })
 assert(type(async_id) == "number", "the callable process namespace must preserve process(spec)")
 if not windows then
+  local capped_output = remuda.process.run({
+    argv = { "/usr/bin/head", "-c", "1048577", "/dev/zero" }, timeout = 3,
+  })
+  local marker = "\n[output truncated by remuda.process.run]"
+  assert(#capped_output.stdout == 1048576 + #marker,
+    "the output cap should retain 1 MiB of data before the truncation marker")
+  assert(capped_output.stdout:byte(1) == 0 and capped_output.stdout:byte(1048576) == 0,
+    "the truncation marker must not consume bytes from the 1 MiB payload cap")
+  assert(capped_output.stdout:sub(-#marker) == marker, "the truncation marker should be appended")
+
   local piped = remuda.process.run({ argv = { "/bin/cat" }, stdin = "process stdin v5", timeout = 3 })
   assert(piped.stdout == "process stdin v5", "process.run should pass stdin to the child")
 end
@@ -163,23 +203,33 @@ assert(timed.timed_out, "process.run must kill a child when its timeout expires"
 assert(timed.code == 124, "timed-out process.run must return timeout code 124")
 if not windows then
   assert(timed.signal == 9, "process.run should report Unix SIGKILL when timeout kills the child")
-  -- The shell exits immediately, but its background child inherits stdout
-  -- and stderr. The entire call, including pipe draining, must obey timeout.
-  local started = os.time()
-  local held_pipes = remuda.process.run({
-    argv = { "/bin/sh", "-c", "sleep 30 & echo $!" }, timeout = 0.2,
-  })
-  local held_pid = held_pipes.stdout:match("(%d+)")
-  if held_pid then os.execute("/bin/kill -KILL " .. held_pid) end
-  assert(held_pipes.timed_out, "process.run must time out when a descendant holds its pipes")
-  assert(held_pid, "the pipe-holding descendant pid should be captured")
-  assert(os.time() - started < 4, "process.run must return by its deadline when a descendant holds pipes")
+  -- The shell exits naturally, but its background child inherits stdout and
+  -- stderr. Preserve the leader's status and kill the remaining process group.
+  for _ = 1, 20 do
+    local started = os.time()
+    local held_pipes = remuda.process.run({
+      argv = { "/bin/sh", "-c", "sleep 30 & echo $!; exit 0" }, timeout = 3,
+    })
+    local held_pid = held_pipes.stdout:match("(%d+)")
+    assert(not held_pipes.timed_out, "a naturally exited leader must not be reported timed out")
+    assert(held_pipes.code == 0, "process.run must report the leader's zero exit code")
+    assert(held_pid, "the pipe-holding descendant pid should be captured")
+    assert(os.time() - started < 3, "process.run should drain after killing the leader's process group")
+    local child_alive = os.execute("/bin/kill -0 " .. held_pid .. " >/dev/null 2>&1")
+    assert(child_alive ~= true and child_alive ~= 0,
+      "the background child should be gone after process.run returns")
+    local after_group_cleanup = remuda.process.run({ argv = echo_argv, timeout = 1 })
+    assert(after_group_cleanup.code == 0, "group cleanup should release output-reader permits")
+  end
 
   -- A descendant can escape the process group with setsid and keep both
-  -- output pipes alive. Limit detached readers so repeated calls cannot leak
-  -- unbounded threads and file descriptors. Skip systems without setsid.
+  -- output pipes alive. Use -f explicitly: util-linux setsid otherwise forks
+  -- only when its caller is already a process-group leader. Keep the original
+  -- leader alive until process.run times out, so the assertion does not depend
+  -- on a scheduling race. Limit detached readers so repeated calls cannot leak
+  -- unbounded threads and file descriptors. Skip systems without setsid -f.
   local setsid_probe = pcall(function()
-    local probe = remuda.process.run({ argv = { "setsid", "/bin/true" }, timeout = 1 })
+    local probe = remuda.process.run({ argv = { "setsid", "-f", "/bin/true" }, timeout = 1 })
     assert(probe.code == 0, "setsid probe failed")
   end)
   if setsid_probe then
@@ -187,8 +237,10 @@ if not windows then
     local exercised_cap, cap_error = pcall(function()
       for _ = 1, 8 do
         local escaped = remuda.process.run({
-          argv = { "/bin/sh", "-c", "setsid /bin/sh -c 'echo $$; exec /bin/sleep 30' &" },
-          timeout = 0.1,
+          argv = { "/bin/sh", "-c", "setsid -f /bin/sh -c 'echo $$; exec /bin/sleep 30' & exec /bin/sleep 30" },
+          -- Leave room for a loaded runner to schedule the escaped child and
+          -- write its PID before the timeout closes the pipes.
+          timeout = 0.5,
         })
         assert(escaped.timed_out, "setsid descendant should leave output pipes open")
         local pid = escaped.stdout:match("(%d+)")

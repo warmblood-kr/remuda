@@ -2422,6 +2422,45 @@ fn a_narrow_shown_list_pane_passes_its_visible_width_to_the_child() {
     );
 }
 
+/// A list preview is observational: only an attached pane may send a Resize.
+#[test]
+fn a_narrow_preview_does_not_send_a_resize_request() {
+    let mut ui = make_ui(vec![row("background", true, false)]);
+    let shown = Some(ShownTarget::Session("background".into()));
+    let mut requests = Vec::new();
+    resize_shown_session_with(&mut ui, &shown, None, 36, 24, |name, size| {
+        requests.push((name.to_owned(), size));
+        Ok(())
+    });
+    assert!(
+        requests.is_empty(),
+        "a list preview must not resize its child PTY"
+    );
+}
+
+#[test]
+fn a_focused_narrow_attach_still_sends_its_pane_resize() {
+    let mut ui = make_ui(vec![row("agent", true, false)]);
+    ui.focus = Focus::Session;
+    let shown = Some(ShownTarget::Session("agent".into()));
+
+    let mut requests = Vec::new();
+    resize_shown_session_with(&mut ui, &shown, Some("agent"), 36, 24, |name, size| {
+        requests.push((name.to_owned(), size));
+        Ok(())
+    });
+
+    let [(name, target)] = requests.as_slice() else {
+        panic!("the focused, held session should receive one resize: {requests:?}");
+    };
+    assert_eq!(name, "agent");
+    assert_eq!(*target, pane_size(&ui, 36, 24));
+    assert!(
+        target.cols() < Size::MIN_COLS,
+        "focused pane should use its narrow width"
+    );
+}
+
 #[test]
 fn a_squeezed_list_drops_fields_rather_than_being_cut() {
     // 80-wide terminal, 80-wide sessions: the list floors at 16. What

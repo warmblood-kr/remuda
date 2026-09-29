@@ -16,8 +16,13 @@ const WORKERS: usize = 4;
 const MAX_FETCH_PAGES: usize =
     registry::MAX_REGISTRY_ENTRIES.div_ceil(crate::net::REGISTRY_REPLICATION_PAGE_ENTRIES) + 8;
 const REPLICATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
-const CLI_PUSH_TIMEOUT: Duration = Duration::from_secs(5);
-const CLI_PEER_TIMEOUT: Duration = Duration::from_secs(2);
+const CLI_PUSH_TIMEOUT: Duration = Duration::from_secs(20);
+const CLI_PUSH_ATTEMPT_TIMEOUTS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+];
+const CLI_PUSH_BACKOFFS: [Duration; 2] = [Duration::from_millis(250), Duration::from_millis(500)];
 
 #[derive(Default)]
 struct WorkState {
@@ -91,7 +96,8 @@ pub struct PeerPushResult {
 }
 
 /// Push the current registry to configured admitted peers before a short-lived
-/// CLI process exits. Work is bounded by five seconds total and four workers.
+/// CLI process exits. Each peer gets bounded retries within a 20-second total
+/// deadline, and work is shared across at most four workers.
 pub fn push_now() -> Vec<PeerPushResult> {
     push_now_excluding(None)
 }
@@ -153,8 +159,7 @@ pub fn push_now_excluding(excluded_peer: Option<&str>) -> Vec<PeerPushResult> {
                         detail: "CLI push deadline elapsed before attempt".into(),
                     }
                 } else {
-                    let peer_deadline = (Instant::now() + CLI_PEER_TIMEOUT).min(deadline);
-                    match push_peer_only(peer_fp, peer_deadline) {
+                    match push_peer_with_retries(peer_fp, deadline) {
                         Ok(()) => PeerPushResult {
                             peer_fp: peer_fp.clone(),
                             reached: true,
@@ -185,6 +190,39 @@ pub fn push_now_excluding(excluded_peer: Option<&str>) -> Vec<PeerPushResult> {
             })
         })
         .collect()
+}
+
+fn push_peer_with_retries(peer_fp: &str, deadline: Instant) -> io::Result<()> {
+    retry_with_backoff(
+        |timeout| {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "CLI push deadline elapsed before attempt",
+                ));
+            }
+            push_peer_only(peer_fp, (now + timeout).min(deadline))
+        },
+        |backoff| thread::sleep(backoff.min(deadline.saturating_duration_since(Instant::now()))),
+    )
+}
+
+fn retry_with_backoff<T>(
+    mut attempt: impl FnMut(Duration) -> io::Result<T>,
+    mut sleep: impl FnMut(Duration),
+) -> io::Result<T> {
+    let mut last_error = None;
+    for (index, timeout) in CLI_PUSH_ATTEMPT_TIMEOUTS.into_iter().enumerate() {
+        if index > 0 {
+            sleep(CLI_PUSH_BACKOFFS[index - 1]);
+        }
+        match attempt(timeout) {
+            Ok(value) => return Ok(value),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.expect("at least one CLI push attempt"))
 }
 
 fn enqueue_all(push: bool) {
@@ -858,6 +896,39 @@ mod tests {
             unchanged: false,
         };
         assert!(fetched.accept(response, "peer").unwrap());
+    }
+
+    #[test]
+    fn cli_push_retries_with_bounded_attempt_timeouts_and_backoff() {
+        let timeouts = std::cell::RefCell::new(Vec::new());
+        let backoffs = std::cell::RefCell::new(Vec::new());
+        let attempts = std::cell::Cell::new(0);
+        let result = retry_with_backoff(
+            |timeout| {
+                timeouts.borrow_mut().push(timeout);
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    Err(io::Error::new(io::ErrorKind::TimedOut, "busy"))
+                } else {
+                    Ok("acknowledged")
+                }
+            },
+            |delay| backoffs.borrow_mut().push(delay),
+        );
+
+        assert_eq!(result.unwrap(), "acknowledged");
+        assert_eq!(
+            *timeouts.borrow(),
+            [
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8)
+            ]
+        );
+        assert_eq!(
+            *backoffs.borrow(),
+            [Duration::from_millis(250), Duration::from_millis(500)]
+        );
     }
 
     #[test]

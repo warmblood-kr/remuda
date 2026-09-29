@@ -1703,6 +1703,25 @@ mod tests {
                 if origin_state.is_some() { 2 } else { 1 }
             );
         }
+
+        // An existing, admitted origin other than the authenticated sender
+        // is a valid voucher for a relayed new admission. Keep this explicit:
+        // the sender must not be mistaken for the entry's origin.
+        let mut registry = registry_with_sender(&sender);
+        let origin = entry("admitted-non-sender-origin", NodeState::Admitted, 1, "seed");
+        let mut relayed = entry("relayed-new-admission", NodeState::Admitted, 1, "seed");
+        relayed.by = origin.node_fp.clone();
+        registry.authorized_nodes.push(origin.clone());
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![relayed.clone()],
+        };
+        let outcome = apply_as_sender(&mut registry, &update, &public_key(&sender)).unwrap();
+        assert_eq!(outcome.dropped_origin_entries, 0);
+        assert!(registry
+            .authorized_nodes
+            .iter()
+            .any(|entry| { entry.node_fp == relayed.node_fp && entry.by == origin.node_fp }));
     }
 
     #[test]

@@ -414,9 +414,12 @@ fn log_listener_error(context: &str, error: &io::Error) {
 }
 
 impl RequestLimiter {
-    fn acquire_registry_request(&self, fingerprint: &str) -> bool {
+    fn acquire_registry_request(&self, fingerprint: &str, priority: bool) -> bool {
         const BURST: f64 = 10.0;
         const REFILL_PER_SECOND: f64 = 1.0;
+        // Background pulls may use nine tokens from the burst. Keep one
+        // available for a registry update carrying an admission or tombstone.
+        const UPDATE_RESERVE: f64 = 1.0;
         let now = Instant::now();
         let mut buckets = self
             .registry_requests
@@ -436,7 +439,7 @@ impl RequestLimiter {
         let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * REFILL_PER_SECOND).min(BURST);
         bucket.last_refill = now;
-        if bucket.tokens < 1.0 {
+        if bucket.tokens < 1.0 || (!priority && bucket.tokens < 1.0 + UPDATE_RESERVE) {
             return false;
         }
         bucket.tokens -= 1.0;
@@ -827,7 +830,7 @@ fn dispatch_payload(
     match request {
         Request::ClusterRegistrySync { digest, offset } => {
             let peer_fp = cluster::encoding::fingerprint(peer_static);
-            if !limiter.acquire_registry_request(&peer_fp) {
+            if !limiter.acquire_registry_request(&peer_fp, false) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "registry replication rate limit exceeded",
@@ -867,7 +870,7 @@ fn dispatch_payload(
         }
         Request::ClusterRegistryUpdate { update_json } => {
             let peer_fp = cluster::encoding::fingerprint(peer_static);
-            if !limiter.acquire_registry_request(&peer_fp) {
+            if !limiter.acquire_registry_request(&peer_fp, true) {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "registry replication rate limit exceeded",
@@ -1010,7 +1013,8 @@ fn handle_connection_with(
     }
     if let Request::Input { bytes, .. } = &request {
         if !state.limiter.allow_remote_input(&peer_fp, bytes.len()) {
-            let response = encode_error("remote Input rate limit exceeded");
+            let response =
+                serde_json::to_vec(&Response::RateLimited).unwrap_or_else(|_| b"null".to_vec());
             return send_encrypted_response(stream, opened, &response);
         }
     }
@@ -1231,6 +1235,7 @@ mod tests {
         stop: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<io::Result<()>>>,
         state_dir: PathBuf,
+        state: Arc<ListenerState>,
     }
 
     #[cfg(unix)]
@@ -1310,6 +1315,7 @@ mod tests {
             });
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = stop.clone();
+            let thread_state = state.clone();
             let thread = std::thread::spawn(move || {
                 serve_socket_until(
                     &listener,
@@ -1319,7 +1325,7 @@ mod tests {
                         spawn_connection_handler(
                             stream,
                             remote_addr,
-                            state.clone(),
+                            thread_state.clone(),
                             authorize.clone(),
                             dispatch.clone(),
                             ConnectionPolicy {
@@ -1337,6 +1343,7 @@ mod tests {
                 stop,
                 thread: Some(thread),
                 state_dir,
+                state,
             }
         }
 
@@ -1384,9 +1391,10 @@ mod tests {
                 join_tokens,
                 admit_join: Arc::new(cluster::admit_join_locked),
             });
+            let test_state = state.clone();
             let listener = Listener {
                 socket: listener,
-                state,
+                state: state.clone(),
                 authorize,
                 dispatch,
                 control_source,
@@ -1401,7 +1409,16 @@ mod tests {
                 stop,
                 thread: Some(thread),
                 state_dir,
+                state: test_state,
             }
+        }
+
+        fn exhaust_remote_input_budget(&self, peer_public: &[u8]) {
+            let peer_fp = cluster::encoding::fingerprint(peer_public);
+            assert!(self
+                .state
+                .limiter
+                .allow_remote_input(&peer_fp, REMOTE_INPUT_BYTES_PER_SECOND));
         }
 
         fn exchange(&self, sealed: frame::SealedRequest) -> (u16, Vec<u8>) {
@@ -1881,6 +1898,46 @@ mod tests {
                 "remote Input batch exceeds {} bytes",
                 crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES
             ))
+        );
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_refuses_rate_limited_input_with_typed_error() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let dispatched = Arc::new(AtomicUsize::new(0));
+        let seen = dispatched.clone();
+        let settings = TestControlSettings::new(br#"{"allow_remote_control":true}"#);
+        let server = SocketTestServer::start_production_with_control_source(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Ok(())),
+            Arc::new(move |_, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::to_vec(&Response::Ack { duplicate: false }).unwrap())
+            }),
+            settings.source(),
+        );
+        server.exhaust_remote_input_budget(&peer.public);
+        let request = Request::Input {
+            name: "session".into(),
+            instance_id: "instance".into(),
+            client_id: "00000000000000000000000000000001".into(),
+            seq: 1,
+            bytes: b"x".to_vec(),
+        };
+        let sealed = sealed_payload_request(&peer, &server, &serde_json::to_vec(&request).unwrap());
+        let (status, response) = server.exchange(sealed);
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Response>(&response).unwrap(),
+            Response::RateLimited
         );
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
@@ -2388,13 +2445,21 @@ mod tests {
     }
 
     #[test]
-    fn registry_requests_allow_ten_burst_per_peer() {
+    fn registry_sync_leaves_reserved_capacity_for_revoke_push() {
         let limiter = RequestLimiter::default();
-        for _ in 0..10 {
-            assert!(limiter.acquire_registry_request("peer-a"));
+        for _ in 0..9 {
+            assert!(limiter.acquire_registry_request("peer-a", false));
         }
-        assert!(!limiter.acquire_registry_request("peer-a"));
-        assert!(limiter.acquire_registry_request("peer-b"));
+        // Anti-entropy keeps polling and must not consume the reserved token.
+        assert!(!limiter.acquire_registry_request("peer-a", false));
+        assert!(limiter.acquire_registry_request("peer-a", true));
+        assert!(!limiter.acquire_registry_request("peer-a", true));
+        // Updates still share the normal per-peer cap when no sync traffic
+        // competes with them.
+        for _ in 0..10 {
+            assert!(limiter.acquire_registry_request("peer-b", true));
+        }
+        assert!(!limiter.acquire_registry_request("peer-b", true));
     }
 
     #[cfg(unix)]
