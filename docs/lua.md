@@ -204,6 +204,32 @@ recreate keeps its advice. Other imperative effects
 (`remuda.schedule`, `remuda.process`, `remuda.new`, and so on) are not owned
 and survive reload; the mod must find and reuse or cancel them itself.
 
+An optional `ready(state)` lets the CLI's `remuda exec NAME` wait for an
+asynchronous start to finish. It returns `true` when ready, `nil` while it is
+still working, or `nil, "message"` when startup failed. A Lua error from the
+callback is also a failure. `timeout_ms` on the same declaration sets the
+readiness deadline; it defaults to 30000 and must be an integer from 1 through
+240000. The CLI checks every 250 ms, issuing a separate short Eval each time.
+Failure exits 1 and prints `mod NAME failed to become ready: message`; timeout
+exits 124 and prints `mod NAME did not become ready within Ns`. Keep the
+callback quick: each Eval still has the daemon's 305-second client deadline.
+Mods without `ready` keep today's immediate-success behavior. This is a
+declaration field alongside `start` and `stop`, not another `remuda.*` word:
+
+```lua
+return {
+  api = "remuda-module-v1",
+  state_version = 1,
+  initialize = function() return { connected = false } end,
+  start = function(state) connect_async(state) end,
+  ready = function(state)
+    if state.error then return nil, state.error end
+    return state.connected or nil
+  end,
+  timeout_ms = 45000,
+}
+```
+
 An optional `stop(state)` runs for the old activation before a reload starts
 its replacement, while the old activation still owns its registrations. It
 also runs for each active lifecycle mod during a clean daemon shutdown.

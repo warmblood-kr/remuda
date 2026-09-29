@@ -56,6 +56,118 @@ fn cli_exec_activates_a_lifecycle_mod() {
     );
 }
 
+#[test]
+fn cli_exec_waits_for_lifecycle_readiness_and_reports_failures() {
+    use std::time::{Duration, Instant};
+
+    let dir = std::env::temp_dir().join(format!("rc-ready-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let write_mod = |name: &str, source: &str| {
+        let mod_dir = dir.join(format!("data/remuda/mods/{name}"));
+        fs::create_dir_all(mod_dir.join(format!("packages/{name}"))).unwrap();
+        fs::write(
+            mod_dir.join("extension.toml"),
+            format!(
+                "name = \"{name}\"\nentry = \"packages/{name}/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n"
+            ),
+        )
+        .unwrap();
+        fs::write(mod_dir.join(format!("packages/{name}/init.lua")), source).unwrap();
+    };
+    let declaration = |fields: &str| {
+        format!(
+            "return {{ api = \"remuda-module-v1\", state_version = 1, initialize = function() return {{ polls = 0 }} end, {fields} }}"
+        )
+    };
+    write_mod("no_ready", &declaration("start = function() end,"));
+    write_mod(
+        "ready_now",
+        &declaration("ready = function() return true end, timeout_ms = 1000,"),
+    );
+    write_mod(
+        "ready_later",
+        &declaration(
+            "ready = function(state) state.polls = state.polls + 1; return state.polls >= 4 and true or nil end, timeout_ms = 3000,",
+        ),
+    );
+    write_mod(
+        "ready_fail",
+        &declaration("ready = function() return nil, 'connection refused' end, timeout_ms = 1000,"),
+    );
+    write_mod(
+        "ready_error",
+        &declaration("ready = function() error('readiness exploded') end, timeout_ms = 1000,"),
+    );
+    write_mod(
+        "ready_timeout",
+        &declaration("ready = function() return nil end, timeout_ms = 50,"),
+    );
+
+    let remuda = |args: &[&str]| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(["-s", "s"])
+            .args(args)
+            .env("REMUDA_RUNTIME_DIR", &dir)
+            .env("XDG_DATA_HOME", dir.join("data"))
+            .env("HOME", &dir)
+            .output()
+            .expect("run remuda")
+    };
+    let boot = remuda(&["-e", "return remuda.session.list()"]);
+    assert!(boot.status.success(), "boot private daemon: {boot:?}");
+
+    let no_ready_started = Instant::now();
+    let no_ready = remuda(&["exec", "no_ready"]);
+    assert!(
+        no_ready.status.success(),
+        "no ready declaration: {no_ready:?}"
+    );
+    assert!(
+        no_ready_started.elapsed() < Duration::from_millis(250),
+        "a mod without ready must keep immediate completion: {no_ready:?}"
+    );
+
+    let ready = remuda(&["exec", "ready_now"]);
+    assert!(ready.status.success(), "immediately ready: {ready:?}");
+
+    let wait_started = Instant::now();
+    let later = remuda(&["exec", "ready_later"]);
+    assert!(later.status.success(), "eventually ready: {later:?}");
+    assert!(
+        wait_started.elapsed() >= Duration::from_millis(500),
+        "exec did not poll between Eval requests: {later:?}"
+    );
+
+    let failed = remuda(&["exec", "ready_fail"]);
+    assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+    assert_eq!(
+        failed.stderr,
+        b"mod ready_fail failed to become ready: connection refused\n"
+    );
+
+    let errored = remuda(&["exec", "ready_error"]);
+    assert_eq!(errored.status.code(), Some(1), "{errored:?}");
+    assert!(
+        String::from_utf8_lossy(&errored.stderr)
+            .starts_with("mod ready_error failed to become ready: "),
+        "thrown readiness error was not reported as startup failure: {errored:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&errored.stderr).contains("readiness exploded"),
+        "thrown readiness error message was lost: {errored:?}"
+    );
+
+    let timed_out = remuda(&["exec", "ready_timeout"]);
+    assert_eq!(timed_out.status.code(), Some(124), "{timed_out:?}");
+    assert_eq!(
+        timed_out.stderr,
+        b"mod ready_timeout did not become ready within 0.05s\n"
+    );
+
+    remuda(&["stop", "-f"]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// The one-line `remuda.exec(...)` wrapper must not borrow the mod's chunk
 /// name: a traceback then blamed `packages/<mod>/init.lua:1: in main chunk`
 /// for a line the mod never had. The mod's own frames keep their names.

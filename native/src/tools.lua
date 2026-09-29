@@ -1030,6 +1030,18 @@ function remuda._activate_module(name, candidate, reactivate)
   if candidate.stop ~= nil and type(candidate.stop) ~= "function" then
     error("module stop must be a function", 0)
   end
+  if candidate.ready ~= nil and type(candidate.ready) ~= "function" then
+    error("module ready must be a function", 0)
+  end
+  local timeout_ms = candidate.timeout_ms
+  if timeout_ms == nil then timeout_ms = 30000 end
+  if candidate.ready ~= nil and (type(timeout_ms) ~= "number" or timeout_ms % 1 ~= 0
+    or timeout_ms < 1 or timeout_ms > 240000) then
+    error("module timeout_ms must be an integer from 1 through 240000", 0)
+  end
+  if candidate.ready == nil and candidate.timeout_ms ~= nil then
+    error("module timeout_ms requires a ready function", 0)
+  end
 
   local hooks = candidate.hooks or {}
   local hook_count = array_length(hooks, "module hooks")
@@ -1283,6 +1295,9 @@ function remuda._activate_module(name, candidate, reactivate)
   local start = candidate.start and function(started_state)
     return with_owner(name, candidate.start, started_state)
   end
+  local ready = candidate.ready and function(ready_state)
+    return with_owner(name, candidate.ready, ready_state)
+  end
   local activation = {
     version = version,
     state = state,
@@ -1292,6 +1307,8 @@ function remuda._activate_module(name, candidate, reactivate)
     contributions = declared_contributions,
     stop = stop,
     start = start,
+    ready = ready,
+    timeout_ms = timeout_ms,
     stopped = false,
   }
   for index = 1, advice_count do
@@ -1422,6 +1439,28 @@ function remuda._stop_modules()
     stop_module_activation(name, module)
   end
 end
+
+-- The CLI polls this small lifecycle result between Eval requests. Keep the
+-- readiness callback in the declaration table, not as another public remuda
+-- word; an absent callback preserves today's immediate exec completion.
+function remuda._module_readiness(name)
+  local module = modules[name]
+  if not module or not module.ready then return { status = "ready" } end
+  local ok, ready, message = pcall(module.ready, module.state)
+  if not ok then return { status = "failed", message = tostring(ready) } end
+  if ready == true and message == nil then return { status = "ready" } end
+  if ready == nil and message == nil then
+    return { status = "pending", timeout_ms = module.timeout_ms }
+  end
+  if ready == nil and type(message) == "string" then
+    return { status = "failed", message = message }
+  end
+  return {
+    status = "failed",
+    message = "ready must return true, nil, or nil, message",
+  }
+end
+register("_module_readiness", "Internal readiness poll for remuda exec.", "_module_readiness(name) -> {status, timeout_ms?, message?}")
 
 local escapes = {
   ['"'] = '\\"',
