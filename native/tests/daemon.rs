@@ -1117,17 +1117,17 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
     let runtime = scratch_dir("input-recovery");
     let path = daemon::socket_path_in(&runtime, "s");
     let _daemon = Daemon::spawn(&runtime);
-    let drained_marker = runtime.join("drained");
-    let progress_marker = runtime.join("progress");
+    let child_input_path = runtime.join("child-input");
+    let dropped_count_path = runtime.join("dropped-count");
+    let barrier_result_path = runtime.join("barrier-result");
     let ready_marker = runtime.join("ready");
     let reader_marker = runtime.join("start-reading");
-    let script = "stty raw -echo; while [ ! -e \"$READY_MARKER\" ]; do sleep 0.02; done; printf READY; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; perl -e 'my $total = 0; my $progress = 0; my $drained = 0; my $tail = \"\"; while (read(STDIN, my $b, 4096)) { $total += length($b); if (!$progress && $total >= 131072) { open(my $p, \">\", $ENV{PROGRESS_PATH}) or die; print $p $total; close($p); $progress = 1; }; $tail .= $b; if (!$drained && index($tail, \"DRAINED-BARRIER\") >= 0) { open(my $d, \">\", $ENV{DRAINED_PATH}) or die; print $d \"done\"; close($d); $drained = 1; }; $tail = substr($tail, -64) if length($tail) > 128; }'";
+    let script = "stty raw -echo min 1 time 0 </dev/tty; while [ ! -e \"$READY_MARKER\" ]; do sleep 0.02; done; printf READY; while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; cat > \"$CAPTURE_PATH\"";
     let env = std::collections::HashMap::from([
         (
-            "PROGRESS_PATH".into(),
-            progress_marker.display().to_string(),
+            "CAPTURE_PATH".into(),
+            child_input_path.display().to_string(),
         ),
-        ("DRAINED_PATH".into(), drained_marker.display().to_string()),
         ("READY_MARKER".into(), ready_marker.display().to_string()),
         ("READER_MARKER".into(), reader_marker.display().to_string()),
     ]);
@@ -1150,6 +1150,8 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
     command.args(["-s", "s", "attach", "target"]);
     command.env("REMUDA_RUNTIME_DIR", &runtime);
     command.env("REMUDA_TEST_ATTACH_STALL_MS", "250");
+    command.env("REMUDA_TEST_ATTACH_BARRIER_RESULT", &barrier_result_path);
+    command.env("REMUDA_TEST_ATTACH_DROPPED_COUNT", &dropped_count_path);
     let viewer = Session::new(
         "viewer",
         Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
@@ -1161,7 +1163,7 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
     std::fs::write(&ready_marker, b"attached").expect("release child readiness");
     wait_for_session_screen(&viewer, "READY");
 
-    let flood = vec![b'x'; 2 * 1024 * 1024];
+    let flood = vec![b'x'; 1100 * 1024];
     let (sent_tx, sent_rx) = std::sync::mpsc::channel();
     std::thread::scope(|scope| {
         let sender = scope.spawn(|| {
@@ -1191,37 +1193,108 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
         );
         sender.join().expect("join flood writer");
         let progress_deadline = Instant::now() + Duration::from_secs(15);
-        loop {
+        while std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()) < 131072 {
             assert!(
                 Instant::now() < progress_deadline,
                 "child did not receive buffered input after recovery"
             );
-            if progress_marker.exists() {
-                break;
-            }
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        let barrier = b"DRAINED-BARRIER";
-        let barrier_deadline = Instant::now() + Duration::from_secs(30);
+        let drop_notice = b"dropping input until the writer recovers";
+        let recovery_notice = b"input writer recovered; queued input resumed";
+        let mut last_total = None;
+        let mut stable_since = Instant::now();
+        let sent = flood.len() as u64;
+        let drain_deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            if drained_marker.exists() {
+            assert!(
+                Instant::now() < drain_deadline,
+                "child input did not drain to a stable recovered state: total={}, dropped={}, sent={sent}; notices={}",
+                std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()),
+                std::fs::read_to_string(&dropped_count_path).unwrap_or_default(),
+                String::from_utf8_lossy(&seen)
+                    .replace('\n', " ")
+                    .chars()
+                    .rev()
+                    .take(180)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>()
+            );
+            if let Ok(chunk) = output.recv_timeout(Duration::from_millis(20)) {
+                seen.extend_from_slice(&chunk);
+            }
+            let last_drop = seen
+                .windows(drop_notice.len())
+                .rposition(|window| window == drop_notice);
+            let last_recovery = seen
+                .windows(recovery_notice.len())
+                .rposition(|window| window == recovery_notice);
+            let recovered =
+                last_recovery.is_some_and(|at| last_drop.is_none_or(|drop_at| at > drop_at));
+            let total = std::fs::metadata(&child_input_path)
+                .ok()
+                .map(|metadata| metadata.len());
+            let dropped = std::fs::read_to_string(&dropped_count_path)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok());
+            if total.is_some() && total != last_total {
+                last_total = total;
+                stable_since = Instant::now();
+            }
+            let drained = total
+                .zip(dropped)
+                .is_some_and(|(total, dropped)| dropped <= sent && total == sent - dropped);
+            if recovered && drained && stable_since.elapsed() >= Duration::from_millis(500) {
                 break;
+            }
+        }
+
+        let barrier = b"DRAINED-BARRIER\n";
+        held.write_raw(barrier)
+            .expect("send one ordered drain barrier after the child read total stabilizes");
+        let enqueue_deadline = Instant::now() + Duration::from_secs(3);
+        while !barrier_result_path.exists() {
+            assert!(
+                Instant::now() < enqueue_deadline,
+                "attach key pump did not classify the single drain barrier"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&barrier_result_path).unwrap(),
+            "queued",
+            "recovered attach queue dropped the single drain barrier"
+        );
+
+        let barrier_deadline = Instant::now() + Duration::from_secs(3);
+        while !std::fs::read(&child_input_path).is_ok_and(|bytes| {
+            bytes
+                .windows(b"DRAINED-BARRIER".len())
+                .any(|window| window == b"DRAINED-BARRIER")
+        }) {
+            if let Ok(chunk) = output.recv_timeout(Duration::from_millis(20)) {
+                seen.extend_from_slice(&chunk);
             }
             assert!(
                 Instant::now() < barrier_deadline,
-                "attach did not forward the ordered drain barrier after the input stall"
+                "recovered attach input queue did not deliver the single ordered drain barrier; child received {} bytes; notices: {}; dropped count: {}",
+                std::fs::metadata(&child_input_path).map_or(0, |metadata| metadata.len()),
+                String::from_utf8_lossy(&seen)
+                    .replace('\n', " ")
+                    .chars()
+                    .rev()
+                    .take(180)
+                    .collect::<String>()
+                    .chars()
+                    .rev()
+                    .collect::<String>(),
+                std::fs::read_to_string(&dropped_count_path).unwrap_or_default()
             );
-            held.write_raw(barrier).expect("send ordered drain barrier");
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(
-            drained_marker.exists(),
-            "child acknowledged queue drain barrier"
-        );
-
-        // The child acknowledged this ordered marker, which follows the
-        // flood in the PTY stream. Reaching it proves the input queue resumed.
     });
     let _ = held.write_raw(&[client::DETACH]);
     wait_for_cli_exit(&viewer, "target");

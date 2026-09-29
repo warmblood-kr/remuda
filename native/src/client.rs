@@ -42,6 +42,7 @@ struct AttachInputQueue {
     dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     drop_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    recovery_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     capacity: usize,
     stall_after: Duration,
     now: std::sync::Arc<dyn Fn() -> Duration + Send + Sync>,
@@ -53,6 +54,7 @@ struct AttachInputWriter {
     dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     queued_bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     drop_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    recovery_notice_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
     now: std::sync::Arc<dyn Fn() -> Duration + Send + Sync>,
 }
 
@@ -100,6 +102,9 @@ impl AttachInputQueue {
                 dropped: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 queued_bytes: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 drop_notice_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                recovery_notice_pending: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )),
                 capacity,
                 stall_after,
                 now,
@@ -164,6 +169,7 @@ impl AttachInputQueue {
             dropped: std::sync::Arc::clone(&self.dropped),
             queued_bytes: std::sync::Arc::clone(&self.queued_bytes),
             drop_notice_pending: std::sync::Arc::clone(&self.drop_notice_pending),
+            recovery_notice_pending: std::sync::Arc::clone(&self.recovery_notice_pending),
             now: std::sync::Arc::clone(&self.now),
         }
     }
@@ -179,6 +185,19 @@ impl AttachInputQueue {
 
     fn take_drop_notice(&self) -> bool {
         self.drop_notice_pending
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn take_recovery_notice(&self) -> bool {
+        if self.queued_bytes.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return false;
+        }
+        let status = self.status.lock().unwrap_or_else(|e| e.into_inner());
+        if status.dropping || status.permanent_failure {
+            return false;
+        }
+        drop(status);
+        self.recovery_notice_pending
             .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
@@ -274,6 +293,8 @@ impl AttachInputWriter {
             && status.delivered_bytes > status.drop_started_after
         {
             status.dropping = false;
+            self.recovery_notice_pending
+                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -329,6 +350,29 @@ fn report_attach_drop_started(queue: &AttachInputQueue, output_lock: &std::sync:
         let _ = output.flush();
     }
 }
+
+fn report_attach_recovered(queue: &AttachInputQueue, output_lock: &std::sync::Mutex<()>) {
+    if queue.take_recovery_notice() {
+        let _guard = output_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut output = std::io::stdout();
+        let _ = writeln!(
+            output,
+            "\r\n[remuda] input writer recovered; queued input resumed"
+        );
+        let _ = output.flush();
+    }
+}
+
+#[cfg(debug_assertions)]
+fn report_test_attach_dropped_count(queue: &AttachInputQueue) {
+    if let Some(path) = std::env::var_os("REMUDA_TEST_ATTACH_DROPPED_COUNT") {
+        let dropped = queue.dropped.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = std::fs::write(path, dropped.to_string());
+    }
+}
+
+#[cfg(not(debug_assertions))]
+fn report_test_attach_dropped_count(_queue: &AttachInputQueue) {}
 
 pub const EMPTY_REPLY_ERROR: &str = "the daemon hung up without answering";
 
@@ -868,6 +912,8 @@ pub fn attach_with_mouse(path: &Path, name: &str, mouse: bool) -> std::io::Resul
             let mut logged_pending_read = false;
             loop {
                 report_attach_drop_started(&input_queue, &output_lock);
+                report_attach_recovered(&input_queue, &output_lock);
+                report_test_attach_dropped_count(&input_queue);
                 if output_done.load(std::sync::atomic::Ordering::SeqCst) {
                     if output_taken_over.load(std::sync::atomic::Ordering::SeqCst) {
                         break;
@@ -1263,7 +1309,17 @@ fn exit_history_if_needed(route: &mut AttachRoute<'_>, bytes: &[u8]) {
         route.scrollback.store(0, Ordering::SeqCst);
         paint_history(route.path, route.name, 0);
     }
-    let _ = route.input.enqueue(bytes, false, false);
+    let dropped = route.input.enqueue(bytes, false, false);
+    #[cfg(debug_assertions)]
+    if bytes
+        .windows(b"DRAINED-BARRIER".len())
+        .any(|window| window == b"DRAINED-BARRIER")
+    {
+        if let Some(path) = std::env::var_os("REMUDA_TEST_ATTACH_BARRIER_RESULT") {
+            let result: &[u8] = if dropped { b"dropped" } else { b"queued" };
+            let _ = std::fs::write(path, result);
+        }
+    }
 }
 
 fn detach_offset(parser: &crate::mouse::SgrParser, bytes: &[u8]) -> Option<usize> {
@@ -1536,6 +1592,8 @@ mod tests {
         assert!(!queue.take_drop_notice());
 
         queue.writer().delivered(4);
+        assert!(queue.take_recovery_notice());
+        assert!(!queue.take_recovery_notice());
         queue.enqueue(b"123456", false, false);
         queue.enqueue(b"q", false, false);
         assert!(queue.take_drop_notice());
