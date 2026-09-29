@@ -168,10 +168,13 @@ if not windows then
   end
 
   -- A descendant can escape the process group with setsid and keep both
-  -- output pipes alive. Limit detached readers so repeated calls cannot leak
-  -- unbounded threads and file descriptors. Skip systems without setsid.
+  -- output pipes alive. Use -f explicitly: util-linux setsid otherwise forks
+  -- only when its caller is already a process-group leader. Keep the original
+  -- leader alive until process.run times out, so the assertion does not depend
+  -- on a scheduling race. Limit detached readers so repeated calls cannot leak
+  -- unbounded threads and file descriptors. Skip systems without setsid -f.
   local setsid_probe = pcall(function()
-    local probe = remuda.process.run({ argv = { "setsid", "/bin/true" }, timeout = 1 })
+    local probe = remuda.process.run({ argv = { "setsid", "-f", "/bin/true" }, timeout = 1 })
     assert(probe.code == 0, "setsid probe failed")
   end)
   if setsid_probe then
@@ -179,7 +182,7 @@ if not windows then
     local exercised_cap, cap_error = pcall(function()
       for _ = 1, 8 do
         local escaped = remuda.process.run({
-          argv = { "/bin/sh", "-c", "setsid /bin/sh -c 'echo $$; exec /bin/sleep 30' &" },
+          argv = { "/bin/sh", "-c", "setsid -f /bin/sh -c 'echo $$; exec /bin/sleep 30' & exec /bin/sleep 30" },
           timeout = 0.1,
         })
         assert(escaped.timed_out, "setsid descendant should leave output pipes open")
