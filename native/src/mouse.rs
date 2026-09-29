@@ -412,6 +412,42 @@ mod tests {
     }
 
     #[test]
+    fn unterminated_paste_timeout_releases_detach_key() {
+        let mut parser = SgrParser::default();
+        let paste = b"\x1b[200~unfinished paste";
+        assert!(parser.feed(paste).is_empty());
+
+        parser.pending_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+        assert_eq!(
+            parser.flush_expired(),
+            vec![InputToken::Paste(paste.to_vec())]
+        );
+        assert_eq!(parser.feed(&[0x1c]), vec![InputToken::Bytes(vec![0x1c])]);
+    }
+
+    #[test]
+    fn unterminated_paste_flushes_at_the_buffer_limit() {
+        let mut parser = SgrParser::default();
+        let limit = 1024 * 1024;
+        let mut paste = b"\x1b[200~".to_vec();
+        paste.resize(limit + b"\x1b[200~".len(), b'x');
+
+        let tokens = parser.feed(&paste);
+
+        assert!(
+            tokens
+                .iter()
+                .any(|token| matches!(token, InputToken::Paste(_))),
+            "the parser must forward a bounded chunk before the end marker"
+        );
+        assert!(
+            parser.pending.len() <= limit,
+            "pending paste buffer exceeds its cap: {}",
+            parser.pending.len()
+        );
+    }
+
+    #[test]
     fn encodes_events_in_the_child_encoding_and_omits_unrequested_releases() {
         let event = SgrMouse {
             button: 0,
