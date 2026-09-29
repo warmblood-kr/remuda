@@ -194,7 +194,7 @@ impl InputSender {
             Ok(Response::RateLimited) => SendOutcome::RateLimited,
             Ok(Response::RemoteControlDisabled) => SendOutcome::RemoteControlDisabled,
             Ok(Response::Error(reason)) if reason == remote_oversize_error() => {
-                SendOutcome::Error(format!("bug: {reason}"))
+                SendOutcome::IoFailure(format!("bug: {reason}"))
             }
             Ok(Response::Error(reason)) => SendOutcome::IoFailure(reason),
             Ok(other) => {
@@ -229,6 +229,7 @@ impl InputSender {
             if let Some(node) = batch.remote_node.as_deref() {
                 queue.drop_waiting_node(node, "remote control disabled");
             }
+            self.rotate_target(queue, batch);
         }
         event
     }
@@ -674,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_control_disabled_stops_target_without_rotating() {
+    fn remote_control_disabled_marks_batch_and_stops_waiting_target() {
         let (mut sender, mut queue, now) = remote_queued(b"first\r".to_vec());
         let client_id = queue.items().next().unwrap().client_id.clone();
         sender
@@ -698,6 +699,36 @@ mod tests {
             .items()
             .all(|batch| batch.state != QueueState::Waiting));
         assert_eq!(queue.items().next().unwrap().client_id, client_id);
+    }
+
+    #[test]
+    fn remote_control_disabled_rotates_client_and_restarts_sequence() {
+        let (mut sender, mut queue, now) = remote_queued(b"first\r".to_vec());
+        let first_client_id = queue.items().next().unwrap().client_id.clone();
+        assert!(queue.begin_due(now).is_some());
+        assert!(matches!(
+            sender.send_remote_started(&mut queue, now, |_, _| {
+                Ok(Response::RemoteControlDisabled)
+            }),
+            Some(QueueEvent::RemoteControlDisabled { .. })
+        ));
+
+        sender
+            .enqueue_remote(
+                &mut queue,
+                "laptop",
+                "build",
+                "remote-instance",
+                b"next\r".to_vec(),
+                now,
+            )
+            .unwrap();
+        let next = queue
+            .items()
+            .find(|batch| batch.state == QueueState::Waiting)
+            .unwrap();
+        assert_eq!(next.seq, 1);
+        assert_ne!(next.client_id, first_client_id);
     }
 
     #[test]
@@ -783,17 +814,56 @@ mod tests {
     }
 
     #[test]
-    fn remote_oversize_refusal_is_a_visible_bug_failure() {
+    fn remote_oversize_error_retries_identically_then_marks_uncertain_with_bug_notice() {
         let (mut sender, mut queue, now) = remote_queued(b"line\r".to_vec());
-        assert!(queue.begin_due(now).is_some());
-        assert!(matches!(
-            sender.send_remote_started(&mut queue, now, |_, _| {
-                Ok(Response::Error(format!(
-                    "remote Input batch exceeds {} bytes",
-                    crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES
-                )))
-            }),
-            Some(QueueEvent::Failed { reason, .. }) if reason.starts_with("bug:")
+        sender
+            .enqueue_remote(
+                &mut queue,
+                "laptop",
+                "build",
+                "remote-instance",
+                b"next\r".to_vec(),
+                now,
+            )
+            .unwrap();
+        let first_client_id = queue.items().next().unwrap().client_id.clone();
+        let mut first_request = None;
+        let oversize = Response::Error(format!(
+            "remote Input batch exceeds {} bytes",
+            crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES
         ));
+        for attempt in 0..=super::super::queue::MAX_IO_RETRIES {
+            let attempt_at = now + Duration::from_secs(u64::from(attempt));
+            assert!(queue.begin_due(attempt_at).is_some());
+            let result = sender.send_remote_started(&mut queue, attempt_at, |_, request| {
+                if let Some(first) = &first_request {
+                    assert_eq!(request, first);
+                } else {
+                    first_request = Some(request.clone());
+                }
+                Ok(oversize.clone())
+            });
+            if attempt < super::super::queue::MAX_IO_RETRIES {
+                assert!(matches!(
+                    result,
+                    Some(QueueEvent::RetryScheduled { seq: 1, .. })
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Some(QueueEvent::Uncertain { seq: 1, reason })
+                        if reason.contains("bug:") && reason.contains("exceeds")
+                ));
+            }
+        }
+        let next = queue.items().next().unwrap();
+        assert_eq!(next.state, QueueState::Uncertain);
+        assert!(next.status.contains("bug:"));
+        let waiting = queue
+            .items()
+            .find(|batch| batch.state == QueueState::Waiting)
+            .unwrap();
+        assert_eq!(waiting.seq, 1);
+        assert_ne!(waiting.client_id, first_client_id);
     }
 }
