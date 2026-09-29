@@ -448,7 +448,11 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             Err(error) => fail(format!("cluster invite: {error}")),
         },
         ClusterCommand::Join { fingerprint, invitation, bind_addr } => match cluster_join(&fingerprint, &invitation, bind_addr) {
-            Ok(()) => { println!("Joined cluster."); ExitCode::SUCCESS }
+            Ok(()) => {
+                println!("Joined cluster.");
+                report_cluster_pushes();
+                ExitCode::SUCCESS
+            }
             Err(error) => fail(format!("cluster join: {error}")),
         },
         ClusterCommand::Nodes => match remuda_native::cluster::nodes() {
@@ -533,11 +537,10 @@ fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
         Ok(true) => {}
         Err(error) => return fail(format!("cluster revoke: {error}")),
     }
-    match remuda_native::cluster::revoke(&fingerprint) {
+    match remuda_native::cluster::revoke_local(&fingerprint) {
         Ok(remuda_native::cluster::RevokeOutcome::Revoked) => {
-            println!(
-                "Node {label} revoked locally; propagates when the cluster transport is enabled."
-            );
+            println!("Node {label} revoked locally.");
+            report_cluster_pushes();
             ExitCode::SUCCESS
         }
         Ok(remuda_native::cluster::RevokeOutcome::AlreadyRevoked) => {
@@ -545,6 +548,24 @@ fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => fail(format!("cluster revoke: {error}")),
+    }
+}
+
+fn report_cluster_pushes() {
+    let peers = remuda_native::cluster::push_now();
+    if peers.is_empty() {
+        println!("Registry push: no configured peers.");
+        return;
+    }
+    for peer in peers {
+        if peer.reached {
+            println!("Registry push reached peer {}.", peer.peer_fp);
+        } else {
+            eprintln!(
+                "Registry push did not reach peer {}: {}.",
+                peer.peer_fp, peer.detail
+            );
+        }
     }
 }
 

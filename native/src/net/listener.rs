@@ -910,7 +910,25 @@ fn handle_unknown_peer_join(
             (state.admit_join)(&opened.peer_static, request.join.endpoint.as_deref())
         });
     if result.is_ok() {
-        cluster::registry_changed();
+        let joining_fp = cluster::encoding::fingerprint(&opened.peer_static);
+        let peers = cluster::push_now_excluding(Some(&joining_fp));
+        let needs_retry = peers.iter().any(|peer| !peer.reached);
+        for peer in &peers {
+            if peer.reached {
+                eprintln!(
+                    "remuda: cluster join admission reached peer {}",
+                    peer.peer_fp
+                );
+            } else {
+                eprintln!(
+                    "remuda: cluster join admission did not reach peer {}: {}",
+                    peer.peer_fp, peer.detail
+                );
+            }
+        }
+        if needs_retry {
+            cluster::registry_changed();
+        }
     }
     let response = if result.is_ok() {
         b"{\"joined\":true}".as_slice()

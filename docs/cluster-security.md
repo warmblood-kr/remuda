@@ -73,6 +73,12 @@ and aggregate registry byte caps; after it completes, ordinary origin checks
 apply to all replication updates. This trust follows the join decision: an
 admitted member already has authority to admit and revoke cluster-wide.
 
+Registry changes are pushed to reachable peers. Short-lived CLI mutations make
+a bounded push attempt for up to five seconds and report each peer's result;
+unreachable peers do not make the local mutation fail. Each daemon also pulls
+from configured admitted peers at startup and about once per minute with
+per-process jitter, so offline peers can catch up without a restart.
+
 On Windows, `cluster init` and `cluster` status refuse to access identity
 storage until owner-only ACL hardening is implemented. Track that work in
 warmblood-kr/remuda#214. Windows has no identity-storage ACL hardening in PR6.

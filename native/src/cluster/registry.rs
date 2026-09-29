@@ -22,6 +22,34 @@ pub const REGISTRY_FORMAT_MAJOR: u16 = 1;
 pub const REGISTRY_FORMAT_MINOR: u16 = 0;
 const MAX_OPTIONAL_FIELDS: usize = 8;
 const MAX_OPTIONAL_FIELDS_BYTES: usize = 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+enum RegistryLimitError {
+    EntryCount,
+    EncodedBytes,
+}
+
+impl std::fmt::Display for RegistryLimitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::EntryCount => "registry exceeds total entry cap",
+            Self::EncodedBytes => "registry exceeds byte cap",
+        })
+    }
+}
+
+impl std::error::Error for RegistryLimitError {}
+
+fn registry_entry_cap_error() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, RegistryLimitError::EntryCount)
+}
+
+fn is_registry_entry_cap_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<RegistryLimitError>())
+        == Some(&RegistryLimitError::EntryCount)
+}
 const RESERVED_ENTRY_FIELDS: [&str; 9] = [
     "node_fp",
     "static_pubkey",
@@ -257,7 +285,7 @@ impl Registry {
             }
         }
         if merged.len() > MAX_REGISTRY_ENTRIES {
-            return Err(invalid_update("registry exceeds total entry cap"));
+            return Err(registry_entry_cap_error());
         }
         let candidate = Registry {
             authorized_nodes: merged.into_values().collect(),
@@ -267,7 +295,10 @@ impl Registry {
             .len()
             > MAX_REGISTRY_BYTES
         {
-            return Err(invalid_update("registry exceeds byte cap"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                RegistryLimitError::EncodedBytes,
+            ));
         }
         self.authorized_nodes = candidate.authorized_nodes;
         Ok(())
@@ -637,7 +668,7 @@ fn merge_update_entry(
         }
     }
     if let Err(error) = compacted.merge(&received) {
-        if error.to_string() == "registry exceeds total entry cap" {
+        if is_registry_entry_cap_error(&error) {
             return Ok(None);
         }
         return Err(error);

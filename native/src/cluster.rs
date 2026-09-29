@@ -11,7 +11,7 @@ mod storage;
 
 pub use identity::NodeIdentity;
 pub use registry::{load_registry, save_registry, AuthorizedNode, NodeState, Registry};
-pub use replication::registry_changed;
+pub use replication::{push_now, push_now_excluding, registry_changed, PeerPushResult};
 
 use std::io;
 
@@ -88,9 +88,28 @@ pub fn record_join_success(
     issuer_addr: std::net::SocketAddr,
     local_endpoint: Option<std::net::SocketAddr>,
 ) -> io::Result<()> {
+    record_join_success_with_schedule(issuer_static_pubkey, issuer_addr, local_endpoint, true)
+}
+
+/// Record local join metadata for the CLI, which performs a bounded push after
+/// importing the issuer snapshot.
+pub fn record_join_success_local(
+    issuer_static_pubkey: &[u8],
+    issuer_addr: std::net::SocketAddr,
+    local_endpoint: Option<std::net::SocketAddr>,
+) -> io::Result<()> {
+    record_join_success_with_schedule(issuer_static_pubkey, issuer_addr, local_endpoint, false)
+}
+
+fn record_join_success_with_schedule(
+    issuer_static_pubkey: &[u8],
+    issuer_addr: std::net::SocketAddr,
+    local_endpoint: Option<std::net::SocketAddr>,
+    schedule: bool,
+) -> io::Result<()> {
     #[cfg(windows)]
     {
-        let _ = (issuer_static_pubkey, issuer_addr, local_endpoint);
+        let _ = (issuer_static_pubkey, issuer_addr, local_endpoint, schedule);
         return Err(identity::windows_storage_error());
     }
     #[cfg(not(windows))]
@@ -183,7 +202,7 @@ pub fn record_join_success(
             registry::save_registry_at(&dir, &registry)?;
         }
         drop(guard);
-        if changed {
+        if changed && schedule {
             replication::registry_changed();
         }
         Ok(())
@@ -383,13 +402,25 @@ pub fn format_nodes_table(identity: &NodeIdentity, registry: &Registry) -> Strin
 
 /// Revoke a member by node label or exact fingerprint under the state lock.
 pub fn revoke(_target: &str) -> io::Result<RevokeOutcome> {
+    revoke_with_schedule(_target, true)
+}
+
+/// Revoke locally for the CLI, which performs its own bounded synchronous push.
+pub fn revoke_local(_target: &str) -> io::Result<RevokeOutcome> {
+    revoke_with_schedule(_target, false)
+}
+
+fn revoke_with_schedule(target: &str, schedule: bool) -> io::Result<RevokeOutcome> {
     #[cfg(windows)]
-    return Err(identity::windows_storage_error());
+    {
+        let _ = (target, schedule);
+        return Err(identity::windows_storage_error());
+    }
     #[cfg(not(windows))]
     {
         let dir = storage::cluster_state_dir()?.join("cluster");
-        let outcome = revoke_at(&dir, _target)?;
-        if outcome == RevokeOutcome::Revoked {
+        let outcome = revoke_at(&dir, target)?;
+        if schedule && outcome == RevokeOutcome::Revoked {
             replication::registry_changed();
         }
         Ok(outcome)

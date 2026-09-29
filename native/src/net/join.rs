@@ -60,7 +60,7 @@ pub fn join(
             "join was refused",
         ));
     }
-    crate::cluster::record_join_success(
+    crate::cluster::record_join_success_local(
         &invitation.issuer_static_pubkey,
         invitation.issuer_addr,
         endpoint,

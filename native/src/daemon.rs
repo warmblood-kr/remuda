@@ -24,6 +24,9 @@ use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use crate::SystemClock;
 use portable_pty::CommandBuilder;
@@ -182,9 +185,7 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     let signals = catch_signals()?;
     let listener: Listener = ipc::listen(path)?;
-    let _ = std::thread::Builder::new()
-        .name("remuda-cluster-startup-sync".into())
-        .spawn(crate::cluster::replication::startup_sync);
+    let anti_entropy = Arc::new(AntiEntropyTask::start()?);
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
 
     let registry = Arc::new(Registry::new());
@@ -216,19 +217,109 @@ pub fn serve(path: &Path) -> std::io::Result<()> {
     }
     spawn_ticker(image.clone(), Arc::clone(&counters), Arc::clone(&registry));
     #[cfg(unix)]
-    stop_on_signals(signals, image.clone(), Arc::clone(&socket_owner));
+    stop_on_signals(
+        signals,
+        image.clone(),
+        Arc::clone(&socket_owner),
+        anti_entropy.clone(),
+    );
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let registry = Arc::clone(&registry);
         let image = image.clone();
         let counters = Arc::clone(&counters);
         let socket_owner = Arc::clone(&socket_owner);
+        let anti_entropy = anti_entropy.clone();
         std::thread::spawn(move || {
-            let _ = handle(stream, &registry, &image, &counters, socket_owner);
+            let _ = handle(
+                stream,
+                &registry,
+                &image,
+                &counters,
+                socket_owner,
+                anti_entropy,
+            );
         });
     }
+    anti_entropy.stop_and_join();
     socket_owner.cleanup();
     Ok(())
+}
+
+struct AntiEntropyTask {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl AntiEntropyTask {
+    fn start() -> std::io::Result<Self> {
+        let interval = anti_entropy_interval();
+        Self::start_with(
+            interval,
+            crate::cluster::replication::startup_sync,
+            crate::cluster::replication::anti_entropy_sync,
+        )
+    }
+
+    fn start_with(
+        interval: Duration,
+        initial_sync: impl FnOnce() + Send + 'static,
+        periodic_sync: impl Fn() + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("remuda-cluster-anti-entropy".into())
+            .spawn(move || {
+                initial_sync();
+                while matches!(
+                    stopped.recv_timeout(interval),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    periodic_sync();
+                }
+            })?;
+        Ok(Self {
+            stop,
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    fn stop_and_join(&self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = thread.join();
+        }
+    }
+
+    #[cfg(test)]
+    fn is_joined(&self) -> bool {
+        self.thread
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_none()
+    }
+}
+
+impl Drop for AntiEntropyTask {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+fn anti_entropy_interval() -> Duration {
+    if let Some(milliseconds) = std::env::var("REMUDA_TEST_CLUSTER_SYNC_INTERVAL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value >= 10)
+    {
+        return Duration::from_millis(milliseconds);
+    }
+    Duration::from_secs(60 + u64::from(std::process::id() % 11))
 }
 
 /// Serialize stale-socket removal and bind for one daemon name. The lock file
@@ -446,6 +537,7 @@ fn stop_on_signals(
     mut reader: std::os::unix::net::UnixStream,
     image: Image,
     socket_owner: Arc<SocketOwnership>,
+    anti_entropy: Arc<AntiEntropyTask>,
 ) {
     use std::io::Read;
     // Auto-started (#107), the daemon leads its own session and a HUP is a
@@ -473,6 +565,7 @@ fn stop_on_signals(
             };
             let _ = writeln!(std::io::stderr(), "remuda daemon: {name}, shutting down");
             reap_processes_before_exit(&image);
+            anti_entropy.stop_and_join();
             socket_owner.cleanup();
             std::process::exit(0);
         }
@@ -531,6 +624,7 @@ fn handle(
     image: &Image,
     counters: &crate::tick::Counters,
     socket_owner: Arc<SocketOwnership>,
+    anti_entropy: Arc<AntiEntropyTask>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let Some(request) = read_request(&stream, &mut reader)? else {
@@ -564,7 +658,7 @@ fn handle(
         // Answer before going. A client left guessing from a hung-up socket
         // cannot tell "it stopped" from "it never heard me".
         request @ Request::Shutdown { .. } => {
-            handle_shutdown(stream, registry, image, socket_owner, request)
+            handle_shutdown(stream, registry, image, socket_owner, anti_entropy, request)
         }
 
         Request::New {
@@ -662,6 +756,7 @@ fn handle_shutdown(
     registry: &Registry,
     image: &Image,
     socket_owner: Arc<SocketOwnership>,
+    anti_entropy: Arc<AntiEntropyTask>,
     request: Request,
 ) -> std::io::Result<()> {
     let Request::Shutdown {
@@ -715,6 +810,7 @@ fn handle_shutdown(
     }
     reply(&stream, &Response::Ok)?;
     reap_processes_before_exit(image);
+    anti_entropy.stop_and_join();
     socket_owner.cleanup();
     std::process::exit(0);
 }
@@ -1046,6 +1142,32 @@ mod tests {
     use remuda_core::protocol::collapse_runs;
     use std::ffi::OsStr;
     use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn anti_entropy_worker_stops_and_joins_on_shutdown() {
+        let syncs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = syncs.clone();
+        let task = super::AntiEntropyTask::start_with(
+            Duration::from_millis(10),
+            || {},
+            move || {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        task.stop_and_join();
+        assert!(task.is_joined());
+        let count_when_joined = syncs.load(std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(
+            syncs.load(std::sync::atomic::Ordering::SeqCst),
+            count_when_joined,
+            "periodic sync callback ran after shutdown joined its worker"
+        );
+    }
 
     #[test]
     fn android_runtime_base_uses_termux_temp_dir_when_xdg_is_unset() {

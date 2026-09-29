@@ -6,7 +6,7 @@ use remuda_core::protocol::{Request, Response};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,6 +16,8 @@ const WORKERS: usize = 4;
 const MAX_FETCH_PAGES: usize =
     registry::MAX_REGISTRY_ENTRIES.div_ceil(crate::net::REGISTRY_REPLICATION_PAGE_ENTRIES) + 8;
 const REPLICATION_OPERATION_TIMEOUT: Duration = Duration::from_secs(90);
+const CLI_PUSH_TIMEOUT: Duration = Duration::from_secs(5);
+const CLI_PEER_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct WorkState {
@@ -74,6 +76,115 @@ fn schedule_changes() {
 /// Schedule initial fetches without making listener or daemon startup wait.
 pub fn startup_sync() {
     enqueue_all(false);
+}
+
+/// Run one pull-only anti-entropy pass for every admitted peer with an endpoint.
+pub fn anti_entropy_sync() {
+    enqueue_all(false);
+}
+
+#[derive(Clone, Debug)]
+pub struct PeerPushResult {
+    pub peer_fp: String,
+    pub reached: bool,
+    pub detail: String,
+}
+
+/// Push the current registry to configured admitted peers before a short-lived
+/// CLI process exits. Work is bounded by five seconds total and four workers.
+pub fn push_now() -> Vec<PeerPushResult> {
+    push_now_excluding(None)
+}
+
+/// Push changes to known peers while excluding a node currently completing
+/// its join exchange; it will import this issuer's snapshot after the reply.
+pub fn push_now_excluding(excluded_peer: Option<&str>) -> Vec<PeerPushResult> {
+    let (identity, registry) = match super::nodes() {
+        Ok(Some(nodes)) => nodes,
+        Ok(None) => {
+            return vec![PeerPushResult {
+                peer_fp: "local registry".into(),
+                reached: false,
+                detail: "cluster is not initialized".into(),
+            }]
+        }
+        Err(error) => {
+            return vec![PeerPushResult {
+                peer_fp: "local registry".into(),
+                reached: false,
+                detail: error.to_string(),
+            }]
+        }
+    };
+    let peers = registry
+        .authorized_nodes
+        .iter()
+        .filter(|node| {
+            node.node_fp != identity.node_fp
+                && node.state == NodeState::Admitted
+                && Some(node.node_fp.as_str()) != excluded_peer
+        })
+        .map(|node| (node.node_fp.clone(), node.endpoint.is_some()))
+        .collect::<Vec<_>>();
+    if peers.is_empty() {
+        return Vec::new();
+    }
+
+    let deadline = Instant::now() + CLI_PUSH_TIMEOUT;
+    let next = AtomicUsize::new(0);
+    let outcomes = Mutex::new(vec![None; peers.len()]);
+    thread::scope(|scope| {
+        for _ in 0..WORKERS.min(peers.len()) {
+            scope.spawn(|| loop {
+                let index = next.fetch_add(1, Ordering::Relaxed);
+                let Some((peer_fp, has_endpoint)) = peers.get(index) else {
+                    break;
+                };
+                let result = if !has_endpoint {
+                    PeerPushResult {
+                        peer_fp: peer_fp.clone(),
+                        reached: false,
+                        detail: "no endpoint configured".into(),
+                    }
+                } else if Instant::now() >= deadline {
+                    PeerPushResult {
+                        peer_fp: peer_fp.clone(),
+                        reached: false,
+                        detail: "CLI push deadline elapsed before attempt".into(),
+                    }
+                } else {
+                    let peer_deadline = (Instant::now() + CLI_PEER_TIMEOUT).min(deadline);
+                    match push_peer_only(peer_fp, peer_deadline) {
+                        Ok(()) => PeerPushResult {
+                            peer_fp: peer_fp.clone(),
+                            reached: true,
+                            detail: "registry push acknowledged".into(),
+                        },
+                        Err(error) => PeerPushResult {
+                            peer_fp: peer_fp.clone(),
+                            reached: false,
+                            detail: error.to_string(),
+                        },
+                    }
+                };
+                outcomes.lock().unwrap_or_else(|error| error.into_inner())[index] = Some(result);
+            });
+        }
+    });
+    let outcomes = outcomes
+        .into_inner()
+        .unwrap_or_else(|error| error.into_inner());
+    outcomes
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result.unwrap_or_else(|| PeerPushResult {
+                peer_fp: peers[index].0.clone(),
+                reached: false,
+                detail: "CLI push deadline elapsed before attempt".into(),
+            })
+        })
+        .collect()
 }
 
 fn enqueue_all(push: bool) {
@@ -195,63 +306,80 @@ fn peer_material(peer_fp: &str) -> io::Result<PeerMaterial> {
 }
 
 fn replicate_peer(peer_fp: &str, push: bool) -> io::Result<()> {
-    let deadline = Instant::now() + REPLICATION_OPERATION_TIMEOUT;
+    replicate_peer_until(
+        peer_fp,
+        push,
+        Instant::now() + REPLICATION_OPERATION_TIMEOUT,
+    )
+}
+
+fn replicate_peer_until(peer_fp: &str, push: bool, deadline: Instant) -> io::Result<()> {
     let material = peer_material(peer_fp)?;
-    let endpoint = material.endpoint;
-    let peer_key = material.peer_key;
-    let local_private = material.local_private;
-    let local_registry = material.registry;
     if push {
-        let (identity, _) = super::nodes()?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized"))?;
-        let entries = snapshot_for_wire(&local_registry.authorized_nodes);
-        for chunk in entries.chunks(crate::net::REGISTRY_REPLICATION_PAGE_ENTRIES) {
-            ensure_peer_admitted(peer_fp)?;
-            let update = registry::RegistryUpdate {
-                sender_fp: identity.node_fp.clone(),
-                entries: chunk.to_vec(),
-            };
-            let encoded = update.encode()?;
-            let update_json = String::from_utf8(encoded).map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidData, "registry update is not UTF-8")
-            })?;
-            if update_json.len() > crate::net::REGISTRY_REPLICATION_PAGE_MAX_BYTES {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "registry update page exceeds byte cap",
-                ));
-            }
-            match request_with_rate_retry(
-                endpoint,
-                &peer_key,
-                &local_private,
-                &Request::ClusterRegistryUpdate { update_json },
-                deadline,
-            ) {
-                Ok(Response::ClusterRegistryAck { .. }) => {}
-                Ok(Response::Error(reason)) => {
-                    return Err(io::Error::other(format!(
-                        "peer refused registry update: {reason}"
-                    )))
-                }
-                Ok(_) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "unexpected update response",
-                    ))
-                }
-                Err(error) => return Err(io::Error::other(error)),
-            }
-        }
+        push_registry_snapshot(peer_fp, &material, deadline)?;
     }
     fetch_peer(
-        endpoint,
-        &peer_key,
-        &local_private,
+        material.endpoint,
+        &material.peer_key,
+        &material.local_private,
         peer_fp,
-        &local_registry,
+        &material.registry,
         deadline,
     )
+}
+
+fn push_peer_only(peer_fp: &str, deadline: Instant) -> io::Result<()> {
+    let material = peer_material(peer_fp)?;
+    push_registry_snapshot(peer_fp, &material, deadline)
+}
+
+fn push_registry_snapshot(
+    peer_fp: &str,
+    material: &PeerMaterial,
+    deadline: Instant,
+) -> io::Result<()> {
+    let (identity, _) = super::nodes()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized"))?;
+    let entries = snapshot_for_wire(&material.registry.authorized_nodes);
+    for chunk in entries.chunks(crate::net::REGISTRY_REPLICATION_PAGE_ENTRIES) {
+        ensure_peer_admitted(peer_fp)?;
+        let update = registry::RegistryUpdate {
+            sender_fp: identity.node_fp.clone(),
+            entries: chunk.to_vec(),
+        };
+        let encoded = update.encode()?;
+        let update_json = String::from_utf8(encoded).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "registry update is not UTF-8")
+        })?;
+        if update_json.len() > crate::net::REGISTRY_REPLICATION_PAGE_MAX_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "registry update page exceeds byte cap",
+            ));
+        }
+        match request_with_rate_retry(
+            material.endpoint,
+            &material.peer_key,
+            &material.local_private,
+            &Request::ClusterRegistryUpdate { update_json },
+            deadline,
+        ) {
+            Ok(Response::ClusterRegistryAck { .. }) => {}
+            Ok(Response::Error(reason)) => {
+                return Err(io::Error::other(format!(
+                    "peer refused registry update: {reason}"
+                )))
+            }
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected update response",
+                ))
+            }
+            Err(error) => return Err(io::Error::other(error)),
+        }
+    }
+    Ok(())
 }
 
 fn ensure_peer_admitted(peer_fp: &str) -> io::Result<()> {

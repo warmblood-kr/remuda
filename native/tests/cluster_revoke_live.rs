@@ -22,10 +22,15 @@ struct PrivateNode {
     root: PathBuf,
     runtime: PathBuf,
     name: String,
+    anti_entropy_interval_ms: Option<u64>,
 }
 
 impl PrivateNode {
     fn start(_label: &str) -> Self {
+        Self::start_with_anti_entropy(_label, None)
+    }
+
+    fn start_with_anti_entropy(_label: &str, anti_entropy_interval_ms: Option<u64>) -> Self {
         let id = NEXT_NODE_ID.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!("cr{}-{id}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -34,7 +39,7 @@ impl PrivateNode {
         std::fs::create_dir_all(&runtime).unwrap();
         std::fs::create_dir_all(&home).unwrap();
         let name = format!("c{}-{id}", std::process::id());
-        let child = spawn_daemon(&name, &runtime, &root);
+        let child = spawn_daemon(&name, &runtime, &root, anti_entropy_interval_ms);
         let pid = child.id();
         let mut node = Self {
             child,
@@ -42,6 +47,7 @@ impl PrivateNode {
             root,
             runtime,
             name,
+            anti_entropy_interval_ms,
         };
         node.wait_ready();
         node
@@ -53,7 +59,12 @@ impl PrivateNode {
 
     fn restart_daemon(&mut self) {
         self.stop_daemon();
-        self.child = spawn_daemon(&self.name, &self.runtime, &self.root);
+        self.child = spawn_daemon(
+            &self.name,
+            &self.runtime,
+            &self.root,
+            self.anti_entropy_interval_ms,
+        );
         self.pid = self.child.id();
         self.wait_ready();
     }
@@ -101,8 +112,14 @@ impl PrivateNode {
     }
 }
 
-fn spawn_daemon(name: &str, runtime: &Path, root: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_remuda"))
+fn spawn_daemon(
+    name: &str,
+    runtime: &Path,
+    root: &Path,
+    anti_entropy_interval_ms: Option<u64>,
+) -> Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+    command
         .args(["-s", name, "daemon"])
         .env("REMUDA_RUNTIME_DIR", runtime)
         .env("HOME", root.join("home"))
@@ -110,11 +127,14 @@ fn spawn_daemon(name: &str, runtime: &Path, root: &Path) -> Child {
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CACHE_HOME", root.join("cache"))
+        .env_remove("REMUDA_TEST_CLUSTER_SYNC_INTERVAL_MS")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .unwrap()
+        .stderr(Stdio::inherit());
+    if let Some(interval) = anti_entropy_interval_ms {
+        command.env("REMUDA_TEST_CLUSTER_SYNC_INTERVAL_MS", interval.to_string());
+    }
+    command.spawn().unwrap()
 }
 
 impl Drop for PrivateNode {
@@ -190,6 +210,17 @@ impl ListenerProcess {
             thread::sleep(Duration::from_millis(20));
         }
     }
+
+    fn stop(&mut self) {
+        assert!(self.runtime.starts_with(&self.root));
+        assert_eq!(
+            self.child.id(),
+            self.pid,
+            "stop only the recorded listener PID"
+        );
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 impl Drop for ListenerProcess {
@@ -201,8 +232,7 @@ impl Drop for ListenerProcess {
             self.pid,
             "drop only the recorded listener PID"
         );
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.stop();
     }
 }
 
@@ -540,6 +570,102 @@ fn wait_for_revocation_on(receiver: &PrivateNode, member_fp: &str) {
         );
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn wait_for_endpoint_on(receiver: &PrivateNode, member_fp: &str, endpoint: SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let registry = read_registry(receiver);
+        if registry.authorized_nodes.iter().any(|entry| {
+            entry.node_fp == member_fp && entry.endpoint.as_deref() == Some(&endpoint.to_string())
+        }) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "endpoint for {member_fp} did not converge"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn revoke_topology(
+    label: &str,
+) -> (
+    PrivateNode,
+    PrivateNode,
+    PrivateNode,
+    ListenerProcess,
+    ListenerProcess,
+    ListenerProcess,
+    String,
+    String,
+    String,
+) {
+    let a = PrivateNode::start_with_anti_entropy(&format!("{label}-a"), Some(200));
+    let b = PrivateNode::start_with_anti_entropy(&format!("{label}-b"), Some(200));
+    let c = PrivateNode::start_with_anti_entropy(&format!("{label}-c"), Some(200));
+    for node in [&a, &b, &c] {
+        successful(
+            node.run(&["cluster", "init"]),
+            "initialize revoke topology node",
+        );
+    }
+    let a_id = a.identity();
+    let b_id = b.identity();
+    let c_id = c.identity();
+    let a_fp = identity_fingerprint(&a_id);
+    let b_fp = identity_fingerprint(&b_id);
+    let c_fp = identity_fingerprint(&c_id);
+    let a_listener = ListenerProcess::start(&a);
+    let b_listener = ListenerProcess::start(&b);
+    let c_listener = ListenerProcess::start(&c);
+    join_member(&a, &b, &a_id, a_listener.address, b_listener.address);
+    join_member(&b, &c, &b_id, b_listener.address, c_listener.address);
+
+    // The bootstrap snapshot must carry A's endpoint to C. B's admission
+    // update must carry C's endpoint back to A so the direct push can work.
+    wait_for_endpoint_on(&c, &a_fp, a_listener.address);
+    wait_for_endpoint_on(&a, &c_fp, c_listener.address);
+    (
+        a, b, c, a_listener, b_listener, c_listener, a_fp, b_fp, c_fp,
+    )
+}
+
+#[test]
+fn revoke_cli_pushes_tombstone_across_a_b_c_join_chain() {
+    let (a, _b, c, _a_listener, _b_listener, _c_listener, _a_fp, b_fp, c_fp) =
+        revoke_topology("revoke-fast-path");
+    let started = Instant::now();
+    let output = a.run(&["cluster", "revoke", &b_fp, "--yes"]);
+    let stdout = successful(output, "revoke B with direct C push");
+    assert!(
+        stdout.contains(&format!("Registry push reached peer {c_fp}.")),
+        "revoke command did not report C reached: {stdout}"
+    );
+    wait_for_revocation_on(&c, &b_fp);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[test]
+fn periodic_pull_catches_revocation_when_c_listener_is_unreachable() {
+    let (a, _b, c, _a_listener, _b_listener, mut c_listener, _a_fp, b_fp, c_fp) =
+        revoke_topology("revoke-fallback");
+    c_listener.stop();
+
+    let output = a.run(&["cluster", "revoke", &b_fp, "--yes"]);
+    assert!(
+        output.status.success(),
+        "revoke failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&format!("Registry push did not reach peer {c_fp}")),
+        "revoke command did not report C unreachable: stdout={} stderr={stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    wait_for_revocation_on(&c, &b_fp);
 }
 
 #[test]
