@@ -5,7 +5,8 @@ use std::io::{self, Write};
 use std::path::Path;
 
 /// Write bytes to a same-directory temporary file, then replace `path`.
-/// `mode` is applied at creation on Unix and is ignored on Windows.
+/// Existing regular-file permissions are preserved; `mode` is applied to new
+/// files at creation on Unix and is ignored on Windows.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     use std::fmt::Write as _;
     #[cfg(not(unix))]
@@ -21,6 +22,19 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<(
             "atomic write path must name a file",
         ));
     }
+
+    #[cfg(unix)]
+    let existing_mode = {
+        use std::os::unix::fs::PermissionsExt;
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                Some(metadata.permissions().mode() & 0o777)
+            }
+            Ok(_) => None,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        }
+    };
 
     let mut random = [0_u8; 16];
     getrandom::fill(&mut random).map_err(|error| {
@@ -40,10 +54,17 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<(
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(mode);
+        options.mode(existing_mode.unwrap_or(mode));
     }
     let mut file = options.open(&temporary)?;
-    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    let written = file.write_all(bytes).and_then(|()| {
+        #[cfg(unix)]
+        if let Some(existing_mode) = existing_mode {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(existing_mode))?;
+        }
+        file.sync_all()
+    });
     drop(file);
     if let Err(error) = written {
         let _ = fs::remove_file(&temporary);
@@ -94,6 +115,11 @@ mod tests {
         let scratch = Scratch::new();
         let target = scratch.0.join("state");
         fs::write(&target, b"old").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        }
 
         write_atomic(&target, b"new", 0o600).unwrap();
 
@@ -104,9 +130,28 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
                 fs::metadata(target).unwrap().permissions().mode() & 0o777,
-                0o600
+                0o644
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preserves_an_existing_file_mode_when_replacing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = Scratch::new();
+        let target = scratch.0.join("secret");
+        fs::write(&target, b"old").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(&target, b"new", 0o644).unwrap();
+
+        assert_eq!(fs::read(&target).unwrap(), b"new");
+        assert_eq!(
+            fs::metadata(target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[cfg(unix)]
