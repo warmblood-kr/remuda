@@ -74,3 +74,34 @@ fn after_must_be_a_nonnegative_number() {
         "#,
     );
 }
+
+#[test]
+fn each_due_schedule_gets_a_fresh_instruction_budget() {
+    let image = schedule_image();
+    eval(
+        &image,
+        r#"
+        total = 0
+        for _ = 1, 4 do
+          remuda.schedule({
+            every = 1,
+            run = function()
+              local sum = 0
+              for i = 1, 100000 do sum = sum + i end
+              total = total + sum
+            end,
+          })
+        end
+        "#,
+    );
+    image
+        .submit_due_schedules(10.0)
+        .expect("queue native schedule tick")
+        .recv_timeout(std::time::Duration::from_secs(3))
+        .expect("native schedule tick completes")
+        .expect("schedule preparation succeeds");
+    eval(
+        &image,
+        "assert(total == 20000200000, 'each due callback should complete within its own budget')",
+    );
+}
