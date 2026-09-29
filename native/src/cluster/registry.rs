@@ -636,7 +636,12 @@ fn merge_update_entry(
             stripped += 1;
         }
     }
-    compacted.merge(&received)?;
+    if let Err(error) = compacted.merge(&received) {
+        if error.to_string() == "registry exceeds total entry cap" {
+            return Ok(None);
+        }
+        return Err(error);
+    }
     Ok(Some((compacted, stripped)))
 }
 
@@ -701,8 +706,14 @@ fn apply_join_bootstrap_at(
 ) -> io::Result<()> {
     let guard = storage::StateLock::acquire(dir)?;
     let mut registry = load_registry_at(dir)?;
+    let identity = super::identity::load_identity_at(dir)?;
     let previous = registry.clone();
-    apply_join_bootstrap_snapshot(&mut registry, update, authenticated_issuer_pubkey)?;
+    apply_join_bootstrap_snapshot(
+        &mut registry,
+        update,
+        authenticated_issuer_pubkey,
+        &identity.node_fp,
+    )?;
     if registry != previous {
         save_registry_at(dir, &registry)?;
         drop(guard);
@@ -715,10 +726,16 @@ fn apply_join_bootstrap_snapshot(
     registry: &mut Registry,
     update: &RegistryUpdate,
     authenticated_issuer_pubkey: &[u8],
+    receiver_fp: &str,
 ) -> io::Result<()> {
     validate_update(update)?;
     let mut current = authenticated_registry(registry, update, authenticated_issuer_pubkey)?;
-    let mut snapshot = update.entries.clone();
+    let mut snapshot = update
+        .entries
+        .iter()
+        .filter(|entry| !(entry.node_fp == receiver_fp && entry.state == NodeState::Revoked))
+        .cloned()
+        .collect::<Vec<_>>();
     for entry in &mut snapshot {
         entry.delivered_by = Some(update.sender_fp.clone());
     }
@@ -1854,6 +1871,63 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.dropped_registry_cap_entries, 1);
+        assert_eq!(registry.authorized_nodes.len(), MAX_REGISTRY_ENTRIES);
+    }
+
+    #[test]
+    fn tombstone_entry_cap_drop_does_not_abort_later_valid_update() {
+        let sender = admitted_sender();
+        let receiver = entry(
+            "local-receiver-at-entry-cap",
+            NodeState::Admitted,
+            1,
+            "sender",
+        );
+        let mut registry = registry_with_sender(&sender);
+        registry.authorized_nodes.push(receiver.clone());
+        let mut valid = entry(
+            "entry-cap-valid-after-tombstone",
+            NodeState::Admitted,
+            1,
+            "sender",
+        );
+        valid.by = sender.node_fp.clone();
+        registry.authorized_nodes.push(valid.clone());
+        for index in 0..MAX_REGISTRY_ENTRIES - 3 {
+            registry.authorized_nodes.push(entry(
+                &format!("entry-cap-existing-{index}"),
+                NodeState::Admitted,
+                1,
+                "sender",
+            ));
+        }
+        assert_eq!(registry.authorized_nodes.len(), MAX_REGISTRY_ENTRIES);
+        let mut unknown_tombstone = entry(
+            "entry-cap-unknown-tombstone",
+            NodeState::Revoked,
+            1,
+            "sender",
+        );
+        unknown_tombstone.by = sender.node_fp.clone();
+        valid.version += 1;
+        let update = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![unknown_tombstone, valid.clone()],
+        };
+
+        let outcome = apply_update(
+            &mut registry,
+            &update,
+            &public_key(&sender),
+            &receiver.node_fp,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.dropped_registry_cap_entries, 1);
+        assert!(registry
+            .authorized_nodes
+            .iter()
+            .any(|known| known.node_fp == valid.node_fp && known.version == valid.version));
         assert_eq!(registry.authorized_nodes.len(), MAX_REGISTRY_ENTRIES);
     }
 

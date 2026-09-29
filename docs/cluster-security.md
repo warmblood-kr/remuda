@@ -64,8 +64,9 @@ receives it, so propagation can lag between nodes. Noise authentication proves
 possession of the pinned static key, not that the member's operator or machine
 remains uncompromised.
 
-At join, the new node fetches the pinned issuer's complete registry snapshot
-over the authenticated Noise channel and imports it once. The issuer is trusted
+After a successful join, the new node fetches the pinned issuer's complete registry snapshot
+over the authenticated Noise channel and imports it. Re-running `cluster join` is a local
+operator action and can apply a fresh bootstrap snapshot again. The issuer is trusted
 for this initial view, including entries whose original admitter is not yet in
 the joiner's registry. The import still enforces page, entry, optional-field,
 and aggregate registry byte caps; after it completes, ordinary origin checks

@@ -237,11 +237,12 @@ fn join_bootstrap_imports_issuer_view_once_then_uses_origin_checks() {
         authorized_nodes: vec![issuer.clone(), joiner.clone()],
     };
     let snapshot = upd(
-        &[issuer.clone(), joiner, inherited.clone()],
+        &[issuer.clone(), joiner.clone(), inherited.clone()],
         &issuer.node_fp,
     );
 
-    apply_join_bootstrap_snapshot(&mut view, &snapshot, &public_key(&issuer)).unwrap();
+    apply_join_bootstrap_snapshot(&mut view, &snapshot, &public_key(&issuer), &joiner.node_fp)
+        .unwrap();
     assert!(view
         .authorized_nodes
         .iter()
@@ -261,4 +262,29 @@ fn join_bootstrap_imports_issuer_view_once_then_uses_origin_checks() {
         .authorized_nodes
         .iter()
         .any(|known| known.node_fp == ordinary_new.node_fp));
+}
+
+#[test]
+fn join_bootstrap_drops_issuer_self_tombstone() {
+    let mut issuer = entry("bootstrap-self-issuer", NodeState::Admitted, 1, "issuer");
+    issuer.by = issuer.node_fp.clone();
+    let mut joiner = entry("bootstrap-self-joiner", NodeState::Admitted, 1, "issuer");
+    joiner.by = issuer.node_fp.clone();
+    let mut self_tombstone = joiner.clone();
+    self_tombstone.state = NodeState::Revoked;
+    self_tombstone.version += 1;
+    self_tombstone.by = issuer.node_fp.clone();
+    let mut view = Registry {
+        authorized_nodes: vec![issuer.clone(), joiner.clone()],
+    };
+
+    apply_join_bootstrap_snapshot(
+        &mut view,
+        &upd(&[issuer.clone(), self_tombstone], &issuer.node_fp),
+        &public_key(&issuer),
+        &joiner.node_fp,
+    )
+    .unwrap();
+
+    assert_eq!(find(&view, &joiner.node_fp).state, NodeState::Admitted);
 }
