@@ -892,6 +892,220 @@ fn new_session(path: &Path, name: &str) {
     );
 }
 
+#[cfg(unix)]
+fn new_byte_capture_session(
+    path: &Path,
+    name: &str,
+    capture_path: &Path,
+    byte_count: usize,
+    wait_for_marker: Option<&Path>,
+    slow_reader: bool,
+) {
+    let reader = if wait_for_marker.is_some() {
+        format!("while [ ! -e \"$READER_MARKER\" ]; do sleep 0.02; done; ")
+            + if slow_reader {
+                "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,1024); last unless $r; print $f $b; $n-=$r; select(undef,undef,undef,0.002)}'"
+            } else {
+                "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,$n); last unless $r; print $f $b; $n-=$r}'"
+            }
+    } else if slow_reader {
+        "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,1024); last unless $r; print $f $b; $n-=$r; select(undef,undef,undef,0.002)}'"
+            .to_string()
+    } else {
+        "perl -e 'my $n=$ENV{BYTE_COUNT}; open(my $f, \">\", $ENV{CAPTURE_PATH}) or die; binmode $f; while($n>0){my $r=read(STDIN,my $b,$n); last unless $r; print $f $b; $n-=$r}'"
+            .to_string()
+    };
+    let script = format!("stty raw -echo; printf READY; {reader}");
+    let mut env = std::collections::HashMap::from([
+        ("CAPTURE_PATH".into(), capture_path.display().to_string()),
+        ("BYTE_COUNT".into(), byte_count.to_string()),
+    ]);
+    if let Some(marker) = wait_for_marker {
+        env.insert("READER_MARKER".into(), marker.display().to_string());
+    }
+    let response = client::request(
+        path,
+        &Request::New {
+            name: Some(name.into()),
+            command: vec!["sh".into(), "-c".into(), script],
+            size: Size::new(80, 24),
+            cwd: None,
+            env: Some(env),
+        },
+    )
+    .expect("start byte-capture child");
+    assert_eq!(response, Response::Value(name.into()));
+}
+
+#[cfg(unix)]
+fn wait_until_attached(path: &Path, name: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if let Ok(Response::Sessions(sessions)) = client::request(path, &Request::List) {
+            if sessions
+                .iter()
+                .any(|session| session.name == name && session.attached)
+            {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "attach client never acquired {name}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_cli_exit(viewer: &Session, name: &str) {
+    let deadline = Instant::now() + PATIENCE;
+    while viewer.is_alive() {
+        assert!(
+            Instant::now() < deadline,
+            "attach client {name} did not exit"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn stop_attach_test_daemon(path: &Path) {
+    let _ = client::request(
+        path,
+        &Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_detach_during_stalled_input_reports_loss_and_exits() {
+    let runtime = scratch_dir("attach-detach-stalled-input");
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&path);
+    let capture_path = runtime.join("captured");
+    let marker = runtime.join("start-reading");
+    let name = "target";
+    let flood = vec![b'x'; 64 * 1024];
+    new_byte_capture_session(
+        &path,
+        name,
+        &capture_path,
+        flood.len(),
+        Some(&marker),
+        false,
+    );
+
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "attach", name]);
+    command.env("REMUDA_RUNTIME_DIR", &runtime);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    let output = held.subscribe().expect("capture attach terminal");
+    wait_until_attached(&path, name);
+    wait_for_session_screen(&viewer, "READY");
+
+    held.write_raw(&flood)
+        .expect("send the stalled-child flood");
+    held.write_raw(&[client::DETACH]).expect("send Ctrl-\\");
+    wait_for_cli_exit(&viewer, name);
+    let output = collect_until_bytes(&output, b"input dropped");
+    assert!(
+        output
+            .windows(b"input dropped".len())
+            .any(|w| w == b"input dropped"),
+        "loss must be reported to the attached user: {}",
+        escaped_tail(&output)
+    );
+    std::fs::write(&marker, b"start").expect("release child for cleanup");
+    stop_attach_test_daemon(&path);
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_keys_before_detach_in_one_read_reach_the_child() {
+    let runtime = scratch_dir("attach-detach-prefix");
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&path);
+    let prefix = b"prefix!\r";
+    for run in 0..5 {
+        let name = format!("target-{run}");
+        let capture_path = runtime.join(format!("captured-{run}"));
+        new_byte_capture_session(&path, &name, &capture_path, prefix.len(), None, false);
+        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+        command.args(["-s", "s", "attach", &name]);
+        command.env("REMUDA_RUNTIME_DIR", &runtime);
+        let viewer = Session::new(
+            format!("viewer-{run}"),
+            Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
+            Arc::new(SystemClock::new()),
+        );
+        let held = viewer.attach();
+        wait_until_attached(&path, &name);
+        wait_for_session_screen(&viewer, "READY");
+
+        let mut input = prefix.to_vec();
+        input.push(client::DETACH);
+        held.write_raw(&input)
+            .expect("write prefix and detach in one key buffer");
+        wait_for_cli_exit(&viewer, &name);
+        let deadline = Instant::now() + PATIENCE;
+        while std::fs::read(&capture_path).ok().as_deref() != Some(prefix.as_slice()) {
+            assert!(
+                Instant::now() < deadline,
+                "pre-detach prefix was lost on run {run}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    stop_attach_test_daemon(&path);
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_large_paste_survives_a_slow_but_reading_child() {
+    let runtime = scratch_dir("attach-slow-reader-paste");
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&path);
+    let name = "target";
+    let capture_path = runtime.join("captured");
+    let paste = vec![b'p'; 256 * 1024];
+    new_byte_capture_session(&path, name, &capture_path, paste.len(), None, true);
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "attach", name]);
+    command.env("REMUDA_RUNTIME_DIR", &runtime);
+    let viewer = Session::new(
+        "viewer",
+        Box::new(PtyAgent::spawn(command, Size::new(80, 24)).expect("spawn attach client")),
+        Arc::new(SystemClock::new()),
+    );
+    let held = viewer.attach();
+    wait_until_attached(&path, name);
+    wait_for_session_screen(&viewer, "READY");
+
+    held.write_raw(&paste).expect("send 256 KiB paste");
+    let deadline = Instant::now() + PATIENCE;
+    while std::fs::read(&capture_path).ok().as_deref() != Some(paste.as_slice()) {
+        assert!(
+            Instant::now() < deadline,
+            "slow reader did not receive the complete paste"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = held.write_raw(&[client::DETACH]);
+    wait_for_cli_exit(&viewer, name);
+    stop_attach_test_daemon(&path);
+}
+
 #[test]
 fn session_identity_survives_as_a_new_value_after_daemon_restart_and_output_versions_advance() {
     let runtime = scratch_dir("ver-restart");
