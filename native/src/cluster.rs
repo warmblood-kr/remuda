@@ -328,6 +328,14 @@ pub fn resolve_target(
             "cluster is not initialized; run `remuda cluster init`",
         )
     })?;
+    resolve_target_in_registry(&registry, target, addr_override)
+}
+
+fn resolve_target_in_registry(
+    registry: &Registry,
+    target: &str,
+    addr_override: Option<SocketAddr>,
+) -> io::Result<ResolvedTarget> {
     let entry = resolve_node(&registry.authorized_nodes, target)?;
     if entry.state != NodeState::Admitted {
         return Err(io::Error::new(
@@ -335,10 +343,28 @@ pub fn resolve_target(
             format!("node {} is revoked", entry.node_fp),
         ));
     }
-    // PR9 adds an optional endpoint to AuthorizedNode. Until then, callers
-    // provide --addr; this function is the shared seam for that fallback.
-    let address = addr_override
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "supply --addr HOST:PORT"))?;
+    let address = match addr_override {
+        Some(address) => address,
+        None => entry
+            .endpoint
+            .as_deref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "node {} has no registry endpoint; supply --addr HOST:PORT",
+                        entry.node_fp
+                    ),
+                )
+            })?
+            .parse()
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid endpoint in cluster registry",
+                )
+            })?,
+    };
     let pinned_static_key = encoding::decode_base64(&entry.static_pubkey)?;
     if pinned_static_key.len() != 32 || encoding::fingerprint(&pinned_static_key) != entry.node_fp {
         return Err(io::Error::new(
@@ -517,6 +543,41 @@ mod nodes_revoke_tests {
         let _ = fs::remove_dir_all(&path);
         storage::create_private_directory(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn registry_entry_endpoint_resolves_without_override() {
+        let dir = temp_dir();
+        let (node, _) = identity::init_identity_at(&dir).unwrap();
+        let registry = Registry {
+            authorized_nodes: vec![AuthorizedNode {
+                node_fp: node.node_fp.clone(),
+                static_pubkey: encoding::encode_base64(&node.static_pubkey),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
+                endpoint: Some("127.0.0.1:48402".into()),
+                state: NodeState::Admitted,
+                version: 1,
+                by: node.node_fp.clone(),
+            }],
+        };
+
+        let resolved = resolve_target_in_registry(&registry, &node.node_fp, None).unwrap();
+        assert_eq!(resolved.address, "127.0.0.1:48402".parse().unwrap());
+        assert_eq!(resolved.pinned_static_key, node.static_pubkey);
+
+        let override_address = "127.0.0.1:48403".parse().unwrap();
+        let overridden =
+            resolve_target_in_registry(&registry, &node.node_fp, Some(override_address)).unwrap();
+        assert_eq!(overridden.address, override_address);
+
+        let mut revoked_registry = registry.clone();
+        revoked_registry.authorized_nodes[0].state = NodeState::Revoked;
+        let error = resolve_target_in_registry(&revoked_registry, &node.node_fp, None).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
