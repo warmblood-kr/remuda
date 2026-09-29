@@ -88,6 +88,7 @@ pub struct SgrParser {
     pending: Vec<u8>,
     pending_since: Option<std::time::Instant>,
     paste_last_input_at: Option<std::time::Instant>,
+    paste_scan_offset: usize,
     in_paste: bool,
 }
 
@@ -191,6 +192,31 @@ impl SgrParser {
                 .is_some_and(|since| since.elapsed() >= duration)
     }
 
+    /// Find a hotkey byte outside bracketed paste spans, accounting for a
+    /// marker prefix buffered by the previous read.
+    pub fn first_byte_outside_paste(&self, bytes: &[u8], target: u8) -> Option<usize> {
+        let prefix_len = self.pending.len().min(PASTE_START.len() - 1);
+        let mut scan = self.pending[self.pending.len() - prefix_len..].to_vec();
+        scan.extend_from_slice(bytes);
+        let mut in_paste = self.in_paste;
+        let mut at = 0;
+        while at < scan.len() {
+            if in_paste && scan[at..].starts_with(PASTE_END) {
+                in_paste = false;
+                at += PASTE_END.len();
+            } else if !in_paste && scan[at..].starts_with(PASTE_START) {
+                in_paste = true;
+                at += PASTE_START.len();
+            } else {
+                if !in_paste && scan[at] == target && at >= prefix_len {
+                    return Some(at - prefix_len);
+                }
+                at += 1;
+            }
+        }
+        None
+    }
+
     pub fn timeout_remaining(&self) -> Option<std::time::Duration> {
         let timeout = if self.in_paste {
             PASTE_IDLE_TIMEOUT
@@ -226,6 +252,7 @@ impl SgrParser {
             self.in_paste = false;
             self.pending_since = None;
             self.paste_last_input_at = None;
+            self.paste_scan_offset = 0;
             close_paste(std::mem::take(&mut self.pending))
         } else if self
             .pending_since
@@ -234,7 +261,7 @@ impl SgrParser {
             if self.in_paste {
                 let held = longest_suffix_prefix(&self.pending, PASTE_END);
                 let safe_len = self.pending.len().saturating_sub(held);
-                let chunk = self.pending.drain(..safe_len).collect::<Vec<_>>();
+                let chunk = self.drain_paste_prefix(safe_len);
                 self.pending_since = (!self.pending.is_empty()).then(std::time::Instant::now);
                 if chunk.is_empty() {
                     Vec::new()
@@ -253,34 +280,38 @@ impl SgrParser {
         let mut out = Vec::new();
         loop {
             if self.in_paste {
-                if let Some(end) = self
-                    .pending
+                let search_from = self.paste_scan_offset.min(self.pending.len());
+                let end = self.pending[search_from..]
                     .windows(PASTE_END.len())
                     .position(|window| window == PASTE_END)
-                {
+                    .map(|offset| search_from + offset);
+                if let Some(end) = end {
                     let len = end + PASTE_END.len();
                     if len <= PASTE_BUFFER_LIMIT {
                         out.push(InputToken::Paste(self.pending.drain(..len).collect()));
                         self.in_paste = false;
                         self.paste_last_input_at = None;
+                        self.paste_scan_offset = 0;
                     } else {
                         let chunk = end.min(PASTE_BUFFER_LIMIT);
-                        out.push(InputToken::Paste(self.pending.drain(..chunk).collect()));
+                        out.push(InputToken::Paste(self.drain_paste_prefix(chunk)));
                     }
                     continue;
                 }
+                self.paste_scan_offset = self.pending.len().saturating_sub(PASTE_END.len() - 1);
                 if self.pending.len() > PASTE_BUFFER_LIMIT {
                     let held = longest_suffix_prefix(&self.pending, PASTE_END);
                     let safe_len = self.pending.len().saturating_sub(held);
                     let chunk = safe_len.min(PASTE_BUFFER_LIMIT);
                     if chunk > 0 {
-                        out.push(InputToken::Paste(self.pending.drain(..chunk).collect()));
+                        out.push(InputToken::Paste(self.drain_paste_prefix(chunk)));
                         continue;
                     }
                 }
                 if finishing {
                     out.extend(close_paste(std::mem::take(&mut self.pending)));
                     self.in_paste = false;
+                    self.paste_scan_offset = 0;
                     continue;
                 }
                 break;
@@ -297,6 +328,7 @@ impl SgrParser {
             if self.pending.starts_with(PASTE_START) {
                 self.in_paste = true;
                 self.paste_last_input_at = Some(std::time::Instant::now());
+                self.paste_scan_offset = 0;
                 continue;
             }
             if PASTE_START.starts_with(&self.pending) {
@@ -360,6 +392,12 @@ impl SgrParser {
             }
         }
         merged
+    }
+
+    fn drain_paste_prefix(&mut self, len: usize) -> Vec<u8> {
+        let chunk = self.pending.drain(..len).collect();
+        self.paste_scan_offset = self.paste_scan_offset.saturating_sub(len);
+        chunk
     }
 }
 

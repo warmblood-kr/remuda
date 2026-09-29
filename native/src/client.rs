@@ -930,13 +930,15 @@ fn route_tokens(
 }
 
 fn detach_offset(parser: &crate::mouse::SgrParser, bytes: &[u8]) -> Option<usize> {
-    if parser.paste_open() {
+    if parser.paste_open()
+        && bytes == [DETACH]
+        && parser.paste_idle_at_least(std::time::Duration::from_secs(1))
+    {
         // While a bracketed paste is live, Ctrl-\\ is data unless it arrives
         // alone after the paste has gone idle.
-        (bytes == [DETACH] && parser.paste_idle_at_least(std::time::Duration::from_secs(1)))
-            .then_some(0)
+        Some(0)
     } else {
-        bytes.iter().position(|&byte| byte == DETACH)
+        parser.first_byte_outside_paste(bytes, DETACH)
     }
 }
 
@@ -1210,6 +1212,33 @@ mod tests {
         assert!(
             matches!(parser.finish().last(), Some(crate::mouse::InputToken::Paste(bytes)) if bytes.ends_with(b"\x1b[201~"))
         );
+    }
+
+    #[test]
+    fn detach_byte_inside_single_read_paste_is_data() {
+        let parser = crate::mouse::SgrParser::default();
+        let paste = b"\x1b[200~ab\x1ccd\x1b[201~";
+        assert_eq!(detach_offset(&parser, paste), None);
+    }
+
+    #[test]
+    fn detach_byte_inside_paste_after_split_start_marker_is_data() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[20").is_empty());
+        let tail = b"0~ab\x1ccd\x1b[201~";
+        assert_eq!(detach_offset(&parser, tail), None);
+        assert!(parser
+            .feed(tail)
+            .iter()
+            .all(|token| matches!(token, crate::mouse::InputToken::Paste(_))));
+    }
+
+    #[test]
+    fn detach_after_paste_end_in_the_same_read_is_still_a_hotkey() {
+        let mut parser = crate::mouse::SgrParser::default();
+        assert!(parser.feed(b"\x1b[200~body").is_empty());
+        let input = b"tail\x1b[201~x\x1c";
+        assert_eq!(detach_offset(&parser, input), Some(input.len() - 1));
     }
 
     #[test]
