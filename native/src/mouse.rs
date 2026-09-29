@@ -166,14 +166,18 @@ impl SgrParser {
     }
 
     pub fn timeout_remaining(&self) -> Option<std::time::Duration> {
+        if self.in_paste {
+            return None;
+        }
         self.pending_since
             .map(|since| ESC_TIMEOUT.saturating_sub(since.elapsed()))
     }
 
     pub fn flush_expired(&mut self) -> Vec<InputToken> {
-        if self
-            .pending_since
-            .is_some_and(|since| since.elapsed() >= ESC_TIMEOUT)
+        if !self.in_paste
+            && self
+                .pending_since
+                .is_some_and(|since| since.elapsed() >= ESC_TIMEOUT)
         {
             self.finish()
         } else {
@@ -195,12 +199,7 @@ impl SgrParser {
                     self.in_paste = false;
                     continue;
                 }
-                let held = longest_suffix_prefix(&self.pending, PASTE_END);
-                let deliver = self.pending.len().saturating_sub(held);
-                if deliver > 0 {
-                    out.push(InputToken::Paste(self.pending.drain(..deliver).collect()));
-                }
-                if finishing && !self.pending.is_empty() {
+                if finishing {
                     out.push(InputToken::Paste(std::mem::take(&mut self.pending)));
                 }
                 break;
@@ -215,9 +214,6 @@ impl SgrParser {
                 out.push(InputToken::Bytes(self.pending.drain(..at).collect()));
             }
             if self.pending.starts_with(PASTE_START) {
-                out.push(InputToken::Paste(
-                    self.pending.drain(..PASTE_START.len()).collect(),
-                ));
                 self.in_paste = true;
                 continue;
             }
@@ -283,13 +279,6 @@ impl SgrParser {
         }
         merged
     }
-}
-
-fn longest_suffix_prefix(bytes: &[u8], prefix: &[u8]) -> usize {
-    (1..=bytes.len().min(prefix.len()))
-        .rev()
-        .find(|&len| bytes[bytes.len() - len..] == prefix[..len])
-        .unwrap_or(0)
 }
 
 enum Parse {
@@ -396,17 +385,11 @@ mod tests {
     fn split_bracketed_paste_preserves_sgr_and_hotkey_bytes() {
         let mut parser = SgrParser::default();
         assert!(parser.feed(b"\x1b[20").is_empty());
-        assert_eq!(
-            parser.feed(b"0~\x1b[<64;1;2M\x1d\x1b[20"),
-            vec![
-                InputToken::Paste(b"\x1b[200~".to_vec()),
-                InputToken::Paste(b"\x1b[<64;1;2M\x1d".to_vec())
-            ]
-        );
+        assert!(parser.feed(b"0~\x1b[<64;1;2M\x1d\x1b[20").is_empty());
         assert_eq!(
             parser.feed(b"1~\x1b[<64;2;3M"),
             vec![
-                InputToken::Paste(b"\x1b[201~".to_vec()),
+                InputToken::Paste(b"\x1b[200~\x1b[<64;1;2M\x1d\x1b[201~".to_vec()),
                 InputToken::Mouse(SgrMouse {
                     button: 64,
                     x: 2,
@@ -441,7 +424,8 @@ mod tests {
                 event,
                 MouseState {
                     mode: MouseMode::Press,
-                    encoding: MouseEncoding::Sgr
+                    encoding: MouseEncoding::Sgr,
+                    bracketed_paste: false,
                 }
             ),
             None
@@ -451,7 +435,8 @@ mod tests {
                 event,
                 MouseState {
                     mode: MouseMode::PressRelease,
-                    encoding: MouseEncoding::Sgr
+                    encoding: MouseEncoding::Sgr,
+                    bracketed_paste: false,
                 }
             )
             .unwrap(),
@@ -465,7 +450,8 @@ mod tests {
                 },
                 MouseState {
                     mode: MouseMode::Press,
-                    encoding: MouseEncoding::Default
+                    encoding: MouseEncoding::Default,
+                    bracketed_paste: false,
                 }
             )
             .unwrap(),
@@ -480,7 +466,8 @@ mod tests {
                 },
                 MouseState {
                     mode: MouseMode::PressRelease,
-                    encoding: MouseEncoding::Sgr
+                    encoding: MouseEncoding::Sgr,
+                    bracketed_paste: false,
                 }
             ),
             None
@@ -522,6 +509,7 @@ mod tests {
                 MouseState {
                     mode: MouseMode::Press,
                     encoding: MouseEncoding::Sgr,
+                    bracketed_paste: false,
                 },
                 true,
                 0,

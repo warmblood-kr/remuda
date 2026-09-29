@@ -2679,6 +2679,32 @@ impl Drop for MouseCapture {
     }
 }
 
+#[derive(Default)]
+struct BracketedPasteCapture(bool);
+
+impl BracketedPasteCapture {
+    fn set(&mut self, enabled: bool) -> std::io::Result<()> {
+        if self.0 == enabled {
+            return Ok(());
+        }
+        if enabled {
+            crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
+        } else {
+            crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste)?;
+        }
+        self.0 = enabled;
+        Ok(())
+    }
+}
+
+impl Drop for BracketedPasteCapture {
+    fn drop(&mut self) {
+        if self.0 {
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+        }
+    }
+}
+
 /// Draw the herd until the user quits. One screen for the whole run: focus
 /// moves between the panes, and the terminal is never handed over, so the
 /// alternate screen is entered exactly once. `notice` is what stderr cannot reach.
@@ -2702,6 +2728,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
     // The exclusive hold on the focused session, and the name it was taken on.
     // Its `Drop` is the detach, so letting it fall out of scope is the release.
     let mut held: Option<(String, Hold)> = None;
+    let mut paste_capture = BracketedPasteCapture::default();
     // What the window last reported showing — refreshed only on a
     // non-skip_list wake, and reused as-is on a Type-forced one.
     let mut shown: Option<ShownTarget> = None;
@@ -2735,6 +2762,13 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 skip_list,
                 selection_moved,
             )?;
+            let paste_enabled = held.as_ref().is_some_and(|(name, _)| {
+                matches!(
+                    client::request(path, &Request::MouseState { name: name.clone() }),
+                    Ok(Response::MouseState(state)) if state.bracketed_paste
+                )
+            });
+            paste_capture.set(paste_enabled)?;
             skip_list = false;
             selection_moved = false;
         }
@@ -2752,6 +2786,15 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 let action = ui.on_key(key);
                 selection_moved = ui.selected != before;
                 action
+            }
+            Event::Paste(text) => {
+                if held.is_none() {
+                    continue;
+                }
+                let mut paste = b"\x1b[200~".to_vec();
+                paste.extend_from_slice(text.as_bytes());
+                paste.extend_from_slice(b"\x1b[201~");
+                Action::Type(paste)
             }
             Event::Mouse(m) => ui.on_mouse(m, cols, rows),
             Event::Resize(_, _) => {

@@ -3054,6 +3054,7 @@ fn direct_attach_forwards_mouse_reports_in_the_live_child_encoding() {
             Ok(Response::MouseState(MouseState {
                 mode: MouseMode::PressRelease,
                 encoding: MouseEncoding::Sgr,
+                bracketed_paste: false,
             })) => break,
             other => {
                 assert!(
