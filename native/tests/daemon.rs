@@ -161,6 +161,7 @@ fn daemon_at(path: &Path) -> impl Drop {
 }
 
 #[test]
+#[allow(clippy::disallowed_types)]
 fn daemon_keeps_answering_ls_when_cluster_listener_bind_fails() {
     use remuda_native::cluster::listener_config::{ListenerBind, ListenerConfig};
     use std::process::Command;
@@ -176,12 +177,14 @@ fn daemon_keeps_answering_ls_when_cluster_listener_bind_fails() {
     let environment = IsolatedClusterStateEnvironment::set(&home, &state);
     remuda_native::cluster::init().expect("initialize isolated cluster state");
     drop(environment);
+    let blocker = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("reserve a loopback address for the failed bind test");
     let cluster_dir = state.join("remuda/cluster");
     remuda_native::cluster::listener_config::write_at(
         &cluster_dir,
         &ListenerConfig {
             enabled: true,
-            bind: ListenerBind::Explicit("192.0.2.1:7441".parse().unwrap()),
+            bind: ListenerBind::Explicit(blocker.local_addr().unwrap()),
             allow_public: false,
         },
     )

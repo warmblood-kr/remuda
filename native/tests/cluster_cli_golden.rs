@@ -8,11 +8,9 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
-static AUTO_LISTENER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct Scratch {
     root: PathBuf,
@@ -170,12 +168,38 @@ fn normalize(input: &str, root: &Path) -> String {
         text.replace_range(start..end, "<TIME>");
     }
     text = replace_nodes(&text);
+    text = replace_listener_addresses(&text);
     text = replace_addresses(&text);
     text = replace_fingerprints_and_base64(&text);
     assert!(
         !has_token_shaped_text(&text),
         "token-shaped data survived normalization: {text}"
     );
+    text
+}
+
+fn replace_listener_addresses(input: &str) -> String {
+    let prefixes = ["Listening on ", "Listener: on "];
+    let mut text = input.to_owned();
+    for prefix in prefixes {
+        let mut out = String::new();
+        let mut rest = text.as_str();
+        while let Some(index) = rest.find(prefix) {
+            out.push_str(&rest[..index + prefix.len()]);
+            let tail = &rest[index + prefix.len()..];
+            let end = tail.find(char::is_whitespace).unwrap_or(tail.len());
+            let address = &tail[..end];
+            if address.parse::<SocketAddr>().is_ok() {
+                out.push_str("<LISTEN_ADDR>");
+                rest = &tail[end..];
+            } else {
+                out.push_str(address);
+                rest = tail;
+            }
+        }
+        out.push_str(rest);
+        text = out;
+    }
     text
 }
 
@@ -424,13 +448,18 @@ fn normalizer_self_test_removes_token_shaped_material() {
     );
     assert!(!normalized.contains(token));
     assert!(!has_token_shaped_text(&normalized));
+    let listener = normalize(
+        "Listening on 192.168.100.100:7441 (only admitted machines can connect)\nListener: on [fd00::1]:7441 (auto)",
+        root,
+    );
+    assert_eq!(
+        listener,
+        "Listening on <LISTEN_ADDR> (only admitted machines can connect)\nListener: on <LISTEN_ADDR> (auto)"
+    );
 }
 
 #[test]
 fn cluster_cli_output_matches_goldens() {
-    let _auto_listener_lock = AUTO_LISTENER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let scratch = Scratch::new();
     let _daemon = start_daemon(&scratch);
     golden_uninitialized_cases(&scratch);
@@ -465,10 +494,14 @@ fn golden_uninitialized_cases(scratch: &Scratch) {
 }
 
 fn golden_initialized_cases(scratch: &Scratch) {
-    golden("init", &scratch.run(&["cluster", "init"]), &scratch.root);
+    golden(
+        "init",
+        &scratch.run(&["cluster", "init", "--no-listen"]),
+        &scratch.root,
+    );
     golden(
         "init_existing",
-        &scratch.run(&["cluster", "init"]),
+        &scratch.run(&["cluster", "init", "--no-listen"]),
         &scratch.root,
     );
     golden(
@@ -480,7 +513,11 @@ fn golden_initialized_cases(scratch: &Scratch) {
 }
 
 fn golden_invite_join_cases(scratch: &Scratch) {
-    let invite = scratch.run(&["cluster", "invite", "--bind", "127.0.0.1:7441"]);
+    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve invite port");
+    let address = reservation.local_addr().expect("read invite port");
+    drop(reservation);
+    let address = address.to_string();
+    let invite = scratch.run(&["cluster", "invite", "--bind", &address]);
     golden("invite", &invite, &scratch.root);
     golden(
         "invite_usage",
@@ -589,9 +626,6 @@ fn golden_remaining_verb_errors(scratch: &Scratch) {
 
 #[test]
 fn cluster_join_and_peer_call_outputs_match_goldens() {
-    let _auto_listener_lock = AUTO_LISTENER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     use remuda_native::cluster::Registry;
 
     let inviter = Scratch::new();
@@ -616,6 +650,7 @@ fn cluster_join_and_peer_call_outputs_match_goldens() {
         initialized.status.success(),
         "joiner init failed: {initialized:?}"
     );
+    configure_listener(&joiner, false, "127.0.0.1:0".parse().unwrap());
     let joined = joiner.run(&["cluster", "join", &fingerprint, &join_line]);
     golden("join_success", &joined, &joiner.root);
 
@@ -654,6 +689,10 @@ fn initialized_node(scratch: &Scratch) -> TrackedChild {
         initialized.status.success(),
         "cluster init failed: {}",
         String::from_utf8_lossy(&initialized.stderr)
+    );
+    assert_eq!(
+        configure_listener(scratch, false, "127.0.0.1:0".parse().unwrap()),
+        remuda_core::protocol::ListenerStatus::Off
     );
     daemon
 }
@@ -783,9 +822,6 @@ fn d4_invite_refuses_a_failed_listener_without_printing_a_join_line() {
 
 #[test]
 fn d4_join_sends_the_joiners_bound_address_to_the_issuer_registry() {
-    let _auto_listener_lock = AUTO_LISTENER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     use remuda_native::cluster::{encoding, Registry};
 
     let inviter = Scratch::new();
@@ -825,26 +861,6 @@ fn d4_join_sends_the_joiners_bound_address_to_the_issuer_registry() {
     assert_eq!(
         entry.endpoint.as_deref(),
         Some(joiner_addr.to_string().as_str())
-    );
-}
-
-#[test]
-fn d4_init_prints_the_listener_address_and_exposure_note() {
-    let _auto_listener_lock = AUTO_LISTENER_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let scratch = Scratch::new();
-    let _daemon = start_daemon(&scratch);
-    let initialized = scratch.run(&["cluster", "init"]);
-    let stdout = String::from_utf8_lossy(&initialized.stdout);
-    assert!(initialized.status.success(), "init failed: {stdout}");
-    assert!(
-        stdout.contains("Listening on "),
-        "missing listener line: {stdout}"
-    );
-    assert!(
-        stdout.contains("only admitted machines can connect"),
-        "missing listener exposure note: {stdout}"
     );
 }
 
