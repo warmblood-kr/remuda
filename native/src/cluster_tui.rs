@@ -817,6 +817,7 @@ impl ClusterUi {
             }
             crossterm::event::Event::Paste(text) => {
                 if let Some(target) = self.remote_keys_mode.clone() {
+                    let text = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
                     let mut bytes = Vec::with_capacity(text.len() + 12);
                     bytes.extend_from_slice(b"\x1b[200~");
                     bytes.extend_from_slice(text.as_bytes());
@@ -2336,6 +2337,35 @@ mod tests {
             &requests[0].1,
             Request::Input { bytes, .. }
                 if bytes == b"\x1b[200~approval text\x1b[201~"
+        ));
+    }
+
+    #[test]
+    fn bracketed_paste_markers_inside_remote_paste_are_stripped() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.handle_event(
+            Event::Paste("left\x1b[201~middle\x1b[200~right".into()),
+            clock.now(),
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "paste should produce an Input");
+        assert!(matches!(
+            &requests[0].1,
+            Request::Input { bytes, .. }
+                if bytes == b"\x1b[200~leftmiddleright\x1b[201~"
         ));
     }
 
