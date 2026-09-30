@@ -417,20 +417,29 @@ fn driver_hosted_remote_tui_capture_shows_live_output_with_trailing_blanks() {
         invitation.status.success(),
         "cluster invite failed: {invitation:?}"
     );
-    let join_line = String::from_utf8(invitation.stdout)
-        .unwrap()
+    let invitation_text = String::from_utf8(invitation.stdout).unwrap();
+    let invite_output = invitation_text
         .lines()
-        .nth(1)
-        .expect("invitation line")
-        .to_owned();
+        .find(|line| line.starts_with("  remuda cluster join "))
+        .expect("printed join command")
+        .trim();
+    let join_command = invite_output
+        .strip_prefix("remuda cluster join '")
+        .and_then(|command| command.strip_suffix('\''))
+        .expect("shell-quoted join command");
+    let (fingerprint, join_line) = join_command
+        .split_once("' '")
+        .expect("separate fingerprint and join line");
+    assert!(!fingerprint.contains('\''));
+    assert!(!join_line.contains('\''));
     let server_address = server_listener.address.to_string();
     let join = server_node
         .command()
         .args([
             "cluster",
             "join",
-            &client_node.fingerprint(),
-            &join_line,
+            fingerprint,
+            join_line,
             "--bind",
             &server_address,
         ])
