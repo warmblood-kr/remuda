@@ -643,6 +643,13 @@ impl ClusterUi {
         } else if self.remote_active.is_some() && self.composer_focused {
             frame.push(self.composer_line());
             frame.push("Enter send · Ctrl-C clear · Esc list".into());
+        } else if self.remote_active.as_ref().is_some_and(|target| {
+            self.remote_input_enabled
+                && self
+                    .remote_session(target)
+                    .is_some_and(|(_, session)| session.alive)
+        }) {
+            frame.push("Enter type · k keys · x close · q detach".into());
         } else if self.remote_active.is_some() {
             frame.push("Remote session is read-only · q detach".into());
         } else if self.ended.is_some() {
