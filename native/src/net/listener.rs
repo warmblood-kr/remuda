@@ -37,10 +37,34 @@ const OBSERVE_INTERVAL: Duration = Duration::from_secs(5);
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 const ACCEPT_RESOURCE_BACKOFF: Duration = Duration::from_millis(250);
 const REPLAY_CAPACITY: usize = 65_536;
+const UNKNOWN_REPLAY_CAPACITY: usize = 1024;
 const REMOTE_INPUT_BYTES_PER_SECOND: usize = 256 * 1024;
 const REMOTE_INPUT_WINDOW: Duration = Duration::from_secs(1);
 const MAX_REMOTE_INPUT_PEERS: usize = 1024;
 static LISTENER_ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Return an IPv4 /32 or IPv6 /64 prefix, normalizing IPv4-mapped IPv6 to IPv4.
+pub fn peer_prefix(address: std::net::IpAddr) -> std::net::IpAddr {
+    match address {
+        std::net::IpAddr::V4(address) => std::net::IpAddr::V4(address),
+        std::net::IpAddr::V6(address) => match address.to_ipv4_mapped() {
+            Some(address) => std::net::IpAddr::V4(address),
+            None => {
+                let segments = address.segments();
+                std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                    segments[0],
+                    segments[1],
+                    segments[2],
+                    segments[3],
+                    0,
+                    0,
+                    0,
+                    0,
+                ))
+            }
+        },
+    }
+}
 
 /// Listener address and opt-in for wildcard binding.
 /// An opted-in IPv6 wildcard may accept IPv4 on dual-stack systems.
@@ -75,9 +99,59 @@ type FrameDispatcher = Arc<dyn Fn(&[u8], &[u8]) -> io::Result<Vec<u8>> + Send + 
 struct ListenerState {
     responder_private: Zeroizing<Vec<u8>>,
     replay: Mutex<replay::ReplayWindow>,
+    unknown_replay: Mutex<replay::ReplayWindow>,
     limiter: Arc<RequestLimiter>,
     join_tokens: JoinTokenStore,
     admit_join: JoinAdmitter,
+}
+
+impl ListenerState {
+    // Unknown joins and non-join frames share the per-prefix attempt bucket.
+    // Consequently, traffic from neighbours behind the same NAT or IPv6 /64
+    // can use a legitimate joiner's ten-per-minute allowance.
+    fn charge_unknown_peer(&self, address: std::net::IpAddr) -> bool {
+        self.limiter
+            .allow_join_attempt(peer_prefix(address), Instant::now())
+    }
+
+    fn check_and_insert_replay(
+        &self,
+        admitted: bool,
+        peer: &str,
+        ephemeral: [u8; 32],
+        timestamp_seconds: i64,
+        now_seconds: i64,
+    ) -> Result<(), replay::ReplayError> {
+        // Always lock in member-then-unknown order. An ephemeral first seen
+        // during a transient authorization failure must remain rejected if
+        // authorization later succeeds (and vice versa).
+        let mut member = self
+            .replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut unknown = self
+            .unknown_replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let monotonic_now = Instant::now();
+        if member.contains_at(&ephemeral, now_seconds, monotonic_now)
+            || unknown.contains_at(&ephemeral, now_seconds, monotonic_now)
+        {
+            return Err(replay::ReplayError::AlreadySeen);
+        }
+        let cache = if admitted {
+            &mut *member
+        } else {
+            &mut *unknown
+        };
+        cache.check_and_insert_at(
+            peer,
+            ephemeral,
+            timestamp_seconds,
+            now_seconds,
+            monotonic_now,
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -249,6 +323,7 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
         state: Arc::new(ListenerState {
             responder_private,
             replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
+            unknown_replay: Mutex::new(replay::ReplayWindow::new(UNKNOWN_REPLAY_CAPACITY)),
             limiter: request_limiter,
             join_tokens,
             admit_join: Arc::new(cluster::admit_join_locked),
@@ -976,16 +1051,25 @@ fn handle_connection_with(
     let peer_fp = cluster::encoding::fingerprint(&opened.peer_static);
     let admitted = authorize(&opened.peer_static).is_ok();
     let now = crate::SystemWallClock::new().unix_seconds() as i64;
-    let replay = state
-        .replay
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .check_and_insert(&peer_fp, opened.ephemeral, opened.timestamp_seconds, now);
+    if !admitted && !state.charge_unknown_peer(remote_addr.ip()) {
+        return ignore_response_error(write_http_response(
+            stream,
+            429,
+            b"join attempt rate limit reached",
+        ));
+    }
+    let replay = state.check_and_insert_replay(
+        admitted,
+        &peer_fp,
+        opened.ephemeral,
+        opened.timestamp_seconds,
+        now,
+    );
     if replay.is_err() {
         return ignore_response_error(write_http_response(stream, 409, b"replayed or stale frame"));
     }
     if !admitted {
-        return handle_unknown_peer_join(stream, remote_addr, state, opened);
+        return handle_unknown_peer_join(stream, state, opened);
     }
     // The cluster listener has two protocol verbs which the local
     // remote-control front must refuse. Decode and authorize them here,
@@ -1057,7 +1141,6 @@ fn handle_connection_with(
 
 fn handle_unknown_peer_join(
     stream: TcpStream,
-    remote_addr: SocketAddr,
     state: Arc<ListenerState>,
     opened: frame::OpenedRequest,
 ) {
@@ -1077,25 +1160,17 @@ fn handle_unknown_peer_join(
         Ok(request) => request,
         Err(_) => return ignore_response_error(write_http_response(stream, 403, b"not admitted")),
     };
-    if !state
-        .limiter
-        .allow_join_attempt(remote_addr.ip(), Instant::now())
-    {
-        return ignore_response_error(write_http_response(
-            stream,
-            429,
-            b"join attempt rate limit reached",
-        ));
-    }
     let result = state
         .join_tokens
         .verify_consume_with(&request.join.token, || {
             (state.admit_join)(&opened.peer_static, request.join.endpoint.as_deref())
         });
-    let response = if result.is_ok() {
-        b"{\"joined\":true}".as_slice()
-    } else {
-        b"{\"joined\":false}".as_slice()
+    let response = match &result {
+        Ok(_) => b"{\"joined\":true}".as_slice(),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            b"{\"joined\":false,\"retry\":true}".as_slice()
+        }
+        Err(_) => b"{\"joined\":false}".as_slice(),
     };
     send_encrypted_response(stream, opened, response);
     if result.is_ok() {
@@ -1165,6 +1240,46 @@ mod tests {
     use std::io;
     use std::io::Cursor;
     use std::sync::{mpsc, Arc};
+
+    #[test]
+    fn peer_prefix_masks_ipv6_and_normalizes_ipv4_mapped_addresses() {
+        let cases = [
+            ("192.0.2.7", "192.0.2.7"),
+            ("2001:db8:1:2:abcd:ef01:2345:6789", "2001:db8:1:2::"),
+            ("2001:db8:1:2:ffff:ffff:ffff:ffff", "2001:db8:1:2::"),
+            ("2001:db8:1:3:abcd:ef01:2345:6789", "2001:db8:1:3::"),
+            ("::ffff:192.0.2.7", "192.0.2.7"),
+        ];
+        for (address, expected) in cases {
+            assert_eq!(
+                peer_prefix(address.parse::<std::net::IpAddr>().unwrap()),
+                expected.parse::<std::net::IpAddr>().unwrap(),
+                "{address}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_peer_addresses_in_one_ipv6_64_share_budget() {
+        let limiter = RequestLimiter::default();
+        let now = Instant::now();
+        for host in 1..=MAX_JOIN_ATTEMPTS_PER_IP {
+            let address = std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001,
+                0xdb8,
+                0,
+                1,
+                0,
+                0,
+                0,
+                host as u16,
+            ));
+            assert!(limiter.allow_join_attempt(peer_prefix(address), now));
+        }
+        let another_host =
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 0xff));
+        assert!(!limiter.allow_join_attempt(peer_prefix(another_host), now));
+    }
 
     #[cfg(unix)]
     struct TestControlSettings(PathBuf);
@@ -1284,6 +1399,7 @@ mod tests {
             let state = Arc::new(ListenerState {
                 responder_private: Zeroizing::new(responder_private),
                 replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
+                unknown_replay: Mutex::new(replay::ReplayWindow::new(UNKNOWN_REPLAY_CAPACITY)),
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
                 admit_join,
@@ -1362,6 +1478,7 @@ mod tests {
             let state = Arc::new(ListenerState {
                 responder_private: Zeroizing::new(responder_private),
                 replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
+                unknown_replay: Mutex::new(replay::ReplayWindow::new(UNKNOWN_REPLAY_CAPACITY)),
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
                 admit_join: Arc::new(cluster::admit_join_locked),
@@ -1397,10 +1514,16 @@ mod tests {
         }
 
         fn exchange(&self, sealed: frame::SealedRequest) -> (u16, Vec<u8>) {
+            self.exchange_with_timeout(sealed, Duration::from_secs(2))
+        }
+
+        fn exchange_with_timeout(
+            &self,
+            sealed: frame::SealedRequest,
+            timeout: Duration,
+        ) -> (u16, Vec<u8>) {
             let mut stream = TcpStream::connect(self.address).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
+            stream.set_read_timeout(Some(timeout)).unwrap();
             write_http_request(&mut stream, &sealed.message);
             let (status, body) = read_http_response(&mut stream).unwrap();
             if status == 200 {
@@ -2284,6 +2407,183 @@ mod tests {
         assert!(parse_http_request(Cursor::new(oversized_headers)).is_err());
     }
 
+    struct MutationRng(u64);
+
+    impl MutationRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn index(&mut self, length: usize) -> usize {
+            (self.next() as usize) % length.max(1)
+        }
+    }
+
+    fn mutate_http_request(seed: &[u8], rng: &mut MutationRng, operation: usize) -> Vec<u8> {
+        match operation % 5 {
+            0 => {
+                let mut bytes = seed.to_vec();
+                let index = rng.index(bytes.len());
+                bytes[index] ^= 1 << rng.index(8);
+                bytes
+            }
+            1 => {
+                let mut bytes = seed.to_vec();
+                bytes.truncate(rng.index(bytes.len()));
+                bytes
+            }
+            2 => {
+                let mut bytes = seed.to_vec();
+                let index = rng.index(bytes.len());
+                bytes.insert(index, bytes[index]);
+                bytes
+            }
+            3 => format!(
+                "POST /cluster HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\n\r\n",
+                MAX_BODY_BYTES + 1
+            )
+            .into_bytes(),
+            _ => {
+                let mut bytes = b"POST /cluster HTTP/1.1\r\n".to_vec();
+                for _ in 0..=MAX_HEADER_COUNT {
+                    bytes.extend_from_slice(b"X-Test: y\r\n");
+                }
+                bytes.extend_from_slice(b"Content-Length: 0\r\n\r\n");
+                bytes
+            }
+        }
+    }
+
+    fn mutate_frame(seed: &[u8], rng: &mut MutationRng, operation: usize) -> Vec<u8> {
+        match operation % 5 {
+            0 => {
+                let mut bytes = seed.to_vec();
+                let index = rng.index(bytes.len());
+                bytes[index] ^= 1 << rng.index(8);
+                bytes
+            }
+            1 => {
+                let mut bytes = seed.to_vec();
+                bytes.truncate(rng.index(bytes.len()));
+                bytes
+            }
+            2 => {
+                let mut bytes = seed.to_vec();
+                let index = rng.index(bytes.len());
+                bytes.insert(index, bytes[index]);
+                bytes
+            }
+            3 => vec![0; MAX_BODY_BYTES + 1],
+            _ => {
+                let mut bytes = seed.to_vec();
+                bytes[..32].fill(0);
+                bytes
+            }
+        }
+    }
+
+    fn run_preauth_mutations(mutations_per_target: usize) {
+        // A per-input bound catches a hang or a super-linear blow-up on one input
+        // without failing slow, instrumented (coverage) CI builds.
+        const PER_INPUT_LIMIT: Duration = Duration::from_secs(1);
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let initiator = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let sealed = frame::seal_request(
+            &initiator.private,
+            &responder.public,
+            1_700_000_000,
+            b"seed",
+        )
+        .unwrap();
+        let http_seed = b"POST /cluster HTTP/1.1\r\nHost: node\r\nContent-Length: 4\r\n\r\nseed";
+        let mut rng = MutationRng(0x9e37_79b9_7f4a_7c15);
+
+        let oversized_length = format!(
+            "POST /cluster HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        assert_eq!(
+            parse_http_request(Cursor::new(oversized_length))
+                .err()
+                .unwrap()
+                .to_string(),
+            "HTTP body exceeds byte cap"
+        );
+        let mut header_flood = b"POST /cluster HTTP/1.1\r\n".to_vec();
+        for _ in 0..=MAX_HEADER_COUNT {
+            header_flood.extend_from_slice(b"X-Test: y\r\n");
+        }
+        header_flood.extend_from_slice(b"Content-Length: 0\r\n\r\n");
+        assert_eq!(
+            parse_http_request(Cursor::new(header_flood))
+                .err()
+                .unwrap()
+                .to_string(),
+            "HTTP request exceeds header count cap"
+        );
+        assert_eq!(
+            frame::open_request(&responder.private, &[0; 31])
+                .err()
+                .unwrap()
+                .to_string(),
+            "invalid Noise IK frame"
+        );
+
+        assert!(parse_http_request(Cursor::new(http_seed)).is_ok());
+        assert!(frame::open_request(&responder.private, &sealed.message).is_ok());
+        for mutation in 0..mutations_per_target {
+            let bytes = mutate_http_request(http_seed, &mut rng, mutation);
+            let started = Instant::now();
+            assert!(bytes.len() <= MAX_HEADER_BYTES + MAX_BODY_BYTES + MAX_REQUEST_LINE_BYTES);
+            let parsed =
+                std::panic::catch_unwind(|| parse_http_request(Cursor::new(bytes.as_slice())))
+                    .unwrap_or_else(|_| panic!("HTTP parser panicked at mutation {mutation}"));
+            assert!(
+                started.elapsed() < PER_INPUT_LIMIT,
+                "HTTP parser took {:?} on mutation {mutation}",
+                started.elapsed()
+            );
+            if let Ok(parsed) = parsed {
+                assert!(parsed.body.len() <= MAX_BODY_BYTES);
+            }
+        }
+        for mutation in 0..mutations_per_target {
+            let bytes = mutate_frame(&sealed.message, &mut rng, mutation);
+            assert!(bytes.len() <= MAX_BODY_BYTES + 1);
+            let started = Instant::now();
+            let opened = std::panic::catch_unwind(|| {
+                frame::open_request(&responder.private, bytes.as_slice())
+            })
+            .unwrap_or_else(|_| panic!("Noise frame decoder panicked at mutation {mutation}"));
+            assert!(
+                started.elapsed() < PER_INPUT_LIMIT,
+                "Noise frame decoder took {:?} on mutation {mutation}",
+                started.elapsed()
+            );
+            if let Ok(opened) = opened {
+                assert!(opened.payload.len() <= MAX_BODY_BYTES);
+            }
+        }
+    }
+
+    #[test]
+    fn preauth_mutations_do_not_panic_or_exceed_caps() {
+        run_preauth_mutations(1_000);
+    }
+
+    #[test]
+    #[ignore = "manual deep pre-auth mutation run"]
+    fn preauth_mutations_long_do_not_panic_or_exceed_caps() {
+        run_preauth_mutations(100_000);
+    }
+
     #[test]
     fn authorization_is_rechecked_after_a_held_request_before_data_returns() {
         let pair = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
@@ -2456,7 +2756,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn socket_admits_unknown_join_once_and_passes_optional_endpoint() {
+    fn valid_token_admits_once_and_passes_optional_endpoint() {
         let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
             .generate_keypair()
             .unwrap();
@@ -2610,6 +2910,177 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unknown_peer_flood_does_not_exhaust_admitted_replay_capacity() {
+        let (server, member, _) = socket_server(
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+        );
+        // The member window is the single shared cache in the pre-fix
+        // implementation. Keep it small so this regression fails there.
+        *server.state.replay.lock().unwrap() = replay::ReplayWindow::new(2);
+        *server.state.unknown_replay.lock().unwrap() = replay::ReplayWindow::new(2);
+        let join = br#"{"join":{"token":"bad"}}"#;
+        for _ in 0..2 {
+            let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+                .generate_keypair()
+                .unwrap();
+            let sealed = sealed_payload_request(&unknown, &server, join);
+            assert_eq!(server.exchange(sealed).0, 200);
+        }
+        let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let (status, _) = server.exchange(sealed_payload_request(&unknown, &server, join));
+        assert_eq!(status, 409);
+
+        let (status, response) = server.exchange(sealed_list_request(&member, &server));
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Response>(&response).unwrap(),
+            Response::Ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn member_frame_seen_while_authorization_fails_cannot_replay_after_recovery() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let authorization_recovers = Arc::new(AtomicBool::new(false));
+        let authorization_state = authorization_recovers.clone();
+        let authorize: MemberAuthorizer = Arc::new(move |_| {
+            if authorization_state.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(permission_denied())
+            }
+        });
+        let server = SocketTestServer::start(
+            responder.private,
+            responder.public,
+            authorize,
+            Arc::new(|_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
+            ConnectionLimits {
+                outer_hold: socket_test_timeout(),
+                post_dispatch_hold: socket_test_timeout(),
+                idle_read: socket_test_timeout(),
+                total_read: socket_test_timeout(),
+            },
+        );
+
+        let sealed = sealed_list_request(&peer, &server);
+        let body = sealed.message.clone();
+        assert_eq!(server.exchange(sealed).0, 403);
+
+        authorization_recovers.store(true, Ordering::SeqCst);
+        let headers = format!("Content-Length: {}\r\n", body.len());
+        assert_eq!(server.send_raw(&body, headers.as_bytes()).unwrap().0, 409);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_peer_frame_does_not_touch_member_replay_cache() {
+        let (server, _, _) = socket_server(
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+        );
+        let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let before = server.state.replay.lock().unwrap().len();
+        let sealed = sealed_payload_request(&unknown, &server, br#"{"join":{"token":"bad"}}"#);
+        assert_eq!(server.exchange(sealed).0, 200);
+        assert_eq!(server.state.replay.lock().unwrap().len(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_peer_replay_is_refused() {
+        let (server, _, _) = socket_server(
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+        );
+        let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let sealed = sealed_payload_request(&unknown, &server, br#"{"join":{"token":"bad"}}"#);
+        let body = sealed.message.clone();
+        assert_eq!(server.exchange(sealed).0, 200);
+        let headers = format!("Content-Length: {}\r\n", body.len());
+        assert_eq!(server.send_raw(&body, headers.as_bytes()).unwrap().0, 409);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_peer_ip_is_charged_before_replay_insert() {
+        let (server, _, _) = socket_server(
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+        );
+        let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let join = br#"{"join":{"token":"bad"}}"#;
+        for _ in 0..MAX_JOIN_ATTEMPTS_PER_IP {
+            assert_eq!(
+                server
+                    .exchange(sealed_payload_request(&unknown, &server, join))
+                    .0,
+                200
+            );
+        }
+        let before = server.state.unknown_replay.lock().unwrap().len();
+        let (status, _) = server.exchange(sealed_payload_request(&unknown, &server, join));
+        assert_eq!(status, 429);
+        assert_eq!(server.state.unknown_replay.lock().unwrap().len(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_join_unknown_frames_are_charged_before_replay_insert() {
+        let (server, _, _) = socket_server(
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+        );
+        let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let payload = serde_json::to_vec(&Request::List).unwrap();
+        for _ in 0..MAX_JOIN_ATTEMPTS_PER_IP {
+            assert_eq!(
+                server
+                    .exchange(sealed_payload_request(&unknown, &server, &payload))
+                    .0,
+                403
+            );
+        }
+        let before = server.state.unknown_replay.lock().unwrap().len();
+        let (status, _) = server.exchange(sealed_payload_request(&unknown, &server, &payload));
+        assert_eq!(status, 429);
+        assert_eq!(server.state.unknown_replay.lock().unwrap().len(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn bad_join_tokens_are_rate_limited_without_writing_token_state() {
         use std::os::unix::fs::MetadataExt;
 
@@ -2651,6 +3122,207 @@ mod tests {
             initial_inode,
             "bad tokens must not replace token state"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_join_token_does_not_wait_for_identity_lock() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let server = SocketTestServer::start_production(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Err(permission_denied())),
+            Arc::new(|_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
+        );
+        let token_path = server.state_dir.join("join_tokens.json");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !token_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(token_path.exists(), "listener startup observes token state");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(server.state_dir.join("identity.lock"))
+            .unwrap();
+        let lock_deadline = Instant::now() + Duration::from_secs(1);
+        let mut locked = false;
+        while Instant::now() < lock_deadline {
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                locked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(locked, "could not acquire test identity.lock");
+
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "join": { "token": crate::cluster::encoding::encode_base64(&[9; 32]) }
+        }))
+        .unwrap();
+        let sealed = sealed_payload_request(&peer, &server, &payload);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let exchange_thread =
+            std::thread::spawn(move || sender.send(server.exchange(sealed)).unwrap());
+        let early_response = receiver.recv_timeout(Duration::from_millis(250));
+        let was_prompt = early_response.is_ok();
+        let unlock_result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+        assert_eq!(unlock_result, 0);
+        drop(lock);
+        let response = match early_response {
+            Ok(response) => response,
+            Err(_) => receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+        };
+        exchange_thread.join().unwrap();
+        assert!(was_prompt, "unknown join token waited for identity.lock");
+        assert_eq!(response, (200, b"{\"joined\":false}".to_vec()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_accepts_token_minted_by_another_store_immediately() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let server = SocketTestServer::start_with_admitter(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Err(permission_denied())),
+            Arc::new(|_, _| panic!("Join must not reach daemon dispatch")),
+            ConnectionLimits {
+                outer_hold: socket_test_timeout(),
+                post_dispatch_hold: socket_test_timeout(),
+                idle_read: socket_test_timeout(),
+                total_read: socket_test_timeout(),
+            },
+            Arc::new(|_, _| Ok(())),
+        );
+        let cli_store =
+            JoinTokenStore::open_at(&server.state_dir, Arc::new(crate::SystemWallClock::new()))
+                .unwrap();
+        let minted = cli_store.mint().unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "join": { "token": minted.token.as_str() }
+        }))
+        .unwrap();
+        let sealed = sealed_payload_request(&peer, &server, &payload);
+        assert_eq!(
+            server.exchange(sealed),
+            (200, b"{\"joined\":true}".to_vec())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_join_waits_for_lock_contention_and_timeout_keeps_token_usable() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let admitted = admissions.clone();
+        let server = SocketTestServer::start_with_admitter(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Err(permission_denied())),
+            Arc::new(|_, _| panic!("Join must not reach daemon dispatch")),
+            ConnectionLimits {
+                outer_hold: Duration::from_secs(8),
+                post_dispatch_hold: Duration::from_secs(8),
+                idle_read: Duration::from_secs(8),
+                total_read: Duration::from_secs(8),
+            },
+            Arc::new(move |_, _| {
+                admitted.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        );
+        let token_store =
+            JoinTokenStore::open_at(&server.state_dir, Arc::new(crate::SystemWallClock::new()))
+                .unwrap();
+
+        let mint_request = || {
+            let minted = token_store.mint().unwrap();
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "join": { "token": minted.token.as_str() }
+            }))
+            .unwrap();
+            (minted, payload)
+        };
+        let hold_lock = || {
+            let path = server.state_dir.join("identity.lock");
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .open(path)
+                    .unwrap();
+                assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+            });
+            locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            (holder, release_tx)
+        };
+
+        let (_, short_wait_payload) = mint_request();
+        let (short_wait_holder, release_short_wait) = hold_lock();
+        let release_short_wait = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            release_short_wait.send(()).unwrap();
+        });
+        let short_wait = sealed_payload_request(&peer, &server, &short_wait_payload);
+        assert_eq!(
+            server.exchange_with_timeout(short_wait, Duration::from_secs(2)),
+            (200, b"{\"joined\":true}".to_vec())
+        );
+        release_short_wait.join().unwrap();
+        short_wait_holder.join().unwrap();
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+
+        let (timed_token, timed_payload) = mint_request();
+        let (timeout_holder, release_timeout) = hold_lock();
+        let timed_request = sealed_payload_request(&peer, &server, &timed_payload);
+        assert_eq!(
+            server.exchange_with_timeout(timed_request, Duration::from_secs(7)),
+            (200, b"{\"joined\":false,\"retry\":true}".to_vec())
+        );
+        release_timeout.send(()).unwrap();
+        timeout_holder.join().unwrap();
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+
+        let retry = serde_json::to_vec(&serde_json::json!({
+            "join": { "token": timed_token.token.as_str() }
+        }))
+        .unwrap();
+        let retry = sealed_payload_request(&peer, &server, &retry);
+        assert_eq!(server.exchange(retry), (200, b"{\"joined\":true}".to_vec()));
+        assert_eq!(admissions.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(unix)]

@@ -46,6 +46,12 @@ impl ReplayWindow {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code, clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
     /// Accept a fresh frame timestamped within ±60 seconds of `now_seconds`.
     pub fn check_and_insert(
         &mut self,
@@ -61,6 +67,17 @@ impl ReplayWindow {
             now_seconds,
             Instant::now(),
         )
+    }
+
+    /// Expire old entries and check whether an ephemeral is still cached.
+    pub fn contains_at(
+        &mut self,
+        ephemeral: &[u8; 32],
+        now_seconds: i64,
+        monotonic_now: Instant,
+    ) -> bool {
+        self.evict_expired(monotonic_now, now_seconds);
+        self.seen.contains_key(ephemeral)
     }
 
     /// Variant with an injected monotonic clock for deterministic eviction tests.
