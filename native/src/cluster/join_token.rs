@@ -17,7 +17,7 @@ const TOKEN_FILE: &str = "join_tokens.json";
 const TOKEN_LIFETIME_SECONDS: u64 = 10 * 60;
 const MAX_OUTSTANDING_TOKENS: usize = 16;
 const MAX_TOKEN_FILE_SIZE: usize = 8 * 1024;
-const JOIN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(200);
+const JOIN_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 const NOISE_PATTERN: &str = "Noise_NN_25519_ChaChaPoly_SHA256";
 
 /// A newly minted bearer token. Keep `token` secret; the state file stores only its hash.
@@ -481,6 +481,6 @@ mod tests {
         };
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
         assert!(started.elapsed() >= JOIN_LOCK_WAIT);
-        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(started.elapsed() < std::time::Duration::from_millis(1500));
     }
 }
