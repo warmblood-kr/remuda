@@ -61,6 +61,7 @@ impl LineComposer {
                 self.cursor = self.text.chars().count();
                 ComposerAction::None
             }
+            KeyCode::Esc => ComposerAction::Detach,
             KeyCode::Backspace => {
                 self.backspace();
                 ComposerAction::None
@@ -156,6 +157,10 @@ mod tests {
         );
         assert_eq!(
             composer.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL)),
+            ComposerAction::Detach
+        );
+        assert_eq!(
+            composer.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             ComposerAction::Detach
         );
     }
