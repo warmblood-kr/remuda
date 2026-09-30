@@ -430,6 +430,8 @@ pub enum ListenerStatus {
     Failed(String),
 }
 
+const LISTENER_HOST_LOCK_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
 pub struct ListenerTask {
     status: Arc<Mutex<ListenerStatus>>,
     stop: std::sync::mpsc::Sender<()>,
@@ -438,6 +440,10 @@ pub struct ListenerTask {
 
 impl ListenerTask {
     pub fn start(daemon_path: &Path) -> Self {
+        Self::start_with_retry_interval(daemon_path, LISTENER_HOST_LOCK_RETRY_INTERVAL)
+    }
+
+    fn start_with_retry_interval(daemon_path: &Path, retry_interval: Duration) -> Self {
         let status = Arc::new(Mutex::new(ListenerStatus::Off));
         let (stop, stopped) = std::sync::mpsc::channel();
         let status_for_thread = Arc::clone(&status);
@@ -445,16 +451,26 @@ impl ListenerTask {
         let thread = std::thread::Builder::new()
             .name("remuda-cluster-listener".into())
             .spawn(move || {
-                let result = start_listener(&daemon_path, &status_for_thread, stopped);
+                let result =
+                    start_listener(&daemon_path, &status_for_thread, stopped, retry_interval);
                 if let Err(reason) = result {
                     set_listener_status(&status_for_thread, ListenerStatus::Failed(reason));
                 }
-            })
-            .expect("spawn cluster listener task");
+            });
+        let thread = match thread {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                set_listener_status(
+                    &status,
+                    ListenerStatus::Failed(format!("spawn cluster listener task: {error}")),
+                );
+                None
+            }
+        };
         Self {
             status,
             stop,
-            thread: Mutex::new(Some(thread)),
+            thread: Mutex::new(thread),
         }
     }
 
@@ -497,6 +513,7 @@ fn start_listener(
     daemon_path: &Path,
     status: &Arc<Mutex<ListenerStatus>>,
     stopped: std::sync::mpsc::Receiver<()>,
+    retry_interval: Duration,
 ) -> Result<(), String> {
     use crate::cluster::listener_config::ListenerBind;
 
@@ -512,59 +529,71 @@ fn start_listener(
         ),
         ListenerBind::Explicit(address) => (address, false),
     };
+    crate::net::listener::validate_bind_address(address, config.allow_public)
+        .map_err(|error| format!("validate cluster listener bind: {error}"))?;
 
-    let _host_lock = match crate::cluster::try_acquire_listener_host_lock() {
-        Ok(lock) => lock,
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            return Err("hosted by another daemon".into())
-        }
-        Err(error) => return Err(format!("lock cluster listener: {error}")),
-    };
-    let listener = crate::net::listener::bind(
-        crate::net::listener::ListenerConfig {
-            bind_addr: address,
-            allow_unspecified: config.allow_public,
-        },
-        daemon_path,
-    )
-    .map_err(|error| format!("bind cluster listener: {error}"))?;
-    let address = listener
-        .local_addr()
-        .map_err(|error| format!("read cluster listener address: {error}"))?;
-    set_listener_status(
-        status,
-        ListenerStatus::On {
-            addr: address,
-            auto,
-        },
-    );
-
-    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let serve_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    std::thread::scope(|scope| {
-        let watcher_flag = Arc::clone(&stop_flag);
-        let watcher_done = Arc::clone(&serve_done);
-        let watcher = scope.spawn(move || loop {
-            match stopped.recv_timeout(Duration::from_millis(25)) {
-                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    watcher_flag.store(true, Ordering::Release);
-                    break;
+    loop {
+        let host_lock = match crate::cluster::try_acquire_listener_host_lock() {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                set_listener_status(
+                    status,
+                    ListenerStatus::Failed("hosted by another daemon".into()),
+                );
+                match stopped.recv_timeout(retry_interval) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                    if watcher_done.load(Ordering::Acquire) =>
-                {
-                    break;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             }
+            Err(error) => return Err(format!("lock cluster listener: {error}")),
+        };
+        let listener = crate::net::listener::bind(
+            crate::net::listener::ListenerConfig {
+                bind_addr: address,
+                allow_unspecified: config.allow_public,
+            },
+            daemon_path,
+        )
+        .map_err(|error| format!("bind cluster listener: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read cluster listener address: {error}"))?;
+        set_listener_status(
+            status,
+            ListenerStatus::On {
+                addr: address,
+                auto,
+            },
+        );
+
+        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serve_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        return std::thread::scope(|scope| {
+            let watcher_flag = Arc::clone(&stop_flag);
+            let watcher_done = Arc::clone(&serve_done);
+            let watcher = scope.spawn(move || loop {
+                match stopped.recv_timeout(Duration::from_millis(25)) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        watcher_flag.store(true, Ordering::Release);
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if watcher_done.load(Ordering::Acquire) =>
+                    {
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            });
+            let result = listener
+                .serve_until(&stop_flag)
+                .map_err(|error| format!("serve cluster listener: {error}"));
+            serve_done.store(true, Ordering::Release);
+            let _ = watcher.join();
+            drop(host_lock);
+            result
         });
-        let result = listener
-            .serve_until(&stop_flag)
-            .map_err(|error| format!("serve cluster listener: {error}"));
-        serve_done.store(true, Ordering::Release);
-        let _ = watcher.join();
-        result
-    })
+    }
 }
 
 /// Serialize stale-socket removal and bind for one daemon name. The lock file
@@ -2284,9 +2313,10 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 mod tests {
     use super::{
         acquire_sync_permit, forward_attach_input, report_attach_input_failure, runtime_base_for,
-        shell_or_default, ListenerStatus, ListenerTask, SyncPermit, ATTACH_INPUT_FAILURE_NOTICE,
-        MAX_CONCURRENT_SYNCS,
+        shell_or_default, SyncPermit, ATTACH_INPUT_FAILURE_NOTICE, MAX_CONCURRENT_SYNCS,
     };
+    #[cfg(not(windows))]
+    use super::{ListenerStatus, ListenerTask};
     use remuda_core::agent::{AgentError, Color, StyledCell};
     use remuda_core::protocol::collapse_runs;
     use remuda_core::protocol::Response;
@@ -2523,9 +2553,10 @@ mod tests {
             let environment = ListenerTaskEnvironment::new(Some(listener_config(bind)));
             let task = ListenerTask::start(&environment.socket_path());
             match wait_for_listener_terminal_status(&task) {
-                ListenerStatus::Failed(reason) => assert!(
-                    reason.contains("allow_public"),
-                    "non-private specific bind {bind} should explain the required opt-in: {reason}"
+                ListenerStatus::Failed(reason) => assert_eq!(
+                    reason,
+                    "validate cluster listener bind: non-private listener bind requires explicit allow_public opt-in",
+                    "non-private specific bind {bind} should be refused by policy before bind"
                 ),
                 status => panic!("expected public bind rejection for {bind}, got {status:?}"),
             }
