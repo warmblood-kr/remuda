@@ -99,17 +99,21 @@ remuda.extension_command("deferred", function(args)
       reply:resolve(0, string.rep("x", 16 * 1024 * 1024), "")
     end }
     return reply
-  elseif args[1] == "secret" or args[1] == "secret_session" then
+  elseif args[1] == "secret" or args[1] == "secret_session" or args[1] == "secret_unicode" or args[1] == "secret_long" then
     local reply = remuda.pending { timeout = 5 }
     local label = "deferred test secret"
     if args[1] == "secret_session" then
       label = "deferred " .. string.char(27) .. "test secret"
+    elseif args[1] == "secret_unicode" then
+      label = "before" .. string.char(226, 128, 139, 226, 128, 174, 226, 128, 168, 226, 128, 169) .. "after"
+    elseif args[1] == "secret_long" then
+      label = string.rep("x", 300)
     end
     reply:prompt_secret { label = label, callback = function(secret, err)
       if err then
         reply:reject("secret prompt " .. err .. "\nNext: remuda deferred --password-file PATH")
       else
-        reply:resolve(0, "secret accepted", "")
+        reply:resolve(0, "secret length: " .. #secret, "")
       end
     end }
     return reply
@@ -505,8 +509,8 @@ fn secret_prompt_non_tty_fallback_and_answer_do_not_leak() {
     let prompt_id = match prompt {
         Response::PromptSecret { id, label, .. } => {
             assert_eq!(
-                label, "deferred test secret",
-                "outside caller gets no prefix"
+                label, "remuda[outside] deferred test secret",
+                "outside caller label must include its provenance tag"
             );
             id
         }
@@ -660,28 +664,16 @@ fn secret_answer_frame_round_trips_at_four_kib_and_reports_too_long() {
 }
 
 #[cfg(unix)]
-#[test]
-fn session_secret_prompt_label_names_the_session_and_strips_controls() {
+fn secret_prompt_in_session(socket: &std::path::Path, session_name: &str, binary: &str) -> String {
     use remuda_core::protocol::{Request, Response, Step};
     use remuda_core::Size;
-    use remuda_native::{client, daemon};
+    use remuda_native::client;
     use std::time::{Duration, Instant};
 
-    let (dir, remuda) = fixture("secret_session_label");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
-    let boot = remuda(&["exec", "deferred"]);
-    assert!(
-        boot.status.success(),
-        "private daemon and module boot: {boot:?}"
-    );
-
-    let socket = daemon::socket_path_in(&dir, "s");
-    let session_name = "secret-label-session";
-    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
     let command = format!("sleep 0.2; \"{binary}\" -s s deferred secret_session");
     assert_eq!(
         client::request(
-            &socket,
+            socket,
             &Request::New {
                 name: Some(session_name.into()),
                 command: vec!["sh".into(), "-c".into(), command],
@@ -697,7 +689,7 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
     let deadline = Instant::now() + Duration::from_secs(8);
     let prompt_screen = loop {
         let screen = match client::request(
-            &socket,
+            socket,
             &Request::Capture {
                 name: session_name.into(),
             },
@@ -715,13 +707,221 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
         std::thread::sleep(Duration::from_millis(25));
     };
     client::request(
-        &socket,
+        socket,
         &Request::Feed {
             name: session_name.into(),
             steps: vec![Step::Burst(vec![b'\r'])],
         },
     )
     .expect("submit empty secret answer");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = match client::request(
+            socket,
+            &Request::Capture {
+                name: session_name.into(),
+            },
+        ) {
+            Ok(Response::Screen(screen)) => screen,
+            other => panic!("capture failed: {other:?}"),
+        };
+        if screen.contains("secret length:") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "secret reply did not finish:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    prompt_screen
+}
+
+#[cfg(unix)]
+#[test]
+fn session_secret_prompt_label_names_the_session_and_strips_controls() {
+    use remuda_native::daemon;
+
+    let (dir, remuda) = fixture("secret_session_label");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let socket = daemon::socket_path_in(&dir, "s");
+    let session_name = "secret-label-session";
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let prompt_screen = secret_prompt_in_session(&socket, session_name, &binary);
+    let _ = remuda(&["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        prompt_screen.contains("remuda[session secret-label-session] deferred test secret"),
+        "session prompt label omitted its provenance tag or retained ESC:\n{prompt_screen}"
+    );
+    assert!(
+        !prompt_screen.contains('\x1b'),
+        "ESC remained in the terminal screen:\n{prompt_screen}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_secret_prompt_tag_replaces_brackets_in_the_session_name() {
+    use remuda_native::daemon;
+
+    let (dir, remuda) = fixture("secret_session_tag_brackets");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let socket = daemon::socket_path_in(&dir, "s");
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let prompt_screen = secret_prompt_in_session(&socket, "x] remuda[outside", &binary);
+    let _ = remuda(&["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        prompt_screen.contains("remuda[session x? remuda?outside] deferred test secret"),
+        "session name forged the caller tag:\n{prompt_screen}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_secret_prompt_tag_caps_the_session_name_at_64_chars() {
+    use remuda_native::daemon;
+
+    let (dir, remuda) = fixture("secret_session_tag_cap");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let socket = daemon::socket_path_in(&dir, "s");
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let session_name = "x".repeat(70);
+    let prompt_screen = secret_prompt_in_session(&socket, &session_name, &binary);
+    let _ = remuda(&["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        prompt_screen.contains(&format!("remuda[session {}]", "x".repeat(64))),
+        "session name was not truncated to 64 chars:\n{prompt_screen}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_secret_prompt_tag_preserves_non_ascii_session_names() {
+    use remuda_native::daemon;
+
+    let (dir, remuda) = fixture("secret_session_tag_unicode");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let socket = daemon::socket_path_in(&dir, "s");
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let session_name = "東京🦀";
+    let prompt_screen = secret_prompt_in_session(&socket, session_name, &binary);
+    let _ = remuda(&["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        prompt_screen.contains("remuda[session 東京🦀] deferred test secret"),
+        "non-ASCII session name changed in the caller tag:\n{prompt_screen}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the pane-input-to-scrollback leak guard as one end-to-end case.
+fn secret_entered_in_session_pane_is_absent_from_capture_and_scrollback() {
+    use remuda_core::protocol::{Request, Response, Step};
+    use remuda_core::Size;
+    use remuda_native::{client, daemon};
+    use std::time::{Duration, Instant};
+
+    let (dir, remuda) = fixture("secret_pane_leak");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let socket = daemon::socket_path_in(&dir, "s");
+    let session_name = "secret-pane-leak-session";
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let command = format!(
+        "for i in $(seq 1 40); do printf 'setup-%s\\n' \"$i\"; done; sleep 0.2; \"{binary}\" -s s deferred secret_session"
+    );
+    assert_eq!(
+        client::request(
+            &socket,
+            &Request::New {
+                name: Some(session_name.into()),
+                command: vec!["sh".into(), "-c".into(), command],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            },
+        )
+        .expect("start secret-prompt session"),
+        Response::Value(session_name.into())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let screen = match client::request(
+            &socket,
+            &Request::Capture {
+                name: session_name.into(),
+            },
+        ) {
+            Ok(Response::Screen(screen)) => screen,
+            other => panic!("capture failed: {other:?}"),
+        };
+        if screen.contains("remuda[session secret-pane-leak-session] deferred test secret") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "secret prompt did not appear:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let sentinel = b"S3CRET-probe";
+    assert_eq!(sentinel.len(), 12);
+    client::request(
+        &socket,
+        &Request::Feed {
+            name: session_name.into(),
+            steps: vec![Step::Burst(sentinel.to_vec())],
+        },
+    )
+    .expect("type secret into the session prompt");
+    client::request(
+        &socket,
+        &Request::Feed {
+            name: session_name.into(),
+            steps: vec![Step::Burst(vec![b'\r'])],
+        },
+    )
+    .expect("submit session prompt secret");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -734,7 +934,7 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
             Ok(Response::Screen(screen)) => screen,
             other => panic!("capture failed: {other:?}"),
         };
-        if screen.contains("secret accepted") {
+        if screen.contains("secret length: 12") {
             break;
         }
         assert!(
@@ -743,17 +943,124 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
-    let _ = remuda(&["stop", "-f"]);
-    let _ = std::fs::remove_dir_all(&dir);
 
+    let capture = match client::request(
+        &socket,
+        &Request::Capture {
+            name: session_name.into(),
+        },
+    ) {
+        Ok(Response::Screen(screen)) => screen,
+        other => panic!("final capture failed: {other:?}"),
+    };
+    let (visible_text, scrollback_len) = match client::request(
+        &socket,
+        &Request::CaptureStyled {
+            name: session_name.into(),
+            scrollback: 0,
+        },
+    ) {
+        Ok(Response::StyledScreen {
+            rows,
+            scrollback_len,
+            ..
+        }) => (
+            rows.into_iter()
+                .map(|row| row.into_iter().map(|run| run.text).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            scrollback_len,
+        ),
+        other => panic!("styled capture failed: {other:?}"),
+    };
+    assert!(scrollback_len > 0, "test session did not create scrollback");
     assert!(
-        prompt_screen.contains("secret-label-session: deferred test secret"),
-        "session prompt label omitted its caller name or retained ESC:\n{prompt_screen}"
+        capture.contains("secret length: 12"),
+        "callback did not receive the 12-byte sentinel:\n{capture}"
     );
     assert!(
-        !prompt_screen.contains('\x1b'),
-        "ESC remained in the terminal screen:\n{prompt_screen}"
+        !capture.contains(std::str::from_utf8(sentinel).unwrap())
+            && !visible_text.contains(std::str::from_utf8(sentinel).unwrap()),
+        "secret appeared in current pane capture:\n{capture}"
     );
+    for offset in 1..=scrollback_len {
+        let history = match client::request(
+            &socket,
+            &Request::CaptureStyled {
+                name: session_name.into(),
+                scrollback: offset,
+            },
+        ) {
+            Ok(Response::StyledScreen { rows, .. }) => rows
+                .into_iter()
+                .map(|row| row.into_iter().map(|run| run.text).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            other => panic!("scrollback capture failed: {other:?}"),
+        };
+        assert!(
+            !history.contains(std::str::from_utf8(sentinel).unwrap()),
+            "secret appeared in scrollback at offset {offset}:\n{history}"
+        );
+    }
+
+    let _ = remuda(&["stop", "-f"]);
+    assert_no_secret_in_files(&dir, sentinel);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+fn secret_prompt_label_for_word(tag: &str, word: &str) -> String {
+    use remuda_core::protocol::{Request, Response};
+    use remuda_native::ipc::TryClone;
+    use std::io::{BufRead, BufReader, Write};
+
+    let (dir, remuda) = fixture(tag);
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+    let mut stream = remuda_native::ipc::connect(&socket).expect("private daemon socket");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone private socket"));
+    let request = Request::Eval {
+        code: format!("return remuda._dispatch_extension_command('deferred', {{'{word}'}}, {{}})"),
+        name: None,
+    };
+    let mut frame = serde_json::to_vec(&request).unwrap();
+    frame.push(b'\n');
+    stream.write_all(&frame).unwrap();
+    let mut prompt_frame = Vec::new();
+    reader.read_until(b'\n', &mut prompt_frame).unwrap();
+    let prompt: Response = serde_json::from_slice(&prompt_frame).unwrap();
+    let label = match prompt {
+        Response::PromptSecret { label, .. } => label,
+        response => panic!("expected secret prompt, got {response:?}"),
+    };
+    drop(reader);
+    drop(stream);
+    label
+}
+
+#[test]
+fn secret_prompt_label_strips_format_and_separator_characters() {
+    let label = secret_prompt_label_for_word("secret_label_unicode", "secret_unicode");
+    assert!(
+        !label
+            .chars()
+            .any(|ch| matches!(ch, '\u{200b}' | '\u{202e}' | '\u{2028}' | '\u{2029}')),
+        "format and line separator characters remained in label: {label:?}"
+    );
+    assert_eq!(label, "remuda[outside] beforeafter");
+}
+
+#[test]
+fn secret_prompt_label_caps_caller_text_at_256_chars() {
+    let label = secret_prompt_label_for_word("secret_label_long", "secret_long");
+    let caller_label = label.strip_prefix("remuda[outside] ").expect("outside tag");
+    assert_eq!(caller_label.chars().count(), 256);
+    assert!(caller_label.chars().all(|ch| ch == 'x'));
 }
 
 fn assert_no_secret_in_files(root: &std::path::Path, secret: &[u8]) {
