@@ -313,6 +313,24 @@ fn successful(output: Output, operation: &str) -> String {
     String::from_utf8(output.stdout).unwrap()
 }
 
+fn invite_command_args(output: &str) -> (&str, &str) {
+    let command = output
+        .lines()
+        .find(|line| line.starts_with("  remuda cluster join "))
+        .expect("printed join command")
+        .trim();
+    let command = command
+        .strip_prefix("remuda cluster join '")
+        .and_then(|command| command.strip_suffix('\''))
+        .expect("shell-quoted join command");
+    let (fingerprint, line) = command
+        .split_once("' '")
+        .expect("separate fingerprint and join line");
+    assert!(!fingerprint.contains('\''));
+    assert!(!line.contains('\''));
+    (fingerprint, line)
+}
+
 fn identity_fingerprint(material: &[u8]) -> String {
     remuda_native::cluster::encoding::fingerprint(&material[32..])
 }
@@ -497,11 +515,12 @@ fn joiner_succeeds_when_an_existing_peer_stalls() {
         "mint invitation while an existing peer is stalled",
     );
     let started = Instant::now();
+    let (invite_fingerprint, join_line) = invite_command_args(&invitation);
     let joined = c.run(&[
         "cluster",
         "join",
-        &identity_fingerprint(&a_identity),
-        invitation.lines().nth(1).unwrap(),
+        invite_fingerprint,
+        join_line,
         "--bind",
         &c_listener.address.to_string(),
     ]);
@@ -530,12 +549,13 @@ fn join_member(
         issuer.run(&["cluster", "invite", "--bind", &address]),
         "mint join invitation",
     );
-    let join_line = invite.lines().nth(1).unwrap();
+    let (invite_fingerprint, join_line) = invite_command_args(&invite);
+    assert_eq!(invite_fingerprint, identity_fingerprint(issuer_identity));
     successful(
         joiner.run(&[
             "cluster",
             "join",
-            &identity_fingerprint(issuer_identity),
+            invite_fingerprint,
             join_line,
             "--bind",
             &joiner_address.to_string(),
@@ -862,8 +882,6 @@ fn admission_on_a_pushes_to_an_existing_peer() {
     assert!(String::from_utf8_lossy(&status.stdout).contains(
         "Any admitted member can admit new keys and revoke any member cluster-wide (see #282)."
     ));
-    let a_identity = a.identity();
-    let a_fingerprint = identity_fingerprint(&a_identity);
     let a_listener = ListenerProcess::start(&a);
     let b_listener = ListenerProcess::start(&b);
     let c_listener = ListenerProcess::start(&c);
@@ -878,9 +896,16 @@ fn admission_on_a_pushes_to_an_existing_peer() {
         ]),
         "mint invitation for C",
     );
-    let c_line = invitation.lines().nth(1).unwrap();
+    let (c_invite_fingerprint, c_line) = invite_command_args(&invitation);
     successful(
-        c.run(&["cluster", "join", &a_fingerprint, c_line, "--bind", &c_bind]),
+        c.run(&[
+            "cluster",
+            "join",
+            c_invite_fingerprint,
+            c_line,
+            "--bind",
+            &c_bind,
+        ]),
         "join C to A",
     );
 
@@ -893,12 +918,12 @@ fn admission_on_a_pushes_to_an_existing_peer() {
         ]),
         "mint invitation for B",
     );
-    let b_line = invitation.lines().nth(1).unwrap();
+    let (b_invite_fingerprint, b_line) = invite_command_args(&invitation);
     successful(
         b.run(&[
             "cluster",
             "join",
-            &a_fingerprint,
+            b_invite_fingerprint,
             b_line,
             "--bind",
             &b_listener.address.to_string(),
@@ -1023,8 +1048,6 @@ fn offline_joined_node_converges_from_its_first_startup_sync() {
     successful(a.run(&["cluster", "init"]), "initialize node A");
     successful(b.run(&["cluster", "init"]), "initialize node B");
     successful(c.run(&["cluster", "init"]), "initialize node C");
-    let a_identity = a.identity();
-    let a_fingerprint = identity_fingerprint(&a_identity);
     let a_listener = ListenerProcess::start(&a);
     let c_listener = ListenerProcess::start(&c);
 
@@ -1037,13 +1060,9 @@ fn offline_joined_node_converges_from_its_first_startup_sync() {
         ]),
         "mint invitation for B",
     );
+    let (b_invite_fingerprint, b_line) = invite_command_args(&invitation);
     successful(
-        b.run(&[
-            "cluster",
-            "join",
-            &a_fingerprint,
-            invitation.lines().nth(1).unwrap(),
-        ]),
+        b.run(&["cluster", "join", b_invite_fingerprint, b_line]),
         "join B to A",
     );
     b.stop_daemon();
@@ -1057,12 +1076,13 @@ fn offline_joined_node_converges_from_its_first_startup_sync() {
         ]),
         "mint invitation for C",
     );
+    let (c_invite_fingerprint, c_line) = invite_command_args(&invitation);
     successful(
         c.run(&[
             "cluster",
             "join",
-            &a_fingerprint,
-            invitation.lines().nth(1).unwrap(),
+            c_invite_fingerprint,
+            c_line,
             "--bind",
             &c_listener.address.to_string(),
         ]),
