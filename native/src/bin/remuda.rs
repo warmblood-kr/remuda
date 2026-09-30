@@ -2655,6 +2655,20 @@ mod cluster_cli_tests {
     #[cfg(unix)]
     #[test]
     fn join_listener_write_failure_does_not_report_a_concurrent_change() {
+        let _serial = JOIN_SIGNAL_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct ResetInterruptState;
+        impl Drop for ResetInterruptState {
+            fn drop(&mut self) {
+                JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
+                JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetInterruptState;
+        JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
+        JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+
         let _environment = ForegroundListenerLockEnvironment::new();
         let cluster_dir = _environment.root.join("state/remuda/cluster");
         let snapshot = ListenerConfig {
