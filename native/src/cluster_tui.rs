@@ -1922,6 +1922,186 @@ mod tests {
         }
     }
 
+    fn remote_screen_rows(rows: usize) -> ScreenSnapshot {
+        ScreenSnapshot {
+            cells: (0..rows)
+                .map(|row| {
+                    vec![StyledCell {
+                        text: format!("body-row-{row}"),
+                        fg: Color::Default,
+                        bg: Color::Default,
+                        bold: false,
+                        dim: false,
+                        italic: false,
+                        underline: false,
+                        inverse: false,
+                        wide: false,
+                    }]
+                })
+                .collect(),
+            wrapped: vec![false; rows],
+            cursor: Cursor {
+                row: rows.saturating_sub(1) as u16,
+                col: 0,
+                visible: true,
+            },
+            scrollback_len: 0,
+            scrollback_total: 0,
+        }
+    }
+
+    fn focused_remote_ui(clock: &ManualClock, screen: ScreenSnapshot) -> ClusterUi {
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(screen),
+        ))));
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        ui.enter_selected(clock.now());
+        ui
+    }
+
+    fn key_event(
+        ui: &mut ClusterUi,
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+        now: Duration,
+    ) {
+        ui.key_event(crossterm::event::KeyEvent::new(code, modifiers), now);
+    }
+
+    #[test]
+    fn remote_keys_mode_uses_terminal_bytes_and_forwards_escape_control_and_navigation_keys() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = focused_remote_ui(&clock, remote_screen("remote"));
+        let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
+        key_event(&mut ui, KeyCode::F(2), KeyModifiers::NONE, clock.now());
+        for (code, modifiers) in [
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL),
+            (KeyCode::Up, KeyModifiers::NONE),
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Char('y'), KeyModifiers::NONE),
+        ] {
+            key_event(&mut ui, code, modifiers, clock.now());
+        }
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let sent = transport.requests.lock().unwrap();
+        assert_eq!(sent.len(), 1, "a burst of keys should be one Input");
+        assert!(matches!(
+            &sent[0].1,
+            Request::Input { bytes, .. }
+                if bytes == b"\x1b\x03\x1b[A\t\ry"
+        ));
+    }
+
+    #[test]
+    fn ctrl_backslash_leaves_remote_keys_mode_without_sending_the_exit_key() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = focused_remote_ui(&clock, remote_screen("remote"));
+        key_event(&mut ui, KeyCode::F(2), KeyModifiers::NONE, clock.now());
+        assert!(ui
+            .render(80, 24, "", &clock)
+            .contains("KEYS laptop/build · Ctrl-\\ back"));
+
+        key_event(
+            &mut ui,
+            KeyCode::Char('\\'),
+            KeyModifiers::CONTROL,
+            clock.now(),
+        );
+
+        assert!(!ui.render(80, 24, "", &clock).contains("KEYS laptop/build"));
+        assert_eq!(ui.input_queue.items().count(), 0);
+    }
+
+    #[test]
+    fn remote_keys_mode_uses_one_status_row_and_all_other_rows_for_the_pane() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        for (cols, rows) in [(80, 24), (40, 12)] {
+            let mut ui = focused_remote_ui(&clock, remote_screen_rows(40));
+            key_event(&mut ui, KeyCode::F(2), KeyModifiers::NONE, clock.now());
+            let frame = ui.render(cols, rows, "", &clock);
+            let lines = frame.lines().collect::<Vec<_>>();
+
+            assert_eq!(lines.len(), usize::from(rows), "{cols}x{rows}: {frame}");
+            assert!(lines[0].contains("KEYS laptop/build · Ctrl-\\ back"));
+            assert_eq!(lines[1..].len(), usize::from(rows - 1));
+            assert!(lines[1].starts_with("body-row-"));
+        }
+    }
+
+    #[test]
+    fn keys_typed_while_a_remote_send_is_in_flight_coalesce_into_one_next_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = focused_remote_ui(&clock, remote_screen("remote"));
+        let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
+        key_event(&mut ui, KeyCode::F(2), KeyModifiers::NONE, clock.now());
+        key_event(&mut ui, KeyCode::Char('a'), KeyModifiers::NONE, clock.now());
+        ui.start_pending(clock.now());
+        key_event(&mut ui, KeyCode::Char('b'), KeyModifiers::NONE, clock.now());
+        key_event(&mut ui, KeyCode::Char('c'), KeyModifiers::NONE, clock.now());
+
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let sent = transport.requests.lock().unwrap();
+        assert_eq!(sent.len(), 2, "the in-flight key plus one coalesced burst");
+        assert!(matches!(
+            &sent[1].1,
+            Request::Input { bytes, .. } if bytes == b"bc"
+        ));
+    }
+
+    #[test]
+    fn bracketed_paste_in_remote_keys_mode_is_forwarded_with_its_markers() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = focused_remote_ui(&clock, remote_screen("remote"));
+        let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
+        key_event(&mut ui, KeyCode::F(2), KeyModifiers::NONE, clock.now());
+        ui.handle_event(Event::Paste("approval text".into()), clock.now());
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        assert!(matches!(
+            &transport.requests.lock().unwrap()[0].1,
+            Request::Input { bytes, .. }
+                if bytes == b"\x1b[200~approval text\x1b[201~"
+        ));
+    }
+
     fn sessions() -> Vec<SessionSummary> {
         vec![SessionSummary {
             id: "session-dev".into(),

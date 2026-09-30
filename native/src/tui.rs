@@ -3516,3 +3516,23 @@ fn kill(path: &Path, name: &str) -> Result<(), String> {
 #[cfg(test)]
 #[path = "../tests/tui_support/tui_unit.rs"]
 mod tui_unit;
+
+#[cfg(test)]
+mod key_bytes_tests {
+    use super::to_bytes;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
+        to_bytes(KeyEvent::new(code, modifiers)).expect("terminal key spelling")
+    }
+
+    #[test]
+    fn terminal_key_events_spell_the_expected_pty_bytes() {
+        assert_eq!(key(KeyCode::Esc, KeyModifiers::NONE), b"\x1b");
+        assert_eq!(key(KeyCode::Char('c'), KeyModifiers::CONTROL), b"\x03");
+        assert_eq!(key(KeyCode::Up, KeyModifiers::NONE), b"\x1b[A");
+        assert_eq!(key(KeyCode::Tab, KeyModifiers::NONE), b"\t");
+        assert_eq!(key(KeyCode::Enter, KeyModifiers::NONE), b"\r");
+        assert_eq!(key(KeyCode::Char('y'), KeyModifiers::NONE), b"y");
+    }
+}
