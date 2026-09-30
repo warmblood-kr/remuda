@@ -26,6 +26,24 @@ handle:cancel()
 
 The callback form is deliberately asynchronous. Network work must run outside the daemon's single Lua thread, and only result delivery may run on the tick. A long-poll held for roughly 30 seconds must leave Lua, timers, and other requests responsive. No `request_sync` form is needed: #213 concerns bounded subprocess execution and Matrix needs no synchronous HTTP path. Do not add a sync form unless a separate core caller demonstrates a need; any future sync operation must have a hard timeout and must not run on the daemon Lua thread.
 
+A validated HTTPS response also includes `peer_certificate = { sha256, not_before, not_after, trusted }`. `sha256` is the lowercase SHA-256 fingerprint of the leaf certificate DER; validity dates are UTC RFC 3339 timestamps. The field is absent for plain HTTP and only appears after the ordinary TLS verifier accepts the certificate.
+
+For a first connection that needs a TOFU decision, inspect the TLS peer without sending an HTTP request:
+
+```lua
+local handle = remuda.http.peer_certificate {
+  url = "https://matrix.example/",
+  timeout = 10,                              -- required total timeout, seconds
+  ca_file = "/path/to/home-ca.pem",          -- optional, same verifier inputs as request
+  pin = "sha256/BASE64_SHA256_OF_LEAF_SPKI", -- optional
+  callback = function(peer) ... end,         -- required
+}
+
+handle:cancel()
+```
+
+`peer_certificate` follows the same asynchronous callback and cancellation pattern as `request`. Success calls back with `{ sha256, not_before, not_after, trusted }`; `reason` is present when `trusted` is false. It runs the configured normal verifier and reports its result while completing only the TLS handshake, including the server handshake-signature check. It sends no HTTP bytes or credentials. SNI and hostname verification use the URL host; non-HTTPS URLs and URLs containing user credentials are rejected. A false trust result never changes the behavior of `request` and does not create a verification bypass.
+
 Lua strings carry method-independent header values and request/response bodies as bytes; the transport does not parse or re-encode JSON. Header names are ASCII case-insensitive HTTP tokens. The returned header map has lowercase names and byte-string values; repeated response fields are joined with `, ` where HTTP permits combination, while `set-cookie` remains a list of values.
 
 ## Bounds and behavior

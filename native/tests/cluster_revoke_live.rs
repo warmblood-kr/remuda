@@ -1354,7 +1354,14 @@ fn offline_joined_node_converges_from_its_first_startup_sync() {
     );
     let (b_invite_fingerprint, b_line) = invite_command_args(&invitation);
     successful(
-        b.run(&["cluster", "join", b_invite_fingerprint, b_line]),
+        b.run(&[
+            "cluster",
+            "join",
+            b_invite_fingerprint,
+            b_line,
+            "--bind",
+            "127.0.0.1:0",
+        ]),
         "join B to A",
     );
     b.stop_daemon();

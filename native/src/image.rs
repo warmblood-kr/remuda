@@ -229,6 +229,10 @@ enum JobKind {
         id: u64,
         result: Result<crate::net::HttpResponse, String>,
     },
+    PeerCertificateComplete {
+        id: u64,
+        result: Result<crate::net::http_client::PeerCertificate, String>,
+    },
     SessionOutput(SessionOutputNotifier),
     SessionOutputFlush(SessionOutputNotifier),
     #[cfg(test)]
@@ -586,6 +590,17 @@ impl Image {
         })
     }
 
+    pub fn start_peer_certificate(&self, request: crate::net::HttpRequest) -> crate::net::HttpTask {
+        let jobs = self.jobs.clone();
+        self.http
+            .start_peer_certificate(request, move |id, result| {
+                let _ = jobs.send(Job {
+                    kind: JobKind::PeerCertificateComplete { id, result },
+                    reply: None,
+                });
+            })
+    }
+
     /// Evaluate `code` in the image and wait for the result. State persists
     /// between calls — a `-e`, a script and a REPL line are all doors into one
     /// interpreter, and a variable set by any of them outlives the call.
@@ -692,6 +707,15 @@ fn process_job(
                 *caller.borrow_mut() = CallerContext::default();
                 if let Err(error) = budget.run(lua, || deliver_http(lua, *id, result.clone())) {
                     eprintln!("remuda: HTTP callback delivery failed: {error}");
+                }
+                Ok(String::new())
+            }
+            JobKind::PeerCertificateComplete { id, result } => {
+                *caller.borrow_mut() = CallerContext::default();
+                if let Err(error) =
+                    budget.run(lua, || deliver_peer_certificate(lua, *id, result.clone()))
+                {
+                    eprintln!("remuda: peer certificate callback delivery failed: {error}");
                 }
                 Ok(String::new())
             }
@@ -831,6 +855,30 @@ fn remove_execution_guard_helpers(lua: &Lua) -> mlua::Result<()> {
     Ok(())
 }
 
+fn deliver_peer_certificate(
+    lua: &Lua,
+    id: u64,
+    result: Result<crate::net::http_client::PeerCertificate, String>,
+) -> mlua::Result<()> {
+    let key = format!("remuda.http.callback.{id}");
+    let callback: mlua::Function = lua.named_registry_value(&key)?;
+    lua.set_named_registry_value(&key, mlua::Value::Nil)?;
+    let value = lua.create_table()?;
+    match result {
+        Ok(peer) => {
+            value.set("sha256", peer.sha256)?;
+            value.set("not_before", peer.not_before)?;
+            value.set("not_after", peer.not_after)?;
+            value.set("trusted", peer.trusted)?;
+            if let Some(reason) = peer.reason {
+                value.set("reason", reason)?;
+            }
+        }
+        Err(error) => value.set("error", error)?,
+    }
+    callback.call::<()>(value)
+}
+
 fn deliver_http(
     lua: &Lua,
     id: u64,
@@ -857,6 +905,14 @@ fn deliver_http(
             }
             value.set("headers", headers)?;
             value.set("body", lua.create_string(&response.body)?)?;
+            if let Some(peer) = response.peer_certificate {
+                let certificate = lua.create_table()?;
+                certificate.set("sha256", peer.sha256)?;
+                certificate.set("not_before", peer.not_before)?;
+                certificate.set("not_after", peer.not_after)?;
+                certificate.set("trusted", peer.trusted)?;
+                value.set("peer_certificate", certificate)?;
+            }
         }
         Err(error) => value.set("error", error)?,
     }

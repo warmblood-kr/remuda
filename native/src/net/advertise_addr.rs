@@ -20,7 +20,7 @@ impl fmt::Display for NoLanAddr {
         } else {
             formatter.write_str("no private LAN address found")?;
         }
-        formatter.write_str(". Next: set one explicitly: remuda cluster listen --bind IP")
+        formatter.write_str(". Next: remuda cluster listen --bind IP")
     }
 }
 
@@ -38,8 +38,8 @@ pub fn is_private_lan(address: IpAddr) -> bool {
     }
 }
 
-/// Return whether an address is safe for automatic listener selection.
-/// `auto_bind` probes only IPv4, so IPv4-mapped IPv6 addresses are not candidates.
+/// Return whether an address is safe for automatic advertisement.
+/// The route probe uses IPv4, so IPv4-mapped IPv6 addresses are not candidates.
 pub fn is_auto_eligible(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => address.is_private(),
@@ -48,13 +48,17 @@ pub fn is_auto_eligible(address: IpAddr) -> bool {
 }
 
 /// Select the default-route address only when it is safe to advertise on a LAN.
-pub fn auto_bind() -> Result<SocketAddr, NoLanAddr> {
+pub fn auto_advertise_addr() -> Result<SocketAddr, NoLanAddr> {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
         .map_err(|_| NoLanAddr { candidate: None })?;
     socket
         .connect(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 9))
         .map_err(|_| NoLanAddr { candidate: None })?;
     let candidate = socket.local_addr().ok().map(|address| address.ip());
+    address_from_candidate(candidate)
+}
+
+fn address_from_candidate(candidate: Option<IpAddr>) -> Result<SocketAddr, NoLanAddr> {
     match candidate {
         Some(address) if is_auto_eligible(address) => {
             Ok(SocketAddr::new(address, CLUSTER_DEFAULT_PORT))
@@ -65,7 +69,10 @@ pub fn auto_bind() -> Result<SocketAddr, NoLanAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_bind, is_auto_eligible, is_private_lan, NoLanAddr, CLUSTER_DEFAULT_PORT};
+    use super::{
+        address_from_candidate, auto_advertise_addr, is_auto_eligible, is_private_lan, NoLanAddr,
+        CLUSTER_DEFAULT_PORT,
+    };
     use std::net::{IpAddr, SocketAddr};
 
     #[test]
@@ -119,13 +126,31 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            "no private LAN address found (candidate 8.8.8.8). Next: set one explicitly: remuda cluster listen --bind IP"
+            "no private LAN address found (candidate 8.8.8.8). Next: remuda cluster listen --bind IP"
         );
     }
 
     #[test]
-    fn auto_bind_returns_private_address_or_typed_no_lan_error() {
-        match auto_bind() {
+    fn auto_advertisement_refuses_only_missing_or_ineligible_candidates() {
+        for candidate in [
+            Some("8.8.8.8".parse().unwrap()),
+            Some("100.64.0.1".parse().unwrap()),
+            None,
+        ] {
+            let error =
+                address_from_candidate(candidate).expect_err("candidate is not auto eligible");
+            assert!(error
+                .to_string()
+                .contains("Next: remuda cluster listen --bind IP"));
+        }
+        let eligible = address_from_candidate(Some("192.168.1.20".parse().unwrap()))
+            .expect("a selected eligible route is sufficient");
+        assert_eq!(eligible, "192.168.1.20:7441".parse().unwrap());
+    }
+
+    #[test]
+    fn auto_advertise_addr_returns_private_address_or_typed_no_lan_error() {
+        match auto_advertise_addr() {
             Ok(address) => {
                 assert!(is_auto_eligible(address.ip()));
                 assert_eq!(address.port(), CLUSTER_DEFAULT_PORT);

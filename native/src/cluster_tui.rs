@@ -21,6 +21,7 @@ use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub mod close_request;
 const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
@@ -587,24 +588,21 @@ impl ClusterUi {
             render_badge(Badge::Reachable),
             age_seconds(now, self.synced_at)
         ));
+        let tree_start = frame.len();
         if self.expanded {
             let visible = self.visible_sessions();
             for index in visible.iter().copied() {
                 let session = &self.sessions[index];
-                frame.push(format!(
-                    "{}{} {:<12} {}",
-                    if index == self.selected { ">" } else { " " },
-                    "   ",
-                    session.name,
-                    session_status(
-                        render_badge(if session.alive {
-                            Badge::Live
-                        } else {
-                            Badge::Ended
-                        }),
-                        self.pending_count(session),
-                    )
-                ));
+                let prefix = format!("{}    ", if index == self.selected { ">" } else { " " },);
+                let status = session_status(
+                    render_badge(if session.alive {
+                        Badge::Live
+                    } else {
+                        Badge::Ended
+                    }),
+                    self.pending_count(session),
+                );
+                frame.push(tree_label_line(&prefix, &session.name, &status, 12, width));
             }
             if visible.is_empty() {
                 frame.push(if self.attention_only {
@@ -620,14 +618,25 @@ impl ClusterUi {
                 }
             }
         }
-        self.append_remote_tree(&mut frame);
+        self.append_remote_tree(&mut frame, width);
         let (pane_header, pane_body) = self.remote_pane(self.local_pane_header(now), screen);
         let divider = "─".repeat(width);
-        frame.push(divider);
-        frame.push(pane_header);
         let queue_rows: Vec<&PendingBatch> = self.input_queue.items().rev().take(3).collect();
         let notice_lines = self.active_notice_lines(now, width);
-        let footer_rows = if self.composer_focused { 2 } else { 1 };
+        let footer_rows = self.footer_row_count(width);
+        let tree_capacity = height.saturating_sub(
+            tree_start + 2 + queue_rows.len() + notice_lines.len() + footer_rows + 1,
+        );
+        let tree_rows = frame.len().saturating_sub(tree_start);
+        if tree_rows > tree_capacity {
+            let kept = tree_capacity.saturating_sub(1);
+            frame.truncate(tree_start + kept);
+            if tree_capacity > 0 {
+                frame.push("… more".into());
+            }
+        }
+        frame.push(divider);
+        frame.push(pane_header);
         let reserved = frame.len() + queue_rows.len() + notice_lines.len() + footer_rows;
         let screen_rows = height.saturating_sub(reserved);
         frame.extend(
@@ -637,7 +646,7 @@ impl ClusterUi {
         );
         frame.extend(notice_lines);
         frame.extend(queue_rows.into_iter().rev().map(queue_line));
-        self.append_footer(&mut frame);
+        self.append_footer(&mut frame, width);
         frame
             .into_iter()
             .map(|line| truncate(&line, width))
@@ -668,10 +677,7 @@ impl ClusterUi {
                 )
             },
         );
-        let status_lines = wrap_to_two_lines(
-            &format!("KEYS {node_label}/{session_name} · Ctrl-\\ back"),
-            width,
-        );
+        let status_lines = vec![remote_keys_hint(&node_label, &session_name, width)];
         let mut frame = status_lines.clone();
         frame.extend(
             visible_remote_pane_lines(&body, true, height.saturating_sub(status_lines.len()))
@@ -694,8 +700,8 @@ impl ClusterUi {
             .map_or_else(Vec::new, |(notice, _)| wrap_to_two_lines(notice, width))
     }
 
-    fn append_footer(&self, frame: &mut Vec<String>) {
-        if let Some(prompt) = self.confirmation.prompt() {
+    fn append_footer(&self, frame: &mut Vec<String>, width: usize) {
+        if let Some(prompt) = self.confirmation.prompt(width) {
             frame.push(prompt);
         } else if self.remote_active.is_some() && self.composer_focused {
             frame.push(self.composer_line());
@@ -706,20 +712,48 @@ impl ClusterUi {
                     .remote_session(target)
                     .is_some_and(|(_, session)| session.alive)
         }) {
-            frame.push("Enter type · k keys · x close · q detach".into());
+            frame.push(if width < 48 {
+                "Enter · k keys · x close · q detach".into()
+            } else {
+                "Enter type · k keys · x close · q detach".into()
+            });
         } else if self.remote_active.is_some() {
-            frame.push("Remote session is read-only · q detach".into());
+            frame.push(if width < 48 {
+                "Read-only · q detach".into()
+            } else {
+                "Remote session is read-only · q detach".into()
+            });
         } else if self.ended.is_some() {
-            frame.push("Input is disabled · x clears ended session · q detaches".into());
+            frame.push(if width < 48 {
+                "Input disabled · x clear · q detach".into()
+            } else {
+                "Input is disabled · x clears ended session · q detaches".into()
+            });
         } else if self.composer_focused {
             frame.push(self.composer_line());
             frame.push("Enter send · Ctrl-C clear · Esc list".into());
         } else {
-            frame.push(self.footer());
+            frame.extend(self.footer(width));
         }
     }
 
-    fn append_remote_tree(&self, frame: &mut Vec<String>) {
+    fn footer_row_count(&self, width: usize) -> usize {
+        if self.composer_focused {
+            2
+        } else if self.confirmation.prompt(width).is_some()
+            || self.remote_active.is_some()
+            || self.ended.is_some()
+            || self.query.is_some()
+        {
+            1
+        } else if width < 52 {
+            2
+        } else {
+            1
+        }
+    }
+
+    fn append_remote_tree(&self, frame: &mut Vec<String>, width: usize) {
         let query = self.query.as_deref().unwrap_or_default();
         for node in &self.remote_snapshot.nodes {
             let node_matches = query.is_empty() || matches_query(query, &node.name);
@@ -737,13 +771,16 @@ impl ClusterUi {
             let is_expanded = self.remote_expanded.contains(&node.registry_key);
             let is_selected =
                 self.remote_selected == Some(RemoteSelection::Node(node.registry_key.clone()));
-            frame.push(format!(
-                "{}{} {} · {}",
+            let prefix = format!(
+                "{}{} ",
                 if is_selected { ">" } else { " " },
                 if is_expanded { "▼" } else { "▶" },
-                node.name,
+            );
+            let state = format!(
+                "· {}",
                 remote_state_label(node.state, node.last_sync_age, node.last_error.as_deref())
-            ));
+            );
+            frame.push(tree_label_line(&prefix, &node.name, &state, 0, width));
             if is_expanded {
                 for session in visible_sessions {
                     let is_selected = self.remote_selected
@@ -752,16 +789,16 @@ impl ClusterUi {
                             name: session.name.clone(),
                             instance_id: session.instance_id.clone(),
                         });
-                    frame.push(format!(
-                        "{}    {:<12} {}{}",
-                        if is_selected { ">" } else { " " },
-                        session.name,
+                    let prefix = format!("{}    ", if is_selected { ">" } else { " " });
+                    let status = format!(
+                        "{}{}",
                         session_status(
                             if session.alive { "live" } else { "ended" },
                             self.remote_pending_count(node, session),
                         ),
                         session_error_suffix(session.last_error.as_deref())
-                    ));
+                    );
+                    frame.push(tree_label_line(&prefix, &session.name, &status, 12, width));
                 }
             }
         }
@@ -1590,11 +1627,19 @@ impl ClusterUi {
             .count()
     }
 
-    fn footer(&self) -> String {
+    fn footer(&self, width: usize) -> Vec<String> {
         let attention = if self.attention_only { "on" } else { "off" };
         match &self.query {
-            Some(query) => format!("search: {query} · Esc clear · Enter select"),
-            None => format!("↑/↓ move · ←/→ tree · Enter · k keys · x close · / search · ! attention: {attention} · q detach"),
+            Some(query) => {
+                let suffix = " · Esc clear · Enter select";
+                let available = width.saturating_sub(UnicodeWidthStr::width("search: ") + UnicodeWidthStr::width(suffix));
+                vec![format!("search: {}{suffix}", ellipsize(query, available))]
+            }
+            None if width < 52 => vec![
+                "↑↓ move · ←→ tree · Enter select".into(),
+                "k keys x close / find ! attn q detach".into(),
+            ],
+            None => vec![format!("↑/↓ move · ←/→ tree · Enter · k keys · x close · / search · ! attention: {attention} · q detach")],
         }
     }
 
@@ -1785,6 +1830,47 @@ impl RemoteSource for EmptyRemoteSource {
 
 fn truncate(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
+}
+
+fn tree_label_line(prefix: &str, label: &str, status: &str, pad_to: usize, width: usize) -> String {
+    let available =
+        width.saturating_sub(UnicodeWidthStr::width(prefix) + 1 + UnicodeWidthStr::width(status));
+    let label = ellipsize(label, available);
+    let label_width = UnicodeWidthStr::width(label.as_str());
+    let padding = pad_to
+        .saturating_sub(label_width)
+        .min(available.saturating_sub(label_width));
+    format!("{prefix}{label}{}{status}", " ".repeat(padding + 1))
+}
+
+fn remote_keys_hint(node: &str, session: &str, width: usize) -> String {
+    let prefix = "KEYS ";
+    let suffix = " · Ctrl-\\ back";
+    let target = format!("{node}/{session}");
+    let available =
+        width.saturating_sub(UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix));
+    format!("{prefix}{}{suffix}", ellipsize(&target, available))
+}
+
+fn ellipsize(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width + 1 > width {
+            break;
+        }
+        result.push(ch);
+        used += ch_width;
+    }
+    result.push('…');
+    result
 }
 
 fn wrap_to_two_lines(text: &str, width: usize) -> Vec<String> {
@@ -2360,6 +2446,122 @@ mod tests {
 
         assert!(!ui.render(80, 24, "", &clock).contains("KEYS laptop/build"));
         assert_eq!(ui.input_queue.items().count(), 0);
+    }
+
+    #[test]
+    fn close_prompt_keeps_choices_visible_at_40_columns() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        snapshot.nodes[0].name = "laptop-with-a-very-long-name".into();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        key_event(&mut ui, KeyCode::Char('x'), KeyModifiers::NONE, clock.now());
+
+        let frame = ui.render(40, 24, "", &clock);
+        let prompt = frame.lines().last().expect("close prompt is rendered");
+        assert!(prompt.ends_with("y / n"), "prompt lost choices: {prompt:?}");
+        assert!(
+            prompt.contains('…'),
+            "long target should be elided: {prompt:?}"
+        );
+        assert!(prompt.chars().count() <= 40, "prompt too wide: {prompt:?}");
+    }
+
+    #[test]
+    fn keys_hint_keeps_exit_binding_visible_at_40_columns() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        snapshot.nodes[0].name = "laptop-with-a-very-long-name".into();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+
+        let frame = ui.render(40, 24, "", &clock);
+        let hint = frame.lines().next().expect("keys hint is rendered");
+        assert!(
+            hint.contains("Ctrl-\\ back"),
+            "hint lost exit binding: {hint:?}"
+        );
+        assert!(hint.contains('…'), "long target should be elided: {hint:?}");
+        assert!(hint.chars().count() <= 40, "hint too wide: {hint:?}");
+    }
+
+    #[test]
+    fn default_footer_keeps_action_keys_at_40_columns() {
+        let clock = ManualClock::new();
+        let ui = ClusterUi::new("studio", sessions(), clock.now());
+        let frame = ui.render(40, 24, "", &clock);
+        let footer = frame.lines().rev().take(2).collect::<Vec<_>>().join(" ");
+        for binding in ["↑", "←", "Enter", "k", "x", "/", "!", "q"] {
+            assert!(
+                footer.contains(binding),
+                "footer lost {binding}: {footer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_tree_labels_are_ellipsized_at_40_columns() {
+        let clock = ManualClock::new();
+        let mut snapshot = remote_snapshot(RemoteState::Reachable, Duration::ZERO, None);
+        snapshot.nodes[0].name = "laptop-with-a-very-long-node-name".into();
+        snapshot.nodes[0].sessions[0].name = "build-with-a-very-long-session-name".into();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_expanded.insert("fp-laptop".into());
+
+        let frame = ui.render(40, 24, "", &clock);
+        let node = frame
+            .lines()
+            .find(|line| line.contains("laptop"))
+            .expect("remote node is rendered");
+        assert!(
+            node.contains('…'),
+            "node label was clipped, not elided: {node:?}"
+        );
+        assert!(node.chars().count() <= 40, "node row too wide: {node:?}");
+        assert!(
+            frame.lines().any(|line| line.contains("… live")),
+            "session label was not elided: {frame}"
+        );
+    }
+
+    #[test]
+    fn remote_tree_is_capped_to_the_40_by_24_viewport() {
+        let clock = ManualClock::new();
+        let mut snapshot = remote_snapshot(RemoteState::Reachable, Duration::ZERO, None);
+        for index in 1..40 {
+            let mut node = snapshot.nodes[0].clone();
+            node.registry_key = format!("fp-node-{index}");
+            node.name = format!("node-{index}");
+            node.sessions.clear();
+            snapshot.nodes.push(node);
+        }
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+
+        let frame = ui.render(40, 24, "", &clock);
+        assert!(frame.lines().count() <= 24, "tree overflowed viewport");
+        assert!(frame
+            .lines()
+            .last()
+            .is_some_and(|line| line.contains("q detach")));
     }
 
     #[test]
@@ -3297,7 +3499,10 @@ mod tests {
 
         let frame = ui.render(100, 24, "", &clock);
 
-        assert!(frame.contains("▶ laptop · stale · sync 17s ago"));
+        assert!(
+            frame.contains("▶ laptop · stale · sync 17s ago"),
+            "unexpected frame: {frame}"
+        );
         assert!(!frame.contains("build"));
     }
 
@@ -3360,15 +3565,13 @@ mod tests {
 
         let frame = ui.render(40, 12, "", &clock);
         let status_lines = frame.lines().take(2).collect::<Vec<_>>();
-
-        assert_eq!(
-            status_lines.len(),
-            2,
-            "long keys status should wrap: {frame}"
+        assert!(
+            status_lines[0].ends_with("Ctrl-\\ back"),
+            "keys status lost its back action: {frame}"
         );
         assert!(
-            status_lines[1].ends_with("Ctrl-\\ back"),
-            "keys status lost its back action: {frame}"
+            status_lines[0].contains('…'),
+            "target was not elided: {frame}"
         );
     }
 
@@ -3417,7 +3620,7 @@ mod tests {
         let (mut ui, _, _) = make_ui();
         ui.key(crossterm::event::KeyCode::Char('x'));
         assert!(
-            ui.confirmation.prompt().is_some(),
+            ui.confirmation.prompt(40).is_some(),
             "x should start close confirmation"
         );
 
