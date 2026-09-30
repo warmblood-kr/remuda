@@ -42,6 +42,29 @@ const REMOTE_INPUT_WINDOW: Duration = Duration::from_secs(1);
 const MAX_REMOTE_INPUT_PEERS: usize = 1024;
 static LISTENER_ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+/// Normalize a peer address to the prefix used for pre-admission budgets.
+pub fn peer_prefix(address: std::net::IpAddr) -> std::net::IpAddr {
+    match address {
+        std::net::IpAddr::V4(address) => std::net::IpAddr::V4(address),
+        std::net::IpAddr::V6(address) => match address.to_ipv4_mapped() {
+            Some(address) => std::net::IpAddr::V4(address),
+            None => {
+                let segments = address.segments();
+                std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                    segments[0],
+                    segments[1],
+                    segments[2],
+                    segments[3],
+                    0,
+                    0,
+                    0,
+                    0,
+                ))
+            }
+        },
+    }
+}
+
 /// Listener address and opt-in for wildcard binding.
 /// An opted-in IPv6 wildcard may accept IPv4 on dual-stack systems.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1165,6 +1188,46 @@ mod tests {
     use std::io;
     use std::io::Cursor;
     use std::sync::{mpsc, Arc};
+
+    #[test]
+    fn peer_prefix_masks_ipv6_and_normalizes_ipv4_mapped_addresses() {
+        let cases = [
+            ("192.0.2.7", "192.0.2.7"),
+            ("2001:db8:1:2:abcd:ef01:2345:6789", "2001:db8:1:2::"),
+            ("2001:db8:1:2:ffff:ffff:ffff:ffff", "2001:db8:1:2::"),
+            ("2001:db8:1:3:abcd:ef01:2345:6789", "2001:db8:1:3::"),
+            ("::ffff:192.0.2.7", "192.0.2.7"),
+        ];
+        for (address, expected) in cases {
+            assert_eq!(
+                peer_prefix(address.parse::<std::net::IpAddr>().unwrap()),
+                expected.parse::<std::net::IpAddr>().unwrap(),
+                "{address}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_peer_addresses_in_one_ipv6_64_share_budget() {
+        let limiter = RequestLimiter::default();
+        let now = Instant::now();
+        for host in 1..=MAX_JOIN_ATTEMPTS_PER_IP {
+            let address = std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001,
+                0xdb8,
+                0,
+                1,
+                0,
+                0,
+                0,
+                host as u16,
+            ));
+            assert!(limiter.allow_join_attempt(address, now));
+        }
+        let another_host =
+            std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 0xff));
+        assert!(!limiter.allow_join_attempt(another_host, now));
+    }
 
     #[cfg(unix)]
     struct TestControlSettings(PathBuf);
@@ -2606,6 +2669,129 @@ mod tests {
         let response = String::from_utf8(response).unwrap();
         assert!(response.contains("invalid remote request"));
         assert!(!response.contains(secret));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_peer_flood_does_not_exhaust_admitted_replay_capacity() {
+        let (server, member, _) = socket_server(
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+        );
+        *server.state.replay.lock().unwrap() = replay::ReplayWindow::new(2);
+        let join = br#"{"join":{"token":"bad"}}"#;
+        for _ in 0..2 {
+            let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+                .generate_keypair()
+                .unwrap();
+            let sealed = sealed_payload_request(&unknown, &server, join);
+            assert_eq!(server.exchange(sealed).0, 200);
+        }
+
+        let (status, response) = server.exchange(sealed_list_request(&member, &server));
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Response>(&response).unwrap(),
+            Response::Ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_peer_frame_does_not_touch_member_replay_cache() {
+        let (server, _, _) = socket_server(
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+        );
+        let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let before = server.state.replay.lock().unwrap().len();
+        let sealed = sealed_payload_request(&unknown, &server, br#"{"join":{"token":"bad"}}"#);
+        assert_eq!(server.exchange(sealed).0, 200);
+        assert_eq!(server.state.replay.lock().unwrap().len(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_peer_replay_is_refused() {
+        let (server, _, _) = socket_server(
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+        );
+        let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let sealed = sealed_payload_request(&unknown, &server, br#"{"join":{"token":"bad"}}"#);
+        let body = sealed.message.clone();
+        assert_eq!(server.exchange(sealed).0, 200);
+        let headers = format!("Content-Length: {}\r\n", body.len());
+        assert_eq!(server.send_raw(&body, headers.as_bytes()).unwrap().0, 409);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_peer_ip_is_charged_before_replay_insert() {
+        let (server, _, _) = socket_server(
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+        );
+        let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let join = br#"{"join":{"token":"bad"}}"#;
+        for _ in 0..MAX_JOIN_ATTEMPTS_PER_IP {
+            assert_eq!(
+                server
+                    .exchange(sealed_payload_request(&unknown, &server, join))
+                    .0,
+                200
+            );
+        }
+        let before = server.state.replay.lock().unwrap().len();
+        let (status, _) = server.exchange(sealed_payload_request(&unknown, &server, join));
+        assert_eq!(status, 429);
+        assert_eq!(server.state.replay.lock().unwrap().len(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_join_unknown_frames_are_charged_before_replay_insert() {
+        let (server, _, _) = socket_server(
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+        );
+        let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let payload = serde_json::to_vec(&Request::List).unwrap();
+        for _ in 0..MAX_JOIN_ATTEMPTS_PER_IP {
+            assert_eq!(
+                server
+                    .exchange(sealed_payload_request(&unknown, &server, &payload))
+                    .0,
+                403
+            );
+        }
+        let before = server.state.replay.lock().unwrap().len();
+        let (status, _) = server.exchange(sealed_payload_request(&unknown, &server, &payload));
+        assert_eq!(status, 429);
+        assert_eq!(server.state.replay.lock().unwrap().len(), before);
     }
 
     #[cfg(unix)]
