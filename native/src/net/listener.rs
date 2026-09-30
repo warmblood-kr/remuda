@@ -2362,8 +2362,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn preauth_mutations_do_not_panic_or_exceed_caps() {
+    fn run_preauth_mutations(mutations_per_target: usize, time_budget: Duration) {
         let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
             .generate_keypair()
             .unwrap();
@@ -2414,7 +2413,7 @@ mod tests {
         assert!(parse_http_request(Cursor::new(http_seed)).is_ok());
         assert!(frame::open_request(&responder.private, &sealed.message).is_ok());
         let started = Instant::now();
-        for mutation in 0..1_000 {
+        for mutation in 0..mutations_per_target {
             let bytes = mutate_http_request(http_seed, &mut rng, mutation);
             assert!(bytes.len() <= MAX_HEADER_BYTES + MAX_BODY_BYTES + MAX_REQUEST_LINE_BYTES);
             let parsed =
@@ -2424,7 +2423,7 @@ mod tests {
                 assert!(parsed.body.len() <= MAX_BODY_BYTES);
             }
         }
-        for mutation in 0..1_000 {
+        for mutation in 0..mutations_per_target {
             let bytes = mutate_frame(&sealed.message, &mut rng, mutation);
             assert!(bytes.len() <= MAX_BODY_BYTES + 1);
             let opened = std::panic::catch_unwind(|| {
@@ -2436,10 +2435,23 @@ mod tests {
             }
         }
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "2,000 deterministic mutations exceeded the 5-second budget: {:?}",
+            started.elapsed() < time_budget,
+            "{} deterministic mutations exceeded the {:?} budget: {:?}",
+            2 * mutations_per_target,
+            time_budget,
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn preauth_mutations_do_not_panic_or_exceed_caps() {
+        run_preauth_mutations(1_000, Duration::from_secs(5));
+    }
+
+    #[test]
+    #[ignore = "manual deep pre-auth mutation run"]
+    fn preauth_mutations_long_do_not_panic_or_exceed_caps() {
+        run_preauth_mutations(100_000, Duration::from_secs(120));
     }
 
     #[test]
