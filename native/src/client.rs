@@ -2320,6 +2320,16 @@ mod tests {
         crossterm::event::Event::Key(crossterm::event::KeyEvent::new(code, modifiers))
     }
 
+    fn secret_key_with_kind(
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+        kind: crossterm::event::KeyEventKind,
+    ) -> crossterm::event::Event {
+        crossterm::event::Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            code, modifiers, kind,
+        ))
+    }
+
     fn secret_text_events(text: &str) -> Vec<crossterm::event::Event> {
         text.chars()
             .map(|character| {
@@ -2384,6 +2394,47 @@ mod tests {
             edit_secret_line(events),
             Err(super::SecretLineError::TooLong)
         );
+    }
+
+    #[test]
+    fn secret_line_accepts_exactly_four_kibibytes() {
+        let mut events = vec![crossterm::event::Event::Paste("x".repeat(4 * 1024))];
+        events.push(secret_key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        assert_eq!(edit_secret_line(events), Ok(Some(vec![b'x'; 4 * 1024])));
+    }
+
+    #[test]
+    fn secret_line_backspace_removes_a_whole_multibyte_character() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut events = secret_text_events("a🦀");
+        events.push(secret_key(KeyCode::Backspace, KeyModifiers::NONE));
+        events.extend(secret_text_events("b"));
+        events.push(secret_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(edit_secret_line(events), Ok(Some(b"ab".to_vec())));
+    }
+
+    #[test]
+    fn secret_line_ignores_release_and_accepts_repeat_key_events() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+        let events = [
+            secret_key_with_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Press),
+            secret_key_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ),
+            secret_key_with_kind(KeyCode::Char('b'), KeyModifiers::NONE, KeyEventKind::Repeat),
+            secret_key_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press),
+        ];
+
+        assert_eq!(edit_secret_line(events), Ok(Some(b"ab".to_vec())));
     }
 
     #[test]
