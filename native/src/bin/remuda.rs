@@ -362,9 +362,13 @@ fn unknown_command(word: &str) -> ExitCode {
             eprintln!("remuda: no command or mod with that name.");
         }
 
-        let suggestion = if command_word {
-            let command_suggestion = suggest_command(word).map(|name| format!("remuda {name}"));
-            command_suggestion.or_else(|| {
+        let command_suggestion = if command_word {
+            suggest_command(word).map(|name| format!("remuda {name}"))
+        } else {
+            None
+        };
+        let suggestion = command_suggestion.clone().or_else(|| {
+            if command_word {
                 let installed_mod_names = remuda_native::packages::manifests()
                     .unwrap_or_default()
                     .into_iter()
@@ -375,15 +379,17 @@ fn unknown_command(word: &str) -> ExitCode {
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 closest_word(word, &installed_mod_name_refs).map(|name| format!("remuda {name}"))
-            })
-        } else {
-            None
-        };
+            } else {
+                None
+            }
+        });
         if let Some(suggestion) = suggestion {
             eprintln!("Did you mean: {suggestion}?");
         }
 
-        let next = if command_word {
+        let next = if let Some(command) = command_suggestion {
+            format!("Next: run {command}.")
+        } else if command_word {
             format!("Next: if {word} is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list.")
         } else {
             "Next: if this is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list.".to_string()
