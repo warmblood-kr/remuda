@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 86] = [
+pub const BINDINGS: [&str; 87] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -43,6 +43,7 @@ pub const BINDINGS: [&str; 86] = [
     "_module_readiness",
     "_pending_create",
     "_pending_events",
+    "_pending_secret_events",
     "_process_drain",
     "_process_killpg",
     "_process_run",
@@ -155,6 +156,11 @@ const WORDS: &[(&str, &str, &str)] = &[
     "_pending_events",
         "Drain deferred-reply completion and cancellation notifications for the Lua tick.",
         "_pending_events() -> {{id, reason?}...}",
+    ),
+    (
+        "_pending_secret_events",
+        "Drain deferred secret-prompt results for the Lua tick. Any Lua code in this image, including MCP run_script, can read these secret events; the prompt protects terminal input and display, not code inside the image.",
+        "_pending_secret_events() -> {{id, prompt_id, secret? | error?}...}",
     ),
     (
         "_session_resize",
@@ -522,7 +528,7 @@ pub(crate) fn bindings(
     let at = || socket.to_path_buf();
     let input_registry = registry.clone();
     fail_binding(lua, &table, image.clone())?;
-    pending_bindings(lua, &table, image.pending_replies())?;
+    pending_bindings(lua, &table, image.pending_replies(), Rc::clone(&caller))?;
     caller_binding(lua, &table, caller)?;
     random_bytes_binding(lua, &table)?;
 
@@ -798,8 +804,10 @@ fn pending_bindings(
     lua: &Lua,
     table: &Table,
     pending: crate::pending::PendingReplies,
+    caller: Rc<RefCell<crate::image::CallerContext>>,
 ) -> mlua::Result<()> {
     let create = pending.clone();
+    let caller_context = Rc::clone(&caller);
     table.set(
         "_pending_create",
         lua.create_function(move |lua, timeout: Option<f64>| {
@@ -813,18 +821,48 @@ fn pending_bindings(
             let (id, handle) = create.create(duration).map_err(|message| {
                 mlua::Error::external(crate::image::TypedFailure { message, code: 1 })
             })?;
+            let context = caller_context.borrow();
+            let caller_session = if matches!(&context.kind, crate::image::CallerKind::Session) {
+                context.session.clone()
+            } else {
+                None
+            };
+            drop(context);
+            let mut handle = handle;
+            handle.set_caller_session(caller_session);
             Ok((id, lua.create_userdata(handle)?))
         })?,
     )?;
+    let event_pending = pending.clone();
     table.set(
         "_pending_events",
         lua.create_function(move |lua, ()| {
-            let events = pending.drain_events();
+            let events = event_pending.drain_events();
             let rows = lua.create_table_with_capacity(events.len(), 0)?;
             for (index, event) in events.into_iter().enumerate() {
                 let row = lua.create_table()?;
                 row.set("id", event.id)?;
                 row.set("reason", event.reason)?;
+                rows.set(index + 1, row)?;
+            }
+            Ok(rows)
+        })?,
+    )?;
+    let secret_pending = pending.clone();
+    table.set(
+        "_pending_secret_events",
+        lua.create_function(move |lua, ()| {
+            let events = secret_pending.drain_secret_events();
+            let rows = lua.create_table_with_capacity(events.len(), 0)?;
+            for (index, event) in events.into_iter().enumerate() {
+                let row = lua.create_table()?;
+                row.set("id", event.pending_id)?;
+                row.set("prompt_id", event.prompt_id)?;
+                match event.answer {
+                    Ok(Some(secret)) => row.set("secret", lua.create_string(secret.as_bytes())?)?,
+                    Ok(None) => row.set("error", "refused")?,
+                    Err(error) => row.set("error", error)?,
+                }
                 rows.set(index + 1, row)?;
             }
             Ok(rows)
@@ -1431,6 +1469,9 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         | Response::ClusterRegistryAck { .. }
         | Response::ClusterListenerStatus(_) => Err(mlua::Error::runtime(
             "cluster control responses are not exposed to scripts",
+        )),
+        Response::PromptSecret { .. } => Err(mlua::Error::runtime(
+            "secret prompts are not supported by this client path",
         )),
     }
 }

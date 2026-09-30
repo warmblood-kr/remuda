@@ -3533,7 +3533,7 @@ fn resize_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
 /// Evaluate one chunk in the daemon's image and print what it came to. Nothing
 /// is printed when it returned nothing, so `-e "x = 1"` is silent.
 fn eval_once(path: &Path, code: &str) -> ExitCode {
-    match remuda_native::client::request(
+    match remuda_native::client::request_with_secret_prompts(
         path,
         &Request::Eval {
             code: code.to_string(),
