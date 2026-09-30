@@ -756,6 +756,18 @@ impl ClusterUi {
         )
     }
 
+    fn handle_event(&mut self, event: crossterm::event::Event, now: Duration) -> bool {
+        match event {
+            crossterm::event::Event::Key(key)
+                if key.kind == crossterm::event::KeyEventKind::Press =>
+            {
+                self.key_event(key, now)
+            }
+            crossterm::event::Event::Paste(_) => false,
+            _ => false,
+        }
+    }
+
     fn key_event(&mut self, event: crossterm::event::KeyEvent, now: Duration) -> bool {
         if self.partial_input_confirm_target.is_some()
             && !self
@@ -1777,15 +1789,10 @@ fn run_loop(
         ui.send_pending(path, clock.now(), remote_input);
         ui.start_pending(clock.now());
         if crossterm::event::poll(Duration::from_millis(250))? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                if key.kind != crossterm::event::KeyEventKind::Press {
-                    continue;
-                }
-                if ui.key_event(key, clock.now()) {
-                    return Ok(());
-                }
-                ui.send_close_pending(path, remote_input, clock.now());
+            if ui.handle_event(crossterm::event::read()?, clock.now()) {
+                return Ok(());
             }
+            ui.send_close_pending(path, remote_input, clock.now());
         }
     }
 }
@@ -1950,7 +1957,7 @@ mod tests {
         }
     }
 
-    fn focused_remote_ui(clock: &ManualClock, screen: ScreenSnapshot) -> ClusterUi {
+    fn selected_remote_ui(clock: &ManualClock, screen: ScreenSnapshot) -> ClusterUi {
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
         ui.remote_synced(&FakeRemoteSource(Mutex::new(remote_snapshot(
             RemoteState::Reachable,
@@ -1959,7 +1966,6 @@ mod tests {
         ))));
         ui.remote_input_enabled = true;
         ui.select_target(Some("fp-laptop/build")).unwrap();
-        ui.enter_selected(clock.now());
         ui
     }
 
@@ -1977,9 +1983,9 @@ mod tests {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         let clock = ManualClock::new();
-        let mut ui = focused_remote_ui(&clock, remote_screen("remote"));
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
         let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
-        key_event(&mut ui, KeyCode::F(2), KeyModifiers::NONE, clock.now());
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
         for (code, modifiers) in [
             (KeyCode::Esc, KeyModifiers::NONE),
             (KeyCode::Char('c'), KeyModifiers::CONTROL),
@@ -2011,8 +2017,8 @@ mod tests {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         let clock = ManualClock::new();
-        let mut ui = focused_remote_ui(&clock, remote_screen("remote"));
-        key_event(&mut ui, KeyCode::F(2), KeyModifiers::NONE, clock.now());
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
         assert!(ui
             .render(80, 24, "", &clock)
             .contains("KEYS laptop/build · Ctrl-\\ back"));
@@ -2034,8 +2040,8 @@ mod tests {
 
         let clock = ManualClock::new();
         for (cols, rows) in [(80, 24), (40, 12)] {
-            let mut ui = focused_remote_ui(&clock, remote_screen_rows(40));
-            key_event(&mut ui, KeyCode::F(2), KeyModifiers::NONE, clock.now());
+            let mut ui = selected_remote_ui(&clock, remote_screen_rows(40));
+            key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
             let frame = ui.render(cols, rows, "", &clock);
             let lines = frame.lines().collect::<Vec<_>>();
 
@@ -2051,9 +2057,9 @@ mod tests {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         let clock = ManualClock::new();
-        let mut ui = focused_remote_ui(&clock, remote_screen("remote"));
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
         let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
-        key_event(&mut ui, KeyCode::F(2), KeyModifiers::NONE, clock.now());
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
         key_event(&mut ui, KeyCode::Char('a'), KeyModifiers::NONE, clock.now());
         ui.start_pending(clock.now());
         key_event(&mut ui, KeyCode::Char('b'), KeyModifiers::NONE, clock.now());
@@ -2084,9 +2090,9 @@ mod tests {
         use crossterm::event::{Event, KeyCode, KeyModifiers};
 
         let clock = ManualClock::new();
-        let mut ui = focused_remote_ui(&clock, remote_screen("remote"));
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
         let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
-        key_event(&mut ui, KeyCode::F(2), KeyModifiers::NONE, clock.now());
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
         ui.handle_event(Event::Paste("approval text".into()), clock.now());
         ui.start_pending(clock.now());
         ui.send_pending(
@@ -2095,8 +2101,10 @@ mod tests {
             Some(&transport),
         );
 
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "paste should produce an Input");
         assert!(matches!(
-            &transport.requests.lock().unwrap()[0].1,
+            &requests[0].1,
             Request::Input { bytes, .. }
                 if bytes == b"\x1b[200~approval text\x1b[201~"
         ));
