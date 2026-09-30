@@ -63,6 +63,55 @@ fn unsafe_unknown_name_is_not_echoed() {
 }
 
 #[test]
+fn unsafe_unknown_name_never_looks_up_or_reports_half_installed_mod_paths() {
+    let dir = std::env::temp_dir().join(format!("remuda-unsafe-mod-path-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let data = dir.join("data");
+    let mods = data.join("remuda/mods");
+
+    // ../x resolves to a deliberately half-installed sibling of mods. The
+    // other malformed name is planted under mods to catch raw-word/path leaks.
+    let outside_mods = data.join("remuda/x");
+    fs::create_dir_all(&outside_mods).unwrap();
+    let long_escape_word = format!("{}\x1b[31m", "a".repeat(40));
+    // Windows forbids ESC in file names, and the malformed name cannot leak
+    // there because it is rejected before the filesystem lookup.
+    #[cfg(unix)]
+    fs::create_dir_all(mods.join(&long_escape_word)).unwrap();
+
+    for word in ["../x", &long_escape_word] {
+        let output = Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .arg(word)
+            .env("REMUDA_RUNTIME_DIR", &dir)
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("HOME", &dir)
+            .output()
+            .expect("run remuda");
+
+        assert!(!output.status.success(), "unknown command succeeded");
+        assert!(
+            output.stdout.is_empty(),
+            "unexpected stdout: {:?}",
+            output.stdout
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr,
+            "remuda: no command or mod with that name.\n\
+             Next: if this is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list.\n"
+        );
+        assert!(!stderr.contains(word), "echoed unsafe word: {stderr:?}");
+        assert!(
+            !stderr.contains(&dir.display().to_string()),
+            "leaked filesystem path: {stderr:?}"
+        );
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn unknown_name_can_suggest_an_installed_mod() {
     let dir = std::env::temp_dir().join(format!(
         "remuda-unknown-installed-mod-{}",

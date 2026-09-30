@@ -456,7 +456,8 @@ fn github_repository(input: &str) -> Result<(String, String, String), String> {
     ))
 }
 
-fn valid_component(value: &str) -> bool {
+/// Whether a mod name or command is one valid package path component.
+pub fn valid_component(value: &str) -> bool {
     !value.is_empty()
         && value != "."
         && value != ".."

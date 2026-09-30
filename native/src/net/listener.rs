@@ -9,7 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -331,12 +331,21 @@ struct AdmittedRequestContext {
     limits: ConnectionLimits,
 }
 
-/// Refuse wildcard binds unless the operator opted in explicitly.
-pub fn validate_bind_address(address: SocketAddr, allow_unspecified: bool) -> io::Result<()> {
-    if address.ip().is_unspecified() && !allow_unspecified {
+/// Refuse wildcard and non-private binds unless the operator opted in explicitly.
+pub fn validate_bind_address(address: SocketAddr, allow_public: bool) -> io::Result<()> {
+    if address.ip().is_unspecified() && !allow_public {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "wildcard listener bind requires explicit public-bind opt-in",
+        ));
+    }
+    if !allow_public
+        && !address.ip().is_loopback()
+        && !crate::net::advertise_addr::is_private_lan(address.ip())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "non-private listener bind requires explicit allow_public opt-in",
         ));
     }
     Ok(())
@@ -2402,6 +2411,8 @@ mod tests {
     #[test]
     fn unspecified_bind_requires_explicit_public_opt_in() {
         assert!(validate_bind_address("127.0.0.1:0".parse().unwrap(), false).is_ok());
+        assert!(validate_bind_address("192.168.1.20:7441".parse().unwrap(), false).is_ok());
+        assert!(validate_bind_address("100.64.0.1:7441".parse().unwrap(), false).is_ok());
         assert!(validate_bind_address("0.0.0.0:0".parse().unwrap(), false).is_err());
         assert!(validate_bind_address("[::]:0".parse().unwrap(), false).is_err());
         assert!(validate_bind_address("0.0.0.0:0".parse().unwrap(), true).is_ok());

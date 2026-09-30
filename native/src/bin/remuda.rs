@@ -19,6 +19,7 @@
 
 use remuda_core::protocol::{Request, Response};
 use remuda_native::client::Left;
+use remuda_native::net::advertise_addr::CLUSTER_DEFAULT_PORT;
 use remuda_native::{daemon, dist, terminal_size};
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
@@ -26,8 +27,6 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
-
-const CLUSTER_DEFAULT_PORT: u16 = 7441;
 
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
@@ -126,7 +125,10 @@ fn main() -> ExitCode {
 
         ["cluster", rest @ ..] => cluster_command(server, &path, rest),
 
-        [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
+        [command, rest @ ..]
+            if remuda_native::packages::valid_component(command)
+                && remuda_native::packages::has_subcommand(command) =>
+        {
             extension_command(server, &path, command, rest, stdin_enabled)
         }
 
@@ -167,13 +169,17 @@ fn main() -> ExitCode {
 
         // Not a known verb or mod command. A mod directory with no readable
         // manifest is named rather than answered with usage (#134).
-        _ => match argv
-            .first()
-            .and_then(|word| remuda_native::packages::half_installed(word))
-        {
-            Some(message) => fail(message),
-            None => unknown_command(argv.first().copied().unwrap_or("")),
-        },
+        _ => {
+            let word = argv.first().copied().unwrap_or("");
+            if !remuda_native::packages::valid_component(word) {
+                unknown_command(word)
+            } else {
+                match remuda_native::packages::half_installed(word) {
+                    Some(message) => fail(message),
+                    None => unknown_command(word),
+                }
+            }
+        }
     }
 }
 
@@ -805,6 +811,10 @@ fn cluster_listen(
     allow_public: bool,
 ) -> ExitCode {
     with_daemon(server, path, |daemon_path| {
+        let _host_lock = match acquire_foreground_listener_host_lock() {
+            Ok(lock) => lock,
+            Err(reason) => return fail(reason),
+        };
         let config = remuda_native::net::listener::ListenerConfig {
             bind_addr,
             allow_unspecified: allow_public,
@@ -1454,9 +1464,25 @@ fn next_step_listen() -> &'static str {
     "Keep this running; open another terminal for invite/join."
 }
 
+fn acquire_foreground_listener_host_lock() -> Result<std::fs::File, String> {
+    match remuda_native::cluster::try_acquire_listener_host_lock() {
+        Ok(lock) => Ok(lock),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(foreground_listener_host_error().into())
+        }
+        Err(error) => Err(format!("cluster listener lock: {error}")),
+    }
+}
+
+fn foreground_listener_host_error() -> &'static str {
+    "the cluster listener already runs in the remuda daemon (Next: remuda cluster to see it)"
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_types)]
 mod cluster_cli_tests {
+    #[cfg(unix)]
+    use super::acquire_foreground_listener_host_lock;
     #[cfg(unix)]
     use super::cluster_join_with_private_loader;
     use super::{
@@ -1476,9 +1502,71 @@ mod cluster_cli_tests {
     #[cfg(unix)]
     use std::sync::Arc;
     #[cfg(unix)]
+    use std::sync::Mutex;
+    #[cfg(unix)]
+    use std::sync::MutexGuard;
+    #[cfg(unix)]
     use std::time::{Duration, Instant};
     #[cfg(unix)]
     use zeroize::Zeroizing;
+
+    #[cfg(unix)]
+    static FOREGROUND_LISTENER_LOCK_TEST: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    struct ForegroundListenerLockEnvironment {
+        _lock: MutexGuard<'static, ()>,
+        root: std::path::PathBuf,
+        old_home: Option<std::ffi::OsString>,
+        old_state: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(unix)]
+    impl ForegroundListenerLockEnvironment {
+        fn new() -> Self {
+            let lock = FOREGROUND_LISTENER_LOCK_TEST
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let root = std::env::temp_dir().join(format!(
+                "remuda-cli-listener-lock-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            let home = root.join("home");
+            let state = root.join("state");
+            std::fs::create_dir(&home).unwrap();
+            std::fs::create_dir(&state).unwrap();
+            let environment = Self {
+                _lock: lock,
+                root,
+                old_home: std::env::var_os("HOME"),
+                old_state: std::env::var_os("XDG_STATE_HOME"),
+            };
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_STATE_HOME", &state);
+            remuda_native::cluster::init().unwrap();
+            environment
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ForegroundListenerLockEnvironment {
+        fn drop(&mut self) {
+            match self.old_home.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.old_state.take() {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
 
     fn invalid_reason(args: &[&str]) -> (String, String) {
         match parse_cluster_command(args) {
@@ -1523,6 +1611,26 @@ mod cluster_cli_tests {
                 bind_addr: "[2001:db8::1]:7441".parse().unwrap(),
                 allow_public: false,
             }
+        );
+    }
+
+    #[test]
+    fn cluster_cli_default_port_matches_advertise_address() {
+        let address = parse_addr_default_port("192.168.1.20").unwrap();
+        assert_eq!(
+            address.port(),
+            remuda_native::net::advertise_addr::CLUSTER_DEFAULT_PORT
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreground_listener_conflict_has_an_actionable_next_step() {
+        let _environment = ForegroundListenerLockEnvironment::new();
+        let _daemon_host_lock = remuda_native::cluster::try_acquire_listener_host_lock().unwrap();
+        assert_eq!(
+            acquire_foreground_listener_host_lock().unwrap_err(),
+            "the cluster listener already runs in the remuda daemon (Next: remuda cluster to see it)"
         );
     }
 
@@ -2491,14 +2599,19 @@ fn split_server_flag(args: &[String]) -> (&str, &[String]) {
 fn split_stdin_flag(args: &[String]) -> Result<(bool, &[String]), &'static str> {
     match args {
         [flag, command, ..]
-            if flag == "--stdin" && remuda_native::packages::has_subcommand(command) =>
+            if flag == "--stdin"
+                && remuda_native::packages::valid_component(command)
+                && remuda_native::packages::has_subcommand(command) =>
         {
             Ok((true, &args[1..]))
         }
         [flag, ..] if flag == "--stdin" => {
             Err("--stdin is only valid before an installed mod command")
         }
-        [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
+        [command, rest @ ..]
+            if remuda_native::packages::valid_component(command)
+                && remuda_native::packages::has_subcommand(command) =>
+        {
             let options = rest.split(|arg| arg == "--").next().unwrap_or(rest);
             if options.iter().any(|arg| arg == "--stdin") {
                 Err("usage: remuda --stdin MOD [ARGS…] (put --stdin before the mod command)")
