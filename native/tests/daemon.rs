@@ -226,6 +226,7 @@ impl Drop for RemoveDirectoryOnDrop {
     }
 }
 
+#[cfg(not(windows))]
 struct ClusterListenerTestDaemon {
     _daemon: Daemon,
     _cleanup: RemoveDirectoryOnDrop,
@@ -234,8 +235,10 @@ struct ClusterListenerTestDaemon {
     state: PathBuf,
 }
 
+#[cfg(not(windows))]
 static CLUSTER_LISTENER_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(not(windows))]
 struct IsolatedClusterStateEnvironment {
     _lock: std::sync::MutexGuard<'static, ()>,
     old_home: Option<std::ffi::OsString>,
@@ -244,6 +247,7 @@ struct IsolatedClusterStateEnvironment {
     old_user_profile: Option<std::ffi::OsString>,
 }
 
+#[cfg(not(windows))]
 impl IsolatedClusterStateEnvironment {
     fn set(home: &Path, state: &Path) -> Self {
         let lock = CLUSTER_LISTENER_ENV_LOCK
@@ -264,6 +268,7 @@ impl IsolatedClusterStateEnvironment {
     }
 }
 
+#[cfg(not(windows))]
 impl Drop for IsolatedClusterStateEnvironment {
     fn drop(&mut self) {
         match self.old_home.take() {
@@ -285,6 +290,7 @@ impl Drop for IsolatedClusterStateEnvironment {
     }
 }
 
+#[cfg(not(windows))]
 fn cluster_listener_test_daemon(
     tag: &str,
     config: Option<remuda_native::cluster::listener_config::ListenerConfig>,
@@ -347,6 +353,7 @@ fn cluster_listener_test_daemon(
     }
 }
 
+#[cfg(not(windows))]
 fn explicit_listener_config(
     bind: std::net::SocketAddr,
 ) -> remuda_native::cluster::listener_config::ListenerConfig {
@@ -358,6 +365,7 @@ fn explicit_listener_config(
     }
 }
 
+#[cfg(not(windows))]
 #[allow(clippy::disallowed_types)]
 fn wait_for_tcp_listener(address: std::net::SocketAddr) {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -373,6 +381,7 @@ fn wait_for_tcp_listener(address: std::net::SocketAddr) {
     }
 }
 
+#[cfg(not(windows))]
 #[allow(clippy::disallowed_types)]
 fn assert_tcp_listener_closed(address: std::net::SocketAddr) {
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -388,6 +397,7 @@ fn assert_tcp_listener_closed(address: std::net::SocketAddr) {
     }
 }
 
+#[cfg(not(windows))]
 #[test]
 #[allow(clippy::disallowed_types)]
 fn cluster_listener_control_starts_stops_and_switches_ports() {
@@ -410,6 +420,7 @@ fn cluster_listener_control_starts_stops_and_switches_ports() {
     );
 }
 
+#[cfg(not(windows))]
 #[test]
 fn cluster_listener_control_starts_stops_and_switches_ports_child() {
     if std::env::var_os("REMUDA_TEST_LISTENER_CONTROL_CHILD").as_deref()
@@ -420,6 +431,7 @@ fn cluster_listener_control_starts_stops_and_switches_ports_child() {
     cluster_listener_control_round_trip();
 }
 
+#[cfg(not(windows))]
 #[allow(clippy::disallowed_types)]
 fn cluster_listener_control_round_trip() {
     use remuda_native::cluster::listener_control;
@@ -461,6 +473,7 @@ fn cluster_listener_control_round_trip() {
     wait_for_tcp_listener(second_addr);
 }
 
+#[cfg(not(windows))]
 #[test]
 #[allow(clippy::disallowed_types)]
 fn cluster_listener_reload_without_config_turns_off() {
