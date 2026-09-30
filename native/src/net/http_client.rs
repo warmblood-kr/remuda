@@ -1122,7 +1122,12 @@ fn verify_trusted_end_entity(
 
 fn asn1_time(tag: u8, bytes: &[u8]) -> Option<i64> {
     let text = std::str::from_utf8(bytes).ok()?;
-    if !text.is_ascii() {
+    if !text.is_ascii()
+        || !text.ends_with('Z')
+        || !text[..text.len() - 1]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
     let (year, rest) = match tag {
@@ -1933,6 +1938,22 @@ mod tests {
         ];
         assert_eq!(std::str::from_utf8(&time).unwrap().len(), 13);
         assert_eq!(super::asn1_time(0x17, &time), None);
+    }
+
+    #[test]
+    fn signed_asn1_time_fields_are_rejected() {
+        for time in [
+            b"-10101000000Z".as_slice(),
+            b"+10101000000Z",
+            b"24+10100000Z",
+            b"2401+1000000Z",
+            b"240101-10000Z",
+            b"24010100-100Z",
+            b"2401010000-1Z",
+        ] {
+            assert_eq!(super::asn1_time(0x17, time), None, "{time:?}");
+        }
+        assert_eq!(super::asn1_time(0x18, b"-0010101000000Z"), None);
     }
 
     #[test]
