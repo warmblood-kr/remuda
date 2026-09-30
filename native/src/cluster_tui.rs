@@ -17,13 +17,14 @@ use remuda_core::clock::Clock;
 use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
 use sender::InputSender;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub mod close_request;
 const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+const REMOTE_KEYS_COALESCE_INTERVAL: Duration = Duration::from_millis(40);
 const REMOTE_PASTE_FAILURE_NOTICE: &str =
     "remote input stopped after a failed chunk; remaining lines dropped";
 const REMOTE_PARTIAL_INPUT_NOTICE: &str =
@@ -102,6 +103,8 @@ pub struct ClusterUi {
     remote_expanded: HashSet<String>,
     remote_selected: Option<RemoteSelection>,
     remote_active: Option<RemoteSelection>,
+    remote_keys_mode: Option<RemoteSelection>,
+    remote_key_buffers: VecDeque<RemoteKeyBuffer>,
     // (registry fingerprint, display label, session name, instance id)
     remote_composer_target: Option<(String, String, String, String)>,
     partial_input_confirm_target: Option<(String, String, String, String)>,
@@ -122,6 +125,12 @@ struct RemoteCloseTarget {
     registry_key: String,
     label: String,
     wire_name: String,
+}
+
+struct RemoteKeyBuffer {
+    target: RemoteSelection,
+    bytes: Vec<u8>,
+    last_input_at: Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,6 +195,8 @@ impl ClusterUi {
             remote_expanded: HashSet::new(),
             remote_selected: None,
             remote_active: None,
+            remote_keys_mode: None,
+            remote_key_buffers: VecDeque::new(),
             remote_composer_target: None,
             partial_input_confirm_target: None,
             remote_input_enabled: false,
@@ -238,6 +249,10 @@ impl ClusterUi {
                 instance_id,
             } => self.has_remote_session(node, name, instance_id),
             RemoteSelection::Node(_) => false,
+        });
+        self.remote_keys_mode = self.remote_keys_mode.take().filter(|selection| {
+            self.remote_session(selection)
+                .is_some_and(|(_, session)| session.alive)
         });
     }
 
@@ -549,6 +564,9 @@ impl ClusterUi {
     pub fn render(&self, cols: u16, rows: u16, screen: &str, clock: &dyn Clock) -> String {
         let width = usize::from(cols.max(1));
         let height = usize::from(rows.max(1));
+        if self.remote_keys_mode.is_some() {
+            return self.render_remote_keys_mode(width, height);
+        }
         let now = clock.now();
         let mut frame = Vec::new();
         let reachable = 1 + self
@@ -641,6 +659,44 @@ impl ClusterUi {
         }
         frame
             .into_iter()
+            .map(|line| truncate(&line, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn render_remote_keys_mode(&self, width: usize, height: usize) -> String {
+        let Some(target @ RemoteSelection::Session { .. }) = &self.remote_keys_mode else {
+            return String::new();
+        };
+        let (node_label, session_name, body) = self.remote_session(target).map_or_else(
+            || {
+                let RemoteSelection::Session { node, name, .. } = target else {
+                    unreachable!()
+                };
+                (node.clone(), name.clone(), String::new())
+            },
+            |(node, session)| {
+                (
+                    node.name.clone(),
+                    session.name.clone(),
+                    session
+                        .screen
+                        .as_ref()
+                        .map(remote_screen_text)
+                        .unwrap_or_default(),
+                )
+            },
+        );
+        let mut frame = vec![format!("KEYS {node_label}/{session_name} · Ctrl-\\ back")];
+        frame.extend(
+            visible_remote_pane_lines(&body, true, height.saturating_sub(1))
+                .into_iter()
+                .map(str::to_string),
+        );
+        frame.resize(height, String::new());
+        frame
+            .into_iter()
+            .take(height)
             .map(|line| truncate(&line, width))
             .collect::<Vec<_>>()
             .join("\n")
@@ -756,6 +812,32 @@ impl ClusterUi {
         )
     }
 
+    fn handle_event(&mut self, event: crossterm::event::Event, now: Duration) -> bool {
+        match event {
+            crossterm::event::Event::Key(key)
+                if key.kind == crossterm::event::KeyEventKind::Press =>
+            {
+                self.key_event(key, now)
+            }
+            crossterm::event::Event::Paste(text) => {
+                if let Some(target) = self.remote_keys_mode.clone() {
+                    let mut text = text;
+                    loop {
+                        let stripped = text.replace("\x1b[200~", "").replace("\x1b[201~", "");
+                        if stripped == text {
+                            break;
+                        }
+                        text = stripped;
+                    }
+                    let bytes = crate::tui::paste_input(&text, true);
+                    self.enqueue_remote_key_bytes(&target, bytes, now);
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     fn key_event(&mut self, event: crossterm::event::KeyEvent, now: Duration) -> bool {
         if self.partial_input_confirm_target.is_some()
             && !self
@@ -788,6 +870,21 @@ impl ClusterUi {
             }
             return false;
         }
+        if let Some(target) = self.remote_keys_mode.clone() {
+            if event
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+                && matches!(event.code, crossterm::event::KeyCode::Char('\\' | '4'))
+            {
+                self.remote_keys_mode = None;
+                self.notice = None;
+                return false;
+            }
+            if let Some(bytes) = crate::tui::to_bytes(event) {
+                self.enqueue_remote_key_bytes(&target, bytes, now);
+            }
+            return false;
+        }
         if self.composer_focused {
             self.handle_composer_event(event, now);
             return false;
@@ -805,6 +902,7 @@ impl ClusterUi {
                 self.attention_only = !self.attention_only;
                 self.select_first_visible();
             }
+            Char('k') if self.query.is_none() => self.enter_remote_keys_mode(now),
             Char(ch) if self.query.is_some() => {
                 if let Some(query) = self.query.as_mut() {
                     query.push(ch);
@@ -829,6 +927,146 @@ impl ClusterUi {
             _ => {}
         }
         false
+    }
+
+    fn enter_remote_keys_mode(&mut self, now: Duration) {
+        let TreeSelection::RemoteSession {
+            node,
+            name,
+            instance_id,
+        } = self.current_tree_selection()
+        else {
+            return;
+        };
+        let target = RemoteSelection::Session {
+            node,
+            name,
+            instance_id,
+        };
+        let Some((snapshot, session)) = self.remote_session(&target) else {
+            self.notice = Some(("remote session is no longer listed".into(), now));
+            return;
+        };
+        if !self.remote_input_enabled || !session.alive {
+            self.notice = Some((
+                format!(
+                    "remote input disabled: {}/{} is unavailable",
+                    snapshot.name, session.name
+                ),
+                now,
+            ));
+            return;
+        }
+        self.remote_active = Some(target.clone());
+        self.remote_keys_mode = Some(target);
+        self.composer_focused = false;
+        self.set_remote_composer_target(None, now);
+        self.notice = None;
+    }
+
+    fn enqueue_remote_key_bytes(
+        &mut self,
+        target: &RemoteSelection,
+        bytes: Vec<u8>,
+        now: Duration,
+    ) {
+        let RemoteSelection::Session {
+            node,
+            name: _,
+            instance_id: _,
+        } = target
+        else {
+            return;
+        };
+        if self.remote_control_disabled.contains(node) {
+            self.notice = Some(("remote control disabled on this node".into(), now));
+            return;
+        }
+        let Some((node_label, session_name, alive)) =
+            self.remote_session(target).map(|(snapshot, session)| {
+                (snapshot.name.clone(), session.name.clone(), session.alive)
+            })
+        else {
+            self.remote_keys_mode = None;
+            self.notice = Some(("remote session is no longer listed".into(), now));
+            return;
+        };
+        if !alive {
+            self.remote_keys_mode = None;
+            self.notice = Some((format!("{node_label}/{session_name} has ended"), now));
+            return;
+        }
+        let at = Instant::now();
+        if let Some(buffer) = self
+            .remote_key_buffers
+            .back_mut()
+            .filter(|buffer| buffer.target == *target)
+        {
+            buffer.bytes.extend(bytes);
+            buffer.last_input_at = at;
+        } else {
+            self.remote_key_buffers.push_back(RemoteKeyBuffer {
+                target: target.clone(),
+                bytes,
+                last_input_at: at,
+            });
+        }
+    }
+
+    fn flush_remote_key_buffer(&mut self, now: Instant, ui_now: Duration) {
+        if self.input_queue.sending_batch().is_some() {
+            return;
+        }
+        let Some(buffer) = self.remote_key_buffers.front() else {
+            return;
+        };
+        if now.saturating_duration_since(buffer.last_input_at) < REMOTE_KEYS_COALESCE_INTERVAL {
+            return;
+        }
+        let buffer = self
+            .remote_key_buffers
+            .pop_front()
+            .expect("remote key buffer exists");
+        let RemoteSelection::Session {
+            node,
+            name,
+            instance_id,
+        } = buffer.target
+        else {
+            return;
+        };
+        let selection = RemoteSelection::Session {
+            node: node.clone(),
+            name,
+            instance_id: instance_id.clone(),
+        };
+        let Some((node_label, session_name, wire_name, alive)) =
+            self.remote_session(&selection).map(|(snapshot, session)| {
+                (
+                    snapshot.name.clone(),
+                    session.name.clone(),
+                    session.wire_name.clone(),
+                    session.alive,
+                )
+            })
+        else {
+            self.notice = Some(("remote session is no longer listed".into(), ui_now));
+            return;
+        };
+        if !alive {
+            self.notice = Some((format!("{node_label}/{session_name} has ended"), ui_now));
+            return;
+        }
+        if let Err(error) = self.input_sender.enqueue_remote(
+            &mut self.input_queue,
+            &node,
+            &wire_name,
+            &instance_id,
+            buffer.bytes,
+            now,
+        ) {
+            self.notice = Some((format!("remote key not queued: {error}"), ui_now));
+        }
     }
 
     fn handle_close_key(&mut self, now: Duration) {
@@ -1141,6 +1379,7 @@ impl ClusterUi {
     }
 
     fn start_pending(&mut self, now: Duration) {
+        self.flush_remote_key_buffer(Instant::now(), now);
         self.input_sender
             .begin_due(&mut self.input_queue, Instant::now());
         if let Some(batch) = self.input_queue.sending_batch() {
@@ -1335,7 +1574,7 @@ impl ClusterUi {
         let attention = if self.attention_only { "on" } else { "off" };
         match &self.query {
             Some(query) => format!("search: {query} · Esc clear · Enter select"),
-            None => format!("↑/↓ move · ←/→ tree · Enter · x close · / search · ! attention: {attention} · q detach"),
+            None => format!("↑/↓ move · ←/→ tree · Enter · k keys · x close · / search · ! attention: {attention} · q detach"),
         }
     }
 
@@ -1665,8 +1904,24 @@ pub fn run_with_remote_selection_and_input(
     remote_input: Option<&dyn RemoteInputTransport>,
 ) -> io::Result<()> {
     let terminal_mode = RawMode::enable()?;
+    let mut paste_capture = crate::tui::BracketedPasteCapture::new(io::stdout());
     let clock = crate::SystemClock::new();
-    let result = run_loop(path, node, target, &clock, source, selection, remote_input);
+    let result = {
+        let mut runtime = ClusterTuiRuntime {
+            clock: &clock,
+            paste_capture: &mut paste_capture,
+        };
+        run_loop(
+            path,
+            node,
+            target,
+            source,
+            selection,
+            remote_input,
+            &mut runtime,
+        )
+    };
+    drop(paste_capture);
     drop(terminal_mode);
     result
 }
@@ -1693,15 +1948,21 @@ pub fn read_frame(
     Ok(ui.render(cols, rows, &body, &clock))
 }
 
+struct ClusterTuiRuntime<'a> {
+    clock: &'a dyn Clock,
+    paste_capture: &'a mut crate::tui::BracketedPasteCapture<io::Stdout>,
+}
+
 fn run_loop(
     path: &Path,
     node: &str,
     target: Option<&str>,
-    clock: &dyn Clock,
     remote_source: &dyn RemoteSource,
     remote_selection: &RemotePollSelection,
     remote_input: Option<&dyn RemoteInputTransport>,
+    runtime: &mut ClusterTuiRuntime<'_>,
 ) -> io::Result<()> {
+    let clock = runtime.clock;
     let mut ui = ClusterUi::with_sender(node, list(path)?, clock.now(), InputSender::random()?);
     ui.remote_input_enabled = remote_input.is_some();
     ui.remote_synced(remote_source);
@@ -1733,6 +1994,7 @@ fn run_loop(
             ui.sessions_synced(current, clock.now());
         }
         ui.remote_synced(remote_source);
+        runtime.paste_capture.set(ui.remote_keys_mode.is_some())?;
         if let Some(RemoteSelection::Session { node, name, .. }) = &ui.remote_active {
             remote_selection.select(node.clone(), name.clone());
         } else {
@@ -1777,15 +2039,10 @@ fn run_loop(
         ui.send_pending(path, clock.now(), remote_input);
         ui.start_pending(clock.now());
         if crossterm::event::poll(Duration::from_millis(250))? {
-            if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
-                if key.kind != crossterm::event::KeyEventKind::Press {
-                    continue;
-                }
-                if ui.key_event(key, clock.now()) {
-                    return Ok(());
-                }
-                ui.send_close_pending(path, remote_input, clock.now());
+            if ui.handle_event(crossterm::event::read()?, clock.now()) {
+                return Ok(());
             }
+            ui.send_close_pending(path, remote_input, clock.now());
         }
     }
 }
@@ -1920,6 +2177,483 @@ mod tests {
                 }],
             }],
         }
+    }
+
+    fn remote_screen_rows(rows: usize) -> ScreenSnapshot {
+        ScreenSnapshot {
+            cells: (0..rows)
+                .map(|row| {
+                    vec![StyledCell {
+                        text: format!("body-row-{row}"),
+                        fg: Color::Default,
+                        bg: Color::Default,
+                        bold: false,
+                        dim: false,
+                        italic: false,
+                        underline: false,
+                        inverse: false,
+                        wide: false,
+                    }]
+                })
+                .collect(),
+            wrapped: vec![false; rows],
+            cursor: Cursor {
+                row: rows.saturating_sub(1) as u16,
+                col: 0,
+                visible: true,
+            },
+            scrollback_len: 0,
+            scrollback_total: 0,
+        }
+    }
+
+    fn selected_remote_ui(clock: &ManualClock, screen: ScreenSnapshot) -> ClusterUi {
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(screen),
+        ))));
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        ui
+    }
+
+    fn key_event(
+        ui: &mut ClusterUi,
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+        now: Duration,
+    ) {
+        ui.key_event(crossterm::event::KeyEvent::new(code, modifiers), now);
+    }
+
+    #[test]
+    fn remote_keys_mode_uses_terminal_bytes_and_forwards_escape_control_and_navigation_keys() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        for (code, modifiers) in [
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL),
+            (KeyCode::Up, KeyModifiers::NONE),
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Char('y'), KeyModifiers::NONE),
+        ] {
+            key_event(&mut ui, code, modifiers, clock.now());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
+        let queued = ui
+            .input_queue
+            .items()
+            .map(|batch| batch.bytes.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(queued, [b"\x1b\x03\x1b[A\t\ry".to_vec()]);
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let sent = transport.requests.lock().unwrap();
+        assert_eq!(sent.len(), 1, "a burst of keys should be one Input");
+        assert!(matches!(
+            &sent[0].1,
+            Request::Input { bytes, .. }
+                if bytes == b"\x1b\x03\x1b[A\t\ry"
+        ));
+    }
+
+    #[test]
+    fn ctrl_backslash_leaves_remote_keys_mode_without_sending_the_exit_key() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        assert!(ui
+            .render(80, 24, "", &clock)
+            .contains("KEYS laptop/build · Ctrl-\\ back"));
+
+        key_event(
+            &mut ui,
+            KeyCode::Char('\\'),
+            KeyModifiers::CONTROL,
+            clock.now(),
+        );
+
+        assert!(!ui.render(80, 24, "", &clock).contains("KEYS laptop/build"));
+        assert_eq!(ui.input_queue.items().count(), 0);
+    }
+
+    #[test]
+    fn keys_mode_capture_disables_on_ctrl_backslash_and_session_loss() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        let mut output = Vec::new();
+        {
+            let mut capture = crate::tui::BracketedPasteCapture::new(&mut output);
+            capture.set(ui.remote_keys_mode.is_some()).unwrap();
+            key_event(
+                &mut ui,
+                KeyCode::Char('\\'),
+                KeyModifiers::CONTROL,
+                clock.now(),
+            );
+            capture.set(ui.remote_keys_mode.is_some()).unwrap();
+        }
+        assert_eq!(output, b"\x1b[?2004h\x1b[?2004l");
+
+        for ended in [false, true] {
+            let clock = ManualClock::new();
+            let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+                RemoteState::Reachable,
+                Duration::ZERO,
+                Some(remote_screen("remote")),
+            )));
+            let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+            ui.remote_synced(&source);
+            ui.remote_input_enabled = true;
+            ui.select_target(Some("fp-laptop/build")).unwrap();
+            key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+
+            let mut output = Vec::new();
+            {
+                let mut capture = crate::tui::BracketedPasteCapture::new(&mut output);
+                capture.set(ui.remote_keys_mode.is_some()).unwrap();
+                let mut snapshot = remote_snapshot(
+                    RemoteState::Reachable,
+                    Duration::ZERO,
+                    Some(remote_screen("remote")),
+                );
+                if ended {
+                    snapshot.nodes[0].sessions[0].alive = false;
+                } else {
+                    snapshot.nodes.clear();
+                }
+                source.replace(snapshot);
+                ui.remote_synced(&source);
+                assert!(ui.remote_keys_mode.is_none());
+                capture.set(ui.remote_keys_mode.is_some()).unwrap();
+            }
+            assert_eq!(output, b"\x1b[?2004h\x1b[?2004l");
+        }
+    }
+
+    #[test]
+    fn bracketed_paste_capture_disables_when_dropped_on_return_or_panic() {
+        fn enable_then_drop(output: &mut Vec<u8>) {
+            let mut capture = crate::tui::BracketedPasteCapture::new(output);
+            capture.set(true).unwrap();
+        }
+
+        let mut returned = Vec::new();
+        enable_then_drop(&mut returned);
+        assert_eq!(returned, b"\x1b[?2004h\x1b[?2004l");
+
+        let mut panicked = Vec::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut capture = crate::tui::BracketedPasteCapture::new(&mut panicked);
+            capture.set(true).unwrap();
+            panic!("exercise capture guard unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(panicked, b"\x1b[?2004h\x1b[?2004l");
+    }
+
+    #[test]
+    fn remote_keys_mode_uses_one_status_row_and_all_other_rows_for_the_pane() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        for (cols, rows) in [(80, 24), (40, 12)] {
+            let mut ui = selected_remote_ui(&clock, remote_screen_rows(40));
+            key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+            let frame = ui.render(cols, rows, "", &clock);
+            let lines = frame.lines().collect::<Vec<_>>();
+
+            assert_eq!(lines.len(), usize::from(rows), "{cols}x{rows}: {frame}");
+            assert!(lines[0].contains("KEYS laptop/build · Ctrl-\\ back"));
+            assert_eq!(lines[1..].len(), usize::from(rows - 1));
+            assert!(lines[1].starts_with("body-row-"));
+        }
+    }
+
+    #[test]
+    fn keys_typed_while_a_remote_send_is_in_flight_coalesce_into_one_next_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        key_event(&mut ui, KeyCode::Char('a'), KeyModifiers::NONE, clock.now());
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
+        key_event(&mut ui, KeyCode::Char('b'), KeyModifiers::NONE, clock.now());
+        key_event(&mut ui, KeyCode::Char('c'), KeyModifiers::NONE, clock.now());
+
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+        *transport.response.lock().unwrap() = Some(Response::Ack { duplicate: false });
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let sent = transport.requests.lock().unwrap();
+        assert_eq!(sent.len(), 2, "the in-flight key plus one coalesced burst");
+        assert!(matches!(
+            &sent[1].1,
+            Request::Input { bytes, .. } if bytes == b"bc"
+        ));
+    }
+
+    #[test]
+    fn bracketed_paste_in_remote_keys_mode_is_forwarded_with_its_markers() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.handle_event(Event::Paste("approval text".into()), clock.now());
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "paste should produce an Input");
+        assert!(matches!(
+            &requests[0].1,
+            Request::Input { bytes, .. }
+                if bytes == b"\x1b[200~approval text\x1b[201~"
+        ));
+    }
+
+    #[test]
+    fn remote_paste_drops_control_bytes_before_wrapping() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.handle_event(
+            Event::Paste("a\x01b\u{009b}c\u{007f}d\t\n\re".into()),
+            clock.now(),
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "paste should produce one Input");
+        assert!(matches!(
+            &requests[0].1,
+            Request::Input { bytes, .. }
+                if bytes == b"\x1b[200~abcd\t\n\re\x1b[201~"
+        ));
+    }
+
+    #[test]
+    fn bracketed_paste_markers_inside_remote_paste_are_stripped() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.handle_event(
+            Event::Paste("left\x1b[2\x1b[201~01~middle\x1b[200~right".into()),
+            clock.now(),
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "paste should produce an Input");
+        assert!(matches!(
+            &requests[0].1,
+            Request::Input { bytes, .. }
+                if bytes == b"\x1b[200~leftmiddleright\x1b[201~"
+        ));
+    }
+
+    #[test]
+    fn remote_keys_do_not_queue_when_node_control_is_disabled() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.remote_control_disabled.insert("fp-laptop".into());
+
+        ui.handle_event(Event::Paste("blocked".into()), clock.now());
+
+        assert!(ui.remote_key_buffers.is_empty());
+        assert_eq!(ui.input_queue.items().count(), 0);
+        assert_eq!(
+            ui.notice.as_ref().map(|(notice, _)| notice.as_str()),
+            Some("remote control disabled on this node")
+        );
+    }
+
+    #[test]
+    fn remote_keys_drop_buffer_when_session_ends_before_flush() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        )));
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&source);
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.handle_event(
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )),
+            clock.now(),
+        );
+        assert_eq!(ui.remote_key_buffers.len(), 1);
+
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        snapshot.nodes[0].sessions[0].alive = false;
+        source.replace(snapshot);
+        ui.remote_synced(&source);
+        ui.flush_remote_key_buffer(
+            Instant::now() + super::REMOTE_KEYS_COALESCE_INTERVAL,
+            clock.now(),
+        );
+
+        assert!(ui.remote_key_buffers.is_empty());
+        assert_eq!(ui.input_queue.items().count(), 0);
+        assert_eq!(
+            ui.notice.as_ref().map(|(notice, _)| notice.as_str()),
+            Some("laptop/build has ended")
+        );
+    }
+
+    #[test]
+    fn remote_keys_drop_buffer_when_session_is_replaced_before_flush() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        )));
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&source);
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.handle_event(
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )),
+            clock.now(),
+        );
+        assert_eq!(ui.remote_key_buffers.len(), 1);
+
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("replacement")),
+        );
+        snapshot.nodes[0].sessions[0].instance_id = "replacement-instance".into();
+        source.replace(snapshot);
+        ui.remote_synced(&source);
+        ui.flush_remote_key_buffer(
+            Instant::now() + super::REMOTE_KEYS_COALESCE_INTERVAL,
+            clock.now(),
+        );
+
+        assert!(ui.remote_key_buffers.is_empty());
+        assert_eq!(ui.input_queue.items().count(), 0);
+        assert_eq!(
+            ui.notice.as_ref().map(|(notice, _)| notice.as_str()),
+            Some("remote session is no longer listed")
+        );
+    }
+
+    #[test]
+    fn large_remote_paste_is_queued_as_chunked_input_batches() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let limit = crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES;
+        let text = "x".repeat(limit + 1);
+        let transport = FakeRemoteInput::new(Response::Uncertain);
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.handle_event(Event::Paste(text), clock.now());
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let batches = ui.input_queue.items().collect::<Vec<_>>();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.bytes.len())
+                .collect::<Vec<_>>(),
+            [limit, 13]
+        );
+        assert_eq!(batches[0].paste_id, batches[1].paste_id);
+        assert!(batches[0].paste_id.is_some());
+        assert_eq!(
+            batches.iter().map(|batch| batch.state).collect::<Vec<_>>(),
+            [QueueState::Uncertain, QueueState::Dropped]
+        );
+        assert!(matches!(
+            &transport.requests.lock().unwrap()[0].1,
+            Request::Input { bytes, .. } if bytes.len() == limit
+        ));
     }
 
     fn sessions() -> Vec<SessionSummary> {
@@ -2083,6 +2817,7 @@ mod tests {
         assert!(frame.contains("ended"));
         assert!(!frame.contains("    dev"));
         assert!(frame.contains("attention: on"));
+        assert!(frame.contains("k keys"));
     }
 
     #[test]

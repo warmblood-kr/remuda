@@ -126,3 +126,10 @@ admitted node can type into and close every session while the setting is on.
 
 These controls do not protect against a compromised local account or host,
 which can read the local cluster keys and change the setting.
+
+Remote keys mode adds no wire operation: encoded key events and bracketed
+paste bytes use the existing authenticated `Input` request, allowlist,
+`allow_remote_control` check, per-peer aggregate limiter, and per-session
+budget. Embedded `ESC [ 200 ~` and `ESC [ 201 ~` paste markers are stripped
+before the UI wraps the payload with one bracketed-paste marker pair. The
+shared paste filter drops control characters except TAB, LF, and CR.
