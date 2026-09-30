@@ -254,7 +254,7 @@ on
 pending
 -------
 
-``pending({timeout?, on_cancel?}) -> handle`` — Return a bounded handle for an extension command's deferred result.
+``pending({timeout?, on_cancel?}) -> handle`` — Return a bounded handle for an extension command's deferred result, including secret and visible line prompts.
 
 process
 -------
