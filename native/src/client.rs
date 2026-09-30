@@ -8,6 +8,7 @@ use remuda_core::protocol::{Request, Response};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 /// Detach key: Ctrl-\ (0x1C). Chosen because almost nothing binds it, unlike
 /// Ctrl-C/D/Z, which the attached program needs. Consumed, never forwarded.
@@ -1760,6 +1761,87 @@ impl Drop for RawMode {
     }
 }
 
+const SECRET_LINE_MAX_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Eq, PartialEq)]
+enum SecretLineError {
+    TooLong,
+}
+
+/// Edit a secret line from terminal events without owning or reading a terminal.
+/// Release events are ignored; repeat events represent repeated key input.
+fn edit_secret_line(
+    events: impl IntoIterator<Item = crossterm::event::Event>,
+) -> Result<Option<Zeroizing<Vec<u8>>>, SecretLineError> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    let mut line = Zeroizing::new(Vec::new());
+    let append = |line: &mut Zeroizing<Vec<u8>>, bytes: &[u8]| {
+        let Some(new_len) = line.len().checked_add(bytes.len()) else {
+            return Err(SecretLineError::TooLong);
+        };
+        if new_len > SECRET_LINE_MAX_BYTES {
+            return Err(SecretLineError::TooLong);
+        }
+        line.extend_from_slice(bytes);
+        Ok(())
+    };
+
+    for event in events {
+        match event {
+            Event::Paste(text) => {
+                let mut paste = Zeroizing::new(text.into_bytes());
+                if paste.ends_with(b"\r\n") {
+                    let content_len = paste.len() - 2;
+                    paste.truncate(content_len);
+                } else if paste
+                    .last()
+                    .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+                {
+                    paste.pop();
+                }
+                append(&mut line, &paste)?;
+            }
+            Event::Key(key) => {
+                match key.kind {
+                    KeyEventKind::Release => continue,
+                    KeyEventKind::Press | KeyEventKind::Repeat => {}
+                }
+                match key.code {
+                    KeyCode::Enter => return Ok(Some(line)),
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Backspace => {
+                        if let Some((last_character, _)) = std::str::from_utf8(&line)
+                            .expect("secret editor buffer is valid UTF-8")
+                            .char_indices()
+                            .next_back()
+                        {
+                            line.truncate(last_character);
+                        }
+                    }
+                    KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None);
+                    }
+                    KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None);
+                    }
+                    KeyCode::Char(character)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        let mut encoded = [0; 4];
+                        append(&mut line, character.encode_utf8(&mut encoded).as_bytes())?;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -2344,7 +2426,7 @@ mod tests {
     fn edit_secret_line(
         events: impl IntoIterator<Item = crossterm::event::Event>,
     ) -> Result<Option<Vec<u8>>, super::SecretLineError> {
-        super::edit_secret_line(events)
+        super::edit_secret_line(events).map(|answer| answer.map(|secret| secret.to_vec()))
     }
 
     #[test]
