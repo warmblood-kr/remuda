@@ -354,6 +354,7 @@ enum ClusterCommand {
         json: bool,
     },
     Help(Option<String>),
+    UnknownVerb(String),
     Invalid {
         verb: String,
         reason: String,
@@ -380,7 +381,7 @@ fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
     }
     let (verb, rest) = args.split_first().expect("non-empty cluster args");
     if !cluster_verb_known(verb) {
-        return invalid_cluster(verb, format!("unknown cluster command '{verb}'"));
+        return ClusterCommand::UnknownVerb((*verb).to_owned());
     }
     let parsed = match *verb {
         "init" => parse_cluster_init(rest),
@@ -420,21 +421,33 @@ fn parse_cluster_init(args: &[&str]) -> Result<ClusterCommand, String> {
 }
 
 fn parse_cluster_invite(args: &[&str]) -> Result<ClusterCommand, String> {
-    let address = parse_flag_value(args, "--bind").ok_or("missing --bind ADDR")?;
-    if args.len()
-        != if args.first().is_some_and(|arg| arg.starts_with("--bind=")) {
-            1
-        } else {
-            2
-        }
-    {
-        return Err("unexpected arguments".into());
-    }
+    let address = match args {
+        ["--bind", address] => *address,
+        [flag] if flag.starts_with("--bind=") => &flag[7..],
+        [] => return Err("missing --bind ADDR".into()),
+        _ => return Err("expected --bind ADDR".into()),
+    };
     let bind_addr = parse_socket_address(address)?;
     Ok(ClusterCommand::Invite { bind_addr })
 }
 
 fn parse_cluster_join(args: &[&str]) -> Result<ClusterCommand, String> {
+    if args.len() > 2 {
+        if let Some(index) = args
+            .iter()
+            .position(|arg| arg.starts_with("remuda-join-v1"))
+        {
+            if remuda_native::cluster::join_line::JoinLine::decode(args[index]).is_err() {
+                let line = args[index..].join(" ");
+                let reason = if index == 0 {
+                    format!("missing fingerprint; add it before the quoted join line: '{line}'")
+                } else {
+                    format!("quote the join line: '{line}'")
+                };
+                return Err(reason);
+            }
+        }
+    }
     if args.len() > 2 && args.get(1) == Some(&"--bind") {
         return Err("missing join line".into());
     }
@@ -444,9 +457,6 @@ fn parse_cluster_join(args: &[&str]) -> Result<ClusterCommand, String> {
     let fingerprint = args[0];
     let invitation = match remuda_native::cluster::join_line::JoinLine::decode(args[1]) {
         Ok(invitation) => invitation,
-        Err(_) if args.len() > 2 && args[1].starts_with("remuda-join-v1") => {
-            return Err(format!("quote the join line: '{}'", args[1..].join(" ")));
-        }
         Err(_) => return Err("invalid join line".into()),
     };
     let bind_addr = match &args[2..] {
@@ -577,16 +587,6 @@ fn parse_cluster_call(
     })
 }
 
-fn parse_flag_value<'a>(args: &'a [&str], flag: &str) -> Option<&'a str> {
-    match args {
-        [value_flag, value, ..] if *value_flag == flag => Some(value),
-        [value_flag, ..] if value_flag.starts_with(&format!("{flag}=")) => {
-            Some(&value_flag[flag.len() + 1..])
-        }
-        _ => None,
-    }
-}
-
 fn parse_socket_address(value: &str) -> Result<std::net::SocketAddr, String> {
     value.parse().map_err(|_| {
         if let Ok(address) = value.parse::<std::net::IpAddr>() {
@@ -694,14 +694,14 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             print!("{}", cluster_usage(verb.as_deref().unwrap_or("")));
             ExitCode::SUCCESS
         }
+        ClusterCommand::UnknownVerb(verb) => {
+            eprintln!("remuda: unknown cluster command '{verb}'");
+            eprint!("{}", cluster_usage(""));
+            ExitCode::from(2)
+        }
         ClusterCommand::Invalid { verb, reason } => {
-            if reason.starts_with("unknown cluster command") {
-                eprintln!("remuda: {reason}");
-                eprint!("{}", cluster_usage(""));
-            } else {
-                eprintln!("remuda: cluster {verb}: {reason}");
-                eprint!("{}", cluster_usage(&verb));
-            }
+            eprintln!("remuda: cluster {verb}: {reason}");
+            eprint!("{}", cluster_usage(&verb));
             ExitCode::from(2)
         }
     }
@@ -1187,6 +1187,25 @@ mod cluster_cli_tests {
     }
 
     #[test]
+    fn cluster_join_without_fingerprint_gets_fingerprint_and_quote_hint() {
+        let join_line = "remuda-join-v1 192.0.2.4:9443 SHA256:other token proof";
+        assert_eq!(
+            invalid_reason(&[
+                "join",
+                "remuda-join-v1",
+                "192.0.2.4:9443",
+                "SHA256:other",
+                "token",
+                "proof",
+            ]),
+            (
+                "join".into(),
+                format!("missing fingerprint; add it before the quoted join line: '{join_line}'")
+            )
+        );
+    }
+
+    #[test]
     fn cluster_help_and_unknown_verbs_are_distinguished() {
         for args in [&["help"][..], &["-h"][..], &["--help"][..]] {
             assert_eq!(parse_cluster_command(args), ClusterCommand::Help(None));
@@ -1196,8 +1215,8 @@ mod cluster_cli_tests {
             ClusterCommand::Help(Some("listen".into()))
         );
         assert_eq!(
-            invalid_reason(&["node"]),
-            ("node".into(), "unknown cluster command 'node'".into())
+            parse_cluster_command(&["node"]),
+            ClusterCommand::UnknownVerb("node".into())
         );
     }
 
