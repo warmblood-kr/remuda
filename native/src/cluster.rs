@@ -21,8 +21,8 @@ use std::io;
 use std::net::SocketAddr;
 
 /// Take the per-user cluster-listener host lock without waiting. The returned
-/// file keeps the OS lock alive until the hosting daemon drops it.
-pub(crate) fn try_acquire_listener_host_lock() -> io::Result<std::fs::File> {
+/// file keeps the OS lock alive until the hosting listener drops it.
+pub fn try_acquire_listener_host_lock() -> io::Result<std::fs::File> {
     #[cfg(not(windows))]
     use std::fs::OpenOptions;
 

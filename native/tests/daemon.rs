@@ -1918,7 +1918,8 @@ fn stalled_pty_write_times_out_without_blocking_reads_and_recovers() {
     assert!(started.elapsed() < Duration::from_secs(6));
     std::fs::write(&reader_marker, b"read now").expect("allow child to read input");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Under CPU saturation the resumed child and PTY writer took 7-23s to drain the queued write.
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match client::request(
             &socket,

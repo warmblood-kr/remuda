@@ -112,8 +112,25 @@ fn quoted_join_line_unknown_word_does_not_echo_its_token() {
     assert_eq!(out.status.code(), Some(1));
     assert!(!stderr.contains(token), "diagnostic echoed secret material");
     assert!(
-        stderr.contains("that looks like a join line; run: remuda cluster join FINGERPRINT"),
+        stderr.contains("that looks like a join line; run: remuda cluster join [FINGERPRINT]")
+            && stderr.contains("FINGERPRINT required when not on a terminal"),
         "missing join-line hint"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn cluster_unknown_join_line_does_not_echo_its_token() {
+    let dir = scratch("cluster-unknown-join-line");
+    let token = "secret-cluster-join-token-337";
+    let join_line = format!("remuda-join-v1 192.0.2.4:7441 SHA256:issuer PUBKEY {token}");
+    let out = remuda(&dir, &["cluster", &join_line]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!stderr.contains(token), "diagnostic echoed secret material");
+    assert!(
+        stderr.contains("that looks like a join line; run: remuda cluster join FINGERPRINT"),
+        "missing cluster join-line hint: {stderr}"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -351,6 +368,41 @@ fn a_half_installed_sibling_does_not_hide_healthy_mods() {
     assert!(
         !bad.status.success() && bad_err.contains("mod 'butler' at"),
         "{bad_err}"
+    );
+}
+
+#[test]
+fn underscore_mod_command_dispatches() {
+    let dir = scratch("underscore-mod-command");
+    let mods = dir.join("data/remuda/mods");
+    let package = mods.join("my_mod");
+    std::fs::create_dir_all(package.join("packages/my_mod")).unwrap();
+    std::fs::write(
+        package.join("extension.toml"),
+        "name = \"my_mod\"\nentry = \"packages/my_mod/init.lua\"\napi = \"remuda-lua-v1\"\ncommand = \"my_mod\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("packages/my_mod/init.lua"),
+        "remuda.extension_command('my_mod', function(args) return 'pong ' .. (args[1] or '') end)",
+    )
+    .unwrap();
+
+    let launch = remuda(&dir, &["my_mod", "--headless"]);
+    let ping = remuda(&dir, &["my_mod", "ping"]);
+    let _ = remuda(&dir, &["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        launch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&launch.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&ping.stdout).trim(),
+        "pong ping",
+        "{}",
+        String::from_utf8_lossy(&ping.stderr)
     );
 }
 
