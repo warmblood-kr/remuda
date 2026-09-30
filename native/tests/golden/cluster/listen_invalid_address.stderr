@@ -1,4 +1,4 @@
 remuda: cluster listen: invalid address 'bad-address'
-usage: remuda cluster listen --bind IP[:PORT] (default port 7441) [--allow-public] [--foreground]
+usage: remuda cluster listen [--bind IP[:PORT] (default port 7441)] [--allow-public] [--foreground]
 usage: remuda cluster listen --off
-example: remuda cluster listen --bind 192.0.2.1
+example: remuda cluster listen
