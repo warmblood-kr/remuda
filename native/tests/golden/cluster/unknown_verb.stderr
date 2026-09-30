@@ -1,0 +1,13 @@
+remuda: unknown cluster command 'wat'
+usage: remuda cluster <command>
+  init
+  invite
+  join
+  nodes
+  revoke
+  control
+  remote
+  listen
+  call
+  help
+Next: use one of the listed cluster commands.

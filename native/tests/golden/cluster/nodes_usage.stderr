@@ -1,0 +1,3 @@
+remuda: cluster nodes: unexpected arguments
+usage: remuda cluster nodes
+example: remuda cluster nodes
