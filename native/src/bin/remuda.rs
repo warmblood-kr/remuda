@@ -2833,6 +2833,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cluster_error_mappings_are_actionable() {
+        let issuer_addr = "192.0.2.8:7441".parse().unwrap();
+        let wildcard_addr = "0.0.0.0:7441".parse().unwrap();
+        let unavailable_addr = "192.0.2.99:7441".parse().unwrap();
+        let cases = [
+            (
+                "join",
+                std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+                Some(issuer_addr),
+                "cannot reach 192.0.2.8:7441 (connection refused).",
+            ),
+            (
+                "join",
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"),
+                Some(issuer_addr),
+                "cannot reach 192.0.2.8:7441 (connection timed out).",
+            ),
+            (
+                "join",
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "join was refused"),
+                Some(issuer_addr),
+                "the invitation was refused (join lines work once and expire after 10 minutes).",
+            ),
+            (
+                "listen",
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "wildcard listener bind requires explicit public-bind opt-in",
+                ),
+                Some(wildcard_addr),
+                "binding all interfaces needs --allow-public",
+            ),
+            (
+                "listen",
+                std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "unavailable"),
+                Some(unavailable_addr),
+                "192.0.2.99 is not an address of this machine.",
+            ),
+            (
+                "invite",
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid cluster join line"),
+                Some(wildcard_addr),
+                "use an address of this machine that the other machine can reach",
+            ),
+        ];
+
+        for (verb, error, address, expected) in cases {
+            let message = describe_cluster_error(verb, &error, address);
+            assert!(message.contains(expected), "{verb}: {message}");
+            assert!(message.contains("Next:"), "{verb}: {message}");
+        }
+    }
+
+    #[test]
+    fn fingerprint_mismatch_explains_how_to_check_the_pin() {
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let invitation = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.8:7441".parse().unwrap(),
+            issuer_fingerprint: fingerprint,
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(
+                remuda_native::cluster::encoding::encode_base64(&[9; 32]),
+            ),
+        };
+        let error = invitation.verify_pin("SHA256:wrong").unwrap_err();
+        let message = describe_cluster_error("join", &error, Some(invitation.issuer_addr));
+        assert!(message.contains("issuer fingerprint mismatch: expected SHA256:wrong"));
+        assert!(message.contains(
+            "Next: ask the inviting machine to run `remuda cluster` and read its Fingerprint line."
+        ));
+    }
+
+    #[test]
+    fn join_error_messages_never_include_invitation_line_or_token() {
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let invitation = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.8:7441".parse().unwrap(),
+            issuer_fingerprint: fingerprint,
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(
+                remuda_native::cluster::encoding::encode_base64(&[9; 32]),
+            ),
+        };
+        let line = invitation.encode().unwrap();
+        let error = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let message = describe_cluster_error("join", &error, Some(invitation.issuer_addr));
+        assert!(!message.contains(&line), "error echoed the invitation line");
+        assert!(
+            !message.contains(invitation.token.as_str()),
+            "error echoed the invitation token"
+        );
+    }
+
+    #[test]
     fn write_timeout_has_a_user_facing_diagnostic() {
         assert_eq!(
             describe(Ok(Response::WriteTimeout)),
