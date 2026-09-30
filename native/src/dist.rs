@@ -54,8 +54,7 @@ pub fn upgrade(channel: Option<&str>) -> Result<(), String> {
         return Err(format!("unknown channel {channel:?} — stable or nightly"));
     }
     eprintln!("remuda: upgrading on the {channel} channel…");
-    let status = installer_command()
-        .env("REMUDA_CHANNEL", &channel)
+    let status = installer_command(&channel)
         .status()
         .map_err(|e| format!("cannot run the installer: {e}"))?;
     if status.success() {
@@ -69,12 +68,15 @@ pub fn upgrade(channel: Option<&str>) -> Result<(), String> {
 /// `curl … | sh`: a pipeline reports the *last* status, so a 404 fed an empty
 /// script to a shell that exited 0 — a failed upgrade that looked finished.
 #[cfg(unix)]
-fn installer_command() -> Command {
+fn installer_command(channel: &str) -> Command {
     let mut command = Command::new("sh");
     command.arg("-c").arg(format!(
         "set -e; t=$(mktemp); trap 'rm -f \"$t\"' EXIT; \
          curl -fsSL --max-time 120 -o \"$t\" {INSTALL_URL}; sh \"$t\""
     ));
+    command
+        .env("REMUDA_CHANNEL", channel)
+        .env_remove("REMUDA_INSTALL_BUTLER");
     command
 }
 
@@ -82,7 +84,7 @@ fn installer_command() -> Command {
 /// what makes `Invoke-WebRequest` raise on a 404 instead of returning an error
 /// page for the next line to execute.
 #[cfg(windows)]
-fn installer_command() -> Command {
+fn installer_command(channel: &str) -> Command {
     let mut command = Command::new("powershell");
     command.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command"]);
     command.arg(format!(
@@ -92,6 +94,9 @@ fn installer_command() -> Command {
          & powershell -NoProfile -ExecutionPolicy Bypass -File $t; exit $LASTEXITCODE }} \
          finally {{ Remove-Item -Force -ErrorAction SilentlyContinue $t }}"
     ));
+    command
+        .env("REMUDA_CHANNEL", channel)
+        .env_remove("REMUDA_INSTALL_BUTLER");
     command
 }
 
@@ -284,7 +289,7 @@ mod tests {
     fn upgrade_installer_does_not_inherit_butler_install_opt_in() {
         // `Command` inherits parent variables unless it explicitly removes
         // them. Inspect the builder instead of running its network installer.
-        let command = installer_command();
+        let command = installer_command("nightly");
         assert!(
             command.get_envs().any(|(name, value)| {
                 name == std::ffi::OsStr::new("REMUDA_INSTALL_BUTLER") && value.is_none()
