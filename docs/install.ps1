@@ -172,6 +172,12 @@ try {
         Write-Host "install.ps1: $installDir is not on your PATH - add it, e.g."
         Write-Host ('  [Environment]::SetEnvironmentVariable(''PATH'', "$env:PATH;' + $installDir + '", ''User'')')
     }
+
+    if ($env:REMUDA_INSTALL_BUTLER -eq '1') {
+        & $installed mod install warmblood-kr/remuda-butler --force
+        if ($LASTEXITCODE -ne 0) { Die 'could not install the Butler mod' }
+        Write-Output 'Next: remuda butler doctor'
+    }
 } finally {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp
 }

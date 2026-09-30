@@ -169,3 +169,8 @@ case ":$PATH:" in
 *":$install_dir:"*) ;;
 *) echo "install.sh: $install_dir is not on your PATH — add it to your shell profile" >&2 ;;
 esac
+
+if [ "${REMUDA_INSTALL_BUTLER:-}" = 1 ]; then
+	"$install_dir/remuda" mod install warmblood-kr/remuda-butler --force || die "could not install the Butler mod"
+	printf '%s\n' 'Next: remuda butler doctor'
+fi
