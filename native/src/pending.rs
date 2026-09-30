@@ -2,6 +2,7 @@
 
 use crate::reply_limit::MAX_REPLY_BYTES;
 use mlua::{LuaString, UserData, UserDataMethods};
+use remuda_core::protocol::SecretBytes;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 pub const MAX_PENDING_REPLIES: usize = 64;
 pub const PENDING_MARKER_PREFIX: &str = "\u{1e}REMUDA_PENDING:";
 const CLIENT_POLL: Duration = Duration::from_millis(25);
+pub const SECRET_PROMPT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug)]
 pub struct CommandResult {
@@ -29,6 +31,18 @@ pub enum Completion {
 pub struct PendingEvent {
     pub id: u64,
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SecretPrompt {
+    pub id: u32,
+    pub label: String,
+}
+
+pub struct SecretPromptEvent {
+    pub pending_id: u64,
+    pub prompt_id: u32,
+    pub answer: Result<Option<SecretBytes>, String>,
 }
 
 struct State {
@@ -69,6 +83,10 @@ struct Entry {
     result_rx: Mutex<Option<Receiver<Completion>>>,
     signal_tx: Sender<Signal>,
     signal_rx: Mutex<Option<Receiver<Signal>>>,
+    prompt_tx: Sender<SecretPrompt>,
+    prompt_rx: Mutex<Option<Receiver<SecretPrompt>>>,
+    prompt_id: Arc<std::sync::atomic::AtomicU32>,
+    prompt_outstanding: Arc<AtomicU8>,
     event_tx: Sender<PendingEvent>,
 }
 
@@ -82,6 +100,7 @@ struct Inner {
     next_id: std::sync::atomic::AtomicU64,
     events_tx: Sender<PendingEvent>,
     events_rx: Mutex<Receiver<PendingEvent>>,
+    secret_events: Mutex<Vec<SecretPromptEvent>>,
     stopping: AtomicU8,
     marker_token: String,
 }
@@ -98,6 +117,7 @@ impl Default for PendingReplies {
             next_id: std::sync::atomic::AtomicU64::new(1),
             events_tx,
             events_rx: Mutex::new(events_rx),
+            secret_events: Mutex::new(Vec::new()),
             stopping: AtomicU8::new(0),
             marker_token: format!(
                 "{:x}",
@@ -167,6 +187,7 @@ impl PendingReplies {
         let id = self.0.next_id.fetch_add(1, Ordering::SeqCst);
         let (result_tx, result_rx) = mpsc::channel();
         let (signal_tx, signal_rx) = mpsc::channel();
+        let (prompt_tx, prompt_rx) = mpsc::channel();
         let state = Arc::new(State::new());
         let entry = Arc::new(Entry {
             id,
@@ -176,9 +197,13 @@ impl PendingReplies {
             result_rx: Mutex::new(Some(result_rx)),
             signal_tx,
             signal_rx: Mutex::new(Some(signal_rx)),
+            prompt_tx,
+            prompt_rx: Mutex::new(Some(prompt_rx)),
+            prompt_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
+            prompt_outstanding: Arc::new(AtomicU8::new(0)),
             event_tx: self.0.events_tx.clone(),
         });
-        entries.insert(id, entry);
+        entries.insert(id, Arc::clone(&entry));
         self.0
             .created
             .lock()
@@ -190,6 +215,9 @@ impl PendingReplies {
                 id,
                 result_tx,
                 state,
+                prompt_tx: entry.prompt_tx.clone(),
+                prompt_id: Arc::clone(&entry.prompt_id),
+                prompt_outstanding: Arc::clone(&entry.prompt_outstanding),
                 event_tx: self.0.events_tx.clone(),
                 marker: format!(
                     "{}{token}:{id}",
@@ -204,6 +232,7 @@ impl PendingReplies {
         &self,
         id: u64,
         mut client_disconnected: impl FnMut() -> bool,
+        mut prompt_client: impl FnMut(SecretPrompt) -> Result<Option<SecretBytes>, String>,
     ) -> Result<WaitResult, String> {
         let entry = self
             .0
@@ -221,6 +250,12 @@ impl PendingReplies {
             .ok_or_else(|| "deferred reply already has a waiter".to_string())?;
         let signal_rx = entry
             .signal_rx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .ok_or_else(|| "deferred reply already has a waiter".to_string())?;
+        let prompt_rx = entry
+            .prompt_rx
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take()
@@ -259,6 +294,20 @@ impl PendingReplies {
                     );
                 }
                 break (Err("client disconnected".into()), None);
+            }
+            if let Ok(prompt) = prompt_rx.try_recv() {
+                let answer = prompt_client(prompt.clone());
+                entry.prompt_outstanding.store(0, Ordering::SeqCst);
+                self.0
+                    .secret_events
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(SecretPromptEvent {
+                        pending_id: id,
+                        prompt_id: prompt.id,
+                        answer,
+                    });
+                continue;
             }
             let now = Instant::now();
             if now >= deadline {
@@ -302,6 +351,16 @@ impl PendingReplies {
             .unwrap_or_else(|p| p.into_inner())
             .try_iter()
             .collect()
+    }
+
+    pub fn drain_secret_events(&self) -> Vec<SecretPromptEvent> {
+        std::mem::take(
+            &mut *self
+                .0
+                .secret_events
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        )
     }
 
     pub fn shutdown(&self) {
@@ -367,12 +426,40 @@ pub struct PendingHandle {
     result_tx: Sender<Completion>,
     state: Arc<State>,
     event_tx: Sender<PendingEvent>,
+    prompt_tx: Sender<SecretPrompt>,
+    prompt_id: Arc<std::sync::atomic::AtomicU32>,
+    prompt_outstanding: Arc<AtomicU8>,
     marker: String,
 }
 
 impl PendingHandle {
     pub fn marker(&self) -> &str {
         &self.marker
+    }
+
+    fn prompt_secret(&self, label: String) -> mlua::Result<u32> {
+        if self.state.status.load(Ordering::SeqCst) != 0 {
+            return Err(mlua::Error::runtime("pending reply is no longer active"));
+        }
+        let prompt_id = self.prompt_id.fetch_add(1, Ordering::SeqCst);
+        if prompt_id == 0 {
+            return Err(mlua::Error::runtime("secret prompt id space exhausted"));
+        }
+        if self.prompt_outstanding.swap(1, Ordering::SeqCst) != 0 {
+            return Err(mlua::Error::runtime(
+                "a secret prompt is already outstanding for this pending reply",
+            ));
+        }
+        self.prompt_tx
+            .send(SecretPrompt {
+                id: prompt_id,
+                label,
+            })
+            .map_err(|_| {
+                self.prompt_outstanding.store(0, Ordering::SeqCst);
+                mlua::Error::runtime("pending reply is no longer connected")
+            })?;
+        Ok(prompt_id)
     }
 
     fn complete(&self, completion: Completion) -> mlua::Result<()> {
@@ -412,6 +499,9 @@ impl PendingHandle {
 
 impl UserData for PendingHandle {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("prompt_secret", |_, this, label: String| {
+            this.prompt_secret(label)
+        });
         methods.add_method(
             "resolve",
             |_, this, (code, stdout, stderr): (i64, LuaString, LuaString)| {
@@ -470,7 +560,7 @@ mod tests {
         let waiter = pending.clone();
         let (done_tx, done_rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
-            let result = waiter.wait(id, || false).unwrap();
+            let result = waiter.wait(id, || false, |_| Ok(None)).unwrap();
             done_tx.send(result.completion).unwrap();
         });
 
@@ -485,5 +575,52 @@ mod tests {
             Ok(Completion::Failure(message)) if message == "claimed completion"
         ));
         thread.join().unwrap();
+    }
+
+    #[test]
+    fn pending_handle_completes_once_and_allows_only_one_prompt_at_a_time() {
+        let pending = PendingReplies::default();
+        let (id, handle) = pending.create(Duration::from_millis(20)).unwrap();
+        let prompt_id = handle.prompt_secret("Password".into()).unwrap();
+        assert!(handle.prompt_secret("Second".into()).is_err());
+        let waiter = pending.clone();
+        let result = waiter
+            .wait(
+                id,
+                || false,
+                |prompt| {
+                    assert_eq!(prompt.id, prompt_id);
+                    assert_eq!(prompt.label, "Password");
+                    Ok(Some(SecretBytes::new(b"probe".to_vec())))
+                },
+            )
+            .unwrap();
+        assert!(
+            matches!(result.completion, Err(ref error) if error == "deferred command timed out")
+        );
+        let events = pending.drain_secret_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].pending_id, id);
+        assert_eq!(events[0].prompt_id, prompt_id);
+        assert_eq!(
+            events[0]
+                .answer
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_bytes(),
+            b"probe"
+        );
+
+        let (id, handle) = pending.create(Duration::from_millis(20)).unwrap();
+        handle.complete(Completion::Failure("done".into())).unwrap();
+        assert!(handle
+            .complete(Completion::Failure("twice".into()))
+            .is_err());
+        assert!(matches!(
+            pending.wait(id, || false, |_| Ok(None)).unwrap().completion,
+            Ok(Completion::Failure(message)) if message == "done"
+        ));
     }
 }

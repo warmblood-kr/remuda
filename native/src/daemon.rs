@@ -1631,30 +1631,51 @@ fn deferred_reply(
     image: &Image,
     id: u64,
 ) -> std::io::Result<()> {
-    #[cfg(unix)]
-    let mut reader = reader;
+    let reader = std::cell::RefCell::new(reader);
     #[cfg(unix)]
     if let Err(error) = stream.set_nonblocking(true) {
         image.pending_replies().abandon(id);
         return Err(error);
     }
-    let result = image.pending_replies().wait(id, || {
-        #[cfg(unix)]
-        {
-            let mut extra = [0u8; 1];
-            match reader.read(&mut extra) {
-                Ok(0) => true,
-                Ok(_) => false,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => false,
-                Err(_) => true,
+    let pending = image.pending_replies();
+    let result = pending.wait(
+        id,
+        || {
+            #[cfg(unix)]
+            {
+                let mut extra = [0u8; 1];
+                match reader.borrow_mut().read(&mut extra) {
+                    Ok(0) => true,
+                    Ok(_) => false,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => false,
+                    Err(_) => true,
+                }
             }
-        }
-        #[cfg(windows)]
-        {
-            crate::ipc::peer_disconnected(reader.get_ref()).unwrap_or(true)
-        }
-    });
+            #[cfg(windows)]
+            {
+                crate::ipc::peer_disconnected(reader.borrow().get_ref()).unwrap_or(true)
+            }
+        },
+        |prompt| {
+            let label: String = prompt.label.chars().filter(|ch| !ch.is_control()).collect();
+            reply(
+                &stream,
+                &Response::PromptSecret {
+                    id: prompt.id,
+                    label,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            read_secret_answer(&mut *reader.borrow_mut(), prompt.id).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::TimedOut {
+                    "cancelled".to_string()
+                } else {
+                    error.to_string()
+                }
+            })
+        },
+    );
     #[cfg(unix)]
     let _ = stream.set_nonblocking(false);
     match result {
@@ -1676,6 +1697,74 @@ fn deferred_reply(
             sent
         }
         Err(error) => reply(&stream, &Response::error(error)),
+    }
+}
+
+fn read_secret_answer(
+    reader: &mut impl Read,
+    expected_id: u32,
+) -> std::io::Result<Option<remuda_core::protocol::SecretBytes>> {
+    read_secret_answer_until(
+        reader,
+        expected_id,
+        std::time::Instant::now() + crate::pending::SECRET_PROMPT_TIMEOUT,
+    )
+}
+
+fn read_secret_answer_until(
+    reader: &mut impl Read,
+    expected_id: u32,
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<remuda_core::protocol::SecretBytes>> {
+    use std::io::ErrorKind;
+    let mut frame = zeroize::Zeroizing::new(Vec::with_capacity(256));
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "secret prompt timed out",
+            ));
+        }
+        let mut byte = [0u8; 1];
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "client disconnected",
+                ))
+            }
+            Ok(_) => {
+                frame.push(byte[0]);
+                if frame.len() > remuda_core::protocol::SECRET_ANSWER_MAX_FRAME_BYTES {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "secret answer frame is oversized",
+                    ));
+                }
+                if byte[0] == b'\n' {
+                    let request: Request = serde_json::from_slice(&frame).map_err(|_| {
+                        std::io::Error::new(ErrorKind::InvalidData, "invalid secret answer")
+                    })?;
+                    return match request {
+                        Request::SecretAnswer { id, secret } if id == expected_id => Ok(secret),
+                        Request::SecretAnswer { .. } => Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "secret answer id mismatch",
+                        )),
+                        _ => Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "expected a secret answer",
+                        )),
+                    };
+                }
+            }
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -3009,6 +3098,34 @@ mod tests {
             shell_or_default(Some("/usr/bin/fish".into())),
             "/usr/bin/fish"
         );
+    }
+
+    #[test]
+    fn secret_answer_reader_rejects_a_wrong_id() {
+        let mut frame = br#"{"SecretAnswer":{"id":8,"secret":null}}"#.to_vec();
+        frame.push(b'\n');
+        let error = super::read_secret_answer(&mut frame.as_slice(), 7).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn secret_answer_reader_rejects_an_oversized_frame() {
+        let frame = vec![b' '; remuda_core::protocol::SECRET_ANSWER_MAX_FRAME_BYTES + 1];
+        let error = super::read_secret_answer(&mut frame.as_slice(), 7).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn secret_answer_reader_reports_eof() {
+        let error = super::read_secret_answer(&mut &b""[..], 7).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn secret_answer_reader_times_out() {
+        let error = super::read_secret_answer_until(&mut &b""[..], 7, std::time::Instant::now())
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[cfg(unix)]

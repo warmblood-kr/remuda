@@ -816,15 +816,36 @@ fn pending_bindings(
             Ok((id, lua.create_userdata(handle)?))
         })?,
     )?;
+    let event_pending = pending.clone();
     table.set(
         "_pending_events",
         lua.create_function(move |lua, ()| {
-            let events = pending.drain_events();
+            let events = event_pending.drain_events();
             let rows = lua.create_table_with_capacity(events.len(), 0)?;
             for (index, event) in events.into_iter().enumerate() {
                 let row = lua.create_table()?;
                 row.set("id", event.id)?;
                 row.set("reason", event.reason)?;
+                rows.set(index + 1, row)?;
+            }
+            Ok(rows)
+        })?,
+    )?;
+    let secret_pending = pending.clone();
+    table.set(
+        "_pending_secret_events",
+        lua.create_function(move |lua, ()| {
+            let events = secret_pending.drain_secret_events();
+            let rows = lua.create_table_with_capacity(events.len(), 0)?;
+            for (index, event) in events.into_iter().enumerate() {
+                let row = lua.create_table()?;
+                row.set("id", event.pending_id)?;
+                row.set("prompt_id", event.prompt_id)?;
+                match event.answer {
+                    Ok(Some(secret)) => row.set("secret", lua.create_string(secret.as_bytes())?)?,
+                    Ok(None) => row.set("error", "refused")?,
+                    Err(error) => row.set("error", error)?,
+                }
                 rows.set(index + 1, row)?;
             }
             Ok(rows)
