@@ -19,6 +19,7 @@
 use crate::agent::{Color, Cursor, MouseState, Size, StyledCell};
 use crate::registry::SessionSummary;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// A local control operation for the daemon-owned cluster listener.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -46,18 +47,18 @@ pub const SECRET_ANSWER_MAX_FRAME_BYTES: usize = 8 * 1024;
 
 /// Secret bytes encoded as base64 on the wire and redacted from debug output.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SecretBytes(#[serde(with = "secret_bytes_base64")] Vec<u8>);
+pub struct SecretBytes(#[serde(with = "secret_bytes_base64")] Zeroizing<Vec<u8>>);
 
 impl SecretBytes {
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        Self(Zeroizing::new(bytes))
     }
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
 
-    pub fn into_bytes(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> Zeroizing<Vec<u8>> {
         self.0
     }
 }
@@ -74,10 +75,11 @@ mod secret_bytes_base64 {
     use serde::de::Error as _;
     use serde::ser::Error as _;
     use serde::{Deserialize, Deserializer, Serializer};
+    use zeroize::Zeroizing;
 
     const MAX_ENCODED_BYTES: usize = SECRET_ANSWER_MAX_BYTES.div_ceil(3) * 4;
 
-    pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(bytes: &Zeroizing<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -87,7 +89,7 @@ mod secret_bytes_base64 {
         serializer.serialize_str(&STANDARD.encode(bytes))
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Zeroizing<Vec<u8>>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -107,7 +109,10 @@ mod secret_bytes_base64 {
         if decoded_len > SECRET_ANSWER_MAX_BYTES {
             return Err(D::Error::custom("secret answer exceeds 4096 bytes"));
         }
-        STANDARD.decode(encoded).map_err(D::Error::custom)
+        STANDARD
+            .decode(encoded)
+            .map(Zeroizing::new)
+            .map_err(D::Error::custom)
     }
 }
 
