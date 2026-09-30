@@ -1571,6 +1571,12 @@ fn finish_join_listener_start(
     let result = start(restore_guard);
     #[cfg(unix)]
     if JOIN_INTERRUPTED.load(Ordering::Acquire) {
+        if let Err(error) = &result {
+            eprintln!(
+                "\x1b[31m{}\x1b[0m",
+                format_failure(&render_join_listener_start_error(error))
+            );
+        }
         return JoinListenerStartOutcome::Cancelled(cancel_join_with_restore(restore_guard));
     }
     #[cfg(not(unix))]
