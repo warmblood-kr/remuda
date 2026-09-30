@@ -20,7 +20,14 @@ pub const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_HEADER_COUNT: usize = 64;
 pub const MAX_BODY_BYTES: usize = 65_535;
+#[cfg(test)]
+pub const MAX_GLOBAL_REQUESTS: usize = 1;
+#[cfg(not(test))]
 pub const MAX_GLOBAL_REQUESTS: usize = 64;
+#[cfg(test)]
+pub const MAX_PREAUTH_REQUESTS: usize = 1;
+#[cfg(not(test))]
+pub const MAX_PREAUTH_REQUESTS: usize = 16;
 pub const MAX_PEER_REQUESTS: usize = 8;
 pub const MAX_PREAUTH_PER_IP: usize = 4;
 pub const MAX_JOIN_ATTEMPTS_PER_IP: usize = 10;
@@ -2176,6 +2183,21 @@ mod tests {
         assert_eq!(status, 429);
         assert_eq!(body, b"source address request capacity reached");
         drop(held);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_serve_until_member_request_evicts_idle_preauth_connection() {
+        let (server, peer) = production_socket_server();
+        let mut idle = TcpStream::connect(server.address).unwrap();
+        idle.set_read_timeout(Some(socket_test_timeout())).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let member = sealed_list_request(&peer, &server);
+        assert_eq!(server.exchange(member).0, 200);
+
+        let mut byte = [0; 1];
+        assert_eq!(idle.read(&mut byte).unwrap(), 0);
     }
 
     #[cfg(unix)]
