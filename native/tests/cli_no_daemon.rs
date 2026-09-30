@@ -72,7 +72,7 @@ fn unknown_cluster_verbs_suggest_the_cluster_path() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         stderr.trim(),
-        "remuda: no command or mod named nodes.\nDid you mean: remuda cluster nodes?\nNext: if nodes is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list."
+        "remuda: no command or mod named nodes.\nDid you mean: remuda cluster nodes?\nNext: run remuda cluster nodes."
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -85,7 +85,7 @@ fn nearby_top_level_typos_get_did_you_mean() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         stderr.trim(),
-        "remuda: no command or mod named atach.\nDid you mean: remuda attach?\nNext: if atach is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list."
+        "remuda: no command or mod named atach.\nDid you mean: remuda attach?\nNext: run remuda attach."
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -172,6 +172,72 @@ fn help_flags_write_usage_to_stdout_and_mod_commands_to_stderr() {
             "{args:?}: {out:?}"
         );
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn upgrade_help_flags_explain_channels_and_daemon_lifecycle() {
+    let dir = scratch("upgrade-help-flags");
+    for args in [&["upgrade", "--help"][..], &["upgrade", "-h"]] {
+        let out = remuda(&dir, args);
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("--channel stable|nightly"), "{stdout}");
+        assert!(
+            stdout.contains("daemon and its sessions") && stdout.contains("remuda stop"),
+            "missing daemon/session behavior: {stdout}"
+        );
+        assert!(
+            stdout
+                .lines()
+                .last()
+                .unwrap_or_default()
+                .starts_with("Next:"),
+            "{stdout}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn invalid_upgrade_channel_suggests_supported_channels_and_next_step() {
+    let dir = scratch("upgrade-bad-channel");
+    let out = remuda(&dir, &["upgrade", "--channel", "beta"]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "use --channel stable or --channel nightly, e.g. remuda upgrade --channel nightly"
+        ),
+        "missing supported channel suggestion: {stderr}"
+    );
+    assert!(
+        stderr
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .starts_with("Next:"),
+        "{stderr}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn top_level_help_ends_with_one_concrete_next_step() {
+    let dir = scratch("help-next-step");
+    let out = remuda(&dir, &["help"]);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let next = stdout
+        .lines()
+        .filter(|line| line.starts_with("Next:"))
+        .collect::<Vec<_>>();
+    assert_eq!(next.len(), 1, "expected one Next line: {stdout}");
+    assert!(
+        next[0].contains("remuda run") && next[0].contains("remuda ls"),
+        "Next line should offer a session action: {}",
+        next[0]
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
