@@ -455,6 +455,7 @@ fn assert_new_identity_rotation(
     );
     let rotation_output = node.run(&["cluster", "init", "--new-identity", "--yes"]);
     let warning = String::from_utf8_lossy(&rotation_output.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&rotation_output.stdout).into_owned();
     successful(rotation_output, "rotate revoked node identity");
     assert!(
         warning.contains(
@@ -462,7 +463,27 @@ fn assert_new_identity_rotation(
         ),
         "rotation did not warn that it leaves the current cluster: {warning}"
     );
+    let cluster_dir = node.root.join("state/remuda/cluster");
+    let listener = remuda_native::cluster::listener_config::read_at(&cluster_dir)
+        .unwrap()
+        .expect("invite should leave the daemon listener enabled");
+    let remuda_native::cluster::listener_config::ListenerBind::Explicit(address) = listener.bind
+    else {
+        panic!("invite should configure an explicit loopback listener");
+    };
     let rotated_identity = node.identity();
+    // The listener still holds the old private key, so a frame sealed to the new public key gets HTTP 400.
+    assert!(
+        matches!(
+            list_from(&rotated_identity, &rotated_identity, address),
+            Response::Sessions(_)
+        ),
+        "the running daemon listener did not reload the rotated identity"
+    );
+    assert!(
+        stdout.contains("Next: ask an admitted machine for a new invite (remuda cluster invite there), then run the join command it prints."),
+        "identity rotation is missing its recovery next step: {stdout}"
+    );
     let new_fingerprint = identity_fingerprint(&rotated_identity);
     assert_ne!(new_fingerprint, old_fingerprint);
     assert!(!token_path.exists(), "old join token state was not cleared");
