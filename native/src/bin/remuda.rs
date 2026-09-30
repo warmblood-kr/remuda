@@ -27,6 +27,8 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
+const CLUSTER_DEFAULT_PORT: u16 = 7441;
+
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
 
@@ -591,23 +593,33 @@ fn parse_addr_default_port(value: &str) -> Result<std::net::SocketAddr, String> 
         return Ok(address);
     }
     if let Ok(address) = value.parse::<std::net::IpAddr>() {
-        return Ok(std::net::SocketAddr::new(address, 7441));
+        return Ok(std::net::SocketAddr::new(address, CLUSTER_DEFAULT_PORT));
+    }
+    if let Some(address) = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .and_then(|value| value.parse::<std::net::Ipv6Addr>().ok())
+    {
+        return Ok(std::net::SocketAddr::new(
+            std::net::IpAddr::V6(address),
+            CLUSTER_DEFAULT_PORT,
+        ));
     }
     Err(format!("invalid address '{value}'"))
 }
 
-pub fn cluster_usage(verb: &str) -> &'static str {
+pub fn cluster_usage(verb: &str) -> String {
     match verb {
-        "init" => "usage: remuda cluster init\nexample: remuda cluster init\n",
-        "invite" => "usage: remuda cluster invite --bind IP[:PORT] (default port 7441)\nexample: remuda cluster invite --bind 192.168.1.20\n",
-        "join" => "usage: remuda cluster join FINGERPRINT 'JOIN_LINE' [--bind IP[:PORT] (default port 7441)]\nexample: remuda cluster join 'SHA256:…' 'remuda-join-v1 …' --bind 192.168.1.20\n",
-        "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n",
-        "revoke" => "usage: remuda cluster revoke NODE|FINGERPRINT [--yes]\nexample: remuda cluster revoke node-abcd1234\n",
-        "control" => "usage: remuda cluster control on|off\nexample: remuda cluster control off\n",
-        "remote" => "usage: remuda cluster remote [NODE/SESSION]\nexample: remuda cluster remote\n",
-        "listen" => "usage: remuda cluster listen --bind IP[:PORT] (default port 7441) [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20\n",
-        "call" => "usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] (default port 7441) [--json]\nexample: remuda cluster call node-abcd1234 list --addr 192.168.1.20\n",
-        _ => "usage: remuda cluster <command>\n  init\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n",
+        "init" => "usage: remuda cluster init\nexample: remuda cluster init\n".into(),
+        "invite" => format!("usage: remuda cluster invite --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})\nexample: remuda cluster invite --bind 192.168.1.20\n"),
+        "join" => format!("usage: remuda cluster join FINGERPRINT 'JOIN_LINE' [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})]\nexample: remuda cluster join 'SHA256:…' 'remuda-join-v1 …' --bind 192.168.1.20\n"),
+        "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n".into(),
+        "revoke" => "usage: remuda cluster revoke NODE|FINGERPRINT [--yes]\nexample: remuda cluster revoke node-abcd1234\n".into(),
+        "control" => "usage: remuda cluster control on|off\nexample: remuda cluster control off\n".into(),
+        "remote" => "usage: remuda cluster remote [NODE/SESSION]\nexample: remuda cluster remote\n".into(),
+        "listen" => format!("usage: remuda cluster listen --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20\n"),
+        "call" => format!("usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--json]\nexample: remuda cluster call node-abcd1234 list --addr 192.168.1.20\n"),
+        _ => "usage: remuda cluster <command>\n  init\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n".into(),
     }
 }
 
@@ -1307,6 +1319,10 @@ mod cluster_cli_tests {
         assert_eq!(
             parse_addr_default_port("2001:db8::4").unwrap(),
             "[2001:db8::4]:7441".parse().unwrap()
+        );
+        assert_eq!(
+            parse_addr_default_port("[fd00::1]").unwrap(),
+            "[fd00::1]:7441".parse().unwrap()
         );
     }
 
