@@ -105,6 +105,19 @@ pub fn push_now() -> Vec<PeerPushResult> {
 /// Push changes to known peers while excluding a node currently completing
 /// its join exchange; it will import this issuer's snapshot after the reply.
 pub fn push_now_excluding(excluded_peer: Option<&str>) -> Vec<PeerPushResult> {
+    push_now_for_targets(excluded_peer, None)
+}
+
+/// Push the current registry to admitted peers and the specified revoked peer.
+/// The revoked peer is included only for the one-shot notice containing its tombstone.
+pub fn push_now_with_revoked_target(revoked_peer: &str) -> Vec<PeerPushResult> {
+    push_now_for_targets(None, Some(revoked_peer))
+}
+
+fn push_now_for_targets(
+    excluded_peer: Option<&str>,
+    revoked_peer: Option<&str>,
+) -> Vec<PeerPushResult> {
     let (identity, registry) = match super::nodes() {
         Ok(Some(nodes)) => nodes,
         Ok(None) => {
@@ -127,10 +140,18 @@ pub fn push_now_excluding(excluded_peer: Option<&str>) -> Vec<PeerPushResult> {
         .iter()
         .filter(|node| {
             node.node_fp != identity.node_fp
-                && node.state == NodeState::Admitted
+                && (node.state == NodeState::Admitted
+                    || (node.state == NodeState::Revoked
+                        && Some(node.node_fp.as_str()) == revoked_peer))
                 && Some(node.node_fp.as_str()) != excluded_peer
         })
-        .map(|node| (node.node_fp.clone(), node.endpoint.is_some()))
+        .map(|node| {
+            (
+                node.node_fp.clone(),
+                node.endpoint.is_some(),
+                node.state == NodeState::Revoked,
+            )
+        })
         .collect::<Vec<_>>();
     if peers.is_empty() {
         return Vec::new();
@@ -143,7 +164,7 @@ pub fn push_now_excluding(excluded_peer: Option<&str>) -> Vec<PeerPushResult> {
         for _ in 0..WORKERS.min(peers.len()) {
             scope.spawn(|| loop {
                 let index = next.fetch_add(1, Ordering::Relaxed);
-                let Some((peer_fp, has_endpoint)) = peers.get(index) else {
+                let Some((peer_fp, has_endpoint, is_revoked_target)) = peers.get(index) else {
                     break;
                 };
                 let result = if !has_endpoint {
@@ -159,7 +180,7 @@ pub fn push_now_excluding(excluded_peer: Option<&str>) -> Vec<PeerPushResult> {
                         detail: "CLI push deadline elapsed before attempt".into(),
                     }
                 } else {
-                    match push_peer_with_retries(peer_fp, deadline) {
+                    match push_peer_with_retries(peer_fp, deadline, *is_revoked_target) {
                         Ok(()) => PeerPushResult {
                             peer_fp: peer_fp.clone(),
                             reached: true,
@@ -192,7 +213,11 @@ pub fn push_now_excluding(excluded_peer: Option<&str>) -> Vec<PeerPushResult> {
         .collect()
 }
 
-fn push_peer_with_retries(peer_fp: &str, deadline: Instant) -> io::Result<()> {
+fn push_peer_with_retries(
+    peer_fp: &str,
+    deadline: Instant,
+    allow_revoked_target: bool,
+) -> io::Result<()> {
     retry_with_backoff(
         |timeout| {
             let now = Instant::now();
@@ -202,7 +227,7 @@ fn push_peer_with_retries(peer_fp: &str, deadline: Instant) -> io::Result<()> {
                     "CLI push deadline elapsed before attempt",
                 ));
             }
-            push_peer_only(peer_fp, (now + timeout).min(deadline))
+            push_peer_only_with_state(peer_fp, (now + timeout).min(deadline), allow_revoked_target)
         },
         |backoff| thread::sleep(backoff.min(deadline.saturating_duration_since(Instant::now()))),
     )
@@ -320,13 +345,29 @@ fn worker_loop(pool: Arc<WorkPool>) {
 }
 
 fn peer_material(peer_fp: &str) -> io::Result<PeerMaterial> {
+    peer_material_for_revocation(peer_fp, false)
+}
+
+fn peer_material_for_revocation(
+    peer_fp: &str,
+    allow_revoked_target: bool,
+) -> io::Result<PeerMaterial> {
     let (_, registry) = super::nodes()?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized"))?;
     let peer = registry
         .authorized_nodes
         .iter()
-        .find(|node| node.node_fp == peer_fp && node.state == NodeState::Admitted)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::PermissionDenied, "peer is not admitted"))?;
+        .find(|node| {
+            node.node_fp == peer_fp
+                && (node.state == NodeState::Admitted
+                    || (allow_revoked_target && node.state == NodeState::Revoked))
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "peer is not admitted for this replication operation",
+            )
+        })?;
     let endpoint = peer.endpoint.as_deref().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotFound, "peer has no configured endpoint")
     })?;
@@ -354,7 +395,7 @@ fn replicate_peer(peer_fp: &str, push: bool) -> io::Result<()> {
 fn replicate_peer_until(peer_fp: &str, push: bool, deadline: Instant) -> io::Result<()> {
     let material = peer_material(peer_fp)?;
     if push {
-        push_registry_snapshot(peer_fp, &material, deadline)?;
+        push_registry_snapshot(peer_fp, &material, deadline, false)?;
     }
     fetch_peer(
         material.endpoint,
@@ -366,21 +407,30 @@ fn replicate_peer_until(peer_fp: &str, push: bool, deadline: Instant) -> io::Res
     )
 }
 
-fn push_peer_only(peer_fp: &str, deadline: Instant) -> io::Result<()> {
-    let material = peer_material(peer_fp)?;
-    push_registry_snapshot(peer_fp, &material, deadline)
+fn push_peer_only_with_state(
+    peer_fp: &str,
+    deadline: Instant,
+    allow_revoked_target: bool,
+) -> io::Result<()> {
+    let material = peer_material_for_revocation(peer_fp, allow_revoked_target)?;
+    push_registry_snapshot(peer_fp, &material, deadline, allow_revoked_target)
 }
 
 fn push_registry_snapshot(
     peer_fp: &str,
     material: &PeerMaterial,
     deadline: Instant,
+    allow_revoked_target: bool,
 ) -> io::Result<()> {
     let (identity, _) = super::nodes()?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized"))?;
-    let entries = snapshot_for_wire(&material.registry.authorized_nodes);
+    let entries = if allow_revoked_target {
+        revoked_target_snapshot_for_wire(&material.registry.authorized_nodes, peer_fp)
+    } else {
+        snapshot_for_wire(&material.registry.authorized_nodes)
+    };
     for chunk in entries.chunks(crate::net::REGISTRY_REPLICATION_PAGE_ENTRIES) {
-        ensure_peer_admitted(peer_fp)?;
+        ensure_peer_pushable(peer_fp, allow_revoked_target)?;
         let update = registry::RegistryUpdate {
             sender_fp: identity.node_fp.clone(),
             entries: chunk.to_vec(),
@@ -431,6 +481,24 @@ fn ensure_peer_admitted(peer_fp: &str) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "peer is no longer admitted for registry replication",
+        ))
+    }
+}
+
+fn ensure_peer_pushable(peer_fp: &str, allow_revoked_target: bool) -> io::Result<()> {
+    if !allow_revoked_target {
+        return ensure_peer_admitted(peer_fp);
+    }
+    let (_, registry) = super::nodes()?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized"))?;
+    if registry.authorized_nodes.iter().any(|node| {
+        node.node_fp == peer_fp && node.state == NodeState::Revoked && node.endpoint.is_some()
+    }) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "revoked target changed before tombstone notification",
         ))
     }
 }
@@ -718,6 +786,19 @@ fn snapshot_for_wire(entries: &[AuthorizedNode]) -> Vec<AuthorizedNode> {
         .collect()
 }
 
+fn revoked_target_snapshot_for_wire(
+    entries: &[AuthorizedNode],
+    revoked_target_fp: &str,
+) -> Vec<AuthorizedNode> {
+    snapshot_for_wire(
+        &entries
+            .iter()
+            .filter(|entry| entry.node_fp == revoked_target_fp && entry.state == NodeState::Revoked)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,6 +840,41 @@ mod tests {
         assert_eq!(relayed[0].delivered_by, None);
         assert_eq!(relayed[0].state, NodeState::Admitted);
         assert_eq!(relayed[1].state, NodeState::Revoked);
+    }
+
+    #[test]
+    fn revoked_target_push_contains_only_its_tombstone() {
+        let entries = vec![
+            AuthorizedNode {
+                node_fp: "SHA256:admitted-peer".into(),
+                static_pubkey: "key-admitted".into(),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
+                endpoint: None,
+                state: NodeState::Admitted,
+                version: 1,
+                by: "SHA256:issuer".into(),
+            },
+            AuthorizedNode {
+                node_fp: "SHA256:revoked-peer".into(),
+                static_pubkey: "key-revoked".into(),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
+                endpoint: None,
+                state: NodeState::Revoked,
+                version: 2,
+                by: "SHA256:issuer".into(),
+            },
+        ];
+
+        let pushed = revoked_target_snapshot_for_wire(&entries, "SHA256:revoked-peer");
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].node_fp, "SHA256:revoked-peer");
+        assert_eq!(pushed[0].state, NodeState::Revoked);
     }
 
     #[test]
