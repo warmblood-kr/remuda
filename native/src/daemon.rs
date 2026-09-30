@@ -2890,6 +2890,118 @@ mod tests {
             Err(crate::net::advertise_addr::NoLanAddr { candidate: None })
         }));
     }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn auto_listener_retries_until_private_address_is_available() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let environment = ListenerTaskEnvironment::new(Some(auto_listener_config()));
+        let available = Arc::new(AtomicBool::new(false));
+        let detector_available = Arc::clone(&available);
+        let detector: AutoAddressDetector = Arc::new(move || {
+            if detector_available.load(Ordering::Acquire) {
+                Ok(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+            } else {
+                Err(crate::net::advertise_addr::NoLanAddr { candidate: None })
+            }
+        });
+        let task = ListenerTask::start_with_detector(&environment.socket_path(), detector);
+
+        assert!(
+            !matches!(task.status(), ListenerStatus::Failed(_)),
+            "Auto listener should wait for a private address instead of failing: {:?}",
+            task.status()
+        );
+        available.store(true, Ordering::Release);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match task.status() {
+                ListenerStatus::On {
+                    addr, auto: true, ..
+                } if addr.ip() == Ipv4Addr::LOCALHOST => break,
+                ListenerStatus::Failed(reason) => {
+                    panic!("Auto listener failed while waiting for LAN: {reason}")
+                }
+                _ if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                status => panic!("Auto listener did not bind after address appeared: {status:?}"),
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn auto_listener_keeps_running_during_address_loss_then_rebinds() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let environment = ListenerTaskEnvironment::new(Some(auto_listener_config()));
+        let phase = Arc::new(AtomicUsize::new(0));
+        let detector_phase = Arc::clone(&phase);
+        let detector_calls = Arc::new(AtomicUsize::new(0));
+        let detector_call_count = Arc::clone(&detector_calls);
+        let detector: AutoAddressDetector = Arc::new(move || {
+            detector_call_count.fetch_add(1, Ordering::AcqRel);
+            match detector_phase.load(Ordering::Acquire) {
+                0 => Ok(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)),
+                1 => Err(crate::net::advertise_addr::NoLanAddr { candidate: None }),
+                _ => Ok(SocketAddr::new(
+                    IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                    0,
+                )),
+            }
+        });
+        let task = ListenerTask::start_with_detector(&environment.socket_path(), detector);
+        let old_address = bound_auto_listener_status(&task);
+        assert_eq!(old_address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        phase.store(1, Ordering::Release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while detector_calls.load(Ordering::Acquire) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detector was not rechecked"
+            );
+            assert!(
+                !matches!(task.status(), ListenerStatus::Failed(_)),
+                "listener failed when the detector lost its address: {:?}",
+                task.status()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            matches!(
+                task.status(),
+                ListenerStatus::On { addr, auto: true, .. } if addr == old_address
+            ),
+            "listener should remain bound while the detector has no address: {:?}",
+            task.status()
+        );
+
+        phase.store(2, Ordering::Release);
+        let recovery_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let new_address = loop {
+            match task.status() {
+                ListenerStatus::On {
+                    addr, auto: true, ..
+                } if addr.ip() == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST) => break addr,
+                ListenerStatus::Failed(reason) => {
+                    panic!("Auto listener failed before the address returned: {reason}")
+                }
+                _ if std::time::Instant::now() < recovery_deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                status => panic!("Auto listener did not rebind after recovery: {status:?}"),
+            }
+        };
+        assert_ne!(new_address, old_address);
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn auto_listener_does_not_bind_without_an_eligible_private_address() {
