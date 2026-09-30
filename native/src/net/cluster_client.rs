@@ -20,6 +20,12 @@ const MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum ClientError {
     /// The peer could not be reached.
     Unreachable,
+    /// The peer address refused a TCP connection.
+    PeerNotListening,
+    /// The peer closed an established TCP connection.
+    PeerClosedConnection,
+    /// The operating system denied opening the connection.
+    OsBlockedConnection,
     /// A connect, read, or total deadline elapsed.
     Timeout,
     /// The peer refused the request with this HTTP status.
@@ -35,6 +41,9 @@ impl std::fmt::Display for ClientError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unreachable => formatter.write_str("cluster peer is unreachable"),
+            Self::PeerNotListening => formatter.write_str("peer is not listening"),
+            Self::PeerClosedConnection => formatter.write_str("peer closed the connection"),
+            Self::OsBlockedConnection => formatter.write_str("the OS blocked the connection"),
             Self::Timeout => formatter.write_str("cluster request timed out"),
             Self::Refused(status) => write!(formatter, "cluster peer refused request ({status})"),
             Self::BadResponse => formatter.write_str("cluster peer returned a bad response"),
@@ -280,13 +289,18 @@ fn map_io(error: io::Error) -> ClientError {
     match error.kind() {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => ClientError::Timeout,
         io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof => ClientError::BadResponse,
+        io::ErrorKind::ConnectionRefused => ClientError::PeerNotListening,
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted => {
+            ClientError::PeerClosedConnection
+        }
+        io::ErrorKind::PermissionDenied => ClientError::OsBlockedConnection,
         _ => ClientError::Unreachable,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{read_http_response_from, ClientError, MAX_BODY_BYTES};
+    use super::{map_io, read_http_response_from, ClientError, MAX_BODY_BYTES};
     use std::io::{BufReader, Cursor, Read};
 
     struct CountedReader {
@@ -320,5 +334,25 @@ mod tests {
             "read {} bytes before refusing an oversized response",
             reader.get_ref().bytes_read
         );
+    }
+
+    #[test]
+    fn io_connection_errors_have_distinct_diagnostics() {
+        let refused = map_io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        assert_eq!(refused, ClientError::PeerNotListening);
+        assert_eq!(refused.to_string(), "peer is not listening");
+
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            let closed = map_io(std::io::Error::from(kind));
+            assert_eq!(closed, ClientError::PeerClosedConnection);
+            assert_eq!(closed.to_string(), "peer closed the connection");
+        }
+
+        let blocked = map_io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(blocked, ClientError::OsBlockedConnection);
+        assert_eq!(blocked.to_string(), "the OS blocked the connection");
     }
 }

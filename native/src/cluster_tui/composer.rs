@@ -35,7 +35,8 @@ impl LineComposer {
                     self.clear();
                     ComposerAction::Cleared
                 }
-                KeyCode::Char('\\') => ComposerAction::Detach,
+                // Crossterm decodes the raw Ctrl-\\ byte as Ctrl-4 on Unix.
+                KeyCode::Char('\\' | '4') => ComposerAction::Detach,
                 _ => ComposerAction::None,
             };
         }
@@ -60,6 +61,7 @@ impl LineComposer {
                 self.cursor = self.text.chars().count();
                 ComposerAction::None
             }
+            KeyCode::Esc => ComposerAction::Detach,
             KeyCode::Backspace => {
                 self.backspace();
                 ComposerAction::None
@@ -151,6 +153,14 @@ mod tests {
         assert_eq!(composer.text(), "");
         assert_eq!(
             composer.handle_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL,)),
+            ComposerAction::Detach
+        );
+        assert_eq!(
+            composer.handle_key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL)),
+            ComposerAction::Detach
+        );
+        assert_eq!(
+            composer.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             ComposerAction::Detach
         );
     }

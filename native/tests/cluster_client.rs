@@ -438,7 +438,7 @@ fn client_rejects_a_low_order_pinned_key_before_connecting() {
 }
 
 #[test]
-fn client_reports_an_unreachable_peer() {
+fn client_reports_a_peer_that_is_not_listening() {
     let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = reservation.local_addr().unwrap();
     drop(reservation);
@@ -454,7 +454,7 @@ fn client_reports_an_unreachable_peer() {
         &initiator.private,
         &Request::List,
     );
-    assert!(matches!(result, Err(ClientError::Unreachable)));
+    assert!(matches!(result, Err(ClientError::PeerNotListening)));
 }
 
 #[test]

@@ -360,6 +360,15 @@ fn read_registry(node: &PrivateNode) -> remuda_native::cluster::Registry {
 }
 
 fn list_from(peer_material: &[u8], server_material: &[u8], address: SocketAddr) -> Response {
+    request_from(peer_material, server_material, address, &Request::List)
+}
+
+fn request_from(
+    peer_material: &[u8],
+    server_material: &[u8],
+    address: SocketAddr,
+    request: &Request,
+) -> Response {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -368,7 +377,7 @@ fn list_from(peer_material: &[u8], server_material: &[u8], address: SocketAddr) 
         &peer_material[..32],
         &server_material[32..],
         now,
-        &serde_json::to_vec(&Request::List).unwrap(),
+        &serde_json::to_vec(request).unwrap(),
     )
     .unwrap();
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
@@ -581,6 +590,96 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
         .find(|line| line.contains(&b_fingerprint))
         .expect("node B row in nodes table");
     assert!(row.contains("revoked"), "node B row is not revoked: {row}");
+}
+
+#[test]
+fn revoked_offline_member_learns_from_pull_on_reconnect_and_unknown_key_gets_no_tombstone() {
+    let _serial = live_test_guard();
+    let a = PrivateNode::start("revoke-pull-a");
+    let mut b = PrivateNode::start("revoke-pull-b");
+    let c = PrivateNode::start("revoke-pull-c");
+    for node in [&a, &b, &c] {
+        successful(
+            node.run(&["cluster", "init"]),
+            "initialize revoke-pull node",
+        );
+    }
+    let a_identity = a.identity();
+    let b_identity = b.identity();
+    let b_fp = identity_fingerprint(&b_identity);
+    let c_fp = identity_fingerprint(&c.identity());
+    let a_listener = ListenerProcess::start(&a);
+    let mut b_listener = ListenerProcess::start(&b);
+    let c_listener = ListenerProcess::start(&c);
+    join_member(&a, &b, &a_identity, a_listener.address, b_listener.address);
+    join_member(&a, &c, &a_identity, a_listener.address, c_listener.address);
+    wait_for_member_and_probe(&b, &c_fp, &c.identity(), &b.identity(), b_listener.address);
+
+    // Keep B's authenticated registry intact while making both its daemon and
+    // listener unavailable, so A cannot deliver the push notification.
+    b_listener.stop();
+    drop(b_listener);
+    b.stop_daemon();
+    successful(
+        a.run(&["cluster", "revoke", &b_fp, "--yes"]),
+        "revoke offline node B",
+    );
+
+    b.restart_daemon();
+    let _reconnected_b_listener = ListenerProcess::start(&b);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let nodes = loop {
+        let output = successful(
+            b.run(&["cluster", "nodes"]),
+            "read reconnected node B's nodes table",
+        );
+        if output.contains("This node was revoked by") || Instant::now() >= deadline {
+            break output;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        nodes.contains("This node was revoked by"),
+        "reconnected B's nodes output omitted the revoked-by line: {nodes}"
+    );
+    let revoked_list = request_from(&b_identity, &a_identity, a_listener.address, &Request::List);
+    assert!(
+        matches!(&revoked_list, Response::Error(message) if message == "not admitted"),
+        "non-sync request from revoked B did not keep the generic refusal: {revoked_list:?}"
+    );
+    let b_registry = read_registry(&b);
+    assert!(
+        b_registry
+            .authorized_nodes
+            .iter()
+            .any(|entry| entry.node_fp == c_fp),
+        "importing A's one-entry tombstone page dropped B's other registry entries: {b_registry:?}"
+    );
+}
+
+#[test]
+fn unknown_key_registry_sync_gets_only_generic_refusal() {
+    let _serial = live_test_guard();
+    let a = PrivateNode::start("revoke-pull-unknown-a");
+    let unknown = PrivateNode::start("revoke-pull-unknown-peer");
+    successful(a.run(&["cluster", "init"]), "initialize node A");
+    successful(unknown.run(&["cluster", "init"]), "initialize unknown node");
+    let a_identity = a.identity();
+    let a_listener = ListenerProcess::start(&a);
+
+    let response = request_from(
+        &unknown.identity(),
+        &a_identity,
+        a_listener.address,
+        &Request::ClusterRegistrySync {
+            digest: None,
+            offset: 0,
+        },
+    );
+    assert!(
+        matches!(&response, Response::Error(message) if message == "not admitted"),
+        "unknown key received a tombstone or non-generic response: {response:?}"
+    );
 }
 
 #[test]

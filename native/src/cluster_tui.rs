@@ -628,14 +628,14 @@ impl ClusterUi {
             frame.push(prompt);
         } else if self.remote_active.is_some() && self.composer_focused {
             frame.push(self.composer_line());
-            frame.push("Enter send · Ctrl-C clear · Ctrl-\\ list".into());
+            frame.push("Enter send · Ctrl-C clear · Esc list".into());
         } else if self.remote_active.is_some() {
             frame.push("Remote session is read-only · q detach".into());
         } else if self.ended.is_some() {
             frame.push("Input is disabled · x clears ended session · q detaches".into());
         } else if self.composer_focused {
             frame.push(self.composer_line());
-            frame.push("Enter send · Ctrl-C clear · Ctrl-\\ list".into());
+            frame.push("Enter send · Ctrl-C clear · Esc list".into());
         } else {
             frame.push(self.footer());
         }
@@ -2467,6 +2467,38 @@ mod tests {
 
         assert!(frame.contains("▶ laptop · stale · sync 17s ago"));
         assert!(!frame.contains("build"));
+    }
+
+    #[test]
+    fn escape_returns_from_remote_composer_to_the_read_only_view() {
+        let clock = ManualClock::new();
+        let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        )));
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&source);
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        ui.enter_selected(clock.now());
+        assert!(ui.composer_focused);
+
+        let focused = ui.render(100, 24, "", &clock);
+        assert!(focused.contains("Enter send · Ctrl-C clear · Esc list"));
+
+        ui.key_event(
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+            clock.now(),
+        );
+
+        assert!(!ui.composer_focused);
+        assert!(ui
+            .render(100, 24, "", &clock)
+            .contains("Remote session is read-only · q detach"));
     }
 
     #[test]

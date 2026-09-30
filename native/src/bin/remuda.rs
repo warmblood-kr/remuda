@@ -292,6 +292,7 @@ remuda — terminal orchestration for coding agents
                                  --mouse=false disables mouse handling (before or after NAME)
   remuda ls | send NAME TEXT     inspect or message sessions
   remuda resize NAME COLS ROWS   resize a session (cols 20..1000, rows 24..500)
+  remuda upgrade [--channel stable|nightly]  replace the CLI binary
   remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon (sessions are lost)
 
   remuda mod install OWNER/REPO  install a mod from GitHub
@@ -316,6 +317,17 @@ remuda — terminal orchestration for coding agents
   remuda --version
 
 Run `remuda mod list` for installed mods and `remuda doc` for the live Lua API.
+Next: run `remuda run -n NAME COMMAND` to start a session, or `remuda ls` to inspect sessions.
+";
+
+const UPGRADE_HELP: &str = "\
+Usage: remuda upgrade [--channel stable|nightly]
+
+Re-runs the installer to replace the CLI with the latest stable or nightly
+release. The running daemon and its sessions keep using the old version until
+you run `remuda stop`.
+
+Next: run `remuda upgrade` to install the latest version from your channel.
 ";
 
 fn help_command() -> ExitCode {
@@ -351,9 +363,13 @@ fn unknown_command(word: &str) -> ExitCode {
             eprintln!("remuda: no command or mod with that name.");
         }
 
-        let suggestion = if command_word {
-            let command_suggestion = suggest_command(word).map(|name| format!("remuda {name}"));
-            command_suggestion.or_else(|| {
+        let command_suggestion = if command_word {
+            suggest_command(word).map(|name| format!("remuda {name}"))
+        } else {
+            None
+        };
+        let suggestion = command_suggestion.clone().or_else(|| {
+            if command_word {
                 let installed_mod_names = remuda_native::packages::manifests()
                     .unwrap_or_default()
                     .into_iter()
@@ -364,15 +380,17 @@ fn unknown_command(word: &str) -> ExitCode {
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 closest_word(word, &installed_mod_name_refs).map(|name| format!("remuda {name}"))
-            })
-        } else {
-            None
-        };
+            } else {
+                None
+            }
+        });
         if let Some(suggestion) = suggestion {
             eprintln!("Did you mean: {suggestion}?");
         }
 
-        let next = if command_word {
+        let next = if let Some(command) = command_suggestion {
+            format!("Next: run {command}.")
+        } else if command_word {
             format!("Next: if {word} is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list.")
         } else {
             "Next: if this is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list.".to_string()
@@ -1551,7 +1569,11 @@ fn cluster_call(
         Ok(response) => response,
         Err(error) => {
             let code = match error {
-                ClientError::Unreachable | ClientError::Timeout => 3,
+                ClientError::Unreachable
+                | ClientError::PeerNotListening
+                | ClientError::PeerClosedConnection
+                | ClientError::OsBlockedConnection
+                | ClientError::Timeout => 3,
                 ClientError::Refused(_) => 4,
                 ClientError::Crypto | ClientError::BadResponse => 5,
             };
@@ -3211,8 +3233,20 @@ fn prepare_command(argv: &[&str], path: &Path) -> Result<Option<String>, String>
 /// Split out of `main` for the same reason `list_sessions` was: clippy's line
 /// budget. This one talks to no daemon — it replaces this very binary.
 fn run_upgrade(args: &[&str]) -> ExitCode {
+    if matches!(args, ["--help"] | ["-h"]) {
+        print!("{UPGRADE_HELP}");
+        return ExitCode::SUCCESS;
+    }
     match upgrade_channel(args).and_then(dist::upgrade) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            eprintln!(
+                "The running daemon and its sessions keep using the old version until you run `remuda stop` (that ends those sessions); the next remuda command starts the new version."
+            );
+            eprintln!(
+                "Next: run `remuda stop` when your sessions can end, then `remuda --version` to check the installed version."
+            );
+            ExitCode::SUCCESS
+        }
         Err(e) => fail(e),
     }
 }
@@ -3303,8 +3337,13 @@ fn upgrade_channel<'a>(args: &[&'a str]) -> Result<Option<&'a str>, String> {
     match args {
         [] => Ok(None),
         ["--channel", name] if dist::is_channel(name) => Ok(Some(name)),
-        ["--channel", name] => Err(format!("unknown channel {name:?} — stable or nightly")),
-        _ => Err("usage: remuda upgrade [--channel stable|nightly]".into()),
+        ["--channel", name] => Err(format!(
+            "unknown channel {name:?}; use --channel stable or --channel nightly, e.g. remuda upgrade --channel nightly.\nNext: run `remuda upgrade --channel stable` or `remuda upgrade --channel nightly`."
+        )),
+        _ => Err(
+            "usage: remuda upgrade [--channel stable|nightly]\nNext: run `remuda upgrade --channel stable` or `remuda upgrade --channel nightly`."
+                .into(),
+        ),
     }
 }
 
