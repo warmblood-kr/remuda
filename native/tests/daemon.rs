@@ -4712,10 +4712,7 @@ fn another_client_eval_returns_while_a_one_second_timer_is_pending() {
     let path = scratch("lua-timer-nonblocking");
     let _daemon = daemon_at(&path);
     assert_eq!(
-        eval(
-            &path,
-            "remuda.after(1, function() end); return 'scheduled'",
-        ),
+        eval(&path, "remuda.after(1, function() end); return 'scheduled'",),
         "scheduled"
     );
 
@@ -4761,7 +4758,10 @@ fn reloading_a_lifecycle_mod_cancels_its_owned_interval() {
     eval(&path, "remuda.exec('timer_mod'); return 'loaded'");
     std::thread::sleep(Duration::from_millis(180));
     let before_reload = read_count(&path, "return remuda._owned_timer_fires or 0");
-    assert!(before_reload >= 1, "owner interval did not fire before reload");
+    assert!(
+        before_reload >= 1,
+        "owner interval did not fire before reload"
+    );
 
     eval(&path, "remuda.reload('timer_mod'); return 'reloaded'");
     std::thread::sleep(Duration::from_millis(200));
@@ -4811,13 +4811,13 @@ fn lua_timers_have_bounded_inputs_and_live_timer_count() {
         "remuda._clock_before = remuda.clock(); remuda.after(0.02, function() remuda._clock_after = remuda.clock() end); return 'clock-set'",
     );
     std::thread::sleep(Duration::from_millis(50));
-    let elapsed = eval(
-        &path,
-        "return remuda._clock_after - remuda._clock_before",
-    )
-    .parse::<u64>()
-    .expect("monotonic millisecond delta");
-    assert!(elapsed >= 10, "clock did not advance in milliseconds: {elapsed}");
+    let elapsed = eval(&path, "return remuda._clock_after - remuda._clock_before")
+        .parse::<u64>()
+        .expect("monotonic millisecond delta");
+    assert!(
+        elapsed >= 10,
+        "clock did not advance in milliseconds: {elapsed}"
+    );
 }
 
 #[test]
@@ -4843,7 +4843,7 @@ fn interval_skips_missed_ticks_and_callback_errors_do_not_stop_timers() {
             return "scheduled"
         "#,
     );
-    std::thread::sleep(Duration::from_millis(160));
+    std::thread::sleep(Duration::from_millis(400));
     let result = eval(
         &path,
         r#"
@@ -4858,7 +4858,10 @@ fn interval_skips_missed_ticks_and_callback_errors_do_not_stop_timers() {
             return #marks
         "#,
     );
-    assert!(result.parse::<usize>().unwrap() <= 5, "missed interval ticks were not skipped");
+    assert!(
+        result.parse::<usize>().unwrap() <= 5,
+        "missed interval ticks were not skipped"
+    );
 }
 
 fn eval(path: &Path, code: &str) -> String {

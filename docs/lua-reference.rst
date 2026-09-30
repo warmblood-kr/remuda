@@ -16,6 +16,11 @@ advise
 
 ``advise(path, how, fn, opts) -> nil`` — Wrap the function at a `remuda.*` path. `how`: around|before|after|override|filter_args|filter_return|before_while|before_until. `opts`: `id` (required; same id replaces), `depth` (-100 outermost).
 
+after
+-----
+
+``after(seconds, fn) -> handle`` — Run a callback once after a delay without blocking the Lua image; cancel with handle:cancel().
+
 attach
 ------
 
@@ -61,6 +66,11 @@ click
 
 ``click(name, col, row, button?) -> nil`` — Send a mouse click at a terminal cell.
 
+clock
+-----
+
+``clock() -> milliseconds`` — Monotonic milliseconds since this Lua image started.
+
 close
 -----
 
@@ -100,6 +110,11 @@ event_counts
 ------------
 
 ``event_counts() -> {[event]=n}`` — How many times each event has been emitted.
+
+every
+-----
+
+``every(seconds, fn) -> handle`` — Run a callback periodically without blocking the Lua image; cancel with handle:cancel().
 
 exec
 ----

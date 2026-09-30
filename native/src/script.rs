@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 88] = [
+pub const BINDINGS: [&str; 94] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -58,9 +58,13 @@ pub const BINDINGS: [&str; 88] = [
     "_session_resize",
     "_sync_window_shown",
     "_take_due_schedules",
+    "_timer_after",
+    "_timer_cancel_owner",
+    "_timer_every",
     "advice_list",
     "advice_member",
     "advise",
+    "after",
     "attach",
     "buffer",
     "buffers",
@@ -70,6 +74,7 @@ pub const BINDINGS: [&str; 88] = [
     "capture_styled",
     "clear_hooks",
     "click",
+    "clock",
     "close",
     "contribute",
     "contributions",
@@ -78,6 +83,7 @@ pub const BINDINGS: [&str; 88] = [
     "emit_until_failure",
     "emit_until_success",
     "event_counts",
+    "every",
     "exec",
     "expect",
     "expect_option",
@@ -147,6 +153,26 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_module_readiness",
         "Internal readiness poll for remuda exec.",
         "_module_readiness(name) -> {status, timeout_ms?, message?}",
+    ),
+    (
+        "_timer_after",
+        "Internal event-loop one-shot timer binding.",
+        "_timer_after(seconds, callback, owner?) -> handle",
+    ),
+    (
+        "_timer_cancel_owner",
+        "Internal lifecycle cleanup for an owner's event-loop timers.",
+        "_timer_cancel_owner(owner) -> nil",
+    ),
+    (
+        "_timer_every",
+        "Internal event-loop repeating timer binding.",
+        "_timer_every(seconds, callback, owner?) -> handle",
+    ),
+    (
+        "clock",
+        "Monotonic milliseconds since this Lua image started.",
+        "clock() -> milliseconds",
     ),
     (
         "_pending_create",
@@ -529,12 +555,14 @@ pub(crate) fn bindings(
     counters: std::sync::Arc<crate::tick::Counters>,
     image: crate::image::Image,
     caller: Rc<RefCell<crate::image::CallerContext>>,
+    timers: crate::image::timers::SharedTimerService,
 ) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     let at = || socket.to_path_buf();
     let input_registry = registry.clone();
     fail_binding(lua, &table, image.clone())?;
     pending_bindings(lua, &table, image.pending_replies(), Rc::clone(&caller))?;
+    timer_bindings(lua, &table, timers)?;
     caller_binding(lua, &table, caller)?;
     random_bytes_binding(lua, &table)?;
 
@@ -770,6 +798,43 @@ fn sleep_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
             Ok(())
         })?,
     )
+}
+
+fn timer_bindings(
+    lua: &Lua,
+    table: &Table,
+    timers: crate::image::timers::SharedTimerService,
+) -> mlua::Result<()> {
+    let clock = Rc::clone(&timers);
+    table.set(
+        "clock",
+        lua.create_function(move |_, ()| Ok(clock.borrow().clock_ms()))?,
+    )?;
+    for (name, repeating) in [("_timer_after", false), ("_timer_every", true)] {
+        let timers = Rc::clone(&timers);
+        table.set(
+            name,
+            lua.create_function(
+                move |lua, (seconds, callback, owner): (f64, mlua::Function, Option<String>)| {
+                    let id = timers
+                        .borrow_mut()
+                        .schedule(lua, seconds, callback, owner, repeating)?;
+                    lua.create_userdata(crate::image::timers::TimerHandle::new(
+                        id,
+                        Rc::clone(&timers),
+                    ))
+                },
+            )?,
+        )?;
+    }
+    table.set(
+        "_timer_cancel_owner",
+        lua.create_function(move |lua, owner: String| {
+            timers.borrow_mut().cancel_owner(lua, &owner);
+            Ok(())
+        })?,
+    )?;
+    Ok(())
 }
 
 fn random_bytes_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
