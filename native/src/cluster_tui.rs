@@ -2424,6 +2424,31 @@ mod tests {
     }
 
     #[test]
+    fn remote_paste_without_bracketed_mode_is_forwarded_without_markers() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.handle_event(Event::Paste("approval text".into()), clock.now());
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "paste should produce one Input");
+        assert!(matches!(
+            &requests[0].1,
+            Request::Input { bytes, .. } if bytes == b"approval text"
+        ));
+    }
+
+    #[test]
     fn bracketed_paste_in_remote_keys_mode_is_forwarded_with_its_markers() {
         use crossterm::event::{Event, KeyCode, KeyModifiers};
 
