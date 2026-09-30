@@ -973,7 +973,7 @@ fn inspect_peer_certificate(
         .map_err(|_| "TLS verifier state unavailable".to_string())?
         .clone()
         .ok_or_else(|| "TLS verifier returned no result".to_string())?;
-    Ok(peer_certificate_from_der(cert, trust.is_ok(), trust.err())?)
+    peer_certificate_from_der(cert, trust.is_ok(), trust.err())
 }
 
 fn peer_certificate_from_der(
