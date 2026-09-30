@@ -1627,6 +1627,40 @@ fn caller_context(stream: &Stream, registry: &Registry) -> crate::image::CallerC
     }
 }
 
+fn is_secret_prompt_format_or_separator(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
+fn sanitize_secret_prompt_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_control() && !is_secret_prompt_format_or_separator(*ch))
+        .collect()
+}
+
 fn deferred_reply(
     stream: Stream,
     reader: BufReader<Stream>,
@@ -1660,11 +1694,16 @@ fn deferred_reply(
             }
         },
         |prompt, timeout| {
-            let label = match prompt.caller_session {
-                Some(session) => format!("{session}: {}", prompt.label),
-                None => prompt.label,
-            };
-            let label: String = label.chars().filter(|ch| !ch.is_control()).collect();
+            let caller = prompt
+                .caller_session
+                .as_deref()
+                .map(sanitize_secret_prompt_text)
+                .unwrap_or_else(|| "outside".to_string());
+            let caller_label: String = sanitize_secret_prompt_text(&prompt.label)
+                .chars()
+                .take(256)
+                .collect();
+            let label = format!("remuda[{caller}] {caller_label}");
             reply(
                 &stream,
                 &Response::PromptSecret {
