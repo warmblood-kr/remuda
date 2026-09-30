@@ -1589,6 +1589,20 @@ impl JoinInterruptHandler {
                 }
                 return Err(error);
             }
+            if prior == libc::SIG_IGN {
+                // Preserve signals ignored by the caller (for example SIGHUP under nohup).
+                if unsafe { libc::signal(signal, libc::SIG_IGN) } == libc::SIG_ERR {
+                    let error = std::io::Error::last_os_error();
+                    for (installed_signal, old_handler) in previous.drain(..).rev() {
+                        // SAFETY: restore the disposition returned by the earlier signal call.
+                        unsafe {
+                            libc::signal(installed_signal, old_handler);
+                        }
+                    }
+                    return Err(error);
+                }
+                continue;
+            }
             previous.push((signal, prior));
         }
         Ok(Self { previous })
