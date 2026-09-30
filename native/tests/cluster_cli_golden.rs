@@ -792,6 +792,98 @@ fn failed_join_restores_the_exact_saved_listener_config() {
     );
 }
 
+#[test]
+fn failed_join_preserves_listener_change_made_while_join_is_blocked() {
+    use remuda_native::cluster::{encoding, join_line::JoinLine, listener_config};
+    use std::process::Stdio;
+    use zeroize::Zeroizing;
+
+    struct ChildGuard(Option<std::process::Child>);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let scratch = Scratch::new();
+    let _daemon = initialized_node(&scratch);
+    let cluster_dir = scratch.root.join("state/remuda/cluster");
+    let fake_issuer = TcpListener::bind("127.0.0.1:0").expect("bind stalled fake issuer");
+    let issuer_addr = fake_issuer.local_addr().unwrap();
+    let key = fs::read(cluster_dir.join("identity.key")).unwrap();
+    let issuer_public: [u8; 32] = key[32..].try_into().unwrap();
+    let fingerprint = encoding::fingerprint(&issuer_public);
+    let invitation = JoinLine {
+        issuer_addr,
+        issuer_fingerprint: fingerprint.clone(),
+        issuer_static_pubkey: issuer_public,
+        token: Zeroizing::new(encoding::encode_base64(&[7; 32])),
+    }
+    .encode()
+    .unwrap();
+    let (connected_tx, connected_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = fake_issuer.accept().expect("accept join connection");
+        connected_tx.send(()).unwrap();
+        release_rx
+            .recv_timeout(Duration::from_secs(8))
+            .expect("test did not release stalled issuer");
+        drop(stream);
+    });
+    let join_bind = unused_loopback_addr();
+    let mut child = ChildGuard(Some(
+        scratch
+            .command(&[
+                "cluster",
+                "join",
+                &fingerprint,
+                &invitation,
+                "--bind",
+                &join_bind.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start isolated join command"),
+    ));
+    connected_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("join never connected to stalled issuer");
+
+    let stopped = scratch.run(&["cluster", "listen", "--off"]);
+    assert!(
+        stopped.status.success(),
+        "concurrent listen --off failed: {stopped:?}"
+    );
+    let changed = listener_config::read_at(&cluster_dir).unwrap();
+    assert_eq!(
+        changed,
+        Some(remuda_native::cluster::listener_config::ListenerConfig {
+            enabled: false,
+            bind: remuda_native::cluster::listener_config::ListenerBind::Explicit(join_bind),
+            allow_public: false,
+        })
+    );
+
+    release_tx.send(()).unwrap();
+    let joined = child.0.take().unwrap().wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(
+        !joined.status.success(),
+        "stalled fake issuer unexpectedly joined"
+    );
+    assert_eq!(
+        listener_config::read_at(&cluster_dir).unwrap(),
+        changed,
+        "failed join overwrote the listener change made while it was blocked"
+    );
+}
+
 fn failed_join_with_listener_config(
     fingerprint: &str,
     join_line: &str,
