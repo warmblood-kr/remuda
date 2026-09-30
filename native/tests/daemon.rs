@@ -4744,7 +4744,7 @@ fn reloading_a_lifecycle_mod_cancels_its_owned_interval() {
           initialize = function() return {} end,
           start = function()
             remuda.every(0.05, function()
-              remuda._owned_timer_fires = (remuda._owned_timer_fires or 0) + 1
+              remuda._timer_test.fires = remuda._timer_test.fires + 1
             end)
           end,
         }"#,
@@ -4755,21 +4755,37 @@ fn reloading_a_lifecycle_mod_cancels_its_owned_interval() {
     command.env("XDG_DATA_HOME", &data);
     let _daemon = spawn::spawn_and_wait(command, &runtime);
     let path = daemon::socket_path_in(&runtime, "s");
+    eval(&path, "remuda._timer_test = { fires = 0 }; return 'ready'");
     eval(&path, "remuda.exec('timer_mod'); return 'loaded'");
-    std::thread::sleep(Duration::from_millis(180));
-    let before_reload = read_count(&path, "return remuda._owned_timer_fires or 0");
-    assert!(
-        before_reload >= 1,
-        "owner interval did not fire before reload"
-    );
+    let before_deadline = Instant::now() + Duration::from_secs(3);
+    let before_reload = loop {
+        let count = read_count(&path, "return remuda._timer_test.fires");
+        if count >= 1 {
+            break count;
+        }
+        assert!(
+            Instant::now() < before_deadline,
+            "owner interval did not fire before reload"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
 
+    std::fs::write(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function() end,
+        }"#,
+    )
+    .expect("write replacement lifecycle mod without timer");
     eval(&path, "remuda.reload('timer_mod'); return 'reloaded'");
-    std::thread::sleep(Duration::from_millis(200));
-    let after_reload = read_count(&path, "return remuda._owned_timer_fires or 0");
-    let after_reload_delta = after_reload - before_reload;
+    let after_reload = read_count(&path, "return remuda._timer_test.fires");
+    std::thread::sleep(Duration::from_millis(300));
+    let settled = read_count(&path, "return remuda._timer_test.fires");
     assert!(
-        (1..=5).contains(&after_reload_delta),
-        "reload should leave one interval active, but it fired {after_reload_delta} times"
+        settled == after_reload && after_reload >= before_reload,
+        "reload should cancel the old interval without losing prior fires: before={before_reload}, immediately after={after_reload}, settled={settled}"
     );
 }
 
