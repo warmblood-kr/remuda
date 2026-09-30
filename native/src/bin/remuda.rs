@@ -2386,6 +2386,9 @@ mod cluster_cli_tests {
     static FOREGROUND_LISTENER_LOCK_TEST: Mutex<()> = Mutex::new(());
 
     #[cfg(unix)]
+    static JOIN_SIGNAL_TEST: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
     struct ForegroundListenerLockEnvironment {
         _lock: MutexGuard<'static, ()>,
         root: std::path::PathBuf,
@@ -2589,6 +2592,9 @@ mod cluster_cli_tests {
     #[cfg(unix)]
     #[test]
     fn join_sigint_handler_sets_the_cancellation_flag() {
+        let _serial = JOIN_SIGNAL_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _handler = JoinInterruptHandler::install().unwrap();
         assert!(!JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
@@ -2597,7 +2603,36 @@ mod cluster_cli_tests {
 
     #[cfg(unix)]
     #[test]
+    fn join_interrupt_handler_preserves_ignored_sighup() {
+        let _serial = JOIN_SIGNAL_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct RestoreSignal(libc::c_int, libc::sighandler_t);
+        impl Drop for RestoreSignal {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::signal(self.0, self.1);
+                }
+            }
+        }
+
+        let prior = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        assert_ne!(prior, libc::SIG_ERR, "set SIGHUP to ignored");
+        let _restore = RestoreSignal(libc::SIGHUP, prior);
+        JOIN_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _handler = JoinInterruptHandler::install().unwrap();
+
+        assert_eq!(current_signal_handler(libc::SIGHUP), libc::SIG_IGN);
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        assert!(!JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn join_interrupt_handler_tracks_signals_and_restores_prior_dispositions() {
+        let _serial = JOIN_SIGNAL_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let signals = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
         let before: Vec<_> = signals
             .iter()
