@@ -775,8 +775,17 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             ExitCode::SUCCESS
         }
         ClusterCommand::UnknownVerb(verb) => {
-            eprintln!("remuda: unknown cluster command '{verb}'");
+            if verb.starts_with("remuda-join-v1") {
+                eprintln!(
+                    "remuda: that looks like a join line; run: remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
+                );
+            } else if is_command_word(&verb) {
+                eprintln!("remuda: unknown cluster command '{verb}'");
+            } else {
+                eprintln!("remuda: unknown cluster command");
+            }
             eprint!("{}", cluster_usage(""));
+            eprintln!("Next: use one of the listed cluster commands.");
             ExitCode::from(2)
         }
         ClusterCommand::Invalid { verb, reason } => {
