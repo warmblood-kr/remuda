@@ -2762,10 +2762,8 @@ mod cluster_cli_tests {
             bind: ListenerBind::Explicit("127.0.0.1:7441".parse().unwrap()),
             allow_public: false,
         };
-        let daemon_path = std::path::PathBuf::from(format!(
-            "/private/tmp/remuda-s3-missing-{}.sock",
-            std::process::id()
-        ));
+        let daemon_path =
+            std::env::temp_dir().join(format!("remuda-s3-missing-{}.sock", std::process::id()));
         let mut restore_guard = JoinListenerRestoreGuard::new(&daemon_path, None);
         restore_guard.set_expected(Some(join_config.clone()));
         let _handler = JoinInterruptHandler::install().unwrap();
@@ -2806,10 +2804,8 @@ mod cluster_cli_tests {
 
         let _reset = ResetInterruptState;
         let _environment = ForegroundListenerLockEnvironment::new();
-        let daemon_path = std::path::PathBuf::from(format!(
-            "/private/tmp/remuda-s3-missing-{}.sock",
-            std::process::id()
-        ));
+        let daemon_path =
+            std::env::temp_dir().join(format!("remuda-s3-missing-{}.sock", std::process::id()));
         let mut restore_guard = JoinListenerRestoreGuard::new(&daemon_path, None);
         JOIN_INTERRUPT_SIGNAL.store(libc::SIGINT, Ordering::Relaxed);
         JOIN_INTERRUPTED.store(true, Ordering::Release);
