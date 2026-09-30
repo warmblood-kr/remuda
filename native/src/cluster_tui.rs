@@ -626,37 +626,18 @@ impl ClusterUi {
         frame.push(divider);
         frame.push(pane_header);
         let queue_rows: Vec<&PendingBatch> = self.input_queue.items().rev().take(3).collect();
-        let notice = self
-            .notice
-            .as_ref()
-            .filter(|(_, at)| now.saturating_sub(*at) < Duration::from_secs(5));
+        let notice_lines = self.active_notice_lines(now, width);
         let footer_rows = if self.composer_focused { 2 } else { 1 };
-        let reserved = frame.len() + queue_rows.len() + usize::from(notice.is_some()) + footer_rows;
+        let reserved = frame.len() + queue_rows.len() + notice_lines.len() + footer_rows;
         let screen_rows = height.saturating_sub(reserved);
         frame.extend(
             visible_remote_pane_lines(&pane_body, self.remote_active.is_some(), screen_rows)
                 .into_iter()
                 .map(str::to_string),
         );
-        if let Some((notice, _)) = notice {
-            frame.push(notice.clone());
-        }
+        frame.extend(notice_lines);
         frame.extend(queue_rows.into_iter().rev().map(queue_line));
-        if let Some(prompt) = self.confirmation.prompt() {
-            frame.push(prompt);
-        } else if self.remote_active.is_some() && self.composer_focused {
-            frame.push(self.composer_line());
-            frame.push("Enter send · Ctrl-C clear · Esc list".into());
-        } else if self.remote_active.is_some() {
-            frame.push("Remote session is read-only · q detach".into());
-        } else if self.ended.is_some() {
-            frame.push("Input is disabled · x clears ended session · q detaches".into());
-        } else if self.composer_focused {
-            frame.push(self.composer_line());
-            frame.push("Enter send · Ctrl-C clear · Esc list".into());
-        } else {
-            frame.push(self.footer());
-        }
+        self.append_footer(&mut frame);
         frame
             .into_iter()
             .map(|line| truncate(&line, width))
@@ -687,9 +668,13 @@ impl ClusterUi {
                 )
             },
         );
-        let mut frame = vec![format!("KEYS {node_label}/{session_name} · Ctrl-\\ back")];
+        let status_lines = wrap_to_two_lines(
+            &format!("KEYS {node_label}/{session_name} · Ctrl-\\ back"),
+            width,
+        );
+        let mut frame = status_lines.clone();
         frame.extend(
-            visible_remote_pane_lines(&body, true, height.saturating_sub(1))
+            visible_remote_pane_lines(&body, true, height.saturating_sub(status_lines.len()))
                 .into_iter()
                 .map(str::to_string),
         );
@@ -700,6 +685,38 @@ impl ClusterUi {
             .map(|line| truncate(&line, width))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn active_notice_lines(&self, now: Duration, width: usize) -> Vec<String> {
+        self.notice
+            .as_ref()
+            .filter(|(_, at)| now.saturating_sub(*at) < Duration::from_secs(5))
+            .map_or_else(Vec::new, |(notice, _)| wrap_to_two_lines(notice, width))
+    }
+
+    fn append_footer(&self, frame: &mut Vec<String>) {
+        if let Some(prompt) = self.confirmation.prompt() {
+            frame.push(prompt);
+        } else if self.remote_active.is_some() && self.composer_focused {
+            frame.push(self.composer_line());
+            frame.push("Enter send · Ctrl-C clear · Esc list".into());
+        } else if self.remote_active.as_ref().is_some_and(|target| {
+            self.remote_input_enabled
+                && self
+                    .remote_session(target)
+                    .is_some_and(|(_, session)| session.alive)
+        }) {
+            frame.push("Enter type · k keys · x close · q detach".into());
+        } else if self.remote_active.is_some() {
+            frame.push("Remote session is read-only · q detach".into());
+        } else if self.ended.is_some() {
+            frame.push("Input is disabled · x clears ended session · q detaches".into());
+        } else if self.composer_focused {
+            frame.push(self.composer_line());
+            frame.push("Enter send · Ctrl-C clear · Esc list".into());
+        } else {
+            frame.push(self.footer());
+        }
     }
 
     fn append_remote_tree(&self, frame: &mut Vec<String>) {
@@ -1768,6 +1785,50 @@ impl RemoteSource for EmptyRemoteSource {
 
 fn truncate(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
+}
+
+fn wrap_to_two_lines(text: &str, width: usize) -> Vec<String> {
+    let words = text.split_whitespace().collect::<Vec<_>>();
+    let mut first = String::new();
+    let mut next_word = 0;
+    while let Some(word) = words.get(next_word) {
+        let candidate = if first.is_empty() {
+            (*word).to_string()
+        } else {
+            format!("{first} {word}")
+        };
+        if candidate.chars().count() > width {
+            break;
+        }
+        first = candidate;
+        next_word += 1;
+    }
+    if next_word == words.len() {
+        return vec![first];
+    }
+
+    let mut second = String::new();
+    let mut tail_word = words.len();
+    while tail_word > next_word {
+        let word = words[tail_word - 1];
+        let candidate = if second.is_empty() {
+            word.to_string()
+        } else {
+            format!("{word} {second}")
+        };
+        if candidate.chars().count() > width {
+            break;
+        }
+        second = candidate;
+        tail_word -= 1;
+    }
+    if tail_word > next_word {
+        let candidate = format!("… {second}");
+        if candidate.chars().count() <= width {
+            second = candidate;
+        }
+    }
+    vec![first, second]
 }
 
 fn queue_line(batch: &PendingBatch) -> String {
@@ -3241,35 +3302,130 @@ mod tests {
     }
 
     #[test]
-    fn escape_returns_from_remote_composer_to_the_read_only_view() {
+    fn long_notices_keep_the_next_step_visible_at_common_terminal_sizes() {
         let clock = ManualClock::new();
-        let source = FakeRemoteSource(Mutex::new(remote_snapshot(
-            RemoteState::Reachable,
-            Duration::ZERO,
-            Some(remote_screen("remote")),
-        )));
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
-        ui.remote_synced(&source);
-        ui.remote_input_enabled = true;
-        ui.select_target(Some("fp-laptop/build")).unwrap();
-        ui.enter_selected(clock.now());
-        assert!(ui.composer_focused);
+        let screen = (0..30)
+            .map(|line| format!("body-{line:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ui.notice = Some(("short notice".into(), clock.now()));
 
-        let focused = ui.render(100, 24, "", &clock);
+        for (cols, rows) in [(80, 24), (40, 12)] {
+            let one_line = ui.render(cols, rows, &screen, &clock);
+            let one_line_body_rows = one_line
+                .lines()
+                .filter(|line| line.starts_with("body-"))
+                .count();
+            ui.notice = Some((
+                "a human is attached to this session, so remote input is paused; wait for them to detach, then retry"
+                    .into(),
+                clock.now(),
+            ));
+            let frame = ui.render(cols, rows, &screen, &clock);
+            let notice_lines = frame
+                .lines()
+                .filter(|line| line.contains("a human") || line.contains("then retry"))
+                .count();
+            let long_notice_body_rows = frame
+                .lines()
+                .filter(|line| line.starts_with("body-"))
+                .count();
+            assert!(
+                frame.contains("then retry"),
+                "notice lost its next step at {cols}x{rows}: {frame}"
+            );
+            assert_eq!(notice_lines, 2, "notice should wrap to two rows: {frame}");
+            assert_eq!(
+                long_notice_body_rows + 1,
+                one_line_body_rows,
+                "a wrapped notice should reserve one additional row: {frame}"
+            );
+            ui.notice = Some(("short notice".into(), clock.now()));
+        }
+    }
+
+    #[test]
+    fn narrow_keys_status_keeps_the_back_action_visible() {
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let node = &mut ui.remote_snapshot.nodes[0];
+        node.name = "a-very-long-remote-node-label-for-status-test".into();
+        node.sessions[0].name = "a-very-long-session-name-for-status-test".into();
+        ui.remote_keys_mode = Some(RemoteSelection::Session {
+            node: "fp-laptop".into(),
+            name: "a-very-long-session-name-for-status-test".into(),
+            instance_id: "remote-instance".into(),
+        });
+
+        let frame = ui.render(40, 12, "", &clock);
+        let status_lines = frame.lines().take(2).collect::<Vec<_>>();
+
+        assert_eq!(
+            status_lines.len(),
+            2,
+            "long keys status should wrap: {frame}"
+        );
+        assert!(
+            status_lines[1].ends_with("Ctrl-\\ back"),
+            "keys status lost its back action: {frame}"
+        );
+    }
+
+    #[test]
+    fn escape_from_remote_composer_shows_live_action_footer() {
+        let make_ui = || {
+            let clock = ManualClock::new();
+            let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+                RemoteState::Reachable,
+                Duration::ZERO,
+                Some(remote_screen("remote")),
+            )));
+            let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+            ui.remote_synced(&source);
+            ui.remote_input_enabled = true;
+            ui.select_target(Some("fp-laptop/build")).unwrap();
+            ui.enter_selected(clock.now());
+            assert!(ui.composer_focused);
+            let focused = ui.render(100, 24, "", &clock);
+            ui.key_event(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                clock.now(),
+            );
+            assert!(!ui.composer_focused);
+            (ui, clock, focused)
+        };
+
+        let (_, clock, focused) = make_ui();
         assert!(focused.contains("Enter send · Ctrl-C clear · Esc list"));
 
-        ui.key_event(
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Esc,
-                crossterm::event::KeyModifiers::NONE,
-            ),
-            clock.now(),
+        let (ui, _, _) = make_ui();
+        let footer = ui.render(100, 24, "", &clock);
+        assert!(footer.contains("Enter type · k keys · x close · q detach"));
+
+        let (mut ui, _, _) = make_ui();
+        ui.key(crossterm::event::KeyCode::Enter);
+        assert!(ui.composer_focused, "Enter should focus the line composer");
+
+        let (mut ui, _, _) = make_ui();
+        ui.key(crossterm::event::KeyCode::Char('k'));
+        assert!(ui.remote_keys_mode.is_some(), "k should enter keys mode");
+
+        let (mut ui, _, _) = make_ui();
+        ui.key(crossterm::event::KeyCode::Char('x'));
+        assert!(
+            ui.confirmation.prompt().is_some(),
+            "x should start close confirmation"
         );
 
-        assert!(!ui.composer_focused);
-        assert!(ui
-            .render(100, 24, "", &clock)
-            .contains("Remote session is read-only · q detach"));
+        let (mut ui, _, _) = make_ui();
+        assert!(
+            ui.key(crossterm::event::KeyCode::Char('q')),
+            "q should detach"
+        );
     }
 
     #[test]

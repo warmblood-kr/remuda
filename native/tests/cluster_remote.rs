@@ -457,7 +457,7 @@ fn real_ctrl_backslash_byte_returns_from_remote_composer_to_tree() {
     tui.writer.write_all(b"\x1c").unwrap();
     tui.wait_for_from(
         output_start,
-        "Remote session is read-only · q detach",
+        "Enter type · k keys · x close · q detach",
         Duration::from_secs(3),
     );
 }
@@ -599,7 +599,7 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
     tui.writer.write_all(b"\x1c").unwrap();
     tui.wait_for_from(
         keys_start,
-        "Remote session is read-only · q detach",
+        "Enter type · k keys · x close · q detach",
         Duration::from_secs(3),
     );
     tui.wait_for_from(output_start, "sent ·", Duration::from_secs(10));
