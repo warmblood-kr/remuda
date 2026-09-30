@@ -1928,6 +1928,27 @@ impl Drop for RawMode {
 
 const SECRET_LINE_MAX_BYTES: usize = 4 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromptLineEcho {
+    Text(char),
+    Erase,
+    Submit,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PromptLineError {
+    TooLong,
+}
+
+fn edit_prompt_line(
+    _events: impl IntoIterator<Item = crossterm::event::Event>,
+    _default: Option<&str>,
+    _max_bytes: usize,
+    _echo: impl FnMut(PromptLineEcho),
+) -> Result<Option<String>, PromptLineError> {
+    Ok(Some(String::new()))
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum SecretLineError {
     TooLong,
@@ -2750,6 +2771,100 @@ mod tests {
         events: impl IntoIterator<Item = crossterm::event::Event>,
     ) -> Result<Option<Vec<u8>>, super::SecretLineError> {
         super::edit_secret_line(events).map(|answer| answer.map(|secret| secret.to_vec()))
+    }
+
+    #[test]
+    fn prompt_line_echoes_typed_characters_backspace_and_enter() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let events = [
+            secret_key(KeyCode::Char('a'), KeyModifiers::NONE),
+            secret_key(KeyCode::Char('é'), KeyModifiers::NONE),
+            secret_key(KeyCode::Backspace, KeyModifiers::NONE),
+            secret_key(KeyCode::Char('x'), KeyModifiers::NONE),
+            secret_key(KeyCode::Enter, KeyModifiers::NONE),
+            secret_key(KeyCode::Char('!'), KeyModifiers::NONE),
+        ];
+        let mut echo = Vec::new();
+
+        let answer = super::edit_prompt_line(events, None, 1024, |action| echo.push(action));
+
+        assert_eq!(answer, Ok(Some("ax".into())));
+        assert_eq!(
+            echo,
+            [
+                super::PromptLineEcho::Text('a'),
+                super::PromptLineEcho::Text('é'),
+                super::PromptLineEcho::Erase,
+                super::PromptLineEcho::Text('x'),
+                super::PromptLineEcho::Submit,
+            ]
+        );
+    }
+
+    #[test]
+    fn prompt_line_empty_enter_returns_default_or_empty_string() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let enter = secret_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            super::edit_prompt_line([enter.clone()], Some("https://example.test"), 1024, |_| {},),
+            Ok(Some("https://example.test".into()))
+        );
+        assert_eq!(
+            super::edit_prompt_line([enter], None, 1024, |_| {}),
+            Ok(Some(String::new()))
+        );
+    }
+
+    #[test]
+    fn prompt_line_rejects_more_than_one_kibibyte() {
+        let events = [crossterm::event::Event::Paste("x".repeat(1025))];
+
+        assert_eq!(
+            super::edit_prompt_line(events, None, 1024, |_| {}),
+            Err(super::PromptLineError::TooLong)
+        );
+    }
+
+    #[test]
+    fn prompt_line_ctrl_c_and_escape_refuse_the_answer() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for cancel in [
+            secret_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            secret_key(KeyCode::Esc, KeyModifiers::NONE),
+        ] {
+            assert_eq!(
+                super::edit_prompt_line([cancel], None, 1024, |_| {}),
+                Ok(None)
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_line_echo_never_emits_pasted_control_characters() {
+        let events = [crossterm::event::Event::Paste("ok\u{1b}[31m".into())];
+        let mut echo = Vec::new();
+
+        let answer = super::edit_prompt_line(events, None, 1024, |action| echo.push(action));
+
+        assert_eq!(answer, Ok(None));
+        assert!(echo.iter().all(|action| match action {
+            super::PromptLineEcho::Text(character) => !character.is_control(),
+            super::PromptLineEcho::Erase | super::PromptLineEcho::Submit => true,
+        }));
+        assert_eq!(
+            echo,
+            [
+                super::PromptLineEcho::Text('o'),
+                super::PromptLineEcho::Text('k'),
+                super::PromptLineEcho::Text('['),
+                super::PromptLineEcho::Text('3'),
+                super::PromptLineEcho::Text('1'),
+                super::PromptLineEcho::Text('m'),
+            ]
+        );
     }
 
     #[test]
