@@ -484,7 +484,7 @@ impl ClusterRemoteTransport {
                     },
                 ) {
                     Ok(Response::Sync { snapshot, .. }) => snapshot.bracketed_paste,
-                    _ => false,
+                    _ => prior.is_some_and(|snapshot| snapshot.bracketed_paste),
                 };
                 RemoteSessionSnapshot {
                     name: display_name(&session.name),
