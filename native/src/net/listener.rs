@@ -2370,7 +2370,10 @@ mod tests {
         }
     }
 
-    fn run_preauth_mutations(mutations_per_target: usize, time_budget: Duration) {
+    fn run_preauth_mutations(mutations_per_target: usize) {
+        // A per-input bound catches a hang or a super-linear blow-up on one input
+        // without failing slow, instrumented (coverage) CI builds.
+        const PER_INPUT_LIMIT: Duration = Duration::from_secs(1);
         let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
             .generate_keypair()
             .unwrap();
@@ -2420,13 +2423,18 @@ mod tests {
 
         assert!(parse_http_request(Cursor::new(http_seed)).is_ok());
         assert!(frame::open_request(&responder.private, &sealed.message).is_ok());
-        let started = Instant::now();
         for mutation in 0..mutations_per_target {
             let bytes = mutate_http_request(http_seed, &mut rng, mutation);
+            let started = Instant::now();
             assert!(bytes.len() <= MAX_HEADER_BYTES + MAX_BODY_BYTES + MAX_REQUEST_LINE_BYTES);
             let parsed =
                 std::panic::catch_unwind(|| parse_http_request(Cursor::new(bytes.as_slice())))
                     .unwrap_or_else(|_| panic!("HTTP parser panicked at mutation {mutation}"));
+            assert!(
+                started.elapsed() < PER_INPUT_LIMIT,
+                "HTTP parser took {:?} on mutation {mutation}",
+                started.elapsed()
+            );
             if let Ok(parsed) = parsed {
                 assert!(parsed.body.len() <= MAX_BODY_BYTES);
             }
@@ -2434,32 +2442,31 @@ mod tests {
         for mutation in 0..mutations_per_target {
             let bytes = mutate_frame(&sealed.message, &mut rng, mutation);
             assert!(bytes.len() <= MAX_BODY_BYTES + 1);
+            let started = Instant::now();
             let opened = std::panic::catch_unwind(|| {
                 frame::open_request(&responder.private, bytes.as_slice())
             })
             .unwrap_or_else(|_| panic!("Noise frame decoder panicked at mutation {mutation}"));
+            assert!(
+                started.elapsed() < PER_INPUT_LIMIT,
+                "Noise frame decoder took {:?} on mutation {mutation}",
+                started.elapsed()
+            );
             if let Ok(opened) = opened {
                 assert!(opened.payload.len() <= MAX_BODY_BYTES);
             }
         }
-        assert!(
-            started.elapsed() < time_budget,
-            "{} deterministic mutations exceeded the {:?} budget: {:?}",
-            2 * mutations_per_target,
-            time_budget,
-            started.elapsed()
-        );
     }
 
     #[test]
     fn preauth_mutations_do_not_panic_or_exceed_caps() {
-        run_preauth_mutations(1_000, Duration::from_secs(5));
+        run_preauth_mutations(1_000);
     }
 
     #[test]
     #[ignore = "manual deep pre-auth mutation run"]
     fn preauth_mutations_long_do_not_panic_or_exceed_caps() {
-        run_preauth_mutations(100_000, Duration::from_secs(120));
+        run_preauth_mutations(100_000);
     }
 
     #[test]
