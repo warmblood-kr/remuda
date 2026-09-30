@@ -401,6 +401,70 @@ fn assert_list_refused(peer: &[u8], server: &[u8], address: SocketAddr, attempt:
 
 // Registry replication uses bounded one-shot pages; listener tests cover the
 // authorization recheck for any held response.
+fn prepare_local_rotation_state(node: &PrivateNode) -> (PathBuf, PathBuf, Vec<u8>) {
+    successful(
+        node.run(&["cluster", "control", "off"]),
+        "disable remote control before identity rotation",
+    );
+    successful(
+        node.run(&["cluster", "invite", "--bind", "127.0.0.1:9443"]),
+        "mint a join token before identity rotation",
+    );
+    let cluster_dir = node.root.join("state/remuda/cluster");
+    let token_path = cluster_dir.join("join_tokens.json");
+    let settings_path = cluster_dir.join("settings.json");
+    assert!(token_path.exists(), "invite did not persist a join token");
+    let settings = std::fs::read(&settings_path).unwrap();
+    (token_path, settings_path, settings)
+}
+
+fn assert_new_identity_rotation(
+    node: &PrivateNode,
+    old_fingerprint: &str,
+    token_path: &Path,
+    settings_path: &Path,
+    settings_before_rotation: &[u8],
+) {
+    let no_yes = node.run(&["cluster", "init", "--new-identity"]);
+    assert!(
+        !no_yes.status.success(),
+        "non-TTY identity rotation was not refused without --yes: {no_yes:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&no_yes.stderr).contains("use --yes"),
+        "non-TTY refusal did not explain --yes: {}",
+        String::from_utf8_lossy(&no_yes.stderr)
+    );
+    let rotation_output = node.run(&["cluster", "init", "--new-identity", "--yes"]);
+    let warning = String::from_utf8_lossy(&rotation_output.stderr).into_owned();
+    successful(rotation_output, "rotate revoked node identity");
+    assert!(
+        warning.contains(
+            "This creates a new identity; this machine leaves its current cluster and needs a new invite."
+        ),
+        "rotation did not warn that it leaves the current cluster: {warning}"
+    );
+    let rotated_identity = node.identity();
+    let new_fingerprint = identity_fingerprint(&rotated_identity);
+    assert_ne!(new_fingerprint, old_fingerprint);
+    assert!(!token_path.exists(), "old join token state was not cleared");
+    assert_eq!(
+        std::fs::read(settings_path).unwrap(),
+        settings_before_rotation,
+        "identity rotation changed local settings"
+    );
+    let cluster_dir = node.root.join("state/remuda/cluster");
+    assert!(
+        !cluster_dir.join("revoked_notice.json").exists(),
+        "new identity did not clear the revocation notice"
+    );
+    let registry = read_registry(node);
+    assert_eq!(registry.authorized_nodes.len(), 1);
+    assert_eq!(registry.authorized_nodes[0].node_fp, new_fingerprint);
+}
+
+// The recovery path is exercised after the notice is delivered over the live
+// cluster wire, then verified against the isolated node's persisted state.
 #[test]
 fn new_identity_init_after_live_revocation_clears_old_join_tokens_and_preserves_settings() {
     let _serial = live_test_guard();
@@ -419,22 +483,7 @@ fn new_identity_init_after_live_revocation_clears_old_join_tokens_and_preserves_
     let c_listener = ListenerProcess::start(&c);
     join_member(&a, &b, &a_identity, listener.address, b_listener.address);
     assert_joiner_stores_issuer(&b, &a_identity, listener.address);
-    successful(
-        b.run(&["cluster", "control", "off"]),
-        "disable B remote control",
-    );
-    successful(
-        b.run(&["cluster", "invite", "--bind", "127.0.0.1:9443"]),
-        "mint a join token on B before identity rotation",
-    );
-    let b_cluster_dir = b.root.join("state/remuda/cluster");
-    let token_path = b_cluster_dir.join("join_tokens.json");
-    let settings_path = b_cluster_dir.join("settings.json");
-    assert!(
-        token_path.exists(),
-        "B's invite did not persist a join token"
-    );
-    let settings_before_rotation = std::fs::read(&settings_path).unwrap();
+    let (token_path, settings_path, settings_before_rotation) = prepare_local_rotation_state(&b);
     join_member(&a, &c, &a_identity, listener.address, c_listener.address);
     wait_for_member_and_probe(
         &c,
@@ -499,50 +548,12 @@ fn new_identity_init_after_live_revocation_clears_old_join_tokens_and_preserves_
         b_nodes_after_init.contains("This node was revoked by"),
         "ordinary init cleared B's notice: {b_nodes_after_init}"
     );
-    let no_yes = b.run(&["cluster", "init", "--new-identity"]);
-    assert!(
-        !no_yes.status.success(),
-        "non-TTY identity rotation was not refused without --yes: {no_yes:?}"
-    );
-    assert!(
-        String::from_utf8_lossy(&no_yes.stderr).contains("use --yes"),
-        "non-TTY refusal did not explain --yes: {}",
-        String::from_utf8_lossy(&no_yes.stderr)
-    );
-    let rotation = successful(
-        b.run(&["cluster", "init", "--new-identity", "--yes"]),
-        "rotate revoked node B's identity",
-    );
-    assert!(
-        rotation.contains(
-            "This creates a new identity; this machine leaves its current cluster and needs a new invite."
-        ),
-        "rotation did not warn that it leaves the current cluster: {rotation}"
-    );
-    let rotated_identity = b.identity();
-    assert_ne!(
-        identity_fingerprint(&rotated_identity),
-        b_fingerprint,
-        "new-identity init did not change B's fingerprint"
-    );
-    assert!(
-        !b_cluster_dir.join("revoked_notice.json").exists(),
-        "new identity did not clear the revocation notice"
-    );
-    assert!(
-        !token_path.exists(),
-        "new identity left join tokens minted under the old key"
-    );
-    assert_eq!(
-        std::fs::read(&settings_path).unwrap(),
-        settings_before_rotation,
-        "new identity changed local remote-control settings"
-    );
-    let rotated_registry = read_registry(&b);
-    assert_eq!(rotated_registry.authorized_nodes.len(), 1);
-    assert_eq!(
-        rotated_registry.authorized_nodes[0].node_fp,
-        identity_fingerprint(&rotated_identity)
+    assert_new_identity_rotation(
+        &b,
+        &b_fingerprint,
+        &token_path,
+        &settings_path,
+        &settings_before_rotation,
     );
     assert_list_refused(
         &b_identity,

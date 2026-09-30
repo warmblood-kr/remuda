@@ -48,9 +48,38 @@ pub fn init() -> io::Result<(NodeIdentity, bool)> {
             }],
         })?;
         registry::save_registry_at(&dir, &registry)?;
-        control::clear_revoked_notice_at(&dir)?;
         Ok((node, created))
     }
+}
+
+/// Replace the local identity and reset membership to the new local node only.
+/// The caller must confirm this disruptive operation in the CLI.
+pub fn init_new_identity() -> io::Result<NodeIdentity> {
+    let dir = identity::prepare_cluster_dir()?;
+    let _guard = storage::StateLock::acquire(&dir)?;
+    identity::load_identity_at(&dir)?;
+    join_token::clear_at(&dir)?;
+    let _ = control::revoked_notice_at(&dir)?;
+    let node = identity::rotate_identity_locked(&dir)?;
+    registry::save_registry_at(
+        &dir,
+        &Registry {
+            authorized_nodes: vec![AuthorizedNode {
+                node_fp: node.node_fp.clone(),
+                static_pubkey: encoding::encode_base64(&node.static_pubkey),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
+                endpoint: None,
+                state: NodeState::Admitted,
+                version: 1,
+                by: node.node_fp.clone(),
+            }],
+        },
+    )?;
+    control::clear_revoked_notice_at(&dir)?;
+    Ok(node)
 }
 
 /// Return the local identity and admitted member count, or `None` before init.
@@ -193,7 +222,6 @@ fn record_join_success_with_schedule(
         if changed {
             registry::save_registry_at(&dir, &registry)?;
         }
-        control::clear_revoked_notice_at(&dir)?;
         drop(guard);
         if changed && schedule {
             replication::registry_changed();

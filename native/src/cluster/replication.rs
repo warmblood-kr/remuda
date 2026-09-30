@@ -424,7 +424,11 @@ fn push_registry_snapshot(
 ) -> io::Result<()> {
     let (identity, _) = super::nodes()?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "cluster is not initialized"))?;
-    let entries = snapshot_for_wire(&material.registry.authorized_nodes);
+    let entries = if allow_revoked_target {
+        revoked_target_snapshot_for_wire(&material.registry.authorized_nodes, peer_fp)
+    } else {
+        snapshot_for_wire(&material.registry.authorized_nodes)
+    };
     for chunk in entries.chunks(crate::net::REGISTRY_REPLICATION_PAGE_ENTRIES) {
         ensure_peer_pushable(peer_fp, allow_revoked_target)?;
         let update = registry::RegistryUpdate {
@@ -780,6 +784,19 @@ fn snapshot_for_wire(entries: &[AuthorizedNode]) -> Vec<AuthorizedNode> {
             entry
         })
         .collect()
+}
+
+fn revoked_target_snapshot_for_wire(
+    entries: &[AuthorizedNode],
+    revoked_target_fp: &str,
+) -> Vec<AuthorizedNode> {
+    snapshot_for_wire(
+        &entries
+            .iter()
+            .filter(|entry| entry.node_fp == revoked_target_fp && entry.state == NodeState::Revoked)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
 }
 
 #[cfg(test)]

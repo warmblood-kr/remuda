@@ -212,6 +212,8 @@ remuda — a pty manager you can attach to
   remuda mod remove NAME          remove one installed mod
   remuda cluster                  show cluster status
   remuda cluster init             create this node's cluster identity
+  remuda cluster init --new-identity [--yes]
+                                  leave the cluster and create a new identity
   remuda cluster invite           invite another node
   remuda cluster join             join another node's cluster
   remuda cluster nodes            list local cluster membership
@@ -289,6 +291,8 @@ remuda — terminal orchestration for coding agents
   remuda mod remove NAME         remove a mod
   remuda cluster                 show cluster status
   remuda cluster init            create this node's cluster identity
+  remuda cluster init --new-identity [--yes]
+                                 leave the cluster and create a new identity
   remuda cluster invite           invite another node
   remuda cluster join             join another node's cluster
   remuda cluster nodes           list local cluster membership
@@ -401,6 +405,9 @@ fn levenshtein(left: &str, right: &str) -> usize {
 enum ClusterCommand {
     Status,
     Init,
+    InitNewIdentity {
+        yes: bool,
+    },
     Invite {
         bind_addr: std::net::SocketAddr,
     },
@@ -486,10 +493,11 @@ fn invalid_cluster(verb: &str, reason: impl Into<String>) -> ClusterCommand {
 }
 
 fn parse_cluster_init(args: &[&str]) -> Result<ClusterCommand, String> {
-    if args.is_empty() {
-        Ok(ClusterCommand::Init)
-    } else {
-        Err("unexpected arguments".into())
+    match args {
+        [] => Ok(ClusterCommand::Init),
+        ["--new-identity"] => Ok(ClusterCommand::InitNewIdentity { yes: false }),
+        ["--new-identity", "--yes"] => Ok(ClusterCommand::InitNewIdentity { yes: true }),
+        _ => Err("expected [--new-identity [--yes]]".into()),
     }
 }
 
@@ -678,7 +686,7 @@ fn parse_socket_address(value: &str) -> Result<std::net::SocketAddr, String> {
 
 pub fn cluster_usage(verb: &str) -> &'static str {
     match verb {
-        "init" => "usage: remuda cluster init\nexample: remuda cluster init\n",
+        "init" => "usage: remuda cluster init [--new-identity [--yes]]\nexample: remuda cluster init --new-identity\n",
         "invite" => "usage: remuda cluster invite --bind IP:PORT\nexample: remuda cluster invite --bind 192.168.1.20:7441\n",
         "join" => "usage: remuda cluster join FINGERPRINT 'JOIN_LINE' [--bind IP:PORT]\nexample: remuda cluster join 'SHA256:…' 'remuda-join-v1 …'\n",
         "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n",
@@ -703,6 +711,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             }
             Err(error) => fail(format!("cluster init: {error}")),
         },
+        ClusterCommand::InitNewIdentity { yes } => cluster_init_new_identity(yes),
         ClusterCommand::Invite { bind_addr } => cluster_invite(bind_addr),
         ClusterCommand::Join {
             fingerprint,
@@ -776,6 +785,40 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             eprint!("{}", cluster_usage(&verb));
             ExitCode::from(2)
         }
+    }
+}
+
+const NEW_IDENTITY_WARNING: &str =
+    "This creates a new identity; this machine leaves its current cluster and needs a new invite.";
+
+fn cluster_init_new_identity(yes: bool) -> ExitCode {
+    let prompt = match new_identity_confirmation(
+        yes,
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+    ) {
+        Ok(prompt) => prompt,
+        Err(error) => return fail(format!("cluster init --new-identity: {error}")),
+    };
+    eprintln!("{NEW_IDENTITY_WARNING}");
+    if prompt {
+        match confirm_new_identity() {
+            Ok(true) => {}
+            Ok(false) => {
+                println!("Cluster identity rotation cancelled.");
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => return fail(format!("cluster init --new-identity: {error}")),
+        }
+    }
+    match remuda_native::cluster::init_new_identity() {
+        Ok(identity) => {
+            println!("Cluster identity rotated");
+            println!("Node: {}", identity.node_name);
+            println!("Fingerprint: {}", identity.node_fp);
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(format!("cluster init --new-identity: {error}")),
     }
 }
 
@@ -1159,6 +1202,30 @@ fn revoke_confirmation(yes: bool, stdin_tty: bool, stderr_tty: bool) -> Result<b
     }
 }
 
+fn new_identity_confirmation(
+    yes: bool,
+    stdin_tty: bool,
+    stderr_tty: bool,
+) -> Result<bool, &'static str> {
+    if yes {
+        Ok(false)
+    } else if stdin_tty && stderr_tty {
+        Ok(true)
+    } else {
+        Err("use --yes to confirm non-interactively")
+    }
+}
+
+fn confirm_new_identity() -> std::io::Result<bool> {
+    use std::io::{self, Write};
+    let mut stderr = io::stderr().lock();
+    write!(stderr, "Create a new cluster identity? [y/N] ")?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(confirmation_answer_is_yes(&answer))
+}
+
 fn confirm_revoke(label: &str, fingerprint: &str, prompt: bool) -> std::io::Result<bool> {
     use std::io::{self, Write};
     if !prompt {
@@ -1197,7 +1264,7 @@ fn write_revocation_notice<W: Write>(
     notice: &remuda_native::cluster::control::RevokedNotice,
 ) -> std::io::Result<()> {
     let text = format!(
-        "This node was revoked by {} at Unix time {}.\nNext: run `remuda cluster init`, then ask an admitted member for a fresh invite and join again.\n",
+        "This node was revoked by {} at Unix time {}.\nNext: run `remuda cluster init --new-identity`, then ask an admitted machine for a new invite.\n",
         remuda_native::cluster::node_label(&notice.by_fp),
         notice.at
     );
@@ -1221,8 +1288,9 @@ mod cluster_cli_tests {
     #[cfg(unix)]
     use super::cluster_join_with_private_loader;
     use super::{
-        cluster_init_message, cluster_usage, confirmation_answer_is_yes, parse_cluster_command,
-        remote_control_status_lines, revoke_confirmation, write_nodes_table, ClusterCommand,
+        cluster_init_message, cluster_usage, confirmation_answer_is_yes, new_identity_confirmation,
+        parse_cluster_command, remote_control_status_lines, revoke_confirmation, write_nodes_table,
+        ClusterCommand, NEW_IDENTITY_WARNING,
     };
     #[cfg(unix)]
     use remuda_native::cluster::join_line::JoinLine;
@@ -1261,19 +1329,27 @@ mod cluster_cli_tests {
 
     #[test]
     fn new_identity_init_is_recognized_with_optional_yes() {
-        assert!(
-            !matches!(
-                parse_cluster_command(&["init", "--new-identity"]),
-                ClusterCommand::Invalid { .. }
-            ),
-            "new-identity init must be recognized so it can prompt on a TTY"
+        assert_eq!(
+            parse_cluster_command(&["init", "--new-identity"]),
+            ClusterCommand::InitNewIdentity { yes: false }
         );
-        assert!(
-            !matches!(
-                parse_cluster_command(&["init", "--new-identity", "--yes"]),
-                ClusterCommand::Invalid { .. }
-            ),
-            "new-identity init must accept --yes for non-interactive use"
+        assert_eq!(
+            parse_cluster_command(&["init", "--new-identity", "--yes"]),
+            ClusterCommand::InitNewIdentity { yes: true }
+        );
+    }
+
+    #[test]
+    fn new_identity_init_requires_yes_when_non_tty() {
+        assert_eq!(
+            new_identity_confirmation(false, false, false),
+            Err("use --yes to confirm non-interactively")
+        );
+        assert_eq!(new_identity_confirmation(true, false, false), Ok(false));
+        assert_eq!(new_identity_confirmation(false, true, true), Ok(true));
+        assert_eq!(
+            NEW_IDENTITY_WARNING,
+            "This creates a new identity; this machine leaves its current cluster and needs a new invite."
         );
     }
 
