@@ -953,8 +953,9 @@ mod cluster_cli_tests {
     #[cfg(unix)]
     use super::cluster_join_with_private_loader;
     use super::{
-        cluster_init_message, confirmation_answer_is_yes, parse_cluster_command,
-        remote_control_status_lines, revoke_confirmation, write_nodes_table, ClusterCommand,
+        cluster_init_message, confirmation_answer_is_yes, invite_message, next_step_init,
+        next_step_join, next_step_status, parse_cluster_command, remote_control_status_lines,
+        revoke_confirmation, write_nodes_table, ClusterCommand,
     };
     #[cfg(unix)]
     use remuda_native::cluster::join_line::JoinLine;
@@ -1015,6 +1016,81 @@ mod cluster_cli_tests {
             parse_cluster_command(&["join", &fingerprint, &line, "--bind", "0.0.0.0:9443"]),
             ClusterCommand::Invalid
         );
+    }
+
+    #[test]
+    fn invite_message_prints_a_shell_parseable_join_command_and_next_step() {
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let invitation = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.4:9443".parse().unwrap(),
+            issuer_fingerprint: fingerprint.clone(),
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        };
+        let output = invite_message(&invitation);
+        let command = output
+            .lines()
+            .find(|line| line.starts_with("  remuda cluster join "))
+            .unwrap()
+            .trim();
+        let encoded = invitation.encode().unwrap();
+        assert!(!fingerprint.contains('\''));
+        assert!(!encoded.contains('\''));
+        assert_eq!(
+            output,
+            format!(
+                "Invitation for one machine, valid 10 minutes. Run this on the other machine:\n\n  remuda cluster join '{fingerprint}' '{encoded}'\n\nNext: after it joins, run `remuda cluster nodes` here to see it."
+            )
+        );
+        assert_eq!(
+            parse_cluster_command(
+                &shell_split_single_quotes(command)
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            ),
+            ClusterCommand::Join {
+                fingerprint,
+                invitation,
+                bind_addr: None,
+            }
+        );
+    }
+
+    #[test]
+    fn next_steps_cover_init_join_and_single_member_status() {
+        assert_eq!(
+            next_step_init(),
+            "Next: remuda cluster invite (on this machine), or join an existing cluster with the command another machine's invite prints."
+        );
+        assert_eq!(next_step_join(), "Next: remuda cluster remote");
+        assert_eq!(next_step_status(1), Some("Next: remuda cluster invite"));
+        assert_eq!(next_step_status(2), None);
+    }
+
+    fn shell_split_single_quotes(command: &str) -> Vec<String> {
+        let mut args = Vec::new();
+        let mut word = String::new();
+        let mut quoted = false;
+        for character in command.chars() {
+            match character {
+                '\'' => quoted = !quoted,
+                ' ' if !quoted => {
+                    if !word.is_empty() {
+                        args.push(std::mem::take(&mut word));
+                    }
+                }
+                _ => word.push(character),
+            }
+        }
+        assert!(!quoted);
+        if !word.is_empty() {
+            args.push(word);
+        }
+        args
     }
 
     #[cfg(unix)]
