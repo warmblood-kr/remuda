@@ -1411,6 +1411,20 @@ fn d4_failed_join_turns_off_a_listener_enabled_by_the_join_command() {
 
 #[test]
 fn d4_sigint_during_join_restores_listener_config_and_exits_130() {
+    assert_join_signal_restores_listener_config(libc::SIGINT);
+}
+
+#[test]
+fn d4_sigterm_during_join_restores_listener_config_and_exits_130() {
+    assert_join_signal_restores_listener_config(libc::SIGTERM);
+}
+
+#[test]
+fn d4_sighup_during_join_restores_listener_config_and_exits_130() {
+    assert_join_signal_restores_listener_config(libc::SIGHUP);
+}
+
+fn assert_join_signal_restores_listener_config(signal: libc::c_int) {
     use remuda_core::protocol::ListenerStatus;
     use remuda_native::cluster::{encoding, join_line::JoinLine, listener_config};
     use std::process::Stdio;
@@ -1436,7 +1450,7 @@ fn d4_sigint_during_join_restores_listener_config_and_exits_130() {
     let fake_issuer = TcpListener::bind("127.0.0.1:0").expect("bind fake issuer");
     fake_issuer.set_nonblocking(true).unwrap();
     let issuer_addr = fake_issuer.local_addr().unwrap();
-    let key = fs::read(scratch.root.join("state/remuda/cluster/identity.key")).unwrap();
+    let key = fs::read(cluster_dir.join("identity.key")).unwrap();
     let issuer_public: [u8; 32] = key[32..].try_into().unwrap();
     let fingerprint = encoding::fingerprint(&issuer_public);
     let invitation = JoinLine {
@@ -1487,19 +1501,20 @@ fn d4_sigint_during_join_restores_listener_config_and_exits_130() {
         .recv_timeout(Duration::from_secs(5))
         .expect("join never connected to fake issuer");
     let child_pid = child.0.as_ref().unwrap().id() as libc::pid_t;
-    assert_eq!(unsafe { libc::kill(child_pid, libc::SIGINT) }, 0);
+    assert_eq!(unsafe { libc::kill(child_pid, signal) }, 0);
     wait_until_child_exits(child.0.as_mut().unwrap(), Duration::from_secs(3));
     let output = child.0.take().unwrap().wait_with_output().unwrap();
     release_tx.send(()).unwrap();
     server.join().unwrap();
+    assert_eq!(
+        listener_config::read_at(&cluster_dir).unwrap(),
+        saved_config,
+        "signal did not restore the saved listener config"
+    );
     assert_eq!(output.status.code(), Some(130));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Join cancelled."), "{stderr}");
     assert!(stderr.contains("Next:"), "{stderr}");
-    assert_eq!(
-        listener_config::read_at(&cluster_dir).unwrap(),
-        saved_config
-    );
     assert_eq!(
         remuda_native::cluster::listener_control::status(&remuda_native::daemon::socket_path_in(
             &scratch.runtime,
