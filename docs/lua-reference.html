@@ -107,6 +107,8 @@
 <p><code>process.run{argv, stdin?, timeout?} -&gt; {code, stdout, stderr, timed_out, signal?}</code> — Run argv directly without a shell; inherits the daemon's environment and working directory. Blocks the Lua image until exit or timeout (default 5s, max 30s), captures each stream up to 1 MiB. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.</p>
 <h2 id="processes">processes</h2>
 <p><code>processes() -&gt; {id...}</code> — List the ids of every process started with <span class="title-ref">remuda.process</span> that is still running.</p>
+<h2 id="random_bytes">random_bytes</h2>
+<p><code>random_bytes(n) -&gt; string</code> — Return n binary-safe bytes from the OS CSPRNG. n must be a whole number from 1 through 65536; integer-valued Lua floats such as 32.0 are accepted. Raises a Lua error if the OS source fails.</p>
 <h2 id="reload">reload</h2>
 <p><code>reload(name) -&gt; nil</code> — Reload a lifecycle-managed mod in this image, preserving state and replacing its registrations.</p>
 <h2 id="remove_dir_all">remove_dir_all</h2>
