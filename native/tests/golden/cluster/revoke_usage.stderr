@@ -1,0 +1,3 @@
+remuda: cluster revoke: expected a node or fingerprint
+usage: remuda cluster revoke NODE|FINGERPRINT [--yes]
+example: remuda cluster revoke <NODE>

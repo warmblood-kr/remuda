@@ -419,6 +419,69 @@ fn assert_list_refused(peer: &[u8], server: &[u8], address: SocketAddr, attempt:
 
 // Registry replication uses bounded one-shot pages; listener tests cover the
 // authorization recheck for any held response.
+fn prepare_local_rotation_state(node: &PrivateNode) -> (PathBuf, PathBuf, Vec<u8>) {
+    successful(
+        node.run(&["cluster", "control", "off"]),
+        "disable remote control before identity rotation",
+    );
+    successful(
+        node.run(&["cluster", "invite", "--bind", "127.0.0.1:9443"]),
+        "mint a join token before identity rotation",
+    );
+    let cluster_dir = node.root.join("state/remuda/cluster");
+    let token_path = cluster_dir.join("join_tokens.json");
+    let settings_path = cluster_dir.join("settings.json");
+    assert!(token_path.exists(), "invite did not persist a join token");
+    let settings = std::fs::read(&settings_path).unwrap();
+    (token_path, settings_path, settings)
+}
+
+fn assert_new_identity_rotation(
+    node: &PrivateNode,
+    old_fingerprint: &str,
+    token_path: &Path,
+    settings_path: &Path,
+    settings_before_rotation: &[u8],
+) {
+    let no_yes = node.run(&["cluster", "init", "--new-identity"]);
+    assert!(
+        !no_yes.status.success(),
+        "non-TTY identity rotation was not refused without --yes: {no_yes:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&no_yes.stderr).contains("use --yes"),
+        "non-TTY refusal did not explain --yes: {}",
+        String::from_utf8_lossy(&no_yes.stderr)
+    );
+    let rotation_output = node.run(&["cluster", "init", "--new-identity", "--yes"]);
+    let warning = String::from_utf8_lossy(&rotation_output.stderr).into_owned();
+    successful(rotation_output, "rotate revoked node identity");
+    assert!(
+        warning.contains(
+            "This creates a new identity; this machine leaves its current cluster and needs a new invite."
+        ),
+        "rotation did not warn that it leaves the current cluster: {warning}"
+    );
+    let rotated_identity = node.identity();
+    let new_fingerprint = identity_fingerprint(&rotated_identity);
+    assert_ne!(new_fingerprint, old_fingerprint);
+    assert!(!token_path.exists(), "old join token state was not cleared");
+    assert_eq!(
+        std::fs::read(settings_path).unwrap(),
+        settings_before_rotation,
+        "identity rotation changed local settings"
+    );
+    let cluster_dir = node.root.join("state/remuda/cluster");
+    assert!(
+        !cluster_dir.join("revoked_notice.json").exists(),
+        "new identity did not clear the revocation notice"
+    );
+    let registry = read_registry(node);
+    assert_eq!(registry.authorized_nodes.len(), 1);
+    assert_eq!(registry.authorized_nodes[0].node_fp, new_fingerprint);
+}
+
+// Revocation behavior across all daemons remains pinned by this test name.
 #[test]
 fn revoking_a_live_member_is_seen_by_all_other_daemons() {
     let _serial = live_test_guard();
@@ -450,6 +513,7 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
         list_from(&b_identity, &a_identity, listener.address),
         Response::Sessions(_)
     ));
+    let convergence_deadline = Instant::now() + Duration::from_secs(30);
     successful(
         a.run(&["cluster", "revoke", &b_fingerprint, "--yes"]),
         "revoke node B on node A",
@@ -470,7 +534,36 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
         "node B's new connection to A",
     );
 
-    wait_for_revocation_on(&c, &b_fingerprint);
+    wait_for_revocation_on_until(&c, &b_fingerprint, convergence_deadline);
+    let b_notice = wait_for_revoked_notice_on_until(&b, &b_fingerprint, convergence_deadline);
+    assert!(
+        b_notice.contains(
+            "Next: run `remuda cluster init --new-identity`, then ask an admitted machine for a new invite"
+        ),
+        "missing recovery guidance: {b_notice}"
+    );
+    let self_row = b_notice
+        .lines()
+        .find(|line| line.contains(&b_fingerprint))
+        .expect("node B's own registry row");
+    assert!(
+        self_row.contains("admitted"),
+        "the receiver's local registry entry changed: {self_row}"
+    );
+    let b_status = successful(b.run(&["cluster"]), "read revoked node B status");
+    assert!(
+        b_status.contains("This node was revoked by"),
+        "cluster status did not show B's revocation notice: {b_status}"
+    );
+    successful(b.run(&["cluster", "init"]), "locally initialize node B");
+    let b_nodes_after_init = successful(
+        b.run(&["cluster", "nodes"]),
+        "read node B's nodes table after ordinary init",
+    );
+    assert!(
+        b_nodes_after_init.contains("This node was revoked by"),
+        "ordinary init cleared B's notice: {b_nodes_after_init}"
+    );
     assert_list_refused(
         &b_identity,
         &c.identity(),
@@ -485,6 +578,37 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
         .find(|line| line.contains(&b_fingerprint))
         .expect("node B row in nodes table");
     assert!(row.contains("revoked"), "node B row is not revoked: {row}");
+}
+
+#[test]
+fn new_identity_init_changes_fingerprint_resets_registry_clears_notice_and_old_join_tokens() {
+    let _serial = live_test_guard();
+    let node = PrivateNode::start("identity-rotation-node");
+    let peer = PrivateNode::start("identity-rotation-peer");
+    successful(node.run(&["cluster", "init"]), "initialize rotation node");
+    successful(peer.run(&["cluster", "init"]), "initialize registry peer");
+    let old_identity = node.identity();
+    let old_fingerprint = identity_fingerprint(&old_identity);
+    let mut registry = read_registry(&node);
+    let peer_identity = peer.identity();
+    registry
+        .authorized_nodes
+        .push(authorized_node(&peer_identity, &old_fingerprint, None));
+    write_registry(&node, &registry);
+    let cluster_dir = node.root.join("state/remuda/cluster");
+    let notice_path = cluster_dir.join("revoked_notice.json");
+    std::fs::write(&notice_path, br#"{"by_fp":"SHA256:issuer","at":"123"}"#).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&notice_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (token_path, settings_path, settings_before_rotation) = prepare_local_rotation_state(&node);
+
+    assert_new_identity_rotation(
+        &node,
+        &old_fingerprint,
+        &token_path,
+        &settings_path,
+        &settings_before_rotation,
+    );
 }
 
 #[test]
@@ -699,6 +823,27 @@ fn wait_for_revocation_on(receiver: &PrivateNode, member_fp: &str) {
         member_fp,
         Instant::now() + Duration::from_secs(30),
     );
+}
+
+fn wait_for_revoked_notice_on_until(
+    receiver: &PrivateNode,
+    member_fp: &str,
+    deadline: Instant,
+) -> String {
+    loop {
+        let output = successful(
+            receiver.run(&["cluster", "nodes"]),
+            "read revoked node's nodes table",
+        );
+        if output.contains("This node was revoked by") && output.contains(member_fp) {
+            return output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "revoked node did not receive its notice within 30 seconds: {output}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn wait_for_revocation_on_until(receiver: &PrivateNode, member_fp: &str, deadline: Instant) {

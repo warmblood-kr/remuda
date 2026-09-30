@@ -112,6 +112,32 @@ pub(super) fn init_identity_locked(dir: &Path) -> io::Result<(NodeIdentity, bool
     }
 }
 
+/// Replace an existing node identity while the caller holds the cluster lock.
+pub(super) fn rotate_identity_locked(dir: &Path) -> io::Result<NodeIdentity> {
+    check_identity_path(dir)?;
+    storage::verify_directory(dir)?;
+    let key_path = dir.join(IDENTITY_FILE);
+    match fs::symlink_metadata(&key_path) {
+        Ok(meta) if meta.file_type().is_file() && !meta.file_type().is_symlink() => {}
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cluster identity path must be a regular file, not a symlink",
+            ))
+        }
+        Err(error) => return Err(error),
+    }
+    let keypair = snow::Builder::new(NOISE_PATTERN.parse().expect("static Noise pattern"))
+        .generate_keypair()
+        .map_err(io::Error::other)?;
+    let private = Zeroizing::new(keypair.private);
+    let mut material = Zeroizing::new(Vec::with_capacity(64));
+    material.extend_from_slice(&private);
+    material.extend_from_slice(&keypair.public);
+    storage::atomic_write(&key_path, &material)?;
+    identity_from_parts(&material)
+}
+
 pub(super) fn load_identity_at(dir: &Path) -> io::Result<NodeIdentity> {
     let bytes = read_identity_material_at(dir)?;
     identity_from_parts(&bytes[..])

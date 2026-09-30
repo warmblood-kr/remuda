@@ -220,6 +220,8 @@ remuda — a pty manager you can attach to
   remuda mod remove NAME          remove one installed mod
   remuda cluster                  show cluster status
   remuda cluster init             create this node's cluster identity
+  remuda cluster init --new-identity [--yes]
+                                  leave the cluster and create a new identity
   remuda cluster invite           invite another node
   remuda cluster join             join another node's cluster
   remuda cluster nodes            list local cluster membership
@@ -297,6 +299,8 @@ remuda — terminal orchestration for coding agents
   remuda mod remove NAME         remove a mod
   remuda cluster                 show cluster status
   remuda cluster init            create this node's cluster identity
+  remuda cluster init --new-identity [--yes]
+                                 leave the cluster and create a new identity
   remuda cluster invite           invite another node
   remuda cluster join             join another node's cluster
   remuda cluster nodes           list local cluster membership
@@ -433,6 +437,9 @@ fn levenshtein(left: &str, right: &str) -> usize {
 enum ClusterCommand {
     Status,
     Init,
+    InitNewIdentity {
+        yes: bool,
+    },
     Invite {
         bind_addr: std::net::SocketAddr,
     },
@@ -518,10 +525,11 @@ fn invalid_cluster(verb: &str, reason: impl Into<String>) -> ClusterCommand {
 }
 
 fn parse_cluster_init(args: &[&str]) -> Result<ClusterCommand, String> {
-    if args.is_empty() {
-        Ok(ClusterCommand::Init)
-    } else {
-        Err("unexpected arguments".into())
+    match args {
+        [] => Ok(ClusterCommand::Init),
+        ["--new-identity"] => Ok(ClusterCommand::InitNewIdentity { yes: false }),
+        ["--new-identity", "--yes"] => Ok(ClusterCommand::InitNewIdentity { yes: true }),
+        _ => Err("expected [--new-identity [--yes]]".into()),
     }
 }
 
@@ -711,7 +719,7 @@ fn parse_addr_default_port(value: &str) -> Result<std::net::SocketAddr, String> 
 
 pub fn cluster_usage(verb: &str) -> String {
     match verb {
-        "init" => "usage: remuda cluster init\nexample: remuda cluster init\n".into(),
+        "init" => "usage: remuda cluster init [--new-identity [--yes]]\nexample: remuda cluster init --new-identity\n".into(),
         "invite" => format!("usage: remuda cluster invite --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})\nexample: remuda cluster invite --bind 192.168.1.20\n"),
         "join" => format!("usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})]\nexample: remuda cluster join 'remuda-join-v1 …'\n"),
         "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n".into(),
@@ -737,6 +745,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             }
             Err(error) => fail(format!("cluster init: {error}")),
         },
+        ClusterCommand::InitNewIdentity { yes } => cluster_init_new_identity(yes),
         ClusterCommand::Invite { bind_addr } => cluster_invite(bind_addr),
         ClusterCommand::Join {
             fingerprint,
@@ -804,6 +813,40 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     }
 }
 
+const NEW_IDENTITY_WARNING: &str =
+    "This creates a new identity; this machine leaves its current cluster and needs a new invite.";
+
+fn cluster_init_new_identity(yes: bool) -> ExitCode {
+    let prompt = match new_identity_confirmation(
+        yes,
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+    ) {
+        Ok(prompt) => prompt,
+        Err(error) => return fail(format!("cluster init --new-identity: {error}")),
+    };
+    eprintln!("{NEW_IDENTITY_WARNING}");
+    if prompt {
+        match confirm_new_identity() {
+            Ok(true) => {}
+            Ok(false) => {
+                println!("Cluster identity rotation cancelled.");
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => return fail(format!("cluster init --new-identity: {error}")),
+        }
+    }
+    match remuda_native::cluster::init_new_identity() {
+        Ok(identity) => {
+            println!("Cluster identity rotated");
+            println!("Node: {}", identity.node_name);
+            println!("Fingerprint: {}", identity.node_fp);
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(format!("cluster init --new-identity: {error}")),
+    }
+}
+
 fn cluster_listen(
     server: &str,
     path: &Path,
@@ -855,6 +898,19 @@ fn cluster_status(server: &str, path: &Path) -> ExitCode {
             println!("Fingerprint: {}", identity.node_fp);
             println!("Members: {members}");
             println!("Authority: Any admitted member can admit new keys and revoke any member cluster-wide (see #282).");
+            match remuda_native::cluster::control::revoked_notice() {
+                Ok(Some(notice)) => {
+                    let mut stdout = std::io::stdout().lock();
+                    if let Err(error) = write_revocation_notice(&mut stdout, &notice) {
+                        if error.kind() == std::io::ErrorKind::BrokenPipe {
+                            return ExitCode::SUCCESS;
+                        }
+                        return fail(format!("cluster status: {error}"));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => return fail(format!("cluster status: {error}")),
+            }
             match remuda_native::cluster::control::enabled() {
                 Ok(enabled) => {
                     let (setting, trust) = remote_control_status_lines(enabled);
@@ -1341,7 +1397,7 @@ fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
     match remuda_native::cluster::revoke_local(&fingerprint) {
         Ok(remuda_native::cluster::RevokeOutcome::Revoked) => {
             println!("Node {label} revoked locally.");
-            report_cluster_pushes();
+            report_revocation_pushes(&fingerprint);
             ExitCode::SUCCESS
         }
         Ok(remuda_native::cluster::RevokeOutcome::AlreadyRevoked) => {
@@ -1353,7 +1409,16 @@ fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
 }
 
 fn report_cluster_pushes() {
-    let peers = remuda_native::cluster::push_now();
+    report_cluster_push_results(remuda_native::cluster::push_now());
+}
+
+fn report_revocation_pushes(revoked_peer: &str) {
+    report_cluster_push_results(remuda_native::cluster::push_now_with_revoked_target(
+        revoked_peer,
+    ));
+}
+
+fn report_cluster_push_results(peers: Vec<remuda_native::cluster::PeerPushResult>) {
     if peers.is_empty() {
         println!("Registry push: no configured peers.");
         return;
@@ -1408,6 +1473,30 @@ fn revoke_confirmation(yes: bool, stdin_tty: bool, stderr_tty: bool) -> Result<b
     } else {
         Err("use --yes to confirm non-interactively")
     }
+}
+
+fn new_identity_confirmation(
+    yes: bool,
+    stdin_tty: bool,
+    stderr_tty: bool,
+) -> Result<bool, &'static str> {
+    if yes {
+        Ok(false)
+    } else if stdin_tty && stderr_tty {
+        Ok(true)
+    } else {
+        Err("use --yes to confirm non-interactively")
+    }
+}
+
+fn confirm_new_identity() -> std::io::Result<bool> {
+    use std::io::{self, Write};
+    let mut stderr = io::stderr().lock();
+    write!(stderr, "Create a new cluster identity? [y/N] ")?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(confirmation_answer_is_yes(&answer))
 }
 
 pub fn join_confirmation(stdin_tty: bool, stderr_tty: bool) -> Result<bool, &'static str> {
@@ -1466,12 +1555,99 @@ fn write_nodes_table<W: Write>(
     identity: &remuda_native::cluster::NodeIdentity,
     registry: &remuda_native::cluster::Registry,
 ) -> std::io::Result<()> {
-    match writer
-        .write_all(remuda_native::cluster::format_nodes_table(identity, registry).as_bytes())
-    {
+    let table = remuda_native::cluster::format_nodes_table(identity, registry);
+    match writer.write_all(table.as_bytes()) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error),
+        Ok(()) => match remuda_native::cluster::control::revoked_notice()? {
+            Some(notice) => write_revocation_notice(writer, &notice),
+            None => Ok(()),
+        },
+    }
+}
+
+fn write_revocation_notice<W: Write>(
+    writer: &mut W,
+    notice: &remuda_native::cluster::control::RevokedNotice,
+) -> std::io::Result<()> {
+    let text = format!(
+        "This node was revoked by {} at {}.\nNext: run `remuda cluster init --new-identity`, then ask an admitted machine for a new invite.\n",
+        remuda_native::cluster::node_label(&notice.by_fp),
+        format_revocation_time(&notice.at)
+    );
+    match writer.write_all(text.as_bytes()) {
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         result => result,
     }
+}
+
+#[cfg(unix)]
+fn format_revocation_time(timestamp: &str) -> String {
+    let Ok(seconds) = timestamp.parse::<libc::time_t>() else {
+        return "unknown local time".into();
+    };
+    let format = b"%Y-%m-%d %H:%M %Z\0";
+    let mut buffer = [0 as libc::c_char; 64];
+    // SAFETY: `local` is a valid zero-initialized C tm output struct,
+    // `seconds` points to a valid time_t, and `buffer` and `format` meet the
+    // writable-buffer and NUL-terminated-format requirements of these calls.
+    let written = unsafe {
+        let mut local = std::mem::zeroed::<libc::tm>();
+        if libc::localtime_r(&seconds, &mut local).is_null() {
+            return "unknown local time".into();
+        }
+        libc::strftime(
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            format.as_ptr().cast(),
+            &local,
+        )
+    };
+    if written == 0 {
+        return "unknown local time".into();
+    }
+    let bytes = buffer[..written]
+        .iter()
+        .map(|byte| *byte as u8)
+        .collect::<Vec<_>>();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[cfg(windows)]
+fn format_revocation_time(timestamp: &str) -> String {
+    // Windows falls back to UTC because native local-time formatting is not
+    // available here without adding a dependency.
+    format_utc_revocation_time(timestamp)
+}
+
+#[cfg(any(windows, test))]
+fn format_utc_revocation_time(timestamp: &str) -> String {
+    let Ok(seconds) = timestamp.parse::<i64>() else {
+        return "unknown UTC time".into();
+    };
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        day_seconds / 3_600,
+        (day_seconds % 3_600) / 60
+    )
+}
+
+#[cfg(any(windows, test))]
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    (year + i64::from(month <= 2), month, day)
 }
 
 fn cluster_init_message(created: bool) -> &'static str {
@@ -1532,9 +1708,10 @@ mod cluster_cli_tests {
     use super::{
         cluster_init_message, cluster_listener_status_lines, cluster_usage,
         confirmation_answer_is_yes, invite_message, join_confirmation, join_prompt,
-        join_success_message, next_step_init, next_step_join, next_step_listen, next_step_status,
-        parse_addr_default_port, parse_cluster_command, remote_control_status_lines,
-        revoke_confirmation, write_nodes_table, ClusterCommand,
+        join_success_message, new_identity_confirmation, next_step_init, next_step_join,
+        next_step_listen, next_step_status, parse_addr_default_port, parse_cluster_command,
+        remote_control_status_lines, revoke_confirmation, write_nodes_table,
+        write_revocation_notice, ClusterCommand, NEW_IDENTITY_WARNING,
     };
     #[cfg(unix)]
     use remuda_native::cluster::join_line::JoinLine;
@@ -1630,6 +1807,32 @@ mod cluster_cli_tests {
             ClusterCommand::Invite {
                 bind_addr: "192.0.2.4:9443".parse().unwrap()
             }
+        );
+    }
+
+    #[test]
+    fn new_identity_init_is_recognized_with_optional_yes() {
+        assert_eq!(
+            parse_cluster_command(&["init", "--new-identity"]),
+            ClusterCommand::InitNewIdentity { yes: false }
+        );
+        assert_eq!(
+            parse_cluster_command(&["init", "--new-identity", "--yes"]),
+            ClusterCommand::InitNewIdentity { yes: true }
+        );
+    }
+
+    #[test]
+    fn new_identity_init_requires_yes_when_non_tty() {
+        assert_eq!(
+            new_identity_confirmation(false, false, false),
+            Err("use --yes to confirm non-interactively")
+        );
+        assert_eq!(new_identity_confirmation(true, false, false), Ok(false));
+        assert_eq!(new_identity_confirmation(false, true, true), Ok(true));
+        assert_eq!(
+            NEW_IDENTITY_WARNING,
+            "This creates a new identity; this machine leaves its current cluster and needs a new invite."
         );
     }
 
@@ -2046,6 +2249,62 @@ mod cluster_cli_tests {
         );
         assert_eq!(next_step_status(1), Some("Next: remuda cluster invite"));
         assert_eq!(next_step_status(2), None);
+    }
+
+    #[test]
+    fn utc_revocation_formatter_handles_fixed_epochs() {
+        assert_eq!(
+            super::format_utc_revocation_time("0"),
+            "1970-01-01 00:00 UTC"
+        );
+        assert_eq!(
+            super::format_utc_revocation_time("1790743860"),
+            "2026-09-30 04:51 UTC"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_revocation_time_has_local_date_time_and_zone_shape() {
+        let actual = super::format_revocation_time("1790743860");
+        let mut fields = actual.split(' ');
+        let date = fields.next().unwrap_or_default().as_bytes();
+        let time = fields.next().unwrap_or_default().as_bytes();
+        let zone = fields.next().unwrap_or_default();
+
+        assert_eq!(date.len(), 10, "{actual}");
+        assert!(date[..4].iter().all(u8::is_ascii_digit), "{actual}");
+        assert_eq!(date[4], b'-', "{actual}");
+        assert!(date[5..7].iter().all(u8::is_ascii_digit), "{actual}");
+        assert_eq!(date[7], b'-', "{actual}");
+        assert!(date[8..10].iter().all(u8::is_ascii_digit), "{actual}");
+        assert_eq!(time.len(), 5, "{actual}");
+        assert!(time[..2].iter().all(u8::is_ascii_digit), "{actual}");
+        assert_eq!(time[2], b':', "{actual}");
+        assert!(time[3..5].iter().all(u8::is_ascii_digit), "{actual}");
+        assert!(!zone.is_empty(), "{actual}");
+        assert!(fields.next().is_none(), "expected one zone token: {actual}");
+    }
+
+    #[test]
+    fn revoked_notice_keeps_local_time_and_recovery_next_step() {
+        let notice = remuda_native::cluster::control::RevokedNotice {
+            by_fp: "SHA256:issuer".into(),
+            at: "1790743860".into(),
+        };
+        let mut output = Vec::new();
+        write_revocation_notice(&mut output, &notice).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(
+            output.contains("This node was revoked by node-"),
+            "{output}"
+        );
+        assert!(
+            output.contains(" at ") && !output.contains("Unix time"),
+            "{output}"
+        );
+        assert!(output.contains("Next: run `remuda cluster init --new-identity`"));
     }
 
     fn shell_split_single_quotes(command: &str) -> Vec<String> {

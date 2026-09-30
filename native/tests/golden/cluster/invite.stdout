@@ -1,0 +1,7 @@
+Invitation for one machine, valid 10 minutes. Run this on the other machine:
+
+  remuda cluster join '<FINGERPRINT>' 'remuda-join-v1 <ADDR> <FINGERPRINT> <KEY_OR_TOKEN> <KEY_OR_TOKEN>'
+
+Fingerprint of this machine: <FINGERPRINT> (the other machine must show the same one)
+
+Next: after it joins, run `remuda cluster nodes` here to see it.
