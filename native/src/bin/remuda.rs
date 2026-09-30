@@ -2482,7 +2482,7 @@ mod cluster_cli_tests {
     }
 
     #[test]
-    fn join_rollback_rendering_reports_restore_errors() {
+    fn join_rollback_rendering_reports_uncertain_listener_state() {
         let failed = render_join_listener_restore_error(&std::io::Error::other("disk is full"));
         assert!(failed.contains("could not restore the saved listener config: disk is full"));
         assert!(failed.contains("remuda cluster listen --off"));

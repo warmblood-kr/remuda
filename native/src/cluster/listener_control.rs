@@ -41,6 +41,7 @@ pub fn stop(daemon_path: &Path) -> io::Result<ListenerStatus> {
         allow_public: false,
     });
     config.enabled = false;
+    config.allow_public = false;
     listener_config::write(&config)?;
     request(daemon_path, ListenerOp::Reload)
 }

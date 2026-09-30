@@ -1152,6 +1152,87 @@ fn cluster_listen_bind_configures_the_daemon_and_returns() {
 }
 
 #[test]
+fn listen_public_opt_in_persists_but_off_and_plain_bind_clear_it() {
+    use remuda_core::protocol::ListenerStatus;
+    use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
+
+    let scratch = Scratch::new();
+    let daemon = start_daemon(&scratch);
+    assert!(scratch
+        .run(&["cluster", "init", "--no-listen"])
+        .status
+        .success());
+    let cluster_dir = scratch.root.join("state/remuda/cluster");
+    let first_addr = unused_loopback_addr();
+    let first_text = first_addr.to_string();
+    let public = scratch.run(&["cluster", "listen", "--bind", &first_text, "--allow-public"]);
+    assert!(public.status.success(), "public opt-in failed: {public:?}");
+    assert_eq!(
+        listener_config::read_at(&cluster_dir).unwrap(),
+        Some(ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit(first_addr),
+            allow_public: true,
+        })
+    );
+
+    drop(daemon);
+    let _restarted_daemon = start_daemon(&scratch);
+    let daemon_path = remuda_native::daemon::socket_path_in(&scratch.runtime, &scratch.name);
+    assert_eq!(
+        remuda_native::cluster::listener_control::status(&daemon_path),
+        ListenerStatus::On {
+            addr: first_addr,
+            auto: false,
+        },
+        "the explicitly enabled listener should reload on daemon restart"
+    );
+    let invite = scratch.run(&["cluster", "invite"]);
+    assert!(invite.status.success(), "no-flag invite failed: {invite:?}");
+    assert!(
+        listener_config::read_at(&cluster_dir)
+            .unwrap()
+            .unwrap()
+            .allow_public,
+        "no-flag invite should reuse the saved opt-in"
+    );
+
+    let second_addr = unused_loopback_addr();
+    let second_text = second_addr.to_string();
+    let private_bind = scratch.run(&["cluster", "listen", "--bind", &second_text]);
+    assert!(
+        private_bind.status.success(),
+        "plain bind failed: {private_bind:?}"
+    );
+    assert_eq!(
+        listener_config::read_at(&cluster_dir).unwrap(),
+        Some(ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit(second_addr),
+            allow_public: false,
+        })
+    );
+
+    let public_again = scratch.run(&[
+        "cluster",
+        "listen",
+        "--bind",
+        &second_text,
+        "--allow-public",
+    ]);
+    assert!(public_again.status.success());
+    let stopped = scratch.run(&["cluster", "listen", "--off"]);
+    assert!(stopped.status.success(), "listen --off failed: {stopped:?}");
+    let saved_after_off = listener_config::read_at(&cluster_dir).unwrap().unwrap();
+    assert!(!saved_after_off.enabled);
+    assert!(!saved_after_off.allow_public);
+    assert_eq!(
+        remuda_native::cluster::listener_control::status(&daemon_path),
+        ListenerStatus::Off
+    );
+}
+
+#[test]
 fn d4_failed_join_turns_off_a_listener_enabled_by_the_join_command() {
     use remuda_core::protocol::ListenerStatus;
     use remuda_native::cluster::{encoding, join_line::JoinLine};
