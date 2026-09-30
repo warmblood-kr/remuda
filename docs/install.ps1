@@ -176,7 +176,7 @@ try {
 
     if ($env:REMUDA_INSTALL_BUTLER -eq '1') {
         & $installed mod install warmblood-kr/remuda-butler --force
-        if ($LASTEXITCODE -ne 0) { Die 'could not install the Butler mod' }
+        if ($LASTEXITCODE -ne 0) { Die 'could not install the Butler mod (Next: remuda mod install warmblood-kr/remuda-butler --force)' }
         Write-Output 'Next: remuda butler doctor'
     }
 } finally {

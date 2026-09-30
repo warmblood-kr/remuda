@@ -172,6 +172,6 @@ case ":$PATH:" in
 esac
 
 if [ "${REMUDA_INSTALL_BUTLER:-}" = 1 ]; then
-	"$install_dir/remuda" mod install warmblood-kr/remuda-butler --force || die "could not install the Butler mod"
+	"$install_dir/remuda" mod install warmblood-kr/remuda-butler --force || die "could not install the Butler mod (Next: remuda mod install warmblood-kr/remuda-butler --force)"
 	printf '%s\n' 'Next: remuda butler doctor'
 fi
