@@ -985,6 +985,94 @@ mod cluster_cli_tests {
     }
 
     #[test]
+    fn cluster_missing_listen_bind_has_actionable_reason() {
+        assert_eq!(
+            format!("{:?}", parse_cluster_command(&["listen"])),
+            "Invalid { verb: \"listen\", reason: \"missing --bind ADDR\" }"
+        );
+    }
+
+    #[test]
+    fn cluster_listen_address_without_port_has_hint() {
+        assert_eq!(
+            format!(
+                "{:?}",
+                parse_cluster_command(&["listen", "--bind", "192.168.100.0"])
+            ),
+            "Invalid { verb: \"listen\", reason: \"address needs a port, e.g. 192.168.100.0:7441\" }"
+        );
+    }
+
+    #[test]
+    fn cluster_unquoted_join_line_has_quote_hint() {
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let join_line = "remuda-join-v1 192.0.2.4:9443 SHA256:other token proof";
+        let actual = format!(
+            "{:?}",
+            parse_cluster_command(&[
+                "join",
+                &fingerprint,
+                "remuda-join-v1",
+                "192.0.2.4:9443",
+                "SHA256:other",
+                "token",
+                "proof"
+            ])
+        );
+        assert_eq!(
+            actual,
+            format!("Invalid {{ verb: \"join\", reason: \"quote the join line: '{join_line}'\" }}")
+        );
+    }
+
+    #[test]
+    fn cluster_help_and_unknown_verbs_are_distinguished() {
+        for args in [&["help"][..], &["-h"][..], &["--help"][..]] {
+            let actual = format!("{:?}", parse_cluster_command(args));
+            assert_eq!(actual, "Help { verb: None }");
+        }
+        assert_eq!(
+            format!("{:?}", parse_cluster_command(&["listen", "--help"])),
+            "Help { verb: Some(\"listen\") }"
+        );
+        assert_eq!(
+            format!("{:?}", parse_cluster_command(&["node"])),
+            "Invalid { verb: \"node\", reason: \"unknown cluster command 'node'\" }"
+        );
+    }
+
+    #[test]
+    fn cluster_address_options_accept_equals_form() {
+        assert_eq!(
+            parse_cluster_command(&["listen", "--bind=192.0.2.4:9443"]),
+            ClusterCommand::Listen {
+                bind_addr: "192.0.2.4:9443".parse().unwrap(),
+                allow_public: false,
+            }
+        );
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let line = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.4:9443".parse().unwrap(),
+            issuer_fingerprint: fingerprint.clone(),
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        }
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            parse_cluster_command(&["join", &fingerprint, &line, "--bind=192.0.2.8:9443"]),
+            ClusterCommand::Join {
+                bind_addr: Some(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn cluster_join_accepts_optional_client_endpoint() {
         let key = [7; 32];
         let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
