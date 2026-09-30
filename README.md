@@ -88,12 +88,14 @@ so install from `nightly` — every commit on `main`:
 **Linux** (x86_64) and **macOS** (Apple Silicon/aarch64):
 
 ```sh
-curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh
+curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly REMUDA_INSTALL_BUTLER=1 sh
 ```
 
 It downloads a signed-by-checksum tarball, verifies it against the release's
-`SHA256SUMS`, and lands `remuda` in `~/.local/bin`. Set `REMUDA_INSTALL_DIR` to
-put it elsewhere.
+`SHA256SUMS`, installs `remuda` in `~/.local/bin`, and installs the Butler mod.
+Set `REMUDA_INSTALL_DIR` to put Remuda elsewhere. This installs the mod without
+asking you to create a Matrix token or config; the command ends by printing
+`Next: remuda butler doctor`.
 
 Nightly does not publish an ARM Linux (`aarch64-linux`) or Intel Mac
 (`x86_64-apple-darwin`) binary; build from source on those platforms.
@@ -101,13 +103,16 @@ Nightly does not publish an ARM Linux (`aarch64-linux`) or Intel Mac
 **Windows** (x86_64), in PowerShell:
 
 ```powershell
-$env:REMUDA_CHANNEL='nightly'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
+$env:REMUDA_CHANNEL='nightly'; $env:REMUDA_INSTALL_BUTLER='1'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
 ```
 
-Same shape: verified against `SHA256SUMS`, landed in `~\.local\bin`, and
-`$env:REMUDA_INSTALL_DIR` moves it. The daemon speaks over a named pipe instead
-of a unix socket, and the terminal handling is the console API instead of
-termios; both live behind one seam, so there is one code path rather than two.
+The tarball is verified against `SHA256SUMS`, Remuda is installed in
+`~\.local\bin`, and the Butler mod is installed. Set
+`$env:REMUDA_INSTALL_DIR` to put Remuda elsewhere. No Matrix token or config is
+required for this install; the command ends by printing
+`Next: remuda butler doctor`. The daemon speaks over a named pipe instead of a
+unix socket, and the terminal handling is the console API instead of termios;
+both live behind one seam, so there is one code path rather than two.
 
 ⚠ **What is proven on Windows, and what is not.** CI builds and runs the whole
 suite on `windows-latest` — including tests that open real ConPTYs and drive the

@@ -2,10 +2,11 @@
 # remuda installer — also the upgrader. `remuda upgrade` re-runs this exact
 # script, so there is one download-and-verify path rather than two.
 #
-#   curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | sh
+#   curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly REMUDA_INSTALL_BUTLER=1 sh
 #
 #   REMUDA_CHANNEL=stable|nightly   default: the channel already installed, else stable
 #   REMUDA_INSTALL_DIR=<dir>        default: ~/.local/bin (Termux: $PREFIX/bin)
+#   REMUDA_INSTALL_BUTLER=1         also install warmblood-kr/remuda-butler
 #
 # Windows has its own installer, docs/install.ps1, because a `uname` case arm
 # cannot run there. The two hold disjoint halves of one platform list and
@@ -169,3 +170,8 @@ case ":$PATH:" in
 *":$install_dir:"*) ;;
 *) echo "install.sh: $install_dir is not on your PATH — add it to your shell profile" >&2 ;;
 esac
+
+if [ "${REMUDA_INSTALL_BUTLER:-}" = 1 ]; then
+	"$install_dir/remuda" mod install warmblood-kr/remuda-butler --force || die "could not install the Butler mod (Next: remuda mod install warmblood-kr/remuda-butler --force)"
+	printf '%s\n' 'Next: remuda butler doctor'
+fi

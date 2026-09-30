@@ -561,7 +561,7 @@ fn auto_listener_ip_changed(
 ) -> bool {
     match detect() {
         Ok(address) => address.ip() != current,
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 
@@ -617,6 +617,83 @@ fn set_listener_status(status: &Arc<Mutex<ListenerStatus>>, value: ListenerStatu
     *status.lock().unwrap_or_else(|error| error.into_inner()) = value;
 }
 
+fn wait_for_auto_listener_retry(
+    status: &Arc<Mutex<ListenerStatus>>,
+    stopped: &Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+    ready: &std::sync::mpsc::Sender<()>,
+    reason: String,
+) -> bool {
+    set_listener_status(status, ListenerStatus::WaitingForLan(reason));
+    let _ = ready.send(());
+    matches!(
+        stopped
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .recv_timeout(crate::net::listener::OBSERVE_INTERVAL),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    )
+}
+
+fn serve_bound_listener(
+    listener: crate::net::listener::Listener,
+    host_lock: std::fs::File,
+    auto: bool,
+    status: &Arc<Mutex<ListenerStatus>>,
+    stopped: &Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+    ready: &std::sync::mpsc::Sender<()>,
+    detector: &AutoAddressDetector,
+) -> Result<bool, String> {
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("read cluster listener address: {error}"))?;
+    set_listener_status(
+        status,
+        ListenerStatus::On {
+            addr: address,
+            auto,
+            advertise_addr: Some(address),
+            listen_addrs: vec![address],
+        },
+    );
+    let _ = ready.send(());
+
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let serve_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::scope(|scope| {
+        let watcher_flag = Arc::clone(&stop_flag);
+        let watcher_done = Arc::clone(&serve_done);
+        let watcher_stopped = Arc::clone(stopped);
+        let watcher = std::thread::Builder::new()
+            .name("remuda-cluster-listener-stop-watcher".into())
+            .spawn_scoped(scope, move || loop {
+                let result = watcher_stopped
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv_timeout(Duration::from_millis(25));
+                match result {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        watcher_flag.store(true, Ordering::Release);
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if watcher_done.load(Ordering::Acquire) =>
+                    {
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            })
+            .map_err(|error| format!("spawn cluster listener stop watcher: {error}"))?;
+        let result = listener.serve_until_rechecking(&stop_flag, || {
+            auto && auto_listener_ip_changed(address.ip(), || detector())
+        });
+        serve_done.store(true, Ordering::Release);
+        let _ = watcher.join();
+        drop(host_lock);
+        result.map_err(|error| format!("serve cluster listener: {error}"))
+    })
+}
+
 fn start_listener(
     daemon_path: &Path,
     status: &Arc<Mutex<ListenerStatus>>,
@@ -636,7 +713,20 @@ fn start_listener(
             }
             Err(error) => return Err(format!("read listener config: {error}")),
         };
-        let (address, auto) = resolve_listener_bind(config.bind, &detector)?;
+        let auto_bind = matches!(
+            &config.bind,
+            crate::cluster::listener_config::ListenerBind::Auto
+        );
+        let (address, auto) = match resolve_listener_bind(config.bind, &detector) {
+            Ok(resolved) => resolved,
+            Err(reason) if auto_bind => {
+                if !wait_for_auto_listener_retry(status, &stopped, ready, reason) {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(reason) => return Err(reason),
+        };
         let allow_public = !auto && config.allow_public;
         crate::net::listener::validate_bind_address(address, allow_public)
             .map_err(|error| format!("validate cluster listener bind: {error}"))?;
@@ -668,55 +758,9 @@ fn start_listener(
             &security,
         )
         .map_err(|error| format!("bind cluster listener: {error}"))?;
-        let address = listener
-            .local_addr()
-            .map_err(|error| format!("read cluster listener address: {error}"))?;
-        set_listener_status(
-            status,
-            ListenerStatus::On {
-                addr: address,
-                auto,
-                advertise_addr: Some(address),
-                listen_addrs: vec![address],
-            },
+        let result = serve_bound_listener(
+            listener, host_lock, auto, status, &stopped, ready, &detector,
         );
-        let _ = ready.send(());
-
-        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let serve_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let result = std::thread::scope(|scope| {
-            let watcher_flag = Arc::clone(&stop_flag);
-            let watcher_done = Arc::clone(&serve_done);
-            let watcher_stopped = Arc::clone(&stopped);
-            let watcher = std::thread::Builder::new()
-                .name("remuda-cluster-listener-stop-watcher".into())
-                .spawn_scoped(scope, move || loop {
-                    let result = watcher_stopped
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .recv_timeout(Duration::from_millis(25));
-                    match result {
-                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            watcher_flag.store(true, Ordering::Release);
-                            break;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                            if watcher_done.load(Ordering::Acquire) =>
-                        {
-                            break;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                })
-                .map_err(|error| format!("spawn cluster listener stop watcher: {error}"))?;
-            let result = listener.serve_until_rechecking(&stop_flag, || {
-                auto && auto_listener_ip_changed(address.ip(), || detector())
-            });
-            serve_done.store(true, Ordering::Release);
-            let _ = watcher.join();
-            drop(host_lock);
-            result.map_err(|error| format!("serve cluster listener: {error}"))
-        });
         if result? {
             continue;
         }
@@ -2886,10 +2930,127 @@ mod tests {
         assert!(!auto_listener_ip_changed(current, || Ok(
             "192.168.1.20:7441".parse().unwrap()
         )));
-        assert!(auto_listener_ip_changed(current, || {
+        assert!(!auto_listener_ip_changed(current, || {
             Err(crate::net::advertise_addr::NoLanAddr { candidate: None })
         }));
     }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn auto_listener_retries_until_private_address_is_available() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let environment = ListenerTaskEnvironment::new(Some(auto_listener_config()));
+        let available = Arc::new(AtomicBool::new(false));
+        let detector_available = Arc::clone(&available);
+        let detector: AutoAddressDetector = Arc::new(move || {
+            if detector_available.load(Ordering::Acquire) {
+                Ok(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+            } else {
+                Err(crate::net::advertise_addr::NoLanAddr { candidate: None })
+            }
+        });
+        let task = ListenerTask::start_with_detector(&environment.socket_path(), detector);
+
+        match task.status() {
+            ListenerStatus::WaitingForLan(reason) => {
+                assert!(reason.contains("no private LAN address found"), "{reason}");
+                assert!(
+                    reason.contains("Next: remuda cluster listen --bind IP"),
+                    "{reason}"
+                );
+            }
+            status => panic!("Auto listener should wait for a private address: {status:?}"),
+        }
+        available.store(true, Ordering::Release);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match task.status() {
+                ListenerStatus::On {
+                    addr, auto: true, ..
+                } if addr.ip() == Ipv4Addr::LOCALHOST => break,
+                ListenerStatus::Failed(reason) => {
+                    panic!("Auto listener failed while waiting for LAN: {reason}")
+                }
+                _ if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                status => panic!("Auto listener did not bind after address appeared: {status:?}"),
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn auto_listener_keeps_running_during_address_loss_then_rebinds() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let environment = ListenerTaskEnvironment::new(Some(auto_listener_config()));
+        let phase = Arc::new(AtomicUsize::new(0));
+        let detector_phase = Arc::clone(&phase);
+        let detector_calls = Arc::new(AtomicUsize::new(0));
+        let detector_call_count = Arc::clone(&detector_calls);
+        let detector: AutoAddressDetector = Arc::new(move || {
+            detector_call_count.fetch_add(1, Ordering::AcqRel);
+            match detector_phase.load(Ordering::Acquire) {
+                0 => Ok(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)),
+                1 => Err(crate::net::advertise_addr::NoLanAddr { candidate: None }),
+                _ => Ok(SocketAddr::new(
+                    IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                    0,
+                )),
+            }
+        });
+        let task = ListenerTask::start_with_detector(&environment.socket_path(), detector);
+        let old_address = bound_auto_listener_status(&task);
+        assert_eq!(old_address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        phase.store(1, Ordering::Release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while detector_calls.load(Ordering::Acquire) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "detector was not rechecked"
+            );
+            assert!(
+                !matches!(task.status(), ListenerStatus::Failed(_)),
+                "listener failed when the detector lost its address: {:?}",
+                task.status()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            matches!(
+                task.status(),
+                ListenerStatus::On { addr, auto: true, .. } if addr == old_address
+            ),
+            "listener should remain bound while the detector has no address: {:?}",
+            task.status()
+        );
+
+        phase.store(2, Ordering::Release);
+        let recovery_deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let new_address = loop {
+            match task.status() {
+                ListenerStatus::On {
+                    addr, auto: true, ..
+                } if addr.ip() == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST) => break addr,
+                ListenerStatus::Failed(reason) => {
+                    panic!("Auto listener failed before the address returned: {reason}")
+                }
+                _ if std::time::Instant::now() < recovery_deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                status => panic!("Auto listener did not rebind after recovery: {status:?}"),
+            }
+        };
+        assert_ne!(new_address, old_address);
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn auto_listener_does_not_bind_without_an_eligible_private_address() {
@@ -2908,7 +3069,7 @@ mod tests {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
                 match task.status() {
-                    ListenerStatus::Failed(reason) => {
+                    ListenerStatus::WaitingForLan(reason) => {
                         assert!(reason.contains("no private LAN address found"), "{reason}");
                         break;
                     }

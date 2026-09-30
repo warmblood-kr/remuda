@@ -1,10 +1,11 @@
 # remuda installer for Windows — also the upgrader. `remuda upgrade` re-runs
 # this exact script, so there is one download-and-verify path rather than two.
 #
-#   irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
+#   $env:REMUDA_CHANNEL='nightly'; $env:REMUDA_INSTALL_BUTLER='1'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
 #
 #   $env:REMUDA_CHANNEL     stable|nightly  default: the channel already installed, else stable
 #   $env:REMUDA_INSTALL_DIR <dir>           default: ~\.local\bin
+#   $env:REMUDA_INSTALL_BUTLER=1            also install warmblood-kr/remuda-butler
 #
 # This mirrors docs/install.sh: resolve the channel version first, then verify
 # its checksum before installing the binary.
@@ -171,6 +172,12 @@ try {
     if (-not $onPath) {
         Write-Host "install.ps1: $installDir is not on your PATH - add it, e.g."
         Write-Host ('  [Environment]::SetEnvironmentVariable(''PATH'', "$env:PATH;' + $installDir + '", ''User'')')
+    }
+
+    if ($env:REMUDA_INSTALL_BUTLER -eq '1') {
+        & $installed mod install warmblood-kr/remuda-butler --force
+        if ($LASTEXITCODE -ne 0) { Die 'could not install the Butler mod (Next: remuda mod install warmblood-kr/remuda-butler --force)' }
+        Write-Output 'Next: remuda butler doctor'
     }
 } finally {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp
