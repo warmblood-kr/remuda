@@ -1851,7 +1851,7 @@ trait SecretPromptTerminal {
     fn disable_raw_mode(&mut self);
 }
 
-impl SecretPromptTerminal for std::io::Stdout {
+impl SecretPromptTerminal for std::io::Stderr {
     fn enable_raw_mode(&mut self) -> std::io::Result<()> {
         crossterm::terminal::enable_raw_mode()
     }
