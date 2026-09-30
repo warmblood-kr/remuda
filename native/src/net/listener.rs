@@ -353,7 +353,36 @@ pub fn validate_bind_address(address: SocketAddr, allow_public: bool) -> io::Res
 
 /// Bind the configured address after confirming that this node is initialized.
 pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> {
-    validate_bind_address(config.bind_addr, config.allow_unspecified)?;
+    bind_with_auto_wildcard(config, daemon_path, false)
+}
+
+/// Bind the auto-selected IPv4 wildcard without granting public opt-in to explicit binds.
+pub(crate) fn bind_auto(address: SocketAddr, daemon_path: &Path) -> io::Result<Listener> {
+    bind_with_auto_wildcard(
+        ListenerConfig {
+            bind_addr: address,
+            allow_unspecified: false,
+        },
+        daemon_path,
+        true,
+    )
+}
+
+fn bind_with_auto_wildcard(
+    config: ListenerConfig,
+    daemon_path: &Path,
+    is_auto: bool,
+) -> io::Result<Listener> {
+    if is_auto {
+        if config.bind_addr.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "auto listener bind must be the IPv4 wildcard",
+            ));
+        }
+    } else {
+        validate_bind_address(config.bind_addr, config.allow_unspecified)?;
+    }
     let (identity_node, registry) = cluster::nodes()?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,

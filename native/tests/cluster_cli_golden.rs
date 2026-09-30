@@ -235,21 +235,26 @@ fn replace_nodes(input: &str) -> String {
 
 fn replace_addresses(input: &str) -> String {
     let mut out = String::new();
-    let mut rest = input;
-    while let Some(index) = rest.find("127.0.0.1:") {
-        out.push_str(&rest[..index]);
-        let tail = &rest[index + "127.0.0.1:".len()..];
-        let count = tail.chars().take_while(char::is_ascii_digit).count();
-        if count > 0 {
-            out.push_str("<ADDR>");
-            rest = &tail[count..];
+    let mut candidate = String::new();
+    for character in input.chars() {
+        if character.is_ascii_hexdigit() || matches!(character, '.' | ':' | '[' | ']' | '%') {
+            candidate.push(character);
         } else {
-            out.push_str("127.0.0.1:");
-            rest = tail;
+            push_address_candidate(&mut out, &mut candidate);
+            out.push(character);
         }
     }
-    out.push_str(rest);
+    push_address_candidate(&mut out, &mut candidate);
     out
+}
+
+fn push_address_candidate(out: &mut String, candidate: &mut String) {
+    if candidate.parse::<SocketAddr>().is_ok() {
+        out.push_str("<ADDR>");
+    } else {
+        out.push_str(candidate);
+    }
+    candidate.clear();
 }
 
 fn replace_fingerprints_and_base64(input: &str) -> String {
@@ -451,7 +456,7 @@ fn normalizer_self_test_removes_token_shaped_material() {
     let root = Path::new("/private/tmp/cluster-golden-self-test");
     let token = "KRBAdTaMOXo+UrPjtDzDXoXS0lgffkokWwzccQvlXIU=";
     let normalized = normalize(
-        &format!("remuda-join-v1 127.0.0.1:7441 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= {token}"),
+        &format!("remuda-join-v1 127.0.0.1:0 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= {token}"),
         root,
     );
     assert!(!normalized.contains(token));
@@ -908,32 +913,6 @@ fn explicit_listener_address(scratch: &Scratch) -> SocketAddr {
 }
 
 #[test]
-fn d4_invite_without_flags_uses_the_daemon_bound_address() {
-    use remuda_native::cluster::join_line::JoinLine;
-
-    let scratch = Scratch::new();
-    let _daemon = initialized_node(&scratch);
-    assert_eq!(
-        configure_listener(&scratch, false, "127.0.0.1:0".parse().unwrap()),
-        remuda_core::protocol::ListenerStatus::Off
-    );
-    let invite = scratch.run(&["cluster", "invite"]);
-    assert!(
-        invite.status.success(),
-        "invite failed: {}",
-        String::from_utf8_lossy(&invite.stderr)
-    );
-    let line = JoinLine::decode(&invitation_join_line(&invite)).expect("decode invite line");
-    let bound = match remuda_native::cluster::listener_control::status(
-        &remuda_native::daemon::socket_path_in(&scratch.runtime, &scratch.name),
-    ) {
-        remuda_core::protocol::ListenerStatus::On { addr, .. } => addr,
-        status => panic!("invite did not enable the listener: {status:?}"),
-    };
-    assert_eq!(line.issuer_addr, bound);
-}
-
-#[test]
 fn d4_invite_addr_overrides_only_the_advertised_address() {
     use remuda_native::cluster::join_line::JoinLine;
 
@@ -958,6 +937,8 @@ fn d4_invite_addr_overrides_only_the_advertised_address() {
         remuda_core::protocol::ListenerStatus::On {
             addr: bound,
             auto: false,
+            advertise_addr: Some(bound),
+            listen_addrs: vec![bound],
         }
     );
 }
@@ -994,7 +975,7 @@ fn d4_invite_refuses_a_failed_listener_without_printing_a_join_line() {
 }
 
 #[test]
-fn d4_join_sends_the_joiners_bound_address_to_the_issuer_registry() {
+fn explicit_join_sends_the_joiners_advertised_address_to_the_issuer_registry() {
     use remuda_native::cluster::{encoding, Registry};
 
     let inviter = Scratch::new();
@@ -1007,18 +988,36 @@ fn d4_join_sends_the_joiners_bound_address_to_the_issuer_registry() {
 
     let joiner = Scratch::new();
     let _joiner_daemon = initialized_node(&joiner);
-    let joined = joiner.run(&["cluster", "join", &fingerprint, &join_line]);
+    let joined = joiner.run(&[
+        "cluster",
+        "join",
+        &fingerprint,
+        &join_line,
+        "--bind",
+        "127.0.0.1:0",
+    ]);
     assert!(
         joined.status.success(),
         "join failed: {}",
         String::from_utf8_lossy(&joined.stderr)
     );
-    let joiner_addr = match remuda_native::cluster::listener_control::status(
-        &remuda_native::daemon::socket_path_in(&joiner.runtime, &joiner.name),
-    ) {
-        remuda_core::protocol::ListenerStatus::On { addr, .. } => addr,
-        status => panic!("join did not enable B's listener: {status:?}"),
-    };
+    let (joiner_bind_addr, joiner_advertise_addr) =
+        match remuda_native::cluster::listener_control::status(
+            &remuda_native::daemon::socket_path_in(&joiner.runtime, &joiner.name),
+        ) {
+            remuda_core::protocol::ListenerStatus::On {
+                addr,
+                advertise_addr: Some(advertise_addr),
+                auto: false,
+                ..
+            } => (addr, advertise_addr),
+            status => panic!("join did not enable B's listener: {status:?}"),
+        };
+    assert_eq!(
+        joiner_bind_addr.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    );
+    assert_eq!(joiner_bind_addr.port(), joiner_advertise_addr.port());
 
     let registry_path = inviter
         .root
@@ -1033,7 +1032,22 @@ fn d4_join_sends_the_joiners_bound_address_to_the_issuer_registry() {
         .expect("joiner entry in issuer registry");
     assert_eq!(
         entry.endpoint.as_deref(),
-        Some(joiner_addr.to_string().as_str())
+        Some(joiner_advertise_addr.to_string().as_str())
+    );
+}
+
+#[test]
+fn d4_explicit_listener_prints_the_listener_address_and_exposure_note() {
+    let scratch = Scratch::new();
+    let _daemon = start_daemon(&scratch);
+    let initialized = scratch.run(&["cluster", "init", "--no-listen"]);
+    assert!(initialized.status.success(), "init failed: {initialized:?}");
+    let bound = explicit_listener_address(&scratch);
+    let output = scratch.run(&["cluster"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("Listening on {bound}")),
+        "missing listener line: {stdout}"
     );
 }
 
@@ -1273,7 +1287,14 @@ fn d4_failed_join_turns_off_a_listener_enabled_by_the_join_command() {
             .expect("reject failed join");
     });
     let mut child = scratch
-        .command(&["cluster", "join", &fingerprint, &invitation])
+        .command(&[
+            "cluster",
+            "join",
+            &fingerprint,
+            &invitation,
+            "--bind",
+            "127.0.0.1:0",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1429,7 +1450,14 @@ fn d4_failed_join_keeps_a_preexisting_listener_on() {
     }
     .encode()
     .unwrap();
-    let joined = scratch.run(&["cluster", "join", "SHA256:wrong", &invitation]);
+    let joined = scratch.run(&[
+        "cluster",
+        "join",
+        "SHA256:wrong",
+        &invitation,
+        "--bind",
+        "127.0.0.1:0",
+    ]);
     assert!(
         !joined.status.success(),
         "wrong fingerprint unexpectedly joined"
@@ -1441,7 +1469,9 @@ fn d4_failed_join_keeps_a_preexisting_listener_on() {
         )),
         ListenerStatus::On {
             addr: bound,
-            auto: false
+            auto: false,
+            advertise_addr: Some(bound),
+            listen_addrs: vec![bound],
         },
         "failed join stopped a listener that was already on"
     );

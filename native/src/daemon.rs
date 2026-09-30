@@ -575,15 +575,21 @@ fn start_listener(
         }
         Err(error) => return Err(format!("read listener config: {error}")),
     };
-    let (address, auto) = match config.bind {
+    let (address, advertise_addr, auto) = match config.bind {
         ListenerBind::Auto => (
-            crate::net::advertise_addr::auto_bind().map_err(|error| error.to_string())?,
+            crate::net::advertise_addr::auto_bind(),
+            Some(
+                crate::net::advertise_addr::auto_advertise_addr()
+                    .map_err(|error| error.to_string())?,
+            ),
             true,
         ),
-        ListenerBind::Explicit(address) => (address, false),
+        ListenerBind::Explicit(address) => (address, Some(address), false),
     };
-    crate::net::listener::validate_bind_address(address, config.allow_public)
-        .map_err(|error| format!("validate cluster listener bind: {error}"))?;
+    if !auto {
+        crate::net::listener::validate_bind_address(address, config.allow_public)
+            .map_err(|error| format!("validate cluster listener bind: {error}"))?;
+    }
 
     loop {
         let host_lock = match crate::cluster::try_acquire_listener_host_lock() {
@@ -601,22 +607,29 @@ fn start_listener(
             }
             Err(error) => return Err(format!("lock cluster listener: {error}")),
         };
-        let listener = crate::net::listener::bind(
-            crate::net::listener::ListenerConfig {
-                bind_addr: address,
-                allow_unspecified: config.allow_public,
-            },
-            daemon_path,
-        )
+        let listener = if auto {
+            crate::net::listener::bind_auto(address, daemon_path)
+        } else {
+            crate::net::listener::bind(
+                crate::net::listener::ListenerConfig {
+                    bind_addr: address,
+                    allow_unspecified: config.allow_public,
+                },
+                daemon_path,
+            )
+        }
         .map_err(|error| format!("bind cluster listener: {error}"))?;
         let address = listener
             .local_addr()
             .map_err(|error| format!("read cluster listener address: {error}"))?;
+        let advertise_addr = if auto { advertise_addr } else { Some(address) };
         set_listener_status(
             status,
             ListenerStatus::On {
                 addr: address,
                 auto,
+                advertise_addr,
+                listen_addrs: vec![address],
             },
         );
         let _ = ready.send(());
@@ -2563,6 +2576,8 @@ mod tests {
     use remuda_core::protocol::collapse_runs;
     use remuda_core::protocol::Response;
     use std::ffi::OsStr;
+    #[cfg(not(windows))]
+    use std::net::TcpListener;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -2667,7 +2682,9 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
             match task.status() {
-                ListenerStatus::On { addr, auto: false } => return addr,
+                ListenerStatus::On {
+                    addr, auto: false, ..
+                } => return addr,
                 ListenerStatus::Off if std::time::Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -2764,7 +2781,10 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn listener_task_reports_bind_failure_as_failed_status() {
-        let environment = ListenerTaskEnvironment::new(Some(listener_config("192.0.2.1:7441")));
+        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied_addr = occupied.local_addr().unwrap();
+        let environment =
+            ListenerTaskEnvironment::new(Some(listener_config(&occupied_addr.to_string())));
         let task = ListenerTask::start(&environment.socket_path());
         match wait_for_listener_terminal_status(&task) {
             ListenerStatus::Failed(reason) => assert!(!reason.is_empty()),
@@ -2776,7 +2796,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn listener_task_refuses_wildcard_without_public_opt_in() {
-        let environment = ListenerTaskEnvironment::new(Some(listener_config("0.0.0.0:7441")));
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("0.0.0.0:0")));
         let task = ListenerTask::start(&environment.socket_path());
         match wait_for_listener_terminal_status(&task) {
             ListenerStatus::Failed(reason) => assert!(
@@ -2791,7 +2811,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn listener_task_refuses_public_specific_bind_without_public_opt_in() {
-        for bind in ["8.8.8.8:7441", "169.254.1.2:7441", "[fe80::1]:7441"] {
+        for bind in ["8.8.8.8:0", "169.254.1.2:0", "[fe80::1]:0"] {
             let environment = ListenerTaskEnvironment::new(Some(listener_config(bind)));
             let task = ListenerTask::start(&environment.socket_path());
             match wait_for_listener_terminal_status(&task) {
@@ -2837,7 +2857,9 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
             match second.status() {
-                ListenerStatus::On { addr, auto: false } => {
+                ListenerStatus::On {
+                    addr, auto: false, ..
+                } => {
                     assert_ne!(addr.port(), 0);
                     let _connection = connect_listener(addr);
                     break;

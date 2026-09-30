@@ -653,8 +653,13 @@ fn parse_cluster_join(args: &[&str]) -> Result<ClusterCommand, String> {
 
 fn parse_join_bind(value: &str) -> Result<std::net::SocketAddr, String> {
     let address = parse_addr_default_port(value)?;
-    remuda_native::cluster::join_line::validate_endpoint(address)
-        .map_err(|_| "invalid client bind address")?;
+    if address.port() == 0 {
+        remuda_native::net::listener::validate_bind_address(address, false)
+            .map_err(|_| "invalid client bind address")?;
+    } else {
+        remuda_native::cluster::join_line::validate_endpoint(address)
+            .map_err(|_| "invalid client bind address")?;
+    }
     Ok(address)
 }
 
@@ -988,10 +993,10 @@ fn cluster_listen_foreground(
         };
         match remuda_native::net::listener::bind(config, daemon_path) {
             Ok(listener) => {
-                eprintln!(
-                    "remuda: cluster listener on {}",
-                    listener.local_addr().unwrap_or(bind_addr)
-                );
+                let address = listener.local_addr().unwrap_or(bind_addr);
+                for line in render_listener_addresses(address, false, Some(address), &[address]) {
+                    eprintln!("remuda: {line}");
+                }
                 eprintln!("{}", next_step_listen());
                 match listener.serve() {
                     Ok(()) => ExitCode::SUCCESS,
@@ -1193,18 +1198,98 @@ fn render_init_listener_lines(status: &remuda_core::protocol::ListenerStatus) ->
     use remuda_core::protocol::ListenerStatus;
 
     match status {
-        ListenerStatus::On { addr, .. } => vec![
-            format!("Listening on {addr} (only admitted machines can connect; turn off: remuda cluster listen --off)"),
-            next_step_init().into(),
-        ],
-        ListenerStatus::Off => vec![
-            "Listener off (--no-listen)".into(),
-            next_step_init().into(),
-        ],
+        ListenerStatus::On {
+            addr,
+            auto,
+            advertise_addr,
+            listen_addrs,
+        } => {
+            let mut lines = render_listener_addresses(*addr, *auto, *advertise_addr, listen_addrs);
+            lines.push(
+                "Only admitted machines can connect; turn off: remuda cluster listen --off".into(),
+            );
+            lines.push(next_step_init().into());
+            lines
+        }
+        ListenerStatus::Off => vec!["Listener off (--no-listen)".into(), next_step_init().into()],
         ListenerStatus::Failed(reason) => vec![
             format!("Listener failed: {reason}"),
             "Next: remuda cluster listen --bind IP".into(),
         ],
+    }
+}
+
+fn render_listener_addresses(
+    addr: std::net::SocketAddr,
+    auto: bool,
+    advertise_addr: Option<std::net::SocketAddr>,
+    listen_addrs: &[std::net::SocketAddr],
+) -> Vec<String> {
+    let addresses = if listen_addrs.is_empty() {
+        vec![addr]
+    } else {
+        listen_addrs.to_vec()
+    };
+    let mut lines = Vec::new();
+    if auto && addr.ip().is_unspecified() {
+        if let Some(advertise_addr) = advertise_addr {
+            lines.push(format!(
+                "Listening on all interfaces ({}); invites use {advertise_addr}",
+                addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        } else {
+            lines.push(format!(
+                "Listening on all interfaces ({})",
+                addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    } else {
+        lines.push(format!(
+            "Listening on {}",
+            addresses
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        if let Some(advertise_addr) =
+            advertise_addr.filter(|advertised| !addresses.contains(advertised))
+        {
+            lines.push(format!("Invites use {advertise_addr}"));
+        }
+    }
+    for address in &addresses {
+        if is_public_listener_address(address.ip()) {
+            lines.push(format!(
+                "Warning: listening on public address {address}; use --allow-public only on a trusted network"
+            ));
+        }
+    }
+    lines
+}
+
+fn is_public_listener_address(address: std::net::IpAddr) -> bool {
+    if address.is_unspecified() || address.is_loopback() || address.is_multicast() {
+        return false;
+    }
+    if remuda_native::net::advertise_addr::is_private_lan(address) {
+        return false;
+    }
+    match address {
+        std::net::IpAddr::V4(address) => {
+            !address.is_link_local() && !address.is_broadcast() && !address.is_documentation()
+        }
+        std::net::IpAddr::V6(address) => {
+            !address.is_unicast_link_local() && !address.is_unique_local()
+        }
     }
 }
 
@@ -1224,10 +1309,34 @@ fn cluster_listener_status_lines(
         Some(ListenerStatus::Off) => {
             vec!["Listener: off (Next: remuda cluster listen --bind IP)".into()]
         }
-        Some(ListenerStatus::On { addr, auto }) => vec![format!(
-            "Listener: on {addr} ({})",
-            if auto { "auto" } else { "explicit" }
-        )],
+        Some(ListenerStatus::On {
+            addr,
+            auto,
+            advertise_addr,
+            listen_addrs,
+        }) => {
+            let addresses = if listen_addrs.is_empty() {
+                vec![addr]
+            } else {
+                listen_addrs.clone()
+            };
+            let mut lines = vec![format!(
+                "Listener: on {} ({})",
+                addresses
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if auto { "auto" } else { "explicit" }
+            )];
+            lines.extend(render_listener_addresses(
+                addr,
+                auto,
+                advertise_addr,
+                &listen_addrs,
+            ));
+            lines
+        }
         Some(ListenerStatus::Failed(reason)) => vec![
             format!("Listener: failed: {reason}"),
             "Next: remuda cluster listen --bind IP".into(),
@@ -1268,7 +1377,11 @@ fn cluster_invite(
             Err(error) => return fail(render_invite_listener_start_error(&error)),
         };
         let bound_addr = match &listener_status {
-            remuda_core::protocol::ListenerStatus::On { addr, .. } => *addr,
+            remuda_core::protocol::ListenerStatus::On {
+                addr,
+                advertise_addr,
+                ..
+            } => advertise_addr.unwrap_or(*addr),
             status => return fail(render_invite_listener_refusal(status)),
         };
         let advertised_addr = advertised_addr.unwrap_or(bound_addr);
@@ -1405,7 +1518,11 @@ fn cluster_join_with_listener(
         }
     };
     let bound_addr = match listener_status {
-        remuda_core::protocol::ListenerStatus::On { addr, .. } => addr,
+        remuda_core::protocol::ListenerStatus::On {
+            addr,
+            advertise_addr,
+            ..
+        } => advertise_addr.unwrap_or(addr),
         status => {
             let message = render_join_listener_refusal(&status);
             let rollback_error = restore_join_listener(&mut restore_guard);
@@ -2306,11 +2423,12 @@ mod cluster_cli_tests {
     use super::cluster_join_with_private_loader;
     use super::{
         cluster_init_message, cluster_listener_status_lines, cluster_usage,
-        confirmation_answer_is_yes, invite_message, join_confirmation, join_prompt,
-        join_success_message, new_identity_confirmation, next_step_init, next_step_join,
-        next_step_listen, next_step_status, parse_addr_default_port, parse_cluster_command,
-        remote_control_status_lines, render_cluster_init_lines, render_init_listener_lines,
-        render_invite_listener_refusal, render_join_failure, render_join_listener_restore_error,
+        confirmation_answer_is_yes, invite_message, is_public_listener_address, join_confirmation,
+        join_prompt, join_success_message, new_identity_confirmation, next_step_init,
+        next_step_join, next_step_listen, next_step_status, parse_addr_default_port,
+        parse_cluster_command, remote_control_status_lines, render_cluster_init_lines,
+        render_init_listener_lines, render_invite_listener_refusal, render_join_failure,
+        render_join_listener_restore_error, render_join_listener_rollback_status,
         render_join_listener_unexpected_on, revoke_confirmation, write_nodes_table,
         write_revocation_notice, ClusterCommand, NEW_IDENTITY_WARNING,
     };
@@ -2460,10 +2578,15 @@ mod cluster_cli_tests {
             &ListenerStatus::On {
                 addr: "192.0.2.4:7441".parse().unwrap(),
                 auto: true,
+                advertise_addr: Some("192.0.2.4:7441".parse().unwrap()),
+                listen_addrs: vec!["192.0.2.4:7441".parse().unwrap()],
             },
         );
+        assert!(listening
+            .iter()
+            .any(|line| { line == "Listening on 192.0.2.4:7441" }));
         assert!(listening.iter().any(|line| {
-            line == "Listening on 192.0.2.4:7441 (only admitted machines can connect; turn off: remuda cluster listen --off)"
+            line == "Only admitted machines can connect; turn off: remuda cluster listen --off"
         }));
         assert!(listening.iter().any(|line| line.starts_with("Next:")));
 
@@ -2484,8 +2607,27 @@ mod cluster_cli_tests {
 
     #[test]
     fn join_rollback_rendering_reports_uncertain_listener_state() {
-        let failed = render_join_listener_restore_error(&std::io::Error::other("disk is full"));
-        assert!(failed.contains("could not restore the saved listener config: disk is full"));
+        let restore_failed =
+            render_join_listener_restore_error(&std::io::Error::other("disk is full"));
+        assert!(
+            restore_failed.contains("could not restore the saved listener config: disk is full")
+        );
+        assert!(restore_failed.contains("remuda cluster listen --off"));
+
+        use remuda_core::protocol::ListenerStatus;
+        let remains_on = render_join_listener_rollback_status(&ListenerStatus::On {
+            addr: "192.0.2.4:7441".parse().unwrap(),
+            auto: false,
+            advertise_addr: Some("192.0.2.4:7441".parse().unwrap()),
+            listen_addrs: vec!["192.0.2.4:7441".parse().unwrap()],
+        });
+        assert!(remains_on.contains("listener remains on at 192.0.2.4:7441"));
+        assert!(remains_on.contains("remuda cluster listen --off"));
+
+        let failed = render_join_listener_rollback_status(&ListenerStatus::Failed(
+            "listener state unavailable".into(),
+        ));
+        assert!(failed.contains("listener state after rollback is failed"));
         assert!(failed.contains("remuda cluster listen --off"));
 
         assert_eq!(
@@ -2867,6 +3009,14 @@ mod cluster_cli_tests {
             }
         ));
         assert!(matches!(
+            parse_cluster_command(&["join", &fingerprint, &line, "--bind", "127.0.0.1:0"]),
+            ClusterCommand::Join {
+                fingerprint: Some(_),
+                bind_addr: Some(address),
+                ..
+            } if address == "127.0.0.1:0".parse().unwrap()
+        ));
+        assert!(matches!(
             parse_cluster_command(&["join", &fingerprint, &line, "--bind", "0.0.0.0:9443"]),
             ClusterCommand::Invalid { .. }
         ));
@@ -3229,12 +3379,124 @@ mod cluster_cli_tests {
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7441);
         assert_eq!(
-            cluster_listener_status_lines(Some(ListenerStatus::On { addr, auto: true })),
-            ["Listener: on 127.0.0.1:7441 (auto)"]
+            cluster_listener_status_lines(Some(ListenerStatus::On {
+                addr,
+                auto: true,
+                advertise_addr: Some(addr),
+                listen_addrs: vec![addr],
+            })),
+            [
+                "Listener: on 127.0.0.1:7441 (auto)",
+                "Listening on 127.0.0.1:7441"
+            ]
         );
         assert_eq!(
-            cluster_listener_status_lines(Some(ListenerStatus::On { addr, auto: false })),
-            ["Listener: on 127.0.0.1:7441 (explicit)"]
+            cluster_listener_status_lines(Some(ListenerStatus::On {
+                addr,
+                auto: false,
+                advertise_addr: Some(addr),
+                listen_addrs: vec![addr],
+            })),
+            [
+                "Listener: on 127.0.0.1:7441 (explicit)",
+                "Listening on 127.0.0.1:7441"
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_listener_init_reports_wildcard_bind_and_advertised_lan_address() {
+        use remuda_core::protocol::ListenerStatus;
+        use std::net::SocketAddr;
+
+        let status = ListenerStatus::On {
+            addr: "0.0.0.0:7441".parse::<SocketAddr>().unwrap(),
+            auto: true,
+            advertise_addr: Some("192.168.1.20:7441".parse().unwrap()),
+            listen_addrs: vec!["0.0.0.0:7441".parse().unwrap()],
+        };
+        let lines = render_init_listener_lines(&status).join("\n");
+        assert!(
+            lines.contains(
+                "Listening on all interfaces (0.0.0.0:7441); invites use 192.168.1.20:7441"
+            ),
+            "init output must distinguish the wildcard bind from the invite address: {lines}"
+        );
+    }
+
+    #[test]
+    fn auto_listener_status_lists_wildcard_and_advertised_lan_addresses() {
+        use remuda_core::protocol::ListenerStatus;
+        use std::net::SocketAddr;
+
+        let status = ListenerStatus::On {
+            addr: "0.0.0.0:7441".parse::<SocketAddr>().unwrap(),
+            auto: true,
+            advertise_addr: Some("192.168.1.20:7441".parse().unwrap()),
+            listen_addrs: vec!["0.0.0.0:7441".parse().unwrap()],
+        };
+        let lines = cluster_listener_status_lines(Some(status)).join("\n");
+        assert!(
+            lines.contains("0.0.0.0:7441") && lines.contains("192.168.1.20:7441"),
+            "status must list both listened and invite addresses: {lines}"
+        );
+    }
+
+    #[test]
+    fn listener_output_warns_for_a_public_listened_address() {
+        use remuda_core::protocol::ListenerStatus;
+
+        assert!(!is_public_listener_address("169.254.1.2".parse().unwrap()));
+        assert!(!is_public_listener_address("192.0.2.1".parse().unwrap()));
+        assert!(!is_public_listener_address("fe80::1".parse().unwrap()));
+        assert!(is_public_listener_address("8.8.8.8".parse().unwrap()));
+        let address = "8.8.8.8:7441".parse().unwrap();
+        let lines = cluster_listener_status_lines(Some(ListenerStatus::On {
+            addr: address,
+            auto: false,
+            advertise_addr: Some(address),
+            listen_addrs: vec![address],
+        }))
+        .join("\n");
+        assert!(
+            lines.contains("Warning: listening on public address 8.8.8.8:7441"),
+            "status must warn when a listened address is public: {lines}"
+        );
+    }
+
+    #[test]
+    fn listener_status_accepts_a_pre_advertise_address_wire_value() {
+        use remuda_core::protocol::ListenerStatus;
+
+        let old_wire_value = r#"{"On":{"addr":"192.168.1.20:7441","auto":true}}"#;
+        let status: ListenerStatus = serde_json::from_str(old_wire_value)
+            .expect("older daemons omit the new listener address fields");
+        assert!(matches!(
+            status,
+            ListenerStatus::On {
+                advertise_addr: None,
+                listen_addrs,
+                ..
+            } if listen_addrs.is_empty()
+        ));
+    }
+
+    #[test]
+    fn listener_status_preserves_separate_bind_and_advertise_addresses() {
+        use remuda_core::protocol::ListenerStatus;
+
+        let wire_value = r#"{"On":{"addr":"0.0.0.0:7441","auto":true,"advertise_addr":"192.168.1.20:7441","listen_addrs":["0.0.0.0:7441"]}}"#;
+        let status: ListenerStatus =
+            serde_json::from_str(wire_value).expect("listener address fields parse");
+        let round_tripped = serde_json::to_value(status).expect("listener status serializes");
+        assert_eq!(
+            round_tripped["On"]["advertise_addr"], "192.168.1.20:7441",
+            "the advertised invite address must survive the protocol round trip"
+        );
+        assert_eq!(
+            round_tripped["On"]["listen_addrs"],
+            serde_json::json!(["0.0.0.0:7441"]),
+            "the listened addresses must survive the protocol round trip"
         );
     }
 

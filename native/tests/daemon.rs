@@ -188,7 +188,7 @@ fn daemon_keeps_answering_ls_when_cluster_listener_bind_fails() {
             allow_public: false,
         },
     )
-    .expect("write a listener address that is not assigned to this host");
+    .expect("write explicit ephemeral loopback listener config");
 
     let mut command = spawn::base_command(&runtime);
     command
@@ -209,6 +209,42 @@ fn daemon_keeps_answering_ls_when_cluster_listener_bind_fails() {
     assert!(
         listed.status.success(),
         "daemon stopped answering ls after its listener bind failed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+#[allow(clippy::disallowed_types)]
+fn daemon_keeps_answering_ls_with_an_explicit_ephemeral_cluster_listener() {
+    use std::process::Command;
+
+    let daemon = cluster_listener_test_daemon(
+        "explicit-ephemeral-listener",
+        Some(explicit_listener_config("127.0.0.1:0".parse().unwrap())),
+    );
+    let response = client::request(
+        &daemon.socket,
+        &Request::ClusterListener(ListenerOp::Status),
+    )
+    .expect("read listener status from the isolated daemon");
+    assert!(matches!(
+        response,
+        Response::ClusterListenerStatus(ListenerStatus::On { addr, .. })
+            if addr.ip().is_loopback() && addr.port() != 0
+    ));
+    let listed = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "ls"])
+        .env("REMUDA_RUNTIME_DIR", daemon.socket.parent().unwrap())
+        .env("HOME", &daemon.home)
+        .env("XDG_STATE_HOME", &daemon.state)
+        .env("LOCALAPPDATA", &daemon.state)
+        .env("USERPROFILE", &daemon.home)
+        .output()
+        .expect("run ls against the live daemon");
+    assert!(
+        listed.status.success(),
+        "daemon stopped answering ls with its listener enabled: {}",
         String::from_utf8_lossy(&listed.stderr)
     );
 }
@@ -444,7 +480,9 @@ fn cluster_listener_control_round_trip() {
         restarted,
         ListenerStatus::On {
             addr: second_addr,
-            auto: false
+            auto: false,
+            advertise_addr: Some(second_addr),
+            listen_addrs: vec![second_addr],
         }
     );
     wait_for_tcp_listener(second_addr);
