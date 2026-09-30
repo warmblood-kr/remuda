@@ -292,7 +292,12 @@ fn cluster_listener_test_daemon(
     use std::process::Command;
 
     static NEXT_LISTENER_TEST: AtomicU64 = AtomicU64::new(1);
-    let root = PathBuf::from("/private/tmp").join(format!(
+    let temp_root = if cfg!(target_os = "macos") {
+        PathBuf::from("/private/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let root = temp_root.join(format!(
         "l3-{}-{}-{tag}",
         std::process::id(),
         NEXT_LISTENER_TEST.fetch_add(1, Ordering::Relaxed)
