@@ -97,18 +97,7 @@ register("_pending_events", "Drain pending completion and cancellation notificat
 local pending_cancel_handlers = {}
 local pending_secret_handlers = {}
 local pending_line_handlers = {}
-function remuda.pending(options)
-  if type(options) ~= "table" then
-    error("pending needs an options table", 2)
-  end
-  local timeout = options.timeout
-  if timeout ~= nil and (type(timeout) ~= "number" or timeout <= 0 or timeout > 300) then
-    error("pending timeout must be a positive number no greater than 300 seconds", 2)
-  end
-  local on_cancel = options.on_cancel
-  if on_cancel ~= nil and type(on_cancel) ~= "function" then
-    error("pending on_cancel must be a function", 2)
-  end
+local function new_pending_handle(timeout, on_cancel)
   local id, native_handle = remuda._pending_create(timeout)
   if on_cancel then pending_cancel_handlers[id] = on_cancel end
   local handle = {}
@@ -139,6 +128,20 @@ function remuda.pending(options)
     return prompt_id
   end
   return handle
+end
+function remuda.pending(options)
+  if type(options) ~= "table" then
+    error("pending needs an options table", 2)
+  end
+  local timeout = options.timeout
+  if timeout ~= nil and (type(timeout) ~= "number" or timeout <= 0 or timeout > 300) then
+    error("pending timeout must be a positive number no greater than 300 seconds", 2)
+  end
+  local on_cancel = options.on_cancel
+  if on_cancel ~= nil and type(on_cancel) ~= "function" then
+    error("pending on_cancel must be a function", 2)
+  end
+  return new_pending_handle(timeout, on_cancel)
 end
 
 local function deliver_pending_events()
@@ -1907,6 +1910,9 @@ function remuda._call(name, arguments, caller)
   if answer == nil then
     return ""
   end
+  if type(answer) == "table" and rawget(answer, "__remuda_pending_handle") ~= nil then
+    return answer
+  end
   return tostring(answer)
 end
 register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments, caller) -> string")
@@ -2140,24 +2146,47 @@ remuda.tool({
     if seconds ~= seconds or seconds <= 0 or seconds > 300 then
       error("wait_for seconds must be positive and no greater than 300", 0)
     end
-    local screen
-    for _ = 1, math.max(1, math.ceil(seconds / 0.1)) do
-      screen = remuda.capture(a.session)
-      if branch_matches({ match = a.pattern }, screen) then
-        return screen
-      end
-      remuda.sleep(0.1)
+    local deadline = remuda.clock() + seconds * 1000
+    local screen = remuda.capture(a.session)
+    if branch_matches({ match = a.pattern }, screen) then
+      return screen
     end
-    error(
-      string.format(
+
+    local timer
+    local pending = new_pending_handle(seconds + 1, function()
+      if timer then timer:cancel() end
+    end)
+    local function reject_deadline()
+      pending:reject(string.format(
         "%s never matched %q within %gs. last screen:\n%s",
         a.session,
         a.pattern,
         seconds,
         screen or ""
-      ),
-      0
-    )
+      ))
+    end
+    local poll
+    poll = function()
+      timer = nil
+      local ok, latest = pcall(remuda.capture, a.session)
+      if not ok then
+        pending:reject(tostring(latest))
+        return
+      end
+      screen = latest
+      if branch_matches({ match = a.pattern }, screen) then
+        pending:resolve(0, screen, "")
+        return
+      end
+      local remaining = (deadline - remuda.clock()) / 1000
+      if remaining <= 0 then
+        reject_deadline()
+        return
+      end
+      timer = remuda.after(math.max(0.01, math.min(0.1, remaining)), poll)
+    end
+    timer = remuda.after(math.max(0.01, math.min(0.1, seconds)), poll)
+    return pending
   end,
 })
 
