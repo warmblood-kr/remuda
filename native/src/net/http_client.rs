@@ -2095,6 +2095,97 @@ mod tests {
     }
 
     #[test]
+    fn pin_only_lua_option_reaches_peer_certificate() {
+        let (url, seen) = selfsigned_stub("localhost");
+        let socket = std::env::temp_dir().join(format!(
+            "unused-http-pin-only-peer-image-{}",
+            std::process::id()
+        ));
+        let image = crate::image::Image::spawn(
+            &socket,
+            std::sync::Arc::new(remuda_core::Registry::new()),
+            std::sync::Arc::new(crate::tick::Counters::default()),
+        );
+        let pin = pin_of(include_str!("testdata/selfsigned-ca.pem"));
+        let code = format!("remuda.http.peer_certificate{{url='{url}', timeout=2, pin='{pin}', pin_only=true, callback=function(r) remuda._pin_only_peer_trusted=r.trusted; remuda._pin_only_peer_reason=r.reason; remuda._pin_only_peer_done=true end}}; return 'started'");
+        assert_eq!(image.eval(&code, None).unwrap(), "started");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while image
+            .eval("return remuda._pin_only_peer_done or false", None)
+            .unwrap()
+            != "true"
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peer certificate pin-only callback did not run"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let trusted = image
+            .eval("return remuda._pin_only_peer_trusted", None)
+            .unwrap();
+        let reason = image
+            .eval("return remuda._pin_only_peer_reason", None)
+            .unwrap();
+        image.stop_for_test();
+        assert_eq!(
+            trusted, "true",
+            "matching pin-only peer certificate: {reason}"
+        );
+        assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn peer_certificate_pin_only_without_pin_is_refused_before_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!(
+            "https://localhost:{}/test",
+            listener.local_addr().unwrap().port()
+        );
+        let socket = std::env::temp_dir().join(format!(
+            "unused-http-pin-only-missing-peer-{}",
+            std::process::id()
+        ));
+        let image = crate::image::Image::spawn(
+            &socket,
+            std::sync::Arc::new(remuda_core::Registry::new()),
+            std::sync::Arc::new(crate::tick::Counters::default()),
+        );
+        let code = format!("remuda.http.peer_certificate{{url='{url}', timeout=2, pin_only=true, callback=function() end}}");
+        let result = image.eval(&code, None);
+        let mut accepted = false;
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        while std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok(_) => {
+                    accepted = true;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("listener accept failed: {error}"),
+            }
+        }
+        image.stop_for_test();
+        assert!(
+            result.is_err(),
+            "missing peer_certificate pin should be rejected"
+        );
+        assert!(
+            !accepted,
+            "missing peer_certificate pin connected to the server"
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("http.peer_certificate") && error.contains("pin"),
+            "{error}"
+        );
+        assert!(error.contains("Next:"), "{error}");
+    }
+
+    #[test]
     fn pin_only_lua_option_reaches_the_request() {
         let (url, seen) = selfsigned_stub("localhost");
         let socket =
