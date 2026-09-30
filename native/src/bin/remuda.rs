@@ -353,7 +353,12 @@ enum ClusterCommand {
         action: CallAction,
         json: bool,
     },
-    Invalid,
+    Help(Option<String>),
+    UnknownVerb(String),
+    Invalid {
+        verb: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -363,87 +368,192 @@ enum CallAction {
 }
 
 fn parse_cluster_command(args: &[&str]) -> ClusterCommand {
-    match args {
-        [] => ClusterCommand::Status,
-        ["init"] => ClusterCommand::Init,
-        ["invite", "--bind", address] => address
-            .parse()
-            .map(|bind_addr| ClusterCommand::Invite { bind_addr })
-            .unwrap_or(ClusterCommand::Invalid),
-        ["join", fingerprint, line] => remuda_native::cluster::join_line::JoinLine::decode(line)
-            .map(|invitation| ClusterCommand::Join {
-                fingerprint: (*fingerprint).to_owned(),
-                invitation,
-                bind_addr: None,
-            })
-            .unwrap_or(ClusterCommand::Invalid),
-        ["join", fingerprint, line, "--bind", address] => {
-            match (
-                remuda_native::cluster::join_line::JoinLine::decode(line),
-                address
-                    .parse::<std::net::SocketAddr>()
-                    .ok()
-                    .filter(|address| {
-                        remuda_native::cluster::join_line::validate_endpoint(*address).is_ok()
-                    }),
-            ) {
-                (Ok(invitation), Some(bind_addr)) => ClusterCommand::Join {
-                    fingerprint: (*fingerprint).to_owned(),
-                    invitation,
-                    bind_addr: Some(bind_addr),
-                },
-                _ => ClusterCommand::Invalid,
-            }
+    if args.is_empty() {
+        return ClusterCommand::Status;
+    }
+    if matches!(args, ["help"] | ["-h"] | ["--help"]) {
+        return ClusterCommand::Help(None);
+    }
+    if let [verb, "--help"] = args {
+        if cluster_verb_known(verb) {
+            return ClusterCommand::Help(Some((*verb).to_owned()));
         }
-        ["nodes"] => ClusterCommand::Nodes,
-        ["control", "on"] => ClusterCommand::Control(true),
-        ["control", "off"] => ClusterCommand::Control(false),
-        ["revoke", target] => ClusterCommand::Revoke {
-            target: (*target).to_string(),
-            yes: false,
-        },
-        ["revoke", target, "--yes"] => ClusterCommand::Revoke {
-            target: (*target).to_string(),
-            yes: true,
-        },
-        ["revoke", "--yes", target] => ClusterCommand::Revoke {
-            target: (*target).to_string(),
-            yes: true,
-        },
-        ["remote"] => ClusterCommand::Remote(None),
-        ["remote", target] if target.contains('/') => {
-            ClusterCommand::Remote(Some((*target).to_string()))
-        }
-        ["listen", "--bind", address] => address
-            .parse()
-            .ok()
-            .map(|bind_addr| ClusterCommand::Listen {
-                bind_addr,
-                allow_public: false,
-            })
-            .unwrap_or(ClusterCommand::Invalid),
-        ["listen", "--bind", address, "--allow-public"]
-        | ["listen", "--allow-public", "--bind", address] => address
-            .parse()
-            .ok()
-            .map(|bind_addr| ClusterCommand::Listen {
-                bind_addr,
-                allow_public: true,
-            })
-            .unwrap_or(ClusterCommand::Invalid),
-        ["call", target, operation, rest @ ..] => parse_cluster_call(target, operation, rest),
-        _ => ClusterCommand::Invalid,
+    }
+    let (verb, rest) = args.split_first().expect("non-empty cluster args");
+    if !cluster_verb_known(verb) {
+        return ClusterCommand::UnknownVerb((*verb).to_owned());
+    }
+    let parsed = match *verb {
+        "init" => parse_cluster_init(rest),
+        "invite" => parse_cluster_invite(rest),
+        "join" => parse_cluster_join(rest),
+        "nodes" => parse_cluster_nodes(rest),
+        "control" => parse_cluster_control(rest),
+        "revoke" => parse_cluster_revoke(rest),
+        "remote" => parse_cluster_remote(rest),
+        "listen" => parse_cluster_listen(rest),
+        "call" => parse_cluster_call_args(rest),
+        _ => unreachable!("cluster_verb_known and parser dispatch disagree"),
+    };
+    parsed.unwrap_or_else(|reason| invalid_cluster(verb, reason))
+}
+
+fn cluster_verb_known(verb: &str) -> bool {
+    matches!(
+        verb,
+        "init" | "invite" | "join" | "nodes" | "control" | "revoke" | "remote" | "listen" | "call"
+    )
+}
+
+fn invalid_cluster(verb: &str, reason: impl Into<String>) -> ClusterCommand {
+    ClusterCommand::Invalid {
+        verb: verb.to_owned(),
+        reason: reason.into(),
     }
 }
 
-fn parse_cluster_call(target: &str, operation: &str, args: &[&str]) -> ClusterCommand {
+fn parse_cluster_init(args: &[&str]) -> Result<ClusterCommand, String> {
+    if args.is_empty() {
+        Ok(ClusterCommand::Init)
+    } else {
+        Err("unexpected arguments".into())
+    }
+}
+
+fn parse_cluster_invite(args: &[&str]) -> Result<ClusterCommand, String> {
+    let address = match args {
+        ["--bind", address] => *address,
+        [flag] if flag.starts_with("--bind=") => &flag[7..],
+        [] => return Err("missing --bind ADDR".into()),
+        _ => return Err("expected --bind ADDR".into()),
+    };
+    let bind_addr = parse_socket_address(address)?;
+    Ok(ClusterCommand::Invite { bind_addr })
+}
+
+fn parse_cluster_join(args: &[&str]) -> Result<ClusterCommand, String> {
+    if args.len() > 2 {
+        if let Some(index) = args
+            .iter()
+            .position(|arg| arg.starts_with("remuda-join-v1"))
+        {
+            if remuda_native::cluster::join_line::JoinLine::decode(args[index]).is_err() {
+                let reason = if index == 0 {
+                    "missing fingerprint; use this form and quote the whole join line: remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
+                } else {
+                    "quote the whole join line (it contains spaces): remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
+                };
+                return Err(reason.into());
+            }
+        }
+    }
+    if args.len() > 2 && args.get(1) == Some(&"--bind") {
+        return Err("missing join line".into());
+    }
+    if args.len() < 2 {
+        return Err("missing fingerprint and join line".into());
+    }
+    let fingerprint = args[0];
+    let invitation = match remuda_native::cluster::join_line::JoinLine::decode(args[1]) {
+        Ok(invitation) => invitation,
+        Err(_) => return Err("invalid join line".into()),
+    };
+    let bind_addr = match &args[2..] {
+        [] => None,
+        ["--bind", address] => Some(parse_join_bind(address)?),
+        [flag] if flag.starts_with("--bind=") => Some(parse_join_bind(&flag[7..])?),
+        _ => return Err("unexpected arguments".into()),
+    };
+    Ok(ClusterCommand::Join {
+        fingerprint: fingerprint.to_owned(),
+        invitation,
+        bind_addr,
+    })
+}
+
+fn parse_join_bind(value: &str) -> Result<std::net::SocketAddr, String> {
+    let address = parse_socket_address(value)?;
+    remuda_native::cluster::join_line::validate_endpoint(address)
+        .map_err(|_| "invalid client bind address")?;
+    Ok(address)
+}
+
+fn parse_cluster_nodes(args: &[&str]) -> Result<ClusterCommand, String> {
+    if args.is_empty() {
+        Ok(ClusterCommand::Nodes)
+    } else {
+        Err("unexpected arguments".into())
+    }
+}
+
+fn parse_cluster_control(args: &[&str]) -> Result<ClusterCommand, String> {
+    match args {
+        ["on"] => Ok(ClusterCommand::Control(true)),
+        ["off"] => Ok(ClusterCommand::Control(false)),
+        _ => Err("expected on or off".into()),
+    }
+}
+
+fn parse_cluster_revoke(args: &[&str]) -> Result<ClusterCommand, String> {
+    match args {
+        [target] => Ok(ClusterCommand::Revoke {
+            target: (*target).to_owned(),
+            yes: false,
+        }),
+        [target, "--yes"] | ["--yes", target] => Ok(ClusterCommand::Revoke {
+            target: (*target).to_owned(),
+            yes: true,
+        }),
+        _ => Err("expected a node or fingerprint".into()),
+    }
+}
+
+fn parse_cluster_remote(args: &[&str]) -> Result<ClusterCommand, String> {
+    match args {
+        [] => Ok(ClusterCommand::Remote(None)),
+        [target] if target.contains('/') => Ok(ClusterCommand::Remote(Some((*target).to_owned()))),
+        _ => Err("expected NODE/SESSION".into()),
+    }
+}
+
+fn parse_cluster_listen(args: &[&str]) -> Result<ClusterCommand, String> {
+    let (allow_public, address) = match args {
+        ["--bind", address] => (false, *address),
+        [flag] if flag.starts_with("--bind=") => (false, &flag[7..]),
+        ["--bind", address, "--allow-public"] | ["--allow-public", "--bind", address] => {
+            (true, *address)
+        }
+        [flag, "--allow-public"] if flag.starts_with("--bind=") => (true, &flag[7..]),
+        ["--allow-public", flag] if flag.starts_with("--bind=") => (true, &flag[7..]),
+        [] => return Err("missing --bind ADDR".into()),
+        _ => return Err("expected --bind ADDR".into()),
+    };
+    let bind_addr = parse_socket_address(address)?;
+    Ok(ClusterCommand::Listen {
+        bind_addr,
+        allow_public,
+    })
+}
+
+fn parse_cluster_call_args(args: &[&str]) -> Result<ClusterCommand, String> {
+    let [target, operation, rest @ ..] = args else {
+        return Err("expected NODE and list or capture SESSION".into());
+    };
+    parse_cluster_call(target, operation, rest)
+}
+
+fn parse_cluster_call(
+    target: &str,
+    operation: &str,
+    args: &[&str],
+) -> Result<ClusterCommand, String> {
     let action = match operation {
         "list" => CallAction::List,
         "capture" => match args.first() {
             Some(session) if !session.starts_with('-') => CallAction::Capture((*session).into()),
-            _ => return ClusterCommand::Invalid,
+            _ => return Err("missing SESSION for capture".into()),
         },
-        _ => return ClusterCommand::Invalid,
+        _ => return Err("expected list or capture SESSION".into()),
     };
     let option_start = usize::from(matches!(action, CallAction::Capture(_)));
     let mut address = None;
@@ -455,22 +565,57 @@ fn parse_cluster_call(target: &str, operation: &str, args: &[&str]) -> ClusterCo
                 json = true;
                 index += 1;
             }
-            "--addr" if address.is_none() && index + 1 < args.len() => {
-                address = args[index + 1].parse().ok();
-                if address.is_none() {
-                    return ClusterCommand::Invalid;
-                }
+            "--addr" if address.is_none() => {
+                let value = args.get(index + 1).ok_or("missing address after --addr")?;
+                address = Some(parse_socket_address(value)?);
                 index += 2;
             }
-            _ => return ClusterCommand::Invalid,
+            flag if address.is_none() && flag.starts_with("--addr=") => {
+                address = Some(parse_socket_address(&flag[7..])?);
+                index += 1;
+            }
+            _ => return Err(format!("unexpected argument {}", args[index])),
         }
     }
-    address.map_or(ClusterCommand::Invalid, |address| ClusterCommand::Call {
+    let address = address.ok_or("missing --addr HOST:PORT")?;
+    Ok(ClusterCommand::Call {
         target: target.into(),
         address,
         action,
         json,
     })
+}
+
+fn parse_socket_address(value: &str) -> Result<std::net::SocketAddr, String> {
+    value.parse().map_err(|_| {
+        if let Ok(address) = value.parse::<std::net::IpAddr>() {
+            match address {
+                std::net::IpAddr::V4(address) => {
+                    format!("address needs a port, e.g. {address}:7441")
+                }
+                std::net::IpAddr::V6(address) => {
+                    format!("address needs a port, e.g. [{address}]:7441")
+                }
+            }
+        } else {
+            format!("invalid address '{value}'")
+        }
+    })
+}
+
+pub fn cluster_usage(verb: &str) -> &'static str {
+    match verb {
+        "init" => "usage: remuda cluster init\nexample: remuda cluster init\n",
+        "invite" => "usage: remuda cluster invite --bind IP:PORT\nexample: remuda cluster invite --bind 192.168.1.20:7441\n",
+        "join" => "usage: remuda cluster join FINGERPRINT 'JOIN_LINE' [--bind IP:PORT]\nexample: remuda cluster join 'SHA256:…' 'remuda-join-v1 …'\n",
+        "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n",
+        "revoke" => "usage: remuda cluster revoke NODE|FINGERPRINT [--yes]\nexample: remuda cluster revoke node-abcd1234\n",
+        "control" => "usage: remuda cluster control on|off\nexample: remuda cluster control off\n",
+        "remote" => "usage: remuda cluster remote [NODE/SESSION]\nexample: remuda cluster remote\n",
+        "listen" => "usage: remuda cluster listen --bind IP:PORT [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20:7441\n",
+        "call" => "usage: remuda cluster call NODE (list|capture SESSION) --addr HOST:PORT [--json]\nexample: remuda cluster call node-abcd1234 list --addr 192.168.1.20:7441\n",
+        _ => "usage: remuda cluster <command>\n  init\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n",
+    }
 }
 
 fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
@@ -546,8 +691,18 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             action,
             json,
         } => cluster_call(&target, address, action, json),
-        ClusterCommand::Invalid => {
-            eprintln!("usage: remuda cluster [init | invite --bind ADDR | join <fingerprint> <join-line> [--bind ADDR] | nodes | revoke <node|fingerprint> [--yes] | control on|off | remote [node/session] | listen --bind ADDR [--allow-public] | call NODE (list | capture SESSION) --addr HOST:PORT [--json]]");
+        ClusterCommand::Help(verb) => {
+            print!("{}", cluster_usage(verb.as_deref().unwrap_or("")));
+            ExitCode::SUCCESS
+        }
+        ClusterCommand::UnknownVerb(verb) => {
+            eprintln!("remuda: unknown cluster command '{verb}'");
+            eprint!("{}", cluster_usage(""));
+            ExitCode::from(2)
+        }
+        ClusterCommand::Invalid { verb, reason } => {
+            eprintln!("remuda: cluster {verb}: {reason}");
+            eprint!("{}", cluster_usage(&verb));
             ExitCode::from(2)
         }
     }
@@ -983,8 +1138,8 @@ mod cluster_cli_tests {
     #[cfg(unix)]
     use super::cluster_join_with_private_loader;
     use super::{
-        cluster_init_message, confirmation_answer_is_yes, invite_message, next_step_init,
-        next_step_join, next_step_listen, next_step_status, parse_cluster_command,
+        cluster_init_message, cluster_usage, confirmation_answer_is_yes, invite_message,
+        next_step_init, next_step_join, next_step_listen, next_step_status, parse_cluster_command,
         remote_control_status_lines, revoke_confirmation, write_nodes_table, ClusterCommand,
     };
     #[cfg(unix)]
@@ -1002,17 +1157,164 @@ mod cluster_cli_tests {
     #[cfg(unix)]
     use zeroize::Zeroizing;
 
+    fn invalid_reason(args: &[&str]) -> (String, String) {
+        match parse_cluster_command(args) {
+            ClusterCommand::Invalid { verb, reason } => (verb, reason),
+            command => panic!("expected an invalid command, got {command:?}"),
+        }
+    }
+
     #[test]
     fn cluster_status_and_init_are_recognized() {
         assert_eq!(parse_cluster_command(&[]), ClusterCommand::Status);
         assert_eq!(parse_cluster_command(&["init"]), ClusterCommand::Init);
-        assert_eq!(parse_cluster_command(&["join"]), ClusterCommand::Invalid);
+        assert_eq!(invalid_reason(&["join"]).0, "join");
         assert_eq!(
             parse_cluster_command(&["invite", "--bind", "192.0.2.4:9443"]),
             ClusterCommand::Invite {
                 bind_addr: "192.0.2.4:9443".parse().unwrap()
             }
         );
+    }
+
+    #[test]
+    fn cluster_missing_listen_bind_has_actionable_reason() {
+        assert_eq!(
+            invalid_reason(&["listen"]),
+            ("listen".into(), "missing --bind ADDR".into())
+        );
+    }
+
+    #[test]
+    fn cluster_listen_address_without_port_has_hint() {
+        assert_eq!(
+            invalid_reason(&["listen", "--bind", "192.168.100.0"]),
+            (
+                "listen".into(),
+                "address needs a port, e.g. 192.168.100.0:7441".into()
+            )
+        );
+    }
+
+    #[test]
+    fn cluster_unquoted_join_line_has_quote_hint() {
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let bearer = "BEARER_TOKEN_MUST_NOT_APPEAR_71d9";
+        let actual = invalid_reason(&[
+            "join",
+            &fingerprint,
+            "remuda-join-v1",
+            "192.0.2.4:9443",
+            "SHA256:other",
+            bearer,
+            "proof",
+        ]);
+        assert_eq!(
+            actual,
+            (
+                "join".into(),
+                "quote the whole join line (it contains spaces): remuda cluster join FINGERPRINT 'remuda-join-v1 …'".into()
+            )
+        );
+        assert!(!actual.1.contains(bearer), "{actual:?}");
+        assert!(
+            !actual.1.contains("remuda-join-v1 192.0.2.4:9443"),
+            "{actual:?}"
+        );
+    }
+
+    #[test]
+    fn cluster_join_without_fingerprint_gets_fingerprint_and_quote_hint() {
+        let bearer = "BEARER_TOKEN_MUST_NOT_APPEAR_71d9";
+        let actual = invalid_reason(&[
+            "join",
+            "remuda-join-v1",
+            "192.0.2.4:9443",
+            "SHA256:other",
+            bearer,
+            "proof",
+        ]);
+        assert_eq!(
+            actual,
+            (
+                "join".into(),
+                "missing fingerprint; use this form and quote the whole join line: remuda cluster join FINGERPRINT 'remuda-join-v1 …'".into()
+            )
+        );
+        assert!(!actual.1.contains(bearer), "{actual:?}");
+        assert!(
+            !actual.1.contains("remuda-join-v1 192.0.2.4:9443"),
+            "{actual:?}"
+        );
+    }
+
+    #[test]
+    fn cluster_help_and_unknown_verbs_are_distinguished() {
+        for args in [&["help"][..], &["-h"][..], &["--help"][..]] {
+            assert_eq!(parse_cluster_command(args), ClusterCommand::Help(None));
+        }
+        assert_eq!(
+            parse_cluster_command(&["listen", "--help"]),
+            ClusterCommand::Help(Some("listen".into()))
+        );
+        assert_eq!(
+            parse_cluster_command(&["node"]),
+            ClusterCommand::UnknownVerb("node".into())
+        );
+    }
+
+    #[test]
+    fn cluster_usage_has_one_verb_per_line_and_examples() {
+        assert_eq!(
+            cluster_usage("listen"),
+            "usage: remuda cluster listen --bind IP:PORT [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20:7441\n"
+        );
+        let usage = cluster_usage("");
+        for verb in [
+            "init", "invite", "join", "nodes", "revoke", "control", "remote", "listen", "call",
+        ] {
+            assert!(
+                usage.contains(&format!("  {verb}\n")),
+                "missing {verb}: {usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn cluster_address_options_accept_equals_form() {
+        assert_eq!(
+            parse_cluster_command(&["invite", "--bind=192.0.2.4:9443"]),
+            ClusterCommand::Invite {
+                bind_addr: "192.0.2.4:9443".parse().unwrap()
+            }
+        );
+        assert_eq!(
+            parse_cluster_command(&["listen", "--bind=192.0.2.4:9443"]),
+            ClusterCommand::Listen {
+                bind_addr: "192.0.2.4:9443".parse().unwrap(),
+                allow_public: false,
+            }
+        );
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let line = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.4:9443".parse().unwrap(),
+            issuer_fingerprint: fingerprint.clone(),
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        }
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            parse_cluster_command(&["join", &fingerprint, &line, "--bind=192.0.2.8:9443"]),
+            ClusterCommand::Join {
+                bind_addr: Some(_),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1042,10 +1344,10 @@ mod cluster_cli_tests {
                 ..
             }
         ));
-        assert_eq!(
+        assert!(matches!(
             parse_cluster_command(&["join", &fingerprint, &line, "--bind", "0.0.0.0:9443"]),
-            ClusterCommand::Invalid
-        );
+            ClusterCommand::Invalid { .. }
+        ));
     }
 
     #[test]
@@ -1204,10 +1506,10 @@ mod cluster_cli_tests {
                 allow_public: true,
             }
         );
-        assert_eq!(
+        assert!(matches!(
             parse_cluster_command(&["listen", "--bind", "not-an-address"]),
-            ClusterCommand::Invalid
-        );
+            ClusterCommand::Invalid { .. }
+        ));
     }
 
     #[test]
@@ -1230,10 +1532,10 @@ mod cluster_cli_tests {
             parse_cluster_command(&["control", "off"]),
             ClusterCommand::Control(false)
         );
-        assert_eq!(
+        assert!(matches!(
             parse_cluster_command(&["control", "yes"]),
-            ClusterCommand::Invalid
-        );
+            ClusterCommand::Invalid { .. }
+        ));
     }
 
     #[test]
@@ -2705,6 +3007,15 @@ mod cluster_call_tests {
             }
         );
         assert_eq!(
+            parse_cluster_command(&["call", "node-abc", "list", "--addr=127.0.0.1:9"]),
+            ClusterCommand::Call {
+                target: "node-abc".into(),
+                address: "127.0.0.1:9".parse().unwrap(),
+                action: CallAction::List,
+                json: false,
+            }
+        );
+        assert_eq!(
             parse_cluster_command(&["call", "node-abc", "capture", "build", "--addr", "[::1]:9"]),
             ClusterCommand::Call {
                 target: "node-abc".into(),
@@ -2735,9 +3046,8 @@ mod cluster_call_tests {
                 "--json",
             ],
         ] {
-            assert_eq!(
-                parse_cluster_command(&args),
-                ClusterCommand::Invalid,
+            assert!(
+                matches!(parse_cluster_command(&args), ClusterCommand::Invalid { .. }),
                 "{args:?}"
             );
         }
