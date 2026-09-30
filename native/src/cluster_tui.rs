@@ -551,6 +551,9 @@ impl ClusterUi {
     pub fn render(&self, cols: u16, rows: u16, screen: &str, clock: &dyn Clock) -> String {
         let width = usize::from(cols.max(1));
         let height = usize::from(rows.max(1));
+        if self.remote_keys_mode.is_some() {
+            return self.render_remote_keys_mode(width, height);
+        }
         let now = clock.now();
         let mut frame = Vec::new();
         let reachable = 1 + self
@@ -643,6 +646,44 @@ impl ClusterUi {
         }
         frame
             .into_iter()
+            .map(|line| truncate(&line, width))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn render_remote_keys_mode(&self, width: usize, height: usize) -> String {
+        let Some(target @ RemoteSelection::Session { .. }) = &self.remote_keys_mode else {
+            return String::new();
+        };
+        let (node_label, session_name, body) = self.remote_session(target).map_or_else(
+            || {
+                let RemoteSelection::Session { node, name, .. } = target else {
+                    unreachable!()
+                };
+                (node.clone(), name.clone(), String::new())
+            },
+            |(node, session)| {
+                (
+                    node.name.clone(),
+                    session.name.clone(),
+                    session
+                        .screen
+                        .as_ref()
+                        .map(remote_screen_text)
+                        .unwrap_or_default(),
+                )
+            },
+        );
+        let mut frame = vec![format!("KEYS {node_label}/{session_name} · Ctrl-\\ back")];
+        frame.extend(
+            visible_remote_pane_lines(&body, true, height.saturating_sub(1))
+                .into_iter()
+                .map(str::to_string),
+        );
+        frame.resize(height, String::new());
+        frame
+            .into_iter()
+            .take(height)
             .map(|line| truncate(&line, width))
             .collect::<Vec<_>>()
             .join("\n")
