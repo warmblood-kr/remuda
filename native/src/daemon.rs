@@ -438,6 +438,27 @@ impl ListenerTask {
     }
 
     fn start_with_retry_interval(daemon_path: &Path, retry_interval: Duration) -> Self {
+        Self::start_with_retry_interval_and_detector(
+            daemon_path,
+            retry_interval,
+            Arc::new(crate::net::advertise_addr::auto_advertise_addr),
+        )
+    }
+
+    #[cfg(all(test, not(windows)))]
+    fn start_with_detector(daemon_path: &Path, detector: AutoAddressDetector) -> Self {
+        Self::start_with_retry_interval_and_detector(
+            daemon_path,
+            LISTENER_HOST_LOCK_RETRY_INTERVAL,
+            detector,
+        )
+    }
+
+    fn start_with_retry_interval_and_detector(
+        daemon_path: &Path,
+        retry_interval: Duration,
+        detector: AutoAddressDetector,
+    ) -> Self {
         let status = Arc::new(Mutex::new(ListenerStatus::Off));
         let (stop, stopped) = std::sync::mpsc::channel();
         let (ready, startup) = std::sync::mpsc::channel();
@@ -453,6 +474,7 @@ impl ListenerTask {
                     &status_for_thread,
                     stopped,
                     retry_interval,
+                    detector,
                     &ready,
                 );
                 if let Err(reason) = result {
@@ -520,6 +542,41 @@ impl Drop for ListenerTask {
     }
 }
 
+fn auto_listener_addresses(
+    detect: impl FnOnce() -> Result<std::net::SocketAddr, crate::net::advertise_addr::NoLanAddr>,
+) -> Result<(std::net::SocketAddr, std::net::SocketAddr), crate::net::advertise_addr::NoLanAddr> {
+    let advertise_addr = detect()?;
+    Ok((advertise_addr, advertise_addr))
+}
+
+type AutoAddressDetector = Arc<
+    dyn Fn() -> Result<std::net::SocketAddr, crate::net::advertise_addr::NoLanAddr> + Send + Sync,
+>;
+
+fn auto_listener_ip_changed(
+    current: std::net::IpAddr,
+    detect: impl FnOnce() -> Result<std::net::SocketAddr, crate::net::advertise_addr::NoLanAddr>,
+) -> bool {
+    match detect() {
+        Ok(address) => address.ip() != current,
+        Err(_) => true,
+    }
+}
+
+fn resolve_listener_bind(
+    bind: crate::cluster::listener_config::ListenerBind,
+    detector: &AutoAddressDetector,
+) -> Result<(std::net::SocketAddr, bool), String> {
+    match bind {
+        crate::cluster::listener_config::ListenerBind::Auto => {
+            auto_listener_addresses(|| detector())
+                .map(|(address, _)| (address, true))
+                .map_err(|error| error.to_string())
+        }
+        crate::cluster::listener_config::ListenerBind::Explicit(address) => Ok((address, false)),
+    }
+}
+
 struct DaemonListenerControl {
     task: Mutex<ListenerTask>,
 }
@@ -563,35 +620,23 @@ fn start_listener(
     status: &Arc<Mutex<ListenerStatus>>,
     stopped: std::sync::mpsc::Receiver<()>,
     retry_interval: Duration,
+    detector: AutoAddressDetector,
     ready: &std::sync::mpsc::Sender<()>,
 ) -> Result<(), String> {
-    use crate::cluster::listener_config::ListenerBind;
-
-    let config = match crate::cluster::listener_config::read() {
-        Ok(Some(config)) if config.enabled => config,
-        Ok(_) => {
-            let _ = ready.send(());
-            return Ok(());
-        }
-        Err(error) => return Err(format!("read listener config: {error}")),
-    };
-    let (address, advertise_addr, auto) = match config.bind {
-        ListenerBind::Auto => (
-            crate::net::advertise_addr::auto_bind(),
-            Some(
-                crate::net::advertise_addr::auto_advertise_addr()
-                    .map_err(|error| error.to_string())?,
-            ),
-            true,
-        ),
-        ListenerBind::Explicit(address) => (address, Some(address), false),
-    };
-    if !auto {
-        crate::net::listener::validate_bind_address(address, config.allow_public)
-            .map_err(|error| format!("validate cluster listener bind: {error}"))?;
-    }
-
+    let stopped = Arc::new(Mutex::new(stopped));
     loop {
+        let config = match crate::cluster::listener_config::read() {
+            Ok(Some(config)) if config.enabled => config,
+            Ok(_) => {
+                let _ = ready.send(());
+                return Ok(());
+            }
+            Err(error) => return Err(format!("read listener config: {error}")),
+        };
+        let (address, auto) = resolve_listener_bind(config.bind, &detector)?;
+        let allow_public = !auto && config.allow_public;
+        crate::net::listener::validate_bind_address(address, allow_public)
+            .map_err(|error| format!("validate cluster listener bind: {error}"))?;
         let host_lock = match crate::cluster::try_acquire_listener_host_lock() {
             Ok(lock) => lock,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -600,35 +645,34 @@ fn start_listener(
                     ListenerStatus::Failed("hosted by another daemon".into()),
                 );
                 let _ = ready.send(());
-                match stopped.recv_timeout(retry_interval) {
+                let result = stopped
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv_timeout(retry_interval);
+                match result {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 }
             }
             Err(error) => return Err(format!("lock cluster listener: {error}")),
         };
-        let listener = if auto {
-            crate::net::listener::bind_auto(address, daemon_path)
-        } else {
-            crate::net::listener::bind(
-                crate::net::listener::ListenerConfig {
-                    bind_addr: address,
-                    allow_unspecified: config.allow_public,
-                },
-                daemon_path,
-            )
-        }
+        let listener = crate::net::listener::bind(
+            crate::net::listener::ListenerConfig {
+                bind_addr: address,
+                allow_unspecified: allow_public,
+            },
+            daemon_path,
+        )
         .map_err(|error| format!("bind cluster listener: {error}"))?;
         let address = listener
             .local_addr()
             .map_err(|error| format!("read cluster listener address: {error}"))?;
-        let advertise_addr = if auto { advertise_addr } else { Some(address) };
         set_listener_status(
             status,
             ListenerStatus::On {
                 addr: address,
                 auto,
-                advertise_addr,
+                advertise_addr: Some(address),
                 listen_addrs: vec![address],
             },
         );
@@ -636,13 +680,18 @@ fn start_listener(
 
         let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let serve_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        return std::thread::scope(|scope| {
+        let result = std::thread::scope(|scope| {
             let watcher_flag = Arc::clone(&stop_flag);
             let watcher_done = Arc::clone(&serve_done);
+            let watcher_stopped = Arc::clone(&stopped);
             let watcher = std::thread::Builder::new()
                 .name("remuda-cluster-listener-stop-watcher".into())
                 .spawn_scoped(scope, move || loop {
-                    match stopped.recv_timeout(Duration::from_millis(25)) {
+                    let result = watcher_stopped
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .recv_timeout(Duration::from_millis(25));
+                    match result {
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                             watcher_flag.store(true, Ordering::Release);
                             break;
@@ -656,14 +705,18 @@ fn start_listener(
                     }
                 })
                 .map_err(|error| format!("spawn cluster listener stop watcher: {error}"))?;
-            let result = listener
-                .serve_until(&stop_flag)
-                .map_err(|error| format!("serve cluster listener: {error}"));
+            let result = listener.serve_until_rechecking(&stop_flag, || {
+                auto && auto_listener_ip_changed(address.ip(), || detector())
+            });
             serve_done.store(true, Ordering::Release);
             let _ = watcher.join();
             drop(host_lock);
-            result
+            result.map_err(|error| format!("serve cluster listener: {error}"))
         });
+        if result? {
+            continue;
+        }
+        return Ok(());
     }
 }
 
@@ -2619,11 +2672,12 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_sync_permit, forward_attach_input, report_attach_input_failure, runtime_base_for,
-        shell_or_default, SyncPermit, ATTACH_INPUT_FAILURE_NOTICE, MAX_CONCURRENT_SYNCS,
+        acquire_sync_permit, auto_listener_addresses, auto_listener_ip_changed,
+        forward_attach_input, report_attach_input_failure, runtime_base_for, shell_or_default,
+        SyncPermit, ATTACH_INPUT_FAILURE_NOTICE, MAX_CONCURRENT_SYNCS,
     };
     #[cfg(not(windows))]
-    use super::{ListenerStatus, ListenerTask};
+    use super::{AutoAddressDetector, ListenerStatus, ListenerTask};
     use remuda_core::agent::{AgentError, Color, StyledCell};
     use remuda_core::protocol::collapse_runs;
     use remuda_core::protocol::Response;
@@ -2636,6 +2690,28 @@ mod tests {
     use std::time::Duration;
 
     static SYNC_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn auto_listener_uses_detected_address_for_bind_and_advertisement() {
+        let detected = "192.168.1.20:7441".parse().unwrap();
+        let (bind_addr, advertise_addr) =
+            auto_listener_addresses(|| Ok(detected)).expect("injected private address");
+        assert_eq!(bind_addr, detected);
+        assert_eq!(advertise_addr, detected);
+    }
+
+    #[test]
+    fn auto_listener_recheck_detects_ip_changes_with_an_injected_detector() {
+        let current = "192.168.1.20".parse().unwrap();
+        let changed = "192.168.1.21:7441".parse().unwrap();
+        assert!(auto_listener_ip_changed(current, || Ok(changed)));
+        assert!(!auto_listener_ip_changed(current, || Ok(
+            "192.168.1.20:7441".parse().unwrap()
+        )));
+        assert!(auto_listener_ip_changed(current, || {
+            Err(crate::net::advertise_addr::NoLanAddr { candidate: None })
+        }));
+    }
     // Windows test-windows is blocked by identity storage hardening tracked in #348.
     #[cfg(not(windows))]
     static LISTENER_TASK_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -2728,6 +2804,16 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    fn auto_listener_config() -> crate::cluster::listener_config::ListenerConfig {
+        use crate::cluster::listener_config::{ListenerBind, ListenerConfig};
+        ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Auto,
+            allow_public: false,
+        }
+    }
+
+    #[cfg(not(windows))]
     fn bound_listener_status(task: &ListenerTask) -> std::net::SocketAddr {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -2744,10 +2830,109 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    fn bound_auto_listener_status(task: &ListenerTask) -> std::net::SocketAddr {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            match task.status() {
+                ListenerStatus::On {
+                    addr, auto: true, ..
+                } => return addr,
+                ListenerStatus::Off if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                status => panic!("expected an auto listener to be on, got {status:?}"),
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn auto_listener_rebinds_when_injected_detected_ip_changes() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let environment = ListenerTaskEnvironment::new(Some(auto_listener_config()));
+        let changed = Arc::new(AtomicBool::new(false));
+        let detector_changed = Arc::clone(&changed);
+        let detector: AutoAddressDetector = Arc::new(move || {
+            let ip = if detector_changed.load(Ordering::Acquire) {
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            } else {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            };
+            Ok(SocketAddr::new(ip, 0))
+        });
+        let task = ListenerTask::start_with_detector(&environment.socket_path(), detector);
+        let old_address = bound_auto_listener_status(&task);
+        assert_eq!(old_address.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        changed.store(true, Ordering::Release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let new_address = loop {
+            match task.status() {
+                ListenerStatus::On {
+                    addr, auto: true, ..
+                } if addr.ip() == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST) => {
+                    break addr;
+                }
+                ListenerStatus::On { .. } if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                status => panic!("listener did not rebind to the changed address: {status:?}"),
+            }
+        };
+        assert!(connect_listener(old_address, Duration::from_millis(200)).is_err());
+        let _connection = connect_listener(new_address, Duration::from_secs(15))
+            .expect("rebound listener accepts TCP");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn auto_listener_does_not_rebind_when_injected_detected_ip_is_unchanged() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let environment = ListenerTaskEnvironment::new(Some(auto_listener_config()));
+        let detector_calls = Arc::new(AtomicUsize::new(0));
+        let detector_call_count = Arc::clone(&detector_calls);
+        let detector: AutoAddressDetector = Arc::new(move || {
+            detector_call_count.fetch_add(1, Ordering::AcqRel);
+            Ok(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0))
+        });
+        let task = ListenerTask::start_with_detector(&environment.socket_path(), detector);
+        let original_address = bound_auto_listener_status(&task);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while detector_calls.load(Ordering::Acquire) < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "auto listener did not recheck the injected address"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+
+        match task.status() {
+            ListenerStatus::On {
+                addr, auto: true, ..
+            } => {
+                assert_eq!(
+                    addr, original_address,
+                    "unchanged IP caused a listener rebind"
+                );
+            }
+            status => panic!("unchanged IP stopped the auto listener: {status:?}"),
+        }
+        let _connection = connect_listener(original_address, Duration::from_secs(15))
+            .expect("unchanged listener accepts TCP");
+    }
+
+    #[cfg(not(windows))]
     #[allow(clippy::disallowed_types)]
-    fn connect_listener(address: std::net::SocketAddr) -> std::net::TcpStream {
-        std::net::TcpStream::connect_timeout(&address, Duration::from_secs(15))
-            .expect("listener accepts TCP within the per-operation deadline")
+    fn connect_listener(
+        address: std::net::SocketAddr,
+        timeout: Duration,
+    ) -> std::io::Result<std::net::TcpStream> {
+        std::net::TcpStream::connect_timeout(&address, timeout)
     }
 
     // Windows test-windows is blocked by identity storage hardening tracked in #348.
@@ -2771,7 +2956,8 @@ mod tests {
             0,
             "status reports the selected ephemeral port"
         );
-        let _connection = connect_listener(address);
+        let _connection =
+            connect_listener(address, Duration::from_secs(15)).expect("listener accepts TCP");
     }
 
     // Windows test-windows is blocked by identity storage hardening tracked in #348.
@@ -2782,7 +2968,8 @@ mod tests {
         let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
         let task = ListenerTask::start(&environment.socket_path());
         let address = bound_listener_status(&task);
-        let connection = connect_listener(address);
+        let connection =
+            connect_listener(address, Duration::from_secs(15)).expect("listener accepts TCP");
         drop(connection);
         drop(task);
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -2824,7 +3011,8 @@ mod tests {
                 }
             }
         }
-        let _connection = connect_listener(first_address);
+        let _connection =
+            connect_listener(first_address, Duration::from_secs(15)).expect("listener accepts TCP");
     }
 
     // Windows test-windows is blocked by identity storage hardening tracked in #348.
@@ -2908,7 +3096,8 @@ mod tests {
                     addr, auto: false, ..
                 } => {
                     assert_ne!(addr.port(), 0);
-                    let _connection = connect_listener(addr);
+                    let _connection = connect_listener(addr, Duration::from_secs(15))
+                        .expect("listener accepts TCP");
                     break;
                 }
                 ListenerStatus::Failed(reason)

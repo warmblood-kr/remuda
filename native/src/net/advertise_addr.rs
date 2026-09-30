@@ -49,11 +49,6 @@ pub fn is_auto_eligible(address: IpAddr) -> bool {
     }
 }
 
-/// Bind to every IPv4 interface by default; advertisement is resolved separately.
-pub fn auto_bind() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), CLUSTER_DEFAULT_PORT)
-}
-
 /// Select the default-route address only when it is safe to advertise on a LAN.
 pub fn auto_advertise_addr() -> Result<SocketAddr, NoLanAddr> {
     let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
@@ -77,8 +72,8 @@ fn address_from_candidate(candidate: Option<IpAddr>) -> Result<SocketAddr, NoLan
 #[cfg(test)]
 mod tests {
     use super::{
-        address_from_candidate, auto_advertise_addr, auto_bind, is_auto_eligible, is_private_lan,
-        NoLanAddr, CLUSTER_DEFAULT_PORT,
+        address_from_candidate, auto_advertise_addr, is_auto_eligible, is_private_lan, NoLanAddr,
+        CLUSTER_DEFAULT_PORT,
     };
     use std::net::{IpAddr, SocketAddr};
 
@@ -168,11 +163,6 @@ mod tests {
                     .is_none_or(|candidate| !is_auto_eligible(candidate)));
             }
         }
-    }
-
-    #[test]
-    fn auto_bind_is_independent_of_route_discovery() {
-        assert_eq!(auto_bind(), "0.0.0.0:7441".parse::<SocketAddr>().unwrap());
     }
 
     #[test]

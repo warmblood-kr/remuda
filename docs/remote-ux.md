@@ -214,7 +214,7 @@ the bounded input path.
 ### Security and implementation constraints
 
 - The allowlisted request front comes first, initially on a local socket. It exposes only the operations required by this UX; never forward the general daemon protocol or arbitrary Lua remotely. The network listener is a later layer over that restricted front.
-- If the listener needs TCP, allow exactly one scoped clippy TCP-ban exception in its module (`#[allow]` at that module), with a `clippy.toml` and documentation note that names #191. Bind only to the configured VPN address; never default to `0.0.0.0`. Start the listener only after `remuda cluster init`.
+- If the listener needs TCP, allow exactly one scoped clippy TCP-ban exception in its module (`#[allow]` at that module), with a `clippy.toml` and documentation note that names #191. Auto mode detects the default-route RFC 1918 address and binds only that address; it re-detects every five seconds and on listener reload. Never default to `0.0.0.0`; require `remuda cluster listen --bind 0.0.0.0 --allow-public` for a wildcard. Start the listener only after `remuda cluster init`.
 - The invite output carries a one-time, expiring token and prints the first node’s fingerprint separately for comparison with `remuda cluster` on the inviting machine. The copied fingerprint in the join command is not an independent trust check. Subsequent requests authenticate with registered node keys. Revoking a node key immediately rejects its later requests.
 
 ## Prior art

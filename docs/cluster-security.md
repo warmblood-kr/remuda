@@ -126,3 +126,15 @@ admitted node can type into and close every session while the setting is on.
 
 These controls do not protect against a compromised local account or host,
 which can read the local cluster keys and change the setting.
+
+Auto listener mode selects the default-route RFC 1918 address and binds only
+that address. It checks the detected address on the existing five-second
+listener observer tick and on reload, closing and rebinding when the IP
+changes. If no eligible private address is available, the listener stays off.
+A public IP or wildcard bind requires an explicit bind and
+`--allow-public`. This keeps the accepted pre-auth availability residual (#341)
+on the selected LAN or VPN interface: an attacker with about 64 distinct
+source prefixes plus a member whose pre-auth read exceeds 250 ms can still
+evict that member, which retries. IPv4 prefixes are /32, so an exposed public
+listener would make that residual internet-reachable; auto mode never binds
+the wildcard. Joins still require the one-time token described in #332.

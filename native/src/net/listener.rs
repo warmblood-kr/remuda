@@ -353,36 +353,7 @@ pub fn validate_bind_address(address: SocketAddr, allow_public: bool) -> io::Res
 
 /// Bind the configured address after confirming that this node is initialized.
 pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> {
-    bind_with_auto_wildcard(config, daemon_path, false)
-}
-
-/// Bind the auto-selected IPv4 wildcard without granting public opt-in to explicit binds.
-pub(crate) fn bind_auto(address: SocketAddr, daemon_path: &Path) -> io::Result<Listener> {
-    bind_with_auto_wildcard(
-        ListenerConfig {
-            bind_addr: address,
-            allow_unspecified: false,
-        },
-        daemon_path,
-        true,
-    )
-}
-
-fn bind_with_auto_wildcard(
-    config: ListenerConfig,
-    daemon_path: &Path,
-    is_auto: bool,
-) -> io::Result<Listener> {
-    if is_auto {
-        if config.bind_addr.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "auto listener bind must be the IPv4 wildcard",
-            ));
-        }
-    } else {
-        validate_bind_address(config.bind_addr, config.allow_unspecified)?;
-    }
+    validate_bind_address(config.bind_addr, config.allow_unspecified)?;
     let (identity_node, registry) = cluster::nodes()?.ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::NotFound,
@@ -445,9 +416,20 @@ impl Listener {
 
     /// Run until stopped; token state and registry changes are observed every five seconds.
     pub fn serve_until(&self, stop: &AtomicBool) -> io::Result<()> {
+        self.serve_until_rechecking(stop, || false).map(|_| ())
+    }
+
+    /// Run until stopped, checking the caller's restart condition on the existing
+    /// five-second observer tick. Returns true when that condition requested a rebind.
+    pub fn serve_until_rechecking(
+        &self,
+        stop: &AtomicBool,
+        should_rebind: impl Fn() -> bool + Send + Sync,
+    ) -> io::Result<bool> {
         std::thread::scope(|scope| {
             let (observe_error_tx, observe_error_rx) = std::sync::mpsc::channel::<io::Error>();
             let (observer_stop_tx, observer_stop_rx) = std::sync::mpsc::channel();
+            let (rebind_requested_tx, rebind_requested_rx) = std::sync::mpsc::channel();
             scope.spawn(move || {
                 if let Err(error) = self.state.join_tokens.observe() {
                     let _ = observe_error_tx.send(error);
@@ -464,6 +446,11 @@ impl Listener {
                     match observer_stop_rx.recv_timeout(OBSERVE_INTERVAL) {
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if should_rebind() {
+                                let _ = rebind_requested_tx.send(());
+                                stop.store(true, Ordering::Release);
+                                break;
+                            }
                             if let Err(error) = self.state.join_tokens.observe() {
                                 let _ = observe_error_tx.send(error);
                                 break;
@@ -515,7 +502,7 @@ impl Listener {
                 },
             );
             let _ = observer_stop_tx.send(());
-            result
+            result.map(|()| rebind_requested_rx.try_recv().is_ok())
         })
     }
 
@@ -536,6 +523,9 @@ where
 {
     while !stop.load(Ordering::Acquire) {
         tick()?;
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         match socket.accept() {
             Ok((stream, remote_addr)) => {
                 if let Err(error) = prepare_accepted_stream(&stream) {

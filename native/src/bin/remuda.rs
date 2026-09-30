@@ -3390,40 +3390,39 @@ mod cluster_cli_tests {
     }
 
     #[test]
-    fn auto_listener_init_reports_wildcard_bind_and_advertised_lan_address() {
+    fn auto_listener_init_reports_the_detected_bind_address() {
         use remuda_core::protocol::ListenerStatus;
         use std::net::SocketAddr;
 
         let status = ListenerStatus::On {
-            addr: "0.0.0.0:7441".parse::<SocketAddr>().unwrap(),
+            addr: "192.168.1.20:7441".parse::<SocketAddr>().unwrap(),
             auto: true,
             advertise_addr: Some("192.168.1.20:7441".parse().unwrap()),
-            listen_addrs: vec!["0.0.0.0:7441".parse().unwrap()],
+            listen_addrs: vec!["192.168.1.20:7441".parse().unwrap()],
         };
         let lines = render_init_listener_lines(&status).join("\n");
         assert!(
-            lines.contains(
-                "Listening on all interfaces (0.0.0.0:7441); invites use 192.168.1.20:7441"
-            ),
-            "init output must distinguish the wildcard bind from the invite address: {lines}"
+            lines.contains("Listening on 192.168.1.20:7441"),
+            "init output must show the detected bind address: {lines}"
         );
     }
 
     #[test]
-    fn auto_listener_status_lists_wildcard_and_advertised_lan_addresses() {
+    fn auto_listener_status_reports_the_detected_bind_address() {
         use remuda_core::protocol::ListenerStatus;
         use std::net::SocketAddr;
 
         let status = ListenerStatus::On {
-            addr: "0.0.0.0:7441".parse::<SocketAddr>().unwrap(),
+            addr: "192.168.1.20:7441".parse::<SocketAddr>().unwrap(),
             auto: true,
             advertise_addr: Some("192.168.1.20:7441".parse().unwrap()),
-            listen_addrs: vec!["0.0.0.0:7441".parse().unwrap()],
+            listen_addrs: vec!["192.168.1.20:7441".parse().unwrap()],
         };
         let lines = cluster_listener_status_lines(Some(status)).join("\n");
         assert!(
-            lines.contains("0.0.0.0:7441") && lines.contains("192.168.1.20:7441"),
-            "status must list both listened and invite addresses: {lines}"
+            lines.contains("Listener: on 192.168.1.20:7441 (auto)")
+                && lines.contains("Listening on 192.168.1.20:7441"),
+            "status must show the detected listener address: {lines}"
         );
     }
 
