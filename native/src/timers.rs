@@ -220,3 +220,30 @@ impl UserData for TimerHandle {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_interval_fire_waits_a_full_interval_before_firing_again() {
+        let lua = Lua::new();
+        let mut timers = TimerService::new();
+        let callback = lua.create_function(|_, ()| Ok(())).unwrap();
+        let interval = Duration::from_millis(20);
+        let id = timers
+            .schedule(&lua, interval.as_secs_f64(), callback, None, true)
+            .unwrap();
+        let first_deadline = timers.timers.get(&id).unwrap().deadline;
+        let late_fire = first_deadline + Duration::from_millis(12);
+
+        let fire = timers.take_due(&lua, late_fire).unwrap().unwrap();
+        assert_eq!(fire.id, id);
+        timers.finish_fire(id, late_fire);
+
+        assert!(
+            timers.timers.get(&id).unwrap().deadline >= late_fire + interval,
+            "a late interval fire must not be followed by a burst"
+        );
+    }
+}

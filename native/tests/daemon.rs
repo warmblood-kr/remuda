@@ -4725,6 +4725,26 @@ fn another_client_eval_returns_while_a_one_second_timer_is_pending() {
 }
 
 #[test]
+fn repeating_timer_keeps_firing_during_client_eval_traffic() {
+    let path = scratch("lua-timer-client-traffic");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        "remuda._traffic_timer_fires = 0; remuda.every(0.04, function() remuda._traffic_timer_fires = remuda._traffic_timer_fires + 1 end); return 'scheduled'",
+    );
+
+    let deadline = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < deadline {
+        assert_eq!(eval(&path, "return 'responsive'"), "responsive");
+    }
+    let count = read_count(&path, "return remuda._traffic_timer_fires");
+    assert!(
+        count >= 5,
+        "interval was starved by eval traffic: {count} fires"
+    );
+}
+
+#[test]
 fn reloading_a_lifecycle_mod_cancels_its_owned_interval() {
     let runtime = unique_scratch_dir("lua-timer-owner");
     let _cleanup = RemoveDirectoryOnDrop(runtime.clone());
