@@ -47,7 +47,7 @@ impl ReplayWindow {
     }
 
     #[cfg(test)]
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.seen.len()
     }

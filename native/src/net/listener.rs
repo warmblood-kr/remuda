@@ -37,12 +37,13 @@ const OBSERVE_INTERVAL: Duration = Duration::from_secs(5);
 const ACCEPT_POLL: Duration = Duration::from_millis(20);
 const ACCEPT_RESOURCE_BACKOFF: Duration = Duration::from_millis(250);
 const REPLAY_CAPACITY: usize = 65_536;
+const UNKNOWN_REPLAY_CAPACITY: usize = 1024;
 const REMOTE_INPUT_BYTES_PER_SECOND: usize = 256 * 1024;
 const REMOTE_INPUT_WINDOW: Duration = Duration::from_secs(1);
 const MAX_REMOTE_INPUT_PEERS: usize = 1024;
 static LISTENER_ERROR_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// Normalize a peer address to the prefix used for pre-admission budgets.
+/// Return an IPv4 /32 or IPv6 /64 prefix, normalizing IPv4-mapped IPv6 to IPv4.
 pub fn peer_prefix(address: std::net::IpAddr) -> std::net::IpAddr {
     match address {
         std::net::IpAddr::V4(address) => std::net::IpAddr::V4(address),
@@ -98,9 +99,36 @@ type FrameDispatcher = Arc<dyn Fn(&[u8], &[u8]) -> io::Result<Vec<u8>> + Send + 
 struct ListenerState {
     responder_private: Zeroizing<Vec<u8>>,
     replay: Mutex<replay::ReplayWindow>,
+    unknown_replay: Mutex<replay::ReplayWindow>,
     limiter: Arc<RequestLimiter>,
     join_tokens: JoinTokenStore,
     admit_join: JoinAdmitter,
+}
+
+impl ListenerState {
+    fn charge_unknown_peer(&self, address: std::net::IpAddr) -> bool {
+        self.limiter
+            .allow_join_attempt(peer_prefix(address), Instant::now())
+    }
+
+    fn check_and_insert_replay(
+        &self,
+        admitted: bool,
+        peer: &str,
+        ephemeral: [u8; 32],
+        timestamp_seconds: i64,
+        now_seconds: i64,
+    ) -> Result<(), replay::ReplayError> {
+        let cache = if admitted {
+            &self.replay
+        } else {
+            &self.unknown_replay
+        };
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .check_and_insert(peer, ephemeral, timestamp_seconds, now_seconds)
+    }
 }
 
 #[derive(Clone)]
@@ -272,6 +300,7 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
         state: Arc::new(ListenerState {
             responder_private,
             replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
+            unknown_replay: Mutex::new(replay::ReplayWindow::new(UNKNOWN_REPLAY_CAPACITY)),
             limiter: request_limiter,
             join_tokens,
             admit_join: Arc::new(cluster::admit_join_locked),
@@ -999,16 +1028,25 @@ fn handle_connection_with(
     let peer_fp = cluster::encoding::fingerprint(&opened.peer_static);
     let admitted = authorize(&opened.peer_static).is_ok();
     let now = crate::SystemWallClock::new().unix_seconds() as i64;
-    let replay = state
-        .replay
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .check_and_insert(&peer_fp, opened.ephemeral, opened.timestamp_seconds, now);
+    if !admitted && !state.charge_unknown_peer(remote_addr.ip()) {
+        return ignore_response_error(write_http_response(
+            stream,
+            429,
+            b"join attempt rate limit reached",
+        ));
+    }
+    let replay = state.check_and_insert_replay(
+        admitted,
+        &peer_fp,
+        opened.ephemeral,
+        opened.timestamp_seconds,
+        now,
+    );
     if replay.is_err() {
         return ignore_response_error(write_http_response(stream, 409, b"replayed or stale frame"));
     }
     if !admitted {
-        return handle_unknown_peer_join(stream, remote_addr, state, opened);
+        return handle_unknown_peer_join(stream, state, opened);
     }
     // The cluster listener has two protocol verbs which the local
     // remote-control front must refuse. Decode and authorize them here,
@@ -1080,7 +1118,6 @@ fn handle_connection_with(
 
 fn handle_unknown_peer_join(
     stream: TcpStream,
-    remote_addr: SocketAddr,
     state: Arc<ListenerState>,
     opened: frame::OpenedRequest,
 ) {
@@ -1100,16 +1137,6 @@ fn handle_unknown_peer_join(
         Ok(request) => request,
         Err(_) => return ignore_response_error(write_http_response(stream, 403, b"not admitted")),
     };
-    if !state
-        .limiter
-        .allow_join_attempt(remote_addr.ip(), Instant::now())
-    {
-        return ignore_response_error(write_http_response(
-            stream,
-            429,
-            b"join attempt rate limit reached",
-        ));
-    }
     let result = state
         .join_tokens
         .verify_consume_with(&request.join.token, || {
@@ -1222,11 +1249,11 @@ mod tests {
                 0,
                 host as u16,
             ));
-            assert!(limiter.allow_join_attempt(address, now));
+            assert!(limiter.allow_join_attempt(peer_prefix(address), now));
         }
         let another_host =
             std::net::IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0, 0, 0, 0xff));
-        assert!(!limiter.allow_join_attempt(another_host, now));
+        assert!(!limiter.allow_join_attempt(peer_prefix(another_host), now));
     }
 
     #[cfg(unix)]
@@ -1347,6 +1374,7 @@ mod tests {
             let state = Arc::new(ListenerState {
                 responder_private: Zeroizing::new(responder_private),
                 replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
+                unknown_replay: Mutex::new(replay::ReplayWindow::new(UNKNOWN_REPLAY_CAPACITY)),
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
                 admit_join,
@@ -1425,6 +1453,7 @@ mod tests {
             let state = Arc::new(ListenerState {
                 responder_private: Zeroizing::new(responder_private),
                 replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
+                unknown_replay: Mutex::new(replay::ReplayWindow::new(UNKNOWN_REPLAY_CAPACITY)),
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
                 admit_join: Arc::new(cluster::admit_join_locked),
@@ -2681,7 +2710,7 @@ mod tests {
             socket_test_timeout(),
             socket_test_timeout(),
         );
-        *server.state.replay.lock().unwrap() = replay::ReplayWindow::new(2);
+        *server.state.unknown_replay.lock().unwrap() = replay::ReplayWindow::new(2);
         let join = br#"{"join":{"token":"bad"}}"#;
         for _ in 0..2 {
             let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
@@ -2760,10 +2789,10 @@ mod tests {
                 200
             );
         }
-        let before = server.state.replay.lock().unwrap().len();
+        let before = server.state.unknown_replay.lock().unwrap().len();
         let (status, _) = server.exchange(sealed_payload_request(&unknown, &server, join));
         assert_eq!(status, 429);
-        assert_eq!(server.state.replay.lock().unwrap().len(), before);
+        assert_eq!(server.state.unknown_replay.lock().unwrap().len(), before);
     }
 
     #[cfg(unix)]
@@ -2788,10 +2817,10 @@ mod tests {
                 403
             );
         }
-        let before = server.state.replay.lock().unwrap().len();
+        let before = server.state.unknown_replay.lock().unwrap().len();
         let (status, _) = server.exchange(sealed_payload_request(&unknown, &server, &payload));
         assert_eq!(status, 429);
-        assert_eq!(server.state.replay.lock().unwrap().len(), before);
+        assert_eq!(server.state.unknown_replay.lock().unwrap().len(), before);
     }
 
     #[cfg(unix)]
