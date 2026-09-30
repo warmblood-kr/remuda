@@ -760,6 +760,164 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)] // Keep the pane-input-to-scrollback leak guard as one end-to-end case.
+fn secret_entered_in_session_pane_is_absent_from_capture_and_scrollback() {
+    use remuda_core::protocol::{Request, Response, Step};
+    use remuda_core::Size;
+    use remuda_native::{client, daemon};
+    use std::time::{Duration, Instant};
+
+    let (dir, remuda) = fixture("secret_pane_leak");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let socket = daemon::socket_path_in(&dir, "s");
+    let session_name = "secret-pane-leak-session";
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let command = format!(
+        "for i in $(seq 1 40); do printf 'setup-%s\\n' \"$i\"; done; sleep 0.2; \"{binary}\" -s s deferred secret_session"
+    );
+    assert_eq!(
+        client::request(
+            &socket,
+            &Request::New {
+                name: Some(session_name.into()),
+                command: vec!["sh".into(), "-c".into(), command],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            },
+        )
+        .expect("start secret-prompt session"),
+        Response::Value(session_name.into())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let screen = match client::request(
+            &socket,
+            &Request::Capture {
+                name: session_name.into(),
+            },
+        ) {
+            Ok(Response::Screen(screen)) => screen,
+            other => panic!("capture failed: {other:?}"),
+        };
+        if screen.contains("remuda[secret-pane-leak-session] deferred test secret") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "secret prompt did not appear:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let sentinel = b"S3CRET-probe";
+    client::request(
+        &socket,
+        &Request::Feed {
+            name: session_name.into(),
+            steps: vec![Step::Burst(sentinel.to_vec())],
+        },
+    )
+    .expect("type secret into the session prompt");
+    client::request(
+        &socket,
+        &Request::Feed {
+            name: session_name.into(),
+            steps: vec![Step::Burst(vec![b'\r'])],
+        },
+    )
+    .expect("submit session prompt secret");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = match client::request(
+            &socket,
+            &Request::Capture {
+                name: session_name.into(),
+            },
+        ) {
+            Ok(Response::Screen(screen)) => screen,
+            other => panic!("capture failed: {other:?}"),
+        };
+        if screen.contains("secret accepted") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "secret reply did not finish:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let capture = match client::request(
+        &socket,
+        &Request::Capture {
+            name: session_name.into(),
+        },
+    ) {
+        Ok(Response::Screen(screen)) => screen,
+        other => panic!("final capture failed: {other:?}"),
+    };
+    let (visible_text, scrollback_len) = match client::request(
+        &socket,
+        &Request::CaptureStyled {
+            name: session_name.into(),
+            scrollback: 0,
+        },
+    ) {
+        Ok(Response::StyledScreen {
+            rows,
+            scrollback_len,
+            ..
+        }) => (
+            rows.into_iter()
+                .map(|row| row.into_iter().map(|run| run.text).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            scrollback_len,
+        ),
+        other => panic!("styled capture failed: {other:?}"),
+    };
+    assert!(scrollback_len > 0, "test session did not create scrollback");
+    assert!(
+        !capture.contains(std::str::from_utf8(sentinel).unwrap())
+            && !visible_text.contains(std::str::from_utf8(sentinel).unwrap()),
+        "secret appeared in current pane capture:\n{capture}"
+    );
+    for offset in 1..=scrollback_len {
+        let history = match client::request(
+            &socket,
+            &Request::CaptureStyled {
+                name: session_name.into(),
+                scrollback: offset,
+            },
+        ) {
+            Ok(Response::StyledScreen { rows, .. }) => rows
+                .into_iter()
+                .map(|row| row.into_iter().map(|run| run.text).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            other => panic!("scrollback capture failed: {other:?}"),
+        };
+        assert!(
+            !history.contains(std::str::from_utf8(sentinel).unwrap()),
+            "secret appeared in scrollback at offset {offset}:\n{history}"
+        );
+    }
+
+    let _ = remuda(&["stop", "-f"]);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 fn secret_prompt_label_for_word(tag: &str, word: &str) -> String {
     use remuda_core::protocol::{Request, Response};
     use remuda_native::ipc::TryClone;
