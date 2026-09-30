@@ -11,7 +11,9 @@
 //! remuda, and that is not circular — the pty under the test is this crate's,
 //! the terminal under test is the binary's.
 
-use remuda_core::protocol::{ListenerOp, ListenerStatus, Request, Response};
+#[cfg(not(windows))]
+use remuda_core::protocol::{ListenerOp, ListenerStatus};
+use remuda_core::protocol::{Request, Response};
 use remuda_core::{Session, Size};
 use remuda_native::{client, daemon, ipc, CommandBuilder, PtyAgent, SystemClock};
 use std::io::{Read, Write};
