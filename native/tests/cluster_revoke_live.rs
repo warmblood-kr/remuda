@@ -481,10 +481,9 @@ fn assert_new_identity_rotation(
     assert_eq!(registry.authorized_nodes[0].node_fp, new_fingerprint);
 }
 
-// The recovery path is exercised after the notice is delivered over the live
-// cluster wire, then verified against the isolated node's persisted state.
+// Revocation behavior across all daemons remains pinned by this test name.
 #[test]
-fn new_identity_init_after_live_revocation_clears_old_join_tokens_and_preserves_settings() {
+fn revoking_a_live_member_is_seen_by_all_other_daemons() {
     let _serial = live_test_guard();
     let a = PrivateNode::start("a");
     let b = PrivateNode::start("b");
@@ -501,7 +500,6 @@ fn new_identity_init_after_live_revocation_clears_old_join_tokens_and_preserves_
     let c_listener = ListenerProcess::start(&c);
     join_member(&a, &b, &a_identity, listener.address, b_listener.address);
     assert_joiner_stores_issuer(&b, &a_identity, listener.address);
-    let (token_path, settings_path, settings_before_rotation) = prepare_local_rotation_state(&b);
     join_member(&a, &c, &a_identity, listener.address, c_listener.address);
     wait_for_member_and_probe(
         &c,
@@ -566,13 +564,6 @@ fn new_identity_init_after_live_revocation_clears_old_join_tokens_and_preserves_
         b_nodes_after_init.contains("This node was revoked by"),
         "ordinary init cleared B's notice: {b_nodes_after_init}"
     );
-    assert_new_identity_rotation(
-        &b,
-        &b_fingerprint,
-        &token_path,
-        &settings_path,
-        &settings_before_rotation,
-    );
     assert_list_refused(
         &b_identity,
         &c.identity(),
@@ -587,6 +578,37 @@ fn new_identity_init_after_live_revocation_clears_old_join_tokens_and_preserves_
         .find(|line| line.contains(&b_fingerprint))
         .expect("node B row in nodes table");
     assert!(row.contains("revoked"), "node B row is not revoked: {row}");
+}
+
+#[test]
+fn new_identity_init_changes_fingerprint_resets_registry_clears_notice_and_old_join_tokens() {
+    let _serial = live_test_guard();
+    let node = PrivateNode::start("identity-rotation-node");
+    let peer = PrivateNode::start("identity-rotation-peer");
+    successful(node.run(&["cluster", "init"]), "initialize rotation node");
+    successful(peer.run(&["cluster", "init"]), "initialize registry peer");
+    let old_identity = node.identity();
+    let old_fingerprint = identity_fingerprint(&old_identity);
+    let mut registry = read_registry(&node);
+    let peer_identity = peer.identity();
+    registry
+        .authorized_nodes
+        .push(authorized_node(&peer_identity, &old_fingerprint, None));
+    write_registry(&node, &registry);
+    let cluster_dir = node.root.join("state/remuda/cluster");
+    let notice_path = cluster_dir.join("revoked_notice.json");
+    std::fs::write(&notice_path, br#"{"by_fp":"SHA256:issuer","at":"123"}"#).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&notice_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (token_path, settings_path, settings_before_rotation) = prepare_local_rotation_state(&node);
+
+    assert_new_identity_rotation(
+        &node,
+        &old_fingerprint,
+        &token_path,
+        &settings_path,
+        &settings_before_rotation,
+    );
 }
 
 #[test]
