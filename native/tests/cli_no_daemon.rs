@@ -119,6 +119,22 @@ fn quoted_join_line_unknown_word_does_not_echo_its_token() {
 }
 
 #[test]
+fn cluster_unknown_join_line_does_not_echo_its_token() {
+    let dir = scratch("cluster-unknown-join-line");
+    let token = "secret-cluster-join-token-337";
+    let join_line = format!("remuda-join-v1 192.0.2.4:7441 SHA256:issuer PUBKEY {token}");
+    let out = remuda(&dir, &["cluster", &join_line]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!stderr.contains(token), "diagnostic echoed secret material");
+    assert!(
+        stderr.contains("that looks like a join line; run: remuda cluster join FINGERPRINT"),
+        "missing cluster join-line hint: {stderr}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn long_whitespace_unknown_word_is_not_echoed() {
     let dir = scratch("unknown-long-word");
     let token = "secret-join-token-331";
