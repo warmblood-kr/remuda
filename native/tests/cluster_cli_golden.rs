@@ -1054,6 +1054,104 @@ fn d4_init_no_listen_leaves_the_listener_off() {
 }
 
 #[test]
+fn cluster_listen_bind_configures_the_daemon_and_returns() {
+    use remuda_core::protocol::ListenerStatus;
+    use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
+    use std::process::Stdio;
+
+    let scratch = Scratch::new();
+    let _daemon = start_daemon(&scratch);
+    assert!(scratch
+        .run(&["cluster", "init", "--no-listen"])
+        .status
+        .success());
+    let bind_addr = unused_loopback_addr();
+    let bind_text = bind_addr.to_string();
+    let mut child = scratch
+        .command(&["cluster", "listen", "--bind", &bind_text])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start cluster listen command");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let returned = child.try_wait().unwrap().is_some();
+    if !returned {
+        let _ = child.kill();
+    }
+    let output = child.wait_with_output().expect("wait for listen command");
+    assert!(
+        returned,
+        "cluster listen --bind should return after daemon reload, got {output:?}"
+    );
+    assert!(output.status.success(), "listen failed: {output:?}");
+    assert_eq!(
+        remuda_native::cluster::listener_control::status(&remuda_native::daemon::socket_path_in(
+            &scratch.runtime,
+            &scratch.name
+        )),
+        ListenerStatus::On {
+            addr: bind_addr,
+            auto: false,
+        }
+    );
+    assert_eq!(
+        listener_config::read_at(&scratch.root.join("state/remuda/cluster")).unwrap(),
+        Some(ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit(bind_addr),
+            allow_public: false,
+        })
+    );
+    let invite = scratch.run(&["cluster", "invite"]);
+    assert!(
+        invite.status.success(),
+        "invite failed after listen: {invite:?}"
+    );
+
+    let stopped = scratch.run(&["cluster", "listen", "--off"]);
+    assert!(stopped.status.success(), "listen --off failed: {stopped:?}");
+    let foreground_addr = unused_loopback_addr();
+    let foreground_text = foreground_addr.to_string();
+    let child = scratch
+        .command(&[
+            "cluster",
+            "listen",
+            "--bind",
+            &foreground_text,
+            "--foreground",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("start foreground listener command");
+    let mut child = TrackedChild(child);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut foreground_reachable = false;
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect_timeout(&foreground_addr, Duration::from_millis(50)).is_ok()
+        {
+            foreground_reachable = true;
+            break;
+        }
+        if child.0.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        foreground_reachable,
+        "--foreground did not bind {foreground_addr}"
+    );
+    assert!(
+        child.0.try_wait().unwrap().is_none(),
+        "--foreground returned early"
+    );
+}
+
+#[test]
 fn d4_failed_join_turns_off_a_listener_enabled_by_the_join_command() {
     use remuda_core::protocol::ListenerStatus;
     use remuda_native::cluster::{encoding, join_line::JoinLine};

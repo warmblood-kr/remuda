@@ -240,7 +240,8 @@ remuda — a pty manager you can attach to
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster remote [node/session] open the read-only cluster tree
-  remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
+  remuda cluster listen --bind ADDR [--allow-public] configure the daemon listener
+                                  --foreground holds the listener in this terminal
                                   [::] may accept IPv4 too on dual-stack systems
   remuda doc [--format F]        print live Lua documentation (rst by default)
   remuda -e <code>              evaluate one chunk in that same image
@@ -320,7 +321,8 @@ remuda — terminal orchestration for coding agents
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster remote [node/session] open the read-only cluster tree
-  remuda cluster listen --bind ADDR [--allow-public] start the cluster listener
+  remuda cluster listen --bind ADDR [--allow-public] configure the daemon listener
+                                  --foreground holds the listener in this terminal
                                   [::] may accept IPv4 too on dual-stack systems
 
   remuda doc | repl | -e CODE    use the persistent Lua runtime
@@ -493,6 +495,7 @@ enum ClusterCommand {
     Listen {
         bind_addr: std::net::SocketAddr,
         allow_public: bool,
+        foreground: bool,
     },
     Call {
         target: String,
@@ -697,21 +700,40 @@ fn parse_cluster_listen(args: &[&str]) -> Result<ClusterCommand, String> {
     if args == ["--off"] {
         return Ok(ClusterCommand::ListenOff);
     }
-    let (allow_public, address) = match args {
-        ["--bind", address] => (false, *address),
-        [flag] if flag.starts_with("--bind=") => (false, &flag[7..]),
-        ["--bind", address, "--allow-public"] | ["--allow-public", "--bind", address] => {
-            (true, *address)
+    let mut address = None;
+    let mut allow_public = false;
+    let mut foreground = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--bind" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err("missing --bind ADDR".into());
+                };
+                if address.replace(*value).is_some() {
+                    return Err("--bind may only be provided once".into());
+                }
+            }
+            flag if flag.starts_with("--bind=") => {
+                if address.replace(&flag[7..]).is_some() {
+                    return Err("--bind may only be provided once".into());
+                }
+            }
+            "--allow-public" => allow_public = true,
+            "--foreground" => foreground = true,
+            _ => return Err("expected --bind ADDR [--allow-public] [--foreground]".into()),
         }
-        [flag, "--allow-public"] if flag.starts_with("--bind=") => (true, &flag[7..]),
-        ["--allow-public", flag] if flag.starts_with("--bind=") => (true, &flag[7..]),
-        [] => return Err("missing --bind ADDR".into()),
-        _ => return Err("expected --bind ADDR".into()),
+        index += 1;
+    }
+    let Some(address) = address else {
+        return Err("missing --bind ADDR".into());
     };
     let bind_addr = parse_addr_default_port(address)?;
     Ok(ClusterCommand::Listen {
         bind_addr,
         allow_public,
+        foreground,
     })
 }
 
@@ -795,7 +817,7 @@ pub fn cluster_usage(verb: &str) -> String {
         "revoke" => "usage: remuda cluster revoke NODE|FINGERPRINT [--yes]\nexample: remuda cluster revoke node-abcd1234\n".into(),
         "control" => "usage: remuda cluster control on|off\nexample: remuda cluster control off\n".into(),
         "remote" => "usage: remuda cluster remote [NODE/SESSION]\nexample: remuda cluster remote\n".into(),
-        "listen" => format!("usage: remuda cluster listen --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20\nusage: remuda cluster listen --off\nexample: remuda cluster listen --off\n"),
+        "listen" => format!("usage: remuda cluster listen --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--allow-public] [--foreground]\nusage: remuda cluster listen --off\nexample: remuda cluster listen --bind 192.168.1.20\n"),
         "call" => format!("usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--json]\nexample: remuda cluster call node-abcd1234 list --addr 192.168.1.20\n"),
         _ => "usage: remuda cluster <command>\n  init\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n".into(),
     }
@@ -844,7 +866,8 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         ClusterCommand::Listen {
             bind_addr,
             allow_public,
-        } => cluster_listen(server, path, bind_addr, allow_public),
+            foreground,
+        } => cluster_listen(server, path, bind_addr, allow_public, foreground),
         ClusterCommand::Call {
             target,
             address,
@@ -912,6 +935,43 @@ fn cluster_init_new_identity(yes: bool) -> ExitCode {
 }
 
 fn cluster_listen(
+    server: &str,
+    path: &Path,
+    bind_addr: std::net::SocketAddr,
+    allow_public: bool,
+    foreground: bool,
+) -> ExitCode {
+    if foreground {
+        return cluster_listen_foreground(server, path, bind_addr, allow_public);
+    }
+    with_daemon(server, path, |daemon_path| {
+        let config = ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit(bind_addr),
+            allow_public,
+        };
+        match remuda_native::cluster::listener_control::start(daemon_path, Some(config)) {
+            Ok(remuda_core::protocol::ListenerStatus::On { addr, .. }) => {
+                println!("Cluster listener on {addr}.");
+                println!(
+                    "Next: run `remuda cluster invite` or `remuda cluster join` when the other machine is ready."
+                );
+                ExitCode::SUCCESS
+            }
+            Ok(remuda_core::protocol::ListenerStatus::Off) => fail(
+                "cluster listen: listener stayed off after reload\nNext: run `remuda cluster` and retry `remuda cluster listen --bind IP`.",
+            ),
+            Ok(remuda_core::protocol::ListenerStatus::Failed(reason)) => fail(format!(
+                "cluster listen: listener failed: {reason}\nNext: check `remuda cluster` and retry `remuda cluster listen --bind IP`."
+            )),
+            Err(error) => fail(format!(
+                "cluster listen: could not reload the daemon listener: {error}\nNext: check `remuda cluster` and retry `remuda cluster listen --bind IP`."
+            )),
+        }
+    })
+}
+
+fn cluster_listen_foreground(
     server: &str,
     path: &Path,
     bind_addr: std::net::SocketAddr,
@@ -1357,14 +1417,11 @@ fn cluster_join_with_listener(
     let join_session = run_join_interruptible(move || {
         cluster_join(&join_fingerprint, &join_invitation, Some(bound_addr))
     });
-    let (join_outcome, _signal_session) = match join_session {
-        Ok(mut session) => (
-            session.outcome.take().expect("join session has an outcome"),
-            Some(session),
-        ),
+    let (join_outcome, signal_session) = match join_session {
+        Ok(mut session) => (session.take_outcome(), Some(session)),
         Err(error) => (JoinRun::Finished(Err(error)), None),
     };
-    match join_outcome {
+    let exit_code = match join_outcome {
         JoinRun::Cancelled => {
             let restore_warning = restore_join_listener(&mut restore_guard);
             eprintln!(
@@ -1388,7 +1445,9 @@ fn cluster_join_with_listener(
             let rollback_error = restore_join_listener(&mut restore_guard);
             fail(render_join_failure(message, rollback_error.as_deref()))
         }
-    }
+    };
+    drop(signal_session);
+    exit_code
 }
 
 struct JoinListenerRestoreGuard {
@@ -1446,7 +1505,15 @@ enum JoinRun {
 struct JoinRunSession {
     outcome: Option<JoinRun>,
     #[cfg(unix)]
-    _handler: JoinInterruptHandler,
+    handler: JoinInterruptHandler,
+}
+
+impl JoinRunSession {
+    fn take_outcome(&mut self) -> JoinRun {
+        #[cfg(unix)]
+        let _ = &self.handler;
+        self.outcome.take().expect("join session has an outcome")
+    }
 }
 
 fn run_join_interruptible(
@@ -1457,7 +1524,7 @@ fn run_join_interruptible(
         let handler = JoinInterruptHandler::install()?;
         Ok(JoinRunSession {
             outcome: Some(wait_for_join(&JOIN_INTERRUPTED, join)),
-            _handler: handler,
+            handler,
         })
     }
     #[cfg(not(unix))]
@@ -2524,6 +2591,7 @@ mod cluster_cli_tests {
             ClusterCommand::Listen {
                 bind_addr: "192.168.100.0:7441".parse().unwrap(),
                 allow_public: false,
+                foreground: false,
             }
         );
         assert_eq!(
@@ -2531,6 +2599,7 @@ mod cluster_cli_tests {
             ClusterCommand::Listen {
                 bind_addr: "[2001:db8::1]:7441".parse().unwrap(),
                 allow_public: false,
+                foreground: false,
             }
         );
     }
@@ -2678,7 +2747,7 @@ mod cluster_cli_tests {
     fn cluster_usage_has_one_verb_per_line_and_examples() {
         assert_eq!(
             cluster_usage("listen"),
-            "usage: remuda cluster listen --bind IP[:PORT] (default port 7441) [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20\nusage: remuda cluster listen --off\nexample: remuda cluster listen --off\n"
+            "usage: remuda cluster listen --bind IP[:PORT] (default port 7441) [--allow-public] [--foreground]\nusage: remuda cluster listen --off\nexample: remuda cluster listen --bind 192.168.1.20\n"
         );
         for verb in ["invite", "join", "call"] {
             let usage = cluster_usage(verb);
@@ -2742,6 +2811,7 @@ mod cluster_cli_tests {
             ClusterCommand::Listen {
                 bind_addr: "192.0.2.4:9443".parse().unwrap(),
                 allow_public: false,
+                foreground: false,
             }
         );
         let key = [7; 32];
@@ -3083,6 +3153,7 @@ mod cluster_cli_tests {
             ClusterCommand::Listen {
                 bind_addr: "192.0.2.4:9443".parse().unwrap(),
                 allow_public: false,
+                foreground: false,
             }
         );
         assert_eq!(
@@ -3090,6 +3161,20 @@ mod cluster_cli_tests {
             ClusterCommand::Listen {
                 bind_addr: "0.0.0.0:9443".parse().unwrap(),
                 allow_public: true,
+                foreground: false,
+            }
+        );
+        assert_eq!(
+            parse_cluster_command(&[
+                "listen",
+                "--foreground",
+                "--allow-public",
+                "--bind=0.0.0.0:9443"
+            ]),
+            ClusterCommand::Listen {
+                bind_addr: "0.0.0.0:9443".parse().unwrap(),
+                allow_public: true,
+                foreground: true,
             }
         );
         assert!(matches!(
