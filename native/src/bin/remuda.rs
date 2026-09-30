@@ -1563,32 +1563,46 @@ fn run_join_interruptible(
 
 #[cfg(unix)]
 struct JoinInterruptHandler {
-    previous: libc::sighandler_t,
+    previous: Vec<(libc::c_int, libc::sighandler_t)>,
 }
 
 #[cfg(unix)]
 impl JoinInterruptHandler {
     fn install() -> std::io::Result<Self> {
         JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
-        let previous = unsafe {
-            libc::signal(
-                libc::SIGINT,
-                record_join_interrupt as *const () as libc::sighandler_t,
-            )
-        };
-        if previous == libc::SIG_ERR {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(Self { previous })
+        let mut previous = Vec::with_capacity(3);
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: install the flag-only handler for this signal, retaining its prior action.
+            let prior = unsafe {
+                libc::signal(
+                    signal,
+                    record_join_interrupt as *const () as libc::sighandler_t,
+                )
+            };
+            if prior == libc::SIG_ERR {
+                let error = std::io::Error::last_os_error();
+                for (installed_signal, old_handler) in previous.drain(..).rev() {
+                    // SAFETY: restore the disposition returned by the earlier signal call.
+                    unsafe {
+                        libc::signal(installed_signal, old_handler);
+                    }
+                }
+                return Err(error);
+            }
+            previous.push((signal, prior));
         }
+        Ok(Self { previous })
     }
 }
 
 #[cfg(unix)]
 impl Drop for JoinInterruptHandler {
     fn drop(&mut self) {
-        unsafe {
-            libc::signal(libc::SIGINT, self.previous);
+        for (signal, previous) in self.previous.drain(..).rev() {
+            // SAFETY: restore the disposition returned when this handler was installed.
+            unsafe {
+                libc::signal(signal, previous);
+            }
         }
     }
 }
@@ -2578,6 +2592,36 @@ mod cluster_cli_tests {
         assert!(!JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
         assert!(JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_interrupt_handler_tracks_signals_and_restores_prior_dispositions() {
+        let signals = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+        let before: Vec<_> = signals
+            .iter()
+            .map(|signal| current_signal_handler(*signal))
+            .collect();
+        let handler = JoinInterruptHandler::install().unwrap();
+        for signal in signals {
+            JOIN_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(unsafe { libc::raise(signal) }, 0);
+            assert!(JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        drop(handler);
+        for (signal, expected) in signals.into_iter().zip(before) {
+            assert_eq!(current_signal_handler(signal), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    fn current_signal_handler(signal: libc::c_int) -> libc::sighandler_t {
+        let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+        // SAFETY: a null action queries the current disposition into valid output storage.
+        let status = unsafe { libc::sigaction(signal, std::ptr::null(), action.as_mut_ptr()) };
+        assert_eq!(status, 0, "query signal disposition");
+        // SAFETY: sigaction initialized the output when it returned success.
+        unsafe { action.assume_init().sa_sigaction }
     }
 
     #[test]
