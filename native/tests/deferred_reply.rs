@@ -113,7 +113,7 @@ remuda.extension_command("deferred", function(args)
       if err then
         reply:reject("secret prompt " .. err .. "\nNext: remuda deferred --password-file PATH")
       else
-        reply:resolve(0, "secret accepted", "")
+        reply:resolve(0, "secret length: " .. #secret, "")
       end
     end }
     return reply
@@ -726,7 +726,7 @@ fn secret_prompt_in_session(socket: &std::path::Path, session_name: &str, binary
             Ok(Response::Screen(screen)) => screen,
             other => panic!("capture failed: {other:?}"),
         };
-        if screen.contains("secret accepted") {
+        if screen.contains("secret length:") {
             break;
         }
         assert!(
@@ -894,7 +894,7 @@ fn secret_entered_in_session_pane_is_absent_from_capture_and_scrollback() {
             Ok(Response::Screen(screen)) => screen,
             other => panic!("capture failed: {other:?}"),
         };
-        if screen.contains("remuda[secret-pane-leak-session] deferred test secret") {
+        if screen.contains("remuda[session secret-pane-leak-session] deferred test secret") {
             break;
         }
         assert!(
@@ -905,6 +905,7 @@ fn secret_entered_in_session_pane_is_absent_from_capture_and_scrollback() {
     }
 
     let sentinel = b"S3CRET-probe";
+    assert_eq!(sentinel.len(), 12);
     client::request(
         &socket,
         &Request::Feed {
@@ -933,7 +934,7 @@ fn secret_entered_in_session_pane_is_absent_from_capture_and_scrollback() {
             Ok(Response::Screen(screen)) => screen,
             other => panic!("capture failed: {other:?}"),
         };
-        if screen.contains("secret accepted") {
+        if screen.contains("secret length: 12") {
             break;
         }
         assert!(
@@ -974,6 +975,10 @@ fn secret_entered_in_session_pane_is_absent_from_capture_and_scrollback() {
     };
     assert!(scrollback_len > 0, "test session did not create scrollback");
     assert!(
+        capture.contains("secret length: 12"),
+        "callback did not receive the 12-byte sentinel:\n{capture}"
+    );
+    assert!(
         !capture.contains(std::str::from_utf8(sentinel).unwrap())
             && !visible_text.contains(std::str::from_utf8(sentinel).unwrap()),
         "secret appeared in current pane capture:\n{capture}"
@@ -1000,6 +1005,7 @@ fn secret_entered_in_session_pane_is_absent_from_capture_and_scrollback() {
     }
 
     let _ = remuda(&["stop", "-f"]);
+    assert_no_secret_in_files(&dir, sentinel);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -1052,7 +1058,7 @@ fn secret_prompt_label_strips_format_and_separator_characters() {
 #[test]
 fn secret_prompt_label_caps_caller_text_at_256_chars() {
     let label = secret_prompt_label_for_word("secret_label_long", "secret_long");
-    let caller_label = label.strip_prefix("remuda[outside] ").unwrap_or(&label);
+    let caller_label = label.strip_prefix("remuda[outside] ").expect("outside tag");
     assert_eq!(caller_label.chars().count(), 256);
     assert!(caller_label.chars().all(|ch| ch == 'x'));
 }
