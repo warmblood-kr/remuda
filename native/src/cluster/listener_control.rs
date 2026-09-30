@@ -20,6 +20,15 @@ pub fn status(daemon_path: &Path) -> ListenerStatus {
 
 /// Enable the listener and ask the selected daemon to reload its task.
 pub fn start(daemon_path: &Path, config: Option<ListenerConfig>) -> io::Result<ListenerStatus> {
+    start_with_config_written(daemon_path, config, || {})
+}
+
+/// Enable the listener, run `config_written` after persisting it, then reload the daemon.
+pub fn start_with_config_written(
+    daemon_path: &Path,
+    config: Option<ListenerConfig>,
+    config_written: impl FnOnce(),
+) -> io::Result<ListenerStatus> {
     let mut config = match config {
         Some(config) => config,
         None => listener_config::read()?.unwrap_or(ListenerConfig {
@@ -30,6 +39,7 @@ pub fn start(daemon_path: &Path, config: Option<ListenerConfig>) -> io::Result<L
     };
     config.enabled = true;
     listener_config::write(&config)?;
+    config_written();
     request(daemon_path, ListenerOp::Reload)
 }
 

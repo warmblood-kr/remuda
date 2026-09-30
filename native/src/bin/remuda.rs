@@ -1402,9 +1402,12 @@ fn cluster_join_with_listener(
                 bind: ListenerBind::Explicit(address),
                 allow_public: false,
             };
-            restore_guard.set_expected(Some(config.clone()));
-            finish_join_listener_start(&mut restore_guard, || {
-                remuda_native::cluster::listener_control::start(daemon_path, Some(config))
+            finish_join_listener_start(&mut restore_guard, |restore_guard| {
+                remuda_native::cluster::listener_control::start_with_config_written(
+                    daemon_path,
+                    Some(config.clone()),
+                    || restore_guard.set_expected(Some(config)),
+                )
             })
         }
         None => match initial_status {
@@ -1418,9 +1421,12 @@ fn cluster_join_with_listener(
                     allow_public: false,
                 });
                 config.enabled = true;
-                restore_guard.set_expected(Some(config.clone()));
-                finish_join_listener_start(&mut restore_guard, || {
-                    remuda_native::cluster::listener_control::start(daemon_path, Some(config))
+                finish_join_listener_start(&mut restore_guard, |restore_guard| {
+                    remuda_native::cluster::listener_control::start_with_config_written(
+                        daemon_path,
+                        Some(config.clone()),
+                        || restore_guard.set_expected(Some(config)),
+                    )
                 })
             }
         },
@@ -1556,9 +1562,11 @@ enum JoinListenerStartOutcome {
 
 fn finish_join_listener_start(
     restore_guard: &mut JoinListenerRestoreGuard,
-    start: impl FnOnce() -> std::io::Result<remuda_core::protocol::ListenerStatus>,
+    start: impl FnOnce(
+        &mut JoinListenerRestoreGuard,
+    ) -> std::io::Result<remuda_core::protocol::ListenerStatus>,
 ) -> JoinListenerStartOutcome {
-    let result = start();
+    let result = start(restore_guard);
     #[cfg(unix)]
     if JOIN_INTERRUPTED.load(Ordering::Acquire) {
         return JoinListenerStartOutcome::Cancelled(cancel_join_with_restore(restore_guard));
@@ -2706,7 +2714,7 @@ mod cluster_cli_tests {
         restore_guard.set_expected(Some(join_config.clone()));
         let _handler = JoinInterruptHandler::install().unwrap();
 
-        let outcome = finish_join_listener_start(&mut restore_guard, || {
+        let outcome = finish_join_listener_start(&mut restore_guard, |_| {
             remuda_native::cluster::listener_config::write(&join_config).unwrap();
             assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
             Ok(ListenerStatus::On {
