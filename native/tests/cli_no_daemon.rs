@@ -103,7 +103,7 @@ fn unrelated_unknown_verb_gets_concise_help() {
 }
 
 #[test]
-fn help_flags_write_usage_to_stdout() {
+fn help_flags_write_usage_to_stdout_and_mod_commands_to_stderr() {
     let dir = scratch("help-output");
     let mod_dir = dir.join("data/remuda/mods/probe");
     std::fs::create_dir_all(&mod_dir).unwrap();
@@ -117,11 +117,10 @@ fn help_flags_write_usage_to_stdout() {
         assert!(out.status.success(), "{args:?}: {out:?}");
         assert!(String::from_utf8_lossy(&out.stdout).contains("terminal orchestration"));
         assert!(
-            String::from_utf8_lossy(&out.stdout)
+            String::from_utf8_lossy(&out.stderr)
                 .contains("Installed mod commands:\n  remuda probe"),
             "{args:?}: {out:?}"
         );
-        assert!(out.stderr.is_empty(), "{args:?}: {out:?}");
     }
     let _ = std::fs::remove_dir_all(dir);
 }

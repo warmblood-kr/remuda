@@ -314,9 +314,9 @@ fn help_command() -> ExitCode {
                 .filter_map(|mod_spec| mod_spec.command)
                 .collect();
             if !commands.is_empty() {
-                println!("Installed mod commands:");
+                eprintln!("Installed mod commands:");
                 for command in commands {
-                    println!("  remuda {command} [--agent AGENT] [--headless]");
+                    eprintln!("  remuda {command} [--agent AGENT] [--headless]");
                 }
             }
             ExitCode::SUCCESS
