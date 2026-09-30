@@ -125,7 +125,8 @@ fn main() -> ExitCode {
         ["cluster", rest @ ..] => cluster_command(server, &path, rest),
 
         [command, rest @ ..]
-            if is_command_word(command) && remuda_native::packages::has_subcommand(command) =>
+            if remuda_native::packages::valid_component(command)
+                && remuda_native::packages::has_subcommand(command) =>
         {
             extension_command(server, &path, command, rest, stdin_enabled)
         }
@@ -169,7 +170,7 @@ fn main() -> ExitCode {
         // manifest is named rather than answered with usage (#134).
         _ => {
             let word = argv.first().copied().unwrap_or("");
-            if !is_command_word(word) {
+            if !remuda_native::packages::valid_component(word) {
                 unknown_command(word)
             } else {
                 match remuda_native::packages::half_installed(word) {
@@ -1997,7 +1998,7 @@ fn split_stdin_flag(args: &[String]) -> Result<(bool, &[String]), &'static str> 
     match args {
         [flag, command, ..]
             if flag == "--stdin"
-                && is_command_word(command)
+                && remuda_native::packages::valid_component(command)
                 && remuda_native::packages::has_subcommand(command) =>
         {
             Ok((true, &args[1..]))
@@ -2006,7 +2007,8 @@ fn split_stdin_flag(args: &[String]) -> Result<(bool, &[String]), &'static str> 
             Err("--stdin is only valid before an installed mod command")
         }
         [command, rest @ ..]
-            if is_command_word(command) && remuda_native::packages::has_subcommand(command) =>
+            if remuda_native::packages::valid_component(command)
+                && remuda_native::packages::has_subcommand(command) =>
         {
             let options = rest.split(|arg| arg == "--").next().unwrap_or(rest);
             if options.iter().any(|arg| arg == "--stdin") {

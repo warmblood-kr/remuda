@@ -354,6 +354,41 @@ fn a_half_installed_sibling_does_not_hide_healthy_mods() {
     );
 }
 
+#[test]
+fn underscore_mod_command_dispatches() {
+    let dir = scratch("underscore-mod-command");
+    let mods = dir.join("data/remuda/mods");
+    let package = mods.join("my_mod");
+    std::fs::create_dir_all(package.join("packages/my_mod")).unwrap();
+    std::fs::write(
+        package.join("extension.toml"),
+        "name = \"my_mod\"\nentry = \"packages/my_mod/init.lua\"\napi = \"remuda-lua-v1\"\ncommand = \"my_mod\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("packages/my_mod/init.lua"),
+        "remuda.extension_command('my_mod', function(args) return 'pong ' .. (args[1] or '') end)",
+    )
+    .unwrap();
+
+    let launch = remuda(&dir, &["my_mod", "--headless"]);
+    let ping = remuda(&dir, &["my_mod", "ping"]);
+    let _ = remuda(&dir, &["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        launch.status.success(),
+        "{}",
+        String::from_utf8_lossy(&launch.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&ping.stdout).trim(),
+        "pong ping",
+        "{}",
+        String::from_utf8_lossy(&ping.stderr)
+    );
+}
+
 /// #150: a half-installed dependency manifest names its owner, dependency,
 /// and path instead of returning only the raw parse failure.
 #[test]
