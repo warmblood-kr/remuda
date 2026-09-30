@@ -44,7 +44,7 @@
 <h2 id="event_counts">event_counts</h2>
 <p><code>event_counts() -&gt; {[event]=n}</code> — How many times each event has been emitted.</p>
 <h2 id="every">every</h2>
-<p><code>every(seconds, fn) -&gt; handle</code> — Run a callback periodically without blocking the Lua image; cancel with handle:cancel().</p>
+<p><code>every(seconds, fn) -&gt; handle</code> — Run a callback periodically without blocking the Lua image; cancel with handle:cancel(). If a callback finishes late, the next tick comes one interval after it ends, so the phase shifts and ticks do not burst to catch up.</p>
 <h2 id="exec">exec</h2>
 <p><code>exec(name) -&gt; nil</code> — Run an installed mod's entry source, by name, in this same image.</p>
 <h2 id="expect">expect</h2>

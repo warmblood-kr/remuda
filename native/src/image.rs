@@ -38,6 +38,7 @@ pub(crate) mod timers;
 // prefix carries typed failures to the CLI without changing ordinary errors.
 const TYPED_FAILURE_PREFIX: &str = "\u{1e}REMUDA_FAIL:";
 const LUA_HOOK_INTERVAL: u32 = 10_000;
+const MAX_TIMER_CALLBACKS_PER_TURN: usize = 1;
 // About 0.6 seconds at the measured 360M instructions/second in release builds.
 const LUA_INSTRUCTION_LIMIT: u64 = 200_000_000;
 const LUA_EXECUTION_LIMIT_MESSAGE: &str = "Lua execution limit exceeded";
@@ -772,13 +773,15 @@ fn run_due_schedules(lua: &Lua, budget: &LuaExecutionBudget, now: f64) -> Result
 }
 
 fn run_due_timers(lua: &Lua, budget: &LuaExecutionBudget, timers: &timers::SharedTimerService) {
-    loop {
+    // Return to the image inbox between callbacks so an overdue timer batch
+    // cannot keep ordinary work queued behind every due callback.
+    for _ in 0..MAX_TIMER_CALLBACKS_PER_TURN {
         let fire = match timers.borrow_mut().take_due(lua, Instant::now()) {
             Ok(Some(fire)) => fire,
-            Ok(None) => break,
+            Ok(None) => return,
             Err(error) => {
                 eprintln!("remuda timer dequeue error: {error}");
-                break;
+                return;
             }
         };
         let callback_result = budget.run(lua, || fire.callback.call::<()>(()));

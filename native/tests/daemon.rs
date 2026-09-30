@@ -4726,14 +4726,18 @@ fn another_client_eval_returns_while_a_one_second_timer_is_pending() {
 
 #[test]
 fn queued_eval_is_serviced_between_due_timer_callbacks() {
-    let path = scratch("timer-batch");
+    let runtime = unique_scratch_dir("timer-batch");
+    let _cleanup = RemoveDirectoryOnDrop(runtime.clone());
+    let path = daemon::socket_path_in(&runtime, "s");
     let _daemon = daemon_at(&path);
     eval(
         &path,
         r#"
-            for _ = 1, 3 do
+            for _ = 1, 10 do
               remuda.after(0.01, function()
-                while true do end
+                local total = 0
+                for i = 1, 300000 do total = total + i end
+                remuda._timer_test_total = total
               end)
             end
             return 'scheduled'
@@ -4746,7 +4750,7 @@ fn queued_eval_is_serviced_between_due_timer_callbacks() {
     let started = Instant::now();
     assert_eq!(eval(&path, "return 'responsive'"), "responsive");
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        started.elapsed() < Duration::from_millis(750),
         "queued eval was not serviced between due timer callbacks"
     );
 }
@@ -4772,7 +4776,7 @@ fn repeating_timer_keeps_firing_during_client_eval_traffic() {
 }
 
 #[test]
-fn reloading_a_lifecycle_mod_cancels_its_owned_interval() {
+fn user_lua_cannot_cancel_another_owners_timer_and_reload_cancels_it() {
     let runtime = unique_scratch_dir("lua-timer-owner");
     let _cleanup = RemoveDirectoryOnDrop(runtime.clone());
     let data = runtime.join("data");
@@ -4816,6 +4820,27 @@ fn reloading_a_lifecycle_mod_cancels_its_owned_interval() {
         );
         std::thread::sleep(Duration::from_millis(20));
     };
+
+    assert_eq!(
+        eval(
+            &path,
+            "local ok = pcall(function() remuda._timer_cancel_owner('timer_mod') end); return tostring(ok)",
+        ),
+        "false",
+        "user Lua must not be able to invoke owner-wide timer cancellation"
+    );
+    let attack_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let fires = read_count(&path, "return remuda._timer_test.fires");
+        if fires > before_reload {
+            break;
+        }
+        assert!(
+            Instant::now() < attack_deadline,
+            "the other owner's interval stopped after the cancellation attempt"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     std::fs::write(
         &entry,

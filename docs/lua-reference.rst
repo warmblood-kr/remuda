@@ -114,7 +114,7 @@ event_counts
 every
 -----
 
-``every(seconds, fn) -> handle`` — Run a callback periodically without blocking the Lua image; cancel with handle:cancel().
+``every(seconds, fn) -> handle`` — Run a callback periodically without blocking the Lua image; cancel with handle:cancel(). If a callback finishes late, the next tick comes one interval after it ends, so the phase shifts and ticks do not burst to catch up.
 
 exec
 ----
