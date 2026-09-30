@@ -1259,7 +1259,7 @@ fn handle_connection_with(stream: TcpStream, context: ConnectionHandlerContext) 
         return ignore_response_error(write_http_response(stream, status, body));
     }
     if !admitted {
-        return handle_unknown_peer_join(stream, state, opened);
+        return handle_unadmitted_peer(stream, state, opened, &peer_fp);
     }
     handle_admitted_request(
         stream,
@@ -1274,6 +1274,96 @@ fn handle_connection_with(stream: TcpStream, context: ConnectionHandlerContext) 
             limits,
         },
     );
+}
+
+fn handle_unadmitted_peer(
+    stream: TcpStream,
+    state: Arc<ListenerState>,
+    opened: frame::OpenedRequest,
+    peer_fp: &str,
+) {
+    let local_node = cluster::nodes().ok().flatten();
+    let revoked_entry = local_node.as_ref().and_then(|(_, registry)| {
+        registry
+            .authorized_nodes
+            .iter()
+            .find(|entry| {
+                entry.node_fp == peer_fp
+                    && entry.state == NodeState::Revoked
+                    && cluster::encoding::decode_base64(&entry.static_pubkey)
+                        .is_ok_and(|key| key == opened.peer_static)
+            })
+            .cloned()
+    });
+    if let Some(entry) = revoked_entry {
+        let request: Request = match serde_json::from_slice(&opened.payload) {
+            Ok(request) => request,
+            Err(_) => {
+                return ignore_response_error(write_http_response(stream, 403, b"not admitted"));
+            }
+        };
+        if let Request::ClusterRegistrySync { digest, offset: 0 } = request {
+            if let Some((identity, _)) = local_node {
+                return handle_revoked_registry_sync(
+                    stream,
+                    state,
+                    opened,
+                    peer_fp,
+                    identity,
+                    entry,
+                    digest.as_deref(),
+                );
+            }
+        }
+        return ignore_response_error(write_http_response(stream, 403, b"not admitted"));
+    }
+    handle_unknown_peer_join(stream, state, opened);
+}
+
+fn handle_revoked_registry_sync(
+    stream: TcpStream,
+    state: Arc<ListenerState>,
+    opened: frame::OpenedRequest,
+    peer_fp: &str,
+    identity: cluster::NodeIdentity,
+    revoked_entry: cluster::AuthorizedNode,
+    known_digest: Option<&str>,
+) {
+    if !state.limiter.acquire_registry_request(peer_fp, false) {
+        return ignore_response_error(write_http_response(
+            stream,
+            429,
+            b"registry replication rate limit exceeded",
+        ));
+    }
+    let entries = [revoked_entry];
+    let digest = match cluster::Registry::digest_replication_snapshot(&entries) {
+        Ok(digest) => digest,
+        Err(_) => {
+            return ignore_response_error(write_http_response(stream, 403, b"not admitted"));
+        }
+    };
+    let unchanged = known_digest == Some(digest.as_str());
+    let entries_json = if unchanged {
+        "[]".to_owned()
+    } else {
+        match cluster::registry::RegistryUpdate::encode_entries_json(&entries) {
+            Ok(entries) => entries,
+            Err(_) => {
+                return ignore_response_error(write_http_response(stream, 403, b"not admitted"));
+            }
+        }
+    };
+    let response = Response::ClusterRegistryPage {
+        sender_fp: identity.node_fp,
+        digest,
+        offset: 0,
+        entries_json,
+        next_offset: None,
+        unchanged,
+    };
+    let payload = serde_json::to_vec(&response).unwrap_or_else(|_| b"null".to_vec());
+    send_encrypted_response(stream, opened, &payload);
 }
 
 fn check_request_replay(

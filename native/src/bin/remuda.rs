@@ -1265,7 +1265,11 @@ fn cluster_call(
         Ok(response) => response,
         Err(error) => {
             let code = match error {
-                ClientError::Unreachable | ClientError::Timeout => 3,
+                ClientError::Unreachable
+                | ClientError::PeerNotListening
+                | ClientError::PeerClosedConnection
+                | ClientError::OsBlockedConnection
+                | ClientError::Timeout => 3,
                 ClientError::Refused(_) => 4,
                 ClientError::Crypto | ClientError::BadResponse => 5,
             };
