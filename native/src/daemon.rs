@@ -561,7 +561,7 @@ fn auto_listener_ip_changed(
 ) -> bool {
     match detect() {
         Ok(address) => address.ip() != current,
-        Err(_) => true,
+        Err(_) => false,
     }
 }
 
@@ -617,6 +617,83 @@ fn set_listener_status(status: &Arc<Mutex<ListenerStatus>>, value: ListenerStatu
     *status.lock().unwrap_or_else(|error| error.into_inner()) = value;
 }
 
+fn wait_for_auto_listener_retry(
+    status: &Arc<Mutex<ListenerStatus>>,
+    stopped: &Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+    ready: &std::sync::mpsc::Sender<()>,
+    reason: String,
+) -> bool {
+    set_listener_status(status, ListenerStatus::WaitingForLan(reason));
+    let _ = ready.send(());
+    matches!(
+        stopped
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .recv_timeout(crate::net::listener::OBSERVE_INTERVAL),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    )
+}
+
+fn serve_bound_listener(
+    listener: crate::net::listener::Listener,
+    host_lock: std::fs::File,
+    auto: bool,
+    status: &Arc<Mutex<ListenerStatus>>,
+    stopped: &Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+    ready: &std::sync::mpsc::Sender<()>,
+    detector: &AutoAddressDetector,
+) -> Result<bool, String> {
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("read cluster listener address: {error}"))?;
+    set_listener_status(
+        status,
+        ListenerStatus::On {
+            addr: address,
+            auto,
+            advertise_addr: Some(address),
+            listen_addrs: vec![address],
+        },
+    );
+    let _ = ready.send(());
+
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let serve_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::scope(|scope| {
+        let watcher_flag = Arc::clone(&stop_flag);
+        let watcher_done = Arc::clone(&serve_done);
+        let watcher_stopped = Arc::clone(stopped);
+        let watcher = std::thread::Builder::new()
+            .name("remuda-cluster-listener-stop-watcher".into())
+            .spawn_scoped(scope, move || loop {
+                let result = watcher_stopped
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv_timeout(Duration::from_millis(25));
+                match result {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        watcher_flag.store(true, Ordering::Release);
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if watcher_done.load(Ordering::Acquire) =>
+                    {
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            })
+            .map_err(|error| format!("spawn cluster listener stop watcher: {error}"))?;
+        let result = listener.serve_until_rechecking(&stop_flag, || {
+            auto && auto_listener_ip_changed(address.ip(), || detector())
+        });
+        serve_done.store(true, Ordering::Release);
+        let _ = watcher.join();
+        drop(host_lock);
+        result.map_err(|error| format!("serve cluster listener: {error}"))
+    })
+}
+
 fn start_listener(
     daemon_path: &Path,
     status: &Arc<Mutex<ListenerStatus>>,
@@ -636,7 +713,20 @@ fn start_listener(
             }
             Err(error) => return Err(format!("read listener config: {error}")),
         };
-        let (address, auto) = resolve_listener_bind(config.bind, &detector)?;
+        let auto_bind = matches!(
+            &config.bind,
+            crate::cluster::listener_config::ListenerBind::Auto
+        );
+        let (address, auto) = match resolve_listener_bind(config.bind, &detector) {
+            Ok(resolved) => resolved,
+            Err(reason) if auto_bind => {
+                if !wait_for_auto_listener_retry(status, &stopped, ready, reason) {
+                    return Ok(());
+                }
+                continue;
+            }
+            Err(reason) => return Err(reason),
+        };
         let allow_public = !auto && config.allow_public;
         crate::net::listener::validate_bind_address(address, allow_public)
             .map_err(|error| format!("validate cluster listener bind: {error}"))?;
@@ -668,55 +758,9 @@ fn start_listener(
             &security,
         )
         .map_err(|error| format!("bind cluster listener: {error}"))?;
-        let address = listener
-            .local_addr()
-            .map_err(|error| format!("read cluster listener address: {error}"))?;
-        set_listener_status(
-            status,
-            ListenerStatus::On {
-                addr: address,
-                auto,
-                advertise_addr: Some(address),
-                listen_addrs: vec![address],
-            },
+        let result = serve_bound_listener(
+            listener, host_lock, auto, status, &stopped, ready, &detector,
         );
-        let _ = ready.send(());
-
-        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let serve_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let result = std::thread::scope(|scope| {
-            let watcher_flag = Arc::clone(&stop_flag);
-            let watcher_done = Arc::clone(&serve_done);
-            let watcher_stopped = Arc::clone(&stopped);
-            let watcher = std::thread::Builder::new()
-                .name("remuda-cluster-listener-stop-watcher".into())
-                .spawn_scoped(scope, move || loop {
-                    let result = watcher_stopped
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .recv_timeout(Duration::from_millis(25));
-                    match result {
-                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                            watcher_flag.store(true, Ordering::Release);
-                            break;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                            if watcher_done.load(Ordering::Acquire) =>
-                        {
-                            break;
-                        }
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                })
-                .map_err(|error| format!("spawn cluster listener stop watcher: {error}"))?;
-            let result = listener.serve_until_rechecking(&stop_flag, || {
-                auto && auto_listener_ip_changed(address.ip(), || detector())
-            });
-            serve_done.store(true, Ordering::Release);
-            let _ = watcher.join();
-            drop(host_lock);
-            result.map_err(|error| format!("serve cluster listener: {error}"))
-        });
         if result? {
             continue;
         }
@@ -2886,7 +2930,7 @@ mod tests {
         assert!(!auto_listener_ip_changed(current, || Ok(
             "192.168.1.20:7441".parse().unwrap()
         )));
-        assert!(auto_listener_ip_changed(current, || {
+        assert!(!auto_listener_ip_changed(current, || {
             Err(crate::net::advertise_addr::NoLanAddr { candidate: None })
         }));
     }
@@ -2909,11 +2953,16 @@ mod tests {
         });
         let task = ListenerTask::start_with_detector(&environment.socket_path(), detector);
 
-        assert!(
-            !matches!(task.status(), ListenerStatus::Failed(_)),
-            "Auto listener should wait for a private address instead of failing: {:?}",
-            task.status()
-        );
+        match task.status() {
+            ListenerStatus::WaitingForLan(reason) => {
+                assert!(reason.contains("no private LAN address found"), "{reason}");
+                assert!(
+                    reason.contains("Next: remuda cluster listen --bind IP"),
+                    "{reason}"
+                );
+            }
+            status => panic!("Auto listener should wait for a private address: {status:?}"),
+        }
         available.store(true, Ordering::Release);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -3020,7 +3069,7 @@ mod tests {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             loop {
                 match task.status() {
-                    ListenerStatus::Failed(reason) => {
+                    ListenerStatus::WaitingForLan(reason) => {
                         assert!(reason.contains("no private LAN address found"), "{reason}");
                         break;
                     }
