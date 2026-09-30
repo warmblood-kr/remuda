@@ -1027,7 +1027,7 @@ fn is_detach(key: KeyEvent) -> bool {
 /// A keypress as the bytes a terminal would have sent, or `None` for a key we
 /// cannot spell — refused rather than sent as an empty burst, the rule
 /// `remuda_core::keys` already states. The spelling is that module's, reused.
-fn to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+pub(crate) fn to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     let base = match key.code {
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Enter => "RET".into(),
@@ -2732,20 +2732,20 @@ impl Drop for MouseCapture {
     }
 }
 
-struct BracketedPasteCapture<W: Write> {
+pub(crate) struct BracketedPasteCapture<W: Write> {
     output: W,
     enabled: bool,
 }
 
 impl<W: Write> BracketedPasteCapture<W> {
-    fn new(output: W) -> Self {
+    pub(crate) fn new(output: W) -> Self {
         Self {
             output,
             enabled: false,
         }
     }
 
-    fn set(&mut self, enabled: bool) -> std::io::Result<()> {
+    pub(crate) fn set(&mut self, enabled: bool) -> std::io::Result<()> {
         if self.enabled == enabled {
             return Ok(());
         }
@@ -2767,7 +2767,7 @@ impl<W: Write> Drop for BracketedPasteCapture<W> {
     }
 }
 
-fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
+pub(crate) fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
     let text: String = text
         .chars()
         .filter(|character| {
@@ -3516,3 +3516,23 @@ fn kill(path: &Path, name: &str) -> Result<(), String> {
 #[cfg(test)]
 #[path = "../tests/tui_support/tui_unit.rs"]
 mod tui_unit;
+
+#[cfg(test)]
+mod key_bytes_tests {
+    use super::to_bytes;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Vec<u8> {
+        to_bytes(KeyEvent::new(code, modifiers)).expect("terminal key spelling")
+    }
+
+    #[test]
+    fn terminal_key_events_spell_the_expected_pty_bytes() {
+        assert_eq!(key(KeyCode::Esc, KeyModifiers::NONE), b"\x1b");
+        assert_eq!(key(KeyCode::Char('c'), KeyModifiers::CONTROL), b"\x03");
+        assert_eq!(key(KeyCode::Up, KeyModifiers::NONE), b"\x1b[A");
+        assert_eq!(key(KeyCode::Tab, KeyModifiers::NONE), b"\t");
+        assert_eq!(key(KeyCode::Enter, KeyModifiers::NONE), b"\r");
+        assert_eq!(key(KeyCode::Char('y'), KeyModifiers::NONE), b"y");
+    }
+}

@@ -49,6 +49,50 @@ pub const SECRET_ANSWER_MAX_BYTES: usize = 4 * 1024;
 /// Maximum newline-delimited frame carrying a [`Request::SecretAnswer`].
 pub const SECRET_ANSWER_MAX_FRAME_BYTES: usize = 8 * 1024;
 
+/// Maximum visible line accepted by a [`Request::LineAnswer`].
+pub const LINE_ANSWER_MAX_BYTES: usize = 1024;
+
+/// Maximum newline-delimited frame carrying a [`Request::LineAnswer`].
+pub const LINE_ANSWER_MAX_FRAME_BYTES: usize = 8 * 1024;
+
+/// Whether a character is an invisible formatting or separator character that
+/// should not be preserved in a prompt label or visible line answer.
+pub fn is_secret_prompt_format_or_separator(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{061c}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{2029}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1343f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
+/// Remove terminal controls and invisible formatting/separator characters
+/// from prompt text crossing the local daemon protocol.
+pub fn sanitize_secret_prompt_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_control() && !is_secret_prompt_format_or_separator(*ch))
+        .collect()
+}
+
 /// Secret bytes encoded as base64 on the wire and redacted from debug output.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretBytes(#[serde(with = "secret_bytes_base64")] Zeroizing<Vec<u8>>);
@@ -275,6 +319,14 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         refusal: Option<SecretAnswerRefusal>,
     },
+    /// Answer an outstanding visible line prompt on this pending word's connection.
+    LineAnswer {
+        id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refusal: Option<SecretAnswerRefusal>,
+    },
 }
 
 /// One element of a [`Request::Feed`] act: bytes, or a pause before the next
@@ -386,6 +438,16 @@ pub enum Response {
         #[serde(default)]
         timeout_ms: u64,
     },
+    /// Ask the client on this connection to collect a visible line from its terminal.
+    PromptLine {
+        id: u32,
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default: Option<String>,
+        /// Remaining lifetime of the pending reply when this prompt was sent.
+        #[serde(default)]
+        timeout_ms: u64,
+    },
 }
 
 impl Response {
@@ -418,6 +480,10 @@ pub struct StyledRun {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct StyledScreen {
     pub rows: Vec<Vec<StyledRun>>,
+    /// Whether the child currently expects pasted text in terminal mode 2004.
+    /// Missing values from older peers mean the mode is disabled.
+    #[serde(default)]
+    pub bracketed_paste: bool,
     #[serde(default)]
     pub wrapped: Vec<bool>,
     #[serde(default)]

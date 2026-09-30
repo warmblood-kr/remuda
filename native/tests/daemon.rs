@@ -2689,6 +2689,36 @@ fn sync_times_out_with_the_current_unchanged_frame() {
     stop_daemon(&runtime, &socket, &mut running);
 }
 
+#[cfg(unix)]
+#[test]
+fn sync_reports_bracketed_paste_mode_enabled_by_child() {
+    let runtime = unique_scratch_dir("sync-bracketed-paste");
+    let _cleanup = RemoveDirectoryOnDrop(runtime.clone());
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut running = spawn::Daemon::spawn(&runtime);
+    start_shell_session(
+        &socket,
+        "stty raw -echo; printf '\\033[?2004h'; printf 'bracketed-sync-ready\\n'; sleep 30",
+    );
+    wait_for(&socket, "versioned", "bracketed-sync-ready");
+    let session = listed_session(&socket);
+    let response = client::request(
+        &socket,
+        &Request::Sync {
+            name: "versioned".into(),
+            instance_id: Some(session.instance_id.expect("session instance id")),
+            since: 0,
+            timeout_ms: 0,
+        },
+    )
+    .expect("sync response after child enables bracketed paste");
+    match response {
+        Response::Sync { snapshot, .. } => assert!(snapshot.bracketed_paste),
+        other => panic!("unexpected sync response: {other:?}"),
+    }
+    stop_daemon(&runtime, &socket, &mut running);
+}
+
 #[test]
 fn sync_waiter_wakes_when_child_exits() {
     let runtime = scratch_dir("sync-child-exit");

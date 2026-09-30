@@ -100,7 +100,7 @@
 <h2 id="on">on</h2>
 <p><code>on(event, fn, opts?) -&gt; nil</code> — Register a callback to run when an event fires. `opts`: <span class="title-ref">group</span>, <span class="title-ref">id</span> (same group+id replaces), <span class="title-ref">depth</span> (-100..100, lower first).</p>
 <h2 id="pending">pending</h2>
-<p><code>pending({timeout?, on_cancel?}) -&gt; handle</code> — Return a bounded handle for an extension command's deferred result.</p>
+<p><code>pending({timeout?, on_cancel?}) -&gt; handle</code> — Return a bounded handle for an extension command's deferred result, including secret and visible line prompts.</p>
 <h2 id="process">process</h2>
 <p><code>process(spec) -&gt; id; process.run(spec) -&gt; {code, stdout, stderr, timed_out}</code> — Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output.</p>
 <h2 id="process.run">process.run</h2>

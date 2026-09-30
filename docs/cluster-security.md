@@ -127,6 +127,15 @@ admitted node can type into and close every session while the setting is on.
 These controls do not protect against a compromised local account or host,
 which can read the local cluster keys and change the setting.
 
+Remote keys mode adds no wire operation: encoded key events and bracketed
+paste bytes use the existing authenticated `Input` request, allowlist,
+`allow_remote_control` check, per-peer aggregate limiter, and per-session
+budget. Embedded `ESC [ 200 ~` and `ESC [ 201 ~` paste markers are stripped.
+The UI adds one bracketed-paste marker pair only when the remote app has enabled
+mode 2004; otherwise the filtered text, including LF and CR, is sent raw as it
+would be in a local terminal, where each newline may submit a line. The shared
+paste filter drops control characters except TAB, LF, and CR.
+
 Auto listener mode selects the default-route RFC 1918 address and binds only
 that address. It checks the detected address on the existing five-second
 listener observer tick and on reload, closing and rebinding when the IP

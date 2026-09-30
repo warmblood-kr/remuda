@@ -67,12 +67,13 @@ register("tools", "The `remuda.tool` registry table, keyed by tool name.", "tabl
 register("_extension_commands", "Handlers registered for installed mod commands.", "table")
 register("extension_command", "Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.", "extension_command(name, handler(args, caller)) -> nil")
 register("_dispatch_extension_command", "Dispatch arguments and caller context to a loaded mod command handler.", "_dispatch_extension_command(name, args, caller) -> value")
-register("pending", "Return a bounded handle for an extension command's deferred result.", "pending({timeout?, on_cancel?}) -> handle")
+register("pending", "Return a bounded handle for an extension command's deferred result, including secret and visible line prompts.", "pending({timeout?, on_cancel?}) -> handle")
 register("_pending_create", "Create a private pending reply handle.", "_pending_create(timeout?) -> id, handle")
 register("_pending_events", "Drain pending completion and cancellation notifications.", "_pending_events() -> {{id, reason?}...}")
 
 local pending_cancel_handlers = {}
 local pending_secret_handlers = {}
+local pending_line_handlers = {}
 function remuda.pending(options)
   if type(options) ~= "table" then
     error("pending needs an options table", 2)
@@ -101,6 +102,19 @@ function remuda.pending(options)
     callbacks[prompt_id] = prompt.callback
     return prompt_id
   end
+  function handle:prompt_line(prompt)
+    if type(prompt) ~= "table" or type(prompt.label) ~= "string" or type(prompt.callback) ~= "function" then
+      error("prompt_line needs a label and callback", 2)
+    end
+    if prompt.default ~= nil and type(prompt.default) ~= "string" then
+      error("prompt_line default must be a string", 2)
+    end
+    local prompt_id = native_handle:prompt_line(prompt.label, prompt.default)
+    local callbacks = pending_line_handlers[id] or {}
+    pending_line_handlers[id] = callbacks
+    callbacks[prompt_id] = prompt.callback
+    return prompt_id
+  end
   return handle
 end
 
@@ -109,6 +123,7 @@ local function deliver_pending_events()
     local callback = pending_cancel_handlers[event.id]
     pending_cancel_handlers[event.id] = nil
     pending_secret_handlers[event.id] = nil
+    pending_line_handlers[event.id] = nil
     if event.reason and callback then
       local ok, err = pcall(callback, event.reason)
       if not ok then
@@ -125,6 +140,20 @@ local function deliver_pending_events()
     end
     if callback then
       local ok, err = pcall(callback, event.secret, event.error)
+      if not ok then
+        io.stderr:write("remuda.pending prompt callback failed\n")
+      end
+    end
+  end
+  for _, event in ipairs(remuda._pending_line_events()) do
+    local callbacks = pending_line_handlers[event.id]
+    local callback = callbacks and callbacks[event.prompt_id]
+    if callbacks then
+      callbacks[event.prompt_id] = nil
+      if next(callbacks) == nil then pending_line_handlers[event.id] = nil end
+    end
+    if callback then
+      local ok, err = pcall(callback, event.line, event.error)
       if not ok then
         io.stderr:write("remuda.pending prompt callback failed\n")
       end

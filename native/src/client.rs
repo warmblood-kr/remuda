@@ -485,6 +485,23 @@ pub fn request_with_secret_prompts(path: &Path, request: &Request) -> std::io::R
             return Err(request_timeout(path, timeout));
         }
         let response = read_response_with_timeout(path, stream.try_clone()?, remaining)?;
+        let response = match response {
+            Response::PromptLine {
+                id,
+                label,
+                default,
+                timeout_ms,
+            } => {
+                match collect_line_from_terminal(&label, default.as_deref(), timeout_ms)? {
+                    LinePromptCollection::Answer(line, refusal) => {
+                        send_line_answer(&stream, id, line.as_deref(), refusal)?;
+                    }
+                    LinePromptCollection::Deadline => {}
+                }
+                continue;
+            }
+            response => response,
+        };
         let Response::PromptSecret {
             id,
             label,
@@ -505,6 +522,14 @@ pub fn request_with_secret_prompts(path: &Path, request: &Request) -> std::io::R
 enum SecretPromptCollection {
     Answer(
         Option<remuda_core::protocol::SecretBytes>,
+        Option<remuda_core::protocol::SecretAnswerRefusal>,
+    ),
+    Deadline,
+}
+
+enum LinePromptCollection {
+    Answer(
+        Option<String>,
         Option<remuda_core::protocol::SecretAnswerRefusal>,
     ),
     Deadline,
@@ -566,6 +591,73 @@ fn collect_secret_from_terminal(
     } else {
         let (secret, refusal) = secret_answer_from_line(answer);
         Ok(SecretPromptCollection::Answer(secret, refusal))
+    }
+}
+
+fn collect_line_from_terminal(
+    label: &str,
+    default: Option<&str>,
+    timeout_ms: u64,
+) -> std::io::Result<LinePromptCollection> {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Ok(LinePromptCollection::Answer(
+            None,
+            Some(remuda_core::protocol::SecretAnswerRefusal::NotATerminal),
+        ));
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    #[cfg(unix)]
+    let signal_guard = SecretPromptSignalGuard::install()?;
+    let mut expired = false;
+    let events = std::iter::from_fn(|| loop {
+        #[cfg(unix)]
+        if SECRET_PROMPT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            expired = true;
+            return None;
+        }
+        let poll_for = remaining.min(Duration::from_millis(100));
+        match crossterm::event::poll(poll_for) {
+            Ok(true) => match crossterm::event::read() {
+                Ok(event) => return Some(event),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            },
+            Ok(false) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    });
+    let answer = prompt_line_with_events(std::io::stderr(), label, default, events)?;
+    #[cfg(unix)]
+    {
+        drop(signal_guard);
+        let received_signal = SECRET_PROMPT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+        if received_signal != 0 {
+            unsafe { libc::raise(received_signal) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "line prompt interrupted by signal",
+            ));
+        }
+    }
+    if expired {
+        Ok(LinePromptCollection::Deadline)
+    } else {
+        let answer = match answer {
+            Ok(Some(line)) => (Some(line), None),
+            Ok(None) => (None, None),
+            Err(PromptLineError::TooLong) => (
+                None,
+                Some(remuda_core::protocol::SecretAnswerRefusal::TooLong),
+            ),
+        };
+        Ok(LinePromptCollection::Answer(answer.0, answer.1))
     }
 }
 
@@ -633,6 +725,30 @@ fn send_secret_answer(
     ));
     serde_json::to_writer(&mut *frame, &request)?;
     frame.push(b'\n');
+    stream.write_all(&frame)?;
+    stream.flush()
+}
+
+fn send_line_answer(
+    mut stream: &Stream,
+    id: u32,
+    line: Option<&str>,
+    refusal: Option<remuda_core::protocol::SecretAnswerRefusal>,
+) -> std::io::Result<()> {
+    let request = Request::LineAnswer {
+        id,
+        line: line.map(str::to_owned),
+        refusal,
+    };
+    let mut frame = Vec::with_capacity(remuda_core::protocol::LINE_ANSWER_MAX_FRAME_BYTES + 1);
+    serde_json::to_writer(&mut frame, &request)?;
+    frame.push(b'\n');
+    if frame.len() > remuda_core::protocol::LINE_ANSWER_MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "line answer frame is oversized",
+        ));
+    }
     stream.write_all(&frame)?;
     stream.flush()
 }
@@ -1928,6 +2044,93 @@ impl Drop for RawMode {
 
 const SECRET_LINE_MAX_BYTES: usize = 4 * 1024;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromptLineEcho {
+    Text(char),
+    Erase,
+    Submit,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PromptLineError {
+    TooLong,
+}
+
+fn edit_prompt_line(
+    events: impl IntoIterator<Item = crossterm::event::Event>,
+    default: Option<&str>,
+    max_bytes: usize,
+    mut echo: impl FnMut(PromptLineEcho),
+) -> Result<Option<String>, PromptLineError> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    let mut line = String::new();
+    let append = |line: &mut String, character: char, echo: &mut dyn FnMut(PromptLineEcho)| {
+        if character.is_control()
+            || remuda_core::protocol::is_secret_prompt_format_or_separator(character)
+        {
+            return Ok(());
+        }
+        let new_len = line
+            .len()
+            .checked_add(character.len_utf8())
+            .ok_or(PromptLineError::TooLong)?;
+        if new_len > max_bytes {
+            return Err(PromptLineError::TooLong);
+        }
+        line.push(character);
+        echo(PromptLineEcho::Text(character));
+        Ok(())
+    };
+
+    for event in events {
+        match event {
+            Event::Paste(text) => {
+                for character in text.chars() {
+                    append(&mut line, character, &mut echo)?;
+                }
+            }
+            Event::Key(key) => {
+                match key.kind {
+                    KeyEventKind::Release => continue,
+                    KeyEventKind::Press | KeyEventKind::Repeat => {}
+                }
+                match key.code {
+                    KeyCode::Enter => {
+                        echo(PromptLineEcho::Submit);
+                        if line.is_empty() {
+                            return Ok(Some(default.unwrap_or_default().to_owned()));
+                        }
+                        return Ok(Some(line));
+                    }
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Backspace => {
+                        if line.pop().is_some() {
+                            echo(PromptLineEcho::Erase);
+                        }
+                    }
+                    KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None);
+                    }
+                    KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None);
+                    }
+                    KeyCode::Char(character)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        append(&mut line, character, &mut echo)?;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Debug, Eq, PartialEq)]
 enum SecretLineError {
     TooLong,
@@ -2110,6 +2313,80 @@ where
     mode.prompt(label)?;
     let answer = edit_secret_line(events);
     mode.finish_line()?;
+    drop(mode);
+    Ok(answer)
+}
+
+fn prompt_line_with_events<T, I>(
+    terminal: T,
+    label: &str,
+    default: Option<&str>,
+    events: I,
+) -> std::io::Result<Result<Option<String>, PromptLineError>>
+where
+    T: SecretPromptTerminal,
+    I: IntoIterator<Item = crossterm::event::Event>,
+{
+    let mut mode = SecretPromptMode::enable(terminal)?;
+    let label: String = label
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    mode.terminal.write_output(label.as_bytes())?;
+    if let Some(default) = default {
+        let default: String = default
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        mode.terminal.write_output(b" [")?;
+        mode.terminal.write_output(default.as_bytes())?;
+        mode.terminal.write_output(b"]")?;
+    }
+    mode.terminal.write_output(b": ")?;
+    mode.terminal.flush_output()?;
+
+    let mut rendered = String::new();
+    let mut output_error = None;
+    let answer = edit_prompt_line(
+        events,
+        default,
+        remuda_core::protocol::LINE_ANSWER_MAX_BYTES,
+        |action| {
+            if output_error.is_some() {
+                return;
+            }
+            let result = match action {
+                PromptLineEcho::Text(character) => {
+                    rendered.push(character);
+                    let mut encoded = [0; 4];
+                    mode.terminal
+                        .write_output(character.encode_utf8(&mut encoded).as_bytes())
+                }
+                PromptLineEcho::Erase => {
+                    if let Some(character) = rendered.pop() {
+                        let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+                        if width > 0 {
+                            let erase = format!("\x1b[{width}D\x1b[{width}P");
+                            mode.terminal.write_output(erase.as_bytes())
+                        } else {
+                            Ok(())
+                        }
+                    } else {
+                        Ok(())
+                    }
+                }
+                PromptLineEcho::Submit => Ok(()),
+            };
+            if let Err(error) = result {
+                output_error = Some(error);
+            }
+        },
+    );
+    if let Some(error) = output_error {
+        return Err(error);
+    }
+    mode.terminal.write_output(b"\r\n")?;
+    mode.terminal.flush_output()?;
     drop(mode);
     Ok(answer)
 }
@@ -2753,6 +3030,136 @@ mod tests {
     }
 
     #[test]
+    fn prompt_line_echoes_typed_characters_backspace_and_enter() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let events = [
+            secret_key(KeyCode::Char('a'), KeyModifiers::NONE),
+            secret_key(KeyCode::Char('é'), KeyModifiers::NONE),
+            secret_key(KeyCode::Backspace, KeyModifiers::NONE),
+            secret_key(KeyCode::Char('x'), KeyModifiers::NONE),
+            secret_key(KeyCode::Enter, KeyModifiers::NONE),
+            secret_key(KeyCode::Char('!'), KeyModifiers::NONE),
+        ];
+        let mut echo = Vec::new();
+
+        let answer = super::edit_prompt_line(events, None, 1024, |action| echo.push(action));
+
+        assert_eq!(answer, Ok(Some("ax".into())));
+        assert_eq!(
+            echo,
+            [
+                super::PromptLineEcho::Text('a'),
+                super::PromptLineEcho::Text('é'),
+                super::PromptLineEcho::Erase,
+                super::PromptLineEcho::Text('x'),
+                super::PromptLineEcho::Submit,
+            ]
+        );
+    }
+
+    #[test]
+    fn prompt_line_empty_enter_returns_default_or_empty_string() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let enter = secret_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            super::edit_prompt_line([enter.clone()], Some("https://example.test"), 1024, |_| {},),
+            Ok(Some("https://example.test".into()))
+        );
+        assert_eq!(
+            super::edit_prompt_line([enter], None, 1024, |_| {}),
+            Ok(Some(String::new()))
+        );
+    }
+
+    #[test]
+    fn prompt_line_rejects_more_than_one_kibibyte() {
+        let events = [crossterm::event::Event::Paste("x".repeat(1025))];
+
+        assert_eq!(
+            super::edit_prompt_line(events, None, 1024, |_| {}),
+            Err(super::PromptLineError::TooLong)
+        );
+    }
+
+    #[test]
+    fn prompt_line_ctrl_c_and_escape_refuse_the_answer() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for cancel in [
+            secret_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            secret_key(KeyCode::Esc, KeyModifiers::NONE),
+        ] {
+            assert_eq!(
+                super::edit_prompt_line([cancel], None, 1024, |_| {}),
+                Ok(None)
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_line_echo_never_emits_pasted_control_characters() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let events = [
+            crossterm::event::Event::Paste("ok\u{1b}[31m".into()),
+            secret_key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let mut echo = Vec::new();
+
+        let answer = super::edit_prompt_line(events, None, 1024, |action| echo.push(action));
+
+        assert_eq!(answer, Ok(Some("ok[31m".into())));
+        assert!(echo.iter().all(|action| match action {
+            super::PromptLineEcho::Text(character) => !character.is_control(),
+            super::PromptLineEcho::Erase | super::PromptLineEcho::Submit => true,
+        }));
+        assert_eq!(
+            echo,
+            [
+                super::PromptLineEcho::Text('o'),
+                super::PromptLineEcho::Text('k'),
+                super::PromptLineEcho::Text('['),
+                super::PromptLineEcho::Text('3'),
+                super::PromptLineEcho::Text('1'),
+                super::PromptLineEcho::Text('m'),
+                super::PromptLineEcho::Submit,
+            ]
+        );
+    }
+
+    #[test]
+    fn prompt_line_echo_drops_format_characters() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let events = [
+            crossterm::event::Event::Paste("ok\u{202e}txt.exe".into()),
+            secret_key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let mut echo = Vec::new();
+
+        let answer = super::edit_prompt_line(events, None, 1024, |action| echo.push(action));
+
+        assert_eq!(answer, Ok(Some("oktxt.exe".into())));
+        assert_eq!(
+            echo,
+            [
+                super::PromptLineEcho::Text('o'),
+                super::PromptLineEcho::Text('k'),
+                super::PromptLineEcho::Text('t'),
+                super::PromptLineEcho::Text('x'),
+                super::PromptLineEcho::Text('t'),
+                super::PromptLineEcho::Text('.'),
+                super::PromptLineEcho::Text('e'),
+                super::PromptLineEcho::Text('x'),
+                super::PromptLineEcho::Text('e'),
+                super::PromptLineEcho::Submit,
+            ]
+        );
+    }
+
+    #[test]
     fn secret_line_enter_submits_and_ignores_later_events() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -2975,6 +3382,42 @@ mod tests {
                 .unwrap();
         assert_eq!(answer.as_slice(), b"S3CRET");
         assert_eq!(terminal.output(), b"Password: \r\x1b[2K\n");
+        assert_eq!(
+            terminal.operations(),
+            [
+                "raw:on",
+                "paste:on",
+                "flush",
+                "flush",
+                "paste:off",
+                "raw:off"
+            ]
+        );
+    }
+
+    #[test]
+    fn prompt_line_prints_default_and_echoes_visible_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::default();
+        let mut events = secret_text_events("ab");
+        events.push(secret_key(KeyCode::Backspace, KeyModifiers::NONE));
+        events.extend(secret_text_events("c"));
+        events.push(secret_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            "Homeserver",
+            Some("https://hs.example"),
+            events,
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some("ac".into())));
+        assert_eq!(
+            terminal.output(),
+            b"Homeserver [https://hs.example]: ab\x1b[1D\x1b[1Pc\r\n"
+        );
         assert_eq!(
             terminal.operations(),
             [

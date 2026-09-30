@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 87] = [
+pub const BINDINGS: [&str; 88] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -43,6 +43,7 @@ pub const BINDINGS: [&str; 87] = [
     "_module_readiness",
     "_pending_create",
     "_pending_events",
+    "_pending_line_events",
     "_pending_secret_events",
     "_process_drain",
     "_process_killpg",
@@ -161,6 +162,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "_pending_secret_events",
         "Drain deferred secret-prompt results for the Lua tick. Any Lua code in this image, including MCP run_script, can read these secret events; the prompt protects terminal input and display, not code inside the image.",
         "_pending_secret_events() -> {{id, prompt_id, secret? | error?}...}",
+    ),
+    (
+        "_pending_line_events",
+        "Drain deferred visible line-prompt results for the Lua tick.",
+        "_pending_line_events() -> {{id, prompt_id, line? | error?}...}",
     ),
     (
         "_session_resize",
@@ -848,6 +854,26 @@ fn pending_bindings(
             Ok(rows)
         })?,
     )?;
+    let line_pending = pending.clone();
+    table.set(
+        "_pending_line_events",
+        lua.create_function(move |lua, ()| {
+            let events = line_pending.drain_line_events();
+            let rows = lua.create_table_with_capacity(events.len(), 0)?;
+            for (index, event) in events.into_iter().enumerate() {
+                let row = lua.create_table()?;
+                row.set("id", event.pending_id)?;
+                row.set("prompt_id", event.prompt_id)?;
+                match event.answer {
+                    Ok(Some(line)) => row.set("line", line)?,
+                    Ok(None) => row.set("error", "refused")?,
+                    Err(error) => row.set("error", error)?,
+                }
+                rows.set(index + 1, row)?;
+            }
+            Ok(rows)
+        })?,
+    )?;
     let secret_pending = pending.clone();
     table.set(
         "_pending_secret_events",
@@ -1472,6 +1498,9 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         )),
         Response::PromptSecret { .. } => Err(mlua::Error::runtime(
             "secret prompts are not supported by this client path",
+        )),
+        Response::PromptLine { .. } => Err(mlua::Error::runtime(
+            "line prompts are not supported by this client path",
         )),
     }
 }

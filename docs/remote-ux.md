@@ -69,7 +69,7 @@ remuda run -n dev claude
 
 From an already joined node, run `remuda cluster remote` to open the same Remuda TUI with the cluster tree on the left and selected-session screen on the right. `remuda cluster remote studio/dev` opens that same UI with the target selected. The daemon keeps the session alive when the initiating terminal goes away.
 
-At first open, expand the local/current node and collapse other nodes. Use ↑/↓ to move through the tree, ←/→ to collapse or expand node groups, and Enter to select a session and focus its line composer. The current target is always named `node / session` in the right pane. A terminal snapshot is shown there with its capture age; the line composer remains in the familiar Remuda footer area.
+At first open, expand the local/current node and collapse other nodes. Use ↑/↓ to move through the tree, ←/→ to collapse or expand node groups, and Enter to select a session and focus its line composer. Press `k` (`k keys` in the footer) on a live selected session to enter fullscreen keys mode; Ctrl-\\ returns to the tree. The current target is always named `node / session` in the right pane. A terminal snapshot is shown there with its capture age; the line composer remains in the familiar Remuda footer area.
 
 ### 2. Phone or laptop view on an unstable network
 
@@ -182,7 +182,7 @@ The selected session pane stays a snapshot, with the line editor integrated into
 
 While offline, characters accumulate in the current draft. Enter freezes that line into the pending queue; pending batches preserve local submission order and retry with the same IDs and bytes. Two viewers’ batches are atomically applied in daemon arrival order. A timeout or reconnect never changes the batch ID. If a batch cannot be proven applied or unapplied, report uncertainty rather than silently duplicating it. Show a small `input from <node/user>` hint when a remote batch arrives, without assigning exclusive input ownership.
 
-The remote line editor handles ordinary text, not arbitrary terminal key timing. Arrows edit the local line; Ctrl-C cancels its current draft; Ctrl-\ returns from session focus to the list; `q` from list/tree focus detaches from the TUI; `x` on the selected session invokes the same termination confirmation as local Remuda. Special application keys remain outside this line-oriented first UX.
+The remote line editor handles ordinary text, not arbitrary terminal key timing. Arrows edit the local line; Ctrl-C cancels its current draft; Ctrl-\ returns from session focus to the list. In keys mode, Esc, Ctrl-C, arrows, Tab, Enter, and other supported terminal key events are forwarded to the selected remote session; Ctrl-\ exits keys mode without forwarding. Paste markers are added only when the remote app has enabled mode 2004. Otherwise the filtered text, including LF and CR, is sent raw as it would be in a local terminal, where each newline may submit a line. Embedded paste markers and other control characters are filtered (TAB, LF, and CR are preserved). `q` from list/tree focus detaches from the TUI; `x` on the selected session invokes the same termination confirmation as local Remuda.
 
 ## Open UX decision
 
