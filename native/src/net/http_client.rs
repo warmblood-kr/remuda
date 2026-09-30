@@ -121,6 +121,8 @@ pub struct HttpRequest {
     pub ca_file: Option<String>,
     /// `sha256/<base64 SPKI SHA-256>`.
     pub pin: Option<String>,
+    /// A matching `pin` replaces chain validation (#382); requires `pin`.
+    pub pin_only: bool,
 }
 
 impl std::fmt::Debug for HttpRequest {
@@ -150,6 +152,7 @@ impl std::fmt::Debug for HttpRequest {
             .field("max_bytes", &self.max_bytes)
             .field("ca_file", &self.ca_file)
             .field("pin", &self.pin)
+            .field("pin_only", &self.pin_only)
             .finish()
     }
 }
@@ -1381,6 +1384,7 @@ pub fn install(
                 max_bytes,
                 ca_file,
                 pin,
+                pin_only: false,
             });
             let key = format!("remuda.http.callback.{}", task.id);
             lua.set_named_registry_value(&key, callback)?;
@@ -1422,6 +1426,7 @@ pub fn install(
                 max_bytes: 0,
                 ca_file,
                 pin,
+                pin_only: false,
             });
             let key = format!("remuda.http.callback.{}", task.id);
             lua.set_named_registry_value(&key, callback)?;
@@ -1512,6 +1517,7 @@ mod tests {
             max_bytes: 1024,
             ca_file: None,
             pin: None,
+            pin_only: false,
         }
     }
 
@@ -1970,6 +1976,157 @@ mod tests {
             .unwrap_err()
             .contains("TLS request failed"));
         assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    fn pin_of(cert_pem: &str) -> String {
+        let cert = super::parse_pem_certs(cert_pem).unwrap();
+        let spki = super::certificate_spki(cert[0].as_ref()).unwrap();
+        format!(
+            "sha256/{}",
+            base64::engine::general_purpose::STANDARD.encode(Sha256::digest(spki))
+        )
+    }
+
+    fn selfsigned_stub(host: &str) -> (String, std::sync::mpsc::Receiver<bool>) {
+        tls_stub_with(
+            include_str!("testdata/selfsigned-ca.pem"),
+            include_str!("testdata/selfsigned-ca-key.pem"),
+            false,
+            host,
+        )
+    }
+
+    fn pin_only_request(url: String, pin: Option<String>) -> HttpRequest {
+        let mut req = request(url);
+        req.pin = pin;
+        req.pin_only = true;
+        req
+    }
+
+    #[test]
+    fn pin_only_accepts_self_signed_certificate_with_matching_pin() {
+        let (url, seen) = selfsigned_stub("localhost");
+        let req = pin_only_request(
+            url,
+            Some(pin_of(include_str!("testdata/selfsigned-ca.pem"))),
+        );
+        assert_eq!(perform(req, None).unwrap().status, 200);
+        assert!(seen.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn plain_pin_stays_additive_for_self_signed_certificate() {
+        let (url, seen) = selfsigned_stub("localhost");
+        let mut req = request(url);
+        req.pin = Some(pin_of(include_str!("testdata/selfsigned-ca.pem")));
+        assert!(perform(req, None)
+            .unwrap_err()
+            .contains("TLS request failed"));
+        assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn pin_only_with_wrong_pin_fails_before_http_bytes() {
+        let (url, seen) = selfsigned_stub("localhost");
+        let req = pin_only_request(url, Some(test_pin()));
+        assert!(perform(req, None)
+            .unwrap_err()
+            .contains("SPKI pin mismatch"));
+        assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn pin_only_with_matching_pin_still_checks_hostname() {
+        let (url, seen) = selfsigned_stub("localhost");
+        let req = pin_only_request(
+            url.replace("localhost", "127.0.0.1"),
+            Some(pin_of(include_str!("testdata/selfsigned-ca.pem"))),
+        );
+        assert!(perform(req, None)
+            .unwrap_err()
+            .contains("TLS request failed"));
+        assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn pin_only_with_matching_pin_still_checks_validity_dates() {
+        let pem = include_str!("testdata/selfsigned-ca.pem");
+        let cert = super::parse_pem_certs(pem).unwrap();
+        let req = pin_only_request("https://localhost/".into(), Some(pin_of(pem)));
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = super::tls_verifier(&req, provider).unwrap();
+        let name = ServerName::try_from("localhost".to_owned()).unwrap();
+        let now = rustls::pki_types::UnixTime::now();
+        verifier
+            .verify_server_cert(&cert[0], &[], &name, &[], now)
+            .expect("pin-only accepts the pinned certificate while it is valid");
+        let too_late =
+            rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(4_102_444_800));
+        assert!(verifier
+            .verify_server_cert(&cert[0], &[], &name, &[], too_late)
+            .unwrap_err()
+            .to_string()
+            .contains("expired"));
+        let too_early = rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_secs(1));
+        assert!(verifier
+            .verify_server_cert(&cert[0], &[], &name, &[], too_early)
+            .unwrap_err()
+            .to_string()
+            .contains("not yet valid"));
+    }
+
+    #[test]
+    fn pin_only_without_pin_is_refused_before_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!(
+            "https://localhost:{}/test",
+            listener.local_addr().unwrap().port()
+        );
+        let error = perform(pin_only_request(url, None), None).unwrap_err();
+        assert!(
+            error.contains("pin_only") && error.contains("pin"),
+            "{error}"
+        );
+        assert!(
+            listener.accept().is_err(),
+            "pin_only without pin must not connect"
+        );
+    }
+
+    #[test]
+    fn pin_only_lua_option_reaches_the_request() {
+        let (url, seen) = selfsigned_stub("localhost");
+        let socket =
+            std::env::temp_dir().join(format!("unused-http-pin-only-image-{}", std::process::id()));
+        let image = crate::image::Image::spawn(
+            &socket,
+            std::sync::Arc::new(remuda_core::Registry::new()),
+            std::sync::Arc::new(crate::tick::Counters::default()),
+        );
+        let pin = pin_of(include_str!("testdata/selfsigned-ca.pem"));
+        let code = format!("remuda.http.request{{method='GET', url='{url}', timeout=2, pin='{pin}', pin_only=true, callback=function(r) remuda._pin_only_status=r.status; remuda._pin_only_error=r.error; remuda._pin_only_done=true end}}; return 'started'");
+        assert_eq!(image.eval(&code, None).unwrap(), "started");
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while image
+            .eval("return remuda._pin_only_done or false", None)
+            .unwrap()
+            != "true"
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "pin_only request callback did not run"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let status = image.eval("return remuda._pin_only_status", None).unwrap();
+        let error = image.eval("return remuda._pin_only_error", None).unwrap();
+        image.stop_for_test();
+        assert_eq!(
+            status, "200",
+            "pin_only=true must reach the request: {error}"
+        );
+        assert!(seen.recv_timeout(Duration::from_secs(1)).unwrap());
     }
 
     #[test]
