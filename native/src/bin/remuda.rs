@@ -817,24 +817,24 @@ fn describe_cluster_error(
             };
             if let Some(reason) = reason {
                 return format!(
-                    "remuda: cluster join: cannot reach {address} ({reason}).\nNext: on the inviting machine, check `remuda cluster listen` is running on that address."
+                    "cluster join: cannot reach {address} ({reason}).\nNext: on the inviting machine, check `remuda cluster listen` is running on that address."
                 );
             }
             if kind == std::io::ErrorKind::PermissionDenied && detail == "join was refused" {
-                return "remuda: cluster join: the invitation was refused (join lines work once and expire after 10 minutes).\nNext: run `remuda cluster invite` on the inviting machine again.".into();
+                return "cluster join: the invitation was refused (join lines work once and expire after 10 minutes).\nNext: run `remuda cluster invite` on the inviting machine again.".into();
             }
             if kind == std::io::ErrorKind::PermissionDenied
                 && detail.starts_with("issuer fingerprint mismatch:")
             {
                 let ClusterErrorContext::Join(invitation) = context else {
-                    return "remuda: cluster join: issuer fingerprint mismatch.\nNext: ask the inviting machine to run `remuda cluster` and read its Fingerprint line.".into();
+                    return "cluster join: issuer fingerprint mismatch.\nNext: ask the inviting machine to run `remuda cluster` and read its Fingerprint line.".into();
                 };
                 let mismatch = describe_fingerprint_mismatch(&detail, invitation);
                 return format!(
-                    "remuda: cluster join: {mismatch}.\nNext: ask the inviting machine to run `remuda cluster` and read its Fingerprint line."
+                    "cluster join: {mismatch}.\nNext: ask the inviting machine to run `remuda cluster` and read its Fingerprint line."
                 );
             }
-            "remuda: cluster join: the operation could not be completed.\nNext: check the invitation and try again.".into()
+            format!("cluster join: {detail}.\nNext: check the invitation and try again.")
         }
         "listen" => {
             let address = context.address();
@@ -842,15 +842,15 @@ fn describe_cluster_error(
                 && detail == "wildcard listener bind requires explicit public-bind opt-in"
                 && address.ip().is_unspecified()
             {
-                return "remuda: cluster listener: binding all interfaces needs --allow-public (or use this machine's LAN IP).\nNext: add --allow-public or bind this machine's LAN IP.".into();
+                return "cluster listener: binding all interfaces needs --allow-public (or use this machine's LAN IP).\nNext: add --allow-public or bind this machine's LAN IP.".into();
             }
             if kind == std::io::ErrorKind::AddrNotAvailable {
                 return format!(
-                    "remuda: cluster listener: {} is not an address of this machine.\nNext: run `remuda cluster listen --bind IP:7441` with this machine's IP.",
+                    "cluster listener: {} is not an address of this machine.\nNext: run `remuda cluster listen --bind IP:7441` with this machine's IP.",
                     address.ip()
                 );
             }
-            format!("remuda: cluster listener: {detail}.\nNext: check the bind address and run `remuda cluster listen` again.")
+            format!("cluster listener: {detail}.\nNext: check the bind address and run `remuda cluster listen` again.")
         }
         "invite" => {
             let address = context.address();
@@ -858,13 +858,11 @@ fn describe_cluster_error(
                 && detail == "invalid cluster join line"
                 && address.ip().is_unspecified()
             {
-                return "remuda: cluster invite: use an address of this machine that the other machine can reach, e.g. --bind 192.168.1.20:7441.\nNext: rerun `remuda cluster invite` with that address.".into();
+                return "cluster invite: use an address of this machine that the other machine can reach, e.g. --bind 192.168.1.20:7441.\nNext: rerun `remuda cluster invite` with that address.".into();
             }
-            format!("remuda: cluster invite: {detail}.\nNext: check the bind address and run `remuda cluster invite` again.")
+            format!("cluster invite: {detail}.\nNext: check the bind address and run `remuda cluster invite` again.")
         }
-        _ => format!(
-            "remuda: cluster {verb}: operation failed.\nNext: run `remuda help` for commands."
-        ),
+        _ => format!("cluster {verb}: operation failed.\nNext: run `remuda help` for commands."),
     }
 }
 
@@ -3256,8 +3254,12 @@ fn fail(message: impl std::fmt::Display) -> ExitCode {
         eprintln!("{text}");
         return ExitCode::from(code);
     }
-    eprintln!("remuda: {message}");
+    eprintln!("{}", format_failure(&message));
     ExitCode::FAILURE
+}
+
+fn format_failure(message: &str) -> String {
+    format!("remuda: {message}")
 }
 
 /// Prints `1..=n`, one per line, flushing after each and sleeping
@@ -3349,6 +3351,25 @@ mod tests {
             assert!(message.contains(expected), "{verb}: {message}");
             assert!(message.contains("Next:"), "{verb}: {message}");
         }
+    }
+
+    #[test]
+    fn generic_join_error_keeps_detail_and_has_one_cli_prefix() {
+        let address = "192.0.2.8:7441".parse().unwrap();
+        let error = std::io::Error::other("connection reset by peer");
+        let description =
+            describe_cluster_error("join", &error, ClusterErrorContext::Address(address));
+        assert_eq!(
+            description,
+            "cluster join: connection reset by peer.\nNext: check the invitation and try again."
+        );
+
+        let printed = format_failure(&description);
+        assert_eq!(printed.matches("remuda: ").count(), 1, "{printed}");
+        assert_eq!(
+            printed,
+            "remuda: cluster join: connection reset by peer.\nNext: check the invitation and try again."
+        );
     }
 
     #[test]
