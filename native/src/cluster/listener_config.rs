@@ -118,10 +118,49 @@ pub fn remove() -> io::Result<()> {
 
 /// Persist the listener configuration in one cluster state directory.
 pub fn write_at(dir: &Path, config: &ListenerConfig) -> io::Result<()> {
-    use std::fs;
-
     super::storage::verify_directory(dir)?;
     let _guard = super::storage::StateLock::acquire(dir)?;
+    write_locked(dir, config)
+}
+
+/// Restore a listener snapshot only while the current config matches `expected`.
+pub fn restore_if_current(
+    expected: Option<&ListenerConfig>,
+    snapshot: Option<ListenerConfig>,
+) -> io::Result<bool> {
+    let dir = super::storage::cluster_state_dir()?.join("cluster");
+    super::identity::load_identity_at(&dir)?;
+    restore_if_current_at(&dir, expected, snapshot)
+}
+
+/// Restore a listener snapshot under the state lock if its expected config remains current.
+pub fn restore_if_current_at(
+    dir: &Path,
+    expected: Option<&ListenerConfig>,
+    snapshot: Option<ListenerConfig>,
+) -> io::Result<bool> {
+    super::storage::verify_directory(dir)?;
+    let _guard = super::storage::StateLock::acquire(dir)?;
+    if read_at(dir)?.as_ref() != expected {
+        return Ok(false);
+    }
+    match snapshot {
+        Some(config) => write_locked(dir, &config)?,
+        None => remove_locked(dir)?,
+    }
+    Ok(true)
+}
+
+/// Remove the persisted listener configuration in one cluster state directory.
+pub fn remove_at(dir: &Path) -> io::Result<()> {
+    super::storage::verify_directory(dir)?;
+    let _guard = super::storage::StateLock::acquire(dir)?;
+    remove_locked(dir)
+}
+
+fn write_locked(dir: &Path, config: &ListenerConfig) -> io::Result<()> {
+    use std::fs;
+
     let path = dir.join(LISTENER_FILE);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -148,12 +187,9 @@ pub fn write_at(dir: &Path, config: &ListenerConfig) -> io::Result<()> {
     super::storage::atomic_write(&path, &bytes)
 }
 
-/// Remove the persisted listener configuration in one cluster state directory.
-pub fn remove_at(dir: &Path) -> io::Result<()> {
+fn remove_locked(dir: &Path) -> io::Result<()> {
     use std::fs;
 
-    super::storage::verify_directory(dir)?;
-    let _guard = super::storage::StateLock::acquire(dir)?;
     let path = dir.join(LISTENER_FILE);
     let file = match open_listener_file(&path) {
         Ok(file) => file,

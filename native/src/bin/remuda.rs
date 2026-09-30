@@ -1378,20 +1378,30 @@ fn cluster_join_with_listener(
             ))
         }
     };
-    let mut restore_guard = JoinListenerRestoreGuard::new(daemon_path, listener_snapshot);
+    let mut restore_guard = JoinListenerRestoreGuard::new(daemon_path, listener_snapshot.clone());
     let initial_status = remuda_native::cluster::listener_control::status(daemon_path);
     let listener_status = match bind_addr {
-        Some(address) => remuda_native::cluster::listener_control::start(
-            daemon_path,
-            Some(ListenerConfig {
+        Some(address) => {
+            let config = ListenerConfig {
                 enabled: true,
                 bind: ListenerBind::Explicit(address),
                 allow_public: false,
-            }),
-        ),
+            };
+            restore_guard.set_expected(Some(config.clone()));
+            remuda_native::cluster::listener_control::start(daemon_path, Some(config))
+        }
         None => match initial_status {
             remuda_core::protocol::ListenerStatus::On { .. } => Ok(initial_status),
-            _ => remuda_native::cluster::listener_control::start(daemon_path, None),
+            _ => {
+                let mut config = listener_snapshot.unwrap_or(ListenerConfig {
+                    enabled: true,
+                    bind: ListenerBind::Auto,
+                    allow_public: false,
+                });
+                config.enabled = true;
+                restore_guard.set_expected(Some(config.clone()));
+                remuda_native::cluster::listener_control::start(daemon_path, Some(config))
+            }
         },
     };
     let listener_status = match listener_status {
@@ -1454,6 +1464,7 @@ fn cluster_join_with_listener(
 struct JoinListenerRestoreGuard {
     daemon_path: PathBuf,
     snapshot: Option<ListenerConfig>,
+    expected: Option<ListenerConfig>,
     expected_off: bool,
     armed: bool,
 }
@@ -1463,15 +1474,26 @@ impl JoinListenerRestoreGuard {
         let expected_off = snapshot.as_ref().is_none_or(|config| !config.enabled);
         Self {
             daemon_path: daemon_path.to_path_buf(),
+            expected: snapshot.clone(),
             snapshot,
             expected_off,
             armed: true,
         }
     }
 
-    fn restore(&mut self) -> std::io::Result<remuda_core::protocol::ListenerStatus> {
+    fn set_expected(&mut self, expected: Option<ListenerConfig>) {
+        self.expected = expected;
+    }
+
+    fn restore(
+        &mut self,
+    ) -> std::io::Result<remuda_native::cluster::listener_control::RestoreOutcome> {
         self.armed = false;
-        remuda_native::cluster::listener_control::restore(&self.daemon_path, self.snapshot.take())
+        remuda_native::cluster::listener_control::restore(
+            &self.daemon_path,
+            self.expected.as_ref(),
+            self.snapshot.take(),
+        )
     }
 
     fn disarm(&mut self) {
@@ -1488,11 +1510,14 @@ impl Drop for JoinListenerRestoreGuard {
 }
 
 fn restore_join_listener(guard: &mut JoinListenerRestoreGuard) -> Option<String> {
+    use remuda_native::cluster::listener_control::RestoreOutcome;
+
     match guard.restore() {
-        Ok(remuda_core::protocol::ListenerStatus::On { addr, .. }) if guard.expected_off => {
-            Some(render_join_listener_unexpected_on(addr))
-        }
-        Ok(_) => None,
+        Ok(RestoreOutcome::Restored(remuda_core::protocol::ListenerStatus::On {
+            addr, ..
+        })) if guard.expected_off => Some(render_join_listener_unexpected_on(addr)),
+        Ok(RestoreOutcome::Restored(_)) => None,
+        Ok(RestoreOutcome::SkippedChanged) => Some(render_join_listener_changed_during_join()),
         Err(error) => Some(render_join_listener_restore_error(&error)),
     }
 }
@@ -1538,32 +1563,60 @@ fn run_join_interruptible(
 
 #[cfg(unix)]
 struct JoinInterruptHandler {
-    previous: libc::sighandler_t,
+    previous: Vec<(libc::c_int, libc::sighandler_t)>,
 }
 
 #[cfg(unix)]
 impl JoinInterruptHandler {
     fn install() -> std::io::Result<Self> {
         JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
-        let previous = unsafe {
-            libc::signal(
-                libc::SIGINT,
-                record_join_interrupt as *const () as libc::sighandler_t,
-            )
-        };
-        if previous == libc::SIG_ERR {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(Self { previous })
+        let mut previous = Vec::with_capacity(3);
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            // SAFETY: install the flag-only handler for this signal, retaining its prior action.
+            let prior = unsafe {
+                libc::signal(
+                    signal,
+                    record_join_interrupt as *const () as libc::sighandler_t,
+                )
+            };
+            if prior == libc::SIG_ERR {
+                let error = std::io::Error::last_os_error();
+                for (installed_signal, old_handler) in previous.drain(..).rev() {
+                    // SAFETY: restore the disposition returned by the earlier signal call.
+                    unsafe {
+                        libc::signal(installed_signal, old_handler);
+                    }
+                }
+                return Err(error);
+            }
+            if prior == libc::SIG_IGN {
+                // Preserve signals ignored by the caller (for example SIGHUP under nohup).
+                if unsafe { libc::signal(signal, libc::SIG_IGN) } == libc::SIG_ERR {
+                    let error = std::io::Error::last_os_error();
+                    for (installed_signal, old_handler) in previous.drain(..).rev() {
+                        // SAFETY: restore the disposition returned by the earlier signal call.
+                        unsafe {
+                            libc::signal(installed_signal, old_handler);
+                        }
+                    }
+                    return Err(error);
+                }
+                continue;
+            }
+            previous.push((signal, prior));
         }
+        Ok(Self { previous })
     }
 }
 
 #[cfg(unix)]
 impl Drop for JoinInterruptHandler {
     fn drop(&mut self) {
-        unsafe {
-            libc::signal(libc::SIGINT, self.previous);
+        for (signal, previous) in self.previous.drain(..).rev() {
+            // SAFETY: restore the disposition returned when this handler was installed.
+            unsafe {
+                libc::signal(signal, previous);
+            }
         }
     }
 }
@@ -1627,6 +1680,10 @@ fn render_join_listener_restore_error(error: &std::io::Error) -> String {
 
 fn render_join_listener_unexpected_on(addr: std::net::SocketAddr) -> String {
     format!("cluster join: listener remains on at {addr}\nNext: run `remuda cluster listen --off` and check `remuda cluster`.")
+}
+
+fn render_join_listener_changed_during_join() -> String {
+    "cluster join: listener config changed during join; leaving the current config unchanged. Next: check `remuda cluster`.".into()
 }
 
 #[derive(Clone, Copy)]
@@ -2343,6 +2400,9 @@ mod cluster_cli_tests {
     static FOREGROUND_LISTENER_LOCK_TEST: Mutex<()> = Mutex::new(());
 
     #[cfg(unix)]
+    static JOIN_SIGNAL_TEST: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
     struct ForegroundListenerLockEnvironment {
         _lock: MutexGuard<'static, ()>,
         root: std::path::PathBuf,
@@ -2505,15 +2565,16 @@ mod cluster_cli_tests {
     #[test]
     fn join_listener_drop_guard_restores_during_unwind() {
         let environment = ForegroundListenerLockEnvironment::new();
-        remuda_native::cluster::listener_config::write(&ListenerConfig {
+        let join_config = ListenerConfig {
             enabled: true,
             bind: ListenerBind::Auto,
             allow_public: false,
-        })
-        .unwrap();
+        };
+        remuda_native::cluster::listener_config::write(&join_config).unwrap();
         let daemon_path = environment.root.join("missing-daemon.sock");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = JoinListenerRestoreGuard::new(&daemon_path, None);
+            let mut guard = JoinListenerRestoreGuard::new(&daemon_path, None);
+            guard.set_expected(Some(join_config));
             panic!("simulate join panic");
         }));
         assert!(result.is_err());
@@ -2545,10 +2606,72 @@ mod cluster_cli_tests {
     #[cfg(unix)]
     #[test]
     fn join_sigint_handler_sets_the_cancellation_flag() {
+        let _serial = JOIN_SIGNAL_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _handler = JoinInterruptHandler::install().unwrap();
         assert!(!JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
         assert!(JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_interrupt_handler_preserves_ignored_sighup() {
+        let _serial = JOIN_SIGNAL_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct RestoreSignal(libc::c_int, libc::sighandler_t);
+        impl Drop for RestoreSignal {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::signal(self.0, self.1);
+                }
+            }
+        }
+
+        let prior = unsafe { libc::signal(libc::SIGHUP, libc::SIG_IGN) };
+        assert_ne!(prior, libc::SIG_ERR, "set SIGHUP to ignored");
+        let _restore = RestoreSignal(libc::SIGHUP, prior);
+        JOIN_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _handler = JoinInterruptHandler::install().unwrap();
+
+        assert_eq!(current_signal_handler(libc::SIGHUP), libc::SIG_IGN);
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        assert!(!JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_interrupt_handler_tracks_signals_and_restores_prior_dispositions() {
+        let _serial = JOIN_SIGNAL_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let signals = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+        let before: Vec<_> = signals
+            .iter()
+            .map(|signal| current_signal_handler(*signal))
+            .collect();
+        let handler = JoinInterruptHandler::install().unwrap();
+        for signal in signals {
+            JOIN_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(unsafe { libc::raise(signal) }, 0);
+            assert!(JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        drop(handler);
+        for (signal, expected) in signals.into_iter().zip(before) {
+            assert_eq!(current_signal_handler(signal), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    fn current_signal_handler(signal: libc::c_int) -> libc::sighandler_t {
+        let mut action = std::mem::MaybeUninit::<libc::sigaction>::uninit();
+        // SAFETY: a null action queries the current disposition into valid output storage.
+        let status = unsafe { libc::sigaction(signal, std::ptr::null(), action.as_mut_ptr()) };
+        assert_eq!(status, 0, "query signal disposition");
+        // SAFETY: sigaction initialized the output when it returned success.
+        unsafe { action.assume_init().sa_sigaction }
     }
 
     #[test]
