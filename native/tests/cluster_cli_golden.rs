@@ -490,7 +490,7 @@ fn listen_off_without_daemon_saves_config_without_starting_one() {
     let original = ListenerConfig {
         enabled: true,
         bind: ListenerBind::Explicit("127.0.0.1:0".parse().unwrap()),
-        allow_public: false,
+        allow_public: true,
     };
     let cluster_dir = scratch.root.join("state/remuda/cluster");
     listener_config::write_at(&cluster_dir, &original).unwrap();
@@ -502,6 +502,7 @@ fn listen_off_without_daemon_saves_config_without_starting_one() {
         listener_config::read_at(&cluster_dir).unwrap(),
         Some(ListenerConfig {
             enabled: false,
+            allow_public: false,
             ..original
         })
     );

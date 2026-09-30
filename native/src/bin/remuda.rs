@@ -1046,6 +1046,7 @@ fn cluster_listen_off(server: &str, path: &Path) -> ExitCode {
             };
             let mut config = config;
             config.enabled = false;
+            config.allow_public = false;
             if let Err(error) = remuda_native::cluster::listener_config::write(&config) {
                 return fail(format!(
                     "cluster listen --off: cannot save disabled listener config: {error}\nNext: start the remuda daemon and retry `remuda cluster listen --off`."
