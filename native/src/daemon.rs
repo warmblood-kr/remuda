@@ -2712,6 +2712,39 @@ mod tests {
             Err(crate::net::advertise_addr::NoLanAddr { candidate: None })
         }));
     }
+    #[cfg(not(windows))]
+    #[test]
+    fn auto_listener_does_not_bind_without_an_eligible_private_address() {
+        use std::net::IpAddr;
+
+        let candidates = [
+            Some("8.8.8.8".parse::<IpAddr>().unwrap()),
+            Some("100.64.0.1".parse().unwrap()),
+            None,
+        ];
+        for candidate in candidates {
+            let environment = ListenerTaskEnvironment::new(Some(auto_listener_config()));
+            let detector: AutoAddressDetector =
+                Arc::new(move || Err(crate::net::advertise_addr::NoLanAddr { candidate }));
+            let task = ListenerTask::start_with_detector(&environment.socket_path(), detector);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match task.status() {
+                    ListenerStatus::Failed(reason) => {
+                        assert!(reason.contains("no private LAN address found"), "{reason}");
+                        break;
+                    }
+                    ListenerStatus::Off if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    status => {
+                        panic!("ineligible candidate unexpectedly bound a listener: {status:?}")
+                    }
+                }
+            }
+        }
+    }
+
     // Windows test-windows is blocked by identity storage hardening tracked in #348.
     #[cfg(not(windows))]
     static LISTENER_TASK_TEST_LOCK: Mutex<()> = Mutex::new(());
