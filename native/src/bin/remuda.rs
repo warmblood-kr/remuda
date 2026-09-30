@@ -1132,31 +1132,40 @@ fn print_cluster_listener_status(server: &str, path: &Path) -> ExitCode {
     }
 }
 
+fn cluster_init_listener_config(existing: Option<ListenerConfig>, enabled: bool) -> ListenerConfig {
+    let (bind, allow_public) = match existing {
+        Some(ListenerConfig {
+            bind: ListenerBind::Explicit(address),
+            allow_public,
+            ..
+        }) => (ListenerBind::Explicit(address), allow_public),
+        _ => (ListenerBind::Auto, false),
+    };
+    ListenerConfig {
+        enabled,
+        bind,
+        allow_public,
+    }
+}
+
 fn cluster_init(server: &str, path: &Path, no_listen: bool) -> ExitCode {
     with_daemon(server, path, |daemon_path| {
         let (identity, created) = match remuda_native::cluster::init() {
             Ok(initialized) => initialized,
             Err(error) => return fail(render_cluster_init_error(&error)),
         };
+        let existing_config = match remuda_native::cluster::listener_control::config() {
+            Ok(config) => config,
+            Err(error) => return fail(render_init_listener_error(&error)),
+        };
+        let config = cluster_init_listener_config(existing_config, !no_listen);
         let listener_status = if no_listen {
-            let config = ListenerConfig {
-                enabled: false,
-                bind: ListenerBind::Auto,
-                allow_public: false,
-            };
             if let Err(error) = remuda_native::cluster::listener_config::write(&config) {
                 return fail(render_init_listener_error(&error));
             }
             remuda_native::cluster::listener_control::stop(daemon_path)
         } else {
-            remuda_native::cluster::listener_control::start(
-                daemon_path,
-                Some(ListenerConfig {
-                    enabled: true,
-                    bind: ListenerBind::Auto,
-                    allow_public: false,
-                }),
-            )
+            remuda_native::cluster::listener_control::start(daemon_path, Some(config))
         };
         match listener_status {
             Ok(status) => {
@@ -3317,6 +3326,22 @@ mod cluster_cli_tests {
             parse_cluster_command(&["listen", "--bind", "not-an-address"]),
             ClusterCommand::Invalid { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cluster_init_keeps_explicit_listener_bind() {
+        let existing = ListenerConfig {
+            enabled: false,
+            bind: ListenerBind::Explicit("192.168.1.20:7441".parse().unwrap()),
+            allow_public: true,
+        };
+        for enabled in [true, false] {
+            let updated = super::cluster_init_listener_config(Some(existing.clone()), enabled);
+            assert_eq!(updated.enabled, enabled);
+            assert_eq!(updated.bind, existing.bind);
+            assert_eq!(updated.allow_public, existing.allow_public);
+        }
     }
 
     #[test]
