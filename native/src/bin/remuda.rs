@@ -27,6 +27,8 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
+const CLUSTER_DEFAULT_PORT: u16 = 7441;
+
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
 
@@ -170,10 +172,7 @@ fn main() -> ExitCode {
             .and_then(|word| remuda_native::packages::half_installed(word))
         {
             Some(message) => fail(message),
-            None => {
-                eprint!("{}", USAGE);
-                ExitCode::FAILURE
-            }
+            None => unknown_command(argv.first().copied().unwrap_or("")),
         },
     }
 }
@@ -215,6 +214,8 @@ remuda — a pty manager you can attach to
   remuda mod remove NAME          remove one installed mod
   remuda cluster                  show cluster status
   remuda cluster init             create this node's cluster identity
+  remuda cluster invite           invite another node
+  remuda cluster join             join another node's cluster
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster remote [node/session] open the read-only cluster tree
@@ -290,6 +291,8 @@ remuda — terminal orchestration for coding agents
   remuda mod remove NAME         remove a mod
   remuda cluster                 show cluster status
   remuda cluster init            create this node's cluster identity
+  remuda cluster invite           invite another node
+  remuda cluster join             join another node's cluster
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster remote [node/session] open the read-only cluster tree
@@ -305,7 +308,7 @@ Run `remuda mod list` for installed mods and `remuda doc` for the live Lua API.
 ";
 
 fn help_command() -> ExitCode {
-    eprint!("{USAGE}");
+    print!("{USAGE}");
     match remuda_native::packages::manifests() {
         Ok(mods) => {
             let commands: Vec<_> = mods
@@ -322,6 +325,78 @@ fn help_command() -> ExitCode {
         }
         Err(error) => fail(error),
     }
+}
+
+fn unknown_command(word: &str) -> ExitCode {
+    if word.starts_with("remuda-join-v1") {
+        eprintln!(
+            "remuda: that looks like a join line; run: remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
+        );
+    } else if is_command_word(word) {
+        match suggest_command(word) {
+            Some(suggestion) => {
+                eprintln!("remuda: unknown command '{word}'. Did you mean 'remuda {suggestion}'?")
+            }
+            None => {
+                eprintln!("remuda: unknown command '{word}'. Run 'remuda help' for commands.")
+            }
+        }
+    } else {
+        eprintln!("remuda: unknown command. Run 'remuda help' for commands.");
+    }
+    ExitCode::FAILURE
+}
+
+fn is_command_word(word: &str) -> bool {
+    !word.is_empty()
+        && word.len() <= 32
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn suggest_command(word: &str) -> Option<String> {
+    const CLUSTER_VERBS: &[&str] = &[
+        "nodes", "init", "invite", "join", "revoke", "remote", "listen", "control", "call",
+    ];
+    if CLUSTER_VERBS.contains(&word) {
+        return Some(format!("cluster {word}"));
+    }
+
+    const TOP_LEVEL_VERBS: &[&str] = &[
+        "run", "attach", "ls", "send", "resize", "stop", "mod", "doc", "repl", "lua", "exec",
+        "mcp", "upgrade", "cluster",
+    ];
+    closest_word(word, TOP_LEVEL_VERBS).map(str::to_owned)
+}
+
+fn closest_word<'a>(word: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let word_length = word.chars().count();
+    candidates
+        .iter()
+        .copied()
+        .map(|candidate| (levenshtein(word, candidate), candidate))
+        .filter(|(distance, _)| *distance <= 2 && *distance < word_length)
+        .min_by_key(|(distance, candidate)| (*distance, *candidate))
+        .map(|(_, candidate)| candidate)
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    let mut row: Vec<usize> = (0..=right.len()).collect();
+    for (i, left_char) in left.iter().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, right_char) in right.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (row[j] + 1)
+                .min(above + 1)
+                .min(diagonal + usize::from(left_char != right_char));
+            diagonal = above;
+        }
+    }
+    row[right.len()]
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -427,7 +502,7 @@ fn parse_cluster_invite(args: &[&str]) -> Result<ClusterCommand, String> {
         [] => return Err("missing --bind ADDR".into()),
         _ => return Err("expected --bind ADDR".into()),
     };
-    let bind_addr = parse_socket_address(address)?;
+    let bind_addr = parse_addr_default_port(address)?;
     Ok(ClusterCommand::Invite { bind_addr })
 }
 
@@ -472,7 +547,7 @@ fn parse_cluster_join(args: &[&str]) -> Result<ClusterCommand, String> {
 }
 
 fn parse_join_bind(value: &str) -> Result<std::net::SocketAddr, String> {
-    let address = parse_socket_address(value)?;
+    let address = parse_addr_default_port(value)?;
     remuda_native::cluster::join_line::validate_endpoint(address)
         .map_err(|_| "invalid client bind address")?;
     Ok(address)
@@ -528,7 +603,7 @@ fn parse_cluster_listen(args: &[&str]) -> Result<ClusterCommand, String> {
         [] => return Err("missing --bind ADDR".into()),
         _ => return Err("expected --bind ADDR".into()),
     };
-    let bind_addr = parse_socket_address(address)?;
+    let bind_addr = parse_addr_default_port(address)?;
     Ok(ClusterCommand::Listen {
         bind_addr,
         allow_public,
@@ -567,11 +642,11 @@ fn parse_cluster_call(
             }
             "--addr" if address.is_none() => {
                 let value = args.get(index + 1).ok_or("missing address after --addr")?;
-                address = Some(parse_socket_address(value)?);
+                address = Some(parse_addr_default_port(value)?);
                 index += 2;
             }
             flag if address.is_none() && flag.starts_with("--addr=") => {
-                address = Some(parse_socket_address(&flag[7..])?);
+                address = Some(parse_addr_default_port(&flag[7..])?);
                 index += 1;
             }
             _ => return Err(format!("unexpected argument {}", args[index])),
@@ -586,35 +661,38 @@ fn parse_cluster_call(
     })
 }
 
-fn parse_socket_address(value: &str) -> Result<std::net::SocketAddr, String> {
-    value.parse().map_err(|_| {
-        if let Ok(address) = value.parse::<std::net::IpAddr>() {
-            match address {
-                std::net::IpAddr::V4(address) => {
-                    format!("address needs a port, e.g. {address}:7441")
-                }
-                std::net::IpAddr::V6(address) => {
-                    format!("address needs a port, e.g. [{address}]:7441")
-                }
-            }
-        } else {
-            format!("invalid address '{value}'")
-        }
-    })
+fn parse_addr_default_port(value: &str) -> Result<std::net::SocketAddr, String> {
+    if let Ok(address) = value.parse() {
+        return Ok(address);
+    }
+    if let Ok(address) = value.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(address, CLUSTER_DEFAULT_PORT));
+    }
+    if let Some(address) = value
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .and_then(|value| value.parse::<std::net::Ipv6Addr>().ok())
+    {
+        return Ok(std::net::SocketAddr::new(
+            std::net::IpAddr::V6(address),
+            CLUSTER_DEFAULT_PORT,
+        ));
+    }
+    Err(format!("invalid address '{value}'"))
 }
 
-pub fn cluster_usage(verb: &str) -> &'static str {
+pub fn cluster_usage(verb: &str) -> String {
     match verb {
-        "init" => "usage: remuda cluster init\nexample: remuda cluster init\n",
-        "invite" => "usage: remuda cluster invite --bind IP:PORT\nexample: remuda cluster invite --bind 192.168.1.20:7441\n",
-        "join" => "usage: remuda cluster join FINGERPRINT 'JOIN_LINE' [--bind IP:PORT]\nexample: remuda cluster join 'SHA256:…' 'remuda-join-v1 …'\n",
-        "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n",
-        "revoke" => "usage: remuda cluster revoke NODE|FINGERPRINT [--yes]\nexample: remuda cluster revoke node-abcd1234\n",
-        "control" => "usage: remuda cluster control on|off\nexample: remuda cluster control off\n",
-        "remote" => "usage: remuda cluster remote [NODE/SESSION]\nexample: remuda cluster remote\n",
-        "listen" => "usage: remuda cluster listen --bind IP:PORT [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20:7441\n",
-        "call" => "usage: remuda cluster call NODE (list|capture SESSION) --addr HOST:PORT [--json]\nexample: remuda cluster call node-abcd1234 list --addr 192.168.1.20:7441\n",
-        _ => "usage: remuda cluster <command>\n  init\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n",
+        "init" => "usage: remuda cluster init\nexample: remuda cluster init\n".into(),
+        "invite" => format!("usage: remuda cluster invite --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})\nexample: remuda cluster invite --bind 192.168.1.20\n"),
+        "join" => format!("usage: remuda cluster join FINGERPRINT 'JOIN_LINE' [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})]\nexample: remuda cluster join 'SHA256:…' 'remuda-join-v1 …' --bind 192.168.1.20\n"),
+        "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n".into(),
+        "revoke" => "usage: remuda cluster revoke NODE|FINGERPRINT [--yes]\nexample: remuda cluster revoke node-abcd1234\n".into(),
+        "control" => "usage: remuda cluster control on|off\nexample: remuda cluster control off\n".into(),
+        "remote" => "usage: remuda cluster remote [NODE/SESSION]\nexample: remuda cluster remote\n".into(),
+        "listen" => format!("usage: remuda cluster listen --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20\n"),
+        "call" => format!("usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--json]\nexample: remuda cluster call node-abcd1234 list --addr 192.168.1.20\n"),
+        _ => "usage: remuda cluster <command>\n  init\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n".into(),
     }
 }
 
@@ -1141,8 +1219,9 @@ mod cluster_cli_tests {
     use super::cluster_join_with_private_loader;
     use super::{
         cluster_init_message, cluster_usage, confirmation_answer_is_yes, invite_message,
-        next_step_init, next_step_join, next_step_listen, next_step_status, parse_cluster_command,
-        remote_control_status_lines, revoke_confirmation, write_nodes_table, ClusterCommand,
+        next_step_init, next_step_join, next_step_listen, next_step_status,
+        parse_addr_default_port, parse_cluster_command, remote_control_status_lines,
+        revoke_confirmation, write_nodes_table, ClusterCommand,
     };
     #[cfg(unix)]
     use remuda_native::cluster::join_line::JoinLine;
@@ -1188,14 +1267,63 @@ mod cluster_cli_tests {
     }
 
     #[test]
-    fn cluster_listen_address_without_port_has_hint() {
+    fn cluster_listen_address_without_port_uses_default() {
         assert_eq!(
-            invalid_reason(&["listen", "--bind", "192.168.100.0"]),
-            (
-                "listen".into(),
-                "address needs a port, e.g. 192.168.100.0:7441".into()
-            )
+            parse_cluster_command(&["listen", "--bind", "192.168.100.0"]),
+            ClusterCommand::Listen {
+                bind_addr: "192.168.100.0:7441".parse().unwrap(),
+                allow_public: false,
+            }
         );
+        assert_eq!(
+            parse_cluster_command(&["listen", "--bind", "2001:db8::1"]),
+            ClusterCommand::Listen {
+                bind_addr: "[2001:db8::1]:7441".parse().unwrap(),
+                allow_public: false,
+            }
+        );
+    }
+
+    #[test]
+    fn cluster_invite_address_without_port_uses_default() {
+        assert_eq!(
+            parse_cluster_command(&["invite", "--bind", "192.0.2.4"]),
+            ClusterCommand::Invite {
+                bind_addr: "192.0.2.4:7441".parse().unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn cluster_join_address_without_port_uses_default() {
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let line = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.4:9443".parse().unwrap(),
+            issuer_fingerprint: fingerprint.clone(),
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        }
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            parse_cluster_command(&["join", &fingerprint, &line, "--bind", "192.0.2.8"]),
+            ClusterCommand::Join {
+                bind_addr: Some(address),
+                ..
+            } if address == "192.0.2.8:7441".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn cluster_call_address_without_port_uses_default() {
+        assert!(matches!(
+            parse_cluster_command(&["call", "node-abc", "list", "--addr", "192.0.2.4"]),
+            ClusterCommand::Call { address, .. }
+                if address == "192.0.2.4:7441".parse().unwrap()
+        ));
     }
 
     #[test]
@@ -1270,8 +1398,13 @@ mod cluster_cli_tests {
     fn cluster_usage_has_one_verb_per_line_and_examples() {
         assert_eq!(
             cluster_usage("listen"),
-            "usage: remuda cluster listen --bind IP:PORT [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20:7441\n"
+            "usage: remuda cluster listen --bind IP[:PORT] (default port 7441) [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20\n"
         );
+        for verb in ["invite", "join", "call"] {
+            let usage = cluster_usage(verb);
+            assert!(usage.contains("IP[:PORT]"), "{verb}: {usage}");
+            assert!(usage.contains("default port 7441"), "{verb}: {usage}");
+        }
         let usage = cluster_usage("");
         for verb in [
             "init", "invite", "join", "nodes", "revoke", "control", "remote", "listen", "call",
@@ -1281,6 +1414,34 @@ mod cluster_cli_tests {
                 "missing {verb}: {usage}"
             );
         }
+    }
+
+    #[test]
+    fn parse_addr_default_port_adds_7441_to_bare_ipv4_and_ipv6() {
+        assert_eq!(
+            parse_addr_default_port("192.0.2.4").unwrap(),
+            "192.0.2.4:7441".parse().unwrap()
+        );
+        assert_eq!(
+            parse_addr_default_port("2001:db8::4").unwrap(),
+            "[2001:db8::4]:7441".parse().unwrap()
+        );
+        assert_eq!(
+            parse_addr_default_port("[fd00::1]").unwrap(),
+            "[fd00::1]:7441".parse().unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_addr_default_port_preserves_explicit_ports() {
+        assert_eq!(
+            parse_addr_default_port("192.0.2.4:9443").unwrap(),
+            "192.0.2.4:9443".parse().unwrap()
+        );
+        assert_eq!(
+            parse_addr_default_port("[2001:db8::4]:9443").unwrap(),
+            "[2001:db8::4]:9443".parse().unwrap()
+        );
     }
 
     #[test]
@@ -3250,6 +3411,29 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suggest_command_qualifies_cluster_verbs() {
+        for verb in [
+            "nodes", "init", "invite", "join", "revoke", "remote", "listen", "control", "call",
+        ] {
+            assert_eq!(suggest_command(verb), Some(format!("cluster {verb}")));
+        }
+    }
+
+    #[test]
+    fn suggest_command_uses_distance_for_top_level_verbs() {
+        assert_eq!(suggest_command("atach").as_deref(), Some("attach"));
+        assert_eq!(suggest_command("zzzz"), None);
+    }
+
+    #[test]
+    fn closest_word_uses_a_shorter_distance_and_breaks_ties_by_name() {
+        assert_eq!(closest_word("x", &["ls"]), None);
+        assert_eq!(closest_word("atach", &["attach"]), Some("attach"));
+        assert_eq!(closest_word("cot", &["cut", "bot"]), Some("bot"));
+        assert_eq!(suggest_command("nodes"), Some("cluster nodes".into()));
+    }
 
     #[test]
     fn write_timeout_has_a_user_facing_diagnostic() {
