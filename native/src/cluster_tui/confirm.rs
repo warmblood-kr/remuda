@@ -20,10 +20,19 @@ impl Confirmation {
     pub fn prompt(&self, width: usize) -> Option<String> {
         self.target.as_ref().map(|(name, _)| {
             let prefix = "kill ";
-            let suffix = "? y / n";
-            let available = width.saturating_sub(
-                UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix),
-            );
+            let long_suffix = "? it is running — y / n";
+            let short_suffix = "? y / n";
+            let suffix = if UnicodeWidthStr::width(prefix)
+                + UnicodeWidthStr::width(name.as_str())
+                + UnicodeWidthStr::width(long_suffix)
+                <= width
+            {
+                long_suffix
+            } else {
+                short_suffix
+            };
+            let available = width
+                .saturating_sub(UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix));
             let name_width = UnicodeWidthStr::width(name.as_str());
             let target = if name_width <= available {
                 name.clone()
@@ -68,7 +77,7 @@ mod tests {
         confirmation.begin("dev".into(), "instance-1".into());
         assert_eq!(
             confirmation.prompt(80).as_deref(),
-            Some("kill dev? y / n")
+            Some("kill dev? it is running — y / n")
         );
         assert_eq!(
             confirmation.handle(KeyCode::Char('y')),
