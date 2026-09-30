@@ -1660,7 +1660,11 @@ fn deferred_reply(
             }
         },
         |prompt, timeout| {
-            let label: String = prompt.label.chars().filter(|ch| !ch.is_control()).collect();
+            let label = match prompt.caller_session {
+                Some(session) => format!("{session}: {}", prompt.label),
+                None => prompt.label,
+            };
+            let label: String = label.chars().filter(|ch| !ch.is_control()).collect();
             reply(
                 &stream,
                 &Response::PromptSecret {

@@ -37,6 +37,7 @@ pub struct PendingEvent {
 pub struct SecretPrompt {
     pub id: u32,
     pub label: String,
+    pub caller_session: Option<String>,
 }
 
 pub struct SecretPromptEvent {
@@ -218,6 +219,7 @@ impl PendingReplies {
                 prompt_tx: entry.prompt_tx.clone(),
                 prompt_id: Arc::clone(&entry.prompt_id),
                 prompt_outstanding: Arc::clone(&entry.prompt_outstanding),
+                caller_session: None,
                 event_tx: self.0.events_tx.clone(),
                 marker: format!(
                     "{}{token}:{id}",
@@ -436,12 +438,17 @@ pub struct PendingHandle {
     prompt_tx: Sender<SecretPrompt>,
     prompt_id: Arc<std::sync::atomic::AtomicU32>,
     prompt_outstanding: Arc<AtomicU8>,
+    caller_session: Option<String>,
     marker: String,
 }
 
 impl PendingHandle {
     pub fn marker(&self) -> &str {
         &self.marker
+    }
+
+    pub fn set_caller_session(&mut self, session: Option<String>) {
+        self.caller_session = session;
     }
 
     fn prompt_secret(&self, label: String) -> mlua::Result<u32> {
@@ -461,6 +468,7 @@ impl PendingHandle {
             .send(SecretPrompt {
                 id: prompt_id,
                 label,
+                caller_session: self.caller_session.clone(),
             })
             .map_err(|_| {
                 self.prompt_outstanding.store(0, Ordering::SeqCst);

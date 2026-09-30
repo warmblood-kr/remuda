@@ -366,7 +366,13 @@ fn secret_prompt_non_tty_fallback_and_answer_do_not_leak() {
     reader.read_until(b'\n', &mut prompt_frame).unwrap();
     let prompt: Response = serde_json::from_slice(&prompt_frame).expect("secret prompt frame");
     let prompt_id = match prompt {
-        Response::PromptSecret { id, .. } => id,
+        Response::PromptSecret { id, label } => {
+            assert_eq!(
+                label, "deferred test secret",
+                "outside caller gets no prefix"
+            );
+            id
+        }
         response => panic!("expected secret prompt, got {response:?}"),
     };
     let answer = Request::SecretAnswer {
@@ -509,12 +515,8 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        prompt_screen.contains(session_name),
-        "session prompt label omitted its caller name:\n{prompt_screen}"
-    );
-    assert!(
-        prompt_screen.contains("deferred test secret"),
-        "sanitized label text was not visible:\n{prompt_screen}"
+        prompt_screen.contains("secret-label-session: deferred test secret"),
+        "session prompt label omitted its caller name or retained ESC:\n{prompt_screen}"
     );
     assert!(
         !prompt_screen.contains('\x1b'),

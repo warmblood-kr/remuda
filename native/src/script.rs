@@ -528,7 +528,7 @@ pub(crate) fn bindings(
     let at = || socket.to_path_buf();
     let input_registry = registry.clone();
     fail_binding(lua, &table, image.clone())?;
-    pending_bindings(lua, &table, image.pending_replies())?;
+    pending_bindings(lua, &table, image.pending_replies(), Rc::clone(&caller))?;
     caller_binding(lua, &table, caller)?;
     random_bytes_binding(lua, &table)?;
 
@@ -804,8 +804,10 @@ fn pending_bindings(
     lua: &Lua,
     table: &Table,
     pending: crate::pending::PendingReplies,
+    caller: Rc<RefCell<crate::image::CallerContext>>,
 ) -> mlua::Result<()> {
     let create = pending.clone();
+    let caller_context = Rc::clone(&caller);
     table.set(
         "_pending_create",
         lua.create_function(move |lua, timeout: Option<f64>| {
@@ -819,6 +821,15 @@ fn pending_bindings(
             let (id, handle) = create.create(duration).map_err(|message| {
                 mlua::Error::external(crate::image::TypedFailure { message, code: 1 })
             })?;
+            let context = caller_context.borrow();
+            let caller_session = if matches!(&context.kind, crate::image::CallerKind::Session) {
+                context.session.clone()
+            } else {
+                None
+            };
+            drop(context);
+            let mut handle = handle;
+            handle.set_caller_session(caller_session);
             Ok((id, lua.create_userdata(handle)?))
         })?,
     )?;
