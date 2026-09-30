@@ -4656,6 +4656,102 @@ fn a_registered_schedule_actually_fires_through_a_real_daemon() {
     }
 }
 
+#[test]
+fn lua_timers_are_available_cancelable_and_run_after_the_current_turn() {
+    let path = scratch("lua-timer-api");
+    let _daemon = daemon_at(&path);
+
+    let scheduled = client::request(
+        &path,
+        &Request::Eval {
+            code: r#"
+                remuda._timer_fired = false
+                local handle = remuda.after(0.03, function()
+                  remuda._timer_fired = true
+                end)
+                assert(type(handle.cancel) == "function")
+                return "scheduled"
+            "#
+            .to_string(),
+            name: None,
+        },
+    )
+    .expect("schedule a timer");
+    assert_eq!(scheduled, Response::Value("scheduled".into()));
+    assert_eq!(eval(&path, "return remuda._timer_fired"), "false");
+
+    // Real time passes in Rust; the image stays available to service another
+    // request while the timer waits.
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(eval(&path, "return remuda._timer_fired"), "true");
+
+    let canceled = client::request(
+        &path,
+        &Request::Eval {
+            code: r#"
+                remuda._canceled_timer_fired = false
+                local handle = remuda.after(0.03, function()
+                  remuda._canceled_timer_fired = true
+                end)
+                handle:cancel()
+                return "canceled"
+            "#
+            .to_string(),
+            name: None,
+        },
+    )
+    .expect("cancel a timer");
+    assert_eq!(canceled, Response::Value("canceled".into()));
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(eval(&path, "return remuda._canceled_timer_fired"), "false");
+}
+
+#[test]
+fn reloading_a_lifecycle_mod_cancels_its_owned_interval() {
+    let runtime = unique_scratch_dir("lua-timer-owner");
+    let _cleanup = RemoveDirectoryOnDrop(runtime.clone());
+    let data = runtime.join("data");
+    let package = data.join("remuda/mods/timer_mod");
+    let entry = package.join("packages/timer_mod/init.lua");
+    std::fs::create_dir_all(entry.parent().unwrap()).expect("create installed mod tree");
+    std::fs::write(
+        package.join("extension.toml"),
+        "name = \"timer_mod\"\nentry = \"packages/timer_mod/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .expect("write lifecycle manifest");
+    std::fs::write(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function()
+            remuda.every(0.05, function()
+              remuda._owned_timer_fires = (remuda._owned_timer_fires or 0) + 1
+            end)
+          end,
+        }"#,
+    )
+    .expect("write lifecycle mod");
+
+    let mut command = spawn::base_command(&runtime);
+    command.env("XDG_DATA_HOME", &data);
+    let _daemon = spawn::spawn_and_wait(command, &runtime);
+    let path = daemon::socket_path_in(&runtime, "s");
+    eval(&path, "remuda.exec('timer_mod'); return 'loaded'");
+    std::thread::sleep(Duration::from_millis(180));
+    let before_reload = read_count(&path, "return remuda._owned_timer_fires or 0");
+    assert!(before_reload >= 1, "owner interval did not fire before reload");
+
+    eval(&path, "remuda.reload('timer_mod'); return 'reloaded'");
+    std::thread::sleep(Duration::from_millis(200));
+    let after_reload = read_count(&path, "return remuda._owned_timer_fires or 0");
+    let after_reload_delta = after_reload - before_reload;
+    assert!(
+        (1..=5).contains(&after_reload_delta),
+        "reload should leave one interval active, but it fired {after_reload_delta} times"
+    );
+}
+
 fn eval(path: &Path, code: &str) -> String {
     match client::request(
         path,
