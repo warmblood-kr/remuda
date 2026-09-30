@@ -228,9 +228,9 @@ impl Drop for RemoveDirectoryOnDrop {
 
 struct ClusterListenerTestDaemon {
     _daemon: Daemon,
-    _environment: IsolatedClusterStateEnvironment,
     _cleanup: RemoveDirectoryOnDrop,
     socket: PathBuf,
+    home: PathBuf,
     state: PathBuf,
 }
 
@@ -333,12 +333,11 @@ fn cluster_listener_test_daemon(
         .env("LOCALAPPDATA", &state)
         .env("USERPROFILE", &home);
     let child = spawn::spawn_and_wait(command, &runtime);
-    let environment = IsolatedClusterStateEnvironment::set(&home, &state);
     ClusterListenerTestDaemon {
         _daemon: child,
-        _environment: environment,
         _cleanup: cleanup,
         socket,
+        home,
         state,
     }
 }
@@ -387,9 +386,41 @@ fn assert_tcp_listener_closed(address: std::net::SocketAddr) {
 #[test]
 #[allow(clippy::disallowed_types)]
 fn cluster_listener_control_starts_stops_and_switches_ports() {
+    use std::process::Command;
+
+    let output = Command::new(std::env::current_exe().expect("test executable path"))
+        .args([
+            "--exact",
+            "cluster_listener_control_starts_stops_and_switches_ports_child",
+            "--nocapture",
+        ])
+        .env("REMUDA_TEST_LISTENER_CONTROL_CHILD", "1")
+        .output()
+        .expect("run listener control test in an isolated caller process");
+    assert!(
+        output.status.success(),
+        "listener control child failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn cluster_listener_control_starts_stops_and_switches_ports_child() {
+    if std::env::var_os("REMUDA_TEST_LISTENER_CONTROL_CHILD").as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return;
+    }
+    cluster_listener_control_round_trip();
+}
+
+#[allow(clippy::disallowed_types)]
+fn cluster_listener_control_round_trip() {
     use remuda_native::cluster::listener_control;
 
     let daemon = cluster_listener_test_daemon("listener-start-stop", None);
+    let _environment = IsolatedClusterStateEnvironment::set(&daemon.home, &daemon.state);
     let first = listener_control::start(
         &daemon.socket,
         Some(explicit_listener_config("127.0.0.1:0".parse().unwrap())),

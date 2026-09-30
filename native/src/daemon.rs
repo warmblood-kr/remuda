@@ -270,7 +270,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     #[cfg(unix)]
     let listener = prepare_unix_listener(listener, path)?;
     let anti_entropy = Arc::new(AntiEntropyTask::start()?);
-    let listener_task = Arc::new(ListenerTask::start(path));
+    let listener_task = Arc::new(DaemonListenerControl::new(ListenerTask::start(path)));
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
 
     let registry = Arc::new(Registry::new());
@@ -310,11 +310,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
             registry,
             image,
             counters,
-            (
-                socket_owner,
-                anti_entropy,
-                Arc::clone(&listener_task.status),
-            ),
+            (socket_owner, anti_entropy, Arc::clone(&listener_task)),
         );
     }
     #[cfg(windows)]
@@ -326,7 +322,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
             let counters = Arc::clone(&counters);
             let socket_owner = Arc::clone(&socket_owner);
             let anti_entropy = anti_entropy.clone();
-            let listener_status = Arc::clone(&listener_task.status);
+            let listener_task = Arc::clone(&listener_task);
             std::thread::spawn(move || {
                 let _ = handle(
                     stream,
@@ -335,11 +331,15 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
                     &counters,
                     socket_owner,
                     anti_entropy,
-                    listener_status,
+                    listener_task,
                 );
             });
         }
-        listener_task.stop_and_join();
+        listener_task
+            .task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .stop_and_join();
         anti_entropy.stop_and_join();
         socket_owner.cleanup();
         Ok(())
@@ -423,53 +423,107 @@ fn anti_entropy_interval() -> Duration {
 }
 
 pub struct ListenerTask {
+    daemon_path: PathBuf,
     status: Arc<Mutex<ListenerStatus>>,
-    stop: std::sync::mpsc::Sender<()>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    stop: Option<std::sync::mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+    startup: Option<std::sync::mpsc::Receiver<()>>,
 }
 
 impl ListenerTask {
     pub fn start(daemon_path: &Path) -> Self {
         let status = Arc::new(Mutex::new(ListenerStatus::Off));
-        let (stop, stopped) = std::sync::mpsc::channel();
-        let status_for_thread = Arc::clone(&status);
-        let daemon_path = daemon_path.to_path_buf();
-        let thread = std::thread::Builder::new()
-            .name("remuda-cluster-listener".into())
-            .spawn(move || {
-                let result = start_listener(&daemon_path, &status_for_thread, stopped);
-                if let Err(reason) = result {
-                    set_listener_status(&status_for_thread, ListenerStatus::Failed(reason));
-                }
-            })
-            .expect("spawn cluster listener task");
-        Self {
+        let mut task = Self {
+            daemon_path: daemon_path.to_path_buf(),
             status,
-            stop,
-            thread: Mutex::new(Some(thread)),
-        }
+            stop: None,
+            thread: None,
+            startup: None,
+        };
+        task.spawn_thread();
+        task
     }
 
     pub fn status(&self) -> ListenerStatus {
         listener_status(&self.status)
     }
 
-    fn stop_and_join(&self) {
-        let _ = self.stop.send(());
-        if let Some(thread) = self
-            .thread
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
+    fn spawn_thread(&mut self) {
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let (ready, startup) = std::sync::mpsc::channel();
+        let status = Arc::clone(&self.status);
+        let daemon_path = self.daemon_path.clone();
+        let ready_on_error = ready.clone();
+        let thread = std::thread::Builder::new()
+            .name("remuda-cluster-listener".into())
+            .spawn(move || {
+                let result = start_listener(&daemon_path, &status, stopped, &ready);
+                if let Err(reason) = result {
+                    set_listener_status(&status, ListenerStatus::Failed(reason));
+                    let _ = ready_on_error.send(());
+                }
+            })
+            .expect("spawn cluster listener task");
+        self.stop = Some(stop);
+        self.thread = Some(thread);
+        self.startup = Some(startup);
+    }
+
+    fn stop_and_join(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+
+    fn restart(&mut self) -> ListenerStatus {
+        self.stop_and_join();
+        set_listener_status(&self.status, ListenerStatus::Off);
+        self.startup = None;
+        self.spawn_thread();
+        if let Some(startup) = self.startup.take() {
+            match startup.recv_timeout(Duration::from_secs(30)) {
+                Ok(()) => {}
+                Err(error) => set_listener_status(
+                    &self.status,
+                    ListenerStatus::Failed(format!("listener startup did not finish: {error}")),
+                ),
+            }
+        }
+        self.status()
     }
 }
 
 impl Drop for ListenerTask {
     fn drop(&mut self) {
         self.stop_and_join();
+    }
+}
+
+struct DaemonListenerControl {
+    task: Mutex<ListenerTask>,
+    status: Arc<Mutex<ListenerStatus>>,
+}
+
+impl DaemonListenerControl {
+    fn new(task: ListenerTask) -> Self {
+        Self {
+            status: Arc::clone(&task.status),
+            task: Mutex::new(task),
+        }
+    }
+
+    fn status(&self) -> ListenerStatus {
+        listener_status(&self.status)
+    }
+
+    fn reload(&self) -> ListenerStatus {
+        self.task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .restart()
     }
 }
 
@@ -489,12 +543,16 @@ fn start_listener(
     daemon_path: &Path,
     status: &Arc<Mutex<ListenerStatus>>,
     stopped: std::sync::mpsc::Receiver<()>,
+    ready: &std::sync::mpsc::Sender<()>,
 ) -> Result<(), String> {
     use crate::cluster::listener_config::ListenerBind;
 
     let config = match crate::cluster::listener_config::read() {
         Ok(Some(config)) if config.enabled => config,
-        Ok(_) => return Ok(()),
+        Ok(_) => {
+            let _ = ready.send(());
+            return Ok(());
+        }
         Err(error) => return Err(format!("read listener config: {error}")),
     };
     let (address, auto) = match config.bind {
@@ -530,6 +588,7 @@ fn start_listener(
             auto,
         },
     );
+    let _ = ready.send(());
 
     let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let serve_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1030,13 +1089,13 @@ fn serve_unix(
     lifecycle: (
         Arc<SocketOwnership>,
         Arc<AntiEntropyTask>,
-        Arc<Mutex<ListenerStatus>>,
+        Arc<DaemonListenerControl>,
     ),
 ) -> ! {
     use std::io::Read as _;
     use std::os::fd::AsRawFd;
 
-    let (socket_owner, anti_entropy, listener_status) = lifecycle;
+    let (socket_owner, anti_entropy, listener_task) = lifecycle;
     let detached = unsafe { libc::getsid(0) == libc::getpid() };
     let mut signal_bytes = [0u8; 1];
     'poll_loop: loop {
@@ -1110,7 +1169,7 @@ fn serve_unix(
                     let counters = Arc::clone(&counters);
                     let socket_owner = Arc::clone(&socket_owner);
                     let anti_entropy = Arc::clone(&anti_entropy);
-                    let listener_status = Arc::clone(&listener_status);
+                    let listener_task = Arc::clone(&listener_task);
                     std::thread::spawn(move || {
                         let _ = handle(
                             stream,
@@ -1119,7 +1178,7 @@ fn serve_unix(
                             &counters,
                             socket_owner,
                             anti_entropy,
-                            listener_status,
+                            listener_task,
                         );
                     });
                 }
@@ -1273,7 +1332,7 @@ fn handle(
     counters: &crate::tick::Counters,
     socket_owner: Arc<SocketOwnership>,
     anti_entropy: Arc<AntiEntropyTask>,
-    listener_status: Arc<Mutex<ListenerStatus>>,
+    listener_task: Arc<DaemonListenerControl>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let Some(request) = read_request(&stream, &mut reader)? else {
@@ -1288,7 +1347,7 @@ fn handle(
         image,
         socket_owner,
         anti_entropy,
-        listener_status,
+        listener_task,
         request,
     )
 }
@@ -1301,7 +1360,7 @@ fn handle_request(
     image: &Image,
     socket_owner: Arc<SocketOwnership>,
     anti_entropy: Arc<AntiEntropyTask>,
-    _listener_status: Arc<Mutex<ListenerStatus>>,
+    listener_task: Arc<DaemonListenerControl>,
     request: Request,
 ) -> std::io::Result<()> {
     match request {
@@ -1318,9 +1377,13 @@ fn handle_request(
             refuse_cluster_registry(&stream)
         }
 
-        Request::ClusterListener(ListenerOp::Status | ListenerOp::Reload) => reply(
+        Request::ClusterListener(ListenerOp::Status) => reply(
             &stream,
-            &Response::error("cluster listener control is not implemented"),
+            &Response::ClusterListenerStatus(listener_task.status()),
+        ),
+        Request::ClusterListener(ListenerOp::Reload) => reply(
+            &stream,
+            &Response::ClusterListenerStatus(listener_task.reload()),
         ),
 
         request @ Request::Shutdown { .. } => {

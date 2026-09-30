@@ -722,7 +722,7 @@ pub fn cluster_usage(verb: &str) -> String {
 
 fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     match parse_cluster_command(args) {
-        ClusterCommand::Status => cluster_status(),
+        ClusterCommand::Status => cluster_status(server, path),
         ClusterCommand::Init => match remuda_native::cluster::init() {
             Ok((identity, created)) => {
                 println!("{}", cluster_init_message(created));
@@ -810,11 +810,11 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     }
 }
 
-fn cluster_status() -> ExitCode {
+fn cluster_status(server: &str, path: &Path) -> ExitCode {
     match remuda_native::cluster::status() {
         Ok(None) => {
             println!("This node is not in a cluster; run `remuda cluster init`.");
-            ExitCode::SUCCESS
+            print_cluster_listener_status(server, path)
         }
         Ok(Some((identity, members))) => {
             println!("Node: {}", identity.node_name);
@@ -826,15 +826,59 @@ fn cluster_status() -> ExitCode {
                     let (setting, trust) = remote_control_status_lines(enabled);
                     println!("{setting}");
                     println!("{trust}");
+                    let listener_status = print_cluster_listener_status(server, path);
                     if let Some(next_step) = next_step_status(members) {
                         println!("{next_step}");
                     }
-                    ExitCode::SUCCESS
+                    listener_status
                 }
                 Err(error) => fail(format!("cluster status: {error}")),
             }
         }
         Err(error) => fail(format!("cluster status: {error}")),
+    }
+}
+
+fn print_cluster_listener_status(server: &str, path: &Path) -> ExitCode {
+    match remuda_native::ipc::connect(path) {
+        Ok(stream) => {
+            drop(stream);
+            with_existing_daemon(server, path, |daemon_path| {
+                let status = remuda_native::cluster::listener_control::status(daemon_path);
+                for line in cluster_listener_status_lines(Some(status)) {
+                    println!("{line}");
+                }
+                ExitCode::SUCCESS
+            })
+        }
+        Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => {
+            for line in cluster_listener_status_lines(None) {
+                println!("{line}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(_) => with_existing_daemon(server, path, |_| ExitCode::SUCCESS),
+    }
+}
+
+fn cluster_listener_status_lines(
+    status: Option<remuda_core::protocol::ListenerStatus>,
+) -> Vec<String> {
+    use remuda_core::protocol::ListenerStatus;
+
+    match status {
+        None => vec!["Listener: off (daemon not running)".into()],
+        Some(ListenerStatus::Off) => {
+            vec!["Listener: off (Next: remuda cluster listen --bind IP)".into()]
+        }
+        Some(ListenerStatus::On { addr, auto }) => vec![format!(
+            "Listener: on {addr} ({})",
+            if auto { "auto" } else { "explicit" }
+        )],
+        Some(ListenerStatus::Failed(reason)) => vec![
+            format!("Listener: failed: {reason}"),
+            "Next: remuda cluster listen --bind IP".into(),
+        ],
     }
 }
 
@@ -1242,10 +1286,10 @@ mod cluster_cli_tests {
     #[cfg(unix)]
     use super::cluster_join_with_private_loader;
     use super::{
-        cluster_init_message, cluster_usage, confirmation_answer_is_yes, invite_message,
-        next_step_init, next_step_join, next_step_listen, next_step_status,
-        parse_addr_default_port, parse_cluster_command, remote_control_status_lines,
-        revoke_confirmation, write_nodes_table, ClusterCommand,
+        cluster_init_message, cluster_listener_status_lines, cluster_usage,
+        confirmation_answer_is_yes, invite_message, next_step_init, next_step_join,
+        next_step_listen, next_step_status, parse_addr_default_port, parse_cluster_command,
+        remote_control_status_lines, revoke_confirmation, write_nodes_table, ClusterCommand,
     };
     #[cfg(unix)]
     use remuda_native::cluster::join_line::JoinLine;
@@ -1734,6 +1778,43 @@ mod cluster_cli_tests {
         assert_eq!(
             remote_control_status_lines(false).0,
             "Remote control: disabled"
+        );
+    }
+
+    #[test]
+    fn cluster_listener_status_formats_on_auto_and_explicit() {
+        use remuda_core::protocol::ListenerStatus;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7441);
+        assert_eq!(
+            cluster_listener_status_lines(Some(ListenerStatus::On { addr, auto: true })),
+            ["Listener: on 127.0.0.1:7441 (auto)"]
+        );
+        assert_eq!(
+            cluster_listener_status_lines(Some(ListenerStatus::On { addr, auto: false })),
+            ["Listener: on 127.0.0.1:7441 (explicit)"]
+        );
+    }
+
+    #[test]
+    fn cluster_listener_status_formats_off_and_failed_with_next_steps() {
+        use remuda_core::protocol::ListenerStatus;
+
+        assert_eq!(
+            cluster_listener_status_lines(Some(ListenerStatus::Off)),
+            ["Listener: off (Next: remuda cluster listen --bind IP)"]
+        );
+        assert_eq!(
+            cluster_listener_status_lines(Some(ListenerStatus::Failed("address in use".into()))),
+            [
+                "Listener: failed: address in use",
+                "Next: remuda cluster listen --bind IP"
+            ]
+        );
+        assert_eq!(
+            cluster_listener_status_lines(None),
+            ["Listener: off (daemon not running)"]
         );
     }
 
