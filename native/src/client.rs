@@ -472,6 +472,58 @@ pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
     read_response_with_timeout(path, stream, timeout)
 }
 
+/// Send an Eval request and service any concealed secret prompts on its
+/// connection before returning the final response.
+pub fn request_with_secret_prompts(path: &Path, request: &Request) -> std::io::Result<Response> {
+    let stream = ipc::connect(path)?;
+    send(&stream, request)?;
+    let timeout = Duration::from_secs(305);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(request_timeout(path, timeout));
+        }
+        let response = read_response_with_timeout(path, stream.try_clone()?, remaining)?;
+        let Response::PromptSecret { id, label } = response else {
+            return Ok(response);
+        };
+        let secret = collect_secret_from_terminal(&label)?;
+        send_secret_answer(&stream, id, secret.as_ref())?;
+    }
+}
+
+fn collect_secret_from_terminal(
+    label: &str,
+) -> std::io::Result<Option<remuda_core::protocol::SecretBytes>> {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Ok(None);
+    }
+    let events = std::iter::from_fn(|| crossterm::event::read().ok());
+    match prompt_secret_with_events(std::io::stderr(), label, events)? {
+        Ok(Some(secret)) => Ok(Some(remuda_core::protocol::SecretBytes::new(
+            secret.to_vec(),
+        ))),
+        Ok(None) | Err(SecretLineError::TooLong) => Ok(None),
+    }
+}
+
+fn send_secret_answer(
+    mut stream: &Stream,
+    id: u32,
+    secret: Option<&remuda_core::protocol::SecretBytes>,
+) -> std::io::Result<()> {
+    let request = Request::SecretAnswer {
+        id,
+        secret: secret.cloned(),
+    };
+    let mut frame = Zeroizing::new(serde_json::to_vec(&request)?);
+    frame.push(b'\n');
+    stream.write_all(&frame)?;
+    stream.flush()
+}
+
 #[cfg(unix)]
 fn read_response_with_timeout(
     path: &Path,
@@ -1847,6 +1899,8 @@ fn edit_secret_line(
 trait SecretPromptTerminal {
     fn enable_raw_mode(&mut self) -> std::io::Result<()>;
     fn enable_bracketed_paste(&mut self) -> std::io::Result<()>;
+    fn write_output(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    fn flush_output(&mut self) -> std::io::Result<()>;
     fn disable_bracketed_paste(&mut self);
     fn disable_raw_mode(&mut self);
 }
@@ -1858,6 +1912,14 @@ impl SecretPromptTerminal for std::io::Stderr {
 
     fn enable_bracketed_paste(&mut self) -> std::io::Result<()> {
         crossterm::execute!(self, crossterm::event::EnableBracketedPaste)
+    }
+
+    fn write_output(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_all(bytes)
+    }
+
+    fn flush_output(&mut self) -> std::io::Result<()> {
+        self.flush()
     }
 
     fn disable_bracketed_paste(&mut self) {
@@ -1880,6 +1942,21 @@ impl<T: SecretPromptTerminal> SecretPromptMode<T> {
         mode.terminal.enable_bracketed_paste()?;
         Ok(mode)
     }
+
+    fn prompt(&mut self, label: &str) -> std::io::Result<()> {
+        let label: String = label
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        self.terminal.write_output(label.as_bytes())?;
+        self.terminal.write_output(b": ")?;
+        self.terminal.flush_output()
+    }
+
+    fn finish_line(&mut self) -> std::io::Result<()> {
+        self.terminal.write_output(b"\r\x1b[2K\n")?;
+        self.terminal.flush_output()
+    }
 }
 
 impl<T: SecretPromptTerminal> Drop for SecretPromptMode<T> {
@@ -1887,6 +1964,23 @@ impl<T: SecretPromptTerminal> Drop for SecretPromptMode<T> {
         self.terminal.disable_bracketed_paste();
         self.terminal.disable_raw_mode();
     }
+}
+
+fn prompt_secret_with_events<T, I>(
+    terminal: T,
+    label: &str,
+    events: I,
+) -> std::io::Result<Result<Option<Zeroizing<Vec<u8>>>, SecretLineError>>
+where
+    T: SecretPromptTerminal,
+    I: IntoIterator<Item = crossterm::event::Event>,
+{
+    let mut mode = SecretPromptMode::enable(terminal)?;
+    mode.prompt(label)?;
+    let answer = edit_secret_line(events);
+    mode.finish_line()?;
+    drop(mode);
+    Ok(answer)
 }
 
 #[cfg(test)]
@@ -1918,15 +2012,22 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     #[derive(Clone, Default)]
-    struct RecordingSecretTerminal(Arc<Mutex<Vec<&'static str>>>);
+    struct RecordingSecretTerminal {
+        operations: Arc<Mutex<Vec<&'static str>>>,
+        output: Arc<Mutex<Vec<u8>>>,
+    }
 
     impl RecordingSecretTerminal {
         fn operations(&self) -> Vec<&'static str> {
-            self.0.lock().unwrap().clone()
+            self.operations.lock().unwrap().clone()
+        }
+
+        fn output(&self) -> Vec<u8> {
+            self.output.lock().unwrap().clone()
         }
 
         fn record(&self, operation: &'static str) {
-            self.0.lock().unwrap().push(operation);
+            self.operations.lock().unwrap().push(operation);
         }
     }
 
@@ -1938,6 +2039,16 @@ mod tests {
 
         fn enable_bracketed_paste(&mut self) -> std::io::Result<()> {
             self.record("paste:on");
+            Ok(())
+        }
+
+        fn write_output(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.output.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn flush_output(&mut self) -> std::io::Result<()> {
+            self.record("flush");
             Ok(())
         }
 
@@ -2705,6 +2816,32 @@ mod tests {
         assert_eq!(
             terminal.operations(),
             vec!["raw:on", "paste:on", "paste:off", "raw:off"]
+        );
+    }
+
+    #[test]
+    fn secret_prompt_prints_sanitized_label_clears_line_and_returns_secret() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+        let terminal = RecordingSecretTerminal::default();
+        let key = secret_key(KeyCode::Enter, KeyModifiers::NONE);
+        let paste = Event::Paste("S3CRET".into());
+        let answer =
+            super::prompt_secret_with_events(terminal.clone(), "Pass\u{1b}\nword", [paste, key])
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert_eq!(answer.as_slice(), b"S3CRET");
+        assert_eq!(terminal.output(), b"Password: \r\x1b[2K\n");
+        assert_eq!(
+            terminal.operations(),
+            [
+                "raw:on",
+                "paste:on",
+                "flush",
+                "flush",
+                "paste:off",
+                "raw:off"
+            ]
         );
     }
 
