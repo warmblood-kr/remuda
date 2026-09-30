@@ -1383,6 +1383,8 @@ fn cluster_join_with_listener(
         }
     };
     let mut restore_guard = JoinListenerRestoreGuard::new(daemon_path, listener_snapshot.clone());
+    // Install before listener start: finish_join_listener_start checks signals after reload
+    // and restores the config, so moving this below start could leave an interrupted join unobserved.
     #[cfg(unix)]
     let signal_handler = match JoinInterruptHandler::install() {
         Ok(handler) => handler,
