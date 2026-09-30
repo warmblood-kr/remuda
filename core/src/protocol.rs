@@ -45,6 +45,12 @@ pub const SECRET_ANSWER_MAX_BYTES: usize = 4 * 1024;
 /// Maximum newline-delimited frame carrying a [`Request::SecretAnswer`].
 pub const SECRET_ANSWER_MAX_FRAME_BYTES: usize = 8 * 1024;
 
+/// Maximum visible line accepted by a [`Request::LineAnswer`].
+pub const LINE_ANSWER_MAX_BYTES: usize = 1024;
+
+/// Maximum newline-delimited frame carrying a [`Request::LineAnswer`].
+pub const LINE_ANSWER_MAX_FRAME_BYTES: usize = 8 * 1024;
+
 /// Secret bytes encoded as base64 on the wire and redacted from debug output.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretBytes(#[serde(with = "secret_bytes_base64")] Zeroizing<Vec<u8>>);
@@ -271,6 +277,14 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         refusal: Option<SecretAnswerRefusal>,
     },
+    /// Answer an outstanding visible line prompt on this pending word's connection.
+    LineAnswer {
+        id: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        line: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refusal: Option<SecretAnswerRefusal>,
+    },
 }
 
 /// One element of a [`Request::Feed`] act: bytes, or a pause before the next
@@ -378,6 +392,16 @@ pub enum Response {
     PromptSecret {
         id: u32,
         label: String,
+        /// Remaining lifetime of the pending reply when this prompt was sent.
+        #[serde(default)]
+        timeout_ms: u64,
+    },
+    /// Ask the client on this connection to collect a visible line from its terminal.
+    PromptLine {
+        id: u32,
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        default: Option<String>,
         /// Remaining lifetime of the pending reply when this prompt was sent.
         #[serde(default)]
         timeout_ms: u64,

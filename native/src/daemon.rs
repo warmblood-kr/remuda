@@ -1530,6 +1530,11 @@ fn handle_request(
             &stream,
             &Response::error("secret answer has no outstanding prompt"),
         ),
+
+        Request::LineAnswer { .. } => reply(
+            &stream,
+            &Response::error("line answer has no outstanding prompt"),
+        ),
     }
 }
 
@@ -1661,6 +1666,7 @@ fn sanitize_secret_prompt_text(text: &str) -> String {
         .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn deferred_reply(
     stream: Stream,
     reader: BufReader<Stream>,
@@ -1742,6 +1748,69 @@ fn deferred_reply(
                 .and_then(|(secret, refusal)| match refusal {
                     Some(refusal) => Err(refusal.error_code().to_string()),
                     None => Ok(secret),
+                })
+        },
+        |prompt, timeout| {
+            let caller = prompt
+                .caller_session
+                .as_deref()
+                .map(|session| {
+                    let name: String = sanitize_secret_prompt_text(session)
+                        .chars()
+                        .map(|character| {
+                            if matches!(character, '[' | ']') {
+                                '?'
+                            } else {
+                                character
+                            }
+                        })
+                        .take(64)
+                        .collect();
+                    format!("session {name}")
+                })
+                .unwrap_or_else(|| "outside".to_string());
+            let caller_label: String = sanitize_secret_prompt_text(&prompt.label)
+                .chars()
+                .take(256)
+                .collect();
+            let label = format!("remuda[{caller}] {caller_label}");
+            let default = prompt.default.as_deref().map(|default| {
+                let mut safe = sanitize_secret_prompt_text(default);
+                if safe.len() > remuda_core::protocol::LINE_ANSWER_MAX_BYTES {
+                    let mut end = remuda_core::protocol::LINE_ANSWER_MAX_BYTES;
+                    while !safe.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    safe.truncate(end);
+                }
+                safe
+            });
+            reply(
+                &stream,
+                &Response::PromptLine {
+                    id: prompt.id,
+                    label,
+                    default,
+                    timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            let answer = read_line_answer_for(&mut *reader.borrow_mut(), prompt.id, timeout);
+            #[cfg(windows)]
+            let answer =
+                read_line_answer_pipe(&mut *reader.borrow_mut(), &stream, prompt.id, timeout);
+            answer
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::TimedOut {
+                        "cancelled".to_string()
+                    } else {
+                        error.to_string()
+                    }
+                })
+                .and_then(|(line, refusal)| match refusal {
+                    Some(refusal) => Err(refusal.error_code().to_string()),
+                    None => Ok(line),
                 })
         },
     );
@@ -1889,6 +1958,141 @@ fn read_secret_answer_until(
                         _ => Err(std::io::Error::new(
                             ErrorKind::InvalidData,
                             "expected a secret answer",
+                        )),
+                    };
+                }
+            }
+            Err(error)
+                if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn read_line_answer_pipe(
+    reader: &mut BufReader<Stream>,
+    stream: &Stream,
+    expected_id: u32,
+    timeout: Duration,
+) -> std::io::Result<(
+    Option<String>,
+    Option<remuda_core::protocol::SecretAnswerRefusal>,
+)> {
+    let buffered = reader.buffer().to_vec();
+    reader.consume(buffered.len());
+    let worker_stream = Arc::new(stream.try_clone()?);
+    let stop_stream = Arc::clone(&worker_stream);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        if worker_stop.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let mut input = std::io::Cursor::new(buffered).chain(&*worker_stream);
+        let _ = send.send(read_line_answer_for(&mut input, expected_id, timeout));
+    });
+    match receive.recv_timeout(timeout) {
+        Ok(answer) => {
+            worker
+                .join()
+                .map_err(|_| std::io::Error::other("line answer reader panicked"))?;
+            answer
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            crate::ipc::stop_reader(&stop_stream, &stop, || worker.is_finished());
+            let _ = worker.join();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "line prompt timed out",
+            ))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = worker.join();
+            Err(std::io::Error::other(
+                "line answer reader stopped unexpectedly",
+            ))
+        }
+    }
+}
+
+fn read_line_answer_for(
+    reader: &mut impl Read,
+    expected_id: u32,
+    timeout: Duration,
+) -> std::io::Result<(
+    Option<String>,
+    Option<remuda_core::protocol::SecretAnswerRefusal>,
+)> {
+    read_line_answer_until(reader, expected_id, std::time::Instant::now() + timeout)
+}
+
+fn read_line_answer_until(
+    reader: &mut impl Read,
+    expected_id: u32,
+    deadline: std::time::Instant,
+) -> std::io::Result<(
+    Option<String>,
+    Option<remuda_core::protocol::SecretAnswerRefusal>,
+)> {
+    use std::io::ErrorKind;
+    let mut frame = Vec::with_capacity(remuda_core::protocol::LINE_ANSWER_MAX_FRAME_BYTES + 1);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "line prompt timed out",
+            ));
+        }
+        let mut byte = [0u8; 1];
+        match reader.read(&mut byte) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "client disconnected",
+                ))
+            }
+            Ok(_) => {
+                frame.push(byte[0]);
+                if frame.len() > remuda_core::protocol::LINE_ANSWER_MAX_FRAME_BYTES {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "line answer frame is oversized",
+                    ));
+                }
+                if byte[0] == b'\n' {
+                    let request: Request = serde_json::from_slice(&frame).map_err(|_| {
+                        std::io::Error::new(ErrorKind::InvalidData, "invalid line answer")
+                    })?;
+                    return match request {
+                        Request::LineAnswer { id, line, refusal } if id == expected_id => {
+                            if line.is_some() && refusal.is_some() {
+                                Err(std::io::Error::new(
+                                    ErrorKind::InvalidData,
+                                    "invalid line answer",
+                                ))
+                            } else if line.as_ref().is_some_and(|line| {
+                                line.len() > remuda_core::protocol::LINE_ANSWER_MAX_BYTES
+                            }) {
+                                Ok((
+                                    None,
+                                    Some(remuda_core::protocol::SecretAnswerRefusal::TooLong),
+                                ))
+                            } else {
+                                Ok((line, refusal))
+                            }
+                        }
+                        Request::LineAnswer { .. } => Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "line answer id mismatch",
+                        )),
+                        _ => Err(std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            "expected a line answer",
                         )),
                     };
                 }

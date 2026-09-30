@@ -485,6 +485,23 @@ pub fn request_with_secret_prompts(path: &Path, request: &Request) -> std::io::R
             return Err(request_timeout(path, timeout));
         }
         let response = read_response_with_timeout(path, stream.try_clone()?, remaining)?;
+        let response = match response {
+            Response::PromptLine {
+                id,
+                label,
+                default,
+                timeout_ms,
+            } => {
+                match collect_line_from_terminal(&label, default.as_deref(), timeout_ms)? {
+                    LinePromptCollection::Answer(line, refusal) => {
+                        send_line_answer(&stream, id, line.as_deref(), refusal)?;
+                    }
+                    LinePromptCollection::Deadline => {}
+                }
+                continue;
+            }
+            response => response,
+        };
         let Response::PromptSecret {
             id,
             label,
@@ -505,6 +522,14 @@ pub fn request_with_secret_prompts(path: &Path, request: &Request) -> std::io::R
 enum SecretPromptCollection {
     Answer(
         Option<remuda_core::protocol::SecretBytes>,
+        Option<remuda_core::protocol::SecretAnswerRefusal>,
+    ),
+    Deadline,
+}
+
+enum LinePromptCollection {
+    Answer(
+        Option<String>,
         Option<remuda_core::protocol::SecretAnswerRefusal>,
     ),
     Deadline,
@@ -566,6 +591,73 @@ fn collect_secret_from_terminal(
     } else {
         let (secret, refusal) = secret_answer_from_line(answer);
         Ok(SecretPromptCollection::Answer(secret, refusal))
+    }
+}
+
+fn collect_line_from_terminal(
+    label: &str,
+    default: Option<&str>,
+    timeout_ms: u64,
+) -> std::io::Result<LinePromptCollection> {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Ok(LinePromptCollection::Answer(
+            None,
+            Some(remuda_core::protocol::SecretAnswerRefusal::NotATerminal),
+        ));
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    #[cfg(unix)]
+    let signal_guard = SecretPromptSignalGuard::install()?;
+    let mut expired = false;
+    let events = std::iter::from_fn(|| loop {
+        #[cfg(unix)]
+        if SECRET_PROMPT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            expired = true;
+            return None;
+        }
+        let poll_for = remaining.min(Duration::from_millis(100));
+        match crossterm::event::poll(poll_for) {
+            Ok(true) => match crossterm::event::read() {
+                Ok(event) => return Some(event),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            },
+            Ok(false) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    });
+    let answer = prompt_line_with_events(std::io::stderr(), label, default, events)?;
+    #[cfg(unix)]
+    {
+        drop(signal_guard);
+        let received_signal = SECRET_PROMPT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+        if received_signal != 0 {
+            unsafe { libc::raise(received_signal) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "line prompt interrupted by signal",
+            ));
+        }
+    }
+    if expired {
+        Ok(LinePromptCollection::Deadline)
+    } else {
+        let answer = match answer {
+            Ok(Some(line)) => (Some(line), None),
+            Ok(None) => (None, None),
+            Err(PromptLineError::TooLong) => (
+                None,
+                Some(remuda_core::protocol::SecretAnswerRefusal::TooLong),
+            ),
+        };
+        Ok(LinePromptCollection::Answer(answer.0, answer.1))
     }
 }
 
@@ -633,6 +725,30 @@ fn send_secret_answer(
     ));
     serde_json::to_writer(&mut *frame, &request)?;
     frame.push(b'\n');
+    stream.write_all(&frame)?;
+    stream.flush()
+}
+
+fn send_line_answer(
+    mut stream: &Stream,
+    id: u32,
+    line: Option<&str>,
+    refusal: Option<remuda_core::protocol::SecretAnswerRefusal>,
+) -> std::io::Result<()> {
+    let request = Request::LineAnswer {
+        id,
+        line: line.map(str::to_owned),
+        refusal,
+    };
+    let mut frame = Vec::with_capacity(remuda_core::protocol::LINE_ANSWER_MAX_FRAME_BYTES + 1);
+    serde_json::to_writer(&mut frame, &request)?;
+    frame.push(b'\n');
+    if frame.len() > remuda_core::protocol::LINE_ANSWER_MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "line answer frame is oversized",
+        ));
+    }
     stream.write_all(&frame)?;
     stream.flush()
 }
@@ -2199,6 +2315,80 @@ where
     Ok(answer)
 }
 
+fn prompt_line_with_events<T, I>(
+    terminal: T,
+    label: &str,
+    default: Option<&str>,
+    events: I,
+) -> std::io::Result<Result<Option<String>, PromptLineError>>
+where
+    T: SecretPromptTerminal,
+    I: IntoIterator<Item = crossterm::event::Event>,
+{
+    let mut mode = SecretPromptMode::enable(terminal)?;
+    let label: String = label
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    mode.terminal.write_output(label.as_bytes())?;
+    if let Some(default) = default {
+        let default: String = default
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        mode.terminal.write_output(b" [")?;
+        mode.terminal.write_output(default.as_bytes())?;
+        mode.terminal.write_output(b"]")?;
+    }
+    mode.terminal.write_output(b": ")?;
+    mode.terminal.flush_output()?;
+
+    let mut rendered = String::new();
+    let mut output_error = None;
+    let answer = edit_prompt_line(
+        events,
+        default,
+        remuda_core::protocol::LINE_ANSWER_MAX_BYTES,
+        |action| {
+            if output_error.is_some() {
+                return;
+            }
+            let result = match action {
+                PromptLineEcho::Text(character) => {
+                    rendered.push(character);
+                    let mut encoded = [0; 4];
+                    mode.terminal
+                        .write_output(character.encode_utf8(&mut encoded).as_bytes())
+                }
+                PromptLineEcho::Erase => {
+                    if let Some(character) = rendered.pop() {
+                        let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+                        if width > 0 {
+                            let erase = format!("\x1b[{width}D\x1b[{width}P");
+                            mode.terminal.write_output(erase.as_bytes())
+                        } else {
+                            Ok(())
+                        }
+                    } else {
+                        Ok(())
+                    }
+                }
+                PromptLineEcho::Submit => Ok(()),
+            };
+            if let Err(error) = result {
+                output_error = Some(error);
+            }
+        },
+    );
+    if let Some(error) = output_error {
+        return Err(error);
+    }
+    mode.terminal.write_output(b"\r\n")?;
+    mode.terminal.flush_output()?;
+    drop(mode);
+    Ok(answer)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
@@ -3160,6 +3350,42 @@ mod tests {
                 .unwrap();
         assert_eq!(answer.as_slice(), b"S3CRET");
         assert_eq!(terminal.output(), b"Password: \r\x1b[2K\n");
+        assert_eq!(
+            terminal.operations(),
+            [
+                "raw:on",
+                "paste:on",
+                "flush",
+                "flush",
+                "paste:off",
+                "raw:off"
+            ]
+        );
+    }
+
+    #[test]
+    fn prompt_line_prints_default_and_echoes_visible_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::default();
+        let mut events = secret_text_events("ab");
+        events.push(secret_key(KeyCode::Backspace, KeyModifiers::NONE));
+        events.extend(secret_text_events("c"));
+        events.push(secret_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            "Homeserver",
+            Some("https://hs.example"),
+            events,
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some("ac".into())));
+        assert_eq!(
+            terminal.output(),
+            b"Homeserver [https://hs.example]: ab\x1b[1D\x1b[1Pc\r\n"
+        );
         assert_eq!(
             terminal.operations(),
             [

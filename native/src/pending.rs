@@ -46,6 +46,20 @@ pub struct SecretPromptEvent {
     pub answer: Result<Option<SecretBytes>, String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct LinePrompt {
+    pub id: u32,
+    pub label: String,
+    pub default: Option<String>,
+    pub caller_session: Option<String>,
+}
+
+pub struct LinePromptEvent {
+    pub pending_id: u64,
+    pub prompt_id: u32,
+    pub answer: Result<Option<String>, String>,
+}
+
 struct State {
     status: AtomicU8, // 0 pending, 1 completed, 2 cancelled
     cancel_reason: Mutex<Option<&'static str>>,
@@ -86,6 +100,8 @@ struct Entry {
     signal_rx: Mutex<Option<Receiver<Signal>>>,
     prompt_tx: Sender<SecretPrompt>,
     prompt_rx: Mutex<Option<Receiver<SecretPrompt>>>,
+    line_prompt_tx: Sender<LinePrompt>,
+    line_prompt_rx: Mutex<Option<Receiver<LinePrompt>>>,
     prompt_id: Arc<std::sync::atomic::AtomicU32>,
     prompt_outstanding: Arc<AtomicU8>,
     event_tx: Sender<PendingEvent>,
@@ -102,6 +118,7 @@ struct Inner {
     events_tx: Sender<PendingEvent>,
     events_rx: Mutex<Receiver<PendingEvent>>,
     secret_events: Mutex<Vec<SecretPromptEvent>>,
+    line_events: Mutex<Vec<LinePromptEvent>>,
     stopping: AtomicU8,
     marker_token: String,
 }
@@ -119,6 +136,7 @@ impl Default for PendingReplies {
             events_tx,
             events_rx: Mutex::new(events_rx),
             secret_events: Mutex::new(Vec::new()),
+            line_events: Mutex::new(Vec::new()),
             stopping: AtomicU8::new(0),
             marker_token: format!(
                 "{:x}",
@@ -189,6 +207,7 @@ impl PendingReplies {
         let (result_tx, result_rx) = mpsc::channel();
         let (signal_tx, signal_rx) = mpsc::channel();
         let (prompt_tx, prompt_rx) = mpsc::channel();
+        let (line_prompt_tx, line_prompt_rx) = mpsc::channel();
         let state = Arc::new(State::new());
         let entry = Arc::new(Entry {
             id,
@@ -200,6 +219,8 @@ impl PendingReplies {
             signal_rx: Mutex::new(Some(signal_rx)),
             prompt_tx,
             prompt_rx: Mutex::new(Some(prompt_rx)),
+            line_prompt_tx,
+            line_prompt_rx: Mutex::new(Some(line_prompt_rx)),
             prompt_id: Arc::new(std::sync::atomic::AtomicU32::new(1)),
             prompt_outstanding: Arc::new(AtomicU8::new(0)),
             event_tx: self.0.events_tx.clone(),
@@ -217,6 +238,7 @@ impl PendingReplies {
                 result_tx,
                 state,
                 prompt_tx: entry.prompt_tx.clone(),
+                line_prompt_tx: entry.line_prompt_tx.clone(),
                 prompt_id: Arc::clone(&entry.prompt_id),
                 prompt_outstanding: Arc::clone(&entry.prompt_outstanding),
                 caller_session: None,
@@ -230,11 +252,13 @@ impl PendingReplies {
         ))
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn wait(
         &self,
         id: u64,
         mut client_disconnected: impl FnMut() -> bool,
         mut prompt_client: impl FnMut(SecretPrompt, Duration) -> Result<Option<SecretBytes>, String>,
+        mut line_prompt_client: impl FnMut(LinePrompt, Duration) -> Result<Option<String>, String>,
     ) -> Result<WaitResult, String> {
         let entry = self
             .0
@@ -258,6 +282,12 @@ impl PendingReplies {
             .ok_or_else(|| "deferred reply already has a waiter".to_string())?;
         let prompt_rx = entry
             .prompt_rx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .ok_or_else(|| "deferred reply already has a waiter".to_string())?;
+        let line_prompt_rx = entry
+            .line_prompt_rx
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take()
@@ -299,6 +329,17 @@ impl PendingReplies {
             }
             if let Ok(prompt) = prompt_rx.try_recv() {
                 serve_secret_prompt(&self.0, &entry, id, prompt, deadline, &mut prompt_client);
+                continue;
+            }
+            if let Ok(prompt) = line_prompt_rx.try_recv() {
+                serve_line_prompt(
+                    &self.0,
+                    &entry,
+                    id,
+                    prompt,
+                    deadline,
+                    &mut line_prompt_client,
+                );
                 continue;
             }
             let now = Instant::now();
@@ -353,6 +394,10 @@ impl PendingReplies {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()),
         )
+    }
+
+    pub fn drain_line_events(&self) -> Vec<LinePromptEvent> {
+        std::mem::take(&mut *self.0.line_events.lock().unwrap_or_else(|p| p.into_inner()))
     }
 
     pub fn shutdown(&self) {
@@ -441,12 +486,41 @@ fn serve_secret_prompt(
         });
 }
 
+fn serve_line_prompt(
+    inner: &Inner,
+    entry: &Entry,
+    pending_id: u64,
+    prompt: LinePrompt,
+    deadline: Instant,
+    prompt_client: &mut impl FnMut(LinePrompt, Duration) -> Result<Option<String>, String>,
+) {
+    let prompt_timeout = deadline
+        .saturating_duration_since(Instant::now())
+        .min(SECRET_PROMPT_TIMEOUT);
+    let answer = if prompt_timeout.is_zero() {
+        Err("cancelled".into())
+    } else {
+        prompt_client(prompt.clone(), prompt_timeout)
+    };
+    entry.prompt_outstanding.store(0, Ordering::SeqCst);
+    inner
+        .line_events
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(LinePromptEvent {
+            pending_id,
+            prompt_id: prompt.id,
+            answer,
+        });
+}
+
 pub struct PendingHandle {
     id: u64,
     result_tx: Sender<Completion>,
     state: Arc<State>,
     event_tx: Sender<PendingEvent>,
     prompt_tx: Sender<SecretPrompt>,
+    line_prompt_tx: Sender<LinePrompt>,
     prompt_id: Arc<std::sync::atomic::AtomicU32>,
     prompt_outstanding: Arc<AtomicU8>,
     caller_session: Option<String>,
@@ -479,6 +553,33 @@ impl PendingHandle {
             .send(SecretPrompt {
                 id: prompt_id,
                 label,
+                caller_session: self.caller_session.clone(),
+            })
+            .map_err(|_| {
+                self.prompt_outstanding.store(0, Ordering::SeqCst);
+                mlua::Error::runtime("pending reply is no longer connected")
+            })?;
+        Ok(prompt_id)
+    }
+
+    fn prompt_line(&self, label: String, default: Option<String>) -> mlua::Result<u32> {
+        if self.state.status.load(Ordering::SeqCst) != 0 {
+            return Err(mlua::Error::runtime("pending reply is no longer active"));
+        }
+        let prompt_id = self.prompt_id.fetch_add(1, Ordering::SeqCst);
+        if prompt_id == 0 {
+            return Err(mlua::Error::runtime("line prompt id space exhausted"));
+        }
+        if self.prompt_outstanding.swap(1, Ordering::SeqCst) != 0 {
+            return Err(mlua::Error::runtime(
+                "a prompt is already outstanding for this pending reply",
+            ));
+        }
+        self.line_prompt_tx
+            .send(LinePrompt {
+                id: prompt_id,
+                label,
+                default,
                 caller_session: self.caller_session.clone(),
             })
             .map_err(|_| {
@@ -528,6 +629,10 @@ impl UserData for PendingHandle {
         methods.add_method("prompt_secret", |_, this, label: String| {
             this.prompt_secret(label)
         });
+        methods.add_method(
+            "prompt_line",
+            |_, this, (label, default): (String, Option<String>)| this.prompt_line(label, default),
+        );
         methods.add_method(
             "resolve",
             |_, this, (code, stdout, stderr): (i64, LuaString, LuaString)| {
@@ -586,7 +691,9 @@ mod tests {
         let waiter = pending.clone();
         let (done_tx, done_rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
-            let result = waiter.wait(id, || false, |_, _| Ok(None)).unwrap();
+            let result = waiter
+                .wait(id, || false, |_, _| Ok(None), |_, _| Ok(None))
+                .unwrap();
             done_tx.send(result.completion).unwrap();
         });
 
@@ -621,6 +728,7 @@ mod tests {
                     assert!(timeout < SECRET_PROMPT_TIMEOUT);
                     Ok(Some(SecretBytes::new(b"probe".to_vec())))
                 },
+                |_, _| Ok(None),
             )
             .unwrap();
         assert!(
@@ -648,7 +756,7 @@ mod tests {
             .is_err());
         assert!(matches!(
             pending
-                .wait(id, || false, |_, _| Ok(None))
+                .wait(id, || false, |_, _| Ok(None), |_, _| Ok(None))
                 .unwrap()
                 .completion,
             Ok(Completion::Failure(message)) if message == "done"

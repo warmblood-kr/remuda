@@ -149,6 +149,12 @@ remuda.extension_command("deferred", function(args)
       if err then reply:reject(err) else reply:resolve(0, line, "") end
     end }
     return reply
+  elseif args[1] == "line_long_default" then
+    local reply = remuda.pending { timeout = 5 }
+    reply:prompt_line { label = "owner ID", default = string.rep("x", 1100), callback = function(line, err)
+      if err then reply:reject(err) else reply:resolve(0, line, "") end
+    end }
+    return reply
   elseif args[1] == "shutdown_wait" then
     local path = args[2]
     return remuda.pending { timeout = 30, on_cancel = function(reason)
@@ -1109,12 +1115,13 @@ fn prompt_line_value_round_trips_over_the_daemon_socket() {
     );
     let socket = remuda_native::daemon::socket_path_in(&dir, "s");
 
-    let answer_over_socket = |line: &str| {
+    let answer_over_socket = |word: &str, line: &str, expected_default: &str| {
         let mut stream = remuda_native::ipc::connect(&socket).expect("private daemon socket");
         let mut reader = BufReader::new(stream.try_clone().expect("clone private socket"));
         let request = Request::Eval {
-            code: "return remuda._dispatch_extension_command('deferred', {'line_answers'}, {})"
-                .into(),
+            code: format!(
+                "return remuda._dispatch_extension_command('deferred', {{'{word}'}}, {{}})"
+            ),
             name: None,
         };
         let mut request_frame = serde_json::to_vec(&request).unwrap();
@@ -1125,8 +1132,8 @@ fn prompt_line_value_round_trips_over_the_daemon_socket() {
         reader.read_until(b'\n', &mut prompt_frame).unwrap();
         let prompt: serde_json::Value = serde_json::from_slice(&prompt_frame).unwrap();
         let prompt_line = prompt.get("PromptLine").expect("PromptLine response");
-        assert_eq!(prompt_line["label"], "owner ID");
-        assert_eq!(prompt_line["default"], "owner");
+        assert_eq!(prompt_line["label"], "remuda[outside] owner ID");
+        assert_eq!(prompt_line["default"], expected_default);
         let id = prompt_line["id"].as_u64().expect("prompt id");
         let answer = serde_json::json!({
             "LineAnswer": { "id": id, "line": line, "refusal": null }
@@ -1153,8 +1160,13 @@ fn prompt_line_value_round_trips_over_the_daemon_socket() {
     };
 
     assert_eq!(
-        answer_over_socket("https://homeserver.example"),
+        answer_over_socket("line_answers", "https://homeserver.example", "owner"),
         b"https://homeserver.example"
+    );
+    let capped_default = "x".repeat(1024);
+    assert_eq!(
+        answer_over_socket("line_long_default", "selected", &capped_default),
+        b"selected"
     );
 
     let stop = remuda(&["stop", "-f"]);
@@ -1250,7 +1262,7 @@ fn session_prompt_line_shows_tagged_label_and_sanitized_default() {
     let _ = fs::remove_dir_all(&dir);
 
     assert!(
-        prompt_screen.contains("remuda[prompt-line-session] wizard label [default]: "),
+        prompt_screen.contains("remuda[session prompt-line-session] wizard label [default]:"),
         "session label/default was not tagged or sanitized:\n{prompt_screen}"
     );
     assert!(
