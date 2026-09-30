@@ -112,6 +112,18 @@ remuda.extension_command("deferred", function(args)
       end
     end }
     return reply
+  elseif args[1] == "secret_cap" or args[1] == "secret_over_cap" then
+    local reply = remuda.pending { timeout = 5 }
+    reply:prompt_secret { label = "secret cap test", callback = function(secret, err)
+      if err then
+        reply:reject(err)
+      elseif #secret == 4096 and secret == string.rep("x", 4096) then
+        reply:resolve(0, "exact 4 KiB", "")
+      else
+        reply:reject("unexpected secret length")
+      end
+    end }
+    return reply
   elseif args[1] == "shutdown_wait" then
     local path = args[2]
     return remuda.pending { timeout = 30, on_cancel = function(reason)
@@ -425,6 +437,101 @@ fn secret_prompt_non_tty_fallback_and_answer_do_not_leak() {
         Some("Next: remuda deferred --password-file PATH"),
         "non-TTY error must end with a concrete password-file Next line: {stderr}"
     );
+}
+
+#[test]
+fn secret_answer_frame_round_trips_at_four_kib_and_reports_too_long() {
+    use remuda_core::protocol::{Request, Response, SecretAnswerRefusal, SecretBytes};
+    use remuda_native::ipc::TryClone;
+    use std::io::{BufRead, BufReader, Write};
+
+    let (dir, remuda) = fixture("secret_cap");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+
+    let answer_over_socket = |word: &str, secret: Option<SecretBytes>, refusal| {
+        let mut stream = remuda_native::ipc::connect(&socket).expect("private daemon socket");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone private socket"));
+        let request = Request::Eval {
+            code: format!(
+                "return remuda._dispatch_extension_command('deferred', {{'{word}'}}, {{}})"
+            ),
+            name: None,
+        };
+        let mut request_frame = serde_json::to_vec(&request).unwrap();
+        request_frame.push(b'\n');
+        stream.write_all(&request_frame).unwrap();
+
+        let mut prompt_frame = Vec::new();
+        reader.read_until(b'\n', &mut prompt_frame).unwrap();
+        let prompt: Response = serde_json::from_slice(&prompt_frame).expect("secret prompt frame");
+        let id = match prompt {
+            Response::PromptSecret { id, .. } => id,
+            response => panic!("expected secret prompt, got {response:?}"),
+        };
+        let answer = Request::SecretAnswer {
+            id,
+            secret,
+            refusal,
+        };
+        let mut answer_frame = serde_json::to_vec(&answer).unwrap();
+        answer_frame.push(b'\n');
+        stream.write_all(&answer_frame).unwrap();
+        let mut reply_frame = Vec::new();
+        reader.read_until(b'\n', &mut reply_frame).unwrap();
+        (answer_frame, reply_frame)
+    };
+
+    let (answer_frame, exact_reply_frame) = answer_over_socket(
+        "secret_cap",
+        Some(SecretBytes::new(vec![b'x'; 4 * 1024])),
+        None,
+    );
+    assert!(
+        answer_frame.len() <= remuda_core::protocol::SECRET_ANSWER_MAX_FRAME_BYTES,
+        "serialized 4 KiB SecretAnswer frame was too large: {} bytes",
+        answer_frame.len()
+    );
+    let decoded_answer: Request = serde_json::from_slice(&answer_frame).unwrap();
+    assert!(matches!(
+        decoded_answer,
+        Request::SecretAnswer {
+            secret: Some(secret),
+            refusal: None,
+            ..
+        } if secret.as_bytes().len() == 4 * 1024
+            && secret.as_bytes().iter().all(|byte| *byte == b'x')
+    ));
+    let exact_reply: Response = serde_json::from_slice(&exact_reply_frame).unwrap();
+    match exact_reply {
+        Response::CommandResult {
+            exit_code,
+            stdout_base64,
+            stderr_base64,
+        } => {
+            assert_eq!(exit_code, 0);
+            assert_eq!(
+                remuda_native::cluster::encoding::decode_base64(&stdout_base64).unwrap(),
+                b"exact 4 KiB"
+            );
+            assert!(stderr_base64.is_empty());
+        }
+        response => panic!("expected successful 4 KiB callback, got {response:?}"),
+    }
+
+    let (_, too_long_reply_frame) =
+        answer_over_socket("secret_over_cap", None, Some(SecretAnswerRefusal::TooLong));
+    let too_long_reply: Response = serde_json::from_slice(&too_long_reply_frame).unwrap();
+    assert_eq!(too_long_reply, Response::Error("too_long".into()));
+
+    let stop = remuda(&["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(stop.status.success(), "{stop:?}");
 }
 
 #[cfg(unix)]
