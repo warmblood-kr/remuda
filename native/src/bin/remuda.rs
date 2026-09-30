@@ -126,7 +126,10 @@ fn main() -> ExitCode {
 
         ["cluster", rest @ ..] => cluster_command(server, &path, rest),
 
-        [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
+        [command, rest @ ..]
+            if remuda_native::packages::valid_component(command)
+                && remuda_native::packages::has_subcommand(command) =>
+        {
             extension_command(server, &path, command, rest, stdin_enabled)
         }
 
@@ -167,13 +170,17 @@ fn main() -> ExitCode {
 
         // Not a known verb or mod command. A mod directory with no readable
         // manifest is named rather than answered with usage (#134).
-        _ => match argv
-            .first()
-            .and_then(|word| remuda_native::packages::half_installed(word))
-        {
-            Some(message) => fail(message),
-            None => unknown_command(argv.first().copied().unwrap_or("")),
-        },
+        _ => {
+            let word = argv.first().copied().unwrap_or("");
+            if !remuda_native::packages::valid_component(word) {
+                unknown_command(word)
+            } else {
+                match remuda_native::packages::half_installed(word) {
+                    Some(message) => fail(message),
+                    None => unknown_command(word),
+                }
+            }
+        }
     }
 }
 
@@ -2491,14 +2498,19 @@ fn split_server_flag(args: &[String]) -> (&str, &[String]) {
 fn split_stdin_flag(args: &[String]) -> Result<(bool, &[String]), &'static str> {
     match args {
         [flag, command, ..]
-            if flag == "--stdin" && remuda_native::packages::has_subcommand(command) =>
+            if flag == "--stdin"
+                && remuda_native::packages::valid_component(command)
+                && remuda_native::packages::has_subcommand(command) =>
         {
             Ok((true, &args[1..]))
         }
         [flag, ..] if flag == "--stdin" => {
             Err("--stdin is only valid before an installed mod command")
         }
-        [command, rest @ ..] if remuda_native::packages::has_subcommand(command) => {
+        [command, rest @ ..]
+            if remuda_native::packages::valid_component(command)
+                && remuda_native::packages::has_subcommand(command) =>
+        {
             let options = rest.split(|arg| arg == "--").next().unwrap_or(rest);
             if options.iter().any(|arg| arg == "--stdin") {
                 Err("usage: remuda --stdin MOD [ARGS…] (put --stdin before the mod command)")
