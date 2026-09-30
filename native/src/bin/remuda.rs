@@ -822,8 +822,8 @@ pub fn cluster_usage(verb: &str) -> String {
         "revoke" => "usage: remuda cluster revoke NODE|FINGERPRINT [--yes]\nexample: remuda cluster revoke node-abcd1234\n".into(),
         "control" => "usage: remuda cluster control on|off\nexample: remuda cluster control off\n".into(),
         "remote" => "usage: remuda cluster remote [NODE/SESSION]\nexample: remuda cluster remote\n".into(),
-        "listen" => format!("usage: remuda cluster listen --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--allow-public] [--foreground]\nusage: remuda cluster listen --off\nexample: remuda cluster listen --bind 192.168.1.20\n"),
-        "call" => format!("usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--json]\nexample: remuda cluster call node-abcd1234 list --addr 192.168.1.20\n"),
+        "listen" => format!("usage: remuda cluster listen --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--allow-public] [--foreground]\nusage: remuda cluster listen --off\nexample: remuda cluster listen --bind 192.0.2.1\n"),
+        "call" => format!("usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--json]\nexample: remuda cluster call node-abcd1234 list --addr 192.0.2.1\n"),
         _ => "usage: remuda cluster <command>\n  init\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n".into(),
     }
 }
@@ -2874,13 +2874,14 @@ mod cluster_cli_tests {
     fn cluster_usage_has_one_verb_per_line_and_examples() {
         assert_eq!(
             cluster_usage("listen"),
-            "usage: remuda cluster listen --bind IP[:PORT] (default port 7441) [--allow-public] [--foreground]\nusage: remuda cluster listen --off\nexample: remuda cluster listen --bind 192.168.1.20\n"
+            "usage: remuda cluster listen --bind IP[:PORT] (default port 7441) [--allow-public] [--foreground]\nusage: remuda cluster listen --off\nexample: remuda cluster listen --bind 192.0.2.1\n"
         );
         for verb in ["invite", "join", "call"] {
             let usage = cluster_usage(verb);
             assert!(usage.contains("IP[:PORT]"), "{verb}: {usage}");
             assert!(usage.contains("default port 7441"), "{verb}: {usage}");
         }
+        assert!(cluster_usage("call").contains("--addr 192.0.2.1"));
         assert_eq!(
             cluster_usage("join"),
             "usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port 7441)]\nexample: remuda cluster join 'remuda-join-v1 …'\n"
