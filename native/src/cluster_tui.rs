@@ -250,6 +250,10 @@ impl ClusterUi {
             } => self.has_remote_session(node, name, instance_id),
             RemoteSelection::Node(_) => false,
         });
+        self.remote_keys_mode = self.remote_keys_mode.take().filter(|selection| {
+            self.remote_session(selection)
+                .is_some_and(|(_, session)| session.alive)
+        });
     }
 
     fn has_remote_session(&self, node: &str, name: &str, instance_id: &str) -> bool {
@@ -832,10 +836,7 @@ impl ClusterUi {
                         }
                         text = stripped;
                     }
-                    let mut bytes = Vec::with_capacity(text.len() + 12);
-                    bytes.extend_from_slice(b"\x1b[200~");
-                    bytes.extend_from_slice(text.as_bytes());
-                    bytes.extend_from_slice(b"\x1b[201~");
+                    let bytes = crate::tui::paste_input(&text, true);
                     self.enqueue_remote_key_bytes(&target, bytes, now);
                 }
                 false
@@ -1910,8 +1911,24 @@ pub fn run_with_remote_selection_and_input(
     remote_input: Option<&dyn RemoteInputTransport>,
 ) -> io::Result<()> {
     let terminal_mode = RawMode::enable()?;
+    let mut paste_capture = crate::tui::BracketedPasteCapture::new(io::stdout());
     let clock = crate::SystemClock::new();
-    let result = run_loop(path, node, target, &clock, source, selection, remote_input);
+    let result = {
+        let mut runtime = ClusterTuiRuntime {
+            clock: &clock,
+            paste_capture: &mut paste_capture,
+        };
+        run_loop(
+            path,
+            node,
+            target,
+            source,
+            selection,
+            remote_input,
+            &mut runtime,
+        )
+    };
+    drop(paste_capture);
     drop(terminal_mode);
     result
 }
@@ -1938,15 +1955,21 @@ pub fn read_frame(
     Ok(ui.render(cols, rows, &body, &clock))
 }
 
+struct ClusterTuiRuntime<'a> {
+    clock: &'a dyn Clock,
+    paste_capture: &'a mut crate::tui::BracketedPasteCapture<io::Stdout>,
+}
+
 fn run_loop(
     path: &Path,
     node: &str,
     target: Option<&str>,
-    clock: &dyn Clock,
     remote_source: &dyn RemoteSource,
     remote_selection: &RemotePollSelection,
     remote_input: Option<&dyn RemoteInputTransport>,
+    runtime: &mut ClusterTuiRuntime<'_>,
 ) -> io::Result<()> {
+    let clock = runtime.clock;
     let mut ui = ClusterUi::with_sender(node, list(path)?, clock.now(), InputSender::random()?);
     ui.remote_input_enabled = remote_input.is_some();
     ui.remote_synced(remote_source);
@@ -1978,6 +2001,7 @@ fn run_loop(
             ui.sessions_synced(current, clock.now());
         }
         ui.remote_synced(remote_source);
+        runtime.paste_capture.set(ui.remote_keys_mode.is_some())?;
         if let Some(RemoteSelection::Session { node, name, .. }) = &ui.remote_active {
             remote_selection.select(node.clone(), name.clone());
         } else {
@@ -2275,6 +2299,84 @@ mod tests {
     }
 
     #[test]
+    fn keys_mode_capture_disables_on_ctrl_backslash_and_session_loss() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        let mut output = Vec::new();
+        {
+            let mut capture = crate::tui::BracketedPasteCapture::new(&mut output);
+            capture.set(ui.remote_keys_mode.is_some()).unwrap();
+            key_event(
+                &mut ui,
+                KeyCode::Char('\\'),
+                KeyModifiers::CONTROL,
+                clock.now(),
+            );
+            capture.set(ui.remote_keys_mode.is_some()).unwrap();
+        }
+        assert_eq!(output, b"\x1b[?2004h\x1b[?2004l");
+
+        for ended in [false, true] {
+            let clock = ManualClock::new();
+            let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+                RemoteState::Reachable,
+                Duration::ZERO,
+                Some(remote_screen("remote")),
+            )));
+            let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+            ui.remote_synced(&source);
+            ui.remote_input_enabled = true;
+            ui.select_target(Some("fp-laptop/build")).unwrap();
+            key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+
+            let mut output = Vec::new();
+            {
+                let mut capture = crate::tui::BracketedPasteCapture::new(&mut output);
+                capture.set(ui.remote_keys_mode.is_some()).unwrap();
+                let mut snapshot = remote_snapshot(
+                    RemoteState::Reachable,
+                    Duration::ZERO,
+                    Some(remote_screen("remote")),
+                );
+                if ended {
+                    snapshot.nodes[0].sessions[0].alive = false;
+                } else {
+                    snapshot.nodes.clear();
+                }
+                source.replace(snapshot);
+                ui.remote_synced(&source);
+                assert!(ui.remote_keys_mode.is_none());
+                capture.set(ui.remote_keys_mode.is_some()).unwrap();
+            }
+            assert_eq!(output, b"\x1b[?2004h\x1b[?2004l");
+        }
+    }
+
+    #[test]
+    fn bracketed_paste_capture_disables_when_dropped_on_return_or_panic() {
+        fn enable_then_drop(output: &mut Vec<u8>) {
+            let mut capture = crate::tui::BracketedPasteCapture::new(output);
+            capture.set(true).unwrap();
+        }
+
+        let mut returned = Vec::new();
+        enable_then_drop(&mut returned);
+        assert_eq!(returned, b"\x1b[?2004h\x1b[?2004l");
+
+        let mut panicked = Vec::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut capture = crate::tui::BracketedPasteCapture::new(&mut panicked);
+            capture.set(true).unwrap();
+            panic!("exercise capture guard unwind");
+        }));
+        assert!(result.is_err());
+        assert_eq!(panicked, b"\x1b[?2004h\x1b[?2004l");
+    }
+
+    #[test]
     fn remote_keys_mode_uses_one_status_row_and_all_other_rows_for_the_pane() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -2355,6 +2457,35 @@ mod tests {
     }
 
     #[test]
+    fn remote_paste_drops_control_bytes_before_wrapping() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.handle_event(
+            Event::Paste("a\x01b\u{009b}c\u{007f}d\t\n\re".into()),
+            clock.now(),
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "paste should produce one Input");
+        assert!(matches!(
+            &requests[0].1,
+            Request::Input { bytes, .. }
+                if bytes == b"\x1b[200~abcd\t\n\re\x1b[201~"
+        ));
+    }
+
+    #[test]
     fn bracketed_paste_markers_inside_remote_paste_are_stripped() {
         use crossterm::event::{Event, KeyCode, KeyModifiers};
 
@@ -2381,6 +2512,115 @@ mod tests {
             Request::Input { bytes, .. }
                 if bytes == b"\x1b[200~leftmiddleright\x1b[201~"
         ));
+    }
+
+    #[test]
+    fn remote_keys_do_not_queue_when_node_control_is_disabled() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.remote_control_disabled.insert("fp-laptop".into());
+
+        ui.handle_event(Event::Paste("blocked".into()), clock.now());
+
+        assert!(ui.remote_key_buffers.is_empty());
+        assert_eq!(ui.input_queue.items().count(), 0);
+        assert_eq!(
+            ui.notice.as_ref().map(|(notice, _)| notice.as_str()),
+            Some("remote control disabled on this node")
+        );
+    }
+
+    #[test]
+    fn remote_keys_drop_buffer_when_session_ends_before_flush() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        )));
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&source);
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.handle_event(
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )),
+            clock.now(),
+        );
+        assert_eq!(ui.remote_key_buffers.len(), 1);
+
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        snapshot.nodes[0].sessions[0].alive = false;
+        source.replace(snapshot);
+        ui.remote_synced(&source);
+        ui.flush_remote_key_buffer(
+            Instant::now() + super::REMOTE_KEYS_COALESCE_INTERVAL,
+            clock.now(),
+        );
+
+        assert!(ui.remote_key_buffers.is_empty());
+        assert_eq!(ui.input_queue.items().count(), 0);
+        assert_eq!(
+            ui.notice.as_ref().map(|(notice, _)| notice.as_str()),
+            Some("laptop/build has ended")
+        );
+    }
+
+    #[test]
+    fn remote_keys_drop_buffer_when_session_is_replaced_before_flush() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        )));
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&source);
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.handle_event(
+            Event::Key(crossterm::event::KeyEvent::new(
+                KeyCode::Char('y'),
+                KeyModifiers::NONE,
+            )),
+            clock.now(),
+        );
+        assert_eq!(ui.remote_key_buffers.len(), 1);
+
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("replacement")),
+        );
+        snapshot.nodes[0].sessions[0].instance_id = "replacement-instance".into();
+        source.replace(snapshot);
+        ui.remote_synced(&source);
+        ui.flush_remote_key_buffer(
+            Instant::now() + super::REMOTE_KEYS_COALESCE_INTERVAL,
+            clock.now(),
+        );
+
+        assert!(ui.remote_key_buffers.is_empty());
+        assert_eq!(ui.input_queue.items().count(), 0);
+        assert_eq!(
+            ui.notice.as_ref().map(|(notice, _)| notice.as_str()),
+            Some("remote session is no longer listed")
+        );
     }
 
     #[test]

@@ -2732,20 +2732,20 @@ impl Drop for MouseCapture {
     }
 }
 
-struct BracketedPasteCapture<W: Write> {
+pub(crate) struct BracketedPasteCapture<W: Write> {
     output: W,
     enabled: bool,
 }
 
 impl<W: Write> BracketedPasteCapture<W> {
-    fn new(output: W) -> Self {
+    pub(crate) fn new(output: W) -> Self {
         Self {
             output,
             enabled: false,
         }
     }
 
-    fn set(&mut self, enabled: bool) -> std::io::Result<()> {
+    pub(crate) fn set(&mut self, enabled: bool) -> std::io::Result<()> {
         if self.enabled == enabled {
             return Ok(());
         }
@@ -2767,7 +2767,7 @@ impl<W: Write> Drop for BracketedPasteCapture<W> {
     }
 }
 
-fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
+pub(crate) fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
     let text: String = text
         .chars()
         .filter(|character| {

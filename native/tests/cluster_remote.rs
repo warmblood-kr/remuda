@@ -534,6 +534,160 @@ fn real_remote_keys_mode_forwards_character_escape_and_ctrl_c() {
 }
 
 #[test]
+#[cfg(unix)]
+fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
+    let client_node = Node::start("paste-live-client");
+    let server_node = Node::start("paste-live-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    let control = server_node
+        .command()
+        .args(["cluster", "control", "on"])
+        .output()
+        .unwrap();
+    assert!(
+        control.status.success(),
+        "cluster control failed: {control:?}"
+    );
+    server_node.start_named_session(
+        "proof",
+        "stty raw -echo; printf 'READY\\r\\n'; seen=0; while :; do byte=$(dd bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '); case \"$byte\" in 13) printf '\\r\\ngot=enter\\r\\n' ;; 108) if [ \"$seen\" = 0 ]; then seen=1; printf '\\r\\ngot=payload\\r\\n'; fi ;; esac; done",
+    );
+
+    let registry_path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    let server = registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap();
+    server.endpoint = Some(listener.address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let server_label = remuda_native::cluster::node_label(&server_node.fingerprint());
+    let mut tui = RemoteTui::start(&client_node, None);
+    tui.wait_for(&server_label, Duration::from_secs(10));
+    tui.writer.write_all(b"\x1b[B\x1b[C").unwrap();
+    tui.wait_for("proof", Duration::from_secs(10));
+    tui.writer.write_all(b"\x1b[B\r").unwrap();
+    tui.wait_for("remote live · reachable", Duration::from_secs(10));
+    tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
+    tui.writer.write_all(b"\x1c").unwrap();
+    let keys_start = tui.output_len();
+    tui.writer.write_all(b"k").unwrap();
+    tui.wait_for(
+        &format!("KEYS {server_label}/proof · Ctrl-\\ back"),
+        Duration::from_secs(3),
+    );
+    assert!(
+        tui.text_from(keys_start).contains("\x1b[?2004h"),
+        "keys mode must enable bracketed paste capture"
+    );
+
+    let output_start = tui.output_len();
+    tui.writer.write_all(b"\x1b[200~line1\rline2").unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    let before_end = tui.text_from(output_start);
+    assert!(
+        !before_end.contains("got=payload")
+            && !before_end.contains("got=enter")
+            && !before_end.contains("Input sent"),
+        "remote received input before paste terminator: {before_end}"
+    );
+
+    tui.writer.write_all(b"\x1b[201~").unwrap();
+    tui.writer.write_all(b"\x1c").unwrap();
+    tui.wait_for_from(
+        keys_start,
+        "Remote session is read-only · q detach",
+        Duration::from_secs(3),
+    );
+    tui.wait_for_from(output_start, "sent ·", Duration::from_secs(10));
+    let output = tui.output.lock().unwrap();
+    let mut parser = vt100::Parser::new(24, 100, 0);
+    parser.process(&output);
+    let screen = parser.screen().contents();
+    let complete_paste_inputs = screen
+        .lines()
+        .filter(|line| line.contains("line1") && line.contains("line2"))
+        .count();
+    assert_eq!(
+        complete_paste_inputs, 1,
+        "the completed paste should be one Input batch; screen:\n{screen}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn real_remote_keys_mode_respects_cluster_control_off() {
+    let client_node = Node::start("keys-denied-client");
+    let server_node = Node::start("keys-denied-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    let control = server_node
+        .command()
+        .args(["cluster", "control", "off"])
+        .output()
+        .unwrap();
+    assert!(
+        control.status.success(),
+        "cluster control failed: {control:?}"
+    );
+    server_node.start_named_session(
+        "proof",
+        "stty raw -echo; printf 'READY\\r\\n'; while :; do byte=$(dd bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '); case \"$byte\" in 121) printf '\\r\\ngot=y\\r\\n' ;; esac; done",
+    );
+
+    let registry_path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    let server = registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap();
+    server.endpoint = Some(listener.address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let server_label = remuda_native::cluster::node_label(&server_node.fingerprint());
+    let mut tui = RemoteTui::start(&client_node, None);
+    tui.wait_for(&server_label, Duration::from_secs(10));
+    tui.writer.write_all(b"\x1b[B\x1b[C").unwrap();
+    tui.wait_for("proof", Duration::from_secs(10));
+    tui.writer.write_all(b"\x1b[B\r").unwrap();
+    tui.wait_for("remote live · reachable", Duration::from_secs(10));
+    tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
+    tui.writer.write_all(b"\x1c").unwrap();
+    tui.writer.write_all(b"k").unwrap();
+    tui.wait_for(
+        &format!("KEYS {server_label}/proof · Ctrl-\\ back"),
+        Duration::from_secs(3),
+    );
+
+    let input_start = tui.output_len();
+    tui.writer.write_all(b"y").unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    let output = tui.text_from(input_start);
+    assert!(
+        !output.contains("got=y"),
+        "server accepted input while cluster control was disabled: {output}"
+    );
+}
+
+#[test]
 fn driver_hosted_remote_tui_capture_shows_live_output_with_trailing_blanks() {
     let client_node = Node::start("driver-remote-client");
     let driver_node = Node::start("driver-remote-driver");
