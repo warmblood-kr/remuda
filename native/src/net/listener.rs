@@ -2103,6 +2103,21 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn wait_for_global_count(limiter: &RequestLimiter, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if limiter.active_global.load(Ordering::Acquire) == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "global permit count did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn ninth_concurrent_remote_sync_is_refused_by_listener_dispatch() {
         use interprocess::local_socket::traits::ListenerExt as _;
@@ -2884,6 +2899,7 @@ mod tests {
         let headers = format!("Content-Length: {}\r\n", body.len());
         assert_eq!(server.send_raw(&body, headers.as_bytes()).unwrap().0, 409);
         wait_for_preauth_count(&server.state.limiter, 0);
+        wait_for_global_count(&server.state.limiter, 0);
 
         server
             .state
