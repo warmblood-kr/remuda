@@ -1111,8 +1111,10 @@ fn cluster_init_message(created: bool) -> &'static str {
 fn invite_message(line: &remuda_native::cluster::join_line::JoinLine) -> std::io::Result<String> {
     let encoded = line.encode()?;
     Ok(format!(
-        "Invitation for one machine, valid 10 minutes. Run this on the other machine:\n\n  remuda cluster join '{}' '{}'\n\nNext: after it joins, run `remuda cluster nodes` here to see it.",
-        line.issuer_fingerprint, encoded
+        "Invitation for one machine, valid 10 minutes. Run this on the other machine:\n\n  remuda cluster join '{}' '{}'\n\nFingerprint of this machine: {} (the other machine must show the same one)\n\nNext: after it joins, run `remuda cluster nodes` here to see it.",
+        line.issuer_fingerprint,
+        encoded,
+        line.issuer_fingerprint
     ))
 }
 
@@ -1374,7 +1376,7 @@ mod cluster_cli_tests {
         assert_eq!(
             output,
             format!(
-                "Invitation for one machine, valid 10 minutes. Run this on the other machine:\n\n  remuda cluster join '{fingerprint}' '{encoded}'\n\nNext: after it joins, run `remuda cluster nodes` here to see it."
+                "Invitation for one machine, valid 10 minutes. Run this on the other machine:\n\n  remuda cluster join '{fingerprint}' '{encoded}'\n\nFingerprint of this machine: {fingerprint} (the other machine must show the same one)\n\nNext: after it joins, run `remuda cluster nodes` here to see it."
             )
         );
         let args = shell_split_single_quotes(command);
