@@ -2312,4 +2312,122 @@ mod tests {
         assert_eq!(scrollback.offset.load(Ordering::SeqCst), 0);
         assert_eq!(received, paste);
     }
+
+    fn secret_key(
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> crossterm::event::Event {
+        crossterm::event::Event::Key(crossterm::event::KeyEvent::new(code, modifiers))
+    }
+
+    fn secret_text_events(text: &str) -> Vec<crossterm::event::Event> {
+        text.chars()
+            .map(|character| {
+                secret_key(
+                    crossterm::event::KeyCode::Char(character),
+                    crossterm::event::KeyModifiers::NONE,
+                )
+            })
+            .collect()
+    }
+
+    fn edit_secret_line(
+        events: impl IntoIterator<Item = crossterm::event::Event>,
+    ) -> Result<Option<Vec<u8>>, super::SecretLineError> {
+        super::edit_secret_line(events)
+    }
+
+    #[test]
+    fn secret_line_enter_submits_and_ignores_later_events() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut events = secret_text_events("secret");
+        events.push(secret_key(KeyCode::Enter, KeyModifiers::NONE));
+        events.extend(secret_text_events("ignored"));
+
+        assert_eq!(edit_secret_line(events), Ok(Some(b"secret".to_vec())));
+    }
+
+    #[test]
+    fn secret_line_backspace_edits_the_previous_character() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut events = secret_text_events("aé");
+        events.push(secret_key(KeyCode::Backspace, KeyModifiers::NONE));
+        events.extend(secret_text_events("b"));
+        events.push(secret_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(edit_secret_line(events), Ok(Some(b"ab".to_vec())));
+    }
+
+    #[test]
+    fn secret_line_ctrl_c_ctrl_d_and_escape_cancel() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let cancel_events = [
+            secret_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            secret_key(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            secret_key(KeyCode::Esc, KeyModifiers::NONE),
+        ];
+        for cancel in cancel_events {
+            let mut events = secret_text_events("partial");
+            events.push(cancel);
+            assert_eq!(edit_secret_line(events), Ok(None));
+        }
+    }
+
+    #[test]
+    fn secret_line_rejects_more_than_four_kibibytes() {
+        let events = [crossterm::event::Event::Paste("x".repeat(4 * 1024 + 1))];
+
+        assert_eq!(
+            edit_secret_line(events),
+            Err(super::SecretLineError::TooLong)
+        );
+    }
+
+    #[test]
+    fn secret_line_paste_inserts_text_without_a_trailing_newline() {
+        let events = [
+            crossterm::event::Event::Paste("pasted secret".into()),
+            secret_key(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ];
+
+        assert_eq!(
+            edit_secret_line(events),
+            Ok(Some(b"pasted secret".to_vec()))
+        );
+    }
+
+    #[test]
+    fn secret_line_paste_inserts_text_without_its_trailing_newline() {
+        let events = [
+            crossterm::event::Event::Paste("pasted secret\n".into()),
+            secret_key(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ];
+
+        assert_eq!(
+            edit_secret_line(events),
+            Ok(Some(b"pasted secret".to_vec()))
+        );
+    }
+
+    #[test]
+    fn secret_line_preserves_multibyte_characters_as_utf8() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut events = secret_text_events("päss🔐");
+        events.push(secret_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            edit_secret_line(events),
+            Ok(Some("päss🔐".as_bytes().to_vec()))
+        );
+    }
 }
