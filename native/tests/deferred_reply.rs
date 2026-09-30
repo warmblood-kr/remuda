@@ -33,6 +33,7 @@ fn pending_handle_count_is_bounded_and_overflow_fails_immediately() {
     ));
 }
 
+#[allow(clippy::too_many_lines)] // The fixture is one Lua module used by the integration cases below.
 fn fixture(tag: &str) -> (std::path::PathBuf, impl Fn(&[&str]) -> Output) {
     let root = if cfg!(target_os = "macos") {
         std::path::PathBuf::from("/private/tmp")
@@ -98,6 +99,38 @@ remuda.extension_command("deferred", function(args)
       reply:resolve(0, string.rep("x", 16 * 1024 * 1024), "")
     end }
     return reply
+  elseif args[1] == "secret" or args[1] == "secret_session" then
+    local reply = remuda.pending { timeout = 5 }
+    local label = "deferred test secret"
+    if args[1] == "secret_session" then
+      label = "deferred " .. string.char(27) .. "test secret"
+    end
+    reply:prompt_secret { label = label, callback = function(secret, err)
+      if err then
+        reply:reject("secret prompt " .. err .. "\nNext: remuda deferred --password-file PATH")
+      else
+        reply:resolve(0, "secret accepted", "")
+      end
+    end }
+    return reply
+  elseif args[1] == "secret_short" then
+    local reply = remuda.pending { timeout = 0.5 }
+    reply:prompt_secret { label = "short secret", callback = function(secret, err)
+      if err then reply:reject(err) else reply:resolve(0, "secret accepted", "") end
+    end }
+    return reply
+  elseif args[1] == "secret_cap" or args[1] == "secret_over_cap" then
+    local reply = remuda.pending { timeout = 5 }
+    reply:prompt_secret { label = "secret cap test", callback = function(secret, err)
+      if err then
+        reply:reject(err)
+      elseif #secret == 4096 and secret == string.rep("x", 4096) then
+        reply:resolve(0, "exact 4 KiB", "")
+      else
+        reply:reject("unexpected secret length")
+      end
+    end }
+    return reply
   elseif args[1] == "shutdown_wait" then
     local path = args[2]
     return remuda.pending { timeout = 30, on_cancel = function(reason)
@@ -122,6 +155,124 @@ end)
             .expect("run remuda")
     };
     (dir, run)
+}
+
+#[cfg(unix)]
+fn secret_prompt_client_exits_and_restores_tty(
+    runtime: &std::path::Path,
+    signal: Option<libc::c_int>,
+) -> (bool, bool, bool) {
+    use std::io::Read as _;
+
+    let pty = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open secret prompt pty");
+    let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "deferred", "secret_short"]);
+    command.env("REMUDA_RUNTIME_DIR", runtime);
+    command.env("XDG_DATA_HOME", runtime.join("data"));
+    command.env("HOME", runtime);
+    let mut child = pty
+        .slave
+        .spawn_command(command)
+        .expect("spawn secret client");
+    let pid = child.process_id().expect("secret client pid");
+    drop(pty.slave);
+    let mut reader = pty
+        .master
+        .try_clone_reader()
+        .expect("clone secret pty reader");
+    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reader_output = output.clone();
+    std::thread::spawn(move || {
+        let mut buffer = [0; 1024];
+        while let Ok(count) = reader.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            reader_output
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..count]);
+        }
+    });
+
+    let flags = || {
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::tcgetattr(pty.master.as_raw_fd().unwrap(), &mut termios) };
+        assert_eq!(result, 0, "read secret prompt terminal mode");
+        termios.c_lflag & libc::ECHO != 0 && termios.c_lflag & libc::ICANON != 0
+    };
+    let prompt_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !output
+        .lock()
+        .unwrap()
+        .windows(b"short secret".len())
+        .any(|w| w == b"short secret")
+        && std::time::Instant::now() < prompt_deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let prompt_shown = output
+        .lock()
+        .unwrap()
+        .windows(b"short secret".len())
+        .any(|w| w == b"short secret");
+    if let (Some(signal), true) = (signal, prompt_shown) {
+        unsafe { libc::kill(pid as libc::pid_t, signal) };
+    }
+
+    let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut exited = false;
+    while std::time::Instant::now() < exit_deadline {
+        if child.try_wait().expect("poll secret client").is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    (prompt_shown, exited, flags())
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_prompt_deadline_and_termination_signals_restore_the_tty() {
+    let (dir, remuda) = fixture("secret-tty-lifecycle");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let deadline_case = secret_prompt_client_exits_and_restores_tty(&dir, None);
+    let term_case = secret_prompt_client_exits_and_restores_tty(&dir, Some(libc::SIGTERM));
+    let hup_case = secret_prompt_client_exits_and_restores_tty(&dir, Some(libc::SIGHUP));
+    let _ = remuda(&["stop", "-f"]);
+
+    assert!(deadline_case.0, "client never displayed its prompt");
+    assert!(
+        deadline_case.1,
+        "client did not exit at its pending deadline"
+    );
+    assert!(deadline_case.2, "deadline left terminal in raw mode");
+    assert!(
+        term_case.0 && term_case.1 && term_case.2,
+        "SIGTERM did not restore terminal: {term_case:?}"
+    );
+    assert!(
+        hup_case.0 && hup_case.1 && hup_case.2,
+        "SIGHUP did not restore terminal: {hup_case:?}"
+    );
 }
 
 #[test]
@@ -320,6 +471,307 @@ fn maximum_deferred_output_round_trips_with_base64_wire_encoding() {
     assert_eq!(output.stdout.len(), 16 * 1024 * 1024);
     assert!(output.stderr.is_empty(), "{output:?}");
     eprintln!("16 MiB deferred reply round trip: {elapsed:.2?}");
+}
+
+#[test]
+fn secret_prompt_non_tty_fallback_and_answer_do_not_leak() {
+    use remuda_core::protocol::{Request, Response, SecretBytes};
+    use remuda_native::ipc::TryClone;
+    use std::io::{BufRead, BufReader, Write};
+
+    let (dir, remuda) = fixture("secret_prompt");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let sentinel = b"S3CRET-probe";
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+    let mut stream = remuda_native::ipc::connect(&socket).expect("private daemon socket");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone private socket"));
+    let request = Request::Eval {
+        code: "return remuda._dispatch_extension_command('deferred', {'secret'}, {})".into(),
+        name: None,
+    };
+    let mut request_frame = serde_json::to_vec(&request).unwrap();
+    request_frame.push(b'\n');
+    stream.write_all(&request_frame).unwrap();
+
+    let mut prompt_frame = Vec::new();
+    reader.read_until(b'\n', &mut prompt_frame).unwrap();
+    let prompt: Response = serde_json::from_slice(&prompt_frame).expect("secret prompt frame");
+    let prompt_id = match prompt {
+        Response::PromptSecret { id, label, .. } => {
+            assert_eq!(
+                label, "deferred test secret",
+                "outside caller gets no prefix"
+            );
+            id
+        }
+        response => panic!("expected secret prompt, got {response:?}"),
+    };
+    let answer = Request::SecretAnswer {
+        id: prompt_id,
+        secret: Some(SecretBytes::new(sentinel.to_vec())),
+        refusal: None,
+    };
+    let mut answer_frame = serde_json::to_vec(&answer).unwrap();
+    answer_frame.push(b'\n');
+    stream.write_all(&answer_frame).unwrap();
+
+    let mut reply_frame = Vec::new();
+    reader.read_until(b'\n', &mut reply_frame).unwrap();
+    assert!(
+        !prompt_frame
+            .windows(sentinel.len())
+            .any(|window| window == sentinel)
+            && !reply_frame
+                .windows(sentinel.len())
+                .any(|window| window == sentinel),
+        "secret appeared in a daemon reply frame"
+    );
+    let reply: Response = serde_json::from_slice(&reply_frame).expect("deferred reply frame");
+    assert!(matches!(reply, Response::CommandResult { .. }), "{reply:?}");
+    drop(reader);
+    drop(stream);
+
+    // Command::output gives this CLI no stdin or stderr TTY.
+    let non_tty = remuda(&["deferred", "secret"]);
+    let stop = remuda(&["stop", "-f"]);
+    let log = socket.with_extension("log");
+    let log_bytes = fs::read(&log).unwrap_or_default();
+    assert!(
+        !log_bytes
+            .windows(sentinel.len())
+            .any(|window| window == sentinel),
+        "sentinel appeared in daemon log {}",
+        log.display()
+    );
+    assert_no_secret_in_files(&dir, sentinel);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(stop.status.success(), "{stop:?}");
+    assert_eq!(non_tty.status.code(), Some(1), "{non_tty:?}");
+    assert!(non_tty.stdout.is_empty(), "{non_tty:?}");
+    let stderr = String::from_utf8_lossy(&non_tty.stderr);
+    assert!(stderr.contains("not_a_terminal"), "{stderr}");
+    assert_eq!(
+        stderr.lines().last(),
+        Some("Next: remuda deferred --password-file PATH"),
+        "non-TTY error must end with a concrete password-file Next line: {stderr}"
+    );
+}
+
+#[test]
+fn secret_answer_frame_round_trips_at_four_kib_and_reports_too_long() {
+    use remuda_core::protocol::{Request, Response, SecretAnswerRefusal, SecretBytes};
+    use remuda_native::ipc::TryClone;
+    use std::io::{BufRead, BufReader, Write};
+
+    let (dir, remuda) = fixture("secret_cap");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+
+    let answer_over_socket = |word: &str, secret: Option<SecretBytes>, refusal| {
+        let mut stream = remuda_native::ipc::connect(&socket).expect("private daemon socket");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone private socket"));
+        let request = Request::Eval {
+            code: format!(
+                "return remuda._dispatch_extension_command('deferred', {{'{word}'}}, {{}})"
+            ),
+            name: None,
+        };
+        let mut request_frame = serde_json::to_vec(&request).unwrap();
+        request_frame.push(b'\n');
+        stream.write_all(&request_frame).unwrap();
+
+        let mut prompt_frame = Vec::new();
+        reader.read_until(b'\n', &mut prompt_frame).unwrap();
+        let prompt: Response = serde_json::from_slice(&prompt_frame).expect("secret prompt frame");
+        let id = match prompt {
+            Response::PromptSecret { id, .. } => id,
+            response => panic!("expected secret prompt, got {response:?}"),
+        };
+        let answer = Request::SecretAnswer {
+            id,
+            secret,
+            refusal,
+        };
+        let mut answer_frame = serde_json::to_vec(&answer).unwrap();
+        answer_frame.push(b'\n');
+        stream.write_all(&answer_frame).unwrap();
+        let mut reply_frame = Vec::new();
+        reader.read_until(b'\n', &mut reply_frame).unwrap();
+        (answer_frame, reply_frame)
+    };
+
+    let (answer_frame, exact_reply_frame) = answer_over_socket(
+        "secret_cap",
+        Some(SecretBytes::new(vec![b'x'; 4 * 1024])),
+        None,
+    );
+    assert!(
+        answer_frame.len() <= remuda_core::protocol::SECRET_ANSWER_MAX_FRAME_BYTES,
+        "serialized 4 KiB SecretAnswer frame was too large: {} bytes",
+        answer_frame.len()
+    );
+    let decoded_answer: Request = serde_json::from_slice(&answer_frame).unwrap();
+    assert!(matches!(
+        decoded_answer,
+        Request::SecretAnswer {
+            secret: Some(secret),
+            refusal: None,
+            ..
+        } if secret.as_bytes().len() == 4 * 1024
+            && secret.as_bytes().iter().all(|byte| *byte == b'x')
+    ));
+    let exact_reply: Response = serde_json::from_slice(&exact_reply_frame).unwrap();
+    match exact_reply {
+        Response::CommandResult {
+            exit_code,
+            stdout_base64,
+            stderr_base64,
+        } => {
+            assert_eq!(exit_code, 0);
+            assert_eq!(
+                remuda_native::cluster::encoding::decode_base64(&stdout_base64).unwrap(),
+                b"exact 4 KiB"
+            );
+            assert!(stderr_base64.is_empty());
+        }
+        response => panic!("expected successful 4 KiB callback, got {response:?}"),
+    }
+
+    let (_, too_long_reply_frame) =
+        answer_over_socket("secret_over_cap", None, Some(SecretAnswerRefusal::TooLong));
+    let too_long_reply: Response = serde_json::from_slice(&too_long_reply_frame).unwrap();
+    assert_eq!(too_long_reply, Response::Error("too_long".into()));
+
+    let stop = remuda(&["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(stop.status.success(), "{stop:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn session_secret_prompt_label_names_the_session_and_strips_controls() {
+    use remuda_core::protocol::{Request, Response, Step};
+    use remuda_core::Size;
+    use remuda_native::{client, daemon};
+    use std::time::{Duration, Instant};
+
+    let (dir, remuda) = fixture("secret_session_label");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let socket = daemon::socket_path_in(&dir, "s");
+    let session_name = "secret-label-session";
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let command = format!("sleep 0.2; \"{binary}\" -s s deferred secret_session");
+    assert_eq!(
+        client::request(
+            &socket,
+            &Request::New {
+                name: Some(session_name.into()),
+                command: vec!["sh".into(), "-c".into(), command],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            },
+        )
+        .expect("start secret-prompt session"),
+        Response::Value(session_name.into())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let prompt_screen = loop {
+        let screen = match client::request(
+            &socket,
+            &Request::Capture {
+                name: session_name.into(),
+            },
+        ) {
+            Ok(Response::Screen(screen)) => screen,
+            other => panic!("capture failed: {other:?}"),
+        };
+        if screen.contains("deferred test secret") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "secret prompt did not appear:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    client::request(
+        &socket,
+        &Request::Feed {
+            name: session_name.into(),
+            steps: vec![Step::Burst(vec![b'\r'])],
+        },
+    )
+    .expect("submit empty secret answer");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = match client::request(
+            &socket,
+            &Request::Capture {
+                name: session_name.into(),
+            },
+        ) {
+            Ok(Response::Screen(screen)) => screen,
+            other => panic!("capture failed: {other:?}"),
+        };
+        if screen.contains("secret accepted") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "secret reply did not finish:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = remuda(&["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        prompt_screen.contains("secret-label-session: deferred test secret"),
+        "session prompt label omitted its caller name or retained ESC:\n{prompt_screen}"
+    );
+    assert!(
+        !prompt_screen.contains('\x1b'),
+        "ESC remained in the terminal screen:\n{prompt_screen}"
+    );
+}
+
+fn assert_no_secret_in_files(root: &std::path::Path, secret: &[u8]) {
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            assert_no_secret_in_files(&path, secret);
+        } else if path.is_file() {
+            let contents = fs::read(&path).unwrap();
+            assert!(
+                !contents
+                    .windows(secret.len())
+                    .any(|window| window == secret),
+                "sentinel appeared in {}",
+                path.display()
+            );
+        }
+    }
 }
 
 #[test]

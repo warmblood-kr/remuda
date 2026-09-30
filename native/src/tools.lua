@@ -72,6 +72,7 @@ register("_pending_create", "Create a private pending reply handle.", "_pending_
 register("_pending_events", "Drain pending completion and cancellation notifications.", "_pending_events() -> {{id, reason?}...}")
 
 local pending_cancel_handlers = {}
+local pending_secret_handlers = {}
 function remuda.pending(options)
   if type(options) ~= "table" then
     error("pending needs an options table", 2)
@@ -84,8 +85,22 @@ function remuda.pending(options)
   if on_cancel ~= nil and type(on_cancel) ~= "function" then
     error("pending on_cancel must be a function", 2)
   end
-  local id, handle = remuda._pending_create(timeout)
+  local id, native_handle = remuda._pending_create(timeout)
   if on_cancel then pending_cancel_handlers[id] = on_cancel end
+  local handle = {}
+  handle.__remuda_pending_handle = native_handle
+  function handle:resolve(...) return native_handle:resolve(...) end
+  function handle:reject(...) return native_handle:reject(...) end
+  function handle:prompt_secret(prompt)
+    if type(prompt) ~= "table" or type(prompt.label) ~= "string" or type(prompt.callback) ~= "function" then
+      error("prompt_secret needs a label and callback", 2)
+    end
+    local prompt_id = native_handle:prompt_secret(prompt.label)
+    local callbacks = pending_secret_handlers[id] or {}
+    pending_secret_handlers[id] = callbacks
+    callbacks[prompt_id] = prompt.callback
+    return prompt_id
+  end
   return handle
 end
 
@@ -93,10 +108,25 @@ local function deliver_pending_events()
   for _, event in ipairs(remuda._pending_events()) do
     local callback = pending_cancel_handlers[event.id]
     pending_cancel_handlers[event.id] = nil
+    pending_secret_handlers[event.id] = nil
     if event.reason and callback then
       local ok, err = pcall(callback, event.reason)
       if not ok then
         io.stderr:write("remuda.pending on_cancel failed: " .. tostring(err) .. "\n")
+      end
+    end
+  end
+  for _, event in ipairs(remuda._pending_secret_events()) do
+    local callbacks = pending_secret_handlers[event.id]
+    local callback = callbacks and callbacks[event.prompt_id]
+    if callbacks then
+      callbacks[event.prompt_id] = nil
+      if next(callbacks) == nil then pending_secret_handlers[event.id] = nil end
+    end
+    if callback then
+      local ok, err = pcall(callback, event.secret, event.error)
+      if not ok then
+        io.stderr:write("remuda.pending prompt callback failed\n")
       end
     end
   end

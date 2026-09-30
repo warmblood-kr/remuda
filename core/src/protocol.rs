@@ -19,6 +19,7 @@
 use crate::agent::{Color, Cursor, MouseState, Size, StyledCell};
 use crate::registry::SessionSummary;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// A local control operation for the daemon-owned cluster listener.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -36,6 +37,101 @@ pub enum ListenerStatus {
         auto: bool,
     },
     Failed(String),
+}
+
+/// Maximum secret payload accepted by [`Request::SecretAnswer`].
+pub const SECRET_ANSWER_MAX_BYTES: usize = 4 * 1024;
+
+/// Maximum newline-delimited frame carrying a [`Request::SecretAnswer`].
+pub const SECRET_ANSWER_MAX_FRAME_BYTES: usize = 8 * 1024;
+
+/// Secret bytes encoded as base64 on the wire and redacted from debug output.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretBytes(#[serde(with = "secret_bytes_base64")] Zeroizing<Vec<u8>>);
+
+impl SecretBytes {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Zeroizing<Vec<u8>> {
+        self.0
+    }
+}
+
+impl core::fmt::Debug for SecretBytes {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("SecretBytes([REDACTED])")
+    }
+}
+
+/// A bounded reason a client could not provide a secret answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretAnswerRefusal {
+    NotATerminal,
+    TooLong,
+}
+
+impl SecretAnswerRefusal {
+    pub fn error_code(self) -> &'static str {
+        match self {
+            Self::NotATerminal => "not_a_terminal",
+            Self::TooLong => "too_long",
+        }
+    }
+}
+
+mod secret_bytes_base64 {
+    use super::SECRET_ANSWER_MAX_BYTES;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::de::Error as _;
+    use serde::ser::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use zeroize::Zeroizing;
+
+    const MAX_ENCODED_BYTES: usize = SECRET_ANSWER_MAX_BYTES.div_ceil(3) * 4;
+
+    pub fn serialize<S>(bytes: &Zeroizing<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if bytes.len() > SECRET_ANSWER_MAX_BYTES {
+            return Err(S::Error::custom("secret answer exceeds 4096 bytes"));
+        }
+        let encoded = Zeroizing::new(STANDARD.encode(bytes));
+        serializer.serialize_str(encoded.as_str())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Zeroizing<Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = Zeroizing::new(String::deserialize(deserializer)?);
+        let input = encoded.as_bytes();
+        if input.len() % 4 != 0 || input.len() > MAX_ENCODED_BYTES {
+            return Err(D::Error::custom("invalid or oversized secret encoding"));
+        }
+        let padding = if input.ends_with(b"==") {
+            2
+        } else if input.ends_with(b"=") {
+            1
+        } else {
+            0
+        };
+        let decoded_len = (input.len() / 4) * 3 - padding;
+        if decoded_len > SECRET_ANSWER_MAX_BYTES {
+            return Err(D::Error::custom("secret answer exceeds 4096 bytes"));
+        }
+        STANDARD
+            .decode(encoded.as_str())
+            .map(Zeroizing::new)
+            .map_err(D::Error::custom)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -168,6 +264,13 @@ pub enum Request {
         /// because only the caller knows where the source came from.
         name: Option<String>,
     },
+    /// Answer an outstanding secret prompt on this pending word's connection.
+    SecretAnswer {
+        id: u32,
+        secret: Option<SecretBytes>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refusal: Option<SecretAnswerRefusal>,
+    },
 }
 
 /// One element of a [`Request::Feed`] act: bytes, or a pause before the next
@@ -271,6 +374,14 @@ pub enum Response {
     },
     /// Current state of the daemon-owned cluster listener.
     ClusterListenerStatus(ListenerStatus),
+    /// Ask the client on this connection to collect a secret from its terminal.
+    PromptSecret {
+        id: u32,
+        label: String,
+        /// Remaining lifetime of the pending reply when this prompt was sent.
+        #[serde(default)]
+        timeout_ms: u64,
+    },
 }
 
 impl Response {

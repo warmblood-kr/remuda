@@ -904,9 +904,9 @@ fn eval(lua: &Lua, code: &str, name: Option<&str>) -> Result<String, String> {
     })?;
 
     if values.len() == 1 {
-        if let Some(mlua::Value::UserData(data)) = values.iter().next() {
-            if let Ok(handle) = data.borrow::<crate::pending::PendingHandle>() {
-                return Ok(handle.marker().to_string());
+        if let Some(value) = values.iter().next() {
+            if let Some(marker) = pending_marker(value) {
+                return Ok(marker);
             }
         }
     }
@@ -921,6 +921,29 @@ fn eval(lua: &Lua, code: &str, name: Option<&str>) -> Result<String, String> {
         rendered.push_str(&render_for_reply(value, remaining)?);
     }
     Ok(rendered)
+}
+
+fn pending_marker(value: &mlua::Value) -> Option<String> {
+    match value {
+        mlua::Value::UserData(data) => data
+            .borrow::<crate::pending::PendingHandle>()
+            .ok()
+            .map(|handle| handle.marker().to_string()),
+        mlua::Value::Table(table) => {
+            let handle = match table
+                .raw_get::<mlua::Value>("__remuda_pending_handle")
+                .ok()?
+            {
+                mlua::Value::UserData(data) => data,
+                _ => return None,
+            };
+            handle
+                .borrow::<crate::pending::PendingHandle>()
+                .ok()
+                .map(|handle| handle.marker().to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Point `print` at a buffer instead of the daemon's stdout, which is
