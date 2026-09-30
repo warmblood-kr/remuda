@@ -625,6 +625,69 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
 }
 
 #[test]
+#[cfg(unix)]
+fn real_remote_keys_mode_respects_cluster_control_off() {
+    let client_node = Node::start("keys-denied-client");
+    let server_node = Node::start("keys-denied-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    let control = server_node
+        .command()
+        .args(["cluster", "control", "off"])
+        .output()
+        .unwrap();
+    assert!(
+        control.status.success(),
+        "cluster control failed: {control:?}"
+    );
+    server_node.start_named_session(
+        "proof",
+        "stty raw -echo; printf 'READY\\r\\n'; while :; do byte=$(dd bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '); case \"$byte\" in 121) printf '\\r\\ngot=y\\r\\n' ;; esac; done",
+    );
+
+    let registry_path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    let server = registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap();
+    server.endpoint = Some(listener.address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let server_label = remuda_native::cluster::node_label(&server_node.fingerprint());
+    let mut tui = RemoteTui::start(&client_node, None);
+    tui.wait_for(&server_label, Duration::from_secs(10));
+    tui.writer.write_all(b"\x1b[B\x1b[C").unwrap();
+    tui.wait_for("proof", Duration::from_secs(10));
+    tui.writer.write_all(b"\x1b[B\r").unwrap();
+    tui.wait_for("remote live · reachable", Duration::from_secs(10));
+    tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
+    tui.writer.write_all(b"\x1c").unwrap();
+    tui.writer.write_all(b"k").unwrap();
+    tui.wait_for(
+        &format!("KEYS {server_label}/proof · Ctrl-\\ back"),
+        Duration::from_secs(3),
+    );
+
+    let input_start = tui.output_len();
+    tui.writer.write_all(b"y").unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    let output = tui.text_from(input_start);
+    assert!(
+        !output.contains("got=y"),
+        "server accepted input while cluster control was disabled: {output}"
+    );
+}
+
+#[test]
 fn driver_hosted_remote_tui_capture_shows_live_output_with_trailing_blanks() {
     let client_node = Node::start("driver-remote-client");
     let driver_node = Node::start("driver-remote-driver");

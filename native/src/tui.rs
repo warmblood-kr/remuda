@@ -2767,7 +2767,7 @@ impl<W: Write> Drop for BracketedPasteCapture<W> {
     }
 }
 
-fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
+pub(crate) fn paste_input(text: &str, bracketed: bool) -> Vec<u8> {
     let text: String = text
         .chars()
         .filter(|character| {
