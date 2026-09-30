@@ -4879,7 +4879,18 @@ fn interval_skips_missed_ticks_and_callback_errors_do_not_stop_timers() {
             return "scheduled"
         "#,
     );
-    std::thread::sleep(Duration::from_millis(400));
+    let minimum_marks_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let marks = read_count(&path, "return #remuda._timer_marks");
+        if marks >= 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < minimum_marks_deadline,
+            "interval did not continue before the deadline: {marks} fires"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let result = eval(
         &path,
         r#"
@@ -4888,7 +4899,7 @@ fn interval_skips_missed_ticks_and_callback_errors_do_not_stop_timers() {
             assert(#marks >= 3,
               "interval did not continue: " .. #marks .. " [" .. table.concat(marks, ",") .. "]")
             for index = 2, #marks do
-              assert(marks[index] - marks[index - 1] >= 10,
+              assert(marks[index] - marks[index - 1] >= 15,
                 "interval burst-fired: " .. table.concat(marks, ","))
             end
             return #marks
