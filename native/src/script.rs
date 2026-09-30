@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 85] = [
+pub const BINDINGS: [&str; 86] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -99,6 +99,7 @@ pub const BINDINGS: [&str; 85] = [
     "pending",
     "process",
     "processes",
+    "random_bytes",
     "reload",
     "remove_dir_all",
     "request_counts",
@@ -304,6 +305,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "request_counts",
         "The daemon's own request-dispatch counts, by Request variant.",
         "request_counts() -> {list, eval, capture_styled}",
+    ),
+    (
+        "random_bytes",
+        "Return n binary-safe bytes from the OS CSPRNG. n must be a whole number from 1 through 65536; integer-valued Lua floats such as 32.0 are accepted. Raises a Lua error if the OS source fails.",
+        "random_bytes(n) -> string",
     ),
     (
         "sleep",
@@ -518,6 +524,7 @@ pub(crate) fn bindings(
     fail_binding(lua, &table, image.clone())?;
     pending_bindings(lua, &table, image.pending_replies())?;
     caller_binding(lua, &table, caller)?;
+    random_bytes_binding(lua, &table)?;
 
     // In-process, not a loopback: the image always runs inside the same
     // daemon this `Registry` belongs to (image.rs), so asking over the wire
@@ -749,6 +756,40 @@ fn sleep_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
                 std::thread::sleep(Duration::from_secs_f64(seconds));
             }
             Ok(())
+        })?,
+    )
+}
+
+fn random_bytes_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
+    table.set(
+        "random_bytes",
+        lua.create_function(|lua, value: Value| {
+            // Cap each Lua allocation at 64 KiB: sufficient for keys and
+            // tokens while preventing a script from requesting huge buffers.
+            const MAX_BYTES: usize = 65_536;
+            let length = match value {
+                Value::Integer(n) if (1..=MAX_BYTES as i64).contains(&n) => n as usize,
+                // Lua 5.4 distinguishes integer and float values; accept an
+                // exact, finite whole-number float like 32.0 as an integer.
+                Value::Number(n)
+                    if n.is_finite()
+                        && n.fract() == 0.0
+                        && (1.0..=MAX_BYTES as f64).contains(&n) =>
+                {
+                    n as usize
+                }
+                _ => {
+                    return Err(mlua::Error::runtime(
+                        "remuda.random_bytes n must be a whole number in 1..=65536",
+                    ));
+                }
+            };
+
+            let mut bytes = vec![0_u8; length];
+            getrandom::fill(&mut bytes).map_err(|error| {
+                mlua::Error::runtime(format!("remuda.random_bytes OS CSPRNG failed: {error}"))
+            })?;
+            lua.create_string(bytes)
         })?,
     )
 }

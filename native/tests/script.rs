@@ -461,6 +461,29 @@ fn remuda_json_nested_words_are_registered() {
 }
 
 #[test]
+fn random_bytes_returns_csprng_bytes_and_rejects_invalid_lengths() {
+    run_lua(
+        "random-bytes",
+        r#"
+        assert(type(remuda.random_bytes) == "function", "remuda.random_bytes is missing")
+
+        assert(#remuda.random_bytes(1) == 1, "random_bytes accepts the lower boundary")
+        assert(#remuda.random_bytes(65536) == 65536, "random_bytes accepts the upper boundary")
+        assert(#remuda.random_bytes(32.0) == 32, "integer-valued Lua floats are accepted")
+        local first = remuda.random_bytes(32)
+        local second = remuda.random_bytes(32)
+        assert(type(first) == "string" and #first == 32, "random_bytes returns exactly n bytes")
+        assert(first ~= second, "independent random_bytes calls should differ")
+
+        for _, n in ipairs({ 0, -1, 1.5, "4", 65537, 2^53, 0/0, math.huge }) do
+          local ok = pcall(remuda.random_bytes, n)
+          assert(not ok, "random_bytes should reject " .. tostring(n))
+        end
+        "#,
+    );
+}
+
+#[test]
 fn registry_documentation_formats_are_live_and_structured() {
     let dir = scratch("registry-docs");
     let path = daemon::socket_path_in(&dir, "s");
@@ -494,6 +517,20 @@ fn registry_documentation_formats_are_live_and_structured() {
         .unwrap()
         .iter()
         .any(|entry| entry["name"] == "session.resize"));
+    let random_bytes = document["runtime"]["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "random_bytes")
+        .expect("random_bytes is documented");
+    assert!(random_bytes["description"]
+        .as_str()
+        .unwrap()
+        .contains("OS CSPRNG"));
+    assert!(random_bytes["description"]
+        .as_str()
+        .unwrap()
+        .contains("65536"));
     for section in ["functions", "variables"] {
         assert!(
             document["runtime"][section]

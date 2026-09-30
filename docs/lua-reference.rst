@@ -271,6 +271,11 @@ processes
 
 ``processes() -> {id...}`` — List the ids of every process started with `remuda.process` that is still running.
 
+random_bytes
+------------
+
+``random_bytes(n) -> string`` — Return n binary-safe bytes from the OS CSPRNG. n must be a whole number from 1 through 65536; integer-valued Lua floats such as 32.0 are accepted. Raises a Lua error if the OS source fails.
+
 reload
 ------
 
