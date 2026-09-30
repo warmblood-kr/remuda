@@ -2369,6 +2369,46 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn large_remote_paste_is_queued_as_chunked_input_batches() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let limit = crate::remote_front::MAX_REMOTE_INPUT_BATCH_BYTES;
+        let text = "x".repeat(limit + 1);
+        let transport = FakeRemoteInput::new(Response::Uncertain);
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+        ui.handle_event(Event::Paste(text), clock.now());
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
+        ui.send_pending(
+            std::path::Path::new("unused"),
+            clock.now(),
+            Some(&transport),
+        );
+
+        let batches = ui.input_queue.items().collect::<Vec<_>>();
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.bytes.len())
+                .collect::<Vec<_>>(),
+            [limit, 13]
+        );
+        assert_eq!(batches[0].paste_id, batches[1].paste_id);
+        assert!(batches[0].paste_id.is_some());
+        assert_eq!(
+            batches.iter().map(|batch| batch.state).collect::<Vec<_>>(),
+            [QueueState::Uncertain, QueueState::Dropped]
+        );
+        assert!(matches!(
+            &transport.requests.lock().unwrap()[0].1,
+            Request::Input { bytes, .. } if bytes.len() == limit
+        ));
+    }
+
     fn sessions() -> Vec<SessionSummary> {
         vec![SessionSummary {
             id: "session-dev".into(),
