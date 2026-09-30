@@ -1383,6 +1383,17 @@ fn cluster_join_with_listener(
         }
     };
     let mut restore_guard = JoinListenerRestoreGuard::new(daemon_path, listener_snapshot.clone());
+    #[cfg(unix)]
+    let signal_handler = match JoinInterruptHandler::install() {
+        Ok(handler) => handler,
+        Err(error) => {
+            return fail(describe_cluster_error(
+                "join",
+                &error,
+                ClusterErrorContext::Join(invitation),
+            ))
+        }
+    };
     let initial_status = remuda_native::cluster::listener_control::status(daemon_path);
     let listener_status = match bind_addr {
         Some(address) => {
@@ -1439,24 +1450,20 @@ fn cluster_join_with_listener(
 
     let join_fingerprint = fingerprint.to_owned();
     let join_invitation = invitation.clone();
-    let join_session = run_join_interruptible(move || {
-        cluster_join(&join_fingerprint, &join_invitation, Some(bound_addr))
-    });
+    let join = move || cluster_join(&join_fingerprint, &join_invitation, Some(bound_addr));
+    #[cfg(unix)]
+    let join_session = run_join_interruptible(signal_handler, join);
+    #[cfg(not(unix))]
+    let join_session = run_join_interruptible(join);
     let (join_outcome, signal_session) = match join_session {
         Ok(mut session) => (session.take_outcome(), Some(session)),
         Err(error) => (JoinRun::Finished(Err(error)), None),
     };
     let exit_code = match join_outcome {
-        JoinRun::Cancelled => {
-            let restore_warning = restore_join_listener(&mut restore_guard);
-            eprintln!(
-                "Join cancelled.\nNext: compare with `remuda cluster` on the inviting machine, then run the join command again."
-            );
-            if let Some(warning) = restore_warning {
-                eprintln!("{warning}");
-            }
-            ExitCode::from((128 + JOIN_INTERRUPT_SIGNAL.load(Ordering::Acquire)) as u8)
-        }
+        #[cfg(unix)]
+        JoinRun::Cancelled => cancel_join_with_restore(&mut restore_guard),
+        #[cfg(not(unix))]
+        JoinRun::Cancelled => ExitCode::from(130),
         JoinRun::Finished(Ok(())) => {
             restore_guard.disarm();
             println!("{}", join_success_message(invitation, fingerprint));
@@ -1548,10 +1555,29 @@ enum JoinListenerStartOutcome {
 }
 
 fn finish_join_listener_start(
-    _restore_guard: &mut JoinListenerRestoreGuard,
+    restore_guard: &mut JoinListenerRestoreGuard,
     start: impl FnOnce() -> std::io::Result<remuda_core::protocol::ListenerStatus>,
 ) -> JoinListenerStartOutcome {
-    JoinListenerStartOutcome::Started(start())
+    let result = start();
+    #[cfg(unix)]
+    if JOIN_INTERRUPTED.load(Ordering::Acquire) {
+        return JoinListenerStartOutcome::Cancelled(cancel_join_with_restore(restore_guard));
+    }
+    #[cfg(not(unix))]
+    let _ = restore_guard;
+    JoinListenerStartOutcome::Started(result)
+}
+
+#[cfg(unix)]
+fn cancel_join_with_restore(restore_guard: &mut JoinListenerRestoreGuard) -> ExitCode {
+    let restore_warning = restore_join_listener(restore_guard);
+    eprintln!(
+        "Join cancelled.\nNext: compare with `remuda cluster` on the inviting machine, then run the join command again."
+    );
+    if let Some(warning) = restore_warning {
+        eprintln!("{warning}");
+    }
+    ExitCode::from((128 + JOIN_INTERRUPT_SIGNAL.load(Ordering::Acquire)) as u8)
 }
 
 struct JoinRunSession {
@@ -1568,23 +1594,24 @@ impl JoinRunSession {
     }
 }
 
+#[cfg(unix)]
+fn run_join_interruptible(
+    handler: JoinInterruptHandler,
+    join: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+) -> std::io::Result<JoinRunSession> {
+    Ok(JoinRunSession {
+        outcome: Some(wait_for_join(&JOIN_INTERRUPTED, join)),
+        handler,
+    })
+}
+
+#[cfg(not(unix))]
 fn run_join_interruptible(
     join: impl FnOnce() -> std::io::Result<()> + Send + 'static,
 ) -> std::io::Result<JoinRunSession> {
-    #[cfg(unix)]
-    {
-        let handler = JoinInterruptHandler::install()?;
-        Ok(JoinRunSession {
-            outcome: Some(wait_for_join(&JOIN_INTERRUPTED, join)),
-            handler,
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(JoinRunSession {
-            outcome: Some(JoinRun::Finished(join())),
-        })
-    }
+    Ok(JoinRunSession {
+        outcome: Some(JoinRun::Finished(join())),
+    })
 }
 
 #[cfg(unix)]
