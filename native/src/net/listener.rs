@@ -106,6 +106,9 @@ struct ListenerState {
 }
 
 impl ListenerState {
+    // Unknown joins and non-join frames share the per-prefix attempt bucket.
+    // Consequently, traffic from neighbours behind the same NAT or IPv6 /64
+    // can use a legitimate joiner's ten-per-minute allowance.
     fn charge_unknown_peer(&self, address: std::net::IpAddr) -> bool {
         self.limiter
             .allow_join_attempt(peer_prefix(address), Instant::now())
@@ -119,15 +122,35 @@ impl ListenerState {
         timestamp_seconds: i64,
         now_seconds: i64,
     ) -> Result<(), replay::ReplayError> {
-        let cache = if admitted {
-            &self.replay
-        } else {
-            &self.unknown_replay
-        };
-        cache
+        // Always lock in member-then-unknown order. An ephemeral first seen
+        // during a transient authorization failure must remain rejected if
+        // authorization later succeeds (and vice versa).
+        let mut member = self
+            .replay
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .check_and_insert(peer, ephemeral, timestamp_seconds, now_seconds)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut unknown = self
+            .unknown_replay
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let monotonic_now = Instant::now();
+        if member.contains_at(&ephemeral, now_seconds, monotonic_now)
+            || unknown.contains_at(&ephemeral, now_seconds, monotonic_now)
+        {
+            return Err(replay::ReplayError::AlreadySeen);
+        }
+        let cache = if admitted {
+            &mut *member
+        } else {
+            &mut *unknown
+        };
+        cache.check_and_insert_at(
+            peer,
+            ephemeral,
+            timestamp_seconds,
+            now_seconds,
+            monotonic_now,
+        )
     }
 }
 
@@ -2710,6 +2733,9 @@ mod tests {
             socket_test_timeout(),
             socket_test_timeout(),
         );
+        // The member window is the single shared cache in the pre-fix
+        // implementation. Keep it small so this regression fails there.
+        *server.state.replay.lock().unwrap() = replay::ReplayWindow::new(2);
         *server.state.unknown_replay.lock().unwrap() = replay::ReplayWindow::new(2);
         let join = br#"{"join":{"token":"bad"}}"#;
         for _ in 0..2 {
@@ -2719,6 +2745,11 @@ mod tests {
             let sealed = sealed_payload_request(&unknown, &server, join);
             assert_eq!(server.exchange(sealed).0, 200);
         }
+        let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let (status, _) = server.exchange(sealed_payload_request(&unknown, &server, join));
+        assert_eq!(status, 409);
 
         let (status, response) = server.exchange(sealed_list_request(&member, &server));
         assert_eq!(status, 200);
@@ -2726,6 +2757,46 @@ mod tests {
             serde_json::from_slice::<Response>(&response).unwrap(),
             Response::Ok
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn member_frame_seen_while_authorization_fails_cannot_replay_after_recovery() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let authorization_recovers = Arc::new(AtomicBool::new(false));
+        let authorization_state = authorization_recovers.clone();
+        let authorize: MemberAuthorizer = Arc::new(move |_| {
+            if authorization_state.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err(permission_denied())
+            }
+        });
+        let server = SocketTestServer::start(
+            responder.private,
+            responder.public,
+            authorize,
+            Arc::new(|_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
+            ConnectionLimits {
+                outer_hold: socket_test_timeout(),
+                post_dispatch_hold: socket_test_timeout(),
+                idle_read: socket_test_timeout(),
+                total_read: socket_test_timeout(),
+            },
+        );
+
+        let sealed = sealed_list_request(&peer, &server);
+        let body = sealed.message.clone();
+        assert_eq!(server.exchange(sealed).0, 403);
+
+        authorization_recovers.store(true, Ordering::SeqCst);
+        let headers = format!("Content-Length: {}\r\n", body.len());
+        assert_eq!(server.send_raw(&body, headers.as_bytes()).unwrap().0, 409);
     }
 
     #[cfg(unix)]

@@ -69,6 +69,17 @@ impl ReplayWindow {
         )
     }
 
+    /// Expire old entries and check whether an ephemeral is still cached.
+    pub fn contains_at(
+        &mut self,
+        ephemeral: &[u8; 32],
+        now_seconds: i64,
+        monotonic_now: Instant,
+    ) -> bool {
+        self.evict_expired(monotonic_now, now_seconds);
+        self.seen.contains_key(ephemeral)
+    }
+
     /// Variant with an injected monotonic clock for deterministic eviction tests.
     pub fn check_and_insert_at(
         &mut self,
