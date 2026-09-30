@@ -141,7 +141,7 @@ mod tests {
                 address_from_candidate(candidate).expect_err("candidate is not auto eligible");
             assert!(error
                 .to_string()
-                .contains("remuda cluster invite --addr IP"));
+                .contains("Next: remuda cluster listen --bind IP"));
         }
         let eligible = address_from_candidate(Some("192.168.1.20".parse().unwrap()))
             .expect("a selected eligible route is sufficient");

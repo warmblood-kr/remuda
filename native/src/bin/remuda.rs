@@ -1535,31 +1535,12 @@ fn cluster_join_with_listener(
             ))
         }
     };
-    let initial_status = remuda_native::cluster::listener_control::status(daemon_path);
-    let listener_status = match bind_addr {
-        Some(address) => {
-            let config = ListenerConfig {
-                enabled: true,
-                bind: ListenerBind::Explicit(address),
-                allow_public: false,
-            };
-            start_join_listener_with_config(daemon_path, &mut restore_guard, config)
-        }
-        None => match initial_status {
-            remuda_core::protocol::ListenerStatus::On { .. } => {
-                JoinListenerStartOutcome::Started(Ok(initial_status))
-            }
-            _ => {
-                let mut config = listener_snapshot.unwrap_or(ListenerConfig {
-                    enabled: true,
-                    bind: ListenerBind::Auto,
-                    allow_public: false,
-                });
-                config.enabled = true;
-                start_join_listener_with_config(daemon_path, &mut restore_guard, config)
-            }
-        },
-    };
+    let listener_status = start_join_listener(
+        daemon_path,
+        &mut restore_guard,
+        listener_snapshot.as_ref(),
+        bind_addr,
+    );
     let listener_status = match listener_status {
         JoinListenerStartOutcome::Started(listener_status) => listener_status,
         JoinListenerStartOutcome::Cancelled(exit_code) => return exit_code,
@@ -1691,6 +1672,40 @@ enum JoinRun {
 enum JoinListenerStartOutcome {
     Started(std::io::Result<remuda_core::protocol::ListenerStatus>),
     Cancelled(ExitCode),
+}
+
+fn start_join_listener(
+    daemon_path: &Path,
+    restore_guard: &mut JoinListenerRestoreGuard,
+    listener_snapshot: Option<&ListenerConfig>,
+    bind_addr: Option<std::net::SocketAddr>,
+) -> JoinListenerStartOutcome {
+    let initial_status = remuda_native::cluster::listener_control::status(daemon_path);
+    match bind_addr {
+        Some(address) => start_join_listener_with_config(
+            daemon_path,
+            restore_guard,
+            ListenerConfig {
+                enabled: true,
+                bind: ListenerBind::Explicit(address),
+                allow_public: false,
+            },
+        ),
+        None => match initial_status {
+            remuda_core::protocol::ListenerStatus::On { .. } => {
+                JoinListenerStartOutcome::Started(Ok(initial_status))
+            }
+            _ => {
+                let mut config = listener_snapshot.cloned().unwrap_or(ListenerConfig {
+                    enabled: true,
+                    bind: ListenerBind::Auto,
+                    allow_public: false,
+                });
+                config.enabled = true;
+                start_join_listener_with_config(daemon_path, restore_guard, config)
+            }
+        },
+    }
 }
 
 fn start_join_listener_with_config(

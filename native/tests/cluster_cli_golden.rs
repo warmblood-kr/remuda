@@ -1586,7 +1586,6 @@ fn assert_join_signal_restores_listener_config(signal: libc::c_int, expected_exi
         let _ = release_rx.recv_timeout(Duration::from_secs(5));
         drop(stream);
     });
-    let bind_addr = unused_loopback_addr().to_string();
     let child = scratch
         .command(&[
             "cluster",
@@ -1594,7 +1593,7 @@ fn assert_join_signal_restores_listener_config(signal: libc::c_int, expected_exi
             &fingerprint,
             &invitation,
             "--bind",
-            &bind_addr,
+            "127.0.0.1:0",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
