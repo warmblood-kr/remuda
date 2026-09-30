@@ -1846,6 +1846,23 @@ mod tests {
     }
 
     #[test]
+    fn peer_certificate_spki_sha256_is_accepted_as_request_pin() {
+        let ca_file = concat!(env!("CARGO_MANIFEST_DIR"), "/src/net/testdata/test-ca.pem");
+        let (url, seen) = tls_stub();
+        let mut req = request(url);
+        req.ca_file = Some(ca_file.into());
+        let peer = super::peer_certificate(&req, None).unwrap();
+        assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+
+        let (url, seen) = tls_stub();
+        let mut req = request(url);
+        req.ca_file = Some(ca_file.into());
+        req.pin = Some(format!("sha256/{}", peer.spki_sha256));
+        assert_eq!(perform(req, None).unwrap().status, 200);
+        assert!(seen.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
     fn invalid_custom_ca_fails_closed() {
         let mut req = request("https://localhost:443/".into());
         req.ca_file = Some("/this/path/does/not/exist/remuda-test-ca.pem".into());
