@@ -626,6 +626,7 @@ fn start_listener(
     ready: &std::sync::mpsc::Sender<()>,
 ) -> Result<(), String> {
     let stopped = Arc::new(Mutex::new(stopped));
+    let security = crate::net::listener::ListenerSecurityResources::new();
     loop {
         let config = match crate::cluster::listener_config::read() {
             Ok(Some(config)) if config.enabled => config,
@@ -658,12 +659,13 @@ fn start_listener(
             }
             Err(error) => return Err(format!("lock cluster listener: {error}")),
         };
-        let listener = crate::net::listener::bind(
+        let listener = crate::net::listener::bind_with_security(
             crate::net::listener::ListenerConfig {
                 bind_addr: address,
                 allow_unspecified: allow_public,
             },
             daemon_path,
+            &security,
         )
         .map_err(|error| format!("bind cluster listener: {error}"))?;
         let address = listener
@@ -3093,6 +3095,88 @@ mod tests {
         assert!(connect_listener(old_address, Duration::from_millis(200)).is_err());
         let _connection = connect_listener(new_address, Duration::from_secs(15))
             .expect("rebound listener accepts TCP");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    #[allow(clippy::disallowed_types)]
+    fn auto_listener_rebind_keeps_replay_window_for_duplicate_request() {
+        use remuda_core::WallClock;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        fn send_status(address: SocketAddr, body: &[u8]) -> u16 {
+            let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))
+                .expect("connect to auto listener");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            write!(
+                stream,
+                "POST /cluster HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+            let mut status = String::new();
+            BufReader::new(stream).read_line(&mut status).unwrap();
+            status
+                .split_whitespace()
+                .nth(1)
+                .expect("HTTP status code")
+                .parse()
+                .unwrap()
+        }
+
+        let environment = ListenerTaskEnvironment::new(Some(auto_listener_config()));
+        let changed = Arc::new(AtomicBool::new(false));
+        let detector_changed = Arc::clone(&changed);
+        let detector: AutoAddressDetector = Arc::new(move || {
+            let ip = if detector_changed.load(Ordering::Acquire) {
+                IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+            } else {
+                IpAddr::V4(Ipv4Addr::LOCALHOST)
+            };
+            Ok(SocketAddr::new(ip, 0))
+        });
+        let task = ListenerTask::start_with_detector(&environment.socket_path(), detector);
+        let old_address = bound_auto_listener_status(&task);
+        let (identity, _) = crate::cluster::nodes()
+            .unwrap()
+            .expect("initialized local cluster identity");
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let payload = br#"{"join":{"token":"invalid"}}"#;
+        let sealed = crate::net::frame::seal_request(
+            &peer.private,
+            &identity.static_pubkey,
+            crate::SystemWallClock::new().unix_seconds() as i64,
+            payload,
+        )
+        .unwrap();
+        let first_status = send_status(old_address, &sealed.message);
+        assert_ne!(first_status, 409, "first request must not be a replay");
+
+        changed.store(true, Ordering::Release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let new_address = loop {
+            match task.status() {
+                ListenerStatus::On {
+                    addr, auto: true, ..
+                } if addr.ip() == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST) => break addr,
+                ListenerStatus::On { .. } if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                status => panic!("listener did not rebind to changed address: {status:?}"),
+            }
+        };
+        assert_eq!(
+            send_status(new_address, &sealed.message),
+            409,
+            "a request replayed across auto rebind must be refused"
+        );
     }
 
     #[cfg(not(windows))]
