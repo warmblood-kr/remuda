@@ -2548,15 +2548,16 @@ mod cluster_cli_tests {
     #[test]
     fn join_listener_drop_guard_restores_during_unwind() {
         let environment = ForegroundListenerLockEnvironment::new();
-        remuda_native::cluster::listener_config::write(&ListenerConfig {
+        let join_config = ListenerConfig {
             enabled: true,
             bind: ListenerBind::Auto,
             allow_public: false,
-        })
-        .unwrap();
+        };
+        remuda_native::cluster::listener_config::write(&join_config).unwrap();
         let daemon_path = environment.root.join("missing-daemon.sock");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = JoinListenerRestoreGuard::new(&daemon_path, None);
+            let mut guard = JoinListenerRestoreGuard::new(&daemon_path, None);
+            guard.set_expected(Some(join_config));
             panic!("simulate join panic");
         }));
         assert!(result.is_err());
