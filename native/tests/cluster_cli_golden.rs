@@ -1323,6 +1323,12 @@ fn cluster_listen_bind_configures_the_daemon_and_returns() {
 
     let stopped = scratch.run(&["cluster", "listen", "--off"]);
     assert!(stopped.status.success(), "listen --off failed: {stopped:?}");
+    assert_foreground_listener_binds_and_stays_running(&scratch);
+}
+
+fn assert_foreground_listener_binds_and_stays_running(scratch: &Scratch) {
+    use std::process::Stdio;
+
     let foreground_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let foreground_text = foreground_bind.to_string();
     let child = scratch
