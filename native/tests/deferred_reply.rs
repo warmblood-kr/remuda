@@ -33,6 +33,7 @@ fn pending_handle_count_is_bounded_and_overflow_fails_immediately() {
     ));
 }
 
+#[allow(clippy::too_many_lines)] // The fixture is one Lua module used by the integration cases below.
 fn fixture(tag: &str) -> (std::path::PathBuf, impl Fn(&[&str]) -> Output) {
     let root = if cfg!(target_os = "macos") {
         std::path::PathBuf::from("/private/tmp")
@@ -222,8 +223,8 @@ fn secret_prompt_client_exits_and_restores_tty(
         .unwrap()
         .windows(b"short secret".len())
         .any(|w| w == b"short secret");
-    if signal.is_some() && prompt_shown {
-        unsafe { libc::kill(pid as libc::pid_t, signal.unwrap()) };
+    if let (Some(signal), true) = (signal, prompt_shown) {
+        unsafe { libc::kill(pid as libc::pid_t, signal) };
     }
 
     let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);

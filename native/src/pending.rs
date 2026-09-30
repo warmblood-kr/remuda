@@ -298,24 +298,7 @@ impl PendingReplies {
                 break (Err("client disconnected".into()), None);
             }
             if let Ok(prompt) = prompt_rx.try_recv() {
-                let prompt_timeout = deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(SECRET_PROMPT_TIMEOUT);
-                let answer = if prompt_timeout.is_zero() {
-                    Err("cancelled".into())
-                } else {
-                    prompt_client(prompt.clone(), prompt_timeout)
-                };
-                entry.prompt_outstanding.store(0, Ordering::SeqCst);
-                self.0
-                    .secret_events
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .push(SecretPromptEvent {
-                        pending_id: id,
-                        prompt_id: prompt.id,
-                        answer,
-                    });
+                serve_secret_prompt(&self.0, &entry, id, prompt, deadline, &mut prompt_client);
                 continue;
             }
             let now = Instant::now();
@@ -428,6 +411,34 @@ fn cancel_entry(entry: &Entry, reason: &'static str) -> bool {
     } else {
         false
     }
+}
+
+fn serve_secret_prompt(
+    inner: &Inner,
+    entry: &Entry,
+    pending_id: u64,
+    prompt: SecretPrompt,
+    deadline: Instant,
+    prompt_client: &mut impl FnMut(SecretPrompt, Duration) -> Result<Option<SecretBytes>, String>,
+) {
+    let prompt_timeout = deadline
+        .saturating_duration_since(Instant::now())
+        .min(SECRET_PROMPT_TIMEOUT);
+    let answer = if prompt_timeout.is_zero() {
+        Err("cancelled".into())
+    } else {
+        prompt_client(prompt.clone(), prompt_timeout)
+    };
+    entry.prompt_outstanding.store(0, Ordering::SeqCst);
+    inner
+        .secret_events
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .push(SecretPromptEvent {
+            pending_id,
+            prompt_id: prompt.id,
+            answer,
+        });
 }
 
 pub struct PendingHandle {
