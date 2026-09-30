@@ -1614,6 +1614,8 @@ fn run_join_interruptible(
 }
 
 #[cfg(not(unix))]
+// ponytail: Windows has no console Ctrl-C handler here, so an interrupted join
+// can exit without restoring its listener config.
 fn run_join_interruptible(
     join: impl FnOnce() -> std::io::Result<()> + Send + 'static,
 ) -> std::io::Result<JoinRunSession> {
