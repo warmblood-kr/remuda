@@ -1392,10 +1392,14 @@ fn cluster_join_with_listener(
                 allow_public: false,
             };
             restore_guard.set_expected(Some(config.clone()));
-            remuda_native::cluster::listener_control::start(daemon_path, Some(config))
+            finish_join_listener_start(&mut restore_guard, || {
+                remuda_native::cluster::listener_control::start(daemon_path, Some(config))
+            })
         }
         None => match initial_status {
-            remuda_core::protocol::ListenerStatus::On { .. } => Ok(initial_status),
+            remuda_core::protocol::ListenerStatus::On { .. } => {
+                JoinListenerStartOutcome::Started(Ok(initial_status))
+            }
             _ => {
                 let mut config = listener_snapshot.unwrap_or(ListenerConfig {
                     enabled: true,
@@ -1404,9 +1408,15 @@ fn cluster_join_with_listener(
                 });
                 config.enabled = true;
                 restore_guard.set_expected(Some(config.clone()));
-                remuda_native::cluster::listener_control::start(daemon_path, Some(config))
+                finish_join_listener_start(&mut restore_guard, || {
+                    remuda_native::cluster::listener_control::start(daemon_path, Some(config))
+                })
             }
         },
+    };
+    let listener_status = match listener_status {
+        JoinListenerStartOutcome::Started(listener_status) => listener_status,
+        JoinListenerStartOutcome::Cancelled(exit_code) => return exit_code,
     };
     let listener_status = match listener_status {
         Ok(status) => status,
@@ -1530,6 +1540,18 @@ fn restore_join_listener(guard: &mut JoinListenerRestoreGuard) -> Option<String>
 enum JoinRun {
     Finished(std::io::Result<()>),
     Cancelled,
+}
+
+enum JoinListenerStartOutcome {
+    Started(std::io::Result<remuda_core::protocol::ListenerStatus>),
+    Cancelled(ExitCode),
+}
+
+fn finish_join_listener_start(
+    _restore_guard: &mut JoinListenerRestoreGuard,
+    start: impl FnOnce() -> std::io::Result<remuda_core::protocol::ListenerStatus>,
+) -> JoinListenerStartOutcome {
+    JoinListenerStartOutcome::Started(start())
 }
 
 struct JoinRunSession {
@@ -2378,7 +2400,8 @@ mod cluster_cli_tests {
     };
     #[cfg(unix)]
     use super::{
-        wait_for_join, JoinInterruptHandler, JoinListenerRestoreGuard, JoinRun, JOIN_INTERRUPTED,
+        finish_join_listener_start, wait_for_join, ExitCode, JoinInterruptHandler,
+        JoinListenerRestoreGuard, JoinListenerStartOutcome, JoinRun, JOIN_INTERRUPTED,
         JOIN_INTERRUPT_SIGNAL,
     };
     #[cfg(unix)]
@@ -2588,6 +2611,54 @@ mod cluster_cli_tests {
             remuda_native::cluster::listener_config::read().unwrap(),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_signal_during_listener_start_restores_listener_config() {
+        use remuda_core::protocol::ListenerStatus;
+
+        let _serial = JOIN_SIGNAL_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct ResetInterruptState;
+        impl Drop for ResetInterruptState {
+            fn drop(&mut self) {
+                JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
+                JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+            }
+        }
+
+        let _reset = ResetInterruptState;
+        let environment = ForegroundListenerLockEnvironment::new();
+        let join_config = ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit("127.0.0.1:7441".parse().unwrap()),
+            allow_public: false,
+        };
+        let daemon_path = environment.root.join("missing-daemon.sock");
+        let mut restore_guard = JoinListenerRestoreGuard::new(&daemon_path, None);
+        restore_guard.set_expected(Some(join_config.clone()));
+        let _handler = JoinInterruptHandler::install().unwrap();
+
+        let outcome = finish_join_listener_start(&mut restore_guard, || {
+            remuda_native::cluster::listener_config::write(&join_config).unwrap();
+            assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+            Ok(ListenerStatus::On {
+                addr: "127.0.0.1:7441".parse().unwrap(),
+                auto: false,
+            })
+        });
+
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            None,
+            "listener config was not restored after cancellation during start"
+        );
+        assert!(matches!(
+            outcome,
+            JoinListenerStartOutcome::Cancelled(code) if code == ExitCode::from(143)
+        ));
     }
 
     #[cfg(unix)]
