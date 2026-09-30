@@ -571,20 +571,23 @@ fn start_listener(
         return std::thread::scope(|scope| {
             let watcher_flag = Arc::clone(&stop_flag);
             let watcher_done = Arc::clone(&serve_done);
-            let watcher = scope.spawn(move || loop {
-                match stopped.recv_timeout(Duration::from_millis(25)) {
-                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        watcher_flag.store(true, Ordering::Release);
-                        break;
+            let watcher = std::thread::Builder::new()
+                .name("remuda-cluster-listener-stop-watcher".into())
+                .spawn_scoped(scope, move || loop {
+                    match stopped.recv_timeout(Duration::from_millis(25)) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                            watcher_flag.store(true, Ordering::Release);
+                            break;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                            if watcher_done.load(Ordering::Acquire) =>
+                        {
+                            break;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                        if watcher_done.load(Ordering::Acquire) =>
-                    {
-                        break;
-                    }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                }
-            });
+                })
+                .map_err(|error| format!("spawn cluster listener stop watcher: {error}"))?;
             let result = listener
                 .serve_until(&stop_flag)
                 .map_err(|error| format!("serve cluster listener: {error}"));
@@ -2329,11 +2332,11 @@ mod tests {
     use std::time::Duration;
 
     static SYNC_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
-    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    // Windows test-windows is blocked by identity storage hardening tracked in #348.
     #[cfg(not(windows))]
     static LISTENER_TASK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-    // D2 ListenerTask socket tests are skipped on Windows until identity storage #214 lands.
+    // D2 ListenerTask socket tests are skipped on Windows until identity storage #348 lands.
     #[cfg(not(windows))]
     struct ListenerTaskEnvironment {
         _lock: MutexGuard<'static, ()>,
@@ -2441,7 +2444,7 @@ mod tests {
             .expect("listener accepts TCP within the per-operation deadline")
     }
 
-    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    // Windows test-windows is blocked by identity storage hardening tracked in #348.
     #[cfg(not(windows))]
     #[test]
     fn listener_task_is_off_without_config() {
@@ -2450,7 +2453,7 @@ mod tests {
         assert_eq!(task.status(), ListenerStatus::Off);
     }
 
-    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    // Windows test-windows is blocked by identity storage hardening tracked in #348.
     #[cfg(not(windows))]
     #[test]
     fn listener_task_accepts_loopback_ephemeral_port_and_reports_status() {
@@ -2465,7 +2468,7 @@ mod tests {
         let _connection = connect_listener(address);
     }
 
-    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    // Windows test-windows is blocked by identity storage hardening tracked in #348.
     #[cfg(not(windows))]
     #[test]
     #[allow(clippy::disallowed_types)]
@@ -2492,7 +2495,7 @@ mod tests {
         }
     }
 
-    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    // Windows test-windows is blocked by identity storage hardening tracked in #348.
     #[cfg(not(windows))]
     #[test]
     fn second_daemon_reports_listener_hosted_by_another_daemon() {
@@ -2518,7 +2521,7 @@ mod tests {
         let _connection = connect_listener(first_address);
     }
 
-    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    // Windows test-windows is blocked by identity storage hardening tracked in #348.
     #[cfg(not(windows))]
     #[test]
     fn listener_task_reports_bind_failure_as_failed_status() {
@@ -2530,7 +2533,7 @@ mod tests {
         }
     }
 
-    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    // Windows test-windows is blocked by identity storage hardening tracked in #348.
     #[cfg(not(windows))]
     #[test]
     fn listener_task_refuses_wildcard_without_public_opt_in() {
@@ -2545,7 +2548,7 @@ mod tests {
         }
     }
 
-    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    // Windows test-windows is blocked by identity storage hardening tracked in #348.
     #[cfg(not(windows))]
     #[test]
     fn listener_task_refuses_public_specific_bind_without_public_opt_in() {
@@ -2563,7 +2566,7 @@ mod tests {
         }
     }
 
-    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    // Windows test-windows is blocked by identity storage hardening tracked in #348.
     #[cfg(not(windows))]
     #[test]
     fn listener_task_retries_host_lock_after_first_daemon_drops_it() {

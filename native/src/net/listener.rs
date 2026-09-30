@@ -2418,6 +2418,30 @@ mod tests {
         assert!(validate_bind_address("0.0.0.0:0".parse().unwrap(), true).is_ok());
     }
 
+    #[test]
+    fn non_private_specific_binds_require_explicit_public_opt_in() {
+        for address in [
+            "8.8.8.8:7441",
+            "[2001:4860::8888]:7441",
+            "[::ffff:8.8.8.8]:7441",
+            "172.15.0.1:7441",
+            "172.32.0.1:7441",
+        ] {
+            let error = validate_bind_address(address.parse().unwrap(), false)
+                .expect_err("non-private specific binds must require explicit opt-in");
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::PermissionDenied,
+                "unexpected bind policy for {address}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "non-private listener bind requires explicit allow_public opt-in",
+                "unexpected bind refusal for {address}"
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn remote_input_obeys_local_control_setting_and_close_stays_refused() {
