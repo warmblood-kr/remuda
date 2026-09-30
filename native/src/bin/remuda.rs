@@ -1025,6 +1025,20 @@ mod cluster_cli_tests {
     }
 
     #[test]
+    fn new_identity_init_is_recognized_with_optional_yes() {
+        assert_ne!(
+            parse_cluster_command(&["init", "--new-identity"]),
+            ClusterCommand::Invalid,
+            "new-identity init must be recognized so it can prompt on a TTY"
+        );
+        assert_ne!(
+            parse_cluster_command(&["init", "--new-identity", "--yes"]),
+            ClusterCommand::Invalid,
+            "new-identity init must accept --yes for non-interactive use"
+        );
+    }
+
+    #[test]
     fn cluster_join_accepts_optional_client_endpoint() {
         let key = [7; 32];
         let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);

@@ -826,6 +826,41 @@ mod tests {
     }
 
     #[test]
+    fn revoked_target_push_contains_only_its_tombstone() {
+        let entries = vec![
+            AuthorizedNode {
+                node_fp: "SHA256:admitted-peer".into(),
+                static_pubkey: "key-admitted".into(),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
+                endpoint: None,
+                state: NodeState::Admitted,
+                version: 1,
+                by: "SHA256:issuer".into(),
+            },
+            AuthorizedNode {
+                node_fp: "SHA256:revoked-peer".into(),
+                static_pubkey: "key-revoked".into(),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
+                endpoint: None,
+                state: NodeState::Revoked,
+                version: 2,
+                by: "SHA256:issuer".into(),
+            },
+        ];
+
+        let pushed = revoked_target_snapshot_for_wire(&entries, "SHA256:revoked-peer");
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].node_fp, "SHA256:revoked-peer");
+        assert_eq!(pushed[0].state, NodeState::Revoked);
+    }
+
+    #[test]
     fn push_wire_codec_preserves_original_by_attribution() {
         let public_key = [42u8; 32];
         let relay_key = [43u8; 32];

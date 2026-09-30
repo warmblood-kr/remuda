@@ -402,7 +402,7 @@ fn assert_list_refused(peer: &[u8], server: &[u8], address: SocketAddr, attempt:
 // Registry replication uses bounded one-shot pages; listener tests cover the
 // authorization recheck for any held response.
 #[test]
-fn revoking_a_live_member_is_seen_by_all_other_daemons() {
+fn new_identity_init_after_live_revocation_clears_old_join_tokens_and_preserves_settings() {
     let _serial = live_test_guard();
     let a = PrivateNode::start("a");
     let b = PrivateNode::start("b");
@@ -419,6 +419,22 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
     let c_listener = ListenerProcess::start(&c);
     join_member(&a, &b, &a_identity, listener.address, b_listener.address);
     assert_joiner_stores_issuer(&b, &a_identity, listener.address);
+    successful(
+        b.run(&["cluster", "control", "off"]),
+        "disable B remote control",
+    );
+    successful(
+        b.run(&["cluster", "invite", "--bind", "127.0.0.1:9443"]),
+        "mint a join token on B before identity rotation",
+    );
+    let b_cluster_dir = b.root.join("state/remuda/cluster");
+    let token_path = b_cluster_dir.join("join_tokens.json");
+    let settings_path = b_cluster_dir.join("settings.json");
+    assert!(
+        token_path.exists(),
+        "B's invite did not persist a join token"
+    );
+    let settings_before_rotation = std::fs::read(&settings_path).unwrap();
     join_member(&a, &c, &a_identity, listener.address, c_listener.address);
     wait_for_member_and_probe(
         &c,
@@ -456,7 +472,9 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
     wait_for_revocation_on_until(&c, &b_fingerprint, convergence_deadline);
     let b_notice = wait_for_revoked_notice_on_until(&b, &b_fingerprint, convergence_deadline);
     assert!(
-        b_notice.contains("Next:"),
+        b_notice.contains(
+            "Next: run `remuda cluster init --new-identity`, then ask an admitted machine for a new invite"
+        ),
         "missing recovery guidance: {b_notice}"
     );
     let self_row = b_notice
@@ -475,11 +493,56 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
     successful(b.run(&["cluster", "init"]), "locally initialize node B");
     let b_nodes_after_init = successful(
         b.run(&["cluster", "nodes"]),
-        "read node B's nodes table after local init",
+        "read node B's nodes table after ordinary init",
     );
     assert!(
-        !b_nodes_after_init.contains("This node was revoked by"),
-        "local cluster init did not clear B's notice: {b_nodes_after_init}"
+        b_nodes_after_init.contains("This node was revoked by"),
+        "ordinary init cleared B's notice: {b_nodes_after_init}"
+    );
+    let no_yes = b.run(&["cluster", "init", "--new-identity"]);
+    assert!(
+        !no_yes.status.success(),
+        "non-TTY identity rotation was not refused without --yes: {no_yes:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&no_yes.stderr).contains("use --yes"),
+        "non-TTY refusal did not explain --yes: {}",
+        String::from_utf8_lossy(&no_yes.stderr)
+    );
+    let rotation = successful(
+        b.run(&["cluster", "init", "--new-identity", "--yes"]),
+        "rotate revoked node B's identity",
+    );
+    assert!(
+        rotation.contains(
+            "This creates a new identity; this machine leaves its current cluster and needs a new invite."
+        ),
+        "rotation did not warn that it leaves the current cluster: {rotation}"
+    );
+    let rotated_identity = b.identity();
+    assert_ne!(
+        identity_fingerprint(&rotated_identity),
+        b_fingerprint,
+        "new-identity init did not change B's fingerprint"
+    );
+    assert!(
+        !b_cluster_dir.join("revoked_notice.json").exists(),
+        "new identity did not clear the revocation notice"
+    );
+    assert!(
+        !token_path.exists(),
+        "new identity left join tokens minted under the old key"
+    );
+    assert_eq!(
+        std::fs::read(&settings_path).unwrap(),
+        settings_before_rotation,
+        "new identity changed local remote-control settings"
+    );
+    let rotated_registry = read_registry(&b);
+    assert_eq!(rotated_registry.authorized_nodes.len(), 1);
+    assert_eq!(
+        rotated_registry.authorized_nodes[0].node_fp,
+        identity_fingerprint(&rotated_identity)
     );
     assert_list_refused(
         &b_identity,
