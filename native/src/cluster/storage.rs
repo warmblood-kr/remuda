@@ -6,6 +6,11 @@ use std::fs::{self, File};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+pub(super) fn lock_with_deadline(dir: &Path, timeout: Duration) -> io::Result<StateLock> {
+    StateLock::lock_with_deadline(dir, timeout)
+}
 
 #[cfg(not(windows))]
 pub(super) fn cluster_state_dir() -> io::Result<PathBuf> {
@@ -166,6 +171,13 @@ impl StateLock {
         file.lock()?;
         Ok(Self(file))
     }
+
+    pub(super) fn lock_with_deadline(dir: &Path, timeout: Duration) -> io::Result<Self> {
+        let path = dir.join("identity.lock");
+        let file = super::windows_security::create_or_open_lock(&path)?;
+        check_private_file(&file, "cluster lock", &path)?;
+        lock_file_with_deadline(file, timeout)
+    }
 }
 #[cfg(windows)]
 impl Drop for StateLock {
@@ -297,10 +309,43 @@ impl StateLock {
         file.lock()?;
         Ok(Self(file))
     }
+
+    pub(super) fn lock_with_deadline(dir: &Path, timeout: Duration) -> io::Result<Self> {
+        let path = dir.join("identity.lock");
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&path)?;
+        check_private_file(&file, "cluster lock", &path)?;
+        lock_file_with_deadline(file, timeout)
+    }
 }
 #[cfg(not(windows))]
 impl Drop for StateLock {
     fn drop(&mut self) {
         drop(self.0.unlock());
+    }
+}
+
+fn lock_file_with_deadline(file: File, timeout: Duration) -> io::Result<StateLock> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(StateLock(file)),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "cluster state lock is busy",
+                ));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error),
+        }
     }
 }
