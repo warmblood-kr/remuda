@@ -1700,6 +1700,9 @@ fn wait_for_join(
     cancelled: &AtomicBool,
     join: impl FnOnce() -> std::io::Result<()> + Send + 'static,
 ) -> JoinRun {
+    if cancelled.load(Ordering::Acquire) {
+        return JoinRun::Cancelled;
+    }
     let (sender, receiver) = mpsc::channel();
     let worker = thread::spawn(move || {
         let _ = sender.send(join());
