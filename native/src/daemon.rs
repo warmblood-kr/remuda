@@ -2576,8 +2576,6 @@ mod tests {
     use remuda_core::protocol::collapse_runs;
     use remuda_core::protocol::Response;
     use std::ffi::OsStr;
-    #[cfg(not(windows))]
-    use std::net::TcpListener;
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -2781,10 +2779,7 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn listener_task_reports_bind_failure_as_failed_status() {
-        let occupied = TcpListener::bind("127.0.0.1:0").unwrap();
-        let occupied_addr = occupied.local_addr().unwrap();
-        let environment =
-            ListenerTaskEnvironment::new(Some(listener_config(&occupied_addr.to_string())));
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("192.0.2.1:7441")));
         let task = ListenerTask::start(&environment.socket_path());
         match wait_for_listener_terminal_status(&task) {
             ListenerStatus::Failed(reason) => assert!(!reason.is_empty()),

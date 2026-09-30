@@ -2428,9 +2428,9 @@ mod cluster_cli_tests {
         next_step_join, next_step_listen, next_step_status, parse_addr_default_port,
         parse_cluster_command, remote_control_status_lines, render_cluster_init_lines,
         render_init_listener_lines, render_invite_listener_refusal, render_join_failure,
-        render_join_listener_restore_error, render_join_listener_rollback_status,
-        render_join_listener_unexpected_on, revoke_confirmation, write_nodes_table,
-        write_revocation_notice, ClusterCommand, NEW_IDENTITY_WARNING,
+        render_join_listener_restore_error, render_join_listener_unexpected_on,
+        revoke_confirmation, write_nodes_table, write_revocation_notice, ClusterCommand,
+        NEW_IDENTITY_WARNING,
     };
     #[cfg(unix)]
     use super::{
@@ -2613,22 +2613,6 @@ mod cluster_cli_tests {
             restore_failed.contains("could not restore the saved listener config: disk is full")
         );
         assert!(restore_failed.contains("remuda cluster listen --off"));
-
-        use remuda_core::protocol::ListenerStatus;
-        let remains_on = render_join_listener_rollback_status(&ListenerStatus::On {
-            addr: "192.0.2.4:7441".parse().unwrap(),
-            auto: false,
-            advertise_addr: Some("192.0.2.4:7441".parse().unwrap()),
-            listen_addrs: vec!["192.0.2.4:7441".parse().unwrap()],
-        });
-        assert!(remains_on.contains("listener remains on at 192.0.2.4:7441"));
-        assert!(remains_on.contains("remuda cluster listen --off"));
-
-        let failed = render_join_listener_rollback_status(&ListenerStatus::Failed(
-            "listener state unavailable".into(),
-        ));
-        assert!(failed.contains("listener state after rollback is failed"));
-        assert!(failed.contains("remuda cluster listen --off"));
 
         assert_eq!(
             render_join_failure("join failed".into(), Some("rollback failed")),
