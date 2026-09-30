@@ -2844,12 +2844,17 @@ mod tests {
 
     #[test]
     fn prompt_line_echo_never_emits_pasted_control_characters() {
-        let events = [crossterm::event::Event::Paste("ok\u{1b}[31m".into())];
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let events = [
+            crossterm::event::Event::Paste("ok\u{1b}[31m".into()),
+            secret_key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
         let mut echo = Vec::new();
 
         let answer = super::edit_prompt_line(events, None, 1024, |action| echo.push(action));
 
-        assert_eq!(answer, Ok(None));
+        assert_eq!(answer, Ok(Some("ok[31m".into())));
         assert!(echo.iter().all(|action| match action {
             super::PromptLineEcho::Text(character) => !character.is_control(),
             super::PromptLineEcho::Erase | super::PromptLineEcho::Submit => true,
