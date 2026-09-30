@@ -525,8 +525,11 @@ fn joiner_succeeds_when_an_existing_peer_stalls() {
         &c_listener.address.to_string(),
     ]);
     let output = successful(joined, "join C while existing peer B is stalled");
+    let joined_node = remuda_native::cluster::node_label(invite_fingerprint);
     assert!(
-        output.contains("Joined cluster."),
+        output.contains(&format!(
+            "Joined {joined_node} (fingerprint {invite_fingerprint})."
+        )),
         "join command did not report success: {output}"
     );
     assert!(
