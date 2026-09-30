@@ -815,7 +815,16 @@ impl ClusterUi {
             {
                 self.key_event(key, now)
             }
-            crossterm::event::Event::Paste(_) => false,
+            crossterm::event::Event::Paste(text) => {
+                if let Some(target) = self.remote_keys_mode.clone() {
+                    let mut bytes = Vec::with_capacity(text.len() + 12);
+                    bytes.extend_from_slice(b"\x1b[200~");
+                    bytes.extend_from_slice(text.as_bytes());
+                    bytes.extend_from_slice(b"\x1b[201~");
+                    self.enqueue_remote_key_bytes(&target, bytes, now);
+                }
+                false
+            }
             _ => false,
         }
     }
@@ -2313,6 +2322,7 @@ mod tests {
         let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
         key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
         ui.handle_event(Event::Paste("approval text".into()), clock.now());
+        std::thread::sleep(Duration::from_millis(50));
         ui.start_pending(clock.now());
         ui.send_pending(
             std::path::Path::new("unused"),
