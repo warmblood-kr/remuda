@@ -88,6 +88,7 @@ function remuda.pending(options)
   local id, native_handle = remuda._pending_create(timeout)
   if on_cancel then pending_cancel_handlers[id] = on_cancel end
   local handle = {}
+  handle.__remuda_pending_handle = native_handle
   function handle:resolve(...) return native_handle:resolve(...) end
   function handle:reject(...) return native_handle:reject(...) end
   function handle:prompt_secret(prompt)

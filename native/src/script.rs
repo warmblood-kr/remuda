@@ -43,6 +43,7 @@ pub const BINDINGS: [&str; 86] = [
     "_module_readiness",
     "_pending_create",
     "_pending_events",
+    "_pending_secret_events",
     "_process_drain",
     "_process_killpg",
     "_process_run",
@@ -155,6 +156,11 @@ const WORDS: &[(&str, &str, &str)] = &[
     "_pending_events",
         "Drain deferred-reply completion and cancellation notifications for the Lua tick.",
         "_pending_events() -> {{id, reason?}...}",
+    ),
+    (
+        "_pending_secret_events",
+        "Drain deferred secret-prompt results for the Lua tick.",
+        "_pending_secret_events() -> {{id, prompt_id, secret? | error?}...}",
     ),
     (
         "_session_resize",
