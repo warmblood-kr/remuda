@@ -592,9 +592,7 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
     );
 
     let output_start = tui.output_len();
-    tui.writer
-        .write_all(b"\x1b[200~line1\rline2")
-        .unwrap();
+    tui.writer.write_all(b"\x1b[200~line1\rline2").unwrap();
     std::thread::sleep(Duration::from_millis(250));
     let before_end = tui.text_from(output_start);
     assert!(
@@ -616,12 +614,12 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
     let mut parser = vt100::Parser::new(24, 100, 0);
     parser.process(&output);
     let screen = parser.screen().contents();
-    let sent_inputs = screen
+    let complete_paste_inputs = screen
         .lines()
-        .filter(|line| line.contains("sent ·"))
+        .filter(|line| line.contains("line1") && line.contains("line2"))
         .count();
     assert_eq!(
-        sent_inputs, 1,
+        complete_paste_inputs, 1,
         "the completed paste should be one Input batch; screen:\n{screen}"
     );
 }
