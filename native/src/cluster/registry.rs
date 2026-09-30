@@ -191,6 +191,7 @@ impl std::error::Error for UnsupportedRegistryMajor {}
 pub struct UpdateOutcome {
     pub applied: Vec<AuthorizedNode>,
     pub alerts: Vec<String>,
+    pub self_revocation_notice_by: Option<String>,
     pub local_metadata_changed: bool,
     pub dropped_origin_entries: usize,
     pub dropped_invalid_entries: usize,
@@ -562,6 +563,9 @@ fn merge_update(
             continue;
         }
         if entry.node_fp == receiver_fp && entry.state == NodeState::Revoked {
+            outcome
+                .self_revocation_notice_by
+                .get_or_insert_with(|| update.sender_fp.clone());
             outcome.alerts.push(format!(
                 "dropped peer tombstone for receiver own key {}",
                 receiver_fp
@@ -788,6 +792,9 @@ fn apply_update_at(
     )?;
     if !outcome.applied.is_empty() || outcome.local_metadata_changed {
         save_registry_at(dir, &registry)?;
+    }
+    if let Some(by_fp) = &outcome.self_revocation_notice_by {
+        super::control::save_revoked_notice_at(dir, by_fp)?;
     }
     for alert in &outcome.alerts {
         eprintln!("remuda: cluster replication alert: {alert}");
@@ -1506,6 +1513,137 @@ mod tests {
         };
         assert!(apply_as_sender(&mut registry, &update, &public_key(&sender)).is_err());
         assert!(registry.authorized_nodes.is_empty());
+    }
+
+    #[test]
+    fn authenticated_self_tombstone_persists_notice_without_revoking_local_entry() {
+        let dir = temp_dir();
+        let (receiver, _) = super::super::identity::init_identity_at(&dir).unwrap();
+        let sender = admitted_sender();
+        let receiver_entry = AuthorizedNode {
+            node_fp: receiver.node_fp.clone(),
+            static_pubkey: encoding::encode_base64(&receiver.static_pubkey),
+            delivered_by: None,
+            format_major: REGISTRY_FORMAT_MAJOR,
+            format_minor: REGISTRY_FORMAT_MINOR,
+            optional_fields: BTreeMap::new(),
+            endpoint: None,
+            state: NodeState::Admitted,
+            version: 1,
+            by: sender.node_fp.clone(),
+        };
+        save_registry_at(
+            &dir,
+            &Registry {
+                authorized_nodes: vec![sender.clone(), receiver_entry.clone()],
+            },
+        )
+        .unwrap();
+        let mut tombstone = receiver_entry.clone();
+        tombstone.state = NodeState::Revoked;
+        tombstone.version = 2;
+        let revoke = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![tombstone],
+        };
+
+        apply_update_at(&dir, &revoke, &public_key(&sender)).unwrap();
+
+        let notice_path = dir.join("revoked_notice.json");
+        let notice: serde_json::Value =
+            serde_json::from_slice(&fs::read(&notice_path).unwrap()).unwrap();
+        assert_eq!(notice["by_fp"], sender.node_fp);
+        assert!(notice["at"].as_str().is_some());
+        let stored = load_registry_at(&dir).unwrap();
+        assert_eq!(
+            stored
+                .authorized_nodes
+                .iter()
+                .find(|entry| entry.node_fp == receiver.node_fp)
+                .unwrap()
+                .state,
+            NodeState::Admitted
+        );
+
+        let mut remote_admission = receiver_entry;
+        remote_admission.version = 99;
+        let un_revoke = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![remote_admission],
+        };
+        apply_update_at(&dir, &un_revoke, &public_key(&sender)).unwrap();
+        let retained_notice: serde_json::Value =
+            serde_json::from_slice(&fs::read(&notice_path).unwrap()).unwrap();
+        assert_eq!(retained_notice, notice);
+        assert_eq!(
+            load_registry_at(&dir)
+                .unwrap()
+                .authorized_nodes
+                .iter()
+                .find(|entry| entry.node_fp == receiver.node_fp)
+                .unwrap()
+                .state,
+            NodeState::Admitted
+        );
+    }
+
+    #[test]
+    fn nonmember_sender_cannot_persist_self_revocation_notice() {
+        let dir = temp_dir();
+        let (receiver, _) = super::super::identity::init_identity_at(&dir).unwrap();
+        let sender = admitted_sender();
+        let outsider = entry(
+            "unadmitted-replication-sender",
+            NodeState::Admitted,
+            1,
+            "outsider",
+        );
+        let receiver_entry = AuthorizedNode {
+            node_fp: receiver.node_fp.clone(),
+            static_pubkey: encoding::encode_base64(&receiver.static_pubkey),
+            delivered_by: None,
+            format_major: REGISTRY_FORMAT_MAJOR,
+            format_minor: REGISTRY_FORMAT_MINOR,
+            optional_fields: BTreeMap::new(),
+            endpoint: None,
+            state: NodeState::Admitted,
+            version: 1,
+            by: receiver.node_fp.clone(),
+        };
+        save_registry_at(
+            &dir,
+            &Registry {
+                authorized_nodes: vec![receiver_entry.clone(), sender.clone()],
+            },
+        )
+        .unwrap();
+        let mut tombstone = receiver_entry;
+        tombstone.state = NodeState::Revoked;
+        tombstone.version = 2;
+        let unadmitted_notice = RegistryUpdate {
+            sender_fp: outsider.node_fp.clone(),
+            entries: vec![tombstone],
+        };
+
+        assert!(apply_update_at(&dir, &unadmitted_notice, &public_key(&outsider)).is_err());
+        assert!(!dir.join("revoked_notice.json").exists());
+
+        let forged_identity = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: unadmitted_notice.entries,
+        };
+        assert!(apply_update_at(&dir, &forged_identity, &public_key(&outsider)).is_err());
+        assert!(!dir.join("revoked_notice.json").exists());
+        assert_eq!(
+            load_registry_at(&dir)
+                .unwrap()
+                .authorized_nodes
+                .iter()
+                .find(|entry| entry.node_fp == receiver.node_fp)
+                .unwrap()
+                .state,
+            NodeState::Admitted
+        );
     }
 
     #[test]
