@@ -275,10 +275,13 @@ fn validate(req: &HttpRequest) -> Result<(), String> {
     if total > MAX_HEADER_BYTES {
         return Err("request headers exceed 64 KiB".into());
     }
+    validate_pin_only(req, "http.request")?;
     if let Some(pin) = &req.pin {
-        decode_pin(pin)?;
+        if !req.pin_only {
+            decode_pin(pin)?;
+        }
     }
-    if (req.ca_file.is_some() || req.pin.is_some()) && url.scheme() != "https" {
+    if (req.ca_file.is_some() || req.pin.is_some() || req.pin_only) && url.scheme() != "https" {
         return Err("TLS options require HTTPS".into());
     }
     Ok(())
@@ -799,7 +802,10 @@ fn tls_verifier(
     req: &HttpRequest,
     provider: Arc<rustls::crypto::CryptoProvider>,
 ) -> Result<Arc<dyn ServerCertVerifier>, String> {
-    let verifier: Arc<dyn ServerCertVerifier> = if let Some(path) = &req.ca_file {
+    validate_pin_only(req, "http.request")?;
+    let verifier: Arc<dyn ServerCertVerifier> = if req.pin_only {
+        Arc::new(rustls_platform_verifier::Verifier::new(provider.clone()).map_err(tls_error)?)
+    } else if let Some(path) = &req.ca_file {
         let pem = read_ca_file(path)?;
         let certs = parse_pem_certs(&pem)?;
         if certs.is_empty() {
@@ -826,6 +832,7 @@ fn tls_verifier(
         Some(pin) => Ok(Arc::new(PinnedVerifier {
             inner: verifier,
             pin: decode_pin(pin)?,
+            pin_only: req.pin_only,
         })),
         None => Ok(verifier),
     }
@@ -925,6 +932,7 @@ fn inspect_peer_certificate(
     if url.scheme() != "https" {
         return Err("peer_certificate requires an https URL".into());
     }
+    validate_pin_only(&req, "http.peer_certificate")?;
     if !url.username().is_empty() || url.password().is_some() {
         return Err("peer_certificate URL must not contain credentials".into());
     }
@@ -1235,6 +1243,7 @@ fn decode_pin(pin: &str) -> Result<[u8; 32], String> {
 struct PinnedVerifier {
     inner: Arc<dyn ServerCertVerifier>,
     pin: [u8; 32],
+    pin_only: bool,
 }
 impl ServerCertVerifier for PinnedVerifier {
     fn verify_server_cert(
@@ -1245,8 +1254,12 @@ impl ServerCertVerifier for PinnedVerifier {
         ocsp: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, TlsError> {
-        self.inner
-            .verify_server_cert(cert, intermediates, name, ocsp, now)?;
+        if self.pin_only {
+            verify_trusted_end_entity(cert, name, now)?;
+        } else {
+            self.inner
+                .verify_server_cert(cert, intermediates, name, ocsp, now)?;
+        }
         let spki = certificate_spki(cert.as_ref()).map_err(TlsError::General)?;
         let actual = Sha256::digest(spki);
         if actual.as_slice() != self.pin {
@@ -1336,6 +1349,41 @@ trait Pipe: Sized {
 }
 impl<T> Pipe for T {}
 
+fn pin_only_error(api: &str) -> String {
+    format!(
+        "{api} pin_only requires a valid pin.\nNext: set pin to sha256/<base64 SPKI SHA-256> or omit pin_only"
+    )
+}
+
+fn validate_pin_only(req: &HttpRequest, api: &str) -> Result<(), String> {
+    if !req.pin_only {
+        return Ok(());
+    }
+    let Some(pin) = req.pin.as_deref() else {
+        return Err(pin_only_error(api));
+    };
+    decode_pin(pin).map_err(|_| pin_only_error(api))?;
+    Ok(())
+}
+
+fn tls_options(
+    options: &mlua::Table,
+    api: &str,
+) -> mlua::Result<(Option<String>, Option<String>, bool)> {
+    let ca_file = options.get::<Option<String>>("ca_file")?;
+    let pin = options.get::<Option<String>>("pin")?;
+    let pin_only = options.get::<Option<bool>>("pin_only")?.unwrap_or(false);
+    if pin_only {
+        let Some(value) = pin.as_deref() else {
+            return Err(mlua::Error::runtime(pin_only_error(api)));
+        };
+        if decode_pin(value).is_err() {
+            return Err(mlua::Error::runtime(pin_only_error(api)));
+        }
+    }
+    Ok((ca_file, pin, pin_only))
+}
+
 pub fn install(
     lua: &mlua::Lua,
     remuda: &mlua::Table,
@@ -1364,8 +1412,7 @@ pub fn install(
                 .get::<Option<mlua::LuaString>>("body")?
                 .map(|value| value.as_bytes().to_vec())
                 .unwrap_or_default();
-            let ca_file = options.get::<Option<String>>("ca_file")?;
-            let pin = options.get::<Option<String>>("pin")?;
+            let (ca_file, pin, pin_only) = tls_options(&options, "http.request")?;
             let callback: mlua::Function = options.get("callback")?;
             let mut headers = Vec::new();
             if let Some(table) = options.get::<Option<mlua::Table>>("headers")? {
@@ -1384,7 +1431,7 @@ pub fn install(
                 max_bytes,
                 ca_file,
                 pin,
-                pin_only: false,
+                pin_only,
             });
             let key = format!("remuda.http.callback.{}", task.id);
             lua.set_named_registry_value(&key, callback)?;
@@ -1413,8 +1460,7 @@ pub fn install(
                 "http.peer_certificate",
             )?
             .unwrap();
-            let ca_file = options.get::<Option<String>>("ca_file")?;
-            let pin = options.get::<Option<String>>("pin")?;
+            let (ca_file, pin, pin_only) = tls_options(&options, "http.peer_certificate")?;
             let callback: mlua::Function = options.get("callback")?;
             let task = peer_image.start_peer_certificate(HttpRequest {
                 method: "GET".into(),
@@ -1426,7 +1472,7 @@ pub fn install(
                 max_bytes: 0,
                 ca_file,
                 pin,
-                pin_only: false,
+                pin_only,
             });
             let key = format!("remuda.http.callback.{}", task.id);
             lua.set_named_registry_value(&key, callback)?;
