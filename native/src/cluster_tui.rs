@@ -17,13 +17,14 @@ use remuda_core::clock::Clock;
 use remuda_core::protocol::{expand_runs, Request, Response};
 use remuda_core::registry::SessionSummary;
 use sender::InputSender;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub mod close_request;
 const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
+const REMOTE_KEYS_COALESCE_INTERVAL: Duration = Duration::from_millis(40);
 const REMOTE_PASTE_FAILURE_NOTICE: &str =
     "remote input stopped after a failed chunk; remaining lines dropped";
 const REMOTE_PARTIAL_INPUT_NOTICE: &str =
@@ -103,6 +104,7 @@ pub struct ClusterUi {
     remote_selected: Option<RemoteSelection>,
     remote_active: Option<RemoteSelection>,
     remote_keys_mode: Option<RemoteSelection>,
+    remote_key_buffers: VecDeque<RemoteKeyBuffer>,
     // (registry fingerprint, display label, session name, instance id)
     remote_composer_target: Option<(String, String, String, String)>,
     partial_input_confirm_target: Option<(String, String, String, String)>,
@@ -123,6 +125,12 @@ struct RemoteCloseTarget {
     registry_key: String,
     label: String,
     wire_name: String,
+}
+
+struct RemoteKeyBuffer {
+    target: RemoteSelection,
+    bytes: Vec<u8>,
+    last_input_at: Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,6 +196,7 @@ impl ClusterUi {
             remote_selected: None,
             remote_active: None,
             remote_keys_mode: None,
+            remote_key_buffers: VecDeque::new(),
             remote_composer_target: None,
             partial_input_confirm_target: None,
             remote_input_enabled: false,
@@ -946,22 +955,18 @@ impl ClusterUi {
         let RemoteSelection::Session {
             node,
             name: _,
-            instance_id,
+            instance_id: _,
         } = target
         else {
             return;
         };
         if self.remote_control_disabled.contains(node) {
+            self.notice = Some(("remote control disabled on this node".into(), now));
             return;
         }
-        let Some((node_label, session_name, wire_name, alive)) =
+        let Some((node_label, session_name, alive)) =
             self.remote_session(target).map(|(snapshot, session)| {
-                (
-                    snapshot.name.clone(),
-                    session.name.clone(),
-                    session.wire_name.clone(),
-                    session.alive,
-                )
+                (snapshot.name.clone(), session.name.clone(), session.alive)
             })
         else {
             self.remote_keys_mode = None;
@@ -973,15 +978,76 @@ impl ClusterUi {
             self.notice = Some((format!("{node_label}/{session_name} has ended"), now));
             return;
         }
+        let at = Instant::now();
+        if let Some(buffer) = self
+            .remote_key_buffers
+            .back_mut()
+            .filter(|buffer| buffer.target == *target)
+        {
+            buffer.bytes.extend(bytes);
+            buffer.last_input_at = at;
+        } else {
+            self.remote_key_buffers.push_back(RemoteKeyBuffer {
+                target: target.clone(),
+                bytes,
+                last_input_at: at,
+            });
+        }
+    }
+
+    fn flush_remote_key_buffer(&mut self, now: Instant, ui_now: Duration) {
+        if self.input_queue.sending_batch().is_some() {
+            return;
+        }
+        let Some(buffer) = self.remote_key_buffers.front() else {
+            return;
+        };
+        if now.saturating_duration_since(buffer.last_input_at) < REMOTE_KEYS_COALESCE_INTERVAL {
+            return;
+        }
+        let buffer = self
+            .remote_key_buffers
+            .pop_front()
+            .expect("remote key buffer exists");
+        let RemoteSelection::Session {
+            node,
+            name,
+            instance_id,
+        } = buffer.target
+        else {
+            return;
+        };
+        let selection = RemoteSelection::Session {
+            node: node.clone(),
+            name,
+            instance_id: instance_id.clone(),
+        };
+        let Some((node_label, session_name, wire_name, alive)) =
+            self.remote_session(&selection).map(|(snapshot, session)| {
+                (
+                    snapshot.name.clone(),
+                    session.name.clone(),
+                    session.wire_name.clone(),
+                    session.alive,
+                )
+            })
+        else {
+            self.notice = Some(("remote session is no longer listed".into(), ui_now));
+            return;
+        };
+        if !alive {
+            self.notice = Some((format!("{node_label}/{session_name} has ended"), ui_now));
+            return;
+        }
         if let Err(error) = self.input_sender.enqueue_remote(
             &mut self.input_queue,
-            node,
+            &node,
             &wire_name,
-            instance_id,
-            bytes,
-            Instant::now(),
+            &instance_id,
+            buffer.bytes,
+            now,
         ) {
-            self.notice = Some((format!("remote key not queued: {error}"), now));
+            self.notice = Some((format!("remote key not queued: {error}"), ui_now));
         }
     }
 
@@ -1295,6 +1361,7 @@ impl ClusterUi {
     }
 
     fn start_pending(&mut self, now: Duration) {
+        self.flush_remote_key_buffer(Instant::now(), now);
         self.input_sender
             .begin_due(&mut self.input_queue, Instant::now());
         if let Some(batch) = self.input_queue.sending_batch() {
@@ -2138,23 +2205,14 @@ mod tests {
         ] {
             key_event(&mut ui, code, modifiers, clock.now());
         }
+        std::thread::sleep(Duration::from_millis(50));
+        ui.start_pending(clock.now());
         let queued = ui
             .input_queue
             .items()
             .map(|batch| batch.bytes.clone())
             .collect::<Vec<_>>();
-        assert_eq!(
-            queued,
-            [
-                b"\x1b".to_vec(),
-                b"\x03".to_vec(),
-                b"\x1b[A".to_vec(),
-                b"\t".to_vec(),
-                b"\r".to_vec(),
-                b"y".to_vec(),
-            ]
-        );
-        ui.start_pending(clock.now());
+        assert_eq!(queued, [b"\x1b\x03\x1b[A\t\ry".to_vec()]);
         ui.send_pending(
             std::path::Path::new("unused"),
             clock.now(),
@@ -2219,6 +2277,7 @@ mod tests {
         let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
         key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
         key_event(&mut ui, KeyCode::Char('a'), KeyModifiers::NONE, clock.now());
+        std::thread::sleep(Duration::from_millis(50));
         ui.start_pending(clock.now());
         key_event(&mut ui, KeyCode::Char('b'), KeyModifiers::NONE, clock.now());
         key_event(&mut ui, KeyCode::Char('c'), KeyModifiers::NONE, clock.now());
@@ -2228,6 +2287,8 @@ mod tests {
             clock.now(),
             Some(&transport),
         );
+        *transport.response.lock().unwrap() = Some(Response::Ack { duplicate: false });
+        std::thread::sleep(Duration::from_millis(50));
         ui.start_pending(clock.now());
         ui.send_pending(
             std::path::Path::new("unused"),
