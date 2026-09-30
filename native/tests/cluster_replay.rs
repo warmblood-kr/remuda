@@ -70,6 +70,23 @@ fn replay_prunes_by_timestamp_and_enforces_capacity() {
 }
 
 #[test]
+fn replay_contains_expires_entries_outside_both_retention_windows() {
+    let mut window = replay::ReplayWindow::new(1);
+    let monotonic = std::time::Instant::now();
+    let ephemeral = [8; 32];
+    window
+        .check_and_insert_at("peer", ephemeral, 1000, 1000, monotonic)
+        .unwrap();
+    assert!(window.contains_at(&ephemeral, 1000, monotonic));
+
+    let later = monotonic + std::time::Duration::from_secs(120);
+    assert!(!window.contains_at(&ephemeral, 1061, later));
+    assert!(window
+        .check_and_insert_at("peer", ephemeral, 1061, 1061, later)
+        .is_ok());
+}
+
+#[test]
 fn replay_peer_cannot_consume_the_global_cache_share() {
     let mut window = replay::ReplayWindow::with_peer_capacity(16, 1);
     let monotonic = std::time::Instant::now();
