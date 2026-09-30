@@ -11,7 +11,7 @@
 //! remuda, and that is not circular — the pty under the test is this crate's,
 //! the terminal under test is the binary's.
 
-use remuda_core::protocol::{Request, Response};
+use remuda_core::protocol::{ListenerOp, ListenerStatus, Request, Response};
 use remuda_core::{Session, Size};
 use remuda_native::{client, daemon, ipc, CommandBuilder, PtyAgent, SystemClock};
 use std::io::{Read, Write};
@@ -224,6 +224,232 @@ impl Drop for RemoveDirectoryOnDrop {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+struct ClusterListenerTestDaemon {
+    _daemon: Daemon,
+    _environment: IsolatedClusterStateEnvironment,
+    _cleanup: RemoveDirectoryOnDrop,
+    socket: PathBuf,
+    state: PathBuf,
+}
+
+static CLUSTER_LISTENER_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct IsolatedClusterStateEnvironment {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    old_home: Option<std::ffi::OsString>,
+    old_state: Option<std::ffi::OsString>,
+    old_local_app_data: Option<std::ffi::OsString>,
+    old_user_profile: Option<std::ffi::OsString>,
+}
+
+impl IsolatedClusterStateEnvironment {
+    fn set(home: &Path, state: &Path) -> Self {
+        let lock = CLUSTER_LISTENER_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let environment = Self {
+            _lock: lock,
+            old_home: std::env::var_os("HOME"),
+            old_state: std::env::var_os("XDG_STATE_HOME"),
+            old_local_app_data: std::env::var_os("LOCALAPPDATA"),
+            old_user_profile: std::env::var_os("USERPROFILE"),
+        };
+        std::env::set_var("HOME", home);
+        std::env::set_var("XDG_STATE_HOME", state);
+        std::env::set_var("LOCALAPPDATA", state);
+        std::env::set_var("USERPROFILE", home);
+        environment
+    }
+}
+
+impl Drop for IsolatedClusterStateEnvironment {
+    fn drop(&mut self) {
+        match self.old_home.take() {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match self.old_state.take() {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+        match self.old_local_app_data.take() {
+            Some(value) => std::env::set_var("LOCALAPPDATA", value),
+            None => std::env::remove_var("LOCALAPPDATA"),
+        }
+        match self.old_user_profile.take() {
+            Some(value) => std::env::set_var("USERPROFILE", value),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
+}
+
+fn cluster_listener_test_daemon(
+    tag: &str,
+    config: Option<remuda_native::cluster::listener_config::ListenerConfig>,
+) -> ClusterListenerTestDaemon {
+    use std::process::Command;
+
+    static NEXT_LISTENER_TEST: AtomicU64 = AtomicU64::new(1);
+    let root = PathBuf::from("/private/tmp").join(format!(
+        "l3-{}-{}-{tag}",
+        std::process::id(),
+        NEXT_LISTENER_TEST.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&root).expect("create private listener test directory");
+    let root = std::fs::canonicalize(root).expect("canonicalize listener test directory");
+    let cleanup = RemoveDirectoryOnDrop(root.clone());
+    let runtime = root.join("runtime");
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir(&runtime).expect("create private listener runtime");
+    std::fs::create_dir(&home).expect("create isolated listener HOME");
+    std::fs::create_dir(&state).expect("create isolated listener state home");
+
+    let initialized = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["cluster", "init"])
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .env("LOCALAPPDATA", &state)
+        .env("USERPROFILE", &home)
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .expect("initialize isolated cluster state");
+    assert!(
+        initialized.status.success(),
+        "cluster init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    if let Some(config) = config {
+        remuda_native::cluster::listener_config::write_at(&state.join("remuda/cluster"), &config)
+            .expect("write isolated listener configuration");
+    }
+
+    let socket = daemon::socket_path_in(&runtime, "s");
+    let mut command = spawn::base_command(&runtime);
+    command
+        .env("XDG_STATE_HOME", &state)
+        .env("LOCALAPPDATA", &state)
+        .env("USERPROFILE", &home);
+    let child = spawn::spawn_and_wait(command, &runtime);
+    let environment = IsolatedClusterStateEnvironment::set(&home, &state);
+    ClusterListenerTestDaemon {
+        _daemon: child,
+        _environment: environment,
+        _cleanup: cleanup,
+        socket,
+        state,
+    }
+}
+
+fn explicit_listener_config(
+    bind: std::net::SocketAddr,
+) -> remuda_native::cluster::listener_config::ListenerConfig {
+    use remuda_native::cluster::listener_config::{ListenerBind, ListenerConfig};
+    ListenerConfig {
+        enabled: true,
+        bind: ListenerBind::Explicit(bind),
+        allow_public: false,
+    }
+}
+
+#[allow(clippy::disallowed_types)]
+fn wait_for_tcp_listener(address: std::net::SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_secs(10)).is_ok() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "TCP listener never opened {address}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[allow(clippy::disallowed_types)]
+fn assert_tcp_listener_closed(address: std::net::SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if std::net::TcpStream::connect_timeout(&address, Duration::from_secs(10)).is_err() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "TCP listener remained open at {address}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+#[allow(clippy::disallowed_types)]
+fn cluster_listener_control_starts_stops_and_switches_ports() {
+    use remuda_native::cluster::listener_control;
+
+    let daemon = cluster_listener_test_daemon("listener-start-stop", None);
+    let first = listener_control::start(
+        &daemon.socket,
+        Some(explicit_listener_config("127.0.0.1:0".parse().unwrap())),
+    )
+    .expect("start and reload the named daemon's listener");
+    let ListenerStatus::On {
+        addr: first_addr, ..
+    } = first
+    else {
+        panic!("expected listener On, got {first:?}");
+    };
+    assert_eq!(listener_control::status(&daemon.socket), first);
+    wait_for_tcp_listener(first_addr);
+
+    let second_socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let second_addr = second_socket.local_addr().unwrap();
+    assert_ne!(second_addr, first_addr);
+    let stopped = listener_control::stop(&daemon.socket).expect("stop the listener");
+    assert_eq!(stopped, ListenerStatus::Off);
+    drop(second_socket);
+    assert_tcp_listener_closed(first_addr);
+
+    let restarted =
+        listener_control::start(&daemon.socket, Some(explicit_listener_config(second_addr)))
+            .expect("restart the listener at its new explicit address");
+    assert_eq!(
+        restarted,
+        ListenerStatus::On {
+            addr: second_addr,
+            auto: false
+        }
+    );
+    wait_for_tcp_listener(second_addr);
+}
+
+#[test]
+#[allow(clippy::disallowed_types)]
+fn cluster_listener_reload_without_config_turns_off() {
+    let address = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let daemon = cluster_listener_test_daemon(
+        "listener-reload-empty",
+        Some(explicit_listener_config(address)),
+    );
+    wait_for_tcp_listener(address);
+    std::fs::remove_file(daemon.state.join("remuda/cluster/listener.json"))
+        .expect("remove listener config before Reload");
+
+    let response = client::request(
+        &daemon.socket,
+        &Request::ClusterListener(ListenerOp::Reload),
+    )
+    .expect("ask the isolated named daemon to reload listener config");
+    assert_eq!(
+        response,
+        Response::ClusterListenerStatus(ListenerStatus::Off)
+    );
+    assert_tcp_listener_closed(address);
 }
 
 #[cfg(unix)]

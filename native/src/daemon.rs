@@ -25,7 +25,7 @@ use interprocess::local_socket::traits::Stream as LocalStream;
 #[cfg(unix)]
 use interprocess::local_socket::ListenerNonblockingMode;
 use remuda_core::agent::Result as AgentResult;
-use remuda_core::protocol::{collapse_runs, Request, Response, StyledScreen};
+use remuda_core::protocol::{collapse_runs, ListenerOp, Request, Response, StyledScreen};
 use remuda_core::{Clock, Registry, Session, Size};
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
@@ -38,6 +38,8 @@ use std::time::Duration;
 
 use crate::SystemClock;
 use portable_pty::CommandBuilder;
+
+pub use remuda_core::protocol::ListenerStatus;
 
 /// Each protocol connection carries one request; cap all simultaneous long
 /// polls so they cannot consume an unbounded number of daemon worker threads.
@@ -418,16 +420,6 @@ fn anti_entropy_interval() -> Duration {
         return Duration::from_millis(milliseconds);
     }
     Duration::from_secs(60 + u64::from(std::process::id() % 11))
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ListenerStatus {
-    Off,
-    On {
-        addr: std::net::SocketAddr,
-        auto: bool,
-    },
-    Failed(String),
 }
 
 pub struct ListenerTask {
@@ -1325,6 +1317,11 @@ fn handle_request(
         Request::ClusterRegistrySync { .. } | Request::ClusterRegistryUpdate { .. } => {
             refuse_cluster_registry(&stream)
         }
+
+        Request::ClusterListener(ListenerOp::Status | ListenerOp::Reload) => reply(
+            &stream,
+            &Response::error("cluster listener control is not implemented"),
+        ),
 
         request @ Request::Shutdown { .. } => {
             handle_shutdown(stream, registry, image, socket_owner, anti_entropy, request)

@@ -20,6 +20,24 @@ use crate::agent::{Color, Cursor, MouseState, Size, StyledCell};
 use crate::registry::SessionSummary;
 use serde::{Deserialize, Serialize};
 
+/// A local control operation for the daemon-owned cluster listener.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum ListenerOp {
+    Status,
+    Reload,
+}
+
+/// The daemon's current listener state, shared by local callers and the wire protocol.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub enum ListenerStatus {
+    Off,
+    On {
+        addr: std::net::SocketAddr,
+        auto: bool,
+    },
+    Failed(String),
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Request {
     /// Every session this node holds.
@@ -125,6 +143,8 @@ pub enum Request {
     },
     /// Apply one bounded, canonical registry update from an authenticated peer.
     ClusterRegistryUpdate { update_json: String },
+    /// Read or reload the daemon-owned local cluster listener.
+    ClusterListener(ListenerOp),
     /// Stop the daemon, so the next command starts a fresh one. The daemon
     /// refuses a request identifying one of its own sessions unless the
     /// caller explicitly overrides the hosted-session guard.
@@ -249,6 +269,8 @@ pub enum Response {
         digest: String,
         applied: bool,
     },
+    /// Current state of the daemon-owned cluster listener.
+    ClusterListenerStatus(ListenerStatus),
 }
 
 impl Response {
