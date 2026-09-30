@@ -47,6 +47,7 @@ getrandom = "=0.3.4"
 snow = { version = "=0.10.0", default-features = false, features = ["default-resolver", "use-chacha20poly1305", "use-curve25519", "use-getrandom", "use-sha2"] }
 zeroize = "=1.9.0"
 remuda-core = { path = "../core" }
+libc = "0.2"
 vt100 = "0.16.2"
 mlua = { version = "0.12.1", features = ["lua54", "vendored"] }
 rustyline = "14.0.0"
@@ -57,11 +58,6 @@ unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.28.0", features = ["socket"] }
-
-# `libc`: `prctl`/`getppid`/`killpg` for `child_guard.rs` (linux), and
-# `setsid` for the auto-started daemon in `bin/remuda.rs` (unix). Already in
-# the graph transitively via several other deps (mio, parking_lot_core, ...).
-libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }

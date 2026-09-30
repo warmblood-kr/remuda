@@ -261,7 +261,7 @@ mod tests {
         super::save_revoked_notice_at(&dir, "SHA256:issuer").unwrap();
         let notice = super::revoked_notice_at(&dir).unwrap().unwrap();
         assert_eq!(notice.by_fp, "SHA256:issuer");
-        assert!(!notice.at.is_empty());
+        assert!(notice.at.parse::<i64>().is_ok());
         super::clear_revoked_notice_at(&dir).unwrap();
         assert!(super::revoked_notice_at(&dir).unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
