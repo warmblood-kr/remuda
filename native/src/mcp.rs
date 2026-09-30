@@ -220,10 +220,24 @@ fn call_response(id: Value, response: Response) -> String {
         // the arm the old comment called unreachable is now the common one, and
         // the decision it left open was made rather than dropped. `steps/013`.
         Response::Value(value) => ok_reply(id, tool_text(&value)),
-        Response::CommandResult { .. } => ok_reply(
-            id,
-            tool_error("deferred replies are not supported by MCP tool calls"),
-        ),
+        Response::CommandResult {
+            exit_code,
+            stdout_base64,
+            stderr_base64,
+        } => {
+            let stdout = crate::cluster::encoding::decode_base64(&stdout_base64)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            let stderr = crate::cluster::encoding::decode_base64(&stderr_base64)
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            if exit_code == 0 {
+                ok_reply(id, tool_text(&stdout))
+            } else {
+                let message = if stderr.is_empty() { &stdout } else { &stderr };
+                ok_reply(id, tool_error(message))
+            }
+        }
         Response::Ok => ok_reply(id, tool_text("ok")),
         Response::AttachStarted { .. } | Response::AttachStatus { .. } => {
             ok_reply(id, tool_error("attach responses are not exposed over MCP"))
