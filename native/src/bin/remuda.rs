@@ -318,6 +318,16 @@ remuda — terminal orchestration for coding agents
 Run `remuda mod list` for installed mods and `remuda doc` for the live Lua API.
 ";
 
+const UPGRADE_HELP: &str = "\
+Usage: remuda upgrade [--channel stable|nightly]
+
+Re-runs the installer to replace the CLI with the latest stable or nightly
+release. The running daemon and its sessions keep using the old version until
+you run `remuda stop`.
+
+Next: run `remuda upgrade` to install the latest version from your channel.
+";
+
 fn help_command() -> ExitCode {
     print!("{USAGE}");
     match remuda_native::packages::manifests() {
@@ -2748,6 +2758,10 @@ fn prepare_command(argv: &[&str], path: &Path) -> Result<Option<String>, String>
 /// Split out of `main` for the same reason `list_sessions` was: clippy's line
 /// budget. This one talks to no daemon — it replaces this very binary.
 fn run_upgrade(args: &[&str]) -> ExitCode {
+    if matches!(args, ["--help"] | ["-h"]) {
+        print!("{UPGRADE_HELP}");
+        return ExitCode::SUCCESS;
+    }
     match upgrade_channel(args).and_then(dist::upgrade) {
         Ok(()) => {
             eprintln!(
@@ -2848,8 +2862,13 @@ fn upgrade_channel<'a>(args: &[&'a str]) -> Result<Option<&'a str>, String> {
     match args {
         [] => Ok(None),
         ["--channel", name] if dist::is_channel(name) => Ok(Some(name)),
-        ["--channel", name] => Err(format!("unknown channel {name:?} — stable or nightly")),
-        _ => Err("usage: remuda upgrade [--channel stable|nightly]".into()),
+        ["--channel", name] => Err(format!(
+            "unknown channel {name:?}; use --channel stable or --channel nightly, e.g. remuda upgrade --channel nightly.\nNext: run `remuda upgrade --channel stable` or `remuda upgrade --channel nightly`."
+        )),
+        _ => Err(
+            "usage: remuda upgrade [--channel stable|nightly]\nNext: run `remuda upgrade --channel stable` or `remuda upgrade --channel nightly`."
+                .into(),
+        ),
     }
 }
 
