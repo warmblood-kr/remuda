@@ -2702,7 +2702,8 @@ mod tests {
         .unwrap();
         let sealed = sealed_payload_request(&peer, &server, &payload);
         let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || sender.send(server.exchange(sealed)).unwrap());
+        let exchange_thread =
+            std::thread::spawn(move || sender.send(server.exchange(sealed)).unwrap());
         let early_response = receiver.recv_timeout(Duration::from_millis(250));
         let was_prompt = early_response.is_ok();
         let unlock_result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
@@ -2712,10 +2713,8 @@ mod tests {
             Ok(response) => response,
             Err(_) => receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
         };
-        assert!(
-            was_prompt,
-            "unknown join token waited for identity.lock"
-        );
+        exchange_thread.join().unwrap();
+        assert!(was_prompt, "unknown join token waited for identity.lock");
         assert_eq!(response, (200, b"{\"joined\":false}".to_vec()));
     }
 
@@ -2741,18 +2740,19 @@ mod tests {
             },
             Arc::new(|_, _| Ok(())),
         );
-        let cli_store = JoinTokenStore::open_at(
-            &server.state_dir,
-            Arc::new(crate::SystemWallClock::new()),
-        )
-        .unwrap();
+        let cli_store =
+            JoinTokenStore::open_at(&server.state_dir, Arc::new(crate::SystemWallClock::new()))
+                .unwrap();
         let minted = cli_store.mint().unwrap();
         let payload = serde_json::to_vec(&serde_json::json!({
             "join": { "token": minted.token.as_str() }
         }))
         .unwrap();
         let sealed = sealed_payload_request(&peer, &server, &payload);
-        assert_eq!(server.exchange(sealed), (200, b"{\"joined\":true}".to_vec()));
+        assert_eq!(
+            server.exchange(sealed),
+            (200, b"{\"joined\":true}".to_vec())
+        );
     }
 
     #[cfg(unix)]
