@@ -733,29 +733,53 @@ fn failed_join_restores_the_exact_saved_listener_config() {
 
     let inviter = Scratch::new();
     let inviter_daemon = start_daemon(&inviter);
-    assert!(inviter
-        .run(&["cluster", "init", "--no-listen"])
-        .status
-        .success());
+    let initialized = inviter.run(&["cluster", "init", "--no-listen"]);
+    assert!(initialized.status.success(), "init failed: {initialized:?}");
     let invite = inviter.run(&["cluster", "invite", "--bind", "127.0.0.1:0"]);
     assert!(invite.status.success(), "invite failed: {invite:?}");
     let (fingerprint, join_line) = invitation_command_args(&invite);
     drop(inviter_daemon);
 
-    let missing_file_result = failed_join_with_listener_config(&fingerprint, &join_line, None);
+    let missing_file_result =
+        failed_join_with_listener_config(&fingerprint, &join_line, None, false, false);
+    let original_addr = unused_loopback_addr();
     let saved = ListenerConfig {
         enabled: true,
-        bind: ListenerBind::Explicit("127.0.0.1:0".parse().unwrap()),
+        bind: ListenerBind::Explicit(original_addr),
         allow_public: false,
     };
-    let saved_file_result =
-        failed_join_with_listener_config(&fingerprint, &join_line, Some(saved.clone()));
+    let saved_file_result = failed_join_with_listener_config(
+        &fingerprint,
+        &join_line,
+        Some(saved.clone()),
+        true,
+        false,
+    );
 
-    assert_eq!(missing_file_result, None, "failure created listener.json");
     assert_eq!(
         saved_file_result,
         Some(saved),
         "failure changed the saved listener config"
+    );
+    assert_eq!(missing_file_result, None, "failure created listener.json");
+
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let failed_status_saved = ListenerConfig {
+        enabled: true,
+        bind: ListenerBind::Explicit(occupied.local_addr().unwrap()),
+        allow_public: false,
+    };
+    let failed_status_result = failed_join_with_listener_config(
+        &fingerprint,
+        &join_line,
+        Some(failed_status_saved.clone()),
+        true,
+        true,
+    );
+    assert_eq!(
+        failed_status_result,
+        Some(failed_status_saved),
+        "failure disabled or changed an enabled config whose listener status was Failed"
     );
 }
 
@@ -763,6 +787,8 @@ fn failed_join_with_listener_config(
     fingerprint: &str,
     join_line: &str,
     initial: Option<remuda_native::cluster::listener_config::ListenerConfig>,
+    enable_initial: bool,
+    expect_failed_initial: bool,
 ) -> Option<remuda_native::cluster::listener_config::ListenerConfig> {
     use remuda_native::cluster::listener_config;
 
@@ -775,23 +801,49 @@ fn failed_join_with_listener_config(
     let cluster_dir = joiner.root.join("state/remuda/cluster");
     let config_path = cluster_dir.join("listener.json");
     match initial {
-        Some(config) => listener_config::write_at(&cluster_dir, &config).unwrap(),
+        Some(ref config) => listener_config::write_at(&cluster_dir, config).unwrap(),
         None => fs::remove_file(&config_path).unwrap(),
     }
+    if enable_initial {
+        let daemon_path = remuda_native::daemon::socket_path_in(&joiner.runtime, &joiner.name);
+        let response = remuda_native::client::request(
+            &daemon_path,
+            &remuda_core::protocol::Request::ClusterListener(
+                remuda_core::protocol::ListenerOp::Reload,
+            ),
+        )
+        .unwrap();
+        match response {
+            remuda_core::protocol::Response::ClusterListenerStatus(status) => {
+                assert_eq!(
+                    matches!(status, remuda_core::protocol::ListenerStatus::Failed(_)),
+                    expect_failed_initial,
+                    "unexpected initial listener status: {status:?}"
+                );
+            }
+            response => panic!("unexpected listener reload response: {response:?}"),
+        }
+    }
 
+    let replacement_addr = unused_loopback_addr();
     let failed = joiner.run(&[
         "cluster",
         "join",
         fingerprint,
         join_line,
         "--bind",
-        "127.0.0.1:0",
+        &replacement_addr.to_string(),
     ]);
     assert!(
         !failed.status.success(),
         "join to stopped inviter succeeded: {failed:?}"
     );
     listener_config::read_at(&cluster_dir).unwrap()
+}
+
+fn unused_loopback_addr() -> std::net::SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap()
 }
 
 fn initialized_node(scratch: &Scratch) -> TrackedChild {

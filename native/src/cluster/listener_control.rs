@@ -45,6 +45,15 @@ pub fn stop(daemon_path: &Path) -> io::Result<ListenerStatus> {
     request(daemon_path, ListenerOp::Reload)
 }
 
+/// Restore a previously saved listener config and ask the daemon to reload it.
+pub fn restore(daemon_path: &Path, snapshot: Option<ListenerConfig>) -> io::Result<ListenerStatus> {
+    match snapshot {
+        Some(config) => listener_config::write(&config)?,
+        None => listener_config::remove()?,
+    }
+    request(daemon_path, ListenerOp::Reload)
+}
+
 fn request(daemon_path: &Path, operation: ListenerOp) -> io::Result<ListenerStatus> {
     match crate::client::request(daemon_path, &Request::ClusterListener(operation))? {
         Response::ClusterListenerStatus(status) => Ok(status),

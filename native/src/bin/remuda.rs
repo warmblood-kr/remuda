@@ -1287,11 +1287,15 @@ fn cluster_join_command(
         ));
     }
     with_daemon(server, path, |daemon_path| {
+        let listener_snapshot = match remuda_native::cluster::listener_config::read() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return fail(format!(
+                    "cluster join: could not read the saved listener config: {error}"
+                ))
+            }
+        };
         let initial_status = remuda_native::cluster::listener_control::status(daemon_path);
-        let listener_was_on = matches!(
-            initial_status,
-            remuda_core::protocol::ListenerStatus::On { .. }
-        );
         let listener_status = match bind_addr {
             Some(address) => remuda_native::cluster::listener_control::start(
                 daemon_path,
@@ -1309,9 +1313,7 @@ fn cluster_join_command(
         let listener_status = match listener_status {
             Ok(status) => status,
             Err(error) => {
-                let rollback_error = (!listener_was_on)
-                    .then(|| stop_join_listener(daemon_path))
-                    .flatten();
+                let rollback_error = restore_join_listener(daemon_path, listener_snapshot.clone());
                 return fail(render_join_failure(
                     render_join_listener_start_error(&error),
                     rollback_error.as_deref(),
@@ -1322,9 +1324,7 @@ fn cluster_join_command(
             remuda_core::protocol::ListenerStatus::On { addr, .. } => addr,
             status => {
                 let message = render_join_listener_refusal(&status);
-                let rollback_error = (!listener_was_on)
-                    .then(|| stop_join_listener(daemon_path))
-                    .flatten();
+                let rollback_error = restore_join_listener(daemon_path, listener_snapshot.clone());
                 return fail(render_join_failure(message, rollback_error.as_deref()));
             }
         };
@@ -1339,20 +1339,17 @@ fn cluster_join_command(
             Err(error) => {
                 let message =
                     describe_cluster_error("join", &error, ClusterErrorContext::Join(invitation));
-                let rollback_error = (!listener_was_on)
-                    .then(|| stop_join_listener(daemon_path))
-                    .flatten();
+                let rollback_error = restore_join_listener(daemon_path, listener_snapshot);
                 fail(render_join_failure(message, rollback_error.as_deref()))
             }
         }
     })
 }
 
-fn stop_join_listener(daemon_path: &Path) -> Option<String> {
-    match remuda_native::cluster::listener_control::stop(daemon_path) {
-        Ok(remuda_core::protocol::ListenerStatus::Off) => None,
-        Ok(status) => Some(render_join_listener_rollback_status(&status)),
-        Err(error) => Some(render_join_listener_rollback_error(&error)),
+fn restore_join_listener(daemon_path: &Path, snapshot: Option<ListenerConfig>) -> Option<String> {
+    match remuda_native::cluster::listener_control::restore(daemon_path, snapshot) {
+        Ok(_) => None,
+        Err(error) => Some(render_join_listener_restore_error(&error)),
     }
 }
 
@@ -1381,22 +1378,8 @@ fn render_join_listener_refusal(status: &remuda_core::protocol::ListenerStatus) 
     }
 }
 
-fn render_join_listener_rollback_error(error: &std::io::Error) -> String {
-    format!("cluster join: could not turn off its listener: {error}\nNext: run `remuda cluster listen --off` and check `remuda cluster`.")
-}
-
-fn render_join_listener_rollback_status(status: &remuda_core::protocol::ListenerStatus) -> String {
-    use remuda_core::protocol::ListenerStatus;
-
-    match status {
-        ListenerStatus::On { addr, .. } => format!(
-            "cluster join: listener remains on at {addr}\nNext: run `remuda cluster listen --off` and check `remuda cluster`."
-        ),
-        ListenerStatus::Failed(reason) => format!(
-            "cluster join: listener state after rollback is failed: {reason}\nNext: check `remuda cluster` and run `remuda cluster listen --off`."
-        ),
-        ListenerStatus::Off => unreachable!("an off listener needs no rollback warning"),
-    }
+fn render_join_listener_restore_error(error: &std::io::Error) -> String {
+    format!("cluster join: could not restore the saved listener config: {error}\nNext: check `remuda cluster` and run `remuda cluster listen --off` if the listener should be disabled.")
 }
 
 #[derive(Clone, Copy)]
@@ -2080,7 +2063,7 @@ mod cluster_cli_tests {
         join_success_message, new_identity_confirmation, next_step_init, next_step_join,
         next_step_listen, next_step_status, parse_addr_default_port, parse_cluster_command,
         remote_control_status_lines, render_cluster_init_lines, render_init_listener_lines,
-        render_invite_listener_refusal, render_join_failure, render_join_listener_rollback_status,
+        render_invite_listener_refusal, render_join_failure, render_join_listener_restore_error,
         revoke_confirmation, write_nodes_table, write_revocation_notice, ClusterCommand,
         NEW_IDENTITY_WARNING,
     };
@@ -2247,20 +2230,9 @@ mod cluster_cli_tests {
     }
 
     #[test]
-    fn join_rollback_rendering_reports_uncertain_listener_state() {
-        use remuda_core::protocol::ListenerStatus;
-
-        let remains_on = render_join_listener_rollback_status(&ListenerStatus::On {
-            addr: "192.0.2.4:7441".parse().unwrap(),
-            auto: false,
-        });
-        assert!(remains_on.contains("listener remains on at 192.0.2.4:7441"));
-        assert!(remains_on.contains("remuda cluster listen --off"));
-
-        let failed = render_join_listener_rollback_status(&ListenerStatus::Failed(
-            "listener state unavailable".into(),
-        ));
-        assert!(failed.contains("listener state after rollback is failed"));
+    fn join_rollback_rendering_reports_restore_errors() {
+        let failed = render_join_listener_restore_error(&std::io::Error::other("disk is full"));
+        assert!(failed.contains("could not restore the saved listener config: disk is full"));
         assert!(failed.contains("remuda cluster listen --off"));
 
         assert_eq!(
