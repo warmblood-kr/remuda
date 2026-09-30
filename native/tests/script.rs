@@ -63,6 +63,20 @@ fn deprecated_flat_session_alias_warns_once_per_process() {
     );
 }
 
+#[test]
+fn remuda_sleep_error_points_to_after() {
+    let dir = scratch("removed-sleep-error");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path, &dir);
+
+    let error = script::run_source(&path, "=removed-sleep-error", "remuda.sleep(0.01)")
+        .expect_err("remuda.sleep should fail with migration guidance");
+    assert!(
+        error.contains("remuda.after"),
+        "sleep error should name remuda.after, got: {error}"
+    );
+}
+
 fn write(dir: &Path, name: &str, source: &str) -> PathBuf {
     let file = dir.join(name);
     std::fs::write(&file, source).expect("write script");
