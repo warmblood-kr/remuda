@@ -90,6 +90,20 @@ if shape not in installer_ps1:
 if "remuda-${{ needs.plan.outputs.version }}-${{ matrix.target }}" not in workflow:
     problems.append("release.yml no longer names assets remuda-<version>-<target>")
 
+# Verify the chosen release manifest before requesting an asset. A valid stable
+# release may predate a newly offered platform, and that case needs the source
+# build hint rather than a predictable asset 404.
+manifest_guard = 'if ! manifest_contains "$asset"; then'
+asset_fetch = 'fetch "$base/$asset"'
+if (
+    manifest_guard not in installer
+    or asset_fetch not in installer
+    or installer.index(manifest_guard) > installer.index(asset_fetch)
+):
+    problems.append("install.sh must check SHA256SUMS for the selected asset before downloading it")
+if 'no $channel build for $os/$arch — build from source:' not in installer:
+    problems.append("install.sh must keep the build-from-source hint when the selected release lacks an asset")
+
 # `dist::is_newer` sorts the prerelease lexically and a sha has no order, so
 # the stamp must reach the second: with `%Y%m%d` two nightlies of one day rank
 # by sha, and the binary really did offer an older build as an upgrade.

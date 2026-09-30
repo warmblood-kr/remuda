@@ -108,8 +108,16 @@ base="https://github.com/$REPO/releases/download/$tag"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
+manifest_contains() {
+	awk -v want="$1" '{ n = $2; sub(/^\.\//, "", n); if (n == want) found = 1 } END { exit !found }' \
+		"$tmp/SHA256SUMS"
+}
+
 if fetch "$base/SHA256SUMS" >"$tmp/SHA256SUMS" 2>/dev/null; then
 	asset="remuda-$version-$target.tar.gz"
+	if ! manifest_contains "$asset"; then
+		die "no $channel build for $os/$arch — build from source: cargo install --git https://github.com/$REPO"
+	fi
 elif [ "$channel" = nightly ]; then
 	# Migration bridge for an index published before nightly releases became
 	# immutable version tags. New indexes resolve above; old ones still install
