@@ -1,0 +1,11 @@
+usage: remuda cluster <command>
+  init
+  invite
+  join
+  nodes
+  revoke
+  control
+  remote
+  listen
+  call
+  help

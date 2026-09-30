@@ -1,0 +1,3 @@
+remuda: cluster join: invalid join line
+usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port 7441)]
+example: remuda cluster join 'remuda-join-v1 …'

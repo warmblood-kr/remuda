@@ -1,0 +1,2 @@
+remuda: cluster join: issuer fingerprint mismatch: expected SHA256:wrong, received <FINGERPRINT> (invitation declares <FINGERPRINT>).
+Next: ask the inviting machine to run `remuda cluster` and read its Fingerprint line.
