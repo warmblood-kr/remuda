@@ -1386,8 +1386,7 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
             std::thread::sleep(Duration::from_millis(20));
         };
         assert_eq!(
-            barrier_result,
-            "queued",
+            barrier_result, "queued",
             "recovered attach queue dropped the single drain barrier"
         );
 
