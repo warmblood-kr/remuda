@@ -1566,7 +1566,7 @@ impl ClusterUi {
         let attention = if self.attention_only { "on" } else { "off" };
         match &self.query {
             Some(query) => format!("search: {query} · Esc clear · Enter select"),
-            None => format!("↑/↓ move · ←/→ tree · Enter · x close · / search · ! attention: {attention} · q detach"),
+            None => format!("↑/↓ move · ←/→ tree · Enter · k keys · x close · / search · ! attention: {attention} · q detach"),
         }
     }
 
@@ -2530,6 +2530,7 @@ mod tests {
         assert!(frame.contains("ended"));
         assert!(!frame.contains("    dev"));
         assert!(frame.contains("attention: on"));
+        assert!(frame.contains("k keys"));
     }
 
     #[test]
