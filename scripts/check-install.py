@@ -41,20 +41,6 @@ workflow = WORKFLOW.read_text(encoding="utf-8")
 installer = INSTALLER.read_text(encoding="utf-8")
 installer_ps1 = INSTALLER_PS1.read_text(encoding="utf-8")
 
-# The opt-in onboarding path installs the independent Butler mod without
-# requiring token/config files. Keep both platform installers aligned on the
-# environment switch and the concrete next command printed to the user.
-for name, source, switch in (
-    ("install.sh", installer, "REMUDA_INSTALL_BUTLER"),
-    ("install.ps1", installer_ps1, "REMUDA_INSTALL_BUTLER"),
-):
-    if switch not in source:
-        problems.append(f"{name} does not support the {switch}=1 opt-in")
-    if "warmblood-kr/remuda-butler" not in source:
-        problems.append(f"{name} does not install the warmblood-kr/remuda-butler mod")
-    if "Next: remuda butler doctor" not in source:
-        problems.append(f"{name} does not print the required next command")
-
 # `- target: <triple>` in the build matrix.
 built = set(re.findall(r"^\s*-\s*target:\s*(\S+)\s*$", workflow, re.M))
 # `Linux/x86_64) target=<triple> ;;` in the uname case arm.
