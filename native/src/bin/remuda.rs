@@ -2914,6 +2914,8 @@ mod cluster_cli_tests {
             Ok(ListenerStatus::On {
                 addr: "127.0.0.1:7441".parse().unwrap(),
                 auto: false,
+                advertise_addr: Some("127.0.0.1:7441".parse().unwrap()),
+                listen_addrs: vec!["127.0.0.1:7441".parse().unwrap()],
             })
         });
 
