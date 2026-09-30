@@ -2439,9 +2439,9 @@ mod cluster_cli_tests {
     };
     #[cfg(unix)]
     use super::{
-        finish_join_listener_start, wait_for_join, ExitCode, JoinInterruptHandler,
-        JoinListenerRestoreGuard, JoinListenerStartOutcome, JoinRun, JOIN_INTERRUPTED,
-        JOIN_INTERRUPT_SIGNAL,
+        finish_join_listener_start, restore_join_listener, start_join_listener_with_config,
+        wait_for_join, ExitCode, JoinInterruptHandler, JoinListenerRestoreGuard,
+        JoinListenerStartOutcome, JoinRun, JOIN_INTERRUPTED, JOIN_INTERRUPT_SIGNAL,
     };
     #[cfg(unix)]
     use remuda_native::cluster::join_line::JoinLine;
@@ -2654,14 +2654,9 @@ mod cluster_cli_tests {
 
     #[cfg(unix)]
     #[test]
-    fn join_listener_write_failure_does_not_mark_join_config_as_expected() {
+    fn join_listener_write_failure_does_not_report_a_concurrent_change() {
         let _environment = ForegroundListenerLockEnvironment::new();
         let cluster_dir = _environment.root.join("state/remuda/cluster");
-        let listener_path = cluster_dir.join("listener.json");
-        let outside = _environment.root.join("outside.json");
-        std::fs::write(&outside, b"existing file").unwrap();
-        std::os::unix::fs::symlink(&outside, &listener_path).unwrap();
-
         let snapshot = ListenerConfig {
             enabled: true,
             bind: ListenerBind::Explicit("127.0.0.1:7441".parse().unwrap()),
@@ -2672,19 +2667,26 @@ mod cluster_cli_tests {
             bind: ListenerBind::Explicit("127.0.0.2:7441".parse().unwrap()),
             allow_public: false,
         };
-        let mut restore_guard = JoinListenerRestoreGuard::new(
-            std::path::Path::new("missing.sock"),
-            Some(snapshot.clone()),
-        );
+        remuda_native::cluster::listener_config::write(&snapshot).unwrap();
+        let daemon_path = std::path::Path::new("missing.sock");
+        let mut restore_guard = JoinListenerRestoreGuard::new(daemon_path, Some(snapshot.clone()));
 
-        let result = remuda_native::cluster::listener_control::start_with_config_written(
-            std::path::Path::new("missing.sock"),
-            Some(join_config.clone()),
-            || restore_guard.set_expected(Some(join_config)),
-        );
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cluster_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let start = start_join_listener_with_config(daemon_path, &mut restore_guard, join_config);
+        std::fs::set_permissions(&cluster_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
 
-        assert!(result.is_err());
-        assert_eq!(restore_guard.expected, Some(snapshot));
+        assert!(matches!(start, JoinListenerStartOutcome::Started(Err(_))));
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            Some(snapshot.clone())
+        );
+        let rollback_message = restore_join_listener(&mut restore_guard).unwrap_or_default();
+        assert!(!rollback_message.contains("listener config changed during join"));
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            Some(snapshot)
+        );
     }
 
     #[cfg(unix)]
