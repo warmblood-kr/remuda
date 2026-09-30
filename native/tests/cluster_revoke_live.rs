@@ -453,6 +453,16 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
     );
 
     wait_for_revocation_on(&c, &b_fingerprint);
+    let b_notice = wait_for_revoked_notice_on(&b, &b_fingerprint);
+    assert!(
+        b_notice.contains("Next:"),
+        "missing recovery guidance: {b_notice}"
+    );
+    let b_status = successful(b.run(&["cluster"]), "read revoked node B status");
+    assert!(
+        b_status.contains("This node was revoked by"),
+        "cluster status did not show B's revocation notice: {b_status}"
+    );
     assert_list_refused(
         &b_identity,
         &c.identity(),
@@ -676,6 +686,24 @@ fn wait_for_revocation_on(receiver: &PrivateNode, member_fp: &str) {
         member_fp,
         Instant::now() + Duration::from_secs(30),
     );
+}
+
+fn wait_for_revoked_notice_on(receiver: &PrivateNode, member_fp: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = successful(
+            receiver.run(&["cluster", "nodes"]),
+            "read revoked node's nodes table",
+        );
+        if output.contains("This node was revoked by") && output.contains(member_fp) {
+            return output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "revoked node did not receive its notice within 30 seconds: {output}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn wait_for_revocation_on_until(receiver: &PrivateNode, member_fp: &str, deadline: Instant) {

@@ -1509,6 +1509,125 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_self_tombstone_persists_notice_without_revoking_local_entry() {
+        let dir = temp_dir();
+        let (receiver, _) = super::super::identity::init_identity_at(&dir).unwrap();
+        let sender = admitted_sender();
+        let receiver_entry = AuthorizedNode {
+            node_fp: receiver.node_fp.clone(),
+            static_pubkey: encoding::encode_base64(&receiver.static_pubkey),
+            delivered_by: None,
+            format_major: REGISTRY_FORMAT_MAJOR,
+            format_minor: REGISTRY_FORMAT_MINOR,
+            optional_fields: BTreeMap::new(),
+            endpoint: None,
+            state: NodeState::Admitted,
+            version: 1,
+            by: sender.node_fp.clone(),
+        };
+        save_registry_at(
+            &dir,
+            &Registry {
+                authorized_nodes: vec![sender.clone(), receiver_entry.clone()],
+            },
+        )
+        .unwrap();
+        let mut tombstone = receiver_entry.clone();
+        tombstone.state = NodeState::Revoked;
+        tombstone.version = 2;
+        let revoke = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![tombstone],
+        };
+
+        apply_update_at(&dir, &revoke, &public_key(&sender)).unwrap();
+
+        let notice_path = dir.join("revoked_notice.json");
+        let notice: serde_json::Value =
+            serde_json::from_slice(&fs::read(&notice_path).unwrap()).unwrap();
+        assert_eq!(notice["by_fp"], sender.node_fp);
+        assert!(notice["at"].as_str().is_some());
+        let stored = load_registry_at(&dir).unwrap();
+        assert_eq!(
+            stored
+                .authorized_nodes
+                .iter()
+                .find(|entry| entry.node_fp == receiver.node_fp)
+                .unwrap()
+                .state,
+            NodeState::Admitted
+        );
+
+        let mut remote_admission = receiver_entry;
+        remote_admission.version = 99;
+        let un_revoke = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: vec![remote_admission],
+        };
+        apply_update_at(&dir, &un_revoke, &public_key(&sender)).unwrap();
+        assert_eq!(
+            fs::read(&notice_path).unwrap(),
+            serde_json::to_vec(&notice).unwrap()
+        );
+        assert_eq!(
+            load_registry_at(&dir)
+                .unwrap()
+                .authorized_nodes
+                .iter()
+                .find(|entry| entry.node_fp == receiver.node_fp)
+                .unwrap()
+                .state,
+            NodeState::Admitted
+        );
+    }
+
+    #[test]
+    fn nonmember_sender_cannot_persist_self_revocation_notice() {
+        let dir = temp_dir();
+        let (receiver, _) = super::super::identity::init_identity_at(&dir).unwrap();
+        let outsider = admitted_sender();
+        let receiver_entry = AuthorizedNode {
+            node_fp: receiver.node_fp.clone(),
+            static_pubkey: encoding::encode_base64(&receiver.static_pubkey),
+            delivered_by: None,
+            format_major: REGISTRY_FORMAT_MAJOR,
+            format_minor: REGISTRY_FORMAT_MINOR,
+            optional_fields: BTreeMap::new(),
+            endpoint: None,
+            state: NodeState::Admitted,
+            version: 1,
+            by: receiver.node_fp.clone(),
+        };
+        save_registry_at(
+            &dir,
+            &Registry {
+                authorized_nodes: vec![receiver_entry.clone()],
+            },
+        )
+        .unwrap();
+        let mut tombstone = receiver_entry;
+        tombstone.state = NodeState::Revoked;
+        tombstone.version = 2;
+        let forged_notice = RegistryUpdate {
+            sender_fp: outsider.node_fp.clone(),
+            entries: vec![tombstone],
+        };
+
+        assert!(apply_update_at(&dir, &forged_notice, &public_key(&outsider)).is_err());
+        assert!(!dir.join("revoked_notice.json").exists());
+        assert_eq!(
+            load_registry_at(&dir)
+                .unwrap()
+                .authorized_nodes
+                .iter()
+                .find(|entry| entry.node_fp == receiver.node_fp)
+                .unwrap()
+                .state,
+            NodeState::Admitted
+        );
+    }
+
+    #[test]
     fn probe_owner_endpoint_update_is_not_shadowed_by_relay() {
         let sender = admitted_sender();
         let mut owner = entry("endpoint-owner", NodeState::Admitted, 1, "origin");
