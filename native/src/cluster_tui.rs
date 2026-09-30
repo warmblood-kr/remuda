@@ -829,7 +829,10 @@ impl ClusterUi {
                         }
                         text = stripped;
                     }
-                    let bytes = crate::tui::paste_input(&text, true);
+                    let bracketed_paste = self
+                        .remote_session(&target)
+                        .is_some_and(|(_, session)| session.bracketed_paste);
+                    let bytes = crate::tui::paste_input(&text, bracketed_paste);
                     self.enqueue_remote_key_bytes(&target, bytes, now);
                 }
                 false
@@ -2172,6 +2175,7 @@ mod tests {
                     instance_id: "remote-instance".into(),
                     alive: true,
                     output_version: Some(7),
+                    bracketed_paste: false,
                     screen,
                     last_error: None,
                 }],
@@ -2208,12 +2212,18 @@ mod tests {
     }
 
     fn selected_remote_ui(clock: &ManualClock, screen: ScreenSnapshot) -> ClusterUi {
+        selected_remote_ui_with_bracketed_paste(clock, screen, true)
+    }
+
+    fn selected_remote_ui_with_bracketed_paste(
+        clock: &ManualClock,
+        screen: ScreenSnapshot,
+        bracketed_paste: bool,
+    ) -> ClusterUi {
+        let mut snapshot = remote_snapshot(RemoteState::Reachable, Duration::ZERO, Some(screen));
+        snapshot.nodes[0].sessions[0].bracketed_paste = bracketed_paste;
         let mut ui = ClusterUi::new("studio", sessions(), clock.now());
-        ui.remote_synced(&FakeRemoteSource(Mutex::new(remote_snapshot(
-            RemoteState::Reachable,
-            Duration::ZERO,
-            Some(screen),
-        ))));
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
         ui.remote_input_enabled = true;
         ui.select_target(Some("fp-laptop/build")).unwrap();
         ui
@@ -2428,7 +2438,8 @@ mod tests {
         use crossterm::event::{Event, KeyCode, KeyModifiers};
 
         let clock = ManualClock::new();
-        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let mut ui =
+            selected_remote_ui_with_bracketed_paste(&clock, remote_screen("remote"), false);
         let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
         key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
         ui.handle_event(Event::Paste("approval text".into()), clock.now());
@@ -2449,11 +2460,11 @@ mod tests {
     }
 
     #[test]
-    fn bracketed_paste_in_remote_keys_mode_is_forwarded_with_its_markers() {
+    fn bracketed_paste_in_remote_keys_mode_gets_exactly_one_marker_pair() {
         use crossterm::event::{Event, KeyCode, KeyModifiers};
 
         let clock = ManualClock::new();
-        let mut ui = selected_remote_ui(&clock, remote_screen("remote"));
+        let mut ui = selected_remote_ui_with_bracketed_paste(&clock, remote_screen("remote"), true);
         let transport = FakeRemoteInput::new(Response::Ack { duplicate: false });
         key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
         ui.handle_event(Event::Paste("approval text".into()), clock.now());

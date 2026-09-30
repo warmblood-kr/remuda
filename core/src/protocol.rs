@@ -414,6 +414,10 @@ pub struct StyledRun {
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct StyledScreen {
     pub rows: Vec<Vec<StyledRun>>,
+    /// Whether the child currently expects pasted text in terminal mode 2004.
+    /// Missing values from older peers mean the mode is disabled.
+    #[serde(default)]
+    pub bracketed_paste: bool,
     #[serde(default)]
     pub wrapped: Vec<bool>,
     #[serde(default)]

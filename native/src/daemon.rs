@@ -1950,6 +1950,7 @@ fn handle_sync(
             output_version: versioned.output_version.unwrap_or(0),
             snapshot: StyledScreen {
                 rows,
+                bracketed_paste: session.mouse_state().bracketed_paste,
                 wrapped: versioned.snapshot.wrapped,
                 scrollback_len: versioned.snapshot.scrollback_len,
                 scrollback_total: versioned.snapshot.scrollback_total,

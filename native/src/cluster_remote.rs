@@ -31,6 +31,7 @@ pub struct RemoteSessionSnapshot {
     pub instance_id: String,
     pub alive: bool,
     pub output_version: Option<u64>,
+    pub bracketed_paste: bool,
     pub screen: Option<ScreenSnapshot>,
     pub last_error: Option<String>,
 }
@@ -460,6 +461,7 @@ impl ClusterRemoteTransport {
                 instance_id,
                 alive: true,
                 output_version: Some(output_version),
+                bracketed_paste: snapshot.bracketed_paste,
                 screen: Some(to_screen_snapshot(snapshot)),
                 last_error: None,
             })),
@@ -471,23 +473,37 @@ impl ClusterRemoteTransport {
                 scrollback_len,
                 scrollback_total,
                 cursor,
-            } => Ok(instance_id
-                .or(listed_instance_id)
-                .map(|instance_id| RemoteSessionSnapshot {
+            } => Ok(instance_id.or(listed_instance_id).map(|instance_id| {
+                let bracketed_paste = match self.request(
+                    target,
+                    &Request::Sync {
+                        name: session.name.clone(),
+                        instance_id: Some(instance_id.clone()),
+                        since: output_version.unwrap_or_default(),
+                        timeout_ms: 0,
+                    },
+                ) {
+                    Ok(Response::Sync { snapshot, .. }) => snapshot.bracketed_paste,
+                    _ => false,
+                };
+                RemoteSessionSnapshot {
                     name: display_name(&session.name),
                     wire_name: session.name,
                     instance_id,
                     alive: true,
                     output_version,
+                    bracketed_paste,
                     screen: Some(to_screen_snapshot(remuda_core::protocol::StyledScreen {
                         rows,
+                        bracketed_paste,
                         wrapped,
                         scrollback_len,
                         scrollback_total,
                         cursor,
                     })),
                     last_error: None,
-                })),
+                }
+            })),
             Response::WrongInstance => Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "remote session instance changed during poll",
@@ -576,6 +592,7 @@ fn unpolled_session_snapshot(
         instance_id,
         alive: session.alive,
         output_version: session.output_version,
+        bracketed_paste: prior.is_some_and(|old| old.bracketed_paste),
         screen: prior.and_then(|old| old.screen.clone()),
         last_error: prior.and_then(|old| old.last_error.clone()),
     })
@@ -943,6 +960,7 @@ mod tests {
             instance_id: "instance-1".into(),
             alive: true,
             output_version: Some(4),
+            bracketed_paste: false,
             screen: Some(screen(text)),
             last_error: None,
         }
@@ -966,6 +984,7 @@ mod tests {
                 wide: false,
             }]],
             wrapped: vec![false],
+            bracketed_paste: false,
             scrollback_len: 0,
             scrollback_total: 0,
             cursor: Cursor {
@@ -979,6 +998,15 @@ mod tests {
             .map(|cell| cell.text.as_str())
             .collect();
         assert_eq!(text, "]52;c;aGk=safe31m");
+    }
+
+    #[test]
+    fn older_screen_snapshot_defaults_bracketed_paste_to_disabled() {
+        let snapshot: remuda_core::protocol::StyledScreen =
+            serde_json::from_str(r#"{"rows":[],"cursor":{"row":0,"col":0,"visible":true}}"#)
+                .unwrap();
+
+        assert!(!snapshot.bracketed_paste);
     }
 
     #[test]
