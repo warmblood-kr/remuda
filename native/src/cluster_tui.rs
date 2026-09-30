@@ -66,6 +66,17 @@ pub fn render_badge(badge: Badge) -> &'static str {
     }
 }
 
+pub fn cluster_tree_has_sessions(
+    local_sessions: &[SessionSummary],
+    remote_snapshot: &RemoteSnapshot,
+) -> bool {
+    !local_sessions.is_empty()
+        || remote_snapshot
+            .nodes
+            .iter()
+            .any(|node| !node.sessions.is_empty())
+}
+
 pub struct ClusterUi {
     node: String,
     sessions: Vec<SessionSummary>,
@@ -583,6 +594,12 @@ impl ClusterUi {
                 } else {
                     "    no matching sessions".into()
                 });
+                if !cluster_tree_has_sessions(&self.sessions, &self.remote_snapshot) {
+                    frame.push(
+                        "    No sessions yet. Start one on any machine: remuda run -n NAME COMMAND"
+                            .into(),
+                    );
+                }
             }
         }
         self.append_remote_tree(&mut frame);
@@ -2384,6 +2401,39 @@ mod tests {
         assert!(frame.contains("no sessions need attention"));
         assert!(frame.contains("local · reachable"));
         assert!(frame.contains("attention: on"));
+    }
+
+    #[test]
+    fn empty_cluster_tree_shows_start_hint_only_when_all_nodes_have_no_sessions() {
+        let clock = ManualClock::new();
+        let mut empty_ui = ClusterUi::new("studio", vec![], clock.now());
+        let empty_remote = FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Unreachable,
+            Duration::from_secs(12),
+            None,
+        )));
+        empty_remote.0.lock().unwrap().nodes[0].sessions.clear();
+        empty_ui.remote_synced(&empty_remote);
+
+        let frame = empty_ui.render(100, 24, "", &clock);
+
+        assert!(
+            frame.contains("No sessions yet. Start one on any machine: remuda run -n NAME COMMAND")
+        );
+
+        let mut stale_ui = ClusterUi::new("studio", vec![], clock.now());
+        let stale_remote = FakeRemoteSource(Mutex::new(remote_snapshot(
+            RemoteState::Unreachable,
+            Duration::from_secs(12),
+            None,
+        )));
+        stale_ui.remote_synced(&stale_remote);
+        stale_ui.remote_expanded.insert("fp-laptop".into());
+
+        let frame = stale_ui.render(100, 24, "", &clock);
+
+        assert!(frame.contains("build"));
+        assert!(!frame.contains("No sessions yet."));
     }
 
     #[test]
