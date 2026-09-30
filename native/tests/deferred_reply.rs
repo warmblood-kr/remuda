@@ -135,6 +135,20 @@ remuda.extension_command("deferred", function(args)
       end
     end }
     return reply
+  elseif args[1] == "line" or args[1] == "line_session" then
+    local reply = remuda.pending { timeout = 5 }
+    local label = "wizard label"
+    local default = "de" .. string.char(27) .. "fa" .. string.char(226, 128, 174) .. "ult"
+    reply:prompt_line { label = label, default = default, callback = function(line, err)
+      if err then reply:reject(err) else reply:resolve(0, "line: " .. line, "") end
+    end }
+    return reply
+  elseif args[1] == "line_answers" then
+    local reply = remuda.pending { timeout = 5 }
+    reply:prompt_line { label = "owner ID", default = "owner", callback = function(line, err)
+      if err then reply:reject(err) else reply:resolve(0, line, "") end
+    end }
+    return reply
   elseif args[1] == "shutdown_wait" then
     local path = args[2]
     return remuda.pending { timeout = 30, on_cancel = function(reason)
@@ -1061,6 +1075,189 @@ fn secret_prompt_label_caps_caller_text_at_256_chars() {
     let caller_label = label.strip_prefix("remuda[outside] ").expect("outside tag");
     assert_eq!(caller_label.chars().count(), 256);
     assert!(caller_label.chars().all(|ch| ch == 'x'));
+}
+
+#[test]
+fn prompt_line_from_a_non_tty_reports_not_a_terminal() {
+    let (dir, remuda) = fixture("line_non_tty");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let output = remuda(&["deferred", "line"]);
+    let _ = remuda(&["stop", "-f"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(stderr.contains("not_a_terminal"), "{stderr}");
+}
+
+#[test]
+fn prompt_line_value_round_trips_over_the_daemon_socket() {
+    use remuda_core::protocol::{Request, Response};
+    use remuda_native::ipc::TryClone;
+    use std::io::{BufRead, BufReader, Write};
+
+    let (dir, remuda) = fixture("line_answers");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+
+    let answer_over_socket = |line: &str| {
+        let mut stream = remuda_native::ipc::connect(&socket).expect("private daemon socket");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone private socket"));
+        let request = Request::Eval {
+            code: "return remuda._dispatch_extension_command('deferred', {'line_answers'}, {})"
+                .into(),
+            name: None,
+        };
+        let mut request_frame = serde_json::to_vec(&request).unwrap();
+        request_frame.push(b'\n');
+        stream.write_all(&request_frame).unwrap();
+
+        let mut prompt_frame = Vec::new();
+        reader.read_until(b'\n', &mut prompt_frame).unwrap();
+        let prompt: serde_json::Value = serde_json::from_slice(&prompt_frame).unwrap();
+        let prompt_line = prompt.get("PromptLine").expect("PromptLine response");
+        assert_eq!(prompt_line["label"], "owner ID");
+        assert_eq!(prompt_line["default"], "owner");
+        let id = prompt_line["id"].as_u64().expect("prompt id");
+        let answer = serde_json::json!({
+            "LineAnswer": { "id": id, "line": line, "refusal": null }
+        });
+        let mut answer_frame = serde_json::to_vec(&answer).unwrap();
+        answer_frame.push(b'\n');
+        stream.write_all(&answer_frame).unwrap();
+
+        let mut reply_frame = Vec::new();
+        reader.read_until(b'\n', &mut reply_frame).unwrap();
+        let reply: Response = serde_json::from_slice(&reply_frame).unwrap();
+        match reply {
+            Response::CommandResult {
+                exit_code,
+                stdout_base64,
+                stderr_base64,
+            } => {
+                assert_eq!(exit_code, 0);
+                assert!(stderr_base64.is_empty());
+                remuda_native::cluster::encoding::decode_base64(&stdout_base64).unwrap()
+            }
+            response => panic!("expected successful line callback, got {response:?}"),
+        }
+    };
+
+    assert_eq!(
+        answer_over_socket("https://homeserver.example"),
+        b"https://homeserver.example"
+    );
+
+    let stop = remuda(&["stop", "-f"]);
+    let _ = fs::remove_dir_all(&dir);
+    assert!(stop.status.success(), "{stop:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn session_prompt_line_shows_tagged_label_and_sanitized_default() {
+    use remuda_core::protocol::{Request, Response, Step};
+    use remuda_core::Size;
+    use remuda_native::{client, daemon};
+    use std::time::{Duration, Instant};
+
+    let (dir, remuda) = fixture("line_session_label");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let socket = daemon::socket_path_in(&dir, "s");
+    let session_name = "prompt-line-session";
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let command = format!("sleep 0.2; \"{binary}\" -s s deferred line_session; sleep 30");
+    assert_eq!(
+        client::request(
+            &socket,
+            &Request::New {
+                name: Some(session_name.into()),
+                command: vec!["sh".into(), "-c".into(), command],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            },
+        )
+        .expect("start prompt-line session"),
+        Response::Value(session_name.into())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let prompt_screen = loop {
+        let screen = match client::request(
+            &socket,
+            &Request::Capture {
+                name: session_name.into(),
+            },
+        ) {
+            Ok(Response::Screen(screen)) => screen,
+            other => panic!("capture failed: {other:?}"),
+        };
+        if screen.contains("wizard label") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "prompt-line prompt did not appear:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    client::request(
+        &socket,
+        &Request::Feed {
+            name: session_name.into(),
+            steps: vec![Step::Burst(vec![b'\r'])],
+        },
+    )
+    .expect("submit empty line answer");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let reply_screen = loop {
+        let screen = match client::request(
+            &socket,
+            &Request::Capture {
+                name: session_name.into(),
+            },
+        ) {
+            Ok(Response::Screen(screen)) => screen,
+            other => panic!("capture failed: {other:?}"),
+        };
+        if screen.contains("line: default") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "prompt-line default reply did not finish:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let _ = remuda(&["stop", "-f"]);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(
+        prompt_screen.contains("remuda[prompt-line-session] wizard label [default]: "),
+        "session label/default was not tagged or sanitized:\n{prompt_screen}"
+    );
+    assert!(
+        !prompt_screen.contains('\x1b') && !prompt_screen.contains('\u{202e}'),
+        "control or bidi override remained in the prompt:\n{prompt_screen}"
+    );
+    assert!(reply_screen.contains("line: default"), "{reply_screen}");
 }
 
 fn assert_no_secret_in_files(root: &std::path::Path, secret: &[u8]) {
