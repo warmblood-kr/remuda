@@ -2456,7 +2456,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn socket_admits_unknown_join_once_and_passes_optional_endpoint() {
+    fn valid_token_admits_once_and_passes_optional_endpoint() {
         let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
             .generate_keypair()
             .unwrap();
@@ -2651,6 +2651,108 @@ mod tests {
             initial_inode,
             "bad tokens must not replace token state"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_join_token_does_not_wait_for_identity_lock() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let server = SocketTestServer::start_production(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Err(permission_denied())),
+            Arc::new(|_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap())),
+        );
+        let token_path = server.state_dir.join("join_tokens.json");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !token_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(token_path.exists(), "listener startup observes token state");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(server.state_dir.join("identity.lock"))
+            .unwrap();
+        let lock_deadline = Instant::now() + Duration::from_secs(1);
+        let mut locked = false;
+        while Instant::now() < lock_deadline {
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                locked = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(locked, "could not acquire test identity.lock");
+
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "join": { "token": crate::cluster::encoding::encode_base64(&[9; 32]) }
+        }))
+        .unwrap();
+        let sealed = sealed_payload_request(&peer, &server, &payload);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || sender.send(server.exchange(sealed)).unwrap());
+        let early_response = receiver.recv_timeout(Duration::from_millis(250));
+        let was_prompt = early_response.is_ok();
+        let unlock_result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) };
+        assert_eq!(unlock_result, 0);
+        drop(lock);
+        let response = match early_response {
+            Ok(response) => response,
+            Err(_) => receiver.recv_timeout(Duration::from_secs(2)).unwrap(),
+        };
+        assert!(
+            was_prompt,
+            "unknown join token waited for identity.lock"
+        );
+        assert_eq!(response, (200, b"{\"joined\":false}".to_vec()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_accepts_token_minted_by_another_store_immediately() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let server = SocketTestServer::start_with_admitter(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Err(permission_denied())),
+            Arc::new(|_, _| panic!("Join must not reach daemon dispatch")),
+            ConnectionLimits {
+                outer_hold: socket_test_timeout(),
+                post_dispatch_hold: socket_test_timeout(),
+                idle_read: socket_test_timeout(),
+                total_read: socket_test_timeout(),
+            },
+            Arc::new(|_, _| Ok(())),
+        );
+        let cli_store = JoinTokenStore::open_at(
+            &server.state_dir,
+            Arc::new(crate::SystemWallClock::new()),
+        )
+        .unwrap();
+        let minted = cli_store.mint().unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "join": { "token": minted.token.as_str() }
+        }))
+        .unwrap();
+        let sealed = sealed_payload_request(&peer, &server, &payload);
+        assert_eq!(server.exchange(sealed), (200, b"{\"joined\":true}".to_vec()));
     }
 
     #[cfg(unix)]
