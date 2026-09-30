@@ -913,6 +913,23 @@ fn explicit_listener_address(scratch: &Scratch) -> SocketAddr {
 }
 
 #[test]
+fn d4_invite_without_flags_uses_the_daemon_bound_address() {
+    use remuda_native::cluster::join_line::JoinLine;
+
+    let scratch = Scratch::new();
+    let _daemon = initialized_node(&scratch);
+    let bound = explicit_listener_address(&scratch);
+    let invite = scratch.run(&["cluster", "invite"]);
+    assert!(
+        invite.status.success(),
+        "invite failed: {}",
+        String::from_utf8_lossy(&invite.stderr)
+    );
+    let line = JoinLine::decode(&invitation_join_line(&invite)).expect("decode invite line");
+    assert_eq!(line.issuer_addr, bound);
+}
+
+#[test]
 fn d4_invite_addr_overrides_only_the_advertised_address() {
     use remuda_native::cluster::join_line::JoinLine;
 
@@ -1037,6 +1054,68 @@ fn explicit_join_sends_the_joiners_advertised_address_to_the_issuer_registry() {
 }
 
 #[test]
+fn d4_join_sends_the_joiners_bound_address_to_the_issuer_registry() {
+    use remuda_native::cluster::{encoding, Registry};
+
+    let inviter = Scratch::new();
+    let _inviter_daemon = initialized_node(&inviter);
+    let issuer_addr = explicit_listener_address(&inviter);
+    let issuer_addr_text = issuer_addr.to_string();
+    let invite = inviter.run(&["cluster", "invite", "--bind", &issuer_addr_text]);
+    assert!(invite.status.success(), "invite failed: {invite:?}");
+    let (fingerprint, join_line) = invitation_command_args(&invite);
+
+    let joiner = Scratch::new();
+    let _joiner_daemon = initialized_node(&joiner);
+    let joined = joiner.run(&[
+        "cluster",
+        "join",
+        &fingerprint,
+        &join_line,
+        "--bind",
+        "127.0.0.1:0",
+    ]);
+    assert!(
+        joined.status.success(),
+        "join failed: {}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
+    let joiner_addr = match remuda_native::cluster::listener_control::status(
+        &remuda_native::daemon::socket_path_in(&joiner.runtime, &joiner.name),
+    ) {
+        remuda_core::protocol::ListenerStatus::On {
+            addr,
+            auto: false,
+            advertise_addr: Some(advertise_addr),
+            ..
+        } => {
+            assert_eq!(
+                advertise_addr, addr,
+                "explicit bind must be advertised as-is"
+            );
+            addr
+        }
+        status => panic!("join did not enable B's listener: {status:?}"),
+    };
+
+    let registry_path = inviter
+        .root
+        .join("state/remuda/cluster/authorized_nodes.json");
+    let registry: Registry = serde_json::from_slice(&fs::read(registry_path).unwrap()).unwrap();
+    let joiner_key = fs::read(joiner.root.join("state/remuda/cluster/identity.key")).unwrap();
+    let joiner_fingerprint = encoding::fingerprint(&joiner_key[32..]);
+    let entry = registry
+        .authorized_nodes
+        .iter()
+        .find(|entry| entry.node_fp == joiner_fingerprint)
+        .expect("joiner entry in issuer registry");
+    assert_eq!(
+        entry.endpoint.as_deref(),
+        Some(joiner_addr.to_string().as_str())
+    );
+}
+
+#[test]
 fn d4_explicit_listener_prints_the_listener_address_and_exposure_note() {
     let scratch = Scratch::new();
     let _daemon = start_daemon(&scratch);
@@ -1110,6 +1189,8 @@ fn cluster_listen_bind_configures_the_daemon_and_returns() {
         ListenerStatus::On {
             addr: bind_addr,
             auto: false,
+            advertise_addr: Some(bind_addr),
+            listen_addrs: vec![bind_addr],
         }
     );
     assert_eq!(
@@ -1199,6 +1280,8 @@ fn listen_public_opt_in_persists_but_off_and_plain_bind_clear_it() {
         ListenerStatus::On {
             addr: first_addr,
             auto: false,
+            advertise_addr: Some(first_addr),
+            listen_addrs: vec![first_addr],
         },
         "the explicitly enabled listener should reload on daemon restart"
     );
