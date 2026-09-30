@@ -232,7 +232,7 @@ impl PendingReplies {
         &self,
         id: u64,
         mut client_disconnected: impl FnMut() -> bool,
-        mut prompt_client: impl FnMut(SecretPrompt) -> Result<Option<SecretBytes>, String>,
+        mut prompt_client: impl FnMut(SecretPrompt, Duration) -> Result<Option<SecretBytes>, String>,
     ) -> Result<WaitResult, String> {
         let entry = self
             .0
@@ -296,7 +296,14 @@ impl PendingReplies {
                 break (Err("client disconnected".into()), None);
             }
             if let Ok(prompt) = prompt_rx.try_recv() {
-                let answer = prompt_client(prompt.clone());
+                let prompt_timeout = deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(SECRET_PROMPT_TIMEOUT);
+                let answer = if prompt_timeout.is_zero() {
+                    Err("cancelled".into())
+                } else {
+                    prompt_client(prompt.clone(), prompt_timeout)
+                };
                 entry.prompt_outstanding.store(0, Ordering::SeqCst);
                 self.0
                     .secret_events
@@ -560,7 +567,7 @@ mod tests {
         let waiter = pending.clone();
         let (done_tx, done_rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
-            let result = waiter.wait(id, || false, |_| Ok(None)).unwrap();
+            let result = waiter.wait(id, || false, |_, _| Ok(None)).unwrap();
             done_tx.send(result.completion).unwrap();
         });
 
@@ -578,9 +585,9 @@ mod tests {
     }
 
     #[test]
-    fn pending_handle_completes_once_and_allows_only_one_prompt_at_a_time() {
+    fn pending_timeout_caps_prompt_wait_and_handle_completes_once() {
         let pending = PendingReplies::default();
-        let (id, handle) = pending.create(Duration::from_millis(20)).unwrap();
+        let (id, handle) = pending.create(Duration::from_millis(200)).unwrap();
         let prompt_id = handle.prompt_secret("Password".into()).unwrap();
         assert!(handle.prompt_secret("Second".into()).is_err());
         let waiter = pending.clone();
@@ -588,9 +595,11 @@ mod tests {
             .wait(
                 id,
                 || false,
-                |prompt| {
+                |prompt, timeout| {
                     assert_eq!(prompt.id, prompt_id);
                     assert_eq!(prompt.label, "Password");
+                    assert!(timeout <= Duration::from_millis(200));
+                    assert!(timeout < SECRET_PROMPT_TIMEOUT);
                     Ok(Some(SecretBytes::new(b"probe".to_vec())))
                 },
             )
@@ -619,7 +628,10 @@ mod tests {
             .complete(Completion::Failure("twice".into()))
             .is_err());
         assert!(matches!(
-            pending.wait(id, || false, |_| Ok(None)).unwrap().completion,
+            pending
+                .wait(id, || false, |_, _| Ok(None))
+                .unwrap()
+                .completion,
             Ok(Completion::Failure(message)) if message == "done"
         ));
     }
