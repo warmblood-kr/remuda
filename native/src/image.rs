@@ -867,6 +867,7 @@ fn deliver_peer_certificate(
     match result {
         Ok(peer) => {
             value.set("sha256", peer.sha256)?;
+            value.set("spki_sha256", peer.spki_sha256)?;
             value.set("not_before", peer.not_before)?;
             value.set("not_after", peer.not_after)?;
             value.set("trusted", peer.trusted)?;
@@ -908,6 +909,7 @@ fn deliver_http(
             if let Some(peer) = response.peer_certificate {
                 let certificate = lua.create_table()?;
                 certificate.set("sha256", peer.sha256)?;
+                certificate.set("spki_sha256", peer.spki_sha256)?;
                 certificate.set("not_before", peer.not_before)?;
                 certificate.set("not_after", peer.not_after)?;
                 certificate.set("trusted", peer.trusted)?;

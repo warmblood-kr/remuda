@@ -165,6 +165,7 @@ pub struct HttpResponse {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PeerCertificate {
     pub sha256: String,
+    pub spki_sha256: String,
     pub not_before: String,
     pub not_after: String,
     pub trusted: bool,
@@ -986,8 +987,11 @@ fn peer_certificate_from_der(
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
+    let spki_sha256 = base64::engine::general_purpose::STANDARD
+        .encode(Sha256::digest(certificate_spki(cert.as_ref())?));
     Ok(PeerCertificate {
         sha256,
+        spki_sha256,
         not_before: format_utc(not_before),
         not_after: format_utc(not_after),
         trusted,
@@ -1780,7 +1784,7 @@ mod tests {
             std::sync::Arc::new(remuda_core::Registry::new()),
             std::sync::Arc::new(crate::tick::Counters::default()),
         );
-        let code = format!("remuda.http.peer_certificate{{url='{url}', timeout=2, callback=function(r) remuda._peer_done=true; remuda._peer_trusted=r.trusted; remuda._peer_sha=r.sha256; remuda._peer_reason=r.reason end}}; return 'started'");
+        let code = format!("remuda.http.peer_certificate{{url='{url}', timeout=2, callback=function(r) remuda._peer_done=true; remuda._peer_trusted=r.trusted; remuda._peer_sha=r.sha256; remuda._peer_spki_sha256=r.spki_sha256; remuda._peer_reason=r.reason end}}; return 'started'");
         assert_eq!(image.eval(&code, None).unwrap(), "started");
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
@@ -1802,6 +1806,10 @@ mod tests {
             "false"
         );
         assert_eq!(image.eval("return #remuda._peer_sha", None).unwrap(), "64");
+        assert_eq!(
+            image.eval("return remuda._peer_spki_sha256", None).unwrap(),
+            test_pin().strip_prefix("sha256/").unwrap()
+        );
         let reason = image.eval("return remuda._peer_reason", None).unwrap();
         assert!(!reason.is_empty() && reason != "nil");
         assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
@@ -1827,6 +1835,10 @@ mod tests {
         let leaf = super::parse_pem_certs(include_str!("testdata/test-leaf.pem")).unwrap();
         assert!(peer.trusted);
         assert_eq!(
+            peer.spki_sha256,
+            test_pin().strip_prefix("sha256/").unwrap()
+        );
+        assert_eq!(
             peer.sha256,
             format!("{:x}", Sha256::digest(leaf[0].as_ref()))
         );
@@ -1839,10 +1851,31 @@ mod tests {
         assert!(!peer.trusted);
         assert!(peer.reason.is_some());
         assert_eq!(
+            peer.spki_sha256,
+            test_pin().strip_prefix("sha256/").unwrap()
+        );
+        assert_eq!(
             peer.sha256,
             format!("{:x}", Sha256::digest(leaf[0].as_ref()))
         );
         assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
+    fn peer_certificate_spki_sha256_is_accepted_as_request_pin() {
+        let ca_file = concat!(env!("CARGO_MANIFEST_DIR"), "/src/net/testdata/test-ca.pem");
+        let (url, seen) = tls_stub();
+        let mut req = request(url);
+        req.ca_file = Some(ca_file.into());
+        let peer = super::peer_certificate(&req, None).unwrap();
+        assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+
+        let (url, seen) = tls_stub();
+        let mut req = request(url);
+        req.ca_file = Some(ca_file.into());
+        req.pin = Some(format!("sha256/{}", peer.spki_sha256));
+        assert_eq!(perform(req, None).unwrap().status, 200);
+        assert!(seen.recv_timeout(Duration::from_secs(1)).unwrap());
     }
 
     #[test]
@@ -1878,6 +1911,10 @@ mod tests {
             .peer_certificate
             .expect("validated HTTPS peer metadata");
         assert!(peer.trusted);
+        assert_eq!(
+            peer.spki_sha256,
+            test_pin().strip_prefix("sha256/").unwrap()
+        );
         assert_eq!(peer.sha256.len(), 64);
         assert!(!peer.not_before.is_empty());
         assert!(!peer.not_after.is_empty());
