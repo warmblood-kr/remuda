@@ -99,11 +99,15 @@ remuda.extension_command("deferred", function(args)
       reply:resolve(0, string.rep("x", 16 * 1024 * 1024), "")
     end }
     return reply
-  elseif args[1] == "secret" or args[1] == "secret_session" then
+  elseif args[1] == "secret" or args[1] == "secret_session" or args[1] == "secret_unicode" or args[1] == "secret_long" then
     local reply = remuda.pending { timeout = 5 }
     local label = "deferred test secret"
     if args[1] == "secret_session" then
       label = "deferred " .. string.char(27) .. "test secret"
+    elseif args[1] == "secret_unicode" then
+      label = "before" .. string.char(226, 128, 139, 226, 128, 174, 226, 128, 168, 226, 128, 169) .. "after"
+    elseif args[1] == "secret_long" then
+      label = string.rep("x", 300)
     end
     reply:prompt_secret { label = label, callback = function(secret, err)
       if err then
@@ -505,8 +509,8 @@ fn secret_prompt_non_tty_fallback_and_answer_do_not_leak() {
     let prompt_id = match prompt {
         Response::PromptSecret { id, label, .. } => {
             assert_eq!(
-                label, "deferred test secret",
-                "outside caller gets no prefix"
+                label, "remuda[outside] deferred test secret",
+                "outside caller label must include its provenance tag"
             );
             id
         }
@@ -747,13 +751,67 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        prompt_screen.contains("secret-label-session: deferred test secret"),
-        "session prompt label omitted its caller name or retained ESC:\n{prompt_screen}"
+        prompt_screen.contains("remuda[secret-label-session] deferred test secret"),
+        "session prompt label omitted its provenance tag or retained ESC:\n{prompt_screen}"
     );
     assert!(
         !prompt_screen.contains('\x1b'),
         "ESC remained in the terminal screen:\n{prompt_screen}"
     );
+}
+
+fn secret_prompt_label_for_word(tag: &str, word: &str) -> String {
+    use remuda_core::protocol::{Request, Response};
+    use remuda_native::ipc::TryClone;
+    use std::io::{BufRead, BufReader, Write};
+
+    let (dir, remuda) = fixture(tag);
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+    let mut stream = remuda_native::ipc::connect(&socket).expect("private daemon socket");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone private socket"));
+    let request = Request::Eval {
+        code: format!("return remuda._dispatch_extension_command('deferred', {{'{word}'}}, {{}})"),
+        name: None,
+    };
+    let mut frame = serde_json::to_vec(&request).unwrap();
+    frame.push(b'\n');
+    stream.write_all(&frame).unwrap();
+    let mut prompt_frame = Vec::new();
+    reader.read_until(b'\n', &mut prompt_frame).unwrap();
+    let prompt: Response = serde_json::from_slice(&prompt_frame).unwrap();
+    let label = match prompt {
+        Response::PromptSecret { label, .. } => label,
+        response => panic!("expected secret prompt, got {response:?}"),
+    };
+    drop(reader);
+    drop(stream);
+    label
+}
+
+#[test]
+fn secret_prompt_label_strips_format_and_separator_characters() {
+    let label = secret_prompt_label_for_word("secret_label_unicode", "secret_unicode");
+    assert!(
+        !label
+            .chars()
+            .any(|ch| matches!(ch, '\u{200b}' | '\u{202e}' | '\u{2028}' | '\u{2029}')),
+        "format and line separator characters remained in label: {label:?}"
+    );
+    assert_eq!(label, "remuda[outside] beforeafter");
+}
+
+#[test]
+fn secret_prompt_label_caps_caller_text_at_256_chars() {
+    let label = secret_prompt_label_for_word("secret_label_long", "secret_long");
+    let caller_label = label.strip_prefix("remuda[outside] ").unwrap_or(&label);
+    assert_eq!(caller_label.chars().count(), 256);
+    assert!(caller_label.chars().all(|ch| ch == 'x'));
 }
 
 fn assert_no_secret_in_files(root: &std::path::Path, secret: &[u8]) {
