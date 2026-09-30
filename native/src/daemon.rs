@@ -268,6 +268,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     #[cfg(unix)]
     let listener = prepare_unix_listener(listener, path)?;
     let anti_entropy = Arc::new(AntiEntropyTask::start()?);
+    let listener_task = Arc::new(ListenerTask::start(path));
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
 
     let registry = Arc::new(Registry::new());
@@ -307,7 +308,11 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
             registry,
             image,
             counters,
-            (socket_owner, anti_entropy),
+            (
+                socket_owner,
+                anti_entropy,
+                Arc::clone(&listener_task.status),
+            ),
         );
     }
     #[cfg(windows)]
@@ -319,6 +324,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
             let counters = Arc::clone(&counters);
             let socket_owner = Arc::clone(&socket_owner);
             let anti_entropy = anti_entropy.clone();
+            let listener_status = Arc::clone(&listener_task.status);
             std::thread::spawn(move || {
                 let _ = handle(
                     stream,
@@ -327,9 +333,11 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
                     &counters,
                     socket_owner,
                     anti_entropy,
+                    listener_status,
                 );
             });
         }
+        listener_task.stop_and_join();
         anti_entropy.stop_and_join();
         socket_owner.cleanup();
         Ok(())
@@ -410,6 +418,182 @@ fn anti_entropy_interval() -> Duration {
         return Duration::from_millis(milliseconds);
     }
     Duration::from_secs(60 + u64::from(std::process::id() % 11))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ListenerStatus {
+    Off,
+    On {
+        addr: std::net::SocketAddr,
+        auto: bool,
+    },
+    Failed(String),
+}
+
+const LISTENER_HOST_LOCK_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+pub struct ListenerTask {
+    status: Arc<Mutex<ListenerStatus>>,
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl ListenerTask {
+    pub fn start(daemon_path: &Path) -> Self {
+        Self::start_with_retry_interval(daemon_path, LISTENER_HOST_LOCK_RETRY_INTERVAL)
+    }
+
+    fn start_with_retry_interval(daemon_path: &Path, retry_interval: Duration) -> Self {
+        let status = Arc::new(Mutex::new(ListenerStatus::Off));
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let status_for_thread = Arc::clone(&status);
+        let daemon_path = daemon_path.to_path_buf();
+        let thread = std::thread::Builder::new()
+            .name("remuda-cluster-listener".into())
+            .spawn(move || {
+                let result =
+                    start_listener(&daemon_path, &status_for_thread, stopped, retry_interval);
+                if let Err(reason) = result {
+                    set_listener_status(&status_for_thread, ListenerStatus::Failed(reason));
+                }
+            });
+        let thread = match thread {
+            Ok(thread) => Some(thread),
+            Err(error) => {
+                set_listener_status(
+                    &status,
+                    ListenerStatus::Failed(format!("spawn cluster listener task: {error}")),
+                );
+                None
+            }
+        };
+        Self {
+            status,
+            stop,
+            thread: Mutex::new(thread),
+        }
+    }
+
+    pub fn status(&self) -> ListenerStatus {
+        listener_status(&self.status)
+    }
+
+    fn stop_and_join(&self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for ListenerTask {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+/// Read the listener's current daemon-owned status word.
+pub fn listener_status(status: &Arc<Mutex<ListenerStatus>>) -> ListenerStatus {
+    status
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+fn set_listener_status(status: &Arc<Mutex<ListenerStatus>>, value: ListenerStatus) {
+    *status.lock().unwrap_or_else(|error| error.into_inner()) = value;
+}
+
+fn start_listener(
+    daemon_path: &Path,
+    status: &Arc<Mutex<ListenerStatus>>,
+    stopped: std::sync::mpsc::Receiver<()>,
+    retry_interval: Duration,
+) -> Result<(), String> {
+    use crate::cluster::listener_config::ListenerBind;
+
+    let config = match crate::cluster::listener_config::read() {
+        Ok(Some(config)) if config.enabled => config,
+        Ok(_) => return Ok(()),
+        Err(error) => return Err(format!("read listener config: {error}")),
+    };
+    let (address, auto) = match config.bind {
+        ListenerBind::Auto => (
+            crate::net::advertise_addr::auto_bind().map_err(|error| error.to_string())?,
+            true,
+        ),
+        ListenerBind::Explicit(address) => (address, false),
+    };
+    crate::net::listener::validate_bind_address(address, config.allow_public)
+        .map_err(|error| format!("validate cluster listener bind: {error}"))?;
+
+    loop {
+        let host_lock = match crate::cluster::try_acquire_listener_host_lock() {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                set_listener_status(
+                    status,
+                    ListenerStatus::Failed("hosted by another daemon".into()),
+                );
+                match stopped.recv_timeout(retry_interval) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                }
+            }
+            Err(error) => return Err(format!("lock cluster listener: {error}")),
+        };
+        let listener = crate::net::listener::bind(
+            crate::net::listener::ListenerConfig {
+                bind_addr: address,
+                allow_unspecified: config.allow_public,
+            },
+            daemon_path,
+        )
+        .map_err(|error| format!("bind cluster listener: {error}"))?;
+        let address = listener
+            .local_addr()
+            .map_err(|error| format!("read cluster listener address: {error}"))?;
+        set_listener_status(
+            status,
+            ListenerStatus::On {
+                addr: address,
+                auto,
+            },
+        );
+
+        let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serve_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        return std::thread::scope(|scope| {
+            let watcher_flag = Arc::clone(&stop_flag);
+            let watcher_done = Arc::clone(&serve_done);
+            let watcher = scope.spawn(move || loop {
+                match stopped.recv_timeout(Duration::from_millis(25)) {
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        watcher_flag.store(true, Ordering::Release);
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        if watcher_done.load(Ordering::Acquire) =>
+                    {
+                        break;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+            });
+            let result = listener
+                .serve_until(&stop_flag)
+                .map_err(|error| format!("serve cluster listener: {error}"));
+            serve_done.store(true, Ordering::Release);
+            let _ = watcher.join();
+            drop(host_lock);
+            result
+        });
+    }
 }
 
 /// Serialize stale-socket removal and bind for one daemon name. The lock file
@@ -880,12 +1064,16 @@ fn serve_unix(
     registry: Arc<Registry>,
     image: Image,
     counters: Arc<crate::tick::Counters>,
-    lifecycle: (Arc<SocketOwnership>, Arc<AntiEntropyTask>),
+    lifecycle: (
+        Arc<SocketOwnership>,
+        Arc<AntiEntropyTask>,
+        Arc<Mutex<ListenerStatus>>,
+    ),
 ) -> ! {
     use std::io::Read as _;
     use std::os::fd::AsRawFd;
 
-    let (socket_owner, anti_entropy) = lifecycle;
+    let (socket_owner, anti_entropy, listener_status) = lifecycle;
     let detached = unsafe { libc::getsid(0) == libc::getpid() };
     let mut signal_bytes = [0u8; 1];
     'poll_loop: loop {
@@ -959,6 +1147,7 @@ fn serve_unix(
                     let counters = Arc::clone(&counters);
                     let socket_owner = Arc::clone(&socket_owner);
                     let anti_entropy = Arc::clone(&anti_entropy);
+                    let listener_status = Arc::clone(&listener_status);
                     std::thread::spawn(move || {
                         let _ = handle(
                             stream,
@@ -967,6 +1156,7 @@ fn serve_unix(
                             &counters,
                             socket_owner,
                             anti_entropy,
+                            listener_status,
                         );
                     });
                 }
@@ -1120,6 +1310,7 @@ fn handle(
     counters: &crate::tick::Counters,
     socket_owner: Arc<SocketOwnership>,
     anti_entropy: Arc<AntiEntropyTask>,
+    listener_status: Arc<Mutex<ListenerStatus>>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let Some(request) = read_request(&stream, &mut reader)? else {
@@ -1134,11 +1325,12 @@ fn handle(
         image,
         socket_owner,
         anti_entropy,
+        listener_status,
         request,
     )
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn handle_request(
     stream: Stream,
     reader: BufReader<Stream>,
@@ -1146,6 +1338,7 @@ fn handle_request(
     image: &Image,
     socket_owner: Arc<SocketOwnership>,
     anti_entropy: Arc<AntiEntropyTask>,
+    _listener_status: Arc<Mutex<ListenerStatus>>,
     request: Request,
 ) -> std::io::Result<()> {
     match request {
@@ -2122,6 +2315,8 @@ mod tests {
         acquire_sync_permit, forward_attach_input, report_attach_input_failure, runtime_base_for,
         shell_or_default, SyncPermit, ATTACH_INPUT_FAILURE_NOTICE, MAX_CONCURRENT_SYNCS,
     };
+    #[cfg(not(windows))]
+    use super::{ListenerStatus, ListenerTask};
     use remuda_core::agent::{AgentError, Color, StyledCell};
     use remuda_core::protocol::collapse_runs;
     use remuda_core::protocol::Response;
@@ -2129,9 +2324,308 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::Mutex;
+    #[cfg(not(windows))]
+    use std::sync::MutexGuard;
     use std::time::Duration;
 
     static SYNC_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
+    static LISTENER_TASK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // D2 ListenerTask socket tests are skipped on Windows until identity storage #214 lands.
+    #[cfg(not(windows))]
+    struct ListenerTaskEnvironment {
+        _lock: MutexGuard<'static, ()>,
+        root: std::path::PathBuf,
+        old_home: Option<std::ffi::OsString>,
+        old_state: Option<std::ffi::OsString>,
+        old_local_app_data: Option<std::ffi::OsString>,
+        old_user_profile: Option<std::ffi::OsString>,
+    }
+
+    #[cfg(not(windows))]
+    impl ListenerTaskEnvironment {
+        fn new(config: Option<crate::cluster::listener_config::ListenerConfig>) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let lock = LISTENER_TASK_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let root = std::env::temp_dir().join(format!(
+                "remuda-listener-task-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root).expect("create isolated listener task state");
+            let home = root.join("home");
+            let state = root.join("state");
+            std::fs::create_dir(&home).expect("create isolated HOME");
+            std::fs::create_dir(&state).expect("create isolated state home");
+            let environment = Self {
+                _lock: lock,
+                root,
+                old_home: std::env::var_os("HOME"),
+                old_state: std::env::var_os("XDG_STATE_HOME"),
+                old_local_app_data: std::env::var_os("LOCALAPPDATA"),
+                old_user_profile: std::env::var_os("USERPROFILE"),
+            };
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_STATE_HOME", &state);
+            std::env::set_var("LOCALAPPDATA", &state);
+            std::env::set_var("USERPROFILE", &home);
+            crate::cluster::init().expect("initialize isolated cluster state");
+            if let Some(config) = config {
+                let cluster_dir = state.join("remuda/cluster");
+                crate::cluster::listener_config::write_at(&cluster_dir, &config)
+                    .expect("write isolated listener config");
+            }
+            environment
+        }
+
+        fn socket_path(&self) -> std::path::PathBuf {
+            self.root.join("runtime/s")
+        }
+    }
+
+    #[cfg(not(windows))]
+    impl Drop for ListenerTaskEnvironment {
+        fn drop(&mut self) {
+            match self.old_home.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.old_state.take() {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match self.old_local_app_data.take() {
+                Some(value) => std::env::set_var("LOCALAPPDATA", value),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+            match self.old_user_profile.take() {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn listener_config(bind: &str) -> crate::cluster::listener_config::ListenerConfig {
+        use crate::cluster::listener_config::{ListenerBind, ListenerConfig};
+        ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit(bind.parse().expect("valid listener test address")),
+            allow_public: false,
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn bound_listener_status(task: &ListenerTask) -> std::net::SocketAddr {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match task.status() {
+                ListenerStatus::On { addr, auto: false } => return addr,
+                ListenerStatus::Off if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                status => panic!("expected an explicit listener to be on, got {status:?}"),
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[allow(clippy::disallowed_types)]
+    fn connect_listener(address: std::net::SocketAddr) -> std::net::TcpStream {
+        std::net::TcpStream::connect_timeout(&address, Duration::from_secs(15))
+            .expect("listener accepts TCP within the per-operation deadline")
+    }
+
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
+    #[test]
+    fn listener_task_is_off_without_config() {
+        let environment = ListenerTaskEnvironment::new(None);
+        let task = ListenerTask::start(&environment.socket_path());
+        assert_eq!(task.status(), ListenerStatus::Off);
+    }
+
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
+    #[test]
+    fn listener_task_accepts_loopback_ephemeral_port_and_reports_status() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
+        let task = ListenerTask::start(&environment.socket_path());
+        let address = bound_listener_status(&task);
+        assert_ne!(
+            address.port(),
+            0,
+            "status reports the selected ephemeral port"
+        );
+        let _connection = connect_listener(address);
+    }
+
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
+    #[test]
+    #[allow(clippy::disallowed_types)]
+    fn listener_task_drop_closes_its_listener_port() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
+        let task = ListenerTask::start(&environment.socket_path());
+        let address = bound_listener_status(&task);
+        let connection = connect_listener(address);
+        drop(connection);
+        drop(task);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match std::net::TcpStream::connect_timeout(&address, Duration::from_secs(15)) {
+                Err(_) => break,
+                Ok(connection) => {
+                    drop(connection);
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "listener stayed open after Drop"
+                    );
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
+    #[test]
+    fn second_daemon_reports_listener_hosted_by_another_daemon() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
+        let first = ListenerTask::start(&environment.socket_path());
+        let first_address = bound_listener_status(&first);
+        let second = ListenerTask::start(&environment.socket_path().with_file_name("s2"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match second.status() {
+                ListenerStatus::Failed(reason) => {
+                    assert!(reason.contains("hosted by another daemon"));
+                    break;
+                }
+                ListenerStatus::Off if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                status => {
+                    panic!("expected the second listener host to lose the lock, got {status:?}")
+                }
+            }
+        }
+        let _connection = connect_listener(first_address);
+    }
+
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
+    #[test]
+    fn listener_task_reports_bind_failure_as_failed_status() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("192.0.2.1:7441")));
+        let task = ListenerTask::start(&environment.socket_path());
+        match wait_for_listener_terminal_status(&task) {
+            ListenerStatus::Failed(reason) => assert!(!reason.is_empty()),
+            status => panic!("expected a bind failure status, got {status:?}"),
+        }
+    }
+
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
+    #[test]
+    fn listener_task_refuses_wildcard_without_public_opt_in() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("0.0.0.0:7441")));
+        let task = ListenerTask::start(&environment.socket_path());
+        match wait_for_listener_terminal_status(&task) {
+            ListenerStatus::Failed(reason) => assert!(
+                reason.contains("wildcard listener bind requires explicit public-bind opt-in"),
+                "wildcard bind should explain the required opt-in: {reason}"
+            ),
+            status => panic!("expected wildcard bind rejection, got {status:?}"),
+        }
+    }
+
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
+    #[test]
+    fn listener_task_refuses_public_specific_bind_without_public_opt_in() {
+        for bind in ["8.8.8.8:7441", "169.254.1.2:7441", "[fe80::1]:7441"] {
+            let environment = ListenerTaskEnvironment::new(Some(listener_config(bind)));
+            let task = ListenerTask::start(&environment.socket_path());
+            match wait_for_listener_terminal_status(&task) {
+                ListenerStatus::Failed(reason) => assert_eq!(
+                    reason,
+                    "validate cluster listener bind: non-private listener bind requires explicit allow_public opt-in",
+                    "non-private specific bind {bind} should be refused by policy before bind"
+                ),
+                status => panic!("expected public bind rejection for {bind}, got {status:?}"),
+            }
+        }
+    }
+
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
+    #[test]
+    fn listener_task_retries_host_lock_after_first_daemon_drops_it() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
+        let first = ListenerTask::start(&environment.socket_path());
+        let _first_address = bound_listener_status(&first);
+        let second = ListenerTask::start_with_retry_interval(
+            &environment.socket_path().with_file_name("s2"),
+            Duration::from_millis(25),
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match second.status() {
+                ListenerStatus::Failed(reason) if reason.contains("hosted by another daemon") => {
+                    break
+                }
+                ListenerStatus::On { .. } => {
+                    panic!("second listener acquired the host lock before the first dropped it")
+                }
+                ListenerStatus::Off if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                status => panic!("expected a transient hosted status, got {status:?}"),
+            }
+        }
+
+        drop(first);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match second.status() {
+                ListenerStatus::On { addr, auto: false } => {
+                    assert_ne!(addr.port(), 0);
+                    let _connection = connect_listener(addr);
+                    break;
+                }
+                ListenerStatus::Failed(reason)
+                    if reason.contains("hosted by another daemon")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                status => panic!("expected listener to recover after lock release, got {status:?}"),
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn wait_for_listener_terminal_status(task: &ListenerTask) -> ListenerStatus {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = task.status();
+            if !matches!(status, ListenerStatus::Off) {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listener startup timed out"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     #[test]
     fn sync_concurrency_is_bounded() {
