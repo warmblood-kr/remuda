@@ -158,6 +158,74 @@ fn daemon_at(path: &Path) -> impl Drop {
     Cleanup(path.to_path_buf())
 }
 
+#[test]
+fn daemon_keeps_answering_ls_when_cluster_listener_bind_fails() {
+    use remuda_native::cluster::listener_config::{ListenerBind, ListenerConfig};
+    use std::process::Command;
+
+    let runtime =
+        std::fs::canonicalize(unique_scratch_dir("lf")).expect("canonicalize private test runtime");
+    let _cleanup = RemoveDirectoryOnDrop(runtime.clone());
+    let home = runtime.join("home");
+    let state = runtime.join("state");
+    std::fs::create_dir_all(&home).expect("create isolated HOME");
+    std::fs::create_dir_all(&state).expect("create isolated state home");
+
+    let initialized = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["cluster", "init"])
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .env("LOCALAPPDATA", &state)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("initialize isolated cluster");
+    assert!(
+        initialized.status.success(),
+        "cluster init failed: {}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let cluster_dir = state.join("remuda/cluster");
+    remuda_native::cluster::listener_config::write_at(
+        &cluster_dir,
+        &ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit("192.0.2.1:7441".parse().unwrap()),
+            allow_public: false,
+        },
+    )
+    .expect("write a listener address that is not assigned to this host");
+
+    let mut command = spawn::base_command(&runtime);
+    command
+        .env("XDG_STATE_HOME", &state)
+        .env("LOCALAPPDATA", &state)
+        .env("USERPROFILE", &home)
+        .stderr(std::process::Stdio::inherit());
+    let _daemon = spawn::spawn_and_wait(command, &runtime);
+    let listed = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["-s", "s", "ls"])
+        .env("REMUDA_RUNTIME_DIR", &runtime)
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .env("LOCALAPPDATA", &state)
+        .env("USERPROFILE", &home)
+        .output()
+        .expect("run ls against the live daemon");
+    assert!(
+        listed.status.success(),
+        "daemon stopped answering ls after its listener bind failed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+}
+
+struct RemoveDirectoryOnDrop(PathBuf);
+
+impl Drop for RemoveDirectoryOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn autostart_reports_the_pid_and_recovery_for_a_held_socket_lock() {

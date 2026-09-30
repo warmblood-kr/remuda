@@ -412,6 +412,40 @@ fn anti_entropy_interval() -> Duration {
     Duration::from_secs(60 + u64::from(std::process::id() % 11))
 }
 
+// RED-stage API scaffold. Replaced by the daemon-owned listener implementation
+// once the lifecycle tests are in place.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ListenerStatus {
+    Off,
+    On {
+        addr: std::net::SocketAddr,
+        auto: bool,
+    },
+    Failed(String),
+}
+
+#[cfg(test)]
+pub struct ListenerTask {
+    status: Arc<Mutex<ListenerStatus>>,
+}
+
+#[cfg(test)]
+impl ListenerTask {
+    pub fn start(_daemon_path: &Path) -> Self {
+        Self {
+            status: Arc::new(Mutex::new(ListenerStatus::Off)),
+        }
+    }
+
+    pub fn status(&self) -> ListenerStatus {
+        self.status
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
 /// Serialize stale-socket removal and bind for one daemon name. The lock file
 /// stays in the runtime directory; unlinking it would let contenders lock
 /// different inodes while one daemon still owns the old file.
@@ -2120,7 +2154,8 @@ fn reply(mut stream: &Stream, response: &Response) -> std::io::Result<()> {
 mod tests {
     use super::{
         acquire_sync_permit, forward_attach_input, report_attach_input_failure, runtime_base_for,
-        shell_or_default, SyncPermit, ATTACH_INPUT_FAILURE_NOTICE, MAX_CONCURRENT_SYNCS,
+        shell_or_default, ListenerStatus, ListenerTask, SyncPermit, ATTACH_INPUT_FAILURE_NOTICE,
+        MAX_CONCURRENT_SYNCS,
     };
     use remuda_core::agent::{AgentError, Color, StyledCell};
     use remuda_core::protocol::collapse_runs;
@@ -2129,9 +2164,160 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::MutexGuard;
     use std::time::Duration;
 
     static SYNC_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static LISTENER_TASK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ListenerTaskEnvironment {
+        _lock: MutexGuard<'static, ()>,
+        root: std::path::PathBuf,
+        old_home: Option<std::ffi::OsString>,
+        old_state: Option<std::ffi::OsString>,
+        old_local_app_data: Option<std::ffi::OsString>,
+        old_user_profile: Option<std::ffi::OsString>,
+    }
+
+    impl ListenerTaskEnvironment {
+        fn new(config: Option<crate::cluster::listener_config::ListenerConfig>) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let lock = LISTENER_TASK_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let root = std::env::temp_dir().join(format!(
+                "remuda-listener-task-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root).expect("create isolated listener task state");
+            let home = root.join("home");
+            let state = root.join("state");
+            std::fs::create_dir(&home).expect("create isolated HOME");
+            std::fs::create_dir(&state).expect("create isolated state home");
+            let environment = Self {
+                _lock: lock,
+                root,
+                old_home: std::env::var_os("HOME"),
+                old_state: std::env::var_os("XDG_STATE_HOME"),
+                old_local_app_data: std::env::var_os("LOCALAPPDATA"),
+                old_user_profile: std::env::var_os("USERPROFILE"),
+            };
+            std::env::set_var("HOME", &home);
+            std::env::set_var("XDG_STATE_HOME", &state);
+            std::env::set_var("LOCALAPPDATA", &state);
+            std::env::set_var("USERPROFILE", &home);
+            crate::cluster::init().expect("initialize isolated cluster state");
+            if let Some(config) = config {
+                let cluster_dir = state.join("remuda/cluster");
+                crate::cluster::listener_config::write_at(&cluster_dir, &config)
+                    .expect("write isolated listener config");
+            }
+            environment
+        }
+
+        fn socket_path(&self) -> std::path::PathBuf {
+            self.root.join("runtime/s")
+        }
+    }
+
+    impl Drop for ListenerTaskEnvironment {
+        fn drop(&mut self) {
+            match self.old_home.take() {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match self.old_state.take() {
+                Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+                None => std::env::remove_var("XDG_STATE_HOME"),
+            }
+            match self.old_local_app_data.take() {
+                Some(value) => std::env::set_var("LOCALAPPDATA", value),
+                None => std::env::remove_var("LOCALAPPDATA"),
+            }
+            match self.old_user_profile.take() {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn listener_config(bind: &str) -> crate::cluster::listener_config::ListenerConfig {
+        use crate::cluster::listener_config::{ListenerBind, ListenerConfig};
+        ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit(bind.parse().expect("valid listener test address")),
+            allow_public: false,
+        }
+    }
+
+    fn bound_listener_status(task: &ListenerTask) -> std::net::SocketAddr {
+        match task.status() {
+            ListenerStatus::On { addr, auto: false } => addr,
+            status => panic!("expected an explicit listener to be on, got {status:?}"),
+        }
+    }
+
+    #[test]
+    fn listener_task_is_off_without_config() {
+        let environment = ListenerTaskEnvironment::new(None);
+        let task = ListenerTask::start(&environment.socket_path());
+        assert_eq!(task.status(), ListenerStatus::Off);
+    }
+
+    #[test]
+    fn listener_task_accepts_loopback_ephemeral_port_and_reports_status() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
+        let task = ListenerTask::start(&environment.socket_path());
+        let address = bound_listener_status(&task);
+        assert_ne!(
+            address.port(),
+            0,
+            "status reports the selected ephemeral port"
+        );
+        std::net::TcpStream::connect(address).expect("listener accepts TCP");
+    }
+
+    #[test]
+    fn listener_task_drop_closes_its_listener_port() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
+        let task = ListenerTask::start(&environment.socket_path());
+        let address = bound_listener_status(&task);
+        std::net::TcpStream::connect(address).expect("listener is reachable before Drop");
+        drop(task);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::net::TcpStream::connect(address).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listener stayed open after Drop"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn second_daemon_reports_listener_hosted_by_another_daemon() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
+        let first = ListenerTask::start(&environment.socket_path());
+        let first_address = bound_listener_status(&first);
+        let second = ListenerTask::start(&environment.socket_path().with_file_name("s2"));
+        match second.status() {
+            ListenerStatus::Failed(reason) => assert!(reason.contains("hosted by another daemon")),
+            status => panic!("expected the second listener host to lose the lock, got {status:?}"),
+        }
+        std::net::TcpStream::connect(first_address).expect("the first listener remains reachable");
+    }
+
+    #[test]
+    fn listener_task_reports_bind_failure_as_failed_status() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("192.0.2.1:7441")));
+        let task = ListenerTask::start(&environment.socket_path());
+        match task.status() {
+            ListenerStatus::Failed(reason) => assert!(!reason.is_empty()),
+            status => panic!("expected a bind failure status, got {status:?}"),
+        }
+    }
 
     #[test]
     fn sync_concurrency_is_bounded() {
