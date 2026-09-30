@@ -21,6 +21,7 @@ use std::collections::{HashSet, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub mod close_request;
 const UI_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
@@ -668,10 +669,7 @@ impl ClusterUi {
                 )
             },
         );
-        let status_lines = wrap_to_two_lines(
-            &format!("KEYS {node_label}/{session_name} · Ctrl-\\ back"),
-            width,
-        );
+        let status_lines = vec![remote_keys_hint(&node_label, &session_name, width)];
         let mut frame = status_lines.clone();
         frame.extend(
             visible_remote_pane_lines(&body, true, height.saturating_sub(status_lines.len()))
@@ -1787,6 +1785,37 @@ fn truncate(text: &str, width: usize) -> String {
     text.chars().take(width).collect()
 }
 
+fn remote_keys_hint(node: &str, session: &str, width: usize) -> String {
+    let prefix = "KEYS ";
+    let suffix = " · Ctrl-\\ back";
+    let target = format!("{node}/{session}");
+    let available = width.saturating_sub(
+        UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix),
+    );
+    format!("{prefix}{}{suffix}", ellipsize(&target, available))
+}
+
+fn ellipsize(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut result = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width + 1 > width {
+            break;
+        }
+        result.push(ch);
+        used += ch_width;
+    }
+    result.push('…');
+    result
+}
+
 fn wrap_to_two_lines(text: &str, width: usize) -> Vec<String> {
     let words = text.split_whitespace().collect::<Vec<_>>();
     let mut first = String::new();
@@ -2384,6 +2413,30 @@ mod tests {
         assert!(prompt.ends_with("y / n"), "prompt lost choices: {prompt:?}");
         assert!(prompt.contains('…'), "long target should be elided: {prompt:?}");
         assert!(prompt.chars().count() <= 40, "prompt too wide: {prompt:?}");
+    }
+
+    #[test]
+    fn keys_hint_keeps_exit_binding_visible_at_40_columns() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        snapshot.nodes[0].name = "laptop-with-a-very-long-name".into();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        key_event(&mut ui, KeyCode::Char('k'), KeyModifiers::NONE, clock.now());
+
+        let frame = ui.render(40, 24, "", &clock);
+        let hint = frame.lines().next().expect("keys hint is rendered");
+        assert!(hint.contains("Ctrl-\\ back"), "hint lost exit binding: {hint:?}");
+        assert!(hint.contains('…'), "long target should be elided: {hint:?}");
+        assert!(hint.chars().count() <= 40, "hint too wide: {hint:?}");
     }
 
     #[test]
