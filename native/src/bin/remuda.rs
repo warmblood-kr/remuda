@@ -1402,13 +1402,7 @@ fn cluster_join_with_listener(
                 bind: ListenerBind::Explicit(address),
                 allow_public: false,
             };
-            finish_join_listener_start(&mut restore_guard, |restore_guard| {
-                remuda_native::cluster::listener_control::start_with_config_written(
-                    daemon_path,
-                    Some(config.clone()),
-                    || restore_guard.set_expected(Some(config)),
-                )
-            })
+            start_join_listener_with_config(daemon_path, &mut restore_guard, config)
         }
         None => match initial_status {
             remuda_core::protocol::ListenerStatus::On { .. } => {
@@ -1421,13 +1415,7 @@ fn cluster_join_with_listener(
                     allow_public: false,
                 });
                 config.enabled = true;
-                finish_join_listener_start(&mut restore_guard, |restore_guard| {
-                    remuda_native::cluster::listener_control::start_with_config_written(
-                        daemon_path,
-                        Some(config.clone()),
-                        || restore_guard.set_expected(Some(config)),
-                    )
-                })
+                start_join_listener_with_config(daemon_path, &mut restore_guard, config)
             }
         },
     };
@@ -1558,6 +1546,20 @@ enum JoinRun {
 enum JoinListenerStartOutcome {
     Started(std::io::Result<remuda_core::protocol::ListenerStatus>),
     Cancelled(ExitCode),
+}
+
+fn start_join_listener_with_config(
+    daemon_path: &Path,
+    restore_guard: &mut JoinListenerRestoreGuard,
+    config: ListenerConfig,
+) -> JoinListenerStartOutcome {
+    finish_join_listener_start(restore_guard, |restore_guard| {
+        remuda_native::cluster::listener_control::start_with_config_written(
+            daemon_path,
+            Some(config.clone()),
+            || restore_guard.set_expected(Some(config)),
+        )
+    })
 }
 
 fn finish_join_listener_start(
