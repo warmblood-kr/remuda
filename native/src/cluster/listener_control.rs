@@ -18,6 +18,11 @@ pub fn status(daemon_path: &Path) -> ListenerStatus {
     }
 }
 
+/// Reload the daemon-owned cluster listener from persisted identity/configuration.
+pub fn reload(daemon_path: &Path) -> io::Result<ListenerStatus> {
+    request(daemon_path, ListenerOp::Reload)
+}
+
 /// Enable the listener and ask the selected daemon to reload its task.
 pub fn start(daemon_path: &Path, config: Option<ListenerConfig>) -> io::Result<ListenerStatus> {
     let mut config = match config {
@@ -30,7 +35,7 @@ pub fn start(daemon_path: &Path, config: Option<ListenerConfig>) -> io::Result<L
     };
     config.enabled = true;
     listener_config::write(&config)?;
-    request(daemon_path, ListenerOp::Reload)
+    reload(daemon_path)
 }
 
 /// Disable the listener and ask the selected daemon to reload its task.
@@ -42,7 +47,7 @@ pub fn stop(daemon_path: &Path) -> io::Result<ListenerStatus> {
     });
     config.enabled = false;
     listener_config::write(&config)?;
-    request(daemon_path, ListenerOp::Reload)
+    reload(daemon_path)
 }
 
 fn request(daemon_path: &Path, operation: ListenerOp) -> io::Result<ListenerStatus> {

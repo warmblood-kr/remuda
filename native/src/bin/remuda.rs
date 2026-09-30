@@ -17,7 +17,7 @@
 //! state-creating commands start the daemon on first use; read-only commands
 //! require it to be running already. `-s` names one. See `USAGE`.
 
-use remuda_core::protocol::{Request, Response};
+use remuda_core::protocol::{ListenerStatus, Request, Response};
 use remuda_native::client::Left;
 use remuda_native::cluster::listener_config::{ListenerBind, ListenerConfig};
 use remuda_native::net::advertise_addr::CLUSTER_DEFAULT_PORT;
@@ -789,7 +789,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     match parse_cluster_command(args) {
         ClusterCommand::Status => cluster_status(server, path),
         ClusterCommand::Init { no_listen } => cluster_init(server, path, no_listen),
-        ClusterCommand::InitNewIdentity { yes } => cluster_init_new_identity(yes),
+        ClusterCommand::InitNewIdentity { yes } => cluster_init_new_identity(server, path, yes),
         ClusterCommand::Invite {
             bind_addr,
             advertised_addr,
@@ -863,7 +863,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
 const NEW_IDENTITY_WARNING: &str =
     "This creates a new identity; this machine leaves its current cluster and needs a new invite.";
 
-fn cluster_init_new_identity(yes: bool) -> ExitCode {
+fn cluster_init_new_identity(server: &str, path: &Path, yes: bool) -> ExitCode {
     let prompt = match new_identity_confirmation(
         yes,
         std::io::stdin().is_terminal(),
@@ -888,7 +888,31 @@ fn cluster_init_new_identity(yes: bool) -> ExitCode {
             println!("Cluster identity rotated");
             println!("Node: {}", identity.node_name);
             println!("Fingerprint: {}", identity.node_fp);
-            ExitCode::SUCCESS
+            let reload = match remuda_native::ipc::connect(path) {
+                Ok(_) => with_existing_daemon(server, path, |daemon_path| {
+                    match remuda_native::cluster::listener_control::reload(daemon_path) {
+                        Ok(ListenerStatus::Failed(reason)) => {
+                            fail(format!("cluster init --new-identity: listener reload failed: {reason}"))
+                        }
+                        Ok(_) => {
+                            println!("Listener reloaded.");
+                            ExitCode::SUCCESS
+                        }
+                        Err(error) => fail(format!(
+                            "cluster init --new-identity: listener reload failed: {error}"
+                        )),
+                    }
+                }),
+                Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => {
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(format!(
+                    "cannot connect to remuda daemon at {}: {error}; refusing to start a second daemon",
+                    path.display()
+                )),
+            };
+            println!("Next: ask an admitted machine for a new invite (remuda cluster invite there), then run the join command it prints.");
+            reload
         }
         Err(error) => fail(format!("cluster init --new-identity: {error}")),
     }
