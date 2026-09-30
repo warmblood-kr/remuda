@@ -28,3 +28,31 @@ fn unknown_top_level_name_reports_mod_install_next_step() {
          Next: if nosuchmod is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list.\n"
     );
 }
+
+#[test]
+fn unsafe_unknown_name_is_not_echoed() {
+    let dir = std::env::temp_dir().join(format!(
+        "remuda-unsafe-unknown-command-{}",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .arg("NOPE")
+        .env("REMUDA_RUNTIME_DIR", &dir)
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("HOME", &dir)
+        .output()
+        .expect("run remuda");
+
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(!output.status.success(), "unknown command succeeded: {output:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "remuda: no command or mod with that name.\n\
+         Next: if this is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list.\n"
+    );
+}
