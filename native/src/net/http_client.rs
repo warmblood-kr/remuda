@@ -1122,7 +1122,12 @@ fn verify_trusted_end_entity(
 
 fn asn1_time(tag: u8, bytes: &[u8]) -> Option<i64> {
     let text = std::str::from_utf8(bytes).ok()?;
-    if !text.is_ascii() {
+    if !text.is_ascii()
+        || !text.ends_with('Z')
+        || !text[..text.len() - 1]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
     let (year, rest) = match tag {
@@ -1336,12 +1341,13 @@ pub fn install(
         lua.create_function(move |lua, options: mlua::Table| {
             let method: String = options.get("method")?;
             let url: String = options.get("url")?;
-            let timeout = duration_option(&options, "timeout", None)?
+            let timeout = duration_option(&options, "timeout", None, "http.request")?
                 .ok_or_else(|| mlua::Error::runtime("http.request requires timeout"))?;
             let connect_timeout = duration_option(
                 &options,
                 "connect_timeout",
                 Some(timeout.min(Duration::from_secs(10))),
+                "http.request",
             )?
             .unwrap();
             let max_bytes = options
@@ -1390,12 +1396,13 @@ pub fn install(
         "peer_certificate",
         lua.create_function(move |lua, options: mlua::Table| {
             let url: String = options.get("url")?;
-            let timeout = duration_option(&options, "timeout", None)?
+            let timeout = duration_option(&options, "timeout", None, "http.peer_certificate")?
                 .ok_or_else(|| mlua::Error::runtime("http.peer_certificate requires timeout"))?;
             let connect_timeout = duration_option(
                 &options,
                 "connect_timeout",
                 Some(timeout.min(Duration::from_secs(10))),
+                "http.peer_certificate",
             )?
             .unwrap();
             let ca_file = options.get::<Option<String>>("ca_file")?;
@@ -1432,6 +1439,7 @@ fn duration_option(
     options: &mlua::Table,
     name: &str,
     default: Option<Duration>,
+    api: &str,
 ) -> mlua::Result<Option<Duration>> {
     let seconds = options.get::<Option<f64>>(name)?;
     let Some(seconds) = seconds else {
@@ -1439,7 +1447,7 @@ fn duration_option(
     };
     if !seconds.is_finite() || seconds <= 0.0 || seconds > 3600.0 {
         return Err(mlua::Error::runtime(format!(
-            "http.request {name} must be between 0 and 3600 seconds"
+            "{api} {name} must be between 0 and 3600 seconds"
         )));
     }
     Ok(Some(Duration::from_secs_f64(seconds)))
@@ -1455,6 +1463,24 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn invalid_timeout_error_names_peer_certificate_api() {
+        let lua = mlua::Lua::new();
+        let options = lua.create_table().unwrap();
+        options.set("timeout", 3601.0).unwrap();
+        let error = super::duration_option(&options, "timeout", None, "http.peer_certificate")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("http.peer_certificate timeout"), "{error}");
+        let request_error = super::duration_option(&options, "timeout", None, "http.request")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            request_error.contains("http.request timeout"),
+            "{request_error}"
+        );
+    }
 
     fn stub(response: &'static [u8], delay: Duration) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1933,6 +1959,22 @@ mod tests {
         ];
         assert_eq!(std::str::from_utf8(&time).unwrap().len(), 13);
         assert_eq!(super::asn1_time(0x17, &time), None);
+    }
+
+    #[test]
+    fn signed_asn1_time_fields_are_rejected() {
+        for time in [
+            b"-10101000000Z".as_slice(),
+            b"+10101000000Z",
+            b"24+10100000Z",
+            b"2401+1000000Z",
+            b"240101-10000Z",
+            b"24010100-100Z",
+            b"2401010000-1Z",
+        ] {
+            assert_eq!(super::asn1_time(0x17, time), None, "{time:?}");
+        }
+        assert_eq!(super::asn1_time(0x18, b"-0010101000000Z"), None);
     }
 
     #[test]
