@@ -714,7 +714,10 @@ fn d4_invite_without_flags_uses_the_daemon_bound_address() {
 
     let scratch = Scratch::new();
     let _daemon = initialized_node(&scratch);
-    let bound = explicit_listener_address(&scratch);
+    assert_eq!(
+        configure_listener(&scratch, false, "127.0.0.1:0".parse().unwrap()),
+        remuda_core::protocol::ListenerStatus::Off
+    );
     let invite = scratch.run(&["cluster", "invite"]);
     assert!(
         invite.status.success(),
@@ -722,7 +725,42 @@ fn d4_invite_without_flags_uses_the_daemon_bound_address() {
         String::from_utf8_lossy(&invite.stderr)
     );
     let line = JoinLine::decode(&invitation_join_line(&invite)).expect("decode invite line");
+    let bound = match remuda_native::cluster::listener_control::status(
+        &remuda_native::daemon::socket_path_in(&scratch.runtime, &scratch.name),
+    ) {
+        remuda_core::protocol::ListenerStatus::On { addr, .. } => addr,
+        status => panic!("invite did not enable the listener: {status:?}"),
+    };
     assert_eq!(line.issuer_addr, bound);
+}
+
+#[test]
+fn d4_invite_addr_overrides_only_the_advertised_address() {
+    use remuda_native::cluster::join_line::JoinLine;
+
+    let scratch = Scratch::new();
+    let _daemon = initialized_node(&scratch);
+    let bound = explicit_listener_address(&scratch);
+    let advertised: SocketAddr = "203.0.113.9:9443".parse().unwrap();
+    let advertised_text = advertised.to_string();
+    let invite = scratch.run(&["cluster", "invite", "--addr", &advertised_text]);
+    assert!(
+        invite.status.success(),
+        "invite failed: {}",
+        String::from_utf8_lossy(&invite.stderr)
+    );
+    let line = JoinLine::decode(&invitation_join_line(&invite)).expect("decode invite line");
+    assert_eq!(line.issuer_addr, advertised);
+    assert_eq!(
+        remuda_native::cluster::listener_control::status(&remuda_native::daemon::socket_path_in(
+            &scratch.runtime,
+            &scratch.name
+        )),
+        remuda_core::protocol::ListenerStatus::On {
+            addr: bound,
+            auto: false,
+        }
+    );
 }
 
 #[test]
@@ -809,6 +847,23 @@ fn d4_init_prints_the_listener_address_and_exposure_note() {
     assert!(
         stdout.contains("only admitted machines can connect"),
         "missing listener exposure note: {stdout}"
+    );
+}
+
+#[test]
+fn d4_init_no_listen_leaves_the_listener_off() {
+    let scratch = Scratch::new();
+    let _daemon = start_daemon(&scratch);
+    let initialized = scratch.run(&["cluster", "init", "--no-listen"]);
+    let stdout = String::from_utf8_lossy(&initialized.stdout);
+    assert!(initialized.status.success(), "init failed: {stdout}");
+    assert!(stdout.contains("Listener off (--no-listen)"), "{stdout}");
+    assert_eq!(
+        remuda_native::cluster::listener_control::status(&remuda_native::daemon::socket_path_in(
+            &scratch.runtime,
+            &scratch.name
+        )),
+        remuda_core::protocol::ListenerStatus::Off
     );
 }
 

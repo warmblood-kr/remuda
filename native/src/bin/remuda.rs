@@ -19,6 +19,7 @@
 
 use remuda_core::protocol::{Request, Response};
 use remuda_native::client::Left;
+use remuda_native::cluster::listener_config::{ListenerBind, ListenerConfig};
 use remuda_native::net::advertise_addr::CLUSTER_DEFAULT_PORT;
 use remuda_native::{daemon, dist, terminal_size};
 use std::fs;
@@ -436,12 +437,15 @@ fn levenshtein(left: &str, right: &str) -> usize {
 #[derive(Debug, PartialEq, Eq)]
 enum ClusterCommand {
     Status,
-    Init,
+    Init {
+        no_listen: bool,
+    },
     InitNewIdentity {
         yes: bool,
     },
     Invite {
-        bind_addr: std::net::SocketAddr,
+        bind_addr: Option<std::net::SocketAddr>,
+        advertised_addr: Option<std::net::SocketAddr>,
     },
     Join {
         fingerprint: Option<String>,
@@ -526,22 +530,53 @@ fn invalid_cluster(verb: &str, reason: impl Into<String>) -> ClusterCommand {
 
 fn parse_cluster_init(args: &[&str]) -> Result<ClusterCommand, String> {
     match args {
-        [] => Ok(ClusterCommand::Init),
+        [] => Ok(ClusterCommand::Init { no_listen: false }),
+        ["--no-listen"] => Ok(ClusterCommand::Init { no_listen: true }),
         ["--new-identity"] => Ok(ClusterCommand::InitNewIdentity { yes: false }),
         ["--new-identity", "--yes"] => Ok(ClusterCommand::InitNewIdentity { yes: true }),
-        _ => Err("expected [--new-identity [--yes]]".into()),
+        _ => Err("expected [--no-listen | --new-identity [--yes]]".into()),
     }
 }
 
 fn parse_cluster_invite(args: &[&str]) -> Result<ClusterCommand, String> {
-    let address = match args {
-        ["--bind", address] => *address,
-        [flag] if flag.starts_with("--bind=") => &flag[7..],
-        [] => return Err("missing --bind ADDR".into()),
-        _ => return Err("expected --bind ADDR".into()),
-    };
-    let bind_addr = parse_addr_default_port(address)?;
-    Ok(ClusterCommand::Invite { bind_addr })
+    let mut bind_addr = None;
+    let mut advertised_addr = None;
+    let mut index = 0;
+    while index < args.len() {
+        let (option, value, consumed) = match args[index] {
+            "--bind" | "--addr" => {
+                let option = args[index];
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| format!("missing address after {option}"))?;
+                (option, *value, 2)
+            }
+            flag if flag.starts_with("--bind=") => ("--bind", &flag[7..], 1),
+            flag if flag.starts_with("--addr=") => ("--addr", &flag[7..], 1),
+            argument => return Err(format!("unexpected argument {argument}")),
+        };
+        let address = parse_addr_default_port(value)?;
+        match option {
+            "--bind" => {
+                if bind_addr.replace(address).is_some() {
+                    return Err("--bind may only be provided once".into());
+                }
+            }
+            "--addr" => {
+                remuda_native::cluster::join_line::validate_endpoint(address)
+                    .map_err(|_| "invalid advertised address")?;
+                if advertised_addr.replace(address).is_some() {
+                    return Err("--addr may only be provided once".into());
+                }
+            }
+            _ => unreachable!("invite option parser returned an unknown option"),
+        }
+        index += consumed;
+    }
+    Ok(ClusterCommand::Invite {
+        bind_addr,
+        advertised_addr,
+    })
 }
 
 fn parse_cluster_join(args: &[&str]) -> Result<ClusterCommand, String> {
@@ -719,8 +754,8 @@ fn parse_addr_default_port(value: &str) -> Result<std::net::SocketAddr, String> 
 
 pub fn cluster_usage(verb: &str) -> String {
     match verb {
-        "init" => "usage: remuda cluster init [--new-identity [--yes]]\nexample: remuda cluster init --new-identity\n".into(),
-        "invite" => format!("usage: remuda cluster invite --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})\nexample: remuda cluster invite --bind 192.168.1.20\n"),
+        "init" => "usage: remuda cluster init [--no-listen | --new-identity [--yes]]\nexample: remuda cluster init --no-listen\n".into(),
+        "invite" => format!("usage: remuda cluster invite [--bind IP[:PORT]] [--addr IP[:PORT]] (default port {CLUSTER_DEFAULT_PORT})\nexample: remuda cluster invite\n"),
         "join" => format!("usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})]\nexample: remuda cluster join 'remuda-join-v1 …'\n"),
         "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n".into(),
         "revoke" => "usage: remuda cluster revoke NODE|FINGERPRINT [--yes]\nexample: remuda cluster revoke node-abcd1234\n".into(),
@@ -735,18 +770,12 @@ pub fn cluster_usage(verb: &str) -> String {
 fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     match parse_cluster_command(args) {
         ClusterCommand::Status => cluster_status(server, path),
-        ClusterCommand::Init => match remuda_native::cluster::init() {
-            Ok((identity, created)) => {
-                println!("{}", cluster_init_message(created));
-                println!("Node: {}", identity.node_name);
-                println!("Fingerprint: {}", identity.node_fp);
-                println!("{}", next_step_init());
-                ExitCode::SUCCESS
-            }
-            Err(error) => fail(format!("cluster init: {error}")),
-        },
+        ClusterCommand::Init { no_listen } => cluster_init(server, path, no_listen),
         ClusterCommand::InitNewIdentity { yes } => cluster_init_new_identity(yes),
-        ClusterCommand::Invite { bind_addr } => cluster_invite(bind_addr),
+        ClusterCommand::Invite {
+            bind_addr,
+            advertised_addr,
+        } => cluster_invite(server, path, bind_addr, advertised_addr),
         ClusterCommand::Join {
             fingerprint,
             invitation,
@@ -951,6 +980,93 @@ fn print_cluster_listener_status(server: &str, path: &Path) -> ExitCode {
     }
 }
 
+fn cluster_init(server: &str, path: &Path, no_listen: bool) -> ExitCode {
+    with_daemon(server, path, |daemon_path| {
+        let (identity, created) = match remuda_native::cluster::init() {
+            Ok(initialized) => initialized,
+            Err(error) => return fail(render_cluster_init_error(&error)),
+        };
+        let listener_status = if no_listen {
+            let config = ListenerConfig {
+                enabled: false,
+                bind: ListenerBind::Auto,
+                allow_public: false,
+            };
+            if let Err(error) = remuda_native::cluster::listener_config::write(&config) {
+                return fail(render_init_listener_error(&error));
+            }
+            remuda_native::cluster::listener_control::stop(daemon_path)
+        } else {
+            remuda_native::cluster::listener_control::start(
+                daemon_path,
+                Some(ListenerConfig {
+                    enabled: true,
+                    bind: ListenerBind::Auto,
+                    allow_public: false,
+                }),
+            )
+        };
+        match listener_status {
+            Ok(status) => {
+                for line in render_cluster_init_lines(
+                    created,
+                    &identity.node_name,
+                    &identity.node_fp,
+                    &status,
+                ) {
+                    println!("{line}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(render_init_listener_error(&error)),
+        }
+    })
+}
+
+fn render_cluster_init_error(error: &std::io::Error) -> String {
+    format!("cluster init: {error}")
+}
+
+fn render_cluster_init_lines(
+    created: bool,
+    node_name: &str,
+    fingerprint: &str,
+    status: &remuda_core::protocol::ListenerStatus,
+) -> Vec<String> {
+    let mut lines = vec![
+        cluster_init_message(created).to_owned(),
+        format!("Node: {node_name}"),
+        format!("Fingerprint: {fingerprint}"),
+    ];
+    lines.extend(render_init_listener_lines(status));
+    lines
+}
+
+fn render_init_listener_lines(status: &remuda_core::protocol::ListenerStatus) -> Vec<String> {
+    use remuda_core::protocol::ListenerStatus;
+
+    match status {
+        ListenerStatus::On { addr, .. } => vec![
+            format!("Listening on {addr} (only admitted machines can connect; turn off: remuda cluster listen --off)"),
+            next_step_init().into(),
+        ],
+        ListenerStatus::Off => vec![
+            "Listener off (--no-listen)".into(),
+            next_step_init().into(),
+        ],
+        ListenerStatus::Failed(reason) => vec![
+            format!("Listener failed: {reason}"),
+            "Next: remuda cluster listen --bind IP".into(),
+        ],
+    }
+}
+
+fn render_init_listener_error(error: &std::io::Error) -> String {
+    format!(
+        "cluster init listener: {error}\nNext: remuda cluster init --no-listen or remuda cluster listen --bind IP"
+    )
+}
+
 fn cluster_listener_status_lines(
     status: Option<remuda_core::protocol::ListenerStatus>,
 ) -> Vec<String> {
@@ -972,24 +1088,87 @@ fn cluster_listener_status_lines(
     }
 }
 
-fn cluster_invite(bind_addr: std::net::SocketAddr) -> ExitCode {
-    match remuda_native::cluster::mint_join_line(bind_addr) {
-        Ok(line) => match invite_message(&line) {
-            Ok(message) => {
-                println!("{message}");
-                ExitCode::SUCCESS
-            }
+fn cluster_invite(
+    server: &str,
+    path: &Path,
+    bind_addr: Option<std::net::SocketAddr>,
+    advertised_addr: Option<std::net::SocketAddr>,
+) -> ExitCode {
+    with_daemon(server, path, |daemon_path| {
+        match remuda_native::cluster::status() {
+            Ok(Some(_)) => {}
+            Ok(None) => return fail(render_invite_not_initialized()),
+            Err(error) => return fail(render_invite_state_error(&error)),
+        }
+        let listener_status = match bind_addr {
+            Some(address) => remuda_native::cluster::listener_control::start(
+                daemon_path,
+                Some(ListenerConfig {
+                    enabled: true,
+                    bind: ListenerBind::Explicit(address),
+                    allow_public: false,
+                }),
+            ),
+            None => match remuda_native::cluster::listener_control::status(daemon_path) {
+                remuda_core::protocol::ListenerStatus::Off => {
+                    remuda_native::cluster::listener_control::start(daemon_path, None)
+                }
+                status => Ok(status),
+            },
+        };
+        let listener_status = match listener_status {
+            Ok(status) => status,
+            Err(error) => return fail(render_invite_listener_start_error(&error)),
+        };
+        let bound_addr = match &listener_status {
+            remuda_core::protocol::ListenerStatus::On { addr, .. } => *addr,
+            status => return fail(render_invite_listener_refusal(status)),
+        };
+        let advertised_addr = advertised_addr.unwrap_or(bound_addr);
+        match remuda_native::cluster::mint_join_line(advertised_addr) {
+            Ok(line) => match invite_message(&line) {
+                Ok(message) => {
+                    println!("{message}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => fail(describe_cluster_error(
+                    "invite",
+                    &error,
+                    ClusterErrorContext::Address(advertised_addr),
+                )),
+            },
             Err(error) => fail(describe_cluster_error(
                 "invite",
                 &error,
-                ClusterErrorContext::Address(bind_addr),
+                ClusterErrorContext::Address(advertised_addr),
             )),
-        },
-        Err(error) => fail(describe_cluster_error(
-            "invite",
-            &error,
-            ClusterErrorContext::Address(bind_addr),
-        )),
+        }
+    })
+}
+
+fn render_invite_not_initialized() -> &'static str {
+    "cluster is not initialized; run `remuda cluster init`"
+}
+
+fn render_invite_state_error(error: &std::io::Error) -> String {
+    format!("cluster invite: {error}\nNext: remuda cluster init")
+}
+
+fn render_invite_listener_start_error(error: &std::io::Error) -> String {
+    format!("cluster invite: could not start the listener: {error}\nNext: remuda cluster listen --bind IP")
+}
+
+fn render_invite_listener_refusal(status: &remuda_core::protocol::ListenerStatus) -> String {
+    use remuda_core::protocol::ListenerStatus;
+
+    match status {
+        ListenerStatus::Off => {
+            "cluster invite: listener is off\nNext: remuda cluster listen --bind IP".into()
+        }
+        ListenerStatus::Failed(reason) => format!(
+            "cluster invite: listener failed: {reason}\nNext: remuda cluster listen --bind IP"
+        ),
+        ListenerStatus::On { .. } => unreachable!("an active listener can accept invitations"),
     }
 }
 
@@ -1715,7 +1894,8 @@ mod cluster_cli_tests {
         confirmation_answer_is_yes, invite_message, join_confirmation, join_prompt,
         join_success_message, new_identity_confirmation, next_step_init, next_step_join,
         next_step_listen, next_step_status, parse_addr_default_port, parse_cluster_command,
-        remote_control_status_lines, revoke_confirmation, write_nodes_table,
+        remote_control_status_lines, render_cluster_init_lines, render_init_listener_lines,
+        render_invite_listener_refusal, revoke_confirmation, write_nodes_table,
         write_revocation_notice, ClusterCommand, NEW_IDENTITY_WARNING,
     };
     #[cfg(unix)]
@@ -1805,14 +1985,79 @@ mod cluster_cli_tests {
     #[test]
     fn cluster_status_and_init_are_recognized() {
         assert_eq!(parse_cluster_command(&[]), ClusterCommand::Status);
-        assert_eq!(parse_cluster_command(&["init"]), ClusterCommand::Init);
+        assert_eq!(
+            parse_cluster_command(&["init"]),
+            ClusterCommand::Init { no_listen: false }
+        );
+        assert_eq!(
+            parse_cluster_command(&["init", "--no-listen"]),
+            ClusterCommand::Init { no_listen: true }
+        );
         assert_eq!(invalid_reason(&["join"]).0, "join");
         assert_eq!(
             parse_cluster_command(&["invite", "--bind", "192.0.2.4:9443"]),
             ClusterCommand::Invite {
-                bind_addr: "192.0.2.4:9443".parse().unwrap()
+                bind_addr: Some("192.0.2.4:9443".parse().unwrap()),
+                advertised_addr: None,
             }
         );
+    }
+
+    #[test]
+    fn cluster_invite_advertised_address_is_recognized() {
+        assert_eq!(
+            parse_cluster_command(&["invite", "--addr=203.0.113.9:9443"]),
+            ClusterCommand::Invite {
+                bind_addr: None,
+                advertised_addr: Some("203.0.113.9:9443".parse().unwrap()),
+            }
+        );
+        assert_eq!(
+            parse_cluster_command(&[
+                "invite",
+                "--bind",
+                "192.0.2.4:7441",
+                "--addr",
+                "203.0.113.9:9443"
+            ]),
+            ClusterCommand::Invite {
+                bind_addr: Some("192.0.2.4:7441".parse().unwrap()),
+                advertised_addr: Some("203.0.113.9:9443".parse().unwrap()),
+            }
+        );
+    }
+
+    #[test]
+    fn init_and_invite_listener_rendering_is_actionable_without_join_tokens() {
+        use remuda_core::protocol::ListenerStatus;
+
+        let listening = render_cluster_init_lines(
+            true,
+            "node-a",
+            "fingerprint-a",
+            &ListenerStatus::On {
+                addr: "192.0.2.4:7441".parse().unwrap(),
+                auto: true,
+            },
+        );
+        assert!(listening.iter().any(|line| {
+            line == "Listening on 192.0.2.4:7441 (only admitted machines can connect; turn off: remuda cluster listen --off)"
+        }));
+        assert!(listening.iter().any(|line| line.starts_with("Next:")));
+
+        let failed = render_init_listener_lines(&ListenerStatus::Failed("address busy".into()));
+        assert!(failed
+            .iter()
+            .any(|line| line == "Listener failed: address busy"));
+        assert!(failed
+            .iter()
+            .any(|line| line == "Next: remuda cluster listen --bind IP"));
+
+        let refusal =
+            render_invite_listener_refusal(&ListenerStatus::Failed("address busy".into()));
+        assert!(refusal.contains("address busy"));
+        assert!(refusal.contains("remuda cluster listen --bind IP"));
+        assert!(!refusal.contains("remuda-join-v1"));
     }
 
     #[test]
@@ -1892,7 +2137,8 @@ mod cluster_cli_tests {
         assert_eq!(
             parse_cluster_command(&["invite", "--bind", "192.0.2.4"]),
             ClusterCommand::Invite {
-                bind_addr: "192.0.2.4:7441".parse().unwrap()
+                bind_addr: Some("192.0.2.4:7441".parse().unwrap()),
+                advertised_addr: None,
             }
         );
     }
@@ -2056,7 +2302,8 @@ mod cluster_cli_tests {
         assert_eq!(
             parse_cluster_command(&["invite", "--bind=192.0.2.4:9443"]),
             ClusterCommand::Invite {
-                bind_addr: "192.0.2.4:9443".parse().unwrap()
+                bind_addr: Some("192.0.2.4:9443".parse().unwrap()),
+                advertised_addr: None,
             }
         );
         assert_eq!(
