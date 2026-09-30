@@ -1941,12 +1941,76 @@ enum PromptLineError {
 }
 
 fn edit_prompt_line(
-    _events: impl IntoIterator<Item = crossterm::event::Event>,
-    _default: Option<&str>,
-    _max_bytes: usize,
-    _echo: impl FnMut(PromptLineEcho),
+    events: impl IntoIterator<Item = crossterm::event::Event>,
+    default: Option<&str>,
+    max_bytes: usize,
+    mut echo: impl FnMut(PromptLineEcho),
 ) -> Result<Option<String>, PromptLineError> {
-    Ok(Some(String::new()))
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    let mut line = String::new();
+    let append = |line: &mut String, character: char, echo: &mut dyn FnMut(PromptLineEcho)| {
+        if character.is_control() {
+            return Ok(());
+        }
+        let new_len = line
+            .len()
+            .checked_add(character.len_utf8())
+            .ok_or(PromptLineError::TooLong)?;
+        if new_len > max_bytes {
+            return Err(PromptLineError::TooLong);
+        }
+        line.push(character);
+        echo(PromptLineEcho::Text(character));
+        Ok(())
+    };
+
+    for event in events {
+        match event {
+            Event::Paste(text) => {
+                for character in text.chars() {
+                    append(&mut line, character, &mut echo)?;
+                }
+            }
+            Event::Key(key) => {
+                match key.kind {
+                    KeyEventKind::Release => continue,
+                    KeyEventKind::Press | KeyEventKind::Repeat => {}
+                }
+                match key.code {
+                    KeyCode::Enter => {
+                        echo(PromptLineEcho::Submit);
+                        if line.is_empty() {
+                            return Ok(Some(default.unwrap_or_default().to_owned()));
+                        }
+                        return Ok(Some(line));
+                    }
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Backspace => {
+                        if line.pop().is_some() {
+                            echo(PromptLineEcho::Erase);
+                        }
+                    }
+                    KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None);
+                    }
+                    KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None);
+                    }
+                    KeyCode::Char(character)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        append(&mut line, character, &mut echo)?;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2868,6 +2932,7 @@ mod tests {
                 super::PromptLineEcho::Text('3'),
                 super::PromptLineEcho::Text('1'),
                 super::PromptLineEcho::Text('m'),
+                super::PromptLineEcho::Submit,
             ]
         );
     }
