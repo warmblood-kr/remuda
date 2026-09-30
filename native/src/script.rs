@@ -159,7 +159,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "_pending_secret_events",
-        "Drain deferred secret-prompt results for the Lua tick.",
+        "Drain deferred secret-prompt results for the Lua tick. Any Lua code in this image, including MCP run_script, can read these secret events; the prompt protects terminal input and display, not code inside the image.",
         "_pending_secret_events() -> {{id, prompt_id, secret? | error?}...}",
     ),
     (
