@@ -170,10 +170,7 @@ fn main() -> ExitCode {
             .and_then(|word| remuda_native::packages::half_installed(word))
         {
             Some(message) => fail(message),
-            None => {
-                eprint!("{}", USAGE);
-                ExitCode::FAILURE
-            }
+            None => unknown_command(argv.first().copied().unwrap_or("")),
         },
     }
 }
@@ -215,6 +212,8 @@ remuda — a pty manager you can attach to
   remuda mod remove NAME          remove one installed mod
   remuda cluster                  show cluster status
   remuda cluster init             create this node's cluster identity
+  remuda cluster invite           invite another node
+  remuda cluster join             join another node's cluster
   remuda cluster nodes            list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster remote [node/session] open the read-only cluster tree
@@ -290,6 +289,8 @@ remuda — terminal orchestration for coding agents
   remuda mod remove NAME         remove a mod
   remuda cluster                 show cluster status
   remuda cluster init            create this node's cluster identity
+  remuda cluster invite           invite another node
+  remuda cluster join             join another node's cluster
   remuda cluster nodes           list local cluster membership
   remuda cluster revoke NODE [--yes] revoke a member locally
   remuda cluster remote [node/session] open the read-only cluster tree
@@ -305,7 +306,7 @@ Run `remuda mod list` for installed mods and `remuda doc` for the live Lua API.
 ";
 
 fn help_command() -> ExitCode {
-    eprint!("{USAGE}");
+    print!("{USAGE}");
     match remuda_native::packages::manifests() {
         Ok(mods) => {
             let commands: Vec<_> = mods
@@ -322,6 +323,78 @@ fn help_command() -> ExitCode {
         }
         Err(error) => fail(error),
     }
+}
+
+fn unknown_command(word: &str) -> ExitCode {
+    if word.starts_with("remuda-join-v1") {
+        eprintln!(
+            "remuda: that looks like a join line; run: remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
+        );
+    } else if is_command_word(word) {
+        match suggest_command(word) {
+            Some(suggestion) => {
+                eprintln!("remuda: unknown command '{word}'. Did you mean 'remuda {suggestion}'?")
+            }
+            None => {
+                eprintln!("remuda: unknown command '{word}'. Run 'remuda help' for commands.")
+            }
+        }
+    } else {
+        eprintln!("remuda: unknown command. Run 'remuda help' for commands.");
+    }
+    ExitCode::FAILURE
+}
+
+fn is_command_word(word: &str) -> bool {
+    !word.is_empty()
+        && word.len() <= 32
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn suggest_command(word: &str) -> Option<String> {
+    const CLUSTER_VERBS: &[&str] = &[
+        "nodes", "init", "invite", "join", "revoke", "remote", "listen", "control", "call",
+    ];
+    if CLUSTER_VERBS.contains(&word) {
+        return Some(format!("cluster {word}"));
+    }
+
+    const TOP_LEVEL_VERBS: &[&str] = &[
+        "run", "attach", "ls", "send", "resize", "stop", "mod", "doc", "repl", "lua", "exec",
+        "mcp", "upgrade", "cluster",
+    ];
+    closest_word(word, TOP_LEVEL_VERBS).map(str::to_owned)
+}
+
+fn closest_word<'a>(word: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let word_length = word.chars().count();
+    candidates
+        .iter()
+        .copied()
+        .map(|candidate| (levenshtein(word, candidate), candidate))
+        .filter(|(distance, _)| *distance <= 2 && *distance < word_length)
+        .min_by_key(|(distance, candidate)| (*distance, *candidate))
+        .map(|(_, candidate)| candidate)
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    let mut row: Vec<usize> = (0..=right.len()).collect();
+    for (i, left_char) in left.iter().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, right_char) in right.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (row[j] + 1)
+                .min(above + 1)
+                .min(diagonal + usize::from(left_char != right_char));
+            diagonal = above;
+        }
+    }
+    row[right.len()]
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -3141,6 +3214,29 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suggest_command_qualifies_cluster_verbs() {
+        for verb in [
+            "nodes", "init", "invite", "join", "revoke", "remote", "listen", "control", "call",
+        ] {
+            assert_eq!(suggest_command(verb), Some(format!("cluster {verb}")));
+        }
+    }
+
+    #[test]
+    fn suggest_command_uses_distance_for_top_level_verbs() {
+        assert_eq!(suggest_command("atach").as_deref(), Some("attach"));
+        assert_eq!(suggest_command("zzzz"), None);
+    }
+
+    #[test]
+    fn closest_word_uses_a_shorter_distance_and_breaks_ties_by_name() {
+        assert_eq!(closest_word("x", &["ls"]), None);
+        assert_eq!(closest_word("atach", &["attach"]), Some("attach"));
+        assert_eq!(closest_word("cot", &["cut", "bot"]), Some("bot"));
+        assert_eq!(suggest_command("nodes"), Some("cluster nodes".into()));
+    }
 
     #[test]
     fn write_timeout_has_a_user_facing_diagnostic() {
