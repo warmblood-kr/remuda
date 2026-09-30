@@ -4725,6 +4725,33 @@ fn another_client_eval_returns_while_a_one_second_timer_is_pending() {
 }
 
 #[test]
+fn queued_eval_is_serviced_between_due_timer_callbacks() {
+    let path = scratch("timer-batch");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            for _ = 1, 3 do
+              remuda.after(0.01, function()
+                while true do end
+              end)
+            end
+            return 'scheduled'
+        "#,
+    );
+
+    // Let the first callback start and the remaining timers become overdue,
+    // then queue ordinary work while the image is draining that due batch.
+    std::thread::sleep(Duration::from_millis(40));
+    let started = Instant::now();
+    assert_eq!(eval(&path, "return 'responsive'"), "responsive");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "queued eval was not serviced between due timer callbacks"
+    );
+}
+
+#[test]
 fn repeating_timer_keeps_firing_during_client_eval_traffic() {
     let path = scratch("lua-timer-client-traffic");
     let _daemon = daemon_at(&path);
