@@ -2965,35 +2965,56 @@ mod tests {
     }
 
     #[test]
-    fn escape_returns_from_remote_composer_to_the_read_only_view() {
-        let clock = ManualClock::new();
-        let source = FakeRemoteSource(Mutex::new(remote_snapshot(
-            RemoteState::Reachable,
-            Duration::ZERO,
-            Some(remote_screen("remote")),
-        )));
-        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
-        ui.remote_synced(&source);
-        ui.remote_input_enabled = true;
-        ui.select_target(Some("fp-laptop/build")).unwrap();
-        ui.enter_selected(clock.now());
-        assert!(ui.composer_focused);
+    fn escape_from_remote_composer_shows_live_action_footer() {
+        let make_ui = || {
+            let clock = ManualClock::new();
+            let source = FakeRemoteSource(Mutex::new(remote_snapshot(
+                RemoteState::Reachable,
+                Duration::ZERO,
+                Some(remote_screen("remote")),
+            )));
+            let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+            ui.remote_synced(&source);
+            ui.remote_input_enabled = true;
+            ui.select_target(Some("fp-laptop/build")).unwrap();
+            ui.enter_selected(clock.now());
+            assert!(ui.composer_focused);
+            let focused = ui.render(100, 24, "", &clock);
+            ui.key_event(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Esc,
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                clock.now(),
+            );
+            assert!(!ui.composer_focused);
+            (ui, clock, focused)
+        };
 
-        let focused = ui.render(100, 24, "", &clock);
+        let (_, clock, focused) = make_ui();
         assert!(focused.contains("Enter send · Ctrl-C clear · Esc list"));
 
-        ui.key_event(
-            crossterm::event::KeyEvent::new(
-                crossterm::event::KeyCode::Esc,
-                crossterm::event::KeyModifiers::NONE,
-            ),
-            clock.now(),
+        let (ui, _, _) = make_ui();
+        let footer = ui.render(100, 24, "", &clock);
+        assert!(footer.contains("Enter type · k keys · x close · q detach"));
+
+        let (mut ui, _, _) = make_ui();
+        ui.key(crossterm::event::KeyCode::Enter);
+        assert!(ui.composer_focused, "Enter should focus the line composer");
+
+        let (mut ui, _, _) = make_ui();
+        ui.key(crossterm::event::KeyCode::Char('k'));
+        assert!(ui.remote_keys_mode.is_some(), "k should enter keys mode");
+
+        let (mut ui, _, _) = make_ui();
+        ui.key(crossterm::event::KeyCode::Char('x'));
+        assert!(
+            ui.confirmation.prompt().is_some(),
+            "x should start close confirmation"
         );
 
-        assert!(!ui.composer_focused);
-        assert!(ui
-            .render(100, 24, "", &clock)
-            .contains("Remote session is read-only · q detach"));
+        let (mut ui, _, _) = make_ui();
+        assert!(ui.key(crossterm::event::KeyCode::Char('q')), "q should detach");
     }
 
     #[test]
