@@ -2,7 +2,7 @@
 
 Remote mode continues the existing Remuda TUI: the list stays on the left and the selected session stays on the right. The difference is that the left side becomes a virtual tree of nodes and their sessions, addressed as `node/session`. The selected remote screen keeps refreshing over short requests and survives network loss. There is no separate remote-client look. The name `control tower` remains reserved for a later composed multi-node control experience.
 
-The approved command tree is `remuda cluster init`, `remuda cluster join <line>`, `remuda cluster nodes`, `remuda cluster revoke <node>`, and `remuda cluster remote [node/session]`. These subcommands are not implemented yet. Example addresses, fingerprints, tokens, and output are illustrative.
+The command tree is `remuda cluster init`, `remuda cluster join [FINGERPRINT] <line>`, `remuda cluster nodes`, `remuda cluster revoke <node>`, and `remuda cluster remote [node/session]`. A terminal join may omit `FINGERPRINT`; outside a terminal, provide a fingerprint checked independently with the inviting machine. Example addresses, fingerprints, tokens, and output are illustrative.
 
 ## Journey 0: form a cluster
 
@@ -25,13 +25,14 @@ Fingerprint of this machine: SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= (the ot
 Next: after it joins, run `remuda cluster nodes` here to see it.
 ```
 
-The operator shares the printed command with the intended machine over a trusted channel. Its invitation expires in 10 minutes and can be used once. Before accepting the join, compare the separately printed fingerprint with `remuda cluster` on the inviting machine over an independent channel or screen. The fingerprint copied inside the join command is not an independent trust check. The joiner then registers its own public key. No public discovery or NAT traversal is implied; both nodes are expected to reach one another on the same VPN.
+The operator shares the printed command with the intended machine over a trusted channel. Its invitation expires in 10 minutes and can be used once. When the join line is pasted by itself in a terminal, Remuda shows the inviter address and fingerprint and asks for confirmation; compare that fingerprint with `remuda cluster` on the inviting machine over an independent channel or screen before answering yes. The fingerprint copied inside the join command is not an independent trust check. If stdin or stderr is not a terminal, pass a fingerprint checked independently with the inviter. The joiner then registers its own public key. No public discovery or NAT traversal is implied; both nodes are expected to reach one another on the same VPN.
 
 ```text
-$ remuda cluster join 'SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=' 'remuda-join-v1 100.80.0.12:7443 SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= a2V5LWV4YW1wbGU= eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
-Invitation fingerprint matches its included public key
-Joining cluster…
-Joined cluster as node: field-laptop
+$ remuda cluster join 'remuda-join-v1 100.80.0.12:7443 SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= a2V5LWV4YW1wbGU= eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
+Joining node-qmfzzty0 at 100.80.0.12:7443
+Fingerprint: SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=
+Check the inviting machine shows this fingerprint (run remuda cluster there). Continue? [y/N] y
+Joined node-qmfzzty0 (fingerprint SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=).
 Next: remuda cluster remote
 ```
 

@@ -330,7 +330,7 @@ fn help_command() -> ExitCode {
 fn unknown_command(word: &str) -> ExitCode {
     if word.starts_with("remuda-join-v1") {
         eprintln!(
-            "remuda: that looks like a join line; run: remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
+            "remuda: that looks like a join line; run: remuda cluster join [FINGERPRINT] 'remuda-join-v1 …' (FINGERPRINT required when not on a terminal)"
         );
     } else {
         let command_word = is_command_word(word);
@@ -537,11 +537,7 @@ fn parse_cluster_join(args: &[&str]) -> Result<ClusterCommand, String> {
             .position(|arg| arg.starts_with("remuda-join-v1"))
         {
             if remuda_native::cluster::join_line::JoinLine::decode(args[index]).is_err() {
-                let reason = if index == 0 {
-                    "quote the whole join line: remuda cluster join 'remuda-join-v1 …'"
-                } else {
-                    "quote the whole join line (it contains spaces): remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
-                };
+                let reason = "quote the whole join line (it contains spaces); FINGERPRINT is optional on a terminal: remuda cluster join [FINGERPRINT] 'remuda-join-v1 …'";
                 return Err(reason.into());
             }
         }
@@ -711,7 +707,7 @@ pub fn cluster_usage(verb: &str) -> String {
     match verb {
         "init" => "usage: remuda cluster init\nexample: remuda cluster init\n".into(),
         "invite" => format!("usage: remuda cluster invite --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})\nexample: remuda cluster invite --bind 192.168.1.20\n"),
-        "join" => format!("usage: remuda cluster join FINGERPRINT 'JOIN_LINE' [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})]\nexample: remuda cluster join 'SHA256:…' 'remuda-join-v1 …' --bind 192.168.1.20\n"),
+        "join" => format!("usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})]\nexample: remuda cluster join 'remuda-join-v1 …'\n"),
         "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n".into(),
         "revoke" => "usage: remuda cluster revoke NODE|FINGERPRINT [--yes]\nexample: remuda cluster revoke node-abcd1234\n".into(),
         "control" => "usage: remuda cluster control on|off\nexample: remuda cluster control off\n".into(),
@@ -1430,7 +1426,7 @@ mod cluster_cli_tests {
             actual,
             (
                 "join".into(),
-                "quote the whole join line (it contains spaces): remuda cluster join FINGERPRINT 'remuda-join-v1 …'".into()
+                "quote the whole join line (it contains spaces); FINGERPRINT is optional on a terminal: remuda cluster join [FINGERPRINT] 'remuda-join-v1 …'".into()
             )
         );
         assert!(!actual.1.contains(bearer), "{actual:?}");
@@ -1455,7 +1451,7 @@ mod cluster_cli_tests {
             actual,
             (
                 "join".into(),
-                "quote the whole join line: remuda cluster join 'remuda-join-v1 …'".into()
+                "quote the whole join line (it contains spaces); FINGERPRINT is optional on a terminal: remuda cluster join [FINGERPRINT] 'remuda-join-v1 …'".into()
             )
         );
         assert!(!actual.1.contains(bearer), "{actual:?}");
@@ -1491,6 +1487,10 @@ mod cluster_cli_tests {
             assert!(usage.contains("IP[:PORT]"), "{verb}: {usage}");
             assert!(usage.contains("default port 7441"), "{verb}: {usage}");
         }
+        assert_eq!(
+            cluster_usage("join"),
+            "usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port 7441)]\nexample: remuda cluster join 'remuda-join-v1 …'\n"
+        );
         let usage = cluster_usage("");
         for verb in [
             "init", "invite", "join", "nodes", "revoke", "control", "remote", "listen", "call",
