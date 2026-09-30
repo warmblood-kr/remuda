@@ -291,6 +291,7 @@ remuda — terminal orchestration for coding agents
                                  --mouse=false disables mouse handling (before or after NAME)
   remuda ls | send NAME TEXT     inspect or message sessions
   remuda resize NAME COLS ROWS   resize a session (cols 20..1000, rows 24..500)
+  remuda upgrade [--channel stable|nightly]  replace the CLI binary
   remuda stop [-f] [--yes] [--i-am-inside]  stop the daemon (sessions are lost)
 
   remuda mod install OWNER/REPO  install a mod from GitHub
@@ -2748,7 +2749,15 @@ fn prepare_command(argv: &[&str], path: &Path) -> Result<Option<String>, String>
 /// budget. This one talks to no daemon — it replaces this very binary.
 fn run_upgrade(args: &[&str]) -> ExitCode {
     match upgrade_channel(args).and_then(dist::upgrade) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => {
+            eprintln!(
+                "The running daemon and its sessions keep using the old version until you run `remuda stop` (that ends those sessions); the next remuda command starts the new version."
+            );
+            eprintln!(
+                "Next: run `remuda stop` when your sessions can end, then `remuda --version` to check the installed version."
+            );
+            ExitCode::SUCCESS
+        }
         Err(e) => fail(e),
     }
 }

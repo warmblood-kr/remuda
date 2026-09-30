@@ -226,7 +226,18 @@ fn upgrade_explains_daemon_and_session_lifecycle() {
         stderr.contains("session"),
         "missing session behavior: {stderr}"
     );
-    assert!(stderr.contains("Next:"), "missing next step: {stderr}");
+    assert!(
+        stderr.contains("until you run `remuda stop` (that ends those sessions)")
+            && stderr.contains("the next remuda command starts the new version"),
+        "missing daemon/session lifecycle: {stderr}"
+    );
+    let next = stderr.lines().last().unwrap_or_default();
+    assert!(
+        next.starts_with("Next:")
+            && next.contains("remuda stop")
+            && next.contains("remuda --version"),
+        "missing concrete next step: {stderr}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

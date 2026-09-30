@@ -85,7 +85,7 @@ The butler spawns a lead; a worker can spawn its own workers (cascading).
 No stable release has been published yet (see [Channels](#channels) below),
 so install from `nightly` — every commit on `main`:
 
-**Linux and macOS** (x86_64, and Apple Silicon):
+**Linux** (x86_64) and **macOS** (Apple Silicon/aarch64):
 
 ```sh
 curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nightly sh
@@ -94,6 +94,9 @@ curl -fsSL https://warmblood-kr.github.io/remuda/install.sh | REMUDA_CHANNEL=nig
 It downloads a signed-by-checksum tarball, verifies it against the release's
 `SHA256SUMS`, and lands `remuda` in `~/.local/bin`. Set `REMUDA_INSTALL_DIR` to
 put it elsewhere.
+
+Nightly does not publish an ARM Linux (`aarch64-linux`) or Intel Mac
+(`x86_64-apple-darwin`) binary; build from source on those platforms.
 
 **Windows** (x86_64), in PowerShell:
 
