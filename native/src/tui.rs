@@ -1027,7 +1027,7 @@ fn is_detach(key: KeyEvent) -> bool {
 /// A keypress as the bytes a terminal would have sent, or `None` for a key we
 /// cannot spell — refused rather than sent as an empty burst, the rule
 /// `remuda_core::keys` already states. The spelling is that module's, reused.
-fn to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+pub(crate) fn to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     let base = match key.code {
         KeyCode::Char(c) => c.to_string(),
         KeyCode::Enter => "RET".into(),

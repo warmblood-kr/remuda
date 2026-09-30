@@ -102,6 +102,7 @@ pub struct ClusterUi {
     remote_expanded: HashSet<String>,
     remote_selected: Option<RemoteSelection>,
     remote_active: Option<RemoteSelection>,
+    remote_keys_mode: Option<RemoteSelection>,
     // (registry fingerprint, display label, session name, instance id)
     remote_composer_target: Option<(String, String, String, String)>,
     partial_input_confirm_target: Option<(String, String, String, String)>,
@@ -186,6 +187,7 @@ impl ClusterUi {
             remote_expanded: HashSet::new(),
             remote_selected: None,
             remote_active: None,
+            remote_keys_mode: None,
             remote_composer_target: None,
             partial_input_confirm_target: None,
             remote_input_enabled: false,
@@ -800,6 +802,12 @@ impl ClusterUi {
             }
             return false;
         }
+        if let Some(target) = self.remote_keys_mode.clone() {
+            if let Some(bytes) = crate::tui::to_bytes(event) {
+                self.enqueue_remote_key_bytes(&target, bytes, now);
+            }
+            return false;
+        }
         if self.composer_focused {
             self.handle_composer_event(event, now);
             return false;
@@ -817,6 +825,7 @@ impl ClusterUi {
                 self.attention_only = !self.attention_only;
                 self.select_first_visible();
             }
+            Char('k') if self.query.is_none() => self.enter_remote_keys_mode(now),
             Char(ch) if self.query.is_some() => {
                 if let Some(query) = self.query.as_mut() {
                     query.push(ch);
@@ -841,6 +850,89 @@ impl ClusterUi {
             _ => {}
         }
         false
+    }
+
+    fn enter_remote_keys_mode(&mut self, now: Duration) {
+        let TreeSelection::RemoteSession {
+            node,
+            name,
+            instance_id,
+        } = self.current_tree_selection()
+        else {
+            return;
+        };
+        let target = RemoteSelection::Session {
+            node,
+            name,
+            instance_id,
+        };
+        let Some((snapshot, session)) = self.remote_session(&target) else {
+            self.notice = Some(("remote session is no longer listed".into(), now));
+            return;
+        };
+        if !self.remote_input_enabled || !session.alive {
+            self.notice = Some((
+                format!(
+                    "remote input disabled: {}/{} is unavailable",
+                    snapshot.name, session.name
+                ),
+                now,
+            ));
+            return;
+        }
+        self.remote_active = Some(target.clone());
+        self.remote_keys_mode = Some(target);
+        self.composer_focused = false;
+        self.set_remote_composer_target(None, now);
+        self.notice = None;
+    }
+
+    fn enqueue_remote_key_bytes(
+        &mut self,
+        target: &RemoteSelection,
+        bytes: Vec<u8>,
+        now: Duration,
+    ) {
+        let RemoteSelection::Session {
+            node,
+            name: _,
+            instance_id,
+        } = target
+        else {
+            return;
+        };
+        if self.remote_control_disabled.contains(node) {
+            return;
+        }
+        let Some((node_label, session_name, wire_name, alive)) =
+            self.remote_session(target).map(|(snapshot, session)| {
+                (
+                    snapshot.name.clone(),
+                    session.name.clone(),
+                    session.wire_name.clone(),
+                    session.alive,
+                )
+            })
+        else {
+            self.remote_keys_mode = None;
+            self.notice = Some(("remote session is no longer listed".into(), now));
+            return;
+        };
+        if !alive {
+            self.remote_keys_mode = None;
+            self.notice = Some((format!("{node_label}/{session_name} has ended"), now));
+            return;
+        }
+        if let Err(error) = self.input_sender.enqueue_remote(
+            &mut self.input_queue,
+            node,
+            &wire_name,
+            instance_id,
+            bytes,
+            Instant::now(),
+        ) {
+            self.notice = Some((format!("remote key not queued: {error}"), now));
+        }
     }
 
     fn handle_close_key(&mut self, now: Duration) {
@@ -1996,6 +2088,22 @@ mod tests {
         ] {
             key_event(&mut ui, code, modifiers, clock.now());
         }
+        let queued = ui
+            .input_queue
+            .items()
+            .map(|batch| batch.bytes.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            queued,
+            [
+                b"\x1b".to_vec(),
+                b"\x03".to_vec(),
+                b"\x1b[A".to_vec(),
+                b"\t".to_vec(),
+                b"\r".to_vec(),
+                b"y".to_vec(),
+            ]
+        );
         ui.start_pending(clock.now());
         ui.send_pending(
             std::path::Path::new("unused"),
