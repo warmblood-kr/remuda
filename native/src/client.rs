@@ -1904,9 +1904,9 @@ mod tests {
     use crate::ipc;
     #[cfg(unix)]
     use interprocess::local_socket::traits::Listener as _;
-    #[cfg(unix)]
-    use remuda_core::protocol::Request;
-    use remuda_core::protocol::Response;
+    use remuda_core::protocol::{
+        Request, Response, SecretBytes, SECRET_ANSWER_MAX_BYTES, SECRET_ANSWER_MAX_FRAME_BYTES,
+    };
     use std::path::Path;
     #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2706,5 +2706,68 @@ mod tests {
             terminal.operations(),
             vec!["raw:on", "paste:on", "paste:off", "raw:off"]
         );
+    }
+
+    #[test]
+    fn secret_answer_and_prompt_round_trip() {
+        let answer = Request::SecretAnswer {
+            id: 19,
+            secret: Some(SecretBytes::new(b"S3CRET-probe".to_vec())),
+        };
+        let answer_wire = serde_json::to_vec(&answer).unwrap();
+        let decoded_answer: Request = serde_json::from_slice(&answer_wire).unwrap();
+        assert_eq!(decoded_answer, answer);
+
+        let prompt = Response::PromptSecret {
+            id: 19,
+            label: "Bot password".into(),
+        };
+        let prompt_wire = serde_json::to_vec(&prompt).unwrap();
+        let decoded_prompt: Response = serde_json::from_slice(&prompt_wire).unwrap();
+        assert_eq!(decoded_prompt, prompt);
+    }
+
+    #[test]
+    fn secret_answer_at_the_byte_cap_fits_its_serialized_frame_limit() {
+        let answer = Request::SecretAnswer {
+            id: 7,
+            secret: Some(SecretBytes::new(vec![0xff; SECRET_ANSWER_MAX_BYTES])),
+        };
+        let mut frame = serde_json::to_vec(&answer).unwrap();
+        frame.push(b'\n');
+
+        let parsed: serde_json::Value = serde_json::from_slice(&frame[..frame.len() - 1]).unwrap();
+        let encoded_secret = parsed["SecretAnswer"]["secret"]
+            .as_str()
+            .expect("secret answer uses a compact string encoding");
+        assert_eq!(encoded_secret.len(), 5_464);
+        assert_eq!(frame.len(), 5_502);
+        assert!(frame.len() <= SECRET_ANSWER_MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn secret_answer_rejects_oversized_payload_frames() {
+        let oversized_answer = Request::SecretAnswer {
+            id: 7,
+            secret: Some(SecretBytes::new(vec![0; SECRET_ANSWER_MAX_BYTES + 1])),
+        };
+        assert!(serde_json::to_vec(&oversized_answer).is_err());
+
+        let encoded_oversized_secret = format!("{}=", "A".repeat(5_463));
+        let frame =
+            format!(r#"{{"SecretAnswer":{{"id":7,"secret":"{encoded_oversized_secret}"}}}}"#);
+        assert!(serde_json::from_str::<Request>(&frame).is_err());
+    }
+
+    #[test]
+    fn secret_answer_debug_redacts_secret_bytes() {
+        let answer = Request::SecretAnswer {
+            id: 7,
+            secret: Some(SecretBytes::new(b"S3CRET-probe".to_vec())),
+        };
+
+        let debug = format!("{answer:?}");
+        assert!(!debug.contains("S3CRET-probe"));
+        assert!(debug.contains("REDACTED"));
     }
 }

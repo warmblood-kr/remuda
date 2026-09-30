@@ -1523,6 +1523,11 @@ fn handle_request(
             let caller = caller_context(&stream, registry);
             handle_eval(stream, reader, image, &code, name.as_deref(), caller)
         }
+
+        Request::SecretAnswer { .. } => reply(
+            &stream,
+            &Response::error("secret answer has no outstanding prompt"),
+        ),
     }
 }
 

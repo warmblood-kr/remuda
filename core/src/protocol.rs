@@ -38,6 +38,144 @@ pub enum ListenerStatus {
     Failed(String),
 }
 
+/// Maximum secret payload accepted by [`Request::SecretAnswer`].
+pub const SECRET_ANSWER_MAX_BYTES: usize = 4 * 1024;
+
+/// Maximum newline-delimited frame carrying a [`Request::SecretAnswer`].
+pub const SECRET_ANSWER_MAX_FRAME_BYTES: usize = 8 * 1024;
+
+/// Secret bytes encoded as base64 on the wire and redacted from debug output.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretBytes(#[serde(with = "secret_bytes_base64")] Vec<u8>);
+
+impl SecretBytes {
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl core::fmt::Debug for SecretBytes {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("SecretBytes([REDACTED])")
+    }
+}
+
+mod secret_bytes_base64 {
+    use super::SECRET_ANSWER_MAX_BYTES;
+    use serde::de::Error as _;
+    use serde::ser::Error as _;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const MAX_ENCODED_BYTES: usize = SECRET_ANSWER_MAX_BYTES.div_ceil(3) * 4;
+
+    pub fn serialize<S>(bytes: &Vec<u8>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if bytes.len() > SECRET_ANSWER_MAX_BYTES {
+            return Err(S::Error::custom("secret answer exceeds 4096 bytes"));
+        }
+        serializer.serialize_str(&encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        decode(&encoded).map_err(D::Error::custom)
+    }
+
+    fn encode(bytes: &[u8]) -> String {
+        let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let first = chunk[0];
+            let second = chunk.get(1).copied();
+            let third = chunk.get(2).copied();
+            encoded.push(ALPHABET[(first >> 2) as usize] as char);
+            encoded
+                .push(ALPHABET[((first & 0x03) << 4 | second.unwrap_or(0) >> 4) as usize] as char);
+            match (second, third) {
+                (None, _) => {
+                    encoded.push('=');
+                    encoded.push('=');
+                }
+                (Some(second), None) => {
+                    encoded.push(ALPHABET[((second & 0x0f) << 2) as usize] as char);
+                    encoded.push('=');
+                }
+                (Some(second), Some(third)) => {
+                    encoded.push(ALPHABET[((second & 0x0f) << 2 | third >> 6) as usize] as char);
+                    encoded.push(ALPHABET[(third & 0x3f) as usize] as char);
+                }
+            }
+        }
+        encoded
+    }
+
+    fn decode_digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+
+    fn decode(encoded: &str) -> Result<Vec<u8>, &'static str> {
+        let input = encoded.as_bytes();
+        if input.len() % 4 != 0 || input.len() > MAX_ENCODED_BYTES {
+            return Err("invalid or oversized secret encoding");
+        }
+        let padding = if input.ends_with(b"==") {
+            2
+        } else if input.ends_with(b"=") {
+            1
+        } else {
+            0
+        };
+        let decoded_len = (input.len() / 4) * 3 - padding;
+        if decoded_len > SECRET_ANSWER_MAX_BYTES {
+            return Err("secret answer exceeds 4096 bytes");
+        }
+
+        let mut decoded = Vec::with_capacity(decoded_len);
+        for (chunk_index, chunk) in input.chunks_exact(4).enumerate() {
+            let is_last = chunk_index + 1 == input.len() / 4;
+            let first = decode_digit(chunk[0]).ok_or("invalid secret encoding")?;
+            let second = decode_digit(chunk[1]).ok_or("invalid secret encoding")?;
+            decoded.push(first << 2 | second >> 4);
+            if chunk[2] == b'=' {
+                if !is_last || chunk[3] != b'=' || second & 0x0f != 0 {
+                    return Err("invalid secret encoding");
+                }
+                continue;
+            }
+            let third = decode_digit(chunk[2]).ok_or("invalid secret encoding")?;
+            decoded.push(second << 4 | third >> 2);
+            if chunk[3] == b'=' {
+                if !is_last || third & 0x03 != 0 {
+                    return Err("invalid secret encoding");
+                }
+                continue;
+            }
+            let fourth = decode_digit(chunk[3]).ok_or("invalid secret encoding")?;
+            decoded.push(third << 6 | fourth);
+        }
+        Ok(decoded)
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub enum Request {
     /// Every session this node holds.
@@ -168,6 +306,11 @@ pub enum Request {
         /// because only the caller knows where the source came from.
         name: Option<String>,
     },
+    /// Answer an outstanding secret prompt on this pending word's connection.
+    SecretAnswer {
+        id: u32,
+        secret: Option<SecretBytes>,
+    },
 }
 
 /// One element of a [`Request::Feed`] act: bytes, or a pause before the next
@@ -271,6 +414,11 @@ pub enum Response {
     },
     /// Current state of the daemon-owned cluster listener.
     ClusterListenerStatus(ListenerStatus),
+    /// Ask the client on this connection to collect a secret from its terminal.
+    PromptSecret {
+        id: u32,
+        label: String,
+    },
 }
 
 impl Response {

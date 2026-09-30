@@ -1432,6 +1432,9 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         | Response::ClusterListenerStatus(_) => Err(mlua::Error::runtime(
             "cluster control responses are not exposed to scripts",
         )),
+        Response::PromptSecret { .. } => Err(mlua::Error::runtime(
+            "secret prompts are not supported by this client path",
+        )),
     }
 }
 
