@@ -6,25 +6,31 @@ The approved command tree is `remuda cluster init`, `remuda cluster join <line>`
 
 ## Journey 0: form a cluster
 
-On the first machine, initialize a cluster of one. `remuda cluster init` creates the node key pair and starts the cluster endpoint on the VPN address. Bare `remuda cluster` shows cluster status after initialization, or the init hint when no cluster exists. Initialization prints the address, public-key fingerprint, and a short-lived, single-use join line:
+On the first machine, initialize a cluster of one. `remuda cluster init` creates the node key pair. Bare `remuda cluster` shows cluster status after initialization, or the init hint when no cluster exists. Initialization prints the node and public-key fingerprint, then points to the next step. Invite prints one complete command to paste on the other machine:
 
 ```text
 $ remuda cluster init
 Cluster initialized
 Node: studio
-Address: 100.80.0.12:7443
 Fingerprint: SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=
-Join line (expires in 10 minutes; single use):
-remuda-join://100.80.0.12:7443?fingerprint=SHA256%3AQmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU%3D&token=eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu
+Next: remuda cluster invite (on this machine), or join an existing cluster with the command another machine's invite prints.
+
+$ remuda cluster invite --bind 100.80.0.12:7443
+Invitation for one machine, valid 10 minutes. Run this on the other machine:
+
+  remuda cluster join 'SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=' 'remuda-join-v1 100.80.0.12:7443 SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= a2V5LWV4YW1wbGU= eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
+
+Next: after it joins, run `remuda cluster nodes` here to see it.
 ```
 
-The operator shares the join line with the intended machine over a trusted channel. The line is a bearer secret: it is shown once, expires quickly, and is consumed once. On the joining machine, run `remuda cluster join <line>` with the received line. The first node's fingerprint is pinned before the secure channel is established, then the joiner registers its own public key. No public discovery or NAT traversal is implied; both nodes are expected to reach one another on the same VPN.
+The operator shares the printed command with the intended machine over a trusted channel. Its invitation expires in 10 minutes and can be used once. On the joining machine, paste the command as printed. The first node's fingerprint is pinned before the secure channel is established, then the joiner registers its own public key. No public discovery or NAT traversal is implied; both nodes are expected to reach one another on the same VPN.
 
 ```text
-$ remuda cluster join 'remuda-join://100.80.0.12:7443?fingerprint=SHA256%3AQmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU%3D&token=eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
+$ remuda cluster join 'SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=' 'remuda-join-v1 100.80.0.12:7443 SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= a2V5LWV4YW1wbGU= eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
 Pinned cluster node fingerprint verified
 Joining cluster…
 Joined cluster as node: field-laptop
+Next: remuda cluster remote
 ```
 
 Every member knows the public keys of every cluster member through a replicated, signed `authorized_nodes` list. Any member can admit or revoke a node; membership changes are pushed to peers, and nodes fetch the current list at startup. Operators can inspect membership and revoke a node key from any member:
