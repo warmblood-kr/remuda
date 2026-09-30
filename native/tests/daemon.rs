@@ -173,19 +173,9 @@ fn daemon_keeps_answering_ls_when_cluster_listener_bind_fails() {
     std::fs::create_dir_all(&home).expect("create isolated HOME");
     std::fs::create_dir_all(&state).expect("create isolated state home");
 
-    let initialized = Command::new(env!("CARGO_BIN_EXE_remuda"))
-        .args(["cluster", "init"])
-        .env("HOME", &home)
-        .env("XDG_STATE_HOME", &state)
-        .env("LOCALAPPDATA", &state)
-        .env("USERPROFILE", &home)
-        .output()
-        .expect("initialize isolated cluster");
-    assert!(
-        initialized.status.success(),
-        "cluster init failed: {}",
-        String::from_utf8_lossy(&initialized.stderr)
-    );
+    let environment = IsolatedClusterStateEnvironment::set(&home, &state);
+    remuda_native::cluster::init().expect("initialize isolated cluster state");
+    drop(environment);
     let cluster_dir = state.join("remuda/cluster");
     remuda_native::cluster::listener_config::write_at(
         &cluster_dir,
@@ -228,7 +218,6 @@ impl Drop for RemoveDirectoryOnDrop {
     }
 }
 
-#[cfg(not(windows))]
 struct ClusterListenerTestDaemon {
     _daemon: Daemon,
     _cleanup: RemoveDirectoryOnDrop,
@@ -237,10 +226,8 @@ struct ClusterListenerTestDaemon {
     state: PathBuf,
 }
 
-#[cfg(not(windows))]
 static CLUSTER_LISTENER_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(not(windows))]
 struct IsolatedClusterStateEnvironment {
     _lock: std::sync::MutexGuard<'static, ()>,
     old_home: Option<std::ffi::OsString>,
@@ -249,7 +236,6 @@ struct IsolatedClusterStateEnvironment {
     old_user_profile: Option<std::ffi::OsString>,
 }
 
-#[cfg(not(windows))]
 impl IsolatedClusterStateEnvironment {
     fn set(home: &Path, state: &Path) -> Self {
         let lock = CLUSTER_LISTENER_ENV_LOCK
@@ -270,7 +256,6 @@ impl IsolatedClusterStateEnvironment {
     }
 }
 
-#[cfg(not(windows))]
 impl Drop for IsolatedClusterStateEnvironment {
     fn drop(&mut self) {
         match self.old_home.take() {
@@ -297,8 +282,6 @@ fn cluster_listener_test_daemon(
     tag: &str,
     config: Option<remuda_native::cluster::listener_config::ListenerConfig>,
 ) -> ClusterListenerTestDaemon {
-    use std::process::Command;
-
     static NEXT_LISTENER_TEST: AtomicU64 = AtomicU64::new(1);
     let temp_root = if cfg!(target_os = "macos") {
         PathBuf::from("/private/tmp")
@@ -320,20 +303,9 @@ fn cluster_listener_test_daemon(
     std::fs::create_dir(&home).expect("create isolated listener HOME");
     std::fs::create_dir(&state).expect("create isolated listener state home");
 
-    let initialized = Command::new(env!("CARGO_BIN_EXE_remuda"))
-        .args(["cluster", "init"])
-        .env("HOME", &home)
-        .env("XDG_STATE_HOME", &state)
-        .env("LOCALAPPDATA", &state)
-        .env("USERPROFILE", &home)
-        .env_remove("XDG_CONFIG_HOME")
-        .output()
-        .expect("initialize isolated cluster state");
-    assert!(
-        initialized.status.success(),
-        "cluster init failed: {}",
-        String::from_utf8_lossy(&initialized.stderr)
-    );
+    let environment = IsolatedClusterStateEnvironment::set(&home, &state);
+    remuda_native::cluster::init().expect("initialize isolated cluster state");
+    drop(environment);
     if let Some(config) = config {
         remuda_native::cluster::listener_config::write_at(&state.join("remuda/cluster"), &config)
             .expect("write isolated listener configuration");

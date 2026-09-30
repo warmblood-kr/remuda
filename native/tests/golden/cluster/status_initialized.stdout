@@ -4,5 +4,5 @@ Members: 1
 Authority: Any admitted member can admit new keys and revoke any member cluster-wide (see #282).
 Remote control: enabled
 Trust if enabled: a compromised admitted node can type into and close every session.
-Listener: off (daemon not running)
+Listener: on 192.168.100.100:7441 (auto)
 Next: remuda cluster invite

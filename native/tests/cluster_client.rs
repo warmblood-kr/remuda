@@ -36,13 +36,6 @@ impl PrivateNode {
         fs::create_dir_all(&state).unwrap();
         fs::create_dir_all(&home).unwrap();
         let name = format!("{}-{serial}", &label[..1]);
-        let init = node_command(&name, &runtime, &root, &state, &home)
-            .args(["cluster", "init"])
-            .output()
-            .expect("run cluster init in isolated state");
-        assert!(init.status.success(), "cluster init failed: {init:?}");
-        let key = fs::read(state.join("remuda/cluster/identity.key")).unwrap();
-        assert_eq!(key.len(), 64);
         let daemon = node_command(&name, &runtime, &root, &state, &home)
             .args(["daemon"])
             .stdin(Stdio::null())
@@ -55,11 +48,20 @@ impl PrivateNode {
             runtime,
             state,
             name,
-            private: key[..32].to_vec(),
-            public: key[32..].to_vec(),
+            private: Vec::new(),
+            public: Vec::new(),
             daemon,
         };
         node.wait_ready();
+        let init = node_command(&node.name, &node.runtime, &node.root, &node.state, &home)
+            .args(["cluster", "init", "--no-listen"])
+            .output()
+            .expect("run cluster init in isolated state");
+        assert!(init.status.success(), "cluster init failed: {init:?}");
+        let key = fs::read(node.state.join("remuda/cluster/identity.key")).unwrap();
+        assert_eq!(key.len(), 64);
+        node.private = key[..32].to_vec();
+        node.public = key[32..].to_vec();
         node
     }
 

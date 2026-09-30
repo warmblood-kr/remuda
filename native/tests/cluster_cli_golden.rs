@@ -428,7 +428,9 @@ fn normalizer_self_test_removes_token_shaped_material() {
 
 #[test]
 fn cluster_cli_output_matches_goldens() {
-    let _auto_listener_lock = AUTO_LISTENER_TEST_LOCK.lock().unwrap();
+    let _auto_listener_lock = AUTO_LISTENER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let scratch = Scratch::new();
     let _daemon = start_daemon(&scratch);
     golden_uninitialized_cases(&scratch);
@@ -587,6 +589,9 @@ fn golden_remaining_verb_errors(scratch: &Scratch) {
 
 #[test]
 fn cluster_join_and_peer_call_outputs_match_goldens() {
+    let _auto_listener_lock = AUTO_LISTENER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     use remuda_native::cluster::Registry;
 
     let inviter = Scratch::new();
@@ -778,6 +783,9 @@ fn d4_invite_refuses_a_failed_listener_without_printing_a_join_line() {
 
 #[test]
 fn d4_join_sends_the_joiners_bound_address_to_the_issuer_registry() {
+    let _auto_listener_lock = AUTO_LISTENER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     use remuda_native::cluster::{encoding, Registry};
 
     let inviter = Scratch::new();
@@ -822,7 +830,9 @@ fn d4_join_sends_the_joiners_bound_address_to_the_issuer_registry() {
 
 #[test]
 fn d4_init_prints_the_listener_address_and_exposure_note() {
-    let _auto_listener_lock = AUTO_LISTENER_TEST_LOCK.lock().unwrap();
+    let _auto_listener_lock = AUTO_LISTENER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let scratch = Scratch::new();
     let _daemon = start_daemon(&scratch);
     let initialized = scratch.run(&["cluster", "init"]);

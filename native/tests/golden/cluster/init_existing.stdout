@@ -1,4 +1,5 @@
 Already initialized
 Node: <NODE>
 Fingerprint: <FINGERPRINT>
+Listening on 192.168.100.100:7441 (only admitted machines can connect; turn off: remuda cluster listen --off)
 Next: remuda cluster invite (on this machine), or join an existing cluster with the command another machine's invite prints.
