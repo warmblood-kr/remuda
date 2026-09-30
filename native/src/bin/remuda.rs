@@ -350,8 +350,7 @@ fn unknown_command(word: &str) -> ExitCode {
                     .iter()
                     .map(String::as_str)
                     .collect::<Vec<_>>();
-                closest_word(word, &installed_mod_name_refs)
-                    .map(|name| format!("remuda exec {name}"))
+                closest_word(word, &installed_mod_name_refs).map(|name| format!("remuda {name}"))
             })
         } else {
             None

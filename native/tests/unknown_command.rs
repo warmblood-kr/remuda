@@ -69,16 +69,16 @@ fn unknown_name_can_suggest_an_installed_mod() {
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);
-    let mod_dir = dir.join("data/remuda/mods/sample");
+    let mod_dir = dir.join("data/remuda/mods/butler");
     fs::create_dir_all(&mod_dir).unwrap();
     fs::write(
         mod_dir.join("extension.toml"),
-        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\n",
+        "name = \"butler\"\nentry = \"packages/butler/init.lua\"\napi = \"remuda-lua-v1\"\n",
     )
     .unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_remuda"))
-        .arg("sampel")
+        .arg("butlr")
         .env("REMUDA_RUNTIME_DIR", &dir)
         .env("XDG_DATA_HOME", dir.join("data"))
         .env("XDG_CONFIG_HOME", dir.join("config"))
@@ -94,8 +94,8 @@ fn unknown_name_can_suggest_an_installed_mod() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
-        "remuda: no command or mod named sampel.\n\
-         Did you mean: remuda exec sample?\n\
-         Next: if sampel is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list.\n"
+        "remuda: no command or mod named butlr.\n\
+         Did you mean: remuda butler?\n\
+         Next: if butlr is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list.\n"
     );
 }
