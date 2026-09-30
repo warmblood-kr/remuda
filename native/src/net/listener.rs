@@ -1092,10 +1092,12 @@ fn handle_unknown_peer_join(
         .verify_consume_with(&request.join.token, || {
             (state.admit_join)(&opened.peer_static, request.join.endpoint.as_deref())
         });
-    let response = if result.is_ok() {
-        b"{\"joined\":true}".as_slice()
-    } else {
-        b"{\"joined\":false}".as_slice()
+    let response = match &result {
+        Ok(_) => b"{\"joined\":true}".as_slice(),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            b"{\"joined\":false,\"retry\":true}".as_slice()
+        }
+        Err(_) => b"{\"joined\":false}".as_slice(),
     };
     send_encrypted_response(stream, opened, response);
     if result.is_ok() {
@@ -1397,10 +1399,16 @@ mod tests {
         }
 
         fn exchange(&self, sealed: frame::SealedRequest) -> (u16, Vec<u8>) {
+            self.exchange_with_timeout(sealed, Duration::from_secs(2))
+        }
+
+        fn exchange_with_timeout(
+            &self,
+            sealed: frame::SealedRequest,
+            timeout: Duration,
+        ) -> (u16, Vec<u8>) {
             let mut stream = TcpStream::connect(self.address).unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
+            stream.set_read_timeout(Some(timeout)).unwrap();
             write_http_request(&mut stream, &sealed.message);
             let (status, body) = read_http_response(&mut stream).unwrap();
             if status == 200 {
@@ -2753,6 +2761,105 @@ mod tests {
             server.exchange(sealed),
             (200, b"{\"joined\":true}".to_vec())
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn valid_join_waits_for_lock_contention_and_timeout_keeps_token_usable() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let peer = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let admissions = Arc::new(AtomicUsize::new(0));
+        let admitted = admissions.clone();
+        let server = SocketTestServer::start_with_admitter(
+            responder.private,
+            responder.public,
+            Arc::new(|_| Err(permission_denied())),
+            Arc::new(|_, _| panic!("Join must not reach daemon dispatch")),
+            ConnectionLimits {
+                outer_hold: Duration::from_secs(8),
+                post_dispatch_hold: Duration::from_secs(8),
+                idle_read: Duration::from_secs(8),
+                total_read: Duration::from_secs(8),
+            },
+            Arc::new(move |_, _| {
+                admitted.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        );
+        let token_store =
+            JoinTokenStore::open_at(&server.state_dir, Arc::new(crate::SystemWallClock::new()))
+                .unwrap();
+
+        let mint_request = || {
+            let minted = token_store.mint().unwrap();
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "join": { "token": minted.token.as_str() }
+            }))
+            .unwrap();
+            (minted, payload)
+        };
+        let hold_lock = || {
+            let path = server.state_dir.join("identity.lock");
+            let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let holder = std::thread::spawn(move || {
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .open(path)
+                    .unwrap();
+                assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+            });
+            locked_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            (holder, release_tx)
+        };
+
+        let (_, short_wait_payload) = mint_request();
+        let (short_wait_holder, release_short_wait) = hold_lock();
+        let release_short_wait = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            release_short_wait.send(()).unwrap();
+        });
+        let short_wait = sealed_payload_request(&peer, &server, &short_wait_payload);
+        assert_eq!(
+            server.exchange_with_timeout(short_wait, Duration::from_secs(2)),
+            (200, b"{\"joined\":true}".to_vec())
+        );
+        release_short_wait.join().unwrap();
+        short_wait_holder.join().unwrap();
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+
+        let (timed_token, timed_payload) = mint_request();
+        let (timeout_holder, release_timeout) = hold_lock();
+        let timed_request = sealed_payload_request(&peer, &server, &timed_payload);
+        assert_eq!(
+            server.exchange_with_timeout(timed_request, Duration::from_secs(7)),
+            (200, b"{\"joined\":false,\"retry\":true}".to_vec())
+        );
+        release_timeout.send(()).unwrap();
+        timeout_holder.join().unwrap();
+        assert_eq!(admissions.load(Ordering::SeqCst), 1);
+
+        let retry = serde_json::to_vec(&serde_json::json!({
+            "join": { "token": timed_token.token.as_str() }
+        }))
+        .unwrap();
+        let retry = sealed_payload_request(&peer, &server, &retry);
+        assert_eq!(server.exchange(retry), (200, b"{\"joined\":true}".to_vec()));
+        assert_eq!(admissions.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(unix)]

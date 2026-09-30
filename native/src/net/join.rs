@@ -1,12 +1,21 @@
 //! Send the one-shot encrypted Join frame to a pinned issuer.
 
 use crate::cluster::join_line::JoinLine;
+use serde::Deserialize;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::net::TcpStream;
 use std::time::Duration;
 
 const MAX_JOIN_RESPONSE_BYTES: usize = 64 * 1024;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JoinResponse {
+    joined: bool,
+    #[serde(default)]
+    retry: bool,
+}
 
 /// Complete a Join exchange after the caller has checked the separate pin.
 pub fn join(
@@ -54,12 +63,7 @@ pub fn join(
         ));
     }
     let opened = super::frame::open_response(sealed, &response[split + 4..])?;
-    if opened != b"{\"joined\":true}" {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "join was refused",
-        ));
-    }
+    check_join_response(&opened)?;
     crate::cluster::record_join_success_local(
         &invitation.issuer_static_pubkey,
         invitation.issuer_addr,
@@ -70,6 +74,27 @@ pub fn join(
         &invitation.issuer_static_pubkey,
         initiator_private,
     )?;
+    Ok(())
+}
+
+fn check_join_response(opened: &[u8]) -> io::Result<()> {
+    let join_response: JoinResponse =
+        serde_json::from_slice(opened).map_err(|_| invalid_join_response())?;
+    if join_response.retry && !join_response.joined {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "join issuer is busy; retry",
+        ));
+    }
+    if !join_response.joined {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "join was refused",
+        ));
+    }
+    if join_response.retry {
+        return Err(invalid_join_response());
+    }
     Ok(())
 }
 
@@ -105,5 +130,12 @@ mod tests {
             response
         );
         assert!(read_join_response(Cursor::new(vec![b'x'; MAX_JOIN_RESPONSE_BYTES + 1])).is_err());
+    }
+
+    #[test]
+    fn busy_join_response_is_retryable() {
+        let error = check_join_response(br#"{"joined":false,"retry":true}"#).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), "join issuer is busy; retry");
     }
 }
