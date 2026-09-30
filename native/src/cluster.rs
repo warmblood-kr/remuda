@@ -5,6 +5,7 @@ pub mod encoding;
 pub mod identity;
 pub mod join_line;
 pub mod join_token;
+pub mod listener_config;
 pub mod registry;
 pub mod replication;
 mod storage;
