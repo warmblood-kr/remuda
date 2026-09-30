@@ -63,6 +63,57 @@ fn help_and_version_never_connect_to_a_daemon() {
     }
 }
 
+#[test]
+fn unknown_cluster_verbs_suggest_the_cluster_path() {
+    let dir = scratch("unknown-cluster-verb");
+    let out = remuda(&dir, &["nodes"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr.trim(),
+        "remuda: unknown command 'nodes'. Did you mean 'remuda cluster nodes'?"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn nearby_top_level_typos_get_did_you_mean() {
+    let dir = scratch("unknown-nearby-verb");
+    let out = remuda(&dir, &["atach"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr.trim(),
+        "remuda: unknown command 'atach'. Did you mean 'remuda attach'?"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn unrelated_unknown_verb_gets_concise_help() {
+    let dir = scratch("unknown-unrelated-verb");
+    let out = remuda(&dir, &["zzzz"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr.trim(),
+        "remuda: unknown command 'zzzz'. Run 'remuda help' for commands."
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn help_flags_write_usage_to_stdout() {
+    let dir = scratch("help-output");
+    for args in [&["help"][..], &["--help"], &["-h"]] {
+        let out = remuda(&dir, args);
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("terminal orchestration"));
+        assert!(out.stderr.is_empty(), "{args:?}: {out:?}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A bad channel fails before any download, after the handshake would have run.
 #[test]
 fn upgrade_never_connects_to_a_daemon() {
@@ -194,10 +245,13 @@ fn a_half_installed_mod_is_named_instead_of_generic_usage() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // A word that names no mod directory at all still gets the usage text.
+    // A word that names no mod directory at all gets the concise diagnostic.
     let dir = scratch("unknown-word");
     let out = remuda(&dir, &["nosuchverb"]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("terminal orchestration"));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "remuda: unknown command 'nosuchverb'. Run 'remuda help' for commands."
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
