@@ -41,7 +41,17 @@ pub fn stop(daemon_path: &Path) -> io::Result<ListenerStatus> {
         allow_public: false,
     });
     config.enabled = false;
+    config.allow_public = false;
     listener_config::write(&config)?;
+    request(daemon_path, ListenerOp::Reload)
+}
+
+/// Restore a previously saved listener config and ask the daemon to reload it.
+pub fn restore(daemon_path: &Path, snapshot: Option<ListenerConfig>) -> io::Result<ListenerStatus> {
+    match snapshot {
+        Some(config) => listener_config::write(&config)?,
+        None => listener_config::remove()?,
+    }
     request(daemon_path, ListenerOp::Reload)
 }
 

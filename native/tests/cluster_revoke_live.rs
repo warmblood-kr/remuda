@@ -159,11 +159,10 @@ impl Drop for PrivateNode {
 }
 
 struct ListenerProcess {
-    child: Child,
-    pid: u32,
     address: SocketAddr,
     root: PathBuf,
     runtime: PathBuf,
+    name: String,
 }
 
 impl ListenerProcess {
@@ -171,45 +170,49 @@ impl ListenerProcess {
         let probe = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = probe.local_addr().unwrap();
         drop(probe);
-        let address_text = address.to_string();
-        let child = Command::new(env!("CARGO_BIN_EXE_remuda"))
-            .args([
-                "-s",
-                &node.name,
-                "cluster",
-                "listen",
-                "--bind",
-                &address_text,
-            ])
-            .env("REMUDA_RUNTIME_DIR", &node.runtime)
-            .env("HOME", node.root.join("home"))
-            .env("XDG_STATE_HOME", node.root.join("state"))
-            .env("XDG_CONFIG_HOME", node.root.join("config"))
-            .env("XDG_DATA_HOME", node.root.join("data"))
-            .env("XDG_CACHE_HOME", node.root.join("cache"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let pid = child.id();
         let mut listener = Self {
-            child,
-            pid,
             address,
             root: node.root.clone(),
             runtime: node.runtime.clone(),
+            name: node.name.clone(),
         };
+        listener.configure(true);
         listener.wait_ready();
         listener
+    }
+
+    fn configure(&self, enabled: bool) {
+        use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
+        listener_config::write_at(
+            &self.root.join("state/remuda/cluster"),
+            &ListenerConfig {
+                enabled,
+                bind: ListenerBind::Explicit(self.address),
+                allow_public: false,
+            },
+        )
+        .unwrap();
+        let response = remuda_native::client::request(
+            &remuda_native::daemon::socket_path_in(&self.runtime, &self.name),
+            &Request::ClusterListener(remuda_core::protocol::ListenerOp::Reload),
+        )
+        .unwrap();
+        let remuda_core::protocol::Response::ClusterListenerStatus(status) = response else {
+            panic!("unexpected listener response: {response:?}");
+        };
+        if enabled {
+            assert!(
+                matches!(status, remuda_core::protocol::ListenerStatus::On { addr, .. } if addr == self.address),
+                "listener did not bind its configured address: {status:?}"
+            );
+        } else {
+            assert_eq!(status, remuda_core::protocol::ListenerStatus::Off);
+        }
     }
 
     fn wait_ready(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some(status) = self.child.try_wait().unwrap() {
-                panic!("cluster listener exited before binding: {status}");
-            }
             if TcpStream::connect_timeout(&self.address, Duration::from_millis(50)).is_ok() {
                 return;
             }
@@ -220,25 +223,13 @@ impl ListenerProcess {
 
     fn stop(&mut self) {
         assert!(self.runtime.starts_with(&self.root));
-        assert_eq!(
-            self.child.id(),
-            self.pid,
-            "stop only the recorded listener PID"
-        );
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.configure(false);
     }
 }
 
 impl Drop for ListenerProcess {
     fn drop(&mut self) {
         assert!(self.runtime.starts_with(&self.root));
-        assert!(self.pid > 0);
-        assert_eq!(
-            self.child.id(),
-            self.pid,
-            "drop only the recorded listener PID"
-        );
         self.stop();
     }
 }
@@ -497,9 +488,18 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
     let a = PrivateNode::start("a");
     let b = PrivateNode::start("b");
     let c = PrivateNode::start("c");
-    successful(a.run(&["cluster", "init"]), "initialize node A");
-    successful(b.run(&["cluster", "init"]), "initialize node B");
-    successful(c.run(&["cluster", "init"]), "initialize node C");
+    successful(
+        a.run(&["cluster", "init", "--no-listen"]),
+        "initialize node A",
+    );
+    successful(
+        b.run(&["cluster", "init", "--no-listen"]),
+        "initialize node B",
+    );
+    successful(
+        c.run(&["cluster", "init", "--no-listen"]),
+        "initialize node C",
+    );
     let a_identity = a.identity();
     let b_identity = b.identity();
     let b_fingerprint = identity_fingerprint(&b_identity);
@@ -564,7 +564,10 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
         b_status.contains("This node was revoked by"),
         "cluster status did not show B's revocation notice: {b_status}"
     );
-    successful(b.run(&["cluster", "init"]), "locally initialize node B");
+    successful(
+        b.run(&["cluster", "init", "--no-listen"]),
+        "locally initialize node B",
+    );
     let b_nodes_after_init = successful(
         b.run(&["cluster", "nodes"]),
         "read node B's nodes table after ordinary init",
@@ -684,8 +687,14 @@ fn new_identity_init_changes_fingerprint_resets_registry_clears_notice_and_old_j
     let _serial = live_test_guard();
     let node = PrivateNode::start("identity-rotation-node");
     let peer = PrivateNode::start("identity-rotation-peer");
-    successful(node.run(&["cluster", "init"]), "initialize rotation node");
-    successful(peer.run(&["cluster", "init"]), "initialize registry peer");
+    successful(
+        node.run(&["cluster", "init", "--no-listen"]),
+        "initialize rotation node",
+    );
+    successful(
+        peer.run(&["cluster", "init", "--no-listen"]),
+        "initialize registry peer",
+    );
     let old_identity = node.identity();
     let old_fingerprint = identity_fingerprint(&old_identity);
     let mut registry = read_registry(&node);
@@ -716,9 +725,18 @@ fn joiner_succeeds_when_an_existing_peer_stalls() {
     let a = PrivateNode::start("join-stalled-a");
     let b = PrivateNode::start("join-stalled-b");
     let c = PrivateNode::start("join-stalled-c");
-    successful(a.run(&["cluster", "init"]), "initialize node A");
-    successful(b.run(&["cluster", "init"]), "initialize node B");
-    successful(c.run(&["cluster", "init"]), "initialize node C");
+    successful(
+        a.run(&["cluster", "init", "--no-listen"]),
+        "initialize node A",
+    );
+    successful(
+        b.run(&["cluster", "init", "--no-listen"]),
+        "initialize node B",
+    );
+    successful(
+        c.run(&["cluster", "init", "--no-listen"]),
+        "initialize node C",
+    );
     let a_identity = a.identity();
     let a_listener = ListenerProcess::start(&a);
     let mut b_listener = ListenerProcess::start(&b);
@@ -832,7 +850,10 @@ fn join_via_non_founder_bootstraps_full_view_including_revoked_origins() {
     let c = PrivateNode::start("bootstrap-c");
     let d = PrivateNode::start("bootstrap-d");
     for node in [&a, &b, &x, &c, &d] {
-        successful(node.run(&["cluster", "init"]), "initialize bootstrap node");
+        successful(
+            node.run(&["cluster", "init", "--no-listen"]),
+            "initialize bootstrap node",
+        );
     }
     let a_id = a.identity();
     let b_id = b.identity();
@@ -1000,7 +1021,7 @@ fn revoke_topology(
     let c = PrivateNode::start_with_anti_entropy(&format!("{label}-c"), Some(200));
     for node in [&a, &b, &c] {
         successful(
-            node.run(&["cluster", "init"]),
+            node.run(&["cluster", "init", "--no-listen"]),
             "initialize revoke topology node",
         );
     }
@@ -1082,7 +1103,10 @@ fn revoke_then_new_admission_converges_after_revoked_member_admitted_a_peer() {
     let x = PrivateNode::start("origin-x");
     let y = PrivateNode::start("origin-y");
     for node in [&a, &b, &x, &y] {
-        successful(node.run(&["cluster", "init"]), "initialize private node");
+        successful(
+            node.run(&["cluster", "init", "--no-listen"]),
+            "initialize private node",
+        );
     }
     let a_id = a.identity();
     let b_id = b.identity();
@@ -1122,9 +1146,18 @@ fn admission_on_a_pushes_to_an_existing_peer() {
     let a = PrivateNode::start("push-a");
     let b = PrivateNode::start("push-b");
     let c = PrivateNode::start("push-c");
-    successful(a.run(&["cluster", "init"]), "initialize node A");
-    successful(b.run(&["cluster", "init"]), "initialize node B");
-    successful(c.run(&["cluster", "init"]), "initialize node C");
+    successful(
+        a.run(&["cluster", "init", "--no-listen"]),
+        "initialize node A",
+    );
+    successful(
+        b.run(&["cluster", "init", "--no-listen"]),
+        "initialize node B",
+    );
+    successful(
+        c.run(&["cluster", "init", "--no-listen"]),
+        "initialize node C",
+    );
     let status = a.run(&["cluster"]);
     assert!(String::from_utf8_lossy(&status.stdout).contains(
         "Any admitted member can admit new keys and revoke any member cluster-wide (see #282)."
@@ -1206,7 +1239,10 @@ fn relayed_push_preserves_origin_and_converges_registry_digests() {
     let c = PrivateNode::start("push-origin-c");
     let x = PrivateNode::start("push-origin-x");
     for node in [&a, &b, &c, &x] {
-        successful(node.run(&["cluster", "init"]), "initialize push test node");
+        successful(
+            node.run(&["cluster", "init", "--no-listen"]),
+            "initialize push test node",
+        );
     }
     let a_id = a.identity();
     let b_id = b.identity();
@@ -1292,9 +1328,18 @@ fn offline_joined_node_converges_from_its_first_startup_sync() {
     let a = PrivateNode::start("offline-a");
     let mut b = PrivateNode::start("offline-b");
     let c = PrivateNode::start("offline-c");
-    successful(a.run(&["cluster", "init"]), "initialize node A");
-    successful(b.run(&["cluster", "init"]), "initialize node B");
-    successful(c.run(&["cluster", "init"]), "initialize node C");
+    successful(
+        a.run(&["cluster", "init", "--no-listen"]),
+        "initialize node A",
+    );
+    successful(
+        b.run(&["cluster", "init", "--no-listen"]),
+        "initialize node B",
+    );
+    successful(
+        c.run(&["cluster", "init", "--no-listen"]),
+        "initialize node C",
+    );
     let a_listener = ListenerProcess::start(&a);
     let c_listener = ListenerProcess::start(&c);
 
@@ -1354,14 +1399,24 @@ fn offline_joined_node_converges_from_its_first_startup_sync() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn revoke_survives_an_endpoint_mismatch_in_the_same_update() {
     let _serial = live_test_guard();
     let a = PrivateNode::start("endpoint-revoke-a");
     let b = PrivateNode::start("endpoint-revoke-b");
     let c = PrivateNode::start("endpoint-revoke-c");
-    successful(a.run(&["cluster", "init"]), "initialize node A");
-    successful(b.run(&["cluster", "init"]), "initialize node B");
-    successful(c.run(&["cluster", "init"]), "initialize node C");
+    successful(
+        a.run(&["cluster", "init", "--no-listen"]),
+        "initialize node A",
+    );
+    successful(
+        b.run(&["cluster", "init", "--no-listen"]),
+        "initialize node B",
+    );
+    successful(
+        c.run(&["cluster", "init", "--no-listen"]),
+        "initialize node C",
+    );
     let a_identity = a.identity();
     let b_identity = b.identity();
     let c_identity = c.identity();

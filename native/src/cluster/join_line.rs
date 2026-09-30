@@ -18,6 +18,17 @@ pub struct JoinLine {
     pub token: Zeroizing<String>,
 }
 
+impl Clone for JoinLine {
+    fn clone(&self) -> Self {
+        Self {
+            issuer_addr: self.issuer_addr,
+            issuer_fingerprint: self.issuer_fingerprint.clone(),
+            issuer_static_pubkey: self.issuer_static_pubkey,
+            token: Zeroizing::new(self.token.to_string()),
+        }
+    }
+}
+
 impl fmt::Debug for JoinLine {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

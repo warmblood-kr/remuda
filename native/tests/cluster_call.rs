@@ -40,12 +40,6 @@ impl Node {
             fs::create_dir_all(dir).unwrap();
         }
         let name = format!("{label}-{serial}");
-        let init = command(&name, &runtime, &root, &state, &home)
-            .args(["cluster", "init"])
-            .output()
-            .unwrap();
-        assert!(init.status.success(), "cluster init failed: {init:?}");
-        let key = fs::read(state.join("remuda/cluster/identity.key")).unwrap();
         let daemon = command(&name, &runtime, &root, &state, &home)
             .args(["daemon"])
             .stdin(Stdio::null())
@@ -58,11 +52,20 @@ impl Node {
             runtime,
             state,
             name,
-            public: key[32..].to_vec(),
-            private: key[..32].to_vec(),
+            public: Vec::new(),
+            private: Vec::new(),
             daemon,
         };
         node.wait_ready();
+        let init = node
+            .command()
+            .args(["cluster", "init", "--no-listen"])
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "cluster init failed: {init:?}");
+        let key = fs::read(node.state.join("remuda/cluster/identity.key")).unwrap();
+        node.public = key[32..].to_vec();
+        node.private = key[..32].to_vec();
         node
     }
 

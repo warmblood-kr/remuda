@@ -1,32 +1,69 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+struct DaemonGuard(Child);
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 #[test]
 fn init_and_status_never_print_private_key_material() {
     let root = std::env::temp_dir().join(format!(
-        "remuda-cluster-cli-{}-{}",
+        "ci{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir_all(&root).unwrap();
+    let runtime = root.join("r");
     let state = root.join("state");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let name = "s";
+    let mut daemon = DaemonGuard(
+        Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(["-s", name, "daemon"])
+            .env("REMUDA_RUNTIME_DIR", &runtime)
+            .env("HOME", &root)
+            .env("XDG_STATE_HOME", &state)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let socket = remuda_native::daemon::socket_path_in(&runtime, name);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while remuda_native::client::request(&socket, &remuda_core::protocol::Request::List).is_err() {
+        if let Some(status) = daemon.0.try_wait().unwrap() {
+            panic!("isolated daemon exited before binding: {status}");
+        }
+        assert!(Instant::now() < deadline, "isolated daemon did not bind");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(["-s", name])
             .args(args)
+            .env("REMUDA_RUNTIME_DIR", &runtime)
             .env("HOME", &root)
             .env("XDG_STATE_HOME", &state)
             .output()
             .unwrap()
     };
-    let initialized = run(&["cluster", "init"]);
+    let initialized = run(&["cluster", "init", "--no-listen"]);
     assert!(initialized.status.success());
     let key = fs::read(state.join("remuda/cluster/identity.key")).unwrap();
-    let repeated = run(&["cluster", "init"]);
+    let repeated = run(&["cluster", "init", "--no-listen"]);
     assert!(repeated.status.success());
     assert!(String::from_utf8_lossy(&repeated.stdout).contains("Already initialized"));
     let status = run(&["cluster"]);
@@ -70,5 +107,6 @@ fn init_and_status_never_print_private_key_material() {
     assert!(!String::from_utf8_lossy(&transcript).contains(&hex));
     assert!(!String::from_utf8_lossy(&transcript)
         .contains(&remuda_native::cluster::encoding::encode_base64(&key[..32])));
+    drop(daemon);
     let _ = fs::remove_dir_all(root);
 }

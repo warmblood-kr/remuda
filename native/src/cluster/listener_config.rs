@@ -109,6 +109,13 @@ pub fn write(config: &ListenerConfig) -> io::Result<()> {
     write_at(&dir, config)
 }
 
+/// Remove the persisted listener configuration after verifying the local identity.
+pub fn remove() -> io::Result<()> {
+    let dir = super::storage::cluster_state_dir()?.join("cluster");
+    super::identity::load_identity_at(&dir)?;
+    remove_at(&dir)
+}
+
 /// Persist the listener configuration in one cluster state directory.
 pub fn write_at(dir: &Path, config: &ListenerConfig) -> io::Result<()> {
     use std::fs;
@@ -139,6 +146,46 @@ pub fn write_at(dir: &Path, config: &ListenerConfig) -> io::Result<()> {
     .map_err(io::Error::other)?;
     bytes.push(b'\n');
     super::storage::atomic_write(&path, &bytes)
+}
+
+/// Remove the persisted listener configuration in one cluster state directory.
+pub fn remove_at(dir: &Path) -> io::Result<()> {
+    use std::fs;
+
+    super::storage::verify_directory(dir)?;
+    let _guard = super::storage::StateLock::acquire(dir)?;
+    let path = dir.join(LISTENER_FILE);
+    let file = match open_listener_file(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cluster listener config is not a regular file; refusing",
+        ));
+    }
+    super::storage::check_private_file(&file, "cluster listener config", &path)?;
+    fs::remove_file(path)
+}
+
+fn open_listener_file(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(not(windows))]
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        options.open(path)
+    }
+    #[cfg(windows)]
+    {
+        super::windows_security::open_for_read(path)
+    }
 }
 
 #[cfg(all(test, unix))]
