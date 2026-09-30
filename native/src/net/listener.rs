@@ -2407,6 +2407,183 @@ mod tests {
         assert!(parse_http_request(Cursor::new(oversized_headers)).is_err());
     }
 
+    struct MutationRng(u64);
+
+    impl MutationRng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn index(&mut self, length: usize) -> usize {
+            (self.next() as usize) % length.max(1)
+        }
+    }
+
+    fn mutate_http_request(seed: &[u8], rng: &mut MutationRng, operation: usize) -> Vec<u8> {
+        match operation % 5 {
+            0 => {
+                let mut bytes = seed.to_vec();
+                let index = rng.index(bytes.len());
+                bytes[index] ^= 1 << rng.index(8);
+                bytes
+            }
+            1 => {
+                let mut bytes = seed.to_vec();
+                bytes.truncate(rng.index(bytes.len()));
+                bytes
+            }
+            2 => {
+                let mut bytes = seed.to_vec();
+                let index = rng.index(bytes.len());
+                bytes.insert(index, bytes[index]);
+                bytes
+            }
+            3 => format!(
+                "POST /cluster HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\n\r\n",
+                MAX_BODY_BYTES + 1
+            )
+            .into_bytes(),
+            _ => {
+                let mut bytes = b"POST /cluster HTTP/1.1\r\n".to_vec();
+                for _ in 0..=MAX_HEADER_COUNT {
+                    bytes.extend_from_slice(b"X-Test: y\r\n");
+                }
+                bytes.extend_from_slice(b"Content-Length: 0\r\n\r\n");
+                bytes
+            }
+        }
+    }
+
+    fn mutate_frame(seed: &[u8], rng: &mut MutationRng, operation: usize) -> Vec<u8> {
+        match operation % 5 {
+            0 => {
+                let mut bytes = seed.to_vec();
+                let index = rng.index(bytes.len());
+                bytes[index] ^= 1 << rng.index(8);
+                bytes
+            }
+            1 => {
+                let mut bytes = seed.to_vec();
+                bytes.truncate(rng.index(bytes.len()));
+                bytes
+            }
+            2 => {
+                let mut bytes = seed.to_vec();
+                let index = rng.index(bytes.len());
+                bytes.insert(index, bytes[index]);
+                bytes
+            }
+            3 => vec![0; MAX_BODY_BYTES + 1],
+            _ => {
+                let mut bytes = seed.to_vec();
+                bytes[..32].fill(0);
+                bytes
+            }
+        }
+    }
+
+    fn run_preauth_mutations(mutations_per_target: usize) {
+        // A per-input bound catches a hang or a super-linear blow-up on one input
+        // without failing slow, instrumented (coverage) CI builds.
+        const PER_INPUT_LIMIT: Duration = Duration::from_secs(1);
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let initiator = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let sealed = frame::seal_request(
+            &initiator.private,
+            &responder.public,
+            1_700_000_000,
+            b"seed",
+        )
+        .unwrap();
+        let http_seed = b"POST /cluster HTTP/1.1\r\nHost: node\r\nContent-Length: 4\r\n\r\nseed";
+        let mut rng = MutationRng(0x9e37_79b9_7f4a_7c15);
+
+        let oversized_length = format!(
+            "POST /cluster HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        assert_eq!(
+            parse_http_request(Cursor::new(oversized_length))
+                .err()
+                .unwrap()
+                .to_string(),
+            "HTTP body exceeds byte cap"
+        );
+        let mut header_flood = b"POST /cluster HTTP/1.1\r\n".to_vec();
+        for _ in 0..=MAX_HEADER_COUNT {
+            header_flood.extend_from_slice(b"X-Test: y\r\n");
+        }
+        header_flood.extend_from_slice(b"Content-Length: 0\r\n\r\n");
+        assert_eq!(
+            parse_http_request(Cursor::new(header_flood))
+                .err()
+                .unwrap()
+                .to_string(),
+            "HTTP request exceeds header count cap"
+        );
+        assert_eq!(
+            frame::open_request(&responder.private, &[0; 31])
+                .err()
+                .unwrap()
+                .to_string(),
+            "invalid Noise IK frame"
+        );
+
+        assert!(parse_http_request(Cursor::new(http_seed)).is_ok());
+        assert!(frame::open_request(&responder.private, &sealed.message).is_ok());
+        for mutation in 0..mutations_per_target {
+            let bytes = mutate_http_request(http_seed, &mut rng, mutation);
+            let started = Instant::now();
+            assert!(bytes.len() <= MAX_HEADER_BYTES + MAX_BODY_BYTES + MAX_REQUEST_LINE_BYTES);
+            let parsed =
+                std::panic::catch_unwind(|| parse_http_request(Cursor::new(bytes.as_slice())))
+                    .unwrap_or_else(|_| panic!("HTTP parser panicked at mutation {mutation}"));
+            assert!(
+                started.elapsed() < PER_INPUT_LIMIT,
+                "HTTP parser took {:?} on mutation {mutation}",
+                started.elapsed()
+            );
+            if let Ok(parsed) = parsed {
+                assert!(parsed.body.len() <= MAX_BODY_BYTES);
+            }
+        }
+        for mutation in 0..mutations_per_target {
+            let bytes = mutate_frame(&sealed.message, &mut rng, mutation);
+            assert!(bytes.len() <= MAX_BODY_BYTES + 1);
+            let started = Instant::now();
+            let opened = std::panic::catch_unwind(|| {
+                frame::open_request(&responder.private, bytes.as_slice())
+            })
+            .unwrap_or_else(|_| panic!("Noise frame decoder panicked at mutation {mutation}"));
+            assert!(
+                started.elapsed() < PER_INPUT_LIMIT,
+                "Noise frame decoder took {:?} on mutation {mutation}",
+                started.elapsed()
+            );
+            if let Ok(opened) = opened {
+                assert!(opened.payload.len() <= MAX_BODY_BYTES);
+            }
+        }
+    }
+
+    #[test]
+    fn preauth_mutations_do_not_panic_or_exceed_caps() {
+        run_preauth_mutations(1_000);
+    }
+
+    #[test]
+    #[ignore = "manual deep pre-auth mutation run"]
+    fn preauth_mutations_long_do_not_panic_or_exceed_caps() {
+        run_preauth_mutations(100_000);
+    }
+
     #[test]
     fn authorization_is_rechecked_after_a_held_request_before_data_returns() {
         let pair = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
