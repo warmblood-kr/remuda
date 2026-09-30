@@ -432,6 +432,7 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
         list_from(&b_identity, &a_identity, listener.address),
         Response::Sessions(_)
     ));
+    let convergence_deadline = Instant::now() + Duration::from_secs(30);
     successful(
         a.run(&["cluster", "revoke", &b_fingerprint, "--yes"]),
         "revoke node B on node A",
@@ -452,16 +453,33 @@ fn revoking_a_live_member_is_seen_by_all_other_daemons() {
         "node B's new connection to A",
     );
 
-    wait_for_revocation_on(&c, &b_fingerprint);
-    let b_notice = wait_for_revoked_notice_on(&b, &b_fingerprint);
+    wait_for_revocation_on_until(&c, &b_fingerprint, convergence_deadline);
+    let b_notice = wait_for_revoked_notice_on_until(&b, &b_fingerprint, convergence_deadline);
     assert!(
         b_notice.contains("Next:"),
         "missing recovery guidance: {b_notice}"
+    );
+    let self_row = b_notice
+        .lines()
+        .find(|line| line.contains(&b_fingerprint))
+        .expect("node B's own registry row");
+    assert!(
+        self_row.contains("admitted"),
+        "the receiver's local registry entry changed: {self_row}"
     );
     let b_status = successful(b.run(&["cluster"]), "read revoked node B status");
     assert!(
         b_status.contains("This node was revoked by"),
         "cluster status did not show B's revocation notice: {b_status}"
+    );
+    successful(b.run(&["cluster", "init"]), "locally initialize node B");
+    let b_nodes_after_init = successful(
+        b.run(&["cluster", "nodes"]),
+        "read node B's nodes table after local init",
+    );
+    assert!(
+        !b_nodes_after_init.contains("This node was revoked by"),
+        "local cluster init did not clear B's notice: {b_nodes_after_init}"
     );
     assert_list_refused(
         &b_identity,
@@ -688,8 +706,11 @@ fn wait_for_revocation_on(receiver: &PrivateNode, member_fp: &str) {
     );
 }
 
-fn wait_for_revoked_notice_on(receiver: &PrivateNode, member_fp: &str) -> String {
-    let deadline = Instant::now() + Duration::from_secs(30);
+fn wait_for_revoked_notice_on_until(
+    receiver: &PrivateNode,
+    member_fp: &str,
+    deadline: Instant,
+) -> String {
     loop {
         let output = successful(
             receiver.run(&["cluster", "nodes"]),

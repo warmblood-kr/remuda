@@ -13,7 +13,9 @@ pub(crate) mod windows_security;
 
 pub use identity::NodeIdentity;
 pub use registry::{load_registry, save_registry, AuthorizedNode, NodeState, Registry};
-pub use replication::{push_now, push_now_excluding, registry_changed, PeerPushResult};
+pub use replication::{
+    push_now, push_now_excluding, push_now_with_revoked_target, registry_changed, PeerPushResult,
+};
 
 use std::io;
 use std::net::SocketAddr;
@@ -46,6 +48,7 @@ pub fn init() -> io::Result<(NodeIdentity, bool)> {
             }],
         })?;
         registry::save_registry_at(&dir, &registry)?;
+        control::clear_revoked_notice_at(&dir)?;
         Ok((node, created))
     }
 }
@@ -190,6 +193,7 @@ fn record_join_success_with_schedule(
         if changed {
             registry::save_registry_at(&dir, &registry)?;
         }
+        control::clear_revoked_notice_at(&dir)?;
         drop(guard);
         if changed && schedule {
             replication::registry_changed();

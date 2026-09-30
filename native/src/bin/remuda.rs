@@ -562,6 +562,19 @@ fn cluster_status() -> ExitCode {
             println!("Fingerprint: {}", identity.node_fp);
             println!("Members: {members}");
             println!("Authority: Any admitted member can admit new keys and revoke any member cluster-wide (see #282).");
+            match remuda_native::cluster::control::revoked_notice() {
+                Ok(Some(notice)) => {
+                    let mut stdout = std::io::stdout().lock();
+                    if let Err(error) = write_revocation_notice(&mut stdout, &notice) {
+                        if error.kind() == std::io::ErrorKind::BrokenPipe {
+                            return ExitCode::SUCCESS;
+                        }
+                        return fail(format!("cluster status: {error}"));
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => return fail(format!("cluster status: {error}")),
+            }
             match remuda_native::cluster::control::enabled() {
                 Ok(enabled) => {
                     let (setting, trust) = remote_control_status_lines(enabled);
@@ -840,7 +853,7 @@ fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
     match remuda_native::cluster::revoke_local(&fingerprint) {
         Ok(remuda_native::cluster::RevokeOutcome::Revoked) => {
             println!("Node {label} revoked locally.");
-            report_cluster_pushes();
+            report_revocation_pushes(&fingerprint);
             ExitCode::SUCCESS
         }
         Ok(remuda_native::cluster::RevokeOutcome::AlreadyRevoked) => {
@@ -852,7 +865,16 @@ fn cluster_revoke(target: &str, yes: bool) -> ExitCode {
 }
 
 fn report_cluster_pushes() {
-    let peers = remuda_native::cluster::push_now();
+    report_cluster_push_results(remuda_native::cluster::push_now());
+}
+
+fn report_revocation_pushes(revoked_peer: &str) {
+    report_cluster_push_results(remuda_native::cluster::push_now_with_revoked_target(
+        revoked_peer,
+    ));
+}
+
+fn report_cluster_push_results(peers: Vec<remuda_native::cluster::PeerPushResult>) {
     if peers.is_empty() {
         println!("Registry push: no configured peers.");
         return;
@@ -931,9 +953,27 @@ fn write_nodes_table<W: Write>(
     identity: &remuda_native::cluster::NodeIdentity,
     registry: &remuda_native::cluster::Registry,
 ) -> std::io::Result<()> {
-    match writer
-        .write_all(remuda_native::cluster::format_nodes_table(identity, registry).as_bytes())
-    {
+    let table = remuda_native::cluster::format_nodes_table(identity, registry);
+    match writer.write_all(table.as_bytes()) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(error) => Err(error),
+        Ok(()) => match remuda_native::cluster::control::revoked_notice()? {
+            Some(notice) => write_revocation_notice(writer, &notice),
+            None => Ok(()),
+        },
+    }
+}
+
+fn write_revocation_notice<W: Write>(
+    writer: &mut W,
+    notice: &remuda_native::cluster::control::RevokedNotice,
+) -> std::io::Result<()> {
+    let text = format!(
+        "This node was revoked by {} at Unix time {}.\nNext: run `remuda cluster init`, then ask an admitted member for a fresh invite and join again.\n",
+        remuda_native::cluster::node_label(&notice.by_fp),
+        notice.at
+    );
+    match writer.write_all(text.as_bytes()) {
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         result => result,
     }

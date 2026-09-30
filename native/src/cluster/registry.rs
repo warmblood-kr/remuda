@@ -191,6 +191,7 @@ impl std::error::Error for UnsupportedRegistryMajor {}
 pub struct UpdateOutcome {
     pub applied: Vec<AuthorizedNode>,
     pub alerts: Vec<String>,
+    pub self_revocation_notice_by: Option<String>,
     pub local_metadata_changed: bool,
     pub dropped_origin_entries: usize,
     pub dropped_invalid_entries: usize,
@@ -562,6 +563,9 @@ fn merge_update(
             continue;
         }
         if entry.node_fp == receiver_fp && entry.state == NodeState::Revoked {
+            outcome
+                .self_revocation_notice_by
+                .get_or_insert_with(|| update.sender_fp.clone());
             outcome.alerts.push(format!(
                 "dropped peer tombstone for receiver own key {}",
                 receiver_fp
@@ -788,6 +792,9 @@ fn apply_update_at(
     )?;
     if !outcome.applied.is_empty() || outcome.local_metadata_changed {
         save_registry_at(dir, &registry)?;
+    }
+    if let Some(by_fp) = &outcome.self_revocation_notice_by {
+        super::control::save_revoked_notice_at(dir, by_fp)?;
     }
     for alert in &outcome.alerts {
         eprintln!("remuda: cluster replication alert: {alert}");
@@ -1565,10 +1572,9 @@ mod tests {
             entries: vec![remote_admission],
         };
         apply_update_at(&dir, &un_revoke, &public_key(&sender)).unwrap();
-        assert_eq!(
-            fs::read(&notice_path).unwrap(),
-            serde_json::to_vec(&notice).unwrap()
-        );
+        let retained_notice: serde_json::Value =
+            serde_json::from_slice(&fs::read(&notice_path).unwrap()).unwrap();
+        assert_eq!(retained_notice, notice);
         assert_eq!(
             load_registry_at(&dir)
                 .unwrap()
@@ -1585,7 +1591,13 @@ mod tests {
     fn nonmember_sender_cannot_persist_self_revocation_notice() {
         let dir = temp_dir();
         let (receiver, _) = super::super::identity::init_identity_at(&dir).unwrap();
-        let outsider = admitted_sender();
+        let sender = admitted_sender();
+        let outsider = entry(
+            "unadmitted-replication-sender",
+            NodeState::Admitted,
+            1,
+            "outsider",
+        );
         let receiver_entry = AuthorizedNode {
             node_fp: receiver.node_fp.clone(),
             static_pubkey: encoding::encode_base64(&receiver.static_pubkey),
@@ -1601,19 +1613,26 @@ mod tests {
         save_registry_at(
             &dir,
             &Registry {
-                authorized_nodes: vec![receiver_entry.clone()],
+                authorized_nodes: vec![receiver_entry.clone(), sender.clone()],
             },
         )
         .unwrap();
         let mut tombstone = receiver_entry;
         tombstone.state = NodeState::Revoked;
         tombstone.version = 2;
-        let forged_notice = RegistryUpdate {
+        let unadmitted_notice = RegistryUpdate {
             sender_fp: outsider.node_fp.clone(),
             entries: vec![tombstone],
         };
 
-        assert!(apply_update_at(&dir, &forged_notice, &public_key(&outsider)).is_err());
+        assert!(apply_update_at(&dir, &unadmitted_notice, &public_key(&outsider)).is_err());
+        assert!(!dir.join("revoked_notice.json").exists());
+
+        let forged_identity = RegistryUpdate {
+            sender_fp: sender.node_fp.clone(),
+            entries: unadmitted_notice.entries,
+        };
+        assert!(apply_update_at(&dir, &forged_identity, &public_key(&outsider)).is_err());
         assert!(!dir.join("revoked_notice.json").exists());
         assert_eq!(
             load_registry_at(&dir)
