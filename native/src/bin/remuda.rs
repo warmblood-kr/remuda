@@ -1155,14 +1155,63 @@ mod cluster_cli_tests {
     }
 
     #[test]
-    fn cluster_listen_address_without_port_has_hint() {
+    fn cluster_listen_address_without_port_uses_default() {
         assert_eq!(
-            invalid_reason(&["listen", "--bind", "192.168.100.0"]),
-            (
-                "listen".into(),
-                "address needs a port, e.g. 192.168.100.0:7441".into()
-            )
+            parse_cluster_command(&["listen", "--bind", "192.168.100.0"]),
+            ClusterCommand::Listen {
+                bind_addr: "192.168.100.0:7441".parse().unwrap(),
+                allow_public: false,
+            }
         );
+        assert_eq!(
+            parse_cluster_command(&["listen", "--bind", "2001:db8::1"]),
+            ClusterCommand::Listen {
+                bind_addr: "[2001:db8::1]:7441".parse().unwrap(),
+                allow_public: false,
+            }
+        );
+    }
+
+    #[test]
+    fn cluster_invite_address_without_port_uses_default() {
+        assert_eq!(
+            parse_cluster_command(&["invite", "--bind", "192.0.2.4"]),
+            ClusterCommand::Invite {
+                bind_addr: "192.0.2.4:7441".parse().unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn cluster_join_address_without_port_uses_default() {
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let line = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.4:9443".parse().unwrap(),
+            issuer_fingerprint: fingerprint.clone(),
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        }
+        .encode()
+        .unwrap();
+        assert!(matches!(
+            parse_cluster_command(&["join", &fingerprint, &line, "--bind", "192.0.2.8"]),
+            ClusterCommand::Join {
+                bind_addr: Some(address),
+                ..
+            } if address == "192.0.2.8:7441".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn cluster_call_address_without_port_uses_default() {
+        assert!(matches!(
+            parse_cluster_command(&["call", "node-abc", "list", "--addr", "192.0.2.4"]),
+            ClusterCommand::Call { address, .. }
+                if address == "192.0.2.4:7441".parse().unwrap()
+        ));
     }
 
     #[test]
