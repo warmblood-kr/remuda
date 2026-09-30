@@ -69,6 +69,23 @@ impl core::fmt::Debug for SecretBytes {
     }
 }
 
+/// A bounded reason a client could not provide a secret answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretAnswerRefusal {
+    NotATerminal,
+    TooLong,
+}
+
+impl SecretAnswerRefusal {
+    pub fn error_code(self) -> &'static str {
+        match self {
+            Self::NotATerminal => "not_a_terminal",
+            Self::TooLong => "too_long",
+        }
+    }
+}
+
 mod secret_bytes_base64 {
     use super::SECRET_ANSWER_MAX_BYTES;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -250,6 +267,8 @@ pub enum Request {
     SecretAnswer {
         id: u32,
         secret: Option<SecretBytes>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        refusal: Option<SecretAnswerRefusal>,
     },
 }
 

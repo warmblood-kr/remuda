@@ -368,6 +368,7 @@ fn secret_prompt_non_tty_fallback_and_answer_do_not_leak() {
     let answer = Request::SecretAnswer {
         id: prompt_id,
         secret: Some(SecretBytes::new(sentinel.to_vec())),
+        refusal: None,
     };
     let mut answer_frame = serde_json::to_vec(&answer).unwrap();
     answer_frame.push(b'\n');

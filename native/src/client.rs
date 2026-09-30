@@ -488,35 +488,42 @@ pub fn request_with_secret_prompts(path: &Path, request: &Request) -> std::io::R
         let Response::PromptSecret { id, label } = response else {
             return Ok(response);
         };
-        let secret = collect_secret_from_terminal(&label)?;
-        send_secret_answer(&stream, id, secret.as_ref())?;
+        let (secret, refusal) = collect_secret_from_terminal(&label)?;
+        send_secret_answer(&stream, id, secret.as_ref(), refusal)?;
     }
 }
 
 fn collect_secret_from_terminal(
     label: &str,
-) -> std::io::Result<Option<remuda_core::protocol::SecretBytes>> {
+) -> std::io::Result<(
+    Option<remuda_core::protocol::SecretBytes>,
+    Option<remuda_core::protocol::SecretAnswerRefusal>,
+)> {
     use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        return Ok(None);
+        return Ok((
+            None,
+            Some(remuda_core::protocol::SecretAnswerRefusal::NotATerminal),
+        ));
     }
     let events = std::iter::from_fn(|| crossterm::event::read().ok());
-    match prompt_secret_with_events(std::io::stderr(), label, events)? {
-        Ok(Some(secret)) => Ok(Some(remuda_core::protocol::SecretBytes::new(
-            secret.to_vec(),
-        ))),
-        Ok(None) | Err(SecretLineError::TooLong) => Ok(None),
-    }
+    Ok(secret_answer_from_line(prompt_secret_with_events(
+        std::io::stderr(),
+        label,
+        events,
+    )?))
 }
 
 fn send_secret_answer(
     mut stream: &Stream,
     id: u32,
     secret: Option<&remuda_core::protocol::SecretBytes>,
+    refusal: Option<remuda_core::protocol::SecretAnswerRefusal>,
 ) -> std::io::Result<()> {
     let request = Request::SecretAnswer {
         id,
         secret: secret.cloned(),
+        refusal,
     };
     let mut frame = Zeroizing::new(serde_json::to_vec(&request)?);
     frame.push(b'\n');
@@ -1820,6 +1827,24 @@ enum SecretLineError {
     TooLong,
 }
 
+fn secret_answer_from_line(
+    answer: Result<Option<Zeroizing<Vec<u8>>>, SecretLineError>,
+) -> (
+    Option<remuda_core::protocol::SecretBytes>,
+    Option<remuda_core::protocol::SecretAnswerRefusal>,
+) {
+    use remuda_core::protocol::SecretAnswerRefusal;
+
+    match answer {
+        Ok(Some(secret)) => (
+            Some(remuda_core::protocol::SecretBytes::new(secret.to_vec())),
+            None,
+        ),
+        Ok(None) => (None, None),
+        Err(SecretLineError::TooLong) => (None, Some(SecretAnswerRefusal::TooLong)),
+    }
+}
+
 /// Edit a secret line from terminal events without owning or reading a terminal.
 /// Release events are ignored; repeat events represent repeated key input.
 fn edit_secret_line(
@@ -2668,6 +2693,18 @@ mod tests {
             edit_secret_line(events),
             Err(super::SecretLineError::TooLong)
         );
+        assert_eq!(
+            super::secret_answer_from_line(Err(super::SecretLineError::TooLong)),
+            (
+                None,
+                Some(remuda_core::protocol::SecretAnswerRefusal::TooLong)
+            )
+        );
+        assert_eq!(
+            super::secret_answer_from_line(Ok(None)),
+            (None, None),
+            "Ctrl-C, Ctrl-D, and Esc remain ordinary refusals"
+        );
     }
 
     #[test]
@@ -2850,6 +2887,7 @@ mod tests {
         let answer = Request::SecretAnswer {
             id: 19,
             secret: Some(SecretBytes::new(b"S3CRET-probe".to_vec())),
+            refusal: None,
         };
         let answer_wire = serde_json::to_vec(&answer).unwrap();
         let decoded_answer: Request = serde_json::from_slice(&answer_wire).unwrap();
@@ -2869,6 +2907,7 @@ mod tests {
         let answer = Request::SecretAnswer {
             id: 7,
             secret: Some(SecretBytes::new(vec![0xff; SECRET_ANSWER_MAX_BYTES])),
+            refusal: None,
         };
         let mut frame = serde_json::to_vec(&answer).unwrap();
         frame.push(b'\n');
@@ -2887,6 +2926,7 @@ mod tests {
         let oversized_answer = Request::SecretAnswer {
             id: 7,
             secret: Some(SecretBytes::new(vec![0; SECRET_ANSWER_MAX_BYTES + 1])),
+            refusal: None,
         };
         assert!(serde_json::to_vec(&oversized_answer).is_err());
 
@@ -2901,6 +2941,7 @@ mod tests {
         let answer = Request::SecretAnswer {
             id: 7,
             secret: Some(SecretBytes::new(b"S3CRET-probe".to_vec())),
+            refusal: None,
         };
 
         let debug = format!("{answer:?}");

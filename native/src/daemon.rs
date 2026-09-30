@@ -1674,13 +1674,18 @@ fn deferred_reply(
             #[cfg(windows)]
             let answer =
                 read_secret_answer_pipe(&mut *reader.borrow_mut(), &stream, prompt.id, timeout);
-            answer.map_err(|error| {
-                if error.kind() == std::io::ErrorKind::TimedOut {
-                    "cancelled".to_string()
-                } else {
-                    error.to_string()
-                }
-            })
+            answer
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::TimedOut {
+                        "cancelled".to_string()
+                    } else {
+                        error.to_string()
+                    }
+                })
+                .and_then(|(secret, refusal)| match refusal {
+                    Some(refusal) => Err(refusal.error_code().to_string()),
+                    None => Ok(secret),
+                })
         },
     );
     #[cfg(unix)]
@@ -1713,7 +1718,10 @@ fn read_secret_answer_pipe(
     stream: &Stream,
     expected_id: u32,
     timeout: Duration,
-) -> std::io::Result<Option<remuda_core::protocol::SecretBytes>> {
+) -> std::io::Result<(
+    Option<remuda_core::protocol::SecretBytes>,
+    Option<remuda_core::protocol::SecretAnswerRefusal>,
+)> {
     let buffered = zeroize::Zeroizing::new(reader.buffer().to_vec());
     reader.consume(buffered.len());
     let worker_stream = Arc::new(stream.try_clone()?);
@@ -1756,7 +1764,10 @@ fn read_secret_answer_for(
     reader: &mut impl Read,
     expected_id: u32,
     timeout: Duration,
-) -> std::io::Result<Option<remuda_core::protocol::SecretBytes>> {
+) -> std::io::Result<(
+    Option<remuda_core::protocol::SecretBytes>,
+    Option<remuda_core::protocol::SecretAnswerRefusal>,
+)> {
     read_secret_answer_until(reader, expected_id, std::time::Instant::now() + timeout)
 }
 
@@ -1764,7 +1775,10 @@ fn read_secret_answer_until(
     reader: &mut impl Read,
     expected_id: u32,
     deadline: std::time::Instant,
-) -> std::io::Result<Option<remuda_core::protocol::SecretBytes>> {
+) -> std::io::Result<(
+    Option<remuda_core::protocol::SecretBytes>,
+    Option<remuda_core::protocol::SecretAnswerRefusal>,
+)> {
     use std::io::ErrorKind;
     let mut frame = zeroize::Zeroizing::new(Vec::with_capacity(256));
     loop {
@@ -1795,7 +1809,20 @@ fn read_secret_answer_until(
                         std::io::Error::new(ErrorKind::InvalidData, "invalid secret answer")
                     })?;
                     return match request {
-                        Request::SecretAnswer { id, secret } if id == expected_id => Ok(secret),
+                        Request::SecretAnswer {
+                            id,
+                            secret,
+                            refusal,
+                        } if id == expected_id => {
+                            if secret.is_some() && refusal.is_some() {
+                                Err(std::io::Error::new(
+                                    ErrorKind::InvalidData,
+                                    "invalid secret answer",
+                                ))
+                            } else {
+                                Ok((secret, refusal))
+                            }
+                        }
                         Request::SecretAnswer { .. } => Err(std::io::Error::new(
                             ErrorKind::InvalidData,
                             "secret answer id mismatch",
@@ -3160,6 +3187,29 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn secret_answer_reader_preserves_the_refusal_reason() {
+        use remuda_core::protocol::{Request, SecretAnswerRefusal};
+
+        let answer = Request::SecretAnswer {
+            id: 7,
+            secret: None,
+            refusal: Some(SecretAnswerRefusal::TooLong),
+        };
+        let mut frame = serde_json::to_vec(&answer).unwrap();
+        frame.push(b'\n');
+
+        assert_eq!(
+            super::read_secret_answer_for(
+                &mut frame.as_slice(),
+                7,
+                crate::pending::SECRET_PROMPT_TIMEOUT,
+            )
+            .unwrap(),
+            (None, Some(SecretAnswerRefusal::TooLong))
+        );
     }
 
     #[test]
