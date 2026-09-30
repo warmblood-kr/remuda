@@ -27,7 +27,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(unix)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 #[cfg(unix)]
 use std::sync::mpsc;
 use std::thread;
@@ -37,8 +37,12 @@ use std::time::{Duration, Instant};
 static JOIN_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
-extern "C" fn record_join_interrupt(_: libc::c_int) {
-    JOIN_INTERRUPTED.store(true, Ordering::Relaxed);
+static JOIN_INTERRUPT_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn record_join_interrupt(signal: libc::c_int) {
+    let _ = JOIN_INTERRUPT_SIGNAL.compare_exchange(0, signal, Ordering::Relaxed, Ordering::Relaxed);
+    JOIN_INTERRUPTED.store(true, Ordering::Release);
 }
 
 #[path = "remuda/codex_tui.rs"]
@@ -1520,6 +1524,17 @@ fn cluster_join_with_listener(
         }
     };
     let mut restore_guard = JoinListenerRestoreGuard::new(daemon_path, listener_snapshot.clone());
+    #[cfg(unix)]
+    let signal_handler = match JoinInterruptHandler::install() {
+        Ok(handler) => handler,
+        Err(error) => {
+            return fail(describe_cluster_error(
+                "join",
+                &error,
+                ClusterErrorContext::Join(invitation),
+            ))
+        }
+    };
     let initial_status = remuda_native::cluster::listener_control::status(daemon_path);
     let listener_status = match bind_addr {
         Some(address) => {
@@ -1528,11 +1543,12 @@ fn cluster_join_with_listener(
                 bind: ListenerBind::Explicit(address),
                 allow_public: false,
             };
-            restore_guard.set_expected(Some(config.clone()));
-            remuda_native::cluster::listener_control::start(daemon_path, Some(config))
+            start_join_listener_with_config(daemon_path, &mut restore_guard, config)
         }
         None => match initial_status {
-            remuda_core::protocol::ListenerStatus::On { .. } => Ok(initial_status),
+            remuda_core::protocol::ListenerStatus::On { .. } => {
+                JoinListenerStartOutcome::Started(Ok(initial_status))
+            }
             _ => {
                 let mut config = listener_snapshot.unwrap_or(ListenerConfig {
                     enabled: true,
@@ -1540,10 +1556,13 @@ fn cluster_join_with_listener(
                     allow_public: false,
                 });
                 config.enabled = true;
-                restore_guard.set_expected(Some(config.clone()));
-                remuda_native::cluster::listener_control::start(daemon_path, Some(config))
+                start_join_listener_with_config(daemon_path, &mut restore_guard, config)
             }
         },
+    };
+    let listener_status = match listener_status {
+        JoinListenerStartOutcome::Started(listener_status) => listener_status,
+        JoinListenerStartOutcome::Cancelled(exit_code) => return exit_code,
     };
     let listener_status = match listener_status {
         Ok(status) => status,
@@ -1570,24 +1589,20 @@ fn cluster_join_with_listener(
 
     let join_fingerprint = fingerprint.to_owned();
     let join_invitation = invitation.clone();
-    let join_session = run_join_interruptible(move || {
-        cluster_join(&join_fingerprint, &join_invitation, Some(bound_addr))
-    });
+    let join = move || cluster_join(&join_fingerprint, &join_invitation, Some(bound_addr));
+    #[cfg(unix)]
+    let join_session = run_join_interruptible(signal_handler, join);
+    #[cfg(not(unix))]
+    let join_session = run_join_interruptible(join);
     let (join_outcome, signal_session) = match join_session {
         Ok(mut session) => (session.take_outcome(), Some(session)),
         Err(error) => (JoinRun::Finished(Err(error)), None),
     };
     let exit_code = match join_outcome {
-        JoinRun::Cancelled => {
-            let restore_warning = restore_join_listener(&mut restore_guard);
-            eprintln!(
-                "Join cancelled.\nNext: compare with `remuda cluster` on the inviting machine, then run the join command again."
-            );
-            if let Some(warning) = restore_warning {
-                eprintln!("{warning}");
-            }
-            ExitCode::from(130)
-        }
+        #[cfg(unix)]
+        JoinRun::Cancelled => cancel_join_with_restore(&mut restore_guard),
+        #[cfg(not(unix))]
+        JoinRun::Cancelled => ExitCode::from(130),
         JoinRun::Finished(Ok(())) => {
             restore_guard.disarm();
             println!("{}", join_success_message(invitation, fingerprint));
@@ -1673,6 +1688,53 @@ enum JoinRun {
     Cancelled,
 }
 
+enum JoinListenerStartOutcome {
+    Started(std::io::Result<remuda_core::protocol::ListenerStatus>),
+    Cancelled(ExitCode),
+}
+
+fn start_join_listener_with_config(
+    daemon_path: &Path,
+    restore_guard: &mut JoinListenerRestoreGuard,
+    config: ListenerConfig,
+) -> JoinListenerStartOutcome {
+    finish_join_listener_start(restore_guard, |restore_guard| {
+        remuda_native::cluster::listener_control::start_with_config_written(
+            daemon_path,
+            Some(config.clone()),
+            || restore_guard.set_expected(Some(config)),
+        )
+    })
+}
+
+fn finish_join_listener_start(
+    restore_guard: &mut JoinListenerRestoreGuard,
+    start: impl FnOnce(
+        &mut JoinListenerRestoreGuard,
+    ) -> std::io::Result<remuda_core::protocol::ListenerStatus>,
+) -> JoinListenerStartOutcome {
+    let result = start(restore_guard);
+    #[cfg(unix)]
+    if JOIN_INTERRUPTED.load(Ordering::Acquire) {
+        return JoinListenerStartOutcome::Cancelled(cancel_join_with_restore(restore_guard));
+    }
+    #[cfg(not(unix))]
+    let _ = restore_guard;
+    JoinListenerStartOutcome::Started(result)
+}
+
+#[cfg(unix)]
+fn cancel_join_with_restore(restore_guard: &mut JoinListenerRestoreGuard) -> ExitCode {
+    let restore_warning = restore_join_listener(restore_guard);
+    eprintln!(
+        "Join cancelled.\nNext: compare with `remuda cluster` on the inviting machine, then run the join command again."
+    );
+    if let Some(warning) = restore_warning {
+        eprintln!("{warning}");
+    }
+    ExitCode::from((128 + JOIN_INTERRUPT_SIGNAL.load(Ordering::Acquire)) as u8)
+}
+
 struct JoinRunSession {
     outcome: Option<JoinRun>,
     #[cfg(unix)]
@@ -1687,23 +1749,26 @@ impl JoinRunSession {
     }
 }
 
+#[cfg(unix)]
+fn run_join_interruptible(
+    handler: JoinInterruptHandler,
+    join: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+) -> std::io::Result<JoinRunSession> {
+    Ok(JoinRunSession {
+        outcome: Some(wait_for_join(&JOIN_INTERRUPTED, join)),
+        handler,
+    })
+}
+
+#[cfg(not(unix))]
+// ponytail: Windows has no console Ctrl-C handler here, so an interrupted join
+// can exit without restoring its listener config.
 fn run_join_interruptible(
     join: impl FnOnce() -> std::io::Result<()> + Send + 'static,
 ) -> std::io::Result<JoinRunSession> {
-    #[cfg(unix)]
-    {
-        let handler = JoinInterruptHandler::install()?;
-        Ok(JoinRunSession {
-            outcome: Some(wait_for_join(&JOIN_INTERRUPTED, join)),
-            handler,
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(JoinRunSession {
-            outcome: Some(JoinRun::Finished(join())),
-        })
-    }
+    Ok(JoinRunSession {
+        outcome: Some(JoinRun::Finished(join())),
+    })
 }
 
 #[cfg(unix)]
@@ -1714,6 +1779,7 @@ struct JoinInterruptHandler {
 #[cfg(unix)]
 impl JoinInterruptHandler {
     fn install() -> std::io::Result<Self> {
+        JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
         JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
         let mut previous = Vec::with_capacity(3);
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
@@ -2521,7 +2587,9 @@ mod cluster_cli_tests {
     };
     #[cfg(unix)]
     use super::{
-        wait_for_join, JoinInterruptHandler, JoinListenerRestoreGuard, JoinRun, JOIN_INTERRUPTED,
+        finish_join_listener_start, restore_join_listener, start_join_listener_with_config,
+        wait_for_join, ExitCode, JoinInterruptHandler, JoinListenerRestoreGuard,
+        JoinListenerStartOutcome, JoinRun, JOIN_INTERRUPTED, JOIN_INTERRUPT_SIGNAL,
     };
     #[cfg(unix)]
     use remuda_native::cluster::join_line::JoinLine;
@@ -2760,6 +2828,108 @@ mod cluster_cli_tests {
 
     #[cfg(unix)]
     #[test]
+    fn join_listener_write_failure_does_not_report_a_concurrent_change() {
+        let _serial = JOIN_SIGNAL_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct ResetInterruptState;
+        impl Drop for ResetInterruptState {
+            fn drop(&mut self) {
+                JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
+                JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+            }
+        }
+        let _reset = ResetInterruptState;
+        JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
+        JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+
+        let _environment = ForegroundListenerLockEnvironment::new();
+        let cluster_dir = _environment.root.join("state/remuda/cluster");
+        let snapshot = ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit("127.0.0.1:7441".parse().unwrap()),
+            allow_public: false,
+        };
+        let join_config = ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit("127.0.0.2:7441".parse().unwrap()),
+            allow_public: false,
+        };
+        remuda_native::cluster::listener_config::write(&snapshot).unwrap();
+        let daemon_path = std::path::Path::new("missing.sock");
+        let mut restore_guard = JoinListenerRestoreGuard::new(daemon_path, Some(snapshot.clone()));
+
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&cluster_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let start = start_join_listener_with_config(daemon_path, &mut restore_guard, join_config);
+        std::fs::set_permissions(&cluster_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(matches!(start, JoinListenerStartOutcome::Started(Err(_))));
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            Some(snapshot.clone())
+        );
+        let rollback_message = restore_join_listener(&mut restore_guard).unwrap_or_default();
+        assert!(!rollback_message.contains("listener config changed during join"));
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            Some(snapshot)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_signal_during_listener_start_restores_listener_config() {
+        use remuda_core::protocol::ListenerStatus;
+
+        let _serial = JOIN_SIGNAL_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        struct ResetInterruptState;
+        impl Drop for ResetInterruptState {
+            fn drop(&mut self) {
+                JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
+                JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+            }
+        }
+
+        let _reset = ResetInterruptState;
+        let _environment = ForegroundListenerLockEnvironment::new();
+        let join_config = ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit("127.0.0.1:7441".parse().unwrap()),
+            allow_public: false,
+        };
+        let daemon_path = std::path::PathBuf::from(format!(
+            "/private/tmp/remuda-s3-missing-{}.sock",
+            std::process::id()
+        ));
+        let mut restore_guard = JoinListenerRestoreGuard::new(&daemon_path, None);
+        restore_guard.set_expected(Some(join_config.clone()));
+        let _handler = JoinInterruptHandler::install().unwrap();
+
+        let outcome = finish_join_listener_start(&mut restore_guard, |_| {
+            remuda_native::cluster::listener_config::write(&join_config).unwrap();
+            assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+            Ok(ListenerStatus::On {
+                addr: "127.0.0.1:7441".parse().unwrap(),
+                auto: false,
+            })
+        });
+
+        assert_eq!(
+            remuda_native::cluster::listener_config::read().unwrap(),
+            None,
+            "listener config was not restored after cancellation during start"
+        );
+        assert!(matches!(
+            outcome,
+            JoinListenerStartOutcome::Cancelled(code) if code == ExitCode::from(143)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn join_wait_observes_cancellation_flag() {
         use std::sync::atomic::AtomicBool;
 
@@ -2787,6 +2957,7 @@ mod cluster_cli_tests {
         assert!(!JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
         assert!(JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(JOIN_INTERRUPT_SIGNAL.load(Ordering::Relaxed), libc::SIGINT);
     }
 
     #[cfg(unix)]
@@ -2827,10 +2998,12 @@ mod cluster_cli_tests {
             .map(|signal| current_signal_handler(*signal))
             .collect();
         let handler = JoinInterruptHandler::install().unwrap();
+        JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+        JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
         for signal in signals {
-            JOIN_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
             assert_eq!(unsafe { libc::raise(signal) }, 0);
             assert!(JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
+            assert_eq!(JOIN_INTERRUPT_SIGNAL.load(Ordering::Relaxed), libc::SIGINT);
         }
         drop(handler);
         for (signal, expected) in signals.into_iter().zip(before) {

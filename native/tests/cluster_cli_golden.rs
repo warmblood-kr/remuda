@@ -1515,20 +1515,20 @@ fn d4_failed_join_turns_off_a_listener_enabled_by_the_join_command() {
 
 #[test]
 fn d4_sigint_during_join_restores_listener_config_and_exits_130() {
-    assert_join_signal_restores_listener_config(libc::SIGINT);
+    assert_join_signal_restores_listener_config(libc::SIGINT, 130);
 }
 
 #[test]
-fn d4_sigterm_during_join_restores_listener_config_and_exits_130() {
-    assert_join_signal_restores_listener_config(libc::SIGTERM);
+fn d4_sigterm_during_join_restores_listener_config_and_exits_143() {
+    assert_join_signal_restores_listener_config(libc::SIGTERM, 143);
 }
 
 #[test]
-fn d4_sighup_during_join_restores_listener_config_and_exits_130() {
-    assert_join_signal_restores_listener_config(libc::SIGHUP);
+fn d4_sighup_during_join_restores_listener_config_and_exits_129() {
+    assert_join_signal_restores_listener_config(libc::SIGHUP, 129);
 }
 
-fn assert_join_signal_restores_listener_config(signal: libc::c_int) {
+fn assert_join_signal_restores_listener_config(signal: libc::c_int, expected_exit: i32) {
     use remuda_core::protocol::ListenerStatus;
     use remuda_native::cluster::{encoding, join_line::JoinLine, listener_config};
     use std::process::Stdio;
@@ -1615,7 +1615,7 @@ fn assert_join_signal_restores_listener_config(signal: libc::c_int) {
         saved_config,
         "signal did not restore the saved listener config"
     );
-    assert_eq!(output.status.code(), Some(130));
+    assert_eq!(output.status.code(), Some(expected_exit));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("Join cancelled."), "{stderr}");
     assert!(stderr.contains("Next:"), "{stderr}");
