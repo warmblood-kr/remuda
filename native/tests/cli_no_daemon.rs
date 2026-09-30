@@ -71,7 +71,7 @@ fn unknown_cluster_verbs_suggest_the_cluster_path() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         stderr.trim(),
-        "remuda: unknown command 'nodes'. Did you mean 'remuda cluster nodes'?"
+        "remuda: no command or mod named nodes.\nDid you mean: remuda cluster nodes?\nNext: if nodes is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list."
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -84,7 +84,7 @@ fn nearby_top_level_typos_get_did_you_mean() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         stderr.trim(),
-        "remuda: unknown command 'atach'. Did you mean 'remuda attach'?"
+        "remuda: no command or mod named atach.\nDid you mean: remuda attach?\nNext: if atach is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list."
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -97,7 +97,7 @@ fn unrelated_unknown_verb_gets_concise_help() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         stderr.trim(),
-        "remuda: unknown command 'zzzz'. Run 'remuda help' for commands."
+        "remuda: no command or mod named zzzz.\nNext: if zzzz is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list."
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -144,7 +144,7 @@ fn long_whitespace_unknown_word_is_not_echoed() {
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(
         stderr.trim(),
-        "remuda: unknown command. Run 'remuda help' for commands."
+        "remuda: no command or mod with that name.\nNext: if this is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list."
     );
     assert!(!stderr.contains(token), "diagnostic echoed secret material");
     let _ = std::fs::remove_dir_all(dir);
@@ -309,7 +309,7 @@ fn a_half_installed_mod_is_named_instead_of_generic_usage() {
     let out = remuda(&dir, &["nosuchverb"]);
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
-        "remuda: unknown command 'nosuchverb'. Run 'remuda help' for commands."
+        "remuda: no command or mod named nosuchverb.\nNext: if nosuchverb is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list."
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
