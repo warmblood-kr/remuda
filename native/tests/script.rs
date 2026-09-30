@@ -523,11 +523,14 @@ fn registry_documentation_formats_are_live_and_structured() {
         .iter()
         .find(|entry| entry["name"] == "random_bytes")
         .expect("random_bytes is documented");
-    assert!(random_bytes["about"]
+    assert!(random_bytes["description"]
         .as_str()
         .unwrap()
         .contains("OS CSPRNG"));
-    assert!(random_bytes["about"].as_str().unwrap().contains("65536"));
+    assert!(random_bytes["description"]
+        .as_str()
+        .unwrap()
+        .contains("65536"));
     for section in ["functions", "variables"] {
         assert!(
             document["runtime"][section]
