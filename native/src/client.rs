@@ -1775,7 +1775,8 @@ fn edit_secret_line(
 ) -> Result<Option<Zeroizing<Vec<u8>>>, SecretLineError> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
-    let mut line = Zeroizing::new(Vec::new());
+    let mut line = Zeroizing::new(Vec::with_capacity(SECRET_LINE_MAX_BYTES));
+    let line_capacity = line.capacity();
     let append = |line: &mut Zeroizing<Vec<u8>>, bytes: &[u8]| {
         let Some(new_len) = line.len().checked_add(bytes.len()) else {
             return Err(SecretLineError::TooLong);
@@ -1784,6 +1785,7 @@ fn edit_secret_line(
             return Err(SecretLineError::TooLong);
         }
         line.extend_from_slice(bytes);
+        debug_assert_eq!(line.capacity(), line_capacity);
         Ok(())
     };
 
