@@ -1050,6 +1050,11 @@ fn describe_cluster_error(
                     "cluster join: {mismatch}.\nNext: ask the inviting machine to run `remuda cluster` and read its Fingerprint line."
                 );
             }
+            if kind == std::io::ErrorKind::PermissionDenied && error.raw_os_error() == Some(1) {
+                return format!(
+                    "cluster join: cannot reach {address} (the OS blocked the connection).\nNext: the OS blocked the connection; allow remuda network access (macOS: System Settings > Privacy & Security > Local Network), then retry the same join command."
+                );
+            }
             format!("cluster join: {detail}.\nNext: check the invitation and try again.")
         }
         "listen" => {
@@ -4199,6 +4204,44 @@ mod tests {
             printed,
             "remuda: cluster join: connection reset by peer.\nNext: check the invitation and try again."
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_permission_denied_explains_network_permission_without_leaking_invite() {
+        let key = [7; 32];
+        let invitation = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.8:7441".parse().unwrap(),
+            issuer_fingerprint: remuda_native::cluster::encoding::fingerprint(&key),
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        };
+        let line = invitation.encode().unwrap();
+        let error = std::io::Error::from_raw_os_error(1);
+
+        let message =
+            describe_cluster_error("join", &error, ClusterErrorContext::Join(&invitation));
+
+        assert_eq!(
+            message,
+            "cluster join: cannot reach 192.0.2.8:7441 (the OS blocked the connection).\nNext: the OS blocked the connection; allow remuda network access (macOS: System Settings > Privacy & Security > Local Network), then retry the same join command."
+        );
+        assert!(!message.contains(&line));
+        assert!(!message.contains(invitation.token.as_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn join_eacces_keeps_the_generic_permission_denied_message() {
+        let address = "192.0.2.8:7441".parse().unwrap();
+        let error = std::io::Error::from_raw_os_error(13);
+
+        let message = describe_cluster_error("join", &error, ClusterErrorContext::Address(address));
+
+        assert!(!message.contains("the OS blocked the connection"));
+        assert!(message.contains("Next: check the invitation and try again."));
     }
 
     #[test]
