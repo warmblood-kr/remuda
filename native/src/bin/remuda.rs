@@ -27,7 +27,7 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(unix)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 #[cfg(unix)]
 use std::sync::mpsc;
 use std::thread;
@@ -37,8 +37,12 @@ use std::time::{Duration, Instant};
 static JOIN_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
-extern "C" fn record_join_interrupt(_: libc::c_int) {
-    JOIN_INTERRUPTED.store(true, Ordering::Relaxed);
+static JOIN_INTERRUPT_SIGNAL: AtomicI32 = AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn record_join_interrupt(signal: libc::c_int) {
+    let _ = JOIN_INTERRUPT_SIGNAL.compare_exchange(0, signal, Ordering::Relaxed, Ordering::Relaxed);
+    JOIN_INTERRUPTED.store(true, Ordering::Release);
 }
 
 #[path = "remuda/codex_tui.rs"]
@@ -1441,7 +1445,7 @@ fn cluster_join_with_listener(
             if let Some(warning) = restore_warning {
                 eprintln!("{warning}");
             }
-            ExitCode::from(130)
+            ExitCode::from((128 + JOIN_INTERRUPT_SIGNAL.load(Ordering::Acquire)) as u8)
         }
         JoinRun::Finished(Ok(())) => {
             restore_guard.disarm();
@@ -1569,6 +1573,7 @@ struct JoinInterruptHandler {
 #[cfg(unix)]
 impl JoinInterruptHandler {
     fn install() -> std::io::Result<Self> {
+        JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
         JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
         let mut previous = Vec::with_capacity(3);
         for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
@@ -2374,6 +2379,7 @@ mod cluster_cli_tests {
     #[cfg(unix)]
     use super::{
         wait_for_join, JoinInterruptHandler, JoinListenerRestoreGuard, JoinRun, JOIN_INTERRUPTED,
+        JOIN_INTERRUPT_SIGNAL,
     };
     #[cfg(unix)]
     use remuda_native::cluster::join_line::JoinLine;
@@ -2613,6 +2619,7 @@ mod cluster_cli_tests {
         assert!(!JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
         assert_eq!(unsafe { libc::raise(libc::SIGINT) }, 0);
         assert!(JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(JOIN_INTERRUPT_SIGNAL.load(Ordering::Relaxed), libc::SIGINT);
     }
 
     #[cfg(unix)]
@@ -2653,10 +2660,12 @@ mod cluster_cli_tests {
             .map(|signal| current_signal_handler(*signal))
             .collect();
         let handler = JoinInterruptHandler::install().unwrap();
+        JOIN_INTERRUPT_SIGNAL.store(0, Ordering::Relaxed);
+        JOIN_INTERRUPTED.store(false, Ordering::Relaxed);
         for signal in signals {
-            JOIN_INTERRUPTED.store(false, std::sync::atomic::Ordering::Relaxed);
             assert_eq!(unsafe { libc::raise(signal) }, 0);
             assert!(JOIN_INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed));
+            assert_eq!(JOIN_INTERRUPT_SIGNAL.load(Ordering::Relaxed), libc::SIGINT);
         }
         drop(handler);
         for (signal, expected) in signals.into_iter().zip(before) {
