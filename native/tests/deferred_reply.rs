@@ -98,6 +98,16 @@ remuda.extension_command("deferred", function(args)
       reply:resolve(0, string.rep("x", 16 * 1024 * 1024), "")
     end }
     return reply
+  elseif args[1] == "secret" then
+    local reply = remuda.pending { timeout = 5 }
+    reply:prompt_secret { label = "deferred test secret", callback = function(secret, err)
+      if err then
+        reply:reject("secret prompt " .. err .. "\nNext: remuda deferred --password-file PATH")
+      else
+        reply:resolve(0, "secret accepted", "")
+      end
+    end }
+    return reply
   elseif args[1] == "shutdown_wait" then
     local path = args[2]
     return remuda.pending { timeout = 30, on_cancel = function(reason)
@@ -320,6 +330,108 @@ fn maximum_deferred_output_round_trips_with_base64_wire_encoding() {
     assert_eq!(output.stdout.len(), 16 * 1024 * 1024);
     assert!(output.stderr.is_empty(), "{output:?}");
     eprintln!("16 MiB deferred reply round trip: {elapsed:.2?}");
+}
+
+#[test]
+fn secret_prompt_non_tty_fallback_and_answer_do_not_leak() {
+    use remuda_core::protocol::{Request, Response, SecretBytes};
+    use remuda_native::ipc::TryClone;
+    use std::io::{BufRead, BufReader, Write};
+
+    let (dir, remuda) = fixture("secret_prompt");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let sentinel = b"S3CRET-probe";
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+    let mut stream = remuda_native::ipc::connect(&socket).expect("private daemon socket");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone private socket"));
+    let request = Request::Eval {
+        code: "return remuda._dispatch_extension_command('deferred', {'secret'}, {})".into(),
+        name: None,
+    };
+    let mut request_frame = serde_json::to_vec(&request).unwrap();
+    request_frame.push(b'\n');
+    stream.write_all(&request_frame).unwrap();
+
+    let mut prompt_frame = Vec::new();
+    reader.read_until(b'\n', &mut prompt_frame).unwrap();
+    let prompt: Response = serde_json::from_slice(&prompt_frame).expect("secret prompt frame");
+    let prompt_id = match prompt {
+        Response::PromptSecret { id, .. } => id,
+        response => panic!("expected secret prompt, got {response:?}"),
+    };
+    let answer = Request::SecretAnswer {
+        id: prompt_id,
+        secret: Some(SecretBytes::new(sentinel.to_vec())),
+    };
+    let mut answer_frame = serde_json::to_vec(&answer).unwrap();
+    answer_frame.push(b'\n');
+    stream.write_all(&answer_frame).unwrap();
+
+    let mut reply_frame = Vec::new();
+    reader.read_until(b'\n', &mut reply_frame).unwrap();
+    assert!(
+        !prompt_frame
+            .windows(sentinel.len())
+            .any(|window| window == sentinel)
+            && !reply_frame
+                .windows(sentinel.len())
+                .any(|window| window == sentinel),
+        "secret appeared in a daemon reply frame"
+    );
+    let reply: Response = serde_json::from_slice(&reply_frame).expect("deferred reply frame");
+    assert!(matches!(reply, Response::CommandResult { .. }), "{reply:?}");
+    drop(reader);
+    drop(stream);
+
+    // Command::output gives this CLI no stdin or stderr TTY.
+    let non_tty = remuda(&["deferred", "secret"]);
+    let stop = remuda(&["stop", "-f"]);
+    let log = socket.with_extension("log");
+    let log_bytes = fs::read(&log).unwrap_or_default();
+    assert!(
+        !log_bytes
+            .windows(sentinel.len())
+            .any(|window| window == sentinel),
+        "sentinel appeared in daemon log {}",
+        log.display()
+    );
+    assert_no_secret_in_files(&dir, sentinel);
+    let _ = fs::remove_dir_all(&dir);
+
+    assert!(stop.status.success(), "{stop:?}");
+    assert_eq!(non_tty.status.code(), Some(1), "{non_tty:?}");
+    assert!(non_tty.stdout.is_empty(), "{non_tty:?}");
+    let stderr = String::from_utf8_lossy(&non_tty.stderr);
+    assert!(stderr.contains("not_a_terminal"), "{stderr}");
+    assert_eq!(
+        stderr.lines().last(),
+        Some("Next: remuda deferred --password-file PATH"),
+        "non-TTY error must end with a concrete password-file Next line: {stderr}"
+    );
+}
+
+fn assert_no_secret_in_files(root: &std::path::Path, secret: &[u8]) {
+    for entry in fs::read_dir(root).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            assert_no_secret_in_files(&path, secret);
+        } else if path.is_file() {
+            let contents = fs::read(&path).unwrap();
+            assert!(
+                !contents
+                    .windows(secret.len())
+                    .any(|window| window == secret),
+                "sentinel appeared in {}",
+                path.display()
+            );
+        }
+    }
 }
 
 #[test]
