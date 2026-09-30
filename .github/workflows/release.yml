@@ -80,9 +80,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Every entry here has been built by a real runner, and that bar is the
-          # rule: `publish` is strict, so a target no runner picks up withholds
-          # ALL assets, and a permanently-queued job looks merely slow.
+          # Every target must have a runner for its architecture; `publish` is
+          # strict, so one unbuilt target withholds ALL assets.
           # `macos-13` proved it — run 34438277779, 27 minutes with
           # `started_at == created_at` and no runner, and nothing shipped.
           #
@@ -92,16 +91,22 @@ jobs:
           # and windows built beside them. A runner group must admit a PUBLIC
           # repo and that is an org admin's call, so macOS stays on GitHub's
           # runner — free here, measured: `billable.MACOS.total_ms = 0`.
-          # Intel mac waits for a host that can answer whether mlua's vendored
-          # C cross-compiles from arm64; nobody has built it yet.
+          # Intel mac uses GitHub's native Intel runner; mlua's vendored C does
+          # not need to cross-compile from arm64.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04 # older glibc → runs on more distros
+            bin: remuda
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
             bin: remuda
           - target: aarch64-linux-android
             os: ubuntu-22.04
             bin: remuda
           - target: aarch64-apple-darwin
             os: macos-14
+            bin: remuda
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
             bin: remuda
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -163,7 +168,7 @@ jobs:
         #
         # Android is cross-compiled too and gets its --version check in the
         # Termux smoke below; this Linux host cannot execute that binary.
-        if: matrix.target != 'x86_64-apple-darwin' && matrix.target != 'aarch64-linux-android'
+        if: matrix.target != 'aarch64-linux-android'
         run: |
           set -eu
           got=$(./target/${{ matrix.target }}/release/${{ matrix.bin }} --version)

@@ -73,19 +73,11 @@ if [ "$termux" = yes ]; then
 fi
 case "$os/$arch" in
 Linux/x86_64) target=x86_64-unknown-linux-gnu ;;
+Linux/aarch64|Linux/arm64) target=aarch64-unknown-linux-gnu ;;
 Android/aarch64|Android/arm64) target=aarch64-linux-android ;;
 Darwin/arm64) target=aarch64-apple-darwin ;;
+Darwin/x86_64) target=x86_64-apple-darwin ;;
 *)
-	if [ "$channel" = nightly ]; then
-		case "$os/$arch" in
-		Linux/aarch64|Linux/arm64)
-			die "no nightly build for aarch64-linux (ARM Linux) — build from source: cargo install --git https://github.com/$REPO"
-			;;
-		Darwin/x86_64|Darwin/i386)
-			die "no nightly build for x86_64-apple-darwin (Intel macOS) — build from source: cargo install --git https://github.com/$REPO"
-			;;
-		esac
-	fi
 	die "no prebuilt binary for $os/$arch — build from source: cargo install --git https://github.com/$REPO"
 	;;
 esac

@@ -95,8 +95,8 @@ It downloads a signed-by-checksum tarball, verifies it against the release's
 `SHA256SUMS`, and lands `remuda` in `~/.local/bin`. Set `REMUDA_INSTALL_DIR` to
 put it elsewhere.
 
-Nightly does not publish an ARM Linux (`aarch64-linux`) or Intel Mac
-(`x86_64-apple-darwin`) binary; build from source on those platforms.
+Nightly also publishes ARM64 Linux (`aarch64-unknown-linux-gnu`) and Intel Mac
+(`x86_64-apple-darwin`) binaries.
 
 **Windows** (x86_64), in PowerShell:
 
