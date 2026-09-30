@@ -438,13 +438,12 @@ fn parse_cluster_join(args: &[&str]) -> Result<ClusterCommand, String> {
             .position(|arg| arg.starts_with("remuda-join-v1"))
         {
             if remuda_native::cluster::join_line::JoinLine::decode(args[index]).is_err() {
-                let line = args[index..].join(" ");
                 let reason = if index == 0 {
-                    format!("missing fingerprint; add it before the quoted join line: '{line}'")
+                    "missing fingerprint; use this form and quote the whole join line: remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
                 } else {
-                    format!("quote the join line: '{line}'")
+                    "quote the whole join line (it contains spaces): remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
                 };
-                return Err(reason);
+                return Err(reason.into());
             }
         }
     }
@@ -1170,38 +1169,52 @@ mod cluster_cli_tests {
     fn cluster_unquoted_join_line_has_quote_hint() {
         let key = [7; 32];
         let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
-        let join_line = "remuda-join-v1 192.0.2.4:9443 SHA256:other token proof";
+        let bearer = "BEARER_TOKEN_MUST_NOT_APPEAR_71d9";
         let actual = invalid_reason(&[
             "join",
             &fingerprint,
             "remuda-join-v1",
             "192.0.2.4:9443",
             "SHA256:other",
-            "token",
+            bearer,
             "proof",
         ]);
         assert_eq!(
             actual,
-            ("join".into(), format!("quote the join line: '{join_line}'"))
+            (
+                "join".into(),
+                "quote the whole join line (it contains spaces): remuda cluster join FINGERPRINT 'remuda-join-v1 …'".into()
+            )
+        );
+        assert!(!actual.1.contains(bearer), "{actual:?}");
+        assert!(
+            !actual.1.contains("remuda-join-v1 192.0.2.4:9443"),
+            "{actual:?}"
         );
     }
 
     #[test]
     fn cluster_join_without_fingerprint_gets_fingerprint_and_quote_hint() {
-        let join_line = "remuda-join-v1 192.0.2.4:9443 SHA256:other token proof";
+        let bearer = "BEARER_TOKEN_MUST_NOT_APPEAR_71d9";
+        let actual = invalid_reason(&[
+            "join",
+            "remuda-join-v1",
+            "192.0.2.4:9443",
+            "SHA256:other",
+            bearer,
+            "proof",
+        ]);
         assert_eq!(
-            invalid_reason(&[
-                "join",
-                "remuda-join-v1",
-                "192.0.2.4:9443",
-                "SHA256:other",
-                "token",
-                "proof",
-            ]),
+            actual,
             (
                 "join".into(),
-                format!("missing fingerprint; add it before the quoted join line: '{join_line}'")
+                "missing fingerprint; use this form and quote the whole join line: remuda cluster join FINGERPRINT 'remuda-join-v1 …'".into()
             )
+        );
+        assert!(!actual.1.contains(bearer), "{actual:?}");
+        assert!(
+            !actual.1.contains("remuda-join-v1 192.0.2.4:9443"),
+            "{actual:?}"
         );
     }
 
