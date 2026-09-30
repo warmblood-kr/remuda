@@ -1670,6 +1670,7 @@ fn deferred_reply(
                 &Response::PromptSecret {
                     id: prompt.id,
                     label,
+                    timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
                 },
             )
             .map_err(|error| error.to_string())?;

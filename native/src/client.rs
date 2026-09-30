@@ -485,33 +485,136 @@ pub fn request_with_secret_prompts(path: &Path, request: &Request) -> std::io::R
             return Err(request_timeout(path, timeout));
         }
         let response = read_response_with_timeout(path, stream.try_clone()?, remaining)?;
-        let Response::PromptSecret { id, label } = response else {
+        let Response::PromptSecret {
+            id,
+            label,
+            timeout_ms,
+        } = response
+        else {
             return Ok(response);
         };
-        let (secret, refusal) = collect_secret_from_terminal(&label)?;
-        send_secret_answer(&stream, id, secret.as_ref(), refusal)?;
+        match collect_secret_from_terminal(&label, timeout_ms)? {
+            SecretPromptCollection::Answer(secret, refusal) => {
+                send_secret_answer(&stream, id, secret.as_ref(), refusal)?;
+            }
+            SecretPromptCollection::Deadline => {}
+        }
     }
+}
+
+enum SecretPromptCollection {
+    Answer(
+        Option<remuda_core::protocol::SecretBytes>,
+        Option<remuda_core::protocol::SecretAnswerRefusal>,
+    ),
+    Deadline,
 }
 
 fn collect_secret_from_terminal(
     label: &str,
-) -> std::io::Result<(
-    Option<remuda_core::protocol::SecretBytes>,
-    Option<remuda_core::protocol::SecretAnswerRefusal>,
-)> {
+    timeout_ms: u64,
+) -> std::io::Result<SecretPromptCollection> {
     use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-        return Ok((
+        return Ok(SecretPromptCollection::Answer(
             None,
             Some(remuda_core::protocol::SecretAnswerRefusal::NotATerminal),
         ));
     }
-    let events = std::iter::from_fn(|| crossterm::event::read().ok());
-    Ok(secret_answer_from_line(prompt_secret_with_events(
-        std::io::stderr(),
-        label,
-        events,
-    )?))
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    #[cfg(unix)]
+    let signal_guard = SecretPromptSignalGuard::install()?;
+    let mut expired = false;
+    let events = std::iter::from_fn(|| loop {
+        #[cfg(unix)]
+        if SECRET_PROMPT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            expired = true;
+            return None;
+        }
+        let poll_for = remaining.min(Duration::from_millis(100));
+        match crossterm::event::poll(poll_for) {
+            Ok(true) => match crossterm::event::read() {
+                Ok(event) => return Some(event),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            },
+            Ok(false) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    });
+    let answer = prompt_secret_with_events(std::io::stderr(), label, events)?;
+    #[cfg(unix)]
+    {
+        drop(signal_guard);
+        let received_signal = SECRET_PROMPT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+        if received_signal != 0 {
+            unsafe { libc::raise(received_signal) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "secret prompt interrupted by signal",
+            ));
+        }
+    }
+    if expired {
+        Ok(SecretPromptCollection::Deadline)
+    } else {
+        let (secret, refusal) = secret_answer_from_line(answer);
+        Ok(SecretPromptCollection::Answer(secret, refusal))
+    }
+}
+
+#[cfg(unix)]
+static SECRET_PROMPT_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn secret_prompt_signal_handler(signal: libc::c_int) {
+    SECRET_PROMPT_SIGNAL.store(signal, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+struct SecretPromptSignalGuard {
+    previous: [(libc::c_int, libc::sighandler_t); 2],
+}
+
+#[cfg(unix)]
+impl SecretPromptSignalGuard {
+    fn install() -> std::io::Result<Self> {
+        use std::io;
+        SECRET_PROMPT_SIGNAL.store(0, std::sync::atomic::Ordering::SeqCst);
+        let signals = [libc::SIGTERM, libc::SIGHUP];
+        let mut previous = [(0, libc::SIG_ERR as libc::sighandler_t); 2];
+        for (index, signal) in signals.into_iter().enumerate() {
+            let old = unsafe {
+                libc::signal(
+                    signal,
+                    secret_prompt_signal_handler as *const () as libc::sighandler_t,
+                )
+            };
+            if old == libc::SIG_ERR as libc::sighandler_t {
+                for (installed_signal, old_handler) in previous[..index].iter().copied() {
+                    unsafe { libc::signal(installed_signal, old_handler) };
+                }
+                return Err(io::Error::last_os_error());
+            }
+            previous[index] = (signal, old);
+        }
+        Ok(Self { previous })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SecretPromptSignalGuard {
+    fn drop(&mut self) {
+        for (signal, handler) in self.previous {
+            unsafe { libc::signal(signal, handler) };
+        }
+    }
 }
 
 fn send_secret_answer(
@@ -2899,6 +3002,7 @@ mod tests {
         let prompt = Response::PromptSecret {
             id: 19,
             label: "Bot password".into(),
+            timeout_ms: 5_000,
         };
         let prompt_wire = serde_json::to_vec(&prompt).unwrap();
         let decoded_prompt: Response = serde_json::from_slice(&prompt_wire).unwrap();

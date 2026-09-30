@@ -378,6 +378,9 @@ pub enum Response {
     PromptSecret {
         id: u32,
         label: String,
+        /// Remaining lifetime of the pending reply when this prompt was sent.
+        #[serde(default)]
+        timeout_ms: u64,
     },
 }
 

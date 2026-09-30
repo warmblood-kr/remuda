@@ -160,7 +160,7 @@ end)
 fn secret_prompt_client_exits_and_restores_tty(
     runtime: &std::path::Path,
     signal: Option<libc::c_int>,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     use std::io::Read as _;
 
     let pty = portable_pty::native_pty_system()
@@ -239,7 +239,7 @@ fn secret_prompt_client_exits_and_restores_tty(
         let _ = child.kill();
         let _ = child.wait();
     }
-    (exited, flags())
+    (prompt_shown, exited, flags())
 }
 
 #[cfg(unix)]
@@ -258,17 +258,18 @@ fn secret_prompt_deadline_and_termination_signals_restore_the_tty() {
     let hup_case = secret_prompt_client_exits_and_restores_tty(&dir, Some(libc::SIGHUP));
     let _ = remuda(&["stop", "-f"]);
 
+    assert!(deadline_case.0, "client never displayed its prompt");
     assert!(
-        deadline_case.0,
+        deadline_case.1,
         "client did not exit at its pending deadline"
     );
-    assert!(deadline_case.1, "deadline left terminal in raw mode");
+    assert!(deadline_case.2, "deadline left terminal in raw mode");
     assert!(
-        term_case.0 && term_case.1,
+        term_case.0 && term_case.1 && term_case.2,
         "SIGTERM did not restore terminal: {term_case:?}"
     );
     assert!(
-        hup_case.0 && hup_case.1,
+        hup_case.0 && hup_case.1 && hup_case.2,
         "SIGHUP did not restore terminal: {hup_case:?}"
     );
 }
@@ -501,7 +502,7 @@ fn secret_prompt_non_tty_fallback_and_answer_do_not_leak() {
     reader.read_until(b'\n', &mut prompt_frame).unwrap();
     let prompt: Response = serde_json::from_slice(&prompt_frame).expect("secret prompt frame");
     let prompt_id = match prompt {
-        Response::PromptSecret { id, label } => {
+        Response::PromptSecret { id, label, .. } => {
             assert_eq!(
                 label, "deferred test secret",
                 "outside caller gets no prefix"
