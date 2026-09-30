@@ -1573,7 +1573,7 @@ fn format_revocation_time(timestamp: &str) -> String {
     format_utc_revocation_time(timestamp)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn format_utc_revocation_time(timestamp: &str) -> String {
     let Ok(seconds) = timestamp.parse::<i64>() else {
         return "unknown UTC time".into();
@@ -1588,7 +1588,7 @@ fn format_utc_revocation_time(timestamp: &str) -> String {
     )
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -2107,31 +2107,59 @@ mod cluster_cli_tests {
     }
 
     #[test]
-    fn revoked_notice_prints_fixed_times_and_keeps_recovery_next_step() {
-        // Run this test with TZ=UTC so Unix local-time conversion is deterministic.
-        for (timestamp, expected) in [
-            ("0", "1970-01-01 00:00 UTC"),
-            ("1790743860", "2026-09-30 04:51 UTC"),
-        ] {
-            let notice = remuda_native::cluster::control::RevokedNotice {
-                by_fp: "SHA256:issuer".into(),
-                at: timestamp.into(),
-            };
-            let mut output = Vec::new();
+    fn utc_revocation_formatter_handles_fixed_epochs() {
+        assert_eq!(
+            super::format_utc_revocation_time("0"),
+            "1970-01-01 00:00 UTC"
+        );
+        assert_eq!(
+            super::format_utc_revocation_time("1790743860"),
+            "2026-09-30 04:51 UTC"
+        );
+    }
 
-            write_revocation_notice(&mut output, &notice).unwrap();
+    #[cfg(unix)]
+    #[test]
+    fn unix_revocation_time_has_local_date_time_and_zone_shape() {
+        let actual = super::format_revocation_time("1790743860");
+        let mut fields = actual.split(' ');
+        let date = fields.next().unwrap_or_default().as_bytes();
+        let time = fields.next().unwrap_or_default().as_bytes();
+        let zone = fields.next().unwrap_or_default();
 
-            let output = String::from_utf8(output).unwrap();
-            assert!(
-                output.contains("This node was revoked by node-"),
-                "{output}"
-            );
-            assert!(
-                output.contains(&format!(" at {expected}.")),
-                "expected UTC timestamp {expected:?}, got {output}"
-            );
-            assert!(output.contains("Next: run `remuda cluster init --new-identity`"));
-        }
+        assert_eq!(date.len(), 10, "{actual}");
+        assert!(date[..4].iter().all(u8::is_ascii_digit), "{actual}");
+        assert_eq!(date[4], b'-', "{actual}");
+        assert!(date[5..7].iter().all(u8::is_ascii_digit), "{actual}");
+        assert_eq!(date[7], b'-', "{actual}");
+        assert!(date[8..10].iter().all(u8::is_ascii_digit), "{actual}");
+        assert_eq!(time.len(), 5, "{actual}");
+        assert!(time[..2].iter().all(u8::is_ascii_digit), "{actual}");
+        assert_eq!(time[2], b':', "{actual}");
+        assert!(time[3..5].iter().all(u8::is_ascii_digit), "{actual}");
+        assert!(!zone.is_empty(), "{actual}");
+        assert!(fields.next().is_none(), "expected one zone token: {actual}");
+    }
+
+    #[test]
+    fn revoked_notice_keeps_local_time_and_recovery_next_step() {
+        let notice = remuda_native::cluster::control::RevokedNotice {
+            by_fp: "SHA256:issuer".into(),
+            at: "1790743860".into(),
+        };
+        let mut output = Vec::new();
+        write_revocation_notice(&mut output, &notice).unwrap();
+        let output = String::from_utf8(output).unwrap();
+
+        assert!(
+            output.contains("This node was revoked by node-"),
+            "{output}"
+        );
+        assert!(
+            output.contains(" at ") && !output.contains("Unix time"),
+            "{output}"
+        );
+        assert!(output.contains("Next: run `remuda cluster init --new-identity`"));
     }
 
     fn shell_split_single_quotes(command: &str) -> Vec<String> {
