@@ -40,6 +40,7 @@ pub enum ListenerStatus {
         #[serde(default)]
         listen_addrs: Vec<std::net::SocketAddr>,
     },
+    WaitingForLan(String),
     Failed(String),
 }
 

@@ -976,6 +976,11 @@ fn cluster_listen(
             Ok(remuda_core::protocol::ListenerStatus::Off) => fail(
                 "cluster listen: listener stayed off after reload\nNext: run `remuda cluster` and retry `remuda cluster listen`.",
             ),
+            Ok(remuda_core::protocol::ListenerStatus::WaitingForLan(reason)) => {
+                println!("Cluster listener waiting for a private LAN address.");
+                println!("{}", listener_failure_next_step(&reason));
+                ExitCode::SUCCESS
+            }
             Ok(remuda_core::protocol::ListenerStatus::Failed(reason)) => fail(format!(
                 "cluster listen: listener failed: {reason}\n{}",
                 listener_failure_next_step(&reason)
@@ -1036,6 +1041,10 @@ fn cluster_listen_off(server: &str, path: &Path) -> ExitCode {
                     println!("Next: run `remuda cluster invite` when you are ready to admit a peer.");
                     ExitCode::SUCCESS
                 }
+                Ok(remuda_core::protocol::ListenerStatus::WaitingForLan(reason)) => fail(format!(
+                    "cluster listen --off: listener is still waiting for a private LAN address\n{}",
+                    listener_failure_next_step(&reason)
+                )),
                 Ok(remuda_core::protocol::ListenerStatus::On { addr, .. }) => fail(format!(
                     "cluster listen --off: listener remains on at {addr}\nNext: check `remuda cluster` and try `remuda cluster listen --off` again."
                 )),
@@ -1240,6 +1249,10 @@ fn render_init_listener_lines(status: &remuda_core::protocol::ListenerStatus) ->
             lines
         }
         ListenerStatus::Off => vec!["Listener off (--no-listen)".into(), next_step_init().into()],
+        ListenerStatus::WaitingForLan(reason) => vec![
+            "Listener waiting for a private LAN address".into(),
+            listener_failure_next_step(reason).into(),
+        ],
         ListenerStatus::Failed(reason) => vec![
             format!("Listener failed: {reason}"),
             listener_failure_next_step(reason).into(),
@@ -1337,6 +1350,10 @@ fn cluster_listener_status_lines(
         Some(ListenerStatus::Off) => {
             vec!["Listener: off (Next: remuda cluster listen)".into()]
         }
+        Some(ListenerStatus::WaitingForLan(reason)) => vec![
+            "Listener: waiting for a private LAN address".into(),
+            listener_failure_next_step(&reason).into(),
+        ],
         Some(ListenerStatus::On {
             addr,
             auto,
@@ -1456,6 +1473,10 @@ fn render_invite_listener_refusal(status: &remuda_core::protocol::ListenerStatus
         ListenerStatus::Off => {
             "cluster invite: listener is off\nNext: remuda cluster listen".into()
         }
+        ListenerStatus::WaitingForLan(reason) => format!(
+            "cluster invite: listener is waiting for a private LAN address\n{}",
+            listener_failure_next_step(reason)
+        ),
         ListenerStatus::Failed(reason) => format!(
             "cluster invite: listener failed: {reason}\n{}",
             listener_failure_next_step(reason)
@@ -1929,6 +1950,10 @@ fn render_join_listener_refusal(status: &remuda_core::protocol::ListenerStatus) 
 
     match status {
         ListenerStatus::Off => "cluster join: listener is off\nNext: remuda cluster listen".into(),
+        ListenerStatus::WaitingForLan(reason) => format!(
+            "cluster join: listener is waiting for a private LAN address\n{}",
+            listener_failure_next_step(reason)
+        ),
         ListenerStatus::Failed(reason) => format!(
             "cluster join: listener failed: {reason}\n{}",
             listener_failure_next_step(reason)
@@ -3971,6 +3996,15 @@ mod cluster_cli_tests {
             [
                 "Listener: failed: address in use",
                 "Next: remuda cluster listen"
+            ]
+        );
+        assert_eq!(
+            cluster_listener_status_lines(Some(ListenerStatus::WaitingForLan(
+                "no private LAN address found. Next: remuda cluster listen --bind IP".into()
+            ))),
+            [
+                "Listener: waiting for a private LAN address",
+                "Next: remuda cluster listen --bind IP"
             ]
         );
         assert_eq!(
