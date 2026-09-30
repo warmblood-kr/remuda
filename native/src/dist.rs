@@ -279,4 +279,17 @@ mod tests {
     fn the_version_is_never_empty() {
         assert!(!VERSION.is_empty());
     }
+
+    #[test]
+    fn upgrade_installer_does_not_inherit_butler_install_opt_in() {
+        // `Command` inherits parent variables unless it explicitly removes
+        // them. Inspect the builder instead of running its network installer.
+        let command = installer_command();
+        assert!(
+            command.get_envs().any(|(name, value)| {
+                name == std::ffi::OsStr::new("REMUDA_INSTALL_BUTLER") && value.is_none()
+            }),
+            "upgrade installer must remove REMUDA_INSTALL_BUTLER from its child environment"
+        );
+    }
 }
