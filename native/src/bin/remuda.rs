@@ -743,34 +743,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         ClusterCommand::Listen {
             bind_addr,
             allow_public,
-        } => with_daemon(server, path, |daemon_path| {
-            let config = remuda_native::net::listener::ListenerConfig {
-                bind_addr,
-                allow_unspecified: allow_public,
-            };
-            match remuda_native::net::listener::bind(config, daemon_path) {
-                Ok(listener) => {
-                    eprintln!(
-                        "remuda: cluster listener on {}",
-                        listener.local_addr().unwrap_or(bind_addr)
-                    );
-                    eprintln!("{}", next_step_listen());
-                    match listener.serve() {
-                        Ok(()) => ExitCode::SUCCESS,
-                        Err(error) => fail(describe_cluster_error(
-                            "listen",
-                            &error,
-                            ClusterErrorContext::Address(bind_addr),
-                        )),
-                    }
-                }
-                Err(error) => fail(describe_cluster_error(
-                    "listen",
-                    &error,
-                    ClusterErrorContext::Address(bind_addr),
-                )),
-            }
-        }),
+        } => cluster_listen(server, path, bind_addr, allow_public),
         ClusterCommand::Call {
             target,
             address,
@@ -801,6 +774,42 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn cluster_listen(
+    server: &str,
+    path: &Path,
+    bind_addr: std::net::SocketAddr,
+    allow_public: bool,
+) -> ExitCode {
+    with_daemon(server, path, |daemon_path| {
+        let config = remuda_native::net::listener::ListenerConfig {
+            bind_addr,
+            allow_unspecified: allow_public,
+        };
+        match remuda_native::net::listener::bind(config, daemon_path) {
+            Ok(listener) => {
+                eprintln!(
+                    "remuda: cluster listener on {}",
+                    listener.local_addr().unwrap_or(bind_addr)
+                );
+                eprintln!("{}", next_step_listen());
+                match listener.serve() {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => fail(describe_cluster_error(
+                        "listen",
+                        &error,
+                        ClusterErrorContext::Address(bind_addr),
+                    )),
+                }
+            }
+            Err(error) => fail(describe_cluster_error(
+                "listen",
+                &error,
+                ClusterErrorContext::Address(bind_addr),
+            )),
+        }
+    })
 }
 
 fn cluster_status() -> ExitCode {
