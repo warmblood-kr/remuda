@@ -1378,20 +1378,30 @@ fn cluster_join_with_listener(
             ))
         }
     };
-    let mut restore_guard = JoinListenerRestoreGuard::new(daemon_path, listener_snapshot);
+    let mut restore_guard = JoinListenerRestoreGuard::new(daemon_path, listener_snapshot.clone());
     let initial_status = remuda_native::cluster::listener_control::status(daemon_path);
     let listener_status = match bind_addr {
-        Some(address) => remuda_native::cluster::listener_control::start(
-            daemon_path,
-            Some(ListenerConfig {
+        Some(address) => {
+            let config = ListenerConfig {
                 enabled: true,
                 bind: ListenerBind::Explicit(address),
                 allow_public: false,
-            }),
-        ),
+            };
+            restore_guard.set_expected(Some(config.clone()));
+            remuda_native::cluster::listener_control::start(daemon_path, Some(config))
+        }
         None => match initial_status {
             remuda_core::protocol::ListenerStatus::On { .. } => Ok(initial_status),
-            _ => remuda_native::cluster::listener_control::start(daemon_path, None),
+            _ => {
+                let mut config = listener_snapshot.unwrap_or(ListenerConfig {
+                    enabled: true,
+                    bind: ListenerBind::Auto,
+                    allow_public: false,
+                });
+                config.enabled = true;
+                restore_guard.set_expected(Some(config.clone()));
+                remuda_native::cluster::listener_control::start(daemon_path, Some(config))
+            }
         },
     };
     let listener_status = match listener_status {
@@ -1454,6 +1464,7 @@ fn cluster_join_with_listener(
 struct JoinListenerRestoreGuard {
     daemon_path: PathBuf,
     snapshot: Option<ListenerConfig>,
+    expected: Option<ListenerConfig>,
     expected_off: bool,
     armed: bool,
 }
@@ -1463,15 +1474,26 @@ impl JoinListenerRestoreGuard {
         let expected_off = snapshot.as_ref().is_none_or(|config| !config.enabled);
         Self {
             daemon_path: daemon_path.to_path_buf(),
+            expected: snapshot.clone(),
             snapshot,
             expected_off,
             armed: true,
         }
     }
 
-    fn restore(&mut self) -> std::io::Result<remuda_core::protocol::ListenerStatus> {
+    fn set_expected(&mut self, expected: Option<ListenerConfig>) {
+        self.expected = expected;
+    }
+
+    fn restore(
+        &mut self,
+    ) -> std::io::Result<remuda_native::cluster::listener_control::RestoreOutcome> {
         self.armed = false;
-        remuda_native::cluster::listener_control::restore(&self.daemon_path, self.snapshot.take())
+        remuda_native::cluster::listener_control::restore(
+            &self.daemon_path,
+            self.expected.as_ref(),
+            self.snapshot.take(),
+        )
     }
 
     fn disarm(&mut self) {
@@ -1488,11 +1510,14 @@ impl Drop for JoinListenerRestoreGuard {
 }
 
 fn restore_join_listener(guard: &mut JoinListenerRestoreGuard) -> Option<String> {
+    use remuda_native::cluster::listener_control::RestoreOutcome;
+
     match guard.restore() {
-        Ok(remuda_core::protocol::ListenerStatus::On { addr, .. }) if guard.expected_off => {
-            Some(render_join_listener_unexpected_on(addr))
-        }
-        Ok(_) => None,
+        Ok(RestoreOutcome::Restored(remuda_core::protocol::ListenerStatus::On {
+            addr, ..
+        })) if guard.expected_off => Some(render_join_listener_unexpected_on(addr)),
+        Ok(RestoreOutcome::Restored(_)) => None,
+        Ok(RestoreOutcome::SkippedChanged) => Some(render_join_listener_changed_during_join()),
         Err(error) => Some(render_join_listener_restore_error(&error)),
     }
 }
@@ -1627,6 +1652,10 @@ fn render_join_listener_restore_error(error: &std::io::Error) -> String {
 
 fn render_join_listener_unexpected_on(addr: std::net::SocketAddr) -> String {
     format!("cluster join: listener remains on at {addr}\nNext: run `remuda cluster listen --off` and check `remuda cluster`.")
+}
+
+fn render_join_listener_changed_during_join() -> String {
+    "cluster join: listener config changed during join; leaving the current config unchanged. Next: check `remuda cluster`.".into()
 }
 
 #[derive(Clone, Copy)]

@@ -877,6 +877,13 @@ fn failed_join_preserves_listener_change_made_while_join_is_blocked() {
         !joined.status.success(),
         "stalled fake issuer unexpectedly joined"
     );
+    assert!(
+        String::from_utf8_lossy(&joined.stderr).lines().any(|line| {
+            line == "cluster join: listener config changed during join; leaving the current config unchanged. Next: check `remuda cluster`."
+        }),
+        "missing one-line concurrent-change note: {}",
+        String::from_utf8_lossy(&joined.stderr)
+    );
     assert_eq!(
         listener_config::read_at(&cluster_dir).unwrap(),
         changed,
