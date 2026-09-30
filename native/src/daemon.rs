@@ -268,6 +268,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     #[cfg(unix)]
     let listener = prepare_unix_listener(listener, path)?;
     let anti_entropy = Arc::new(AntiEntropyTask::start()?);
+    let listener_task = Arc::new(ListenerTask::start(path));
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
 
     let registry = Arc::new(Registry::new());
@@ -307,7 +308,11 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
             registry,
             image,
             counters,
-            (socket_owner, anti_entropy),
+            (
+                socket_owner,
+                anti_entropy,
+                Arc::clone(&listener_task.status),
+            ),
         );
     }
     #[cfg(windows)]
@@ -319,6 +324,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
             let counters = Arc::clone(&counters);
             let socket_owner = Arc::clone(&socket_owner);
             let anti_entropy = anti_entropy.clone();
+            let listener_status = Arc::clone(&listener_task.status);
             std::thread::spawn(move || {
                 let _ = handle(
                     stream,
@@ -327,9 +333,11 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
                     &counters,
                     socket_owner,
                     anti_entropy,
+                    listener_status,
                 );
             });
         }
+        listener_task.stop_and_join();
         anti_entropy.stop_and_join();
         socket_owner.cleanup();
         Ok(())
@@ -412,9 +420,6 @@ fn anti_entropy_interval() -> Duration {
     Duration::from_secs(60 + u64::from(std::process::id() % 11))
 }
 
-// RED-stage API scaffold. Replaced by the daemon-owned listener implementation
-// once the lifecycle tests are in place.
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ListenerStatus {
     Off,
@@ -425,25 +430,141 @@ pub enum ListenerStatus {
     Failed(String),
 }
 
-#[cfg(test)]
 pub struct ListenerTask {
     status: Arc<Mutex<ListenerStatus>>,
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-#[cfg(test)]
 impl ListenerTask {
-    pub fn start(_daemon_path: &Path) -> Self {
+    pub fn start(daemon_path: &Path) -> Self {
+        let status = Arc::new(Mutex::new(ListenerStatus::Off));
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let status_for_thread = Arc::clone(&status);
+        let daemon_path = daemon_path.to_path_buf();
+        let thread = std::thread::Builder::new()
+            .name("remuda-cluster-listener".into())
+            .spawn(move || {
+                let result = start_listener(&daemon_path, &status_for_thread, stopped);
+                if let Err(reason) = result {
+                    set_listener_status(&status_for_thread, ListenerStatus::Failed(reason));
+                }
+            })
+            .expect("spawn cluster listener task");
         Self {
-            status: Arc::new(Mutex::new(ListenerStatus::Off)),
+            status,
+            stop,
+            thread: Mutex::new(Some(thread)),
         }
     }
 
     pub fn status(&self) -> ListenerStatus {
-        self.status
+        listener_status(&self.status)
+    }
+
+    fn stop_and_join(&self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self
+            .thread
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .clone()
+            .take()
+        {
+            let _ = thread.join();
+        }
     }
+}
+
+impl Drop for ListenerTask {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+/// Read the listener's current daemon-owned status word.
+pub fn listener_status(status: &Arc<Mutex<ListenerStatus>>) -> ListenerStatus {
+    status
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
+fn set_listener_status(status: &Arc<Mutex<ListenerStatus>>, value: ListenerStatus) {
+    *status.lock().unwrap_or_else(|error| error.into_inner()) = value;
+}
+
+fn start_listener(
+    daemon_path: &Path,
+    status: &Arc<Mutex<ListenerStatus>>,
+    stopped: std::sync::mpsc::Receiver<()>,
+) -> Result<(), String> {
+    use crate::cluster::listener_config::ListenerBind;
+
+    let config = match crate::cluster::listener_config::read() {
+        Ok(Some(config)) if config.enabled => config,
+        Ok(_) => return Ok(()),
+        Err(error) => return Err(format!("read listener config: {error}")),
+    };
+    let (address, auto) = match config.bind {
+        ListenerBind::Auto => (
+            crate::net::advertise_addr::auto_bind().map_err(|error| error.to_string())?,
+            true,
+        ),
+        ListenerBind::Explicit(address) => (address, false),
+    };
+
+    let _host_lock = match crate::cluster::try_acquire_listener_host_lock() {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            return Err("hosted by another daemon".into())
+        }
+        Err(error) => return Err(format!("lock cluster listener: {error}")),
+    };
+    let listener = crate::net::listener::bind(
+        crate::net::listener::ListenerConfig {
+            bind_addr: address,
+            allow_unspecified: config.allow_public,
+        },
+        daemon_path,
+    )
+    .map_err(|error| format!("bind cluster listener: {error}"))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("read cluster listener address: {error}"))?;
+    set_listener_status(
+        status,
+        ListenerStatus::On {
+            addr: address,
+            auto,
+        },
+    );
+
+    let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let serve_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::scope(|scope| {
+        let watcher_flag = Arc::clone(&stop_flag);
+        let watcher_done = Arc::clone(&serve_done);
+        let watcher = scope.spawn(move || loop {
+            match stopped.recv_timeout(Duration::from_millis(25)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    watcher_flag.store(true, Ordering::Release);
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    if watcher_done.load(Ordering::Acquire) =>
+                {
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        });
+        let result = listener
+            .serve_until(&stop_flag)
+            .map_err(|error| format!("serve cluster listener: {error}"));
+        serve_done.store(true, Ordering::Release);
+        let _ = watcher.join();
+        result
+    })
 }
 
 /// Serialize stale-socket removal and bind for one daemon name. The lock file
@@ -914,12 +1035,16 @@ fn serve_unix(
     registry: Arc<Registry>,
     image: Image,
     counters: Arc<crate::tick::Counters>,
-    lifecycle: (Arc<SocketOwnership>, Arc<AntiEntropyTask>),
+    lifecycle: (
+        Arc<SocketOwnership>,
+        Arc<AntiEntropyTask>,
+        Arc<Mutex<ListenerStatus>>,
+    ),
 ) -> ! {
     use std::io::Read as _;
     use std::os::fd::AsRawFd;
 
-    let (socket_owner, anti_entropy) = lifecycle;
+    let (socket_owner, anti_entropy, listener_status) = lifecycle;
     let detached = unsafe { libc::getsid(0) == libc::getpid() };
     let mut signal_bytes = [0u8; 1];
     'poll_loop: loop {
@@ -993,6 +1118,7 @@ fn serve_unix(
                     let counters = Arc::clone(&counters);
                     let socket_owner = Arc::clone(&socket_owner);
                     let anti_entropy = Arc::clone(&anti_entropy);
+                    let listener_status = Arc::clone(&listener_status);
                     std::thread::spawn(move || {
                         let _ = handle(
                             stream,
@@ -1001,6 +1127,7 @@ fn serve_unix(
                             &counters,
                             socket_owner,
                             anti_entropy,
+                            listener_status,
                         );
                     });
                 }
@@ -1154,6 +1281,7 @@ fn handle(
     counters: &crate::tick::Counters,
     socket_owner: Arc<SocketOwnership>,
     anti_entropy: Arc<AntiEntropyTask>,
+    listener_status: Arc<Mutex<ListenerStatus>>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let Some(request) = read_request(&stream, &mut reader)? else {
@@ -1168,11 +1296,12 @@ fn handle(
         image,
         socket_owner,
         anti_entropy,
+        listener_status,
         request,
     )
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn handle_request(
     stream: Stream,
     reader: BufReader<Stream>,
@@ -1180,6 +1309,7 @@ fn handle_request(
     image: &Image,
     socket_owner: Arc<SocketOwnership>,
     anti_entropy: Arc<AntiEntropyTask>,
+    _listener_status: Arc<Mutex<ListenerStatus>>,
     request: Request,
 ) -> std::io::Result<()> {
     match request {
@@ -2253,10 +2383,22 @@ mod tests {
     }
 
     fn bound_listener_status(task: &ListenerTask) -> std::net::SocketAddr {
-        match task.status() {
-            ListenerStatus::On { addr, auto: false } => addr,
-            status => panic!("expected an explicit listener to be on, got {status:?}"),
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match task.status() {
+                ListenerStatus::On { addr, auto: false } => return addr,
+                ListenerStatus::Off if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                status => panic!("expected an explicit listener to be on, got {status:?}"),
+            }
         }
+    }
+
+    #[allow(clippy::disallowed_types)]
+    fn connect_listener(address: std::net::SocketAddr) -> std::net::TcpStream {
+        std::net::TcpStream::connect_timeout(&address, Duration::from_secs(15))
+            .expect("listener accepts TCP within the per-operation deadline")
     }
 
     #[test]
@@ -2276,22 +2418,30 @@ mod tests {
             0,
             "status reports the selected ephemeral port"
         );
-        std::net::TcpStream::connect(address).expect("listener accepts TCP");
+        let _connection = connect_listener(address);
     }
 
     #[test]
+    #[allow(clippy::disallowed_types)]
     fn listener_task_drop_closes_its_listener_port() {
         let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
         let task = ListenerTask::start(&environment.socket_path());
         let address = bound_listener_status(&task);
-        std::net::TcpStream::connect(address).expect("listener is reachable before Drop");
+        let connection = connect_listener(address);
+        drop(connection);
         drop(task);
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while std::net::TcpStream::connect(address).is_ok() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "listener stayed open after Drop"
-            );
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match std::net::TcpStream::connect_timeout(&address, Duration::from_secs(15)) {
+                Err(_) => break,
+                Ok(connection) => {
+                    drop(connection);
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "listener stayed open after Drop"
+                    );
+                }
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -2302,20 +2452,46 @@ mod tests {
         let first = ListenerTask::start(&environment.socket_path());
         let first_address = bound_listener_status(&first);
         let second = ListenerTask::start(&environment.socket_path().with_file_name("s2"));
-        match second.status() {
-            ListenerStatus::Failed(reason) => assert!(reason.contains("hosted by another daemon")),
-            status => panic!("expected the second listener host to lose the lock, got {status:?}"),
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match second.status() {
+                ListenerStatus::Failed(reason) => {
+                    assert!(reason.contains("hosted by another daemon"));
+                    break;
+                }
+                ListenerStatus::Off if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                status => {
+                    panic!("expected the second listener host to lose the lock, got {status:?}")
+                }
+            }
         }
-        std::net::TcpStream::connect(first_address).expect("the first listener remains reachable");
+        let _connection = connect_listener(first_address);
     }
 
     #[test]
     fn listener_task_reports_bind_failure_as_failed_status() {
         let environment = ListenerTaskEnvironment::new(Some(listener_config("192.0.2.1:7441")));
         let task = ListenerTask::start(&environment.socket_path());
-        match task.status() {
+        match wait_for_listener_terminal_status(&task) {
             ListenerStatus::Failed(reason) => assert!(!reason.is_empty()),
             status => panic!("expected a bind failure status, got {status:?}"),
+        }
+    }
+
+    fn wait_for_listener_terminal_status(task: &ListenerTask) -> ListenerStatus {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let status = task.status();
+            if !matches!(status, ListenerStatus::Off) {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "listener startup timed out"
+            );
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 

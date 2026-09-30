@@ -19,6 +19,44 @@ pub use replication::{push_now, push_now_excluding, registry_changed, PeerPushRe
 use std::io;
 use std::net::SocketAddr;
 
+/// Take the per-user cluster-listener host lock without waiting. The returned
+/// file keeps the OS lock alive until the hosting daemon drops it.
+pub(crate) fn try_acquire_listener_host_lock() -> io::Result<std::fs::File> {
+    #[cfg(not(windows))]
+    use std::fs::OpenOptions;
+
+    let dir = storage::cluster_state_dir()?.join("cluster");
+    storage::verify_directory(&dir)?;
+    let path = dir.join("listener.lock");
+    #[cfg(windows)]
+    let file = {
+        let file = windows_security::create_or_open_lock(&path)?;
+        storage::check_private_file(&file, "cluster listener lock", &path)?;
+        file
+    };
+    #[cfg(not(windows))]
+    let file = {
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let file = options.open(&path)?;
+        storage::check_private_file(&file, "cluster listener lock", &path)?;
+        file
+    };
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "cluster listener hosted by another daemon",
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RevokeOutcome {
     Revoked,
