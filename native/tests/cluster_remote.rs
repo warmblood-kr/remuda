@@ -322,6 +322,15 @@ impl RemoteTui {
         String::from_utf8_lossy(&self.output.lock().unwrap()).into_owned()
     }
 
+    fn output_len(&self) -> usize {
+        self.output.lock().unwrap().len()
+    }
+
+    fn text_from(&self, offset: usize) -> String {
+        let output = self.output.lock().unwrap();
+        String::from_utf8_lossy(&output[offset.min(output.len())..]).into_owned()
+    }
+
     fn wait_for(&self, needle: &str, timeout: Duration) {
         let deadline = Instant::now() + timeout;
         loop {
@@ -332,6 +341,21 @@ impl RemoteTui {
             assert!(
                 Instant::now() < deadline,
                 "TUI did not render {needle:?}: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn wait_for_from(&self, offset: usize, needle: &str, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let text = self.text_from(offset);
+            if text.contains(needle) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "TUI did not render {needle:?} after input: {text}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -398,6 +422,50 @@ fn real_remote_tui_paints_the_selected_remote_session_screen() {
     tui.wait_for("remote live · reachable", Duration::from_secs(10));
     tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
     tui.wait_for("PR8-MARKER", Duration::from_secs(10));
+}
+
+#[test]
+#[cfg(unix)]
+fn real_ctrl_backslash_byte_returns_from_remote_composer_to_tree() {
+    let client_node = Node::start("key-client");
+    let server_node = Node::start("key-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    server_node.start_session("sleep 30");
+
+    let registry_path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    let server = registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap();
+    server.endpoint = Some(listener.address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let server_label = remuda_native::cluster::node_label(&server_node.fingerprint());
+    let mut tui = RemoteTui::start(&client_node, None);
+    tui.wait_for(&server_label, Duration::from_secs(10));
+    tui.writer.write_all(b"\x1b[B\x1b[C").unwrap();
+    tui.wait_for("proof", Duration::from_secs(10));
+    tui.writer.write_all(b"\x1b[B\r").unwrap();
+    tui.wait_for("remote live · reachable", Duration::from_secs(10));
+    tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
+
+    let output_start = tui.output_len();
+    tui.writer.write_all(b"\x1c").unwrap();
+    tui.wait_for_from(
+        output_start,
+        "Remote session is read-only · q detach",
+        Duration::from_secs(3),
+    );
 }
 
 #[test]
