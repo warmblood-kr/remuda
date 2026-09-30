@@ -1985,6 +1985,7 @@ mod tests {
     #[test]
     fn unspecified_bind_requires_explicit_public_opt_in() {
         assert!(validate_bind_address("127.0.0.1:0".parse().unwrap(), false).is_ok());
+        assert!(validate_bind_address("192.168.1.20:7441".parse().unwrap(), false).is_ok());
         assert!(validate_bind_address("0.0.0.0:0".parse().unwrap(), false).is_err());
         assert!(validate_bind_address("[::]:0".parse().unwrap(), false).is_err());
         assert!(validate_bind_address("0.0.0.0:0".parse().unwrap(), true).is_ok());

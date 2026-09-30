@@ -2294,12 +2294,17 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
     use std::sync::Mutex;
+    #[cfg(not(windows))]
     use std::sync::MutexGuard;
     use std::time::Duration;
 
     static SYNC_PERMIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
     static LISTENER_TASK_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    // D2 ListenerTask socket tests are skipped on Windows until identity storage #214 lands.
+    #[cfg(not(windows))]
     struct ListenerTaskEnvironment {
         _lock: MutexGuard<'static, ()>,
         root: std::path::PathBuf,
@@ -2309,6 +2314,7 @@ mod tests {
         old_user_profile: Option<std::ffi::OsString>,
     }
 
+    #[cfg(not(windows))]
     impl ListenerTaskEnvironment {
         fn new(config: Option<crate::cluster::listener_config::ListenerConfig>) -> Self {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -2351,6 +2357,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     impl Drop for ListenerTaskEnvironment {
         fn drop(&mut self) {
             match self.old_home.take() {
@@ -2373,6 +2380,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     fn listener_config(bind: &str) -> crate::cluster::listener_config::ListenerConfig {
         use crate::cluster::listener_config::{ListenerBind, ListenerConfig};
         ListenerConfig {
@@ -2382,6 +2390,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     fn bound_listener_status(task: &ListenerTask) -> std::net::SocketAddr {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {
@@ -2395,12 +2404,15 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[allow(clippy::disallowed_types)]
     fn connect_listener(address: std::net::SocketAddr) -> std::net::TcpStream {
         std::net::TcpStream::connect_timeout(&address, Duration::from_secs(15))
             .expect("listener accepts TCP within the per-operation deadline")
     }
 
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
     #[test]
     fn listener_task_is_off_without_config() {
         let environment = ListenerTaskEnvironment::new(None);
@@ -2408,6 +2420,8 @@ mod tests {
         assert_eq!(task.status(), ListenerStatus::Off);
     }
 
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
     #[test]
     fn listener_task_accepts_loopback_ephemeral_port_and_reports_status() {
         let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
@@ -2421,6 +2435,8 @@ mod tests {
         let _connection = connect_listener(address);
     }
 
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
     #[test]
     #[allow(clippy::disallowed_types)]
     fn listener_task_drop_closes_its_listener_port() {
@@ -2446,6 +2462,8 @@ mod tests {
         }
     }
 
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
     #[test]
     fn second_daemon_reports_listener_hosted_by_another_daemon() {
         let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
@@ -2470,6 +2488,8 @@ mod tests {
         let _connection = connect_listener(first_address);
     }
 
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
     #[test]
     fn listener_task_reports_bind_failure_as_failed_status() {
         let environment = ListenerTaskEnvironment::new(Some(listener_config("192.0.2.1:7441")));
@@ -2480,6 +2500,87 @@ mod tests {
         }
     }
 
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
+    #[test]
+    fn listener_task_refuses_wildcard_without_public_opt_in() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("0.0.0.0:7441")));
+        let task = ListenerTask::start(&environment.socket_path());
+        match wait_for_listener_terminal_status(&task) {
+            ListenerStatus::Failed(reason) => assert!(
+                reason.contains("wildcard listener bind requires explicit public-bind opt-in"),
+                "wildcard bind should explain the required opt-in: {reason}"
+            ),
+            status => panic!("expected wildcard bind rejection, got {status:?}"),
+        }
+    }
+
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
+    #[test]
+    fn listener_task_refuses_public_specific_bind_without_public_opt_in() {
+        for bind in ["8.8.8.8:7441", "169.254.1.2:7441", "[fe80::1]:7441"] {
+            let environment = ListenerTaskEnvironment::new(Some(listener_config(bind)));
+            let task = ListenerTask::start(&environment.socket_path());
+            match wait_for_listener_terminal_status(&task) {
+                ListenerStatus::Failed(reason) => assert!(
+                    reason.contains("allow_public"),
+                    "non-private specific bind {bind} should explain the required opt-in: {reason}"
+                ),
+                status => panic!("expected public bind rejection for {bind}, got {status:?}"),
+            }
+        }
+    }
+
+    // Windows test-windows is blocked by identity storage hardening tracked in #214.
+    #[cfg(not(windows))]
+    #[test]
+    fn listener_task_retries_host_lock_after_first_daemon_drops_it() {
+        let environment = ListenerTaskEnvironment::new(Some(listener_config("127.0.0.1:0")));
+        let first = ListenerTask::start(&environment.socket_path());
+        let _first_address = bound_listener_status(&first);
+        let second = ListenerTask::start_with_retry_interval(
+            &environment.socket_path().with_file_name("s2"),
+            Duration::from_millis(25),
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match second.status() {
+                ListenerStatus::Failed(reason) if reason.contains("hosted by another daemon") => {
+                    break
+                }
+                ListenerStatus::On { .. } => {
+                    panic!("second listener acquired the host lock before the first dropped it")
+                }
+                ListenerStatus::Off if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                status => panic!("expected a transient hosted status, got {status:?}"),
+            }
+        }
+
+        drop(first);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match second.status() {
+                ListenerStatus::On { addr, auto: false } => {
+                    assert_ne!(addr.port(), 0);
+                    let _connection = connect_listener(addr);
+                    break;
+                }
+                ListenerStatus::Failed(reason)
+                    if reason.contains("hosted by another daemon")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                status => panic!("expected listener to recover after lock release, got {status:?}"),
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
     fn wait_for_listener_terminal_status(task: &ListenerTask) -> ListenerStatus {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         loop {

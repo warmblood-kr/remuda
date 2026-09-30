@@ -1309,6 +1309,23 @@ mod cluster_cli_tests {
     }
 
     #[test]
+    fn cluster_cli_default_port_matches_advertise_address() {
+        let address = parse_addr_default_port("192.168.1.20").unwrap();
+        assert_eq!(
+            address.port(),
+            remuda_native::net::advertise_addr::CLUSTER_DEFAULT_PORT
+        );
+    }
+
+    #[test]
+    fn foreground_listener_conflict_has_an_actionable_next_step() {
+        assert_eq!(
+            foreground_listener_host_error(),
+            "the cluster listener already runs in the remuda daemon (Next: remuda cluster to see it)"
+        );
+    }
+
+    #[test]
     fn cluster_invite_address_without_port_uses_default() {
         assert_eq!(
             parse_cluster_command(&["invite", "--bind", "192.0.2.4"]),

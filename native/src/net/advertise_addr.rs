@@ -54,18 +54,16 @@ pub fn auto_bind() -> Result<SocketAddr, NoLanAddr> {
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_bind, is_private_lan, CLUSTER_DEFAULT_PORT};
+    use super::{auto_bind, is_private_lan, NoLanAddr, CLUSTER_DEFAULT_PORT};
     use std::net::{IpAddr, SocketAddr};
 
     #[test]
-    fn private_lan_address_classification_matches_private_and_cgnat_ranges() {
+    fn auto_classifier_excludes_cgnat_and_checks_boundaries() {
         let private = [
             "10.0.0.1",
             "172.16.0.1",
             "172.31.255.254",
             "192.168.1.2",
-            "100.64.0.1",
-            "100.127.255.254",
             "fc00::1",
             "fdff::1",
         ];
@@ -77,16 +75,34 @@ mod tests {
         let not_private = [
             "127.0.0.1",
             "169.254.1.2",
+            "172.15.255.254",
+            "172.32.0.1",
+            "100.63.255.254",
+            "100.64.0.1",
+            "100.127.255.254",
+            "100.128.0.1",
             "8.8.8.8",
             "192.0.2.1",
             "::1",
             "fe80::1",
+            "::ffff:10.0.0.1",
             "2001:4860:4860::8888",
         ];
         for address in not_private {
             let address: IpAddr = address.parse().unwrap();
             assert!(!is_private_lan(address), "expected non-private: {address}");
         }
+    }
+
+    #[test]
+    fn no_lan_address_suggests_an_explicit_bind_next_step() {
+        let error = NoLanAddr {
+            candidate: Some("8.8.8.8".parse().unwrap()),
+        };
+        assert_eq!(
+            error.to_string(),
+            "no private LAN address found (candidate 8.8.8.8). Next: set one explicitly: remuda cluster listen --bind IP"
+        );
     }
 
     #[test]
