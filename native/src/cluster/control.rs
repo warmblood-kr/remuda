@@ -7,6 +7,14 @@ use serde::{Deserialize, Serialize};
 
 const SETTINGS_FILE: &str = "settings.json";
 const SETTINGS_MAX_BYTES: u64 = 4096;
+const REVOKED_NOTICE_FILE: &str = "revoked_notice.json";
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RevokedNotice {
+    pub by_fp: String,
+    pub at: String,
+}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +33,106 @@ pub fn set_enabled(value: bool) -> io::Result<()> {
     let dir = super::storage::cluster_state_dir()?.join("cluster");
     super::identity::load_identity_at(&dir)?;
     set_enabled_at(&dir, value)
+}
+
+/// Read this node's local revocation notice, if an admitted member has sent one.
+pub fn revoked_notice() -> io::Result<Option<RevokedNotice>> {
+    revoked_notice_at(&super::storage::cluster_state_dir()?.join("cluster"))
+}
+
+pub(super) fn revoked_notice_at(dir: &Path) -> io::Result<Option<RevokedNotice>> {
+    use std::fs;
+    #[cfg(not(windows))]
+    use std::fs::OpenOptions;
+    use std::io::Read;
+
+    match fs::symlink_metadata(dir) {
+        Ok(_) => super::storage::verify_directory(dir)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let path = dir.join(REVOKED_NOTICE_FILE);
+    #[cfg(not(windows))]
+    let file = {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    };
+    #[cfg(windows)]
+    let file = match super::windows_security::open_for_read(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    super::storage::check_private_file(&file, "cluster revocation notice", &path)?;
+    if file.metadata()?.len() > SETTINGS_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cluster revocation notice exceeds byte cap",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(SETTINGS_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > SETTINGS_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cluster revocation notice exceeds byte cap",
+        ));
+    }
+    let notice: RevokedNotice = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if !notice.by_fp.starts_with("SHA256:") || notice.at.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cluster revocation notice has invalid fields",
+        ));
+    }
+    Ok(Some(notice))
+}
+
+pub(super) fn save_revoked_notice_at(dir: &Path, by_fp: &str) -> io::Result<()> {
+    super::storage::verify_directory(dir)?;
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string();
+    let mut bytes = serde_json::to_vec(&RevokedNotice {
+        by_fp: by_fp.to_owned(),
+        at,
+    })
+    .map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    super::storage::atomic_write(&dir.join(REVOKED_NOTICE_FILE), &bytes)
+}
+
+pub(super) fn clear_revoked_notice_at(dir: &Path) -> io::Result<()> {
+    use std::fs;
+
+    super::storage::verify_directory(dir)?;
+    let path = dir.join(REVOKED_NOTICE_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cluster revocation notice is a symlink; refusing",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    let _ = revoked_notice_at(dir)?;
+    fs::remove_file(path)
 }
 
 /// Read the setting from one cluster state directory.
@@ -144,6 +252,18 @@ mod tests {
         assert!(!enabled_at(&dir).unwrap());
         set_enabled_at(&dir, true).unwrap();
         assert!(enabled_at(&dir).unwrap());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn revoked_notice_persists_until_a_local_clear() {
+        let dir = cluster_dir();
+        super::save_revoked_notice_at(&dir, "SHA256:issuer").unwrap();
+        let notice = super::revoked_notice_at(&dir).unwrap().unwrap();
+        assert_eq!(notice.by_fp, "SHA256:issuer");
+        assert!(notice.at.parse::<i64>().is_ok());
+        super::clear_revoked_notice_at(&dir).unwrap();
+        assert!(super::revoked_notice_at(&dir).unwrap().is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

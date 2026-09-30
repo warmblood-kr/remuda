@@ -239,6 +239,27 @@ fn observe_cache(cache: &mut TokenCache, now: u64) {
     cache.last_observed_unix_seconds = now;
 }
 
+/// Remove all outstanding invite tokens while the caller holds the cluster lock.
+pub(super) fn clear_at(directory: &Path) -> io::Result<()> {
+    use std::fs;
+
+    storage::verify_directory(directory)?;
+    let path = directory.join(TOKEN_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} is a symlink; refusing", path.display()),
+        )),
+        Ok(metadata) if metadata.file_type().is_file() => fs::remove_file(path),
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "join token state must be a regular file",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 impl TokenState {
     fn new(now: u64) -> Self {
         Self {
