@@ -844,6 +844,15 @@ impl ClusterUi {
             return false;
         }
         if let Some(target) = self.remote_keys_mode.clone() {
+            if event
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+                && matches!(event.code, crossterm::event::KeyCode::Char('\\' | '4'))
+            {
+                self.remote_keys_mode = None;
+                self.notice = None;
+                return false;
+            }
             if let Some(bytes) = crate::tui::to_bytes(event) {
                 self.enqueue_remote_key_bytes(&target, bytes, now);
             }
