@@ -3,6 +3,7 @@
 
 #![cfg(unix)]
 
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -171,6 +172,61 @@ fn help_flags_write_usage_to_stdout_and_mod_commands_to_stderr() {
             "{args:?}: {out:?}"
         );
     }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn help_lists_the_upgrade_command() {
+    let dir = scratch("upgrade-help");
+    let out = remuda(&dir, &["help"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("remuda upgrade"),
+        "help omitted upgrade: {out:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn upgrade_explains_daemon_and_session_lifecycle() {
+    let dir = scratch("upgrade-message");
+    let fake_bin = dir.join("bin");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+    let curl = fake_bin.join("curl");
+    std::fs::write(
+        &curl,
+        "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then\n    shift\n    printf '#!/bin/sh\\nexit 0\\n' > \"$1\"\n    exit 0\n  fi\n  shift\ndone\nexit 2\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&curl).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&curl, permissions).unwrap();
+    let path = format!(
+        "{}:{}",
+        fake_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(["upgrade", "--channel", "nightly"])
+        .env("PATH", path)
+        .env("REMUDA_RUNTIME_DIR", &dir)
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("HOME", &dir)
+        .env("REMUDA_NO_UPDATE_CHECK", "1")
+        .output()
+        .expect("run remuda upgrade");
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("daemon"),
+        "missing daemon behavior: {stderr}"
+    );
+    assert!(
+        stderr.contains("session"),
+        "missing session behavior: {stderr}"
+    );
+    assert!(stderr.contains("Next:"), "missing next step: {stderr}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
