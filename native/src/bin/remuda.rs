@@ -330,7 +330,7 @@ fn help_command() -> ExitCode {
 fn unknown_command(word: &str) -> ExitCode {
     if word.starts_with("remuda-join-v1") {
         eprintln!(
-            "remuda: that looks like a join line; run: remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
+            "remuda: that looks like a join line; run: remuda cluster join [FINGERPRINT] 'remuda-join-v1 …' (FINGERPRINT required when not on a terminal)"
         );
     } else {
         let command_word = is_command_word(word);
@@ -431,7 +431,7 @@ enum ClusterCommand {
         bind_addr: std::net::SocketAddr,
     },
     Join {
-        fingerprint: String,
+        fingerprint: Option<String>,
         invitation: remuda_native::cluster::join_line::JoinLine,
         bind_addr: Option<std::net::SocketAddr>,
     },
@@ -537,34 +537,32 @@ fn parse_cluster_join(args: &[&str]) -> Result<ClusterCommand, String> {
             .position(|arg| arg.starts_with("remuda-join-v1"))
         {
             if remuda_native::cluster::join_line::JoinLine::decode(args[index]).is_err() {
-                let reason = if index == 0 {
-                    "missing fingerprint; use this form and quote the whole join line: remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
-                } else {
-                    "quote the whole join line (it contains spaces): remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
-                };
+                let reason = "quote the whole join line (it contains spaces); FINGERPRINT is optional on a terminal: remuda cluster join [FINGERPRINT] 'remuda-join-v1 …'";
                 return Err(reason.into());
             }
         }
     }
-    if args.len() > 2 && args.get(1) == Some(&"--bind") {
-        return Err("missing join line".into());
-    }
-    if args.len() < 2 {
-        return Err("missing fingerprint and join line".into());
-    }
-    let fingerprint = args[0];
-    let invitation = match remuda_native::cluster::join_line::JoinLine::decode(args[1]) {
+    let (fingerprint, line_index) = match args {
+        [] => return Err("missing join line".into()),
+        [_] => (None, 0),
+        [line, ..] if remuda_native::cluster::join_line::JoinLine::decode(line).is_ok() => {
+            (None, 0)
+        }
+        [fingerprint, ..] => (Some(*fingerprint), 1),
+    };
+    let line = args.get(line_index).ok_or("missing join line")?;
+    let invitation = match remuda_native::cluster::join_line::JoinLine::decode(line) {
         Ok(invitation) => invitation,
         Err(_) => return Err("invalid join line".into()),
     };
-    let bind_addr = match &args[2..] {
+    let bind_addr = match &args[line_index + 1..] {
         [] => None,
         ["--bind", address] => Some(parse_join_bind(address)?),
         [flag] if flag.starts_with("--bind=") => Some(parse_join_bind(&flag[7..])?),
         _ => return Err("unexpected arguments".into()),
     };
     Ok(ClusterCommand::Join {
-        fingerprint: fingerprint.to_owned(),
+        fingerprint: fingerprint.map(str::to_owned),
         invitation,
         bind_addr,
     })
@@ -709,7 +707,7 @@ pub fn cluster_usage(verb: &str) -> String {
     match verb {
         "init" => "usage: remuda cluster init\nexample: remuda cluster init\n".into(),
         "invite" => format!("usage: remuda cluster invite --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})\nexample: remuda cluster invite --bind 192.168.1.20\n"),
-        "join" => format!("usage: remuda cluster join FINGERPRINT 'JOIN_LINE' [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})]\nexample: remuda cluster join 'SHA256:…' 'remuda-join-v1 …' --bind 192.168.1.20\n"),
+        "join" => format!("usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})]\nexample: remuda cluster join 'remuda-join-v1 …'\n"),
         "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n".into(),
         "revoke" => "usage: remuda cluster revoke NODE|FINGERPRINT [--yes]\nexample: remuda cluster revoke node-abcd1234\n".into(),
         "control" => "usage: remuda cluster control on|off\nexample: remuda cluster control off\n".into(),
@@ -738,7 +736,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             fingerprint,
             invitation,
             bind_addr,
-        } => cluster_join_command(&fingerprint, &invitation, bind_addr),
+        } => cluster_join_command(fingerprint.as_deref(), &invitation, bind_addr),
         ClusterCommand::Nodes => match remuda_native::cluster::nodes() {
             Ok(Some((identity, registry))) => {
                 let mut stdout = std::io::stdout().lock();
@@ -886,13 +884,39 @@ fn cluster_invite(bind_addr: std::net::SocketAddr) -> ExitCode {
 }
 
 fn cluster_join_command(
-    fingerprint: &str,
+    fingerprint: Option<&str>,
     invitation: &remuda_native::cluster::join_line::JoinLine,
     bind_addr: Option<std::net::SocketAddr>,
 ) -> ExitCode {
+    let fingerprint = match fingerprint {
+        Some(fingerprint) => fingerprint,
+        None => {
+            if join_confirmation(
+                std::io::stdin().is_terminal(),
+                std::io::stderr().is_terminal(),
+            )
+            .is_err()
+            {
+                eprintln!("remuda: fingerprint confirmation requires stdin and stderr terminals");
+                eprint!("{}", cluster_usage("join"));
+                eprintln!("Next: use the two-argument join form with an independently supplied fingerprint.");
+                return ExitCode::from(2);
+            }
+            match confirm_join(invitation) {
+                Ok(true) => invitation.issuer_fingerprint.as_str(),
+                Ok(false) => {
+                    eprintln!(
+                        "Join cancelled.\nNext: compare with `remuda cluster` on the inviting machine, then run the join command again."
+                    );
+                    return ExitCode::FAILURE;
+                }
+                Err(error) => return fail(format!("cluster join confirmation: {error}")),
+            }
+        }
+    };
     match cluster_join(fingerprint, invitation, bind_addr) {
         Ok(()) => {
-            println!("Joined cluster.");
+            println!("{}", join_success_message(invitation, fingerprint));
             report_cluster_pushes();
             println!("{}", next_step_join());
             ExitCode::SUCCESS
@@ -1332,6 +1356,40 @@ fn revoke_confirmation(yes: bool, stdin_tty: bool, stderr_tty: bool) -> Result<b
     }
 }
 
+pub fn join_confirmation(stdin_tty: bool, stderr_tty: bool) -> Result<bool, &'static str> {
+    if stdin_tty && stderr_tty {
+        Ok(true)
+    } else {
+        Err("fingerprint confirmation requires stdin and stderr terminals")
+    }
+}
+
+pub fn join_prompt(invitation: &remuda_native::cluster::join_line::JoinLine) -> String {
+    let node = remuda_native::cluster::node_label(&invitation.issuer_fingerprint);
+    format!(
+        "Joining {node} at {}\nFingerprint: {}\nCheck the inviting machine shows this fingerprint (run remuda cluster there). Continue? [y/N]",
+        invitation.issuer_addr, invitation.issuer_fingerprint
+    )
+}
+
+pub fn join_success_message(
+    invitation: &remuda_native::cluster::join_line::JoinLine,
+    pinned_fingerprint: &str,
+) -> String {
+    let node = remuda_native::cluster::node_label(&invitation.issuer_fingerprint);
+    format!("Joined {node} (fingerprint {pinned_fingerprint}).")
+}
+
+fn confirm_join(invitation: &remuda_native::cluster::join_line::JoinLine) -> std::io::Result<bool> {
+    use std::io::{self, Write};
+    let mut stderr = io::stderr().lock();
+    write!(stderr, "{} ", join_prompt(invitation))?;
+    stderr.flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(confirmation_answer_is_yes(&answer))
+}
+
 fn confirm_revoke(label: &str, fingerprint: &str, prompt: bool) -> std::io::Result<bool> {
     use std::io::{self, Write};
     if !prompt {
@@ -1403,9 +1461,9 @@ mod cluster_cli_tests {
     use super::cluster_join_with_private_loader;
     use super::{
         cluster_init_message, cluster_usage, confirmation_answer_is_yes, invite_message,
-        next_step_init, next_step_join, next_step_listen, next_step_status,
-        parse_addr_default_port, parse_cluster_command, remote_control_status_lines,
-        revoke_confirmation, write_nodes_table, ClusterCommand,
+        join_confirmation, join_prompt, join_success_message, next_step_init, next_step_join,
+        next_step_listen, next_step_status, parse_addr_default_port, parse_cluster_command,
+        remote_control_status_lines, revoke_confirmation, write_nodes_table, ClusterCommand,
     };
     #[cfg(unix)]
     use remuda_native::cluster::join_line::JoinLine;
@@ -1528,7 +1586,7 @@ mod cluster_cli_tests {
             actual,
             (
                 "join".into(),
-                "quote the whole join line (it contains spaces): remuda cluster join FINGERPRINT 'remuda-join-v1 …'".into()
+                "quote the whole join line (it contains spaces); FINGERPRINT is optional on a terminal: remuda cluster join [FINGERPRINT] 'remuda-join-v1 …'".into()
             )
         );
         assert!(!actual.1.contains(bearer), "{actual:?}");
@@ -1553,7 +1611,7 @@ mod cluster_cli_tests {
             actual,
             (
                 "join".into(),
-                "missing fingerprint; use this form and quote the whole join line: remuda cluster join FINGERPRINT 'remuda-join-v1 …'".into()
+                "quote the whole join line (it contains spaces); FINGERPRINT is optional on a terminal: remuda cluster join [FINGERPRINT] 'remuda-join-v1 …'".into()
             )
         );
         assert!(!actual.1.contains(bearer), "{actual:?}");
@@ -1589,6 +1647,10 @@ mod cluster_cli_tests {
             assert!(usage.contains("IP[:PORT]"), "{verb}: {usage}");
             assert!(usage.contains("default port 7441"), "{verb}: {usage}");
         }
+        assert_eq!(
+            cluster_usage("join"),
+            "usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port 7441)]\nexample: remuda cluster join 'remuda-join-v1 …'\n"
+        );
         let usage = cluster_usage("");
         for verb in [
             "init", "invite", "join", "nodes", "revoke", "control", "remote", "listen", "call",
@@ -1658,6 +1720,7 @@ mod cluster_cli_tests {
         assert!(matches!(
             parse_cluster_command(&["join", &fingerprint, &line, "--bind=192.0.2.8:9443"]),
             ClusterCommand::Join {
+                fingerprint: Some(_),
                 bind_addr: Some(_),
                 ..
             }
@@ -1680,6 +1743,7 @@ mod cluster_cli_tests {
         assert!(matches!(
             parse_cluster_command(&["join", &fingerprint, &line]),
             ClusterCommand::Join {
+                fingerprint: Some(_),
                 bind_addr: None,
                 ..
             }
@@ -1687,6 +1751,7 @@ mod cluster_cli_tests {
         assert!(matches!(
             parse_cluster_command(&["join", &fingerprint, &line, "--bind", "192.0.2.8:9443"]),
             ClusterCommand::Join {
+                fingerprint: Some(_),
                 bind_addr: Some(_),
                 ..
             }
@@ -1694,6 +1759,29 @@ mod cluster_cli_tests {
         assert!(matches!(
             parse_cluster_command(&["join", &fingerprint, &line, "--bind", "0.0.0.0:9443"]),
             ClusterCommand::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn cluster_join_accepts_line_without_fingerprint() {
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let invitation = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.4:9443".parse().unwrap(),
+            issuer_fingerprint: fingerprint.clone(),
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        };
+        let line = invitation.encode().unwrap();
+        assert!(matches!(
+            parse_cluster_command(&["join", &line]),
+            ClusterCommand::Join {
+                fingerprint: None,
+                bind_addr: None,
+                ..
+            }
         ));
     }
 
@@ -1729,11 +1817,67 @@ mod cluster_cli_tests {
         assert_eq!(
             parse_cluster_command(&args[2..].iter().map(String::as_str).collect::<Vec<_>>(),),
             ClusterCommand::Join {
-                fingerprint,
+                fingerprint: Some(fingerprint),
                 invitation,
                 bind_addr: None,
             }
         );
+    }
+
+    #[test]
+    fn join_prompt_shows_fingerprint_and_address_without_token() {
+        let key = [7; 32];
+        let invitation = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.4:9443".parse().unwrap(),
+            issuer_fingerprint: remuda_native::cluster::encoding::fingerprint(&key),
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        };
+        let prompt = join_prompt(&invitation);
+        let node = remuda_native::cluster::node_label(&invitation.issuer_fingerprint);
+        assert!(prompt.contains(&format!("Joining {node} at 192.0.2.4:9443")));
+        assert!(prompt.contains(&invitation.issuer_fingerprint));
+        assert!(prompt.contains(
+            "Check the inviting machine shows this fingerprint (run remuda cluster there). Continue? [y/N]"
+        ));
+        assert!(!prompt.contains(invitation.token.as_str()));
+    }
+
+    #[test]
+    fn join_success_message_identifies_the_pinned_issuer_without_the_token() {
+        let key = [7; 32];
+        let invitation = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.4:9443".parse().unwrap(),
+            issuer_fingerprint: remuda_native::cluster::encoding::fingerprint(&key),
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        };
+        let node = remuda_native::cluster::node_label(&invitation.issuer_fingerprint);
+        let message = join_success_message(&invitation, &invitation.issuer_fingerprint);
+        assert_eq!(
+            message,
+            format!(
+                "Joined {node} (fingerprint {}).",
+                invitation.issuer_fingerprint
+            )
+        );
+        assert!(!message.contains(invitation.token.as_str()));
+    }
+
+    #[test]
+    fn join_confirmation_requires_both_ttys_and_only_yes_proceeds() {
+        assert!(join_confirmation(false, false).is_err());
+        assert!(join_confirmation(false, true).is_err());
+        assert!(join_confirmation(true, false).is_err());
+        assert_eq!(join_confirmation(true, true), Ok(true));
+        assert!(confirmation_answer_is_yes("y\n"));
+        assert!(confirmation_answer_is_yes("yes\n"));
+        assert!(!confirmation_answer_is_yes("n\n"));
+        assert!(!confirmation_answer_is_yes(""));
     }
 
     #[test]
