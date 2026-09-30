@@ -2,7 +2,7 @@
 #![allow(clippy::disallowed_types)]
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
@@ -756,7 +756,7 @@ fn failed_join_restores_the_exact_saved_listener_config() {
 
     let missing_file_result =
         failed_join_with_listener_config(&fingerprint, &join_line, None, false, false);
-    let original_addr = unused_loopback_addr();
+    let original_addr = "127.0.0.1:0".parse().unwrap();
     let saved = ListenerConfig {
         enabled: true,
         bind: ListenerBind::Explicit(original_addr),
@@ -840,7 +840,7 @@ fn failed_join_preserves_listener_change_made_while_join_is_blocked() {
             .expect("test did not release stalled issuer");
         drop(stream);
     });
-    let join_bind = unused_loopback_addr();
+    let join_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut child = ChildGuard(Some(
         scratch
             .command(&[
@@ -859,6 +859,17 @@ fn failed_join_preserves_listener_change_made_while_join_is_blocked() {
     connected_rx
         .recv_timeout(Duration::from_secs(5))
         .expect("join never connected to stalled issuer");
+
+    match remuda_native::cluster::listener_control::status(&remuda_native::daemon::socket_path_in(
+        &scratch.runtime,
+        &scratch.name,
+    )) {
+        remuda_core::protocol::ListenerStatus::On { addr, .. } => {
+            assert_eq!(addr.ip(), join_bind.ip());
+            assert_ne!(addr.port(), 0, "listener did not report its assigned port");
+        }
+        status => panic!("join did not start its listener: {status:?}"),
+    }
 
     let stopped = scratch.run(&["cluster", "listen", "--off"]);
     assert!(
@@ -938,7 +949,7 @@ fn failed_join_with_listener_config(
         }
     }
 
-    let replacement_addr = unused_loopback_addr();
+    let replacement_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let failed = joiner.run(&[
         "cluster",
         "join",
@@ -952,11 +963,6 @@ fn failed_join_with_listener_config(
         "join to stopped inviter succeeded: {failed:?}"
     );
     listener_config::read_at(&cluster_dir).unwrap()
-}
-
-fn unused_loopback_addr() -> std::net::SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    listener.local_addr().unwrap()
 }
 
 fn initialized_node(scratch: &Scratch) -> TrackedChild {
@@ -1258,7 +1264,7 @@ fn cluster_listen_bind_configures_the_daemon_and_returns() {
         .run(&["cluster", "init", "--no-listen"])
         .status
         .success());
-    let bind_addr = unused_loopback_addr();
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let bind_text = bind_addr.to_string();
     let mut child = scratch
         .command(&["cluster", "listen", "--bind", &bind_text])
@@ -1280,17 +1286,26 @@ fn cluster_listen_bind_configures_the_daemon_and_returns() {
         "cluster listen --bind should return after daemon reload, got {output:?}"
     );
     assert!(output.status.success(), "listen failed: {output:?}");
-    assert_eq!(
-        remuda_native::cluster::listener_control::status(&remuda_native::daemon::socket_path_in(
-            &scratch.runtime,
-            &scratch.name
-        )),
+    let bound_addr = match remuda_native::cluster::listener_control::status(
+        &remuda_native::daemon::socket_path_in(&scratch.runtime, &scratch.name),
+    ) {
         ListenerStatus::On {
-            addr: bind_addr,
+            addr,
             auto: false,
-            advertise_addr: Some(bind_addr),
-            listen_addrs: vec![bind_addr],
+            advertise_addr: Some(advertise_addr),
+            listen_addrs,
+        } => {
+            assert_eq!(advertise_addr, addr);
+            assert_eq!(listen_addrs, vec![addr]);
+            addr
         }
+        status => panic!("expected listener On, got {status:?}"),
+    };
+    assert_eq!(bound_addr.ip(), bind_addr.ip());
+    assert_ne!(
+        bound_addr.port(),
+        0,
+        "listener did not report its assigned port"
     );
     assert_eq!(
         listener_config::read_at(&scratch.root.join("state/remuda/cluster")).unwrap(),
@@ -1308,8 +1323,8 @@ fn cluster_listen_bind_configures_the_daemon_and_returns() {
 
     let stopped = scratch.run(&["cluster", "listen", "--off"]);
     assert!(stopped.status.success(), "listen --off failed: {stopped:?}");
-    let foreground_addr = unused_loopback_addr();
-    let foreground_text = foreground_addr.to_string();
+    let foreground_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let foreground_text = foreground_bind.to_string();
     let child = scratch
         .command(&[
             "cluster",
@@ -1319,10 +1334,23 @@ fn cluster_listen_bind_configures_the_daemon_and_returns() {
             "--foreground",
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("start foreground listener command");
     let mut child = TrackedChild(child);
+    let mut stderr = std::io::BufReader::new(child.0.stderr.take().unwrap());
+    let mut address_line = String::new();
+    stderr
+        .read_line(&mut address_line)
+        .expect("read foreground listener address");
+    let foreground_addr: SocketAddr = address_line
+        .trim()
+        .strip_prefix("remuda: Listening on ")
+        .expect("foreground listener address line")
+        .parse()
+        .expect("parse foreground listener address");
+    assert_eq!(foreground_addr.ip(), foreground_bind.ip());
+    assert_ne!(foreground_addr.port(), 0);
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut foreground_reachable = false;
     while Instant::now() < deadline {
@@ -1358,15 +1386,23 @@ fn listen_public_opt_in_persists_but_off_and_plain_bind_clear_it() {
         .status
         .success());
     let cluster_dir = scratch.root.join("state/remuda/cluster");
-    let first_addr = unused_loopback_addr();
-    let first_text = first_addr.to_string();
+    let first_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let first_text = first_bind.to_string();
     let public = scratch.run(&["cluster", "listen", "--bind", &first_text, "--allow-public"]);
     assert!(public.status.success(), "public opt-in failed: {public:?}");
+    let first_addr = match remuda_native::cluster::listener_control::status(
+        &remuda_native::daemon::socket_path_in(&scratch.runtime, &scratch.name),
+    ) {
+        ListenerStatus::On { addr, .. } => addr,
+        status => panic!("public listener did not start: {status:?}"),
+    };
+    assert_eq!(first_addr.ip(), first_bind.ip());
+    assert_ne!(first_addr.port(), 0);
     assert_eq!(
         listener_config::read_at(&cluster_dir).unwrap(),
         Some(ListenerConfig {
             enabled: true,
-            bind: ListenerBind::Explicit(first_addr),
+            bind: ListenerBind::Explicit(first_bind),
             allow_public: true,
         })
     );
@@ -1374,16 +1410,20 @@ fn listen_public_opt_in_persists_but_off_and_plain_bind_clear_it() {
     drop(daemon);
     let _restarted_daemon = start_daemon(&scratch);
     let daemon_path = remuda_native::daemon::socket_path_in(&scratch.runtime, &scratch.name);
-    assert_eq!(
-        remuda_native::cluster::listener_control::status(&daemon_path),
+    match remuda_native::cluster::listener_control::status(&daemon_path) {
         ListenerStatus::On {
-            addr: first_addr,
+            addr,
             auto: false,
-            advertise_addr: Some(first_addr),
-            listen_addrs: vec![first_addr],
-        },
-        "the explicitly enabled listener should reload on daemon restart"
-    );
+            advertise_addr: Some(advertise_addr),
+            listen_addrs,
+        } => {
+            assert_eq!(addr.ip(), first_bind.ip());
+            assert_ne!(addr.port(), 0);
+            assert_eq!(advertise_addr, addr);
+            assert_eq!(listen_addrs, vec![addr]);
+        }
+        status => panic!("saved listener did not reload after restart: {status:?}"),
+    }
     let invite = scratch.run(&["cluster", "invite"]);
     assert!(invite.status.success(), "no-flag invite failed: {invite:?}");
     assert!(
@@ -1394,18 +1434,24 @@ fn listen_public_opt_in_persists_but_off_and_plain_bind_clear_it() {
         "no-flag invite should reuse the saved opt-in"
     );
 
-    let second_addr = unused_loopback_addr();
-    let second_text = second_addr.to_string();
+    let second_bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let second_text = second_bind.to_string();
     let private_bind = scratch.run(&["cluster", "listen", "--bind", &second_text]);
     assert!(
         private_bind.status.success(),
         "plain bind failed: {private_bind:?}"
     );
+    let second_addr = match remuda_native::cluster::listener_control::status(&daemon_path) {
+        ListenerStatus::On { addr, .. } => addr,
+        status => panic!("plain listener did not start: {status:?}"),
+    };
+    assert_eq!(second_addr.ip(), second_bind.ip());
+    assert_ne!(second_addr.port(), 0);
     assert_eq!(
         listener_config::read_at(&cluster_dir).unwrap(),
         Some(ListenerConfig {
             enabled: true,
-            bind: ListenerBind::Explicit(second_addr),
+            bind: ListenerBind::Explicit(second_bind),
             allow_public: false,
         })
     );
