@@ -1199,7 +1199,10 @@ fn prompt_line_sanitizes_raw_socket_answer() {
     let (dir, remuda) = fixture("line_sanitize");
     let _cleanup = PrivateDaemonCleanup(dir.clone());
     let boot = remuda(&["exec", "deferred"]);
-    assert!(boot.status.success(), "private daemon and module boot: {boot:?}");
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
     let socket = remuda_native::daemon::socket_path_in(&dir, "s");
     let mut stream = remuda_native::ipc::connect(&socket).expect("private daemon socket");
     let mut reader = BufReader::new(stream.try_clone().expect("clone private socket"));
@@ -1260,7 +1263,10 @@ fn deferred_prompt_rejects_crossed_answer_types_and_calls_back_once() {
     let (dir, remuda) = fixture("crossed_prompt_answers");
     let _cleanup = PrivateDaemonCleanup(dir.clone());
     let boot = remuda(&["exec", "deferred"]);
-    assert!(boot.status.success(), "private daemon and module boot: {boot:?}");
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
     let socket = remuda_native::daemon::socket_path_in(&dir, "s");
 
     let cross_answer = |word: &str, line_prompt: bool| {

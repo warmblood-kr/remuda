@@ -26,7 +26,9 @@ use interprocess::local_socket::traits::Stream as LocalStream;
 use interprocess::local_socket::ListenerNonblockingMode;
 use remuda_core::agent::Result as AgentResult;
 pub use remuda_core::protocol::ListenerStatus;
-use remuda_core::protocol::{collapse_runs, ListenerOp, Request, Response, StyledScreen};
+use remuda_core::protocol::{
+    collapse_runs, sanitize_secret_prompt_text, ListenerOp, Request, Response, StyledScreen,
+};
 use remuda_core::{Clock, Registry, Session, Size};
 use std::collections::HashMap;
 #[cfg(windows)]
@@ -1632,40 +1634,6 @@ fn caller_context(stream: &Stream, registry: &Registry) -> crate::image::CallerC
     }
 }
 
-fn is_secret_prompt_format_or_separator(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{00ad}'
-            | '\u{0600}'..='\u{0605}'
-            | '\u{061c}'
-            | '\u{06dd}'
-            | '\u{070f}'
-            | '\u{0890}'..='\u{0891}'
-            | '\u{08e2}'
-            | '\u{180e}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{2028}'..='\u{2029}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206f}'
-            | '\u{feff}'
-            | '\u{fff9}'..='\u{fffb}'
-            | '\u{110bd}'
-            | '\u{110cd}'
-            | '\u{13430}'..='\u{1343f}'
-            | '\u{1bca0}'..='\u{1bca3}'
-            | '\u{1d173}'..='\u{1d17a}'
-            | '\u{e0001}'
-            | '\u{e0020}'..='\u{e007f}'
-    )
-}
-
-fn sanitize_secret_prompt_text(text: &str) -> String {
-    text.chars()
-        .filter(|ch| !ch.is_control() && !is_secret_prompt_format_or_separator(*ch))
-        .collect()
-}
-
 #[allow(clippy::too_many_lines)]
 fn deferred_reply(
     stream: Stream,
@@ -2075,15 +2043,18 @@ fn read_line_answer_until(
                                     ErrorKind::InvalidData,
                                     "invalid line answer",
                                 ))
-                            } else if line.as_ref().is_some_and(|line| {
-                                line.len() > remuda_core::protocol::LINE_ANSWER_MAX_BYTES
-                            }) {
-                                Ok((
-                                    None,
-                                    Some(remuda_core::protocol::SecretAnswerRefusal::TooLong),
-                                ))
                             } else {
-                                Ok((line, refusal))
+                                let line = line.map(|line| sanitize_secret_prompt_text(&line));
+                                if line.as_ref().is_some_and(|line| {
+                                    line.len() > remuda_core::protocol::LINE_ANSWER_MAX_BYTES
+                                }) {
+                                    Ok((
+                                        None,
+                                        Some(remuda_core::protocol::SecretAnswerRefusal::TooLong),
+                                    ))
+                                } else {
+                                    Ok((line, refusal))
+                                }
                             }
                         }
                         Request::LineAnswer { .. } => Err(std::io::Error::new(

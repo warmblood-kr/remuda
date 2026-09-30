@@ -2066,7 +2066,9 @@ fn edit_prompt_line(
 
     let mut line = String::new();
     let append = |line: &mut String, character: char, echo: &mut dyn FnMut(PromptLineEcho)| {
-        if character.is_control() {
+        if character.is_control()
+            || remuda_core::protocol::is_secret_prompt_format_or_separator(character)
+        {
             return Ok(());
         }
         let new_len = line
@@ -3152,6 +3154,7 @@ mod tests {
                 super::PromptLineEcho::Text('e'),
                 super::PromptLineEcho::Text('x'),
                 super::PromptLineEcho::Text('e'),
+                super::PromptLineEcho::Submit,
             ]
         );
     }
