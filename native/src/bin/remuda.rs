@@ -3015,12 +3015,15 @@ mod cluster_cli_tests {
         assert!(reported.len() >= 2);
         assert!(reported[0].starts_with("\x1b[31m"));
         assert!(reported[0].contains("could not start the listener: address already in use"));
-        assert!(
-            reported[0].find("address already in use").unwrap()
-                < reported[0]
-                    .find("Next: remuda cluster listen --bind IP")
-                    .unwrap()
-        );
+        let rendered = reported[0]
+            .strip_prefix("\x1b[31m")
+            .unwrap()
+            .strip_suffix("\x1b[0m")
+            .unwrap();
+        let mut lines = rendered.lines();
+        assert!(lines.next().unwrap().contains("address already in use"));
+        assert_eq!(lines.next(), Some("Next: remuda cluster listen"));
+        assert_eq!(lines.next(), None);
         assert!(reported[1].starts_with("Join cancelled."));
     }
 
