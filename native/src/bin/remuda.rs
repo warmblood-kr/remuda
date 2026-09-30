@@ -1519,7 +1519,7 @@ fn write_revocation_notice<W: Write>(
     let text = format!(
         "This node was revoked by {} at {}.\nNext: run `remuda cluster init --new-identity`, then ask an admitted machine for a new invite.\n",
         remuda_native::cluster::node_label(&notice.by_fp),
-        format_local_revocation_time(&notice.at)
+        format_revocation_time(&notice.at)
     );
     match writer.write_all(text.as_bytes()) {
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
@@ -1527,61 +1527,73 @@ fn write_revocation_notice<W: Write>(
     }
 }
 
-fn format_local_revocation_time(timestamp: &str) -> String {
-    let seconds = match timestamp.parse::<i64>() {
-        Ok(seconds) => seconds,
-        Err(_) => return "unknown local time".into(),
-    };
-    let seconds = match libc::time_t::try_from(seconds) {
-        Ok(seconds) => seconds,
-        Err(_) => return "unknown local time".into(),
-    };
-    // SAFETY: `tm` is a plain C output struct and is fully initialized by the
-    // platform local-time conversion function before it is read.
-    let mut local = unsafe { std::mem::zeroed::<libc::tm>() };
-    #[cfg(windows)]
-    let converted = unsafe { libc::localtime_s(&mut local, &seconds) == 0 };
-    #[cfg(not(windows))]
-    let converted = unsafe { !libc::localtime_r(&seconds, &mut local).is_null() };
-    if !converted {
+#[cfg(unix)]
+fn format_revocation_time(timestamp: &str) -> String {
+    let Ok(seconds) = timestamp.parse::<libc::time_t>() else {
         return "unknown local time".into();
-    }
-
-    #[cfg(not(windows))]
-    {
-        let mut buffer = [0 as libc::c_char; 64];
-        let format = b"%Y-%m-%d %H:%M %Z\0";
-        // SAFETY: `buffer` is writable, `format` is NUL-terminated, and
-        // `local` was initialized by localtime above.
-        let written = unsafe {
-            libc::strftime(
-                buffer.as_mut_ptr(),
-                buffer.len(),
-                format.as_ptr().cast(),
-                &local,
-            )
-        };
-        if written == 0 {
+    };
+    let format = b"%Y-%m-%d %H:%M %Z\0";
+    let mut buffer = [0 as libc::c_char; 64];
+    // SAFETY: `local` is a valid zero-initialized C tm output struct,
+    // `seconds` points to a valid time_t, and `buffer` and `format` meet the
+    // writable-buffer and NUL-terminated-format requirements of these calls.
+    let written = unsafe {
+        let mut local = std::mem::zeroed::<libc::tm>();
+        if libc::localtime_r(&seconds, &mut local).is_null() {
             return "unknown local time".into();
         }
-        String::from_utf8_lossy(
-            // SAFETY: strftime wrote exactly `written` bytes into the buffer.
-            unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), written) },
+        libc::strftime(
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            format.as_ptr().cast(),
+            &local,
         )
-        .into_owned()
+    };
+    if written == 0 {
+        return "unknown local time".into();
     }
+    let bytes = buffer[..written]
+        .iter()
+        .map(|byte| *byte as u8)
+        .collect::<Vec<_>>();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
 
-    #[cfg(windows)]
-    {
-        format!(
-            "{:04}-{:02}-{:02} {:02}:{:02} local",
-            local.tm_year + 1900,
-            local.tm_mon + 1,
-            local.tm_mday,
-            local.tm_hour,
-            local.tm_min
-        )
-    }
+#[cfg(windows)]
+fn format_revocation_time(timestamp: &str) -> String {
+    // Windows falls back to UTC because native local-time formatting is not
+    // available here without adding a dependency.
+    format_utc_revocation_time(timestamp)
+}
+
+#[cfg(windows)]
+fn format_utc_revocation_time(timestamp: &str) -> String {
+    let Ok(seconds) = timestamp.parse::<i64>() else {
+        return "unknown UTC time".into();
+    };
+    let days = seconds.div_euclid(86_400);
+    let day_seconds = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        day_seconds / 3_600,
+        (day_seconds % 3_600) / 60
+    )
+}
+
+#[cfg(windows)]
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    (year + i64::from(month <= 2), month, day)
 }
 
 fn cluster_init_message(created: bool) -> &'static str {
@@ -2088,47 +2100,31 @@ mod cluster_cli_tests {
     }
 
     #[test]
-    fn revoked_notice_prints_local_human_time_and_keeps_recovery_next_step() {
-        let notice = remuda_native::cluster::control::RevokedNotice {
-            by_fp: "SHA256:issuer".into(),
-            at: "1790743860".into(),
-        };
-        let mut output = Vec::new();
+    fn revoked_notice_prints_fixed_times_and_keeps_recovery_next_step() {
+        // Run this test with TZ=UTC so Unix local-time conversion is deterministic.
+        for (timestamp, expected) in [
+            ("0", "1970-01-01 00:00 UTC"),
+            ("1790743860", "2026-09-30 04:51 UTC"),
+        ] {
+            let notice = remuda_native::cluster::control::RevokedNotice {
+                by_fp: "SHA256:issuer".into(),
+                at: timestamp.into(),
+            };
+            let mut output = Vec::new();
 
-        write_revocation_notice(&mut output, &notice).unwrap();
+            write_revocation_notice(&mut output, &notice).unwrap();
 
-        let output = String::from_utf8(output).unwrap();
-        assert!(
-            output.contains("This node was revoked by node-"),
-            "{output}"
-        );
-        assert!(
-            output.contains(" at ") && !output.contains("Unix time"),
-            "notice should show a human local time: {output}"
-        );
-        let displayed_time = output
-            .lines()
-            .next()
-            .unwrap()
-            .split(" at ")
-            .nth(1)
-            .unwrap()
-            .trim_end_matches('.');
-        let bytes = displayed_time.as_bytes();
-        assert!(
-            bytes.len() >= 16
-                && bytes[..4].iter().all(u8::is_ascii_digit)
-                && bytes[4] == b'-'
-                && bytes[5..7].iter().all(u8::is_ascii_digit)
-                && bytes[7] == b'-'
-                && bytes[8..10].iter().all(u8::is_ascii_digit)
-                && bytes[10] == b' '
-                && bytes[11..13].iter().all(u8::is_ascii_digit)
-                && bytes[13] == b':'
-                && bytes[14..16].iter().all(u8::is_ascii_digit),
-            "notice timestamp is not a local date and time: {displayed_time}"
-        );
-        assert!(output.contains("Next: run `remuda cluster init --new-identity`"));
+            let output = String::from_utf8(output).unwrap();
+            assert!(
+                output.contains("This node was revoked by node-"),
+                "{output}"
+            );
+            assert!(
+                output.contains(&format!(" at {expected}.")),
+                "expected UTC timestamp {expected:?}, got {output}"
+            );
+            assert!(output.contains("Next: run `remuda cluster init --new-identity`"));
+        }
     }
 
     fn shell_split_single_quotes(command: &str) -> Vec<String> {
