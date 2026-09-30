@@ -3128,6 +3128,35 @@ mod tests {
     }
 
     #[test]
+    fn prompt_line_echo_drops_format_characters() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let events = [
+            crossterm::event::Event::Paste("ok\u{202e}txt.exe".into()),
+            secret_key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let mut echo = Vec::new();
+
+        let answer = super::edit_prompt_line(events, None, 1024, |action| echo.push(action));
+
+        assert_eq!(answer, Ok(Some("oktxt.exe".into())));
+        assert_eq!(
+            echo,
+            [
+                super::PromptLineEcho::Text('o'),
+                super::PromptLineEcho::Text('k'),
+                super::PromptLineEcho::Text('t'),
+                super::PromptLineEcho::Text('x'),
+                super::PromptLineEcho::Text('t'),
+                super::PromptLineEcho::Text('.'),
+                super::PromptLineEcho::Text('e'),
+                super::PromptLineEcho::Text('x'),
+                super::PromptLineEcho::Text('e'),
+            ]
+        );
+    }
+
+    #[test]
     fn secret_line_enter_submits_and_ignores_later_events() {
         use crossterm::event::{KeyCode, KeyModifiers};
 

@@ -149,6 +149,22 @@ remuda.extension_command("deferred", function(args)
       if err then reply:reject(err) else reply:resolve(0, line, "") end
     end }
     return reply
+  elseif args[1] == "line_cross" then
+    _G.line_cross_calls = 0
+    local reply = remuda.pending { timeout = 5 }
+    reply:prompt_line { label = "line cross", callback = function(line, err)
+      _G.line_cross_calls = _G.line_cross_calls + 1
+      if err then reply:reject(err) else reply:resolve(0, line or "", "") end
+    end }
+    return reply
+  elseif args[1] == "secret_cross" then
+    _G.secret_cross_calls = 0
+    local reply = remuda.pending { timeout = 5 }
+    reply:prompt_secret { label = "secret cross", callback = function(secret, err)
+      _G.secret_cross_calls = _G.secret_cross_calls + 1
+      if err then reply:reject(err) else reply:resolve(0, "accepted", "") end
+    end }
+    return reply
   elseif args[1] == "line_long_default" then
     local reply = remuda.pending { timeout = 5 }
     reply:prompt_line { label = "owner ID", default = string.rep("x", 1100), callback = function(line, err)
@@ -1171,6 +1187,142 @@ fn prompt_line_value_round_trips_over_the_daemon_socket() {
 
     let stop = remuda(&["stop", "-f"]);
     let _ = fs::remove_dir_all(&dir);
+    assert!(stop.status.success(), "{stop:?}");
+}
+
+#[test]
+fn prompt_line_sanitizes_raw_socket_answer() {
+    use remuda_core::protocol::{Request, Response};
+    use remuda_native::ipc::TryClone;
+    use std::io::{BufRead, BufReader, Write};
+
+    let (dir, remuda) = fixture("line_sanitize");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(boot.status.success(), "private daemon and module boot: {boot:?}");
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+    let mut stream = remuda_native::ipc::connect(&socket).expect("private daemon socket");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone private socket"));
+    let request = Request::Eval {
+        code: "return remuda._dispatch_extension_command('deferred', {'line_answers'}, {})".into(),
+        name: None,
+    };
+    let mut frame = serde_json::to_vec(&request).unwrap();
+    frame.push(b'\n');
+    stream.write_all(&frame).unwrap();
+
+    let mut prompt_frame = Vec::new();
+    reader.read_until(b'\n', &mut prompt_frame).unwrap();
+    let prompt: Response = serde_json::from_slice(&prompt_frame).unwrap();
+    let id = match prompt {
+        Response::PromptLine { id, .. } => id,
+        response => panic!("expected line prompt, got {response:?}"),
+    };
+    let answer = Request::LineAnswer {
+        id,
+        line: Some("ok\u{1b}\r\n\u{202e}\u{200b}txt.exe".into()),
+        refusal: None,
+    };
+    let mut answer_frame = serde_json::to_vec(&answer).unwrap();
+    answer_frame.push(b'\n');
+    stream.write_all(&answer_frame).unwrap();
+
+    let mut reply_frame = Vec::new();
+    reader.read_until(b'\n', &mut reply_frame).unwrap();
+    let reply: Response = serde_json::from_slice(&reply_frame).unwrap();
+    match reply {
+        Response::CommandResult {
+            exit_code,
+            stdout_base64,
+            stderr_base64,
+        } => {
+            assert_eq!(exit_code, 0);
+            assert!(stderr_base64.is_empty());
+            assert_eq!(
+                remuda_native::cluster::encoding::decode_base64(&stdout_base64).unwrap(),
+                b"oktxt.exe"
+            );
+        }
+        response => panic!("expected sanitized callback result, got {response:?}"),
+    }
+    drop(reader);
+    drop(stream);
+    let stop = remuda(&["stop", "-f"]);
+    assert!(stop.status.success(), "{stop:?}");
+}
+
+#[test]
+fn deferred_prompt_rejects_crossed_answer_types_and_calls_back_once() {
+    use remuda_core::protocol::{Request, Response, SecretBytes};
+    use remuda_native::ipc::TryClone;
+    use std::io::{BufRead, BufReader, Write};
+
+    let (dir, remuda) = fixture("crossed_prompt_answers");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(boot.status.success(), "private daemon and module boot: {boot:?}");
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+
+    let cross_answer = |word: &str, line_prompt: bool| {
+        let mut stream = remuda_native::ipc::connect(&socket).expect("private daemon socket");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone private socket"));
+        let request = Request::Eval {
+            code: format!(
+                "return remuda._dispatch_extension_command('deferred', {{'{word}'}}, {{}})"
+            ),
+            name: None,
+        };
+        let mut frame = serde_json::to_vec(&request).unwrap();
+        frame.push(b'\n');
+        stream.write_all(&frame).unwrap();
+
+        let mut prompt_frame = Vec::new();
+        reader.read_until(b'\n', &mut prompt_frame).unwrap();
+        let prompt: Response = serde_json::from_slice(&prompt_frame).unwrap();
+        let id = match (line_prompt, prompt) {
+            (true, Response::PromptLine { id, .. })
+            | (false, Response::PromptSecret { id, .. }) => id,
+            (_, response) => panic!("unexpected crossed-answer prompt: {response:?}"),
+        };
+        let answer = if line_prompt {
+            Request::SecretAnswer {
+                id,
+                secret: Some(SecretBytes::new(b"wrong variant".to_vec())),
+                refusal: None,
+            }
+        } else {
+            Request::LineAnswer {
+                id,
+                line: Some("wrong variant".into()),
+                refusal: None,
+            }
+        };
+        let mut answer_frame = serde_json::to_vec(&answer).unwrap();
+        answer_frame.push(b'\n');
+        stream.write_all(&answer_frame).unwrap();
+
+        let mut reply_frame = Vec::new();
+        reader.read_until(b'\n', &mut reply_frame).unwrap();
+        serde_json::from_slice::<Response>(&reply_frame).unwrap()
+    };
+
+    assert_eq!(
+        cross_answer("line_cross", true),
+        Response::Error("expected a line answer".into())
+    );
+    let line_calls = remuda(&["-e", "return tostring(_G.line_cross_calls)"]);
+    assert!(line_calls.status.success(), "{line_calls:?}");
+    assert_eq!(String::from_utf8_lossy(&line_calls.stdout).trim(), "1");
+
+    assert_eq!(
+        cross_answer("secret_cross", false),
+        Response::Error("expected a secret answer".into())
+    );
+    let secret_calls = remuda(&["-e", "return tostring(_G.secret_cross_calls)"]);
+    assert!(secret_calls.status.success(), "{secret_calls:?}");
+    assert_eq!(String::from_utf8_lossy(&secret_calls.stdout).trim(), "1");
+
+    let stop = remuda(&["stop", "-f"]);
     assert!(stop.status.success(), "{stop:?}");
 }
 
