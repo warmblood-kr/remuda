@@ -3,8 +3,8 @@ use std::process::Command;
 
 #[test]
 fn unknown_top_level_name_reports_mod_install_next_step() {
-    let dir = std::path::PathBuf::from(format!(
-        "/private/tmp/remuda-unknown-command-{}",
+    let dir = std::env::temp_dir().join(format!(
+        "remuda-unknown-command-{}",
         std::process::id()
     ));
     let _ = fs::remove_dir_all(&dir);
