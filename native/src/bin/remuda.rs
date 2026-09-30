@@ -780,7 +780,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             fingerprint,
             invitation,
             bind_addr,
-        } => cluster_join_command(fingerprint.as_deref(), &invitation, bind_addr),
+        } => cluster_join_command(server, path, fingerprint.as_deref(), &invitation, bind_addr),
         ClusterCommand::Nodes => match remuda_native::cluster::nodes() {
             Ok(Some((identity, registry))) => {
                 let mut stdout = std::io::stdout().lock();
@@ -1173,6 +1173,8 @@ fn render_invite_listener_refusal(status: &remuda_core::protocol::ListenerStatus
 }
 
 fn cluster_join_command(
+    server: &str,
+    path: &Path,
     fingerprint: Option<&str>,
     invitation: &remuda_native::cluster::join_line::JoinLine,
     bind_addr: Option<std::net::SocketAddr>,
@@ -1203,18 +1205,123 @@ fn cluster_join_command(
             }
         }
     };
-    match cluster_join(fingerprint, invitation, bind_addr) {
-        Ok(()) => {
-            println!("{}", join_success_message(invitation, fingerprint));
-            report_cluster_pushes();
-            println!("{}", next_step_join());
-            ExitCode::SUCCESS
-        }
-        Err(error) => fail(describe_cluster_error(
+    if let Err(error) = invitation.verify_pin(fingerprint) {
+        return fail(describe_cluster_error(
             "join",
             &error,
             ClusterErrorContext::Join(invitation),
-        )),
+        ));
+    }
+    with_daemon(server, path, |daemon_path| {
+        let initial_status = remuda_native::cluster::listener_control::status(daemon_path);
+        let listener_was_on = matches!(
+            initial_status,
+            remuda_core::protocol::ListenerStatus::On { .. }
+        );
+        let listener_status = match bind_addr {
+            Some(address) => remuda_native::cluster::listener_control::start(
+                daemon_path,
+                Some(ListenerConfig {
+                    enabled: true,
+                    bind: ListenerBind::Explicit(address),
+                    allow_public: false,
+                }),
+            ),
+            None => match initial_status {
+                remuda_core::protocol::ListenerStatus::On { .. } => Ok(initial_status),
+                _ => remuda_native::cluster::listener_control::start(daemon_path, None),
+            },
+        };
+        let listener_status = match listener_status {
+            Ok(status) => status,
+            Err(error) => {
+                let rollback_error = (!listener_was_on)
+                    .then(|| stop_join_listener(daemon_path))
+                    .flatten();
+                return fail(render_join_failure(
+                    render_join_listener_start_error(&error),
+                    rollback_error.as_deref(),
+                ));
+            }
+        };
+        let bound_addr = match listener_status {
+            remuda_core::protocol::ListenerStatus::On { addr, .. } => addr,
+            status => {
+                let message = render_join_listener_refusal(&status);
+                let rollback_error = (!listener_was_on)
+                    .then(|| stop_join_listener(daemon_path))
+                    .flatten();
+                return fail(render_join_failure(message, rollback_error.as_deref()));
+            }
+        };
+
+        match cluster_join(fingerprint, invitation, Some(bound_addr)) {
+            Ok(()) => {
+                println!("{}", join_success_message(invitation, fingerprint));
+                report_cluster_pushes();
+                println!("{}", next_step_join());
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                let message =
+                    describe_cluster_error("join", &error, ClusterErrorContext::Join(invitation));
+                let rollback_error = (!listener_was_on)
+                    .then(|| stop_join_listener(daemon_path))
+                    .flatten();
+                fail(render_join_failure(message, rollback_error.as_deref()))
+            }
+        }
+    })
+}
+
+fn stop_join_listener(daemon_path: &Path) -> Option<String> {
+    match remuda_native::cluster::listener_control::stop(daemon_path) {
+        Ok(remuda_core::protocol::ListenerStatus::Off) => None,
+        Ok(status) => Some(render_join_listener_rollback_status(&status)),
+        Err(error) => Some(render_join_listener_rollback_error(&error)),
+    }
+}
+
+fn render_join_failure(message: String, rollback_error: Option<&str>) -> String {
+    match rollback_error {
+        Some(rollback_error) => format!("{message}\n{rollback_error}"),
+        None => message,
+    }
+}
+
+fn render_join_listener_start_error(error: &std::io::Error) -> String {
+    format!("cluster join: could not start the listener: {error}\nNext: remuda cluster listen --bind IP")
+}
+
+fn render_join_listener_refusal(status: &remuda_core::protocol::ListenerStatus) -> String {
+    use remuda_core::protocol::ListenerStatus;
+
+    match status {
+        ListenerStatus::Off => {
+            "cluster join: listener is off\nNext: remuda cluster listen --bind IP".into()
+        }
+        ListenerStatus::Failed(reason) => format!(
+            "cluster join: listener failed: {reason}\nNext: remuda cluster listen --bind IP"
+        ),
+        ListenerStatus::On { .. } => unreachable!("an active listener can accept joins"),
+    }
+}
+
+fn render_join_listener_rollback_error(error: &std::io::Error) -> String {
+    format!("cluster join: could not turn off its listener: {error}\nNext: run `remuda cluster listen --off` and check `remuda cluster`.")
+}
+
+fn render_join_listener_rollback_status(status: &remuda_core::protocol::ListenerStatus) -> String {
+    use remuda_core::protocol::ListenerStatus;
+
+    match status {
+        ListenerStatus::On { addr, .. } => format!(
+            "cluster join: listener remains on at {addr}\nNext: run `remuda cluster listen --off` and check `remuda cluster`."
+        ),
+        ListenerStatus::Failed(reason) => format!(
+            "cluster join: listener state after rollback is failed: {reason}\nNext: check `remuda cluster` and run `remuda cluster listen --off`."
+        ),
+        ListenerStatus::Off => unreachable!("an off listener needs no rollback warning"),
     }
 }
 
@@ -1895,8 +2002,9 @@ mod cluster_cli_tests {
         join_success_message, new_identity_confirmation, next_step_init, next_step_join,
         next_step_listen, next_step_status, parse_addr_default_port, parse_cluster_command,
         remote_control_status_lines, render_cluster_init_lines, render_init_listener_lines,
-        render_invite_listener_refusal, revoke_confirmation, write_nodes_table,
-        write_revocation_notice, ClusterCommand, NEW_IDENTITY_WARNING,
+        render_invite_listener_refusal, render_join_failure, render_join_listener_rollback_status,
+        revoke_confirmation, write_nodes_table, write_revocation_notice, ClusterCommand,
+        NEW_IDENTITY_WARNING,
     };
     #[cfg(unix)]
     use remuda_native::cluster::join_line::JoinLine;
@@ -2058,6 +2166,29 @@ mod cluster_cli_tests {
         assert!(refusal.contains("address busy"));
         assert!(refusal.contains("remuda cluster listen --bind IP"));
         assert!(!refusal.contains("remuda-join-v1"));
+    }
+
+    #[test]
+    fn join_rollback_rendering_reports_uncertain_listener_state() {
+        use remuda_core::protocol::ListenerStatus;
+
+        let remains_on = render_join_listener_rollback_status(&ListenerStatus::On {
+            addr: "192.0.2.4:7441".parse().unwrap(),
+            auto: false,
+        });
+        assert!(remains_on.contains("listener remains on at 192.0.2.4:7441"));
+        assert!(remains_on.contains("remuda cluster listen --off"));
+
+        let failed = render_join_listener_rollback_status(&ListenerStatus::Failed(
+            "listener state unavailable".into(),
+        ));
+        assert!(failed.contains("listener state after rollback is failed"));
+        assert!(failed.contains("remuda cluster listen --off"));
+
+        assert_eq!(
+            render_join_failure("join failed".into(), Some("rollback failed")),
+            "join failed\nrollback failed"
+        );
     }
 
     #[test]

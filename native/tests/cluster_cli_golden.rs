@@ -3,14 +3,16 @@
 
 use std::fs;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+static AUTO_LISTENER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 struct Scratch {
     root: PathBuf,
@@ -106,32 +108,6 @@ fn start_daemon(scratch: &Scratch) -> TrackedChild {
         std::thread::sleep(Duration::from_millis(20));
     }
     daemon
-}
-
-fn start_listener(scratch: &Scratch) -> (TrackedChild, SocketAddr) {
-    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
-    let address = reservation.local_addr().expect("reserved address");
-    drop(reservation);
-    let address_text = address.to_string();
-    let child = scratch
-        .command(&["cluster", "listen", "--bind", &address_text])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("start isolated listener");
-    let mut listener = TrackedChild(child);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
-            return (listener, address);
-        }
-        if let Some(status) = listener.0.try_wait().expect("check isolated listener") {
-            panic!("isolated listener exited before ready: {status}");
-        }
-        assert!(Instant::now() < deadline, "isolated listener did not bind");
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 fn golden(name: &str, output: &Output, root: &Path) {
@@ -452,7 +428,9 @@ fn normalizer_self_test_removes_token_shaped_material() {
 
 #[test]
 fn cluster_cli_output_matches_goldens() {
+    let _auto_listener_lock = AUTO_LISTENER_TEST_LOCK.lock().unwrap();
     let scratch = Scratch::new();
+    let _daemon = start_daemon(&scratch);
     golden_uninitialized_cases(&scratch);
     golden_initialized_cases(&scratch);
     golden_invite_join_cases(&scratch);
@@ -547,7 +525,8 @@ fn golden_revoke_cancel_case(scratch: &Scratch) {
         &scratch.root,
     );
     let peer = Scratch::new();
-    peer.run(&["cluster", "init"]);
+    let _peer_daemon = start_daemon(&peer);
+    peer.run(&["cluster", "init", "--no-listen"]);
     let peer_label = add_peer_for_revoke(scratch, &peer);
     golden(
         "revoke_cancel",
@@ -611,20 +590,23 @@ fn cluster_join_and_peer_call_outputs_match_goldens() {
     use remuda_native::cluster::Registry;
 
     let inviter = Scratch::new();
-    let initialized = inviter.run(&["cluster", "init"]);
+    let _daemon = start_daemon(&inviter);
+    let initialized = inviter.run(&["cluster", "init", "--no-listen"]);
     assert!(
         initialized.status.success(),
         "inviter init failed: {initialized:?}"
     );
-    let _daemon = start_daemon(&inviter);
-    let (_listener, address) = start_listener(&inviter);
+    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve inviter port");
+    let address = reservation.local_addr().expect("read reserved address");
+    drop(reservation);
     let address_text = address.to_string();
     let invite = inviter.run(&["cluster", "invite", "--bind", &address_text]);
     assert!(invite.status.success(), "invite failed: {invite:?}");
     let (fingerprint, join_line) = invitation_command_args(&invite);
 
     let joiner = Scratch::new();
-    let initialized = joiner.run(&["cluster", "init"]);
+    let _joiner_daemon = start_daemon(&joiner);
+    let initialized = joiner.run(&["cluster", "init", "--no-listen"]);
     assert!(
         initialized.status.success(),
         "joiner init failed: {initialized:?}"
@@ -662,7 +644,7 @@ fn cluster_join_and_peer_call_outputs_match_goldens() {
 
 fn initialized_node(scratch: &Scratch) -> TrackedChild {
     let daemon = start_daemon(scratch);
-    let initialized = scratch.run(&["cluster", "init"]);
+    let initialized = scratch.run(&["cluster", "init", "--no-listen"]);
     assert!(
         initialized.status.success(),
         "cluster init failed: {}",
@@ -808,13 +790,18 @@ fn d4_join_sends_the_joiners_bound_address_to_the_issuer_registry() {
 
     let joiner = Scratch::new();
     let _joiner_daemon = initialized_node(&joiner);
-    let joiner_addr = explicit_listener_address(&joiner);
     let joined = joiner.run(&["cluster", "join", &fingerprint, &join_line]);
     assert!(
         joined.status.success(),
         "join failed: {}",
         String::from_utf8_lossy(&joined.stderr)
     );
+    let joiner_addr = match remuda_native::cluster::listener_control::status(
+        &remuda_native::daemon::socket_path_in(&joiner.runtime, &joiner.name),
+    ) {
+        remuda_core::protocol::ListenerStatus::On { addr, .. } => addr,
+        status => panic!("join did not enable B's listener: {status:?}"),
+    };
 
     let registry_path = inviter
         .root
@@ -835,6 +822,7 @@ fn d4_join_sends_the_joiners_bound_address_to_the_issuer_registry() {
 
 #[test]
 fn d4_init_prints_the_listener_address_and_exposure_note() {
+    let _auto_listener_lock = AUTO_LISTENER_TEST_LOCK.lock().unwrap();
     let scratch = Scratch::new();
     let _daemon = start_daemon(&scratch);
     let initialized = scratch.run(&["cluster", "init"]);
@@ -941,5 +929,42 @@ fn d4_failed_join_turns_off_a_listener_enabled_by_the_join_command() {
         remuda_native::cluster::listener_control::status(&daemon_path),
         ListenerStatus::Off,
         "failed join left its newly enabled listener running"
+    );
+}
+
+#[test]
+fn d4_failed_join_keeps_a_preexisting_listener_on() {
+    use remuda_core::protocol::ListenerStatus;
+    use remuda_native::cluster::{encoding, join_line::JoinLine};
+    use zeroize::Zeroizing;
+
+    let scratch = Scratch::new();
+    let _daemon = initialized_node(&scratch);
+    let bound = explicit_listener_address(&scratch);
+    let issuer_key = [7; 32];
+    let fingerprint = encoding::fingerprint(&issuer_key);
+    let invitation = JoinLine {
+        issuer_addr: "127.0.0.1:9".parse().unwrap(),
+        issuer_fingerprint: fingerprint.clone(),
+        issuer_static_pubkey: issuer_key,
+        token: Zeroizing::new(encoding::encode_base64(&[8; 32])),
+    }
+    .encode()
+    .unwrap();
+    let joined = scratch.run(&["cluster", "join", "SHA256:wrong", &invitation]);
+    assert!(
+        !joined.status.success(),
+        "wrong fingerprint unexpectedly joined"
+    );
+    assert_eq!(
+        remuda_native::cluster::listener_control::status(&remuda_native::daemon::socket_path_in(
+            &scratch.runtime,
+            &scratch.name
+        )),
+        ListenerStatus::On {
+            addr: bound,
+            auto: false
+        },
+        "failed join stopped a listener that was already on"
     );
 }
