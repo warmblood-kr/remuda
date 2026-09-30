@@ -20,13 +20,7 @@ pub const MAX_REQUEST_LINE_BYTES: usize = 8 * 1024;
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_HEADER_COUNT: usize = 64;
 pub const MAX_BODY_BYTES: usize = 65_535;
-#[cfg(test)]
-pub const MAX_GLOBAL_REQUESTS: usize = 1;
-#[cfg(not(test))]
 pub const MAX_GLOBAL_REQUESTS: usize = 64;
-#[cfg(test)]
-pub const MAX_PREAUTH_REQUESTS: usize = 1;
-#[cfg(not(test))]
 pub const MAX_PREAUTH_REQUESTS: usize = 16;
 pub const MAX_PEER_REQUESTS: usize = 8;
 pub const MAX_PREAUTH_PER_IP: usize = 4;
@@ -116,7 +110,11 @@ struct MemberRegistryCache {
 #[derive(Default)]
 struct RequestLimiter {
     active_global: AtomicUsize,
+    global_limit_override: AtomicUsize,
     active_ips: Mutex<HashMap<std::net::IpAddr, usize>>,
+    active_preauth: Mutex<VecDeque<PreauthEntry>>,
+    next_preauth_id: AtomicUsize,
+    preauth_limit_override: AtomicUsize,
     active_peers: Mutex<HashMap<String, usize>>,
     join_attempts: Mutex<HashMap<std::net::IpAddr, VecDeque<Instant>>>,
     registry_requests: Mutex<HashMap<String, RegistryTokenBucket>>,
@@ -175,6 +173,16 @@ struct RegistryTokenBucket {
 }
 
 struct GlobalPermit(Arc<RequestLimiter>);
+
+struct PreauthPermit {
+    limiter: Arc<RequestLimiter>,
+    id: usize,
+}
+
+struct PreauthEntry {
+    id: usize,
+    socket: TcpStream,
+}
 
 struct PeerPermit {
     limiter: Arc<RequestLimiter>,
@@ -470,12 +478,44 @@ impl RequestLimiter {
     }
 
     fn acquire_global(self: &Arc<Self>) -> Option<Arc<GlobalPermit>> {
+        let limit = configured_limit(&self.global_limit_override, MAX_GLOBAL_REQUESTS);
         self.active_global
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < MAX_GLOBAL_REQUESTS).then_some(count + 1)
+                (count < limit).then_some(count + 1)
             })
             .ok()
             .map(|_| Arc::new(GlobalPermit(self.clone())))
+    }
+
+    fn acquire_preauth(self: &Arc<Self>, stream: &TcpStream) -> io::Result<PreauthPermit> {
+        let control_stream = stream.try_clone()?;
+        let mut active = self
+            .active_preauth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let limit = configured_limit(&self.preauth_limit_override, MAX_PREAUTH_REQUESTS);
+        if active.len() >= limit {
+            if let Some(oldest) = active.pop_front() {
+                let _ = oldest.socket.shutdown(Shutdown::Both);
+            }
+        }
+        let id = self.next_preauth_id.fetch_add(1, Ordering::Relaxed);
+        active.push_back(PreauthEntry {
+            id,
+            socket: control_stream,
+        });
+        Ok(PreauthPermit {
+            limiter: self.clone(),
+            id,
+        })
+    }
+
+    fn release_preauth(&self, id: usize) {
+        let mut active = self
+            .active_preauth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active.retain(|entry| entry.id != id);
     }
 
     fn acquire_peer(self: &Arc<Self>, fingerprint: &str) -> Option<Arc<PeerPermit>> {
@@ -533,9 +573,22 @@ impl RequestLimiter {
     }
 }
 
+fn configured_limit(override_value: &AtomicUsize, default: usize) -> usize {
+    match override_value.load(Ordering::Relaxed) {
+        0 => default,
+        value => value,
+    }
+}
+
 impl Drop for GlobalPermit {
     fn drop(&mut self) {
         self.0.active_global.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for PreauthPermit {
+    fn drop(&mut self) {
+        self.limiter.release_preauth(self.id);
     }
 }
 
@@ -934,12 +987,11 @@ fn spawn_connection_handler(
     dispatch: FrameDispatcher,
     policy: ConnectionPolicy,
 ) -> io::Result<()> {
+    let _ = stream.set_write_timeout(Some(policy.limits.idle_read));
     let Some(ip_permit) = state.limiter.acquire_ip(remote_addr.ip()) else {
         return write_http_response(stream, 429, b"source address request capacity reached");
     };
-    let Some(global_permit) = state.limiter.acquire_global() else {
-        return write_http_response(stream, 503, b"request capacity reached");
-    };
+    let preauth_permit = state.limiter.acquire_preauth(&stream)?;
     std::thread::Builder::new()
         .name("remuda-cluster-listener".into())
         .spawn(move || {
@@ -948,7 +1000,7 @@ fn spawn_connection_handler(
                 stream,
                 remote_addr,
                 state,
-                global_permit,
+                preauth_permit,
                 authorize,
                 dispatch,
                 policy,
@@ -961,7 +1013,7 @@ fn handle_connection_with(
     stream: TcpStream,
     remote_addr: SocketAddr,
     state: Arc<ListenerState>,
-    global_permit: Arc<GlobalPermit>,
+    preauth_permit: PreauthPermit,
     authorize: MemberAuthorizer,
     dispatch: FrameDispatcher,
     policy: ConnectionPolicy,
@@ -982,13 +1034,19 @@ fn handle_connection_with(
     };
     let peer_fp = cluster::encoding::fingerprint(&opened.peer_static);
     let admitted = authorize(&opened.peer_static).is_ok();
-    let now = crate::SystemWallClock::new().unix_seconds() as i64;
-    let replay = state
-        .replay
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .check_and_insert(&peer_fp, opened.ephemeral, opened.timestamp_seconds, now);
-    if replay.is_err() {
+    let member_permit = if admitted {
+        acquire_member_permit(&state, preauth_permit)
+    } else {
+        None
+    };
+    if admitted && member_permit.is_none() {
+        return ignore_response_error(write_http_response(
+            stream,
+            503,
+            b"request capacity reached",
+        ));
+    }
+    if !accept_frame_replay(&state, &peer_fp, &opened) {
         return ignore_response_error(write_http_response(stream, 409, b"replayed or stale frame"));
     }
     if !admitted {
@@ -1027,7 +1085,10 @@ fn handle_connection_with(
     let peer_static = opened.peer_static.clone();
     let dispatch_worker = dispatch.clone();
     let authorize_worker = authorize.clone();
-    let worker_global = global_permit.clone();
+    let worker_global = member_permit
+        .as_ref()
+        .expect("authorized request holds member capacity")
+        .clone();
     let worker_peer = peer_permit.clone();
     let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
     let worker = std::thread::Builder::new()
@@ -1060,6 +1121,28 @@ fn handle_connection_with(
         return send_encrypted_response(stream, opened, &refused);
     }
     send_encrypted_response(stream, opened, &response)
+}
+
+fn acquire_member_permit(
+    state: &ListenerState,
+    preauth_permit: PreauthPermit,
+) -> Option<Arc<GlobalPermit>> {
+    drop(preauth_permit);
+    state.limiter.acquire_global()
+}
+
+fn accept_frame_replay(
+    state: &ListenerState,
+    peer_fp: &str,
+    opened: &frame::OpenedRequest,
+) -> bool {
+    let now = crate::SystemWallClock::new().unix_seconds() as i64;
+    state
+        .replay
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .check_and_insert(peer_fp, opened.ephemeral, opened.timestamp_seconds, now)
+        .is_ok()
 }
 
 fn handle_unknown_peer_join(
@@ -2189,6 +2272,16 @@ mod tests {
     #[test]
     fn production_serve_until_member_request_evicts_idle_preauth_connection() {
         let (server, peer) = production_socket_server();
+        server
+            .state
+            .limiter
+            .global_limit_override
+            .store(1, Ordering::Relaxed);
+        server
+            .state
+            .limiter
+            .preauth_limit_override
+            .store(1, Ordering::Relaxed);
         let mut idle = TcpStream::connect(server.address).unwrap();
         idle.set_read_timeout(Some(socket_test_timeout())).unwrap();
         std::thread::sleep(Duration::from_millis(100));
