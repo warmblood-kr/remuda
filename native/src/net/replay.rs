@@ -46,6 +46,12 @@ impl ReplayWindow {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code, clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+
     /// Accept a fresh frame timestamped within ±60 seconds of `now_seconds`.
     pub fn check_and_insert(
         &mut self,
