@@ -2642,6 +2642,41 @@ mod cluster_cli_tests {
 
     #[cfg(unix)]
     #[test]
+    fn join_listener_write_failure_does_not_mark_join_config_as_expected() {
+        let _environment = ForegroundListenerLockEnvironment::new();
+        let cluster_dir = _environment.root.join("state/remuda/cluster");
+        let listener_path = cluster_dir.join("listener.json");
+        let outside = _environment.root.join("outside.json");
+        std::fs::write(&outside, b"existing file").unwrap();
+        std::os::unix::fs::symlink(&outside, &listener_path).unwrap();
+
+        let snapshot = ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit("127.0.0.1:7441".parse().unwrap()),
+            allow_public: false,
+        };
+        let join_config = ListenerConfig {
+            enabled: true,
+            bind: ListenerBind::Explicit("127.0.0.2:7441".parse().unwrap()),
+            allow_public: false,
+        };
+        let mut restore_guard = JoinListenerRestoreGuard::new(
+            std::path::Path::new("missing.sock"),
+            Some(snapshot.clone()),
+        );
+
+        let result = remuda_native::cluster::listener_control::start_with_config_written(
+            std::path::Path::new("missing.sock"),
+            Some(join_config.clone()),
+            || restore_guard.set_expected(Some(join_config)),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(restore_guard.expected, Some(snapshot));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn join_signal_during_listener_start_restores_listener_config() {
         use remuda_core::protocol::ListenerStatus;
 
@@ -2657,13 +2692,16 @@ mod cluster_cli_tests {
         }
 
         let _reset = ResetInterruptState;
-        let environment = ForegroundListenerLockEnvironment::new();
+        let _environment = ForegroundListenerLockEnvironment::new();
         let join_config = ListenerConfig {
             enabled: true,
             bind: ListenerBind::Explicit("127.0.0.1:7441".parse().unwrap()),
             allow_public: false,
         };
-        let daemon_path = environment.root.join("missing-daemon.sock");
+        let daemon_path = std::path::PathBuf::from(format!(
+            "/private/tmp/remuda-s3-missing-{}.sock",
+            std::process::id()
+        ));
         let mut restore_guard = JoinListenerRestoreGuard::new(&daemon_path, None);
         restore_guard.set_expected(Some(join_config.clone()));
         let _handler = JoinInterruptHandler::install().unwrap();
