@@ -1784,7 +1784,9 @@ fn read_secret_answer_until(
     Option<remuda_core::protocol::SecretAnswerRefusal>,
 )> {
     use std::io::ErrorKind;
-    let mut frame = zeroize::Zeroizing::new(Vec::with_capacity(256));
+    let mut frame = zeroize::Zeroizing::new(Vec::with_capacity(
+        remuda_core::protocol::SECRET_ANSWER_MAX_FRAME_BYTES + 1,
+    ));
     loop {
         if std::time::Instant::now() >= deadline {
             return Err(std::io::Error::new(

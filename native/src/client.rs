@@ -525,7 +525,10 @@ fn send_secret_answer(
         secret: secret.cloned(),
         refusal,
     };
-    let mut frame = Zeroizing::new(serde_json::to_vec(&request)?);
+    let mut frame = Zeroizing::new(Vec::with_capacity(
+        remuda_core::protocol::SECRET_ANSWER_MAX_FRAME_BYTES + 1,
+    ));
+    serde_json::to_writer(&mut *frame, &request)?;
     frame.push(b'\n');
     stream.write_all(&frame)?;
     stream.flush()

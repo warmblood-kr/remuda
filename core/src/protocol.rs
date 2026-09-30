@@ -103,14 +103,15 @@ mod secret_bytes_base64 {
         if bytes.len() > SECRET_ANSWER_MAX_BYTES {
             return Err(S::Error::custom("secret answer exceeds 4096 bytes"));
         }
-        serializer.serialize_str(&STANDARD.encode(bytes))
+        let encoded = Zeroizing::new(STANDARD.encode(bytes));
+        serializer.serialize_str(encoded.as_str())
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Zeroizing<Vec<u8>>, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let encoded = String::deserialize(deserializer)?;
+        let encoded = Zeroizing::new(String::deserialize(deserializer)?);
         let input = encoded.as_bytes();
         if input.len() % 4 != 0 || input.len() > MAX_ENCODED_BYTES {
             return Err(D::Error::custom("invalid or oversized secret encoding"));
@@ -127,7 +128,7 @@ mod secret_bytes_base64 {
             return Err(D::Error::custom("secret answer exceeds 4096 bytes"));
         }
         STANDARD
-            .decode(encoded)
+            .decode(encoded.as_str())
             .map(Zeroizing::new)
             .map_err(D::Error::custom)
     }
