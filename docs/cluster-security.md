@@ -135,3 +135,15 @@ The UI adds one bracketed-paste marker pair only when the remote app has enabled
 mode 2004; otherwise the filtered text, including LF and CR, is sent raw as it
 would be in a local terminal, where each newline may submit a line. The shared
 paste filter drops control characters except TAB, LF, and CR.
+
+Auto listener mode selects the default-route RFC 1918 address and binds only
+that address. It checks the detected address on the existing five-second
+listener observer tick and on reload, closing and rebinding when the IP
+changes. If no eligible private address is available, the listener stays off.
+A public IP or wildcard bind requires an explicit bind and
+`--allow-public`. This keeps the accepted pre-auth availability residual (#341)
+on the selected LAN or VPN interface: an attacker with about 64 distinct
+source prefixes plus a member whose pre-auth read exceeds 250 ms can still
+evict that member, which retries. IPv4 prefixes are /32, so an exposed public
+listener would make that residual internet-reachable; auto mode never binds
+the wildcard. Joins still require the one-time token described in #332.

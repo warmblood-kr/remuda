@@ -120,11 +120,30 @@ type FrameDispatcher = Arc<dyn Fn(&[u8], &[u8]) -> io::Result<Vec<u8>> + Send + 
 
 struct ListenerState {
     responder_private: Zeroizing<Vec<u8>>,
-    replay: Mutex<replay::ReplayWindow>,
-    unknown_replay: Mutex<replay::ReplayWindow>,
+    replay: Arc<Mutex<replay::ReplayWindow>>,
+    unknown_replay: Arc<Mutex<replay::ReplayWindow>>,
     limiter: Arc<RequestLimiter>,
     join_tokens: JoinTokenStore,
     admit_join: JoinAdmitter,
+}
+
+/// Replay and request admission state that must survive auto-listener rebinds.
+pub(crate) struct ListenerSecurityResources {
+    replay: Arc<Mutex<replay::ReplayWindow>>,
+    unknown_replay: Arc<Mutex<replay::ReplayWindow>>,
+    limiter: Arc<RequestLimiter>,
+}
+
+impl ListenerSecurityResources {
+    pub(crate) fn new() -> Self {
+        Self {
+            replay: Arc::new(Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY))),
+            unknown_replay: Arc::new(Mutex::new(replay::ReplayWindow::new(
+                UNKNOWN_REPLAY_CAPACITY,
+            ))),
+            limiter: Arc::new(RequestLimiter::default()),
+        }
+    }
 }
 
 impl ListenerState {
@@ -353,6 +372,15 @@ pub fn validate_bind_address(address: SocketAddr, allow_public: bool) -> io::Res
 
 /// Bind the configured address after confirming that this node is initialized.
 pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> {
+    let security = ListenerSecurityResources::new();
+    bind_with_security(config, daemon_path, &security)
+}
+
+pub(crate) fn bind_with_security(
+    config: ListenerConfig,
+    daemon_path: &Path,
+    security: &ListenerSecurityResources,
+) -> io::Result<Listener> {
     validate_bind_address(config.bind_addr, config.allow_unspecified)?;
     let (identity_node, registry) = cluster::nodes()?.ok_or_else(|| {
         io::Error::new(
@@ -382,8 +410,7 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
     let authorize: MemberAuthorizer =
         Arc::new(move |peer_static| authorizer_cache.authorize(peer_static));
     let dispatch_path = daemon_path.to_path_buf();
-    let request_limiter = Arc::new(RequestLimiter::default());
-    let dispatch_limiter = request_limiter.clone();
+    let dispatch_limiter = Arc::clone(&security.limiter);
     let dispatch: FrameDispatcher = Arc::new(move |payload, peer_static| {
         dispatch_payload(payload, peer_static, &dispatch_path, &dispatch_limiter)
     });
@@ -391,9 +418,9 @@ pub fn bind(config: ListenerConfig, daemon_path: &Path) -> io::Result<Listener> 
         socket,
         state: Arc::new(ListenerState {
             responder_private,
-            replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
-            unknown_replay: Mutex::new(replay::ReplayWindow::new(UNKNOWN_REPLAY_CAPACITY)),
-            limiter: request_limiter,
+            replay: Arc::clone(&security.replay),
+            unknown_replay: Arc::clone(&security.unknown_replay),
+            limiter: Arc::clone(&security.limiter),
             join_tokens,
             admit_join: Arc::new(cluster::admit_join_locked),
         }),
@@ -416,9 +443,20 @@ impl Listener {
 
     /// Run until stopped; token state and registry changes are observed every five seconds.
     pub fn serve_until(&self, stop: &AtomicBool) -> io::Result<()> {
+        self.serve_until_rechecking(stop, || false).map(|_| ())
+    }
+
+    /// Run until stopped, checking the caller's restart condition on the existing
+    /// five-second observer tick. Returns true when that condition requested a rebind.
+    pub fn serve_until_rechecking(
+        &self,
+        stop: &AtomicBool,
+        should_rebind: impl Fn() -> bool + Send + Sync,
+    ) -> io::Result<bool> {
         std::thread::scope(|scope| {
             let (observe_error_tx, observe_error_rx) = std::sync::mpsc::channel::<io::Error>();
             let (observer_stop_tx, observer_stop_rx) = std::sync::mpsc::channel();
+            let (rebind_requested_tx, rebind_requested_rx) = std::sync::mpsc::channel();
             scope.spawn(move || {
                 if let Err(error) = self.state.join_tokens.observe() {
                     let _ = observe_error_tx.send(error);
@@ -435,6 +473,11 @@ impl Listener {
                     match observer_stop_rx.recv_timeout(OBSERVE_INTERVAL) {
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            if should_rebind() {
+                                let _ = rebind_requested_tx.send(());
+                                stop.store(true, Ordering::Release);
+                                break;
+                            }
                             if let Err(error) = self.state.join_tokens.observe() {
                                 let _ = observe_error_tx.send(error);
                                 break;
@@ -486,7 +529,7 @@ impl Listener {
                 },
             );
             let _ = observer_stop_tx.send(());
-            result
+            result.map(|()| rebind_requested_rx.try_recv().is_ok())
         })
     }
 
@@ -507,6 +550,9 @@ where
 {
     while !stop.load(Ordering::Acquire) {
         tick()?;
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
         match socket.accept() {
             Ok((stream, remote_addr)) => {
                 if let Err(error) = prepare_accepted_stream(&stream) {
@@ -1739,8 +1785,10 @@ mod tests {
                     .unwrap();
             let state = Arc::new(ListenerState {
                 responder_private: Zeroizing::new(responder_private),
-                replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
-                unknown_replay: Mutex::new(replay::ReplayWindow::new(UNKNOWN_REPLAY_CAPACITY)),
+                replay: Arc::new(Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY))),
+                unknown_replay: Arc::new(Mutex::new(replay::ReplayWindow::new(
+                    UNKNOWN_REPLAY_CAPACITY,
+                ))),
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
                 admit_join,
@@ -1818,8 +1866,10 @@ mod tests {
                     .unwrap();
             let state = Arc::new(ListenerState {
                 responder_private: Zeroizing::new(responder_private),
-                replay: Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY)),
-                unknown_replay: Mutex::new(replay::ReplayWindow::new(UNKNOWN_REPLAY_CAPACITY)),
+                replay: Arc::new(Mutex::new(replay::ReplayWindow::new(REPLAY_CAPACITY))),
+                unknown_replay: Arc::new(Mutex::new(replay::ReplayWindow::new(
+                    UNKNOWN_REPLAY_CAPACITY,
+                ))),
                 limiter: Arc::new(RequestLimiter::default()),
                 join_tokens,
                 admit_join: Arc::new(cluster::admit_join_locked),

@@ -68,6 +68,38 @@ impl HttpClient {
         });
         task
     }
+
+    pub fn start_peer_certificate(
+        &self,
+        req: HttpRequest,
+        complete: impl FnOnce(u64, Result<PeerCertificate, String>) + Send + 'static,
+    ) -> HttpTask {
+        const MAX_IN_FLIGHT: usize = 32;
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let task = HttpTask {
+            id,
+            cancelled: cancelled.clone(),
+        };
+        let admitted = self
+            .inner
+            .active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_IN_FLIGHT).then_some(n + 1)
+            })
+            .is_ok();
+        if !admitted {
+            complete(id, Err("maximum concurrent HTTP requests reached".into()));
+            return task;
+        }
+        let active = self.inner.clone();
+        std::thread::spawn(move || {
+            let result = inspect_peer_certificate(req, Some(&cancelled), active.dns_active.clone());
+            active.active.fetch_sub(1, Ordering::AcqRel);
+            complete(id, result);
+        });
+        task
+    }
 }
 
 type ResponseHeaders = BTreeMap<String, Vec<Vec<u8>>>;
@@ -127,6 +159,16 @@ pub struct HttpResponse {
     pub status: u16,
     pub headers: ResponseHeaders,
     pub body: Vec<u8>,
+    pub peer_certificate: Option<PeerCertificate>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerCertificate {
+    pub sha256: String,
+    pub not_before: String,
+    pub not_after: String,
+    pub trusted: bool,
+    pub reason: Option<String>,
 }
 
 pub fn perform(req: HttpRequest, cancelled: Option<&AtomicBool>) -> Result<HttpResponse, String> {
@@ -168,37 +210,7 @@ fn perform_with_dns_limit(
         Host::Ipv4(address) => format!("{address}:{port}"),
         Host::Ipv6(address) => format!("[{address}]:{port}"),
     };
-    if dns_active
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-            (count < 32).then_some(count + 1)
-        })
-        .is_err()
-    {
-        return Err("maximum concurrent DNS lookups reached".into());
-    }
-    let (resolved_tx, resolved_rx) = std::sync::mpsc::channel();
-    let resolver_count = dns_active.clone();
-    std::thread::spawn(move || {
-        let result = address
-            .to_socket_addrs()
-            .map(|items| items.collect::<Vec<_>>());
-        resolver_count.fetch_sub(1, Ordering::AcqRel);
-        let _ = resolved_tx.send(result);
-    });
-    let addresses = loop {
-        check(deadline, cancelled)?;
-        let wait = deadline
-            .saturating_duration_since(Instant::now())
-            .min(SOCKET_POLL);
-        match resolved_rx.recv_timeout(wait) {
-            Ok(Ok(addresses)) => break addresses,
-            Ok(Err(_)) => return Err("HTTP DNS resolution failed".into()),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("HTTP DNS resolution failed".into())
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-        }
-    };
+    let addresses = resolve_addresses(address, deadline, cancelled, dns_active)?;
     let connect_deadline = (Instant::now() + req.connect_timeout).min(deadline);
     let stream = connect(addresses.into_iter(), connect_deadline, cancelled)?;
     stream
@@ -211,7 +223,18 @@ fn perform_with_dns_limit(
     if let Some((tls, server_name)) = tls {
         let conn = rustls::ClientConnection::new(tls, server_name).map_err(tls_error)?;
         let mut wire = Wire::new(rustls::StreamOwned::new(conn, stream), deadline, cancelled);
-        execute_http(&mut wire, &req, &url)
+        wire.flush()?;
+        let mut response = execute_http(&mut wire, &req, &url)?;
+        response.peer_certificate = Some(peer_certificate_from_der(
+            wire.stream
+                .conn
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .ok_or_else(|| "TLS handshake returned no peer certificate".to_string())?,
+            true,
+            None,
+        )?);
+        Ok(response)
     } else {
         let mut wire = Wire::new(stream, deadline, cancelled);
         execute_http(&mut wire, &req, &url)
@@ -259,6 +282,44 @@ fn validate(req: &HttpRequest) -> Result<(), String> {
 
 fn is_token(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+fn resolve_addresses(
+    address: String,
+    deadline: Instant,
+    cancelled: Option<&AtomicBool>,
+    dns_active: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<Vec<SocketAddr>, String> {
+    if dns_active
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+            (count < 32).then_some(count + 1)
+        })
+        .is_err()
+    {
+        return Err("maximum concurrent DNS lookups reached".into());
+    }
+    let (resolved_tx, resolved_rx) = std::sync::mpsc::channel();
+    let resolver_count = dns_active.clone();
+    std::thread::spawn(move || {
+        let result = address
+            .to_socket_addrs()
+            .map(|items| items.collect::<Vec<_>>());
+        resolver_count.fetch_sub(1, Ordering::AcqRel);
+        let _ = resolved_tx.send(result);
+    });
+    loop {
+        check(deadline, cancelled)?;
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(SOCKET_POLL);
+        match resolved_rx.recv_timeout(wait) {
+            Ok(Ok(addresses)) => return Ok(addresses),
+            Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err("HTTP DNS resolution failed".into())
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
 }
 
 fn connect(
@@ -400,6 +461,7 @@ fn execute_http<S: Read + Write>(
         status,
         headers,
         body,
+        peer_certificate: None,
     })
 }
 
@@ -715,6 +777,24 @@ fn tls_failure_reason(message: &str) -> Option<&'static str> {
 
 fn tls_config(req: &HttpRequest) -> Result<Arc<ClientConfig>, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let verifier = tls_verifier(req, provider.clone())?;
+    client_config(provider, verifier)
+}
+
+fn inspecting_tls_config(
+    req: &HttpRequest,
+    result: Arc<std::sync::Mutex<Option<Result<(), String>>>>,
+) -> Result<Arc<ClientConfig>, String> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let inner = tls_verifier(req, provider.clone())?;
+    let verifier: Arc<dyn ServerCertVerifier> = Arc::new(InspectingVerifier { inner, result });
+    client_config(provider, verifier)
+}
+
+fn tls_verifier(
+    req: &HttpRequest,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Arc<dyn ServerCertVerifier>, String> {
     let verifier: Arc<dyn ServerCertVerifier> = if let Some(path) = &req.ca_file {
         let pem = read_ca_file(path)?;
         let certs = parse_pem_certs(&pem)?;
@@ -738,13 +818,19 @@ fn tls_config(req: &HttpRequest) -> Result<Arc<ClientConfig>, String> {
     } else {
         Arc::new(rustls_platform_verifier::Verifier::new(provider.clone()).map_err(tls_error)?)
     };
-    let verifier: Arc<dyn ServerCertVerifier> = match &req.pin {
-        Some(pin) => Arc::new(PinnedVerifier {
+    match &req.pin {
+        Some(pin) => Ok(Arc::new(PinnedVerifier {
             inner: verifier,
             pin: decode_pin(pin)?,
-        }),
-        None => verifier,
-    };
+        })),
+        None => Ok(verifier),
+    }
+}
+
+fn client_config(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    verifier: Arc<dyn ServerCertVerifier>,
+) -> Result<Arc<ClientConfig>, String> {
     ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(tls_error)?
@@ -753,6 +839,182 @@ fn tls_config(req: &HttpRequest) -> Result<Arc<ClientConfig>, String> {
         .with_no_client_auth()
         .pipe(Arc::new)
         .pipe(Ok)
+}
+
+#[derive(Debug)]
+struct InspectingVerifier {
+    inner: Arc<dyn ServerCertVerifier>,
+    result: Arc<std::sync::Mutex<Option<Result<(), String>>>>,
+}
+
+impl ServerCertVerifier for InspectingVerifier {
+    fn verify_server_cert(
+        &self,
+        cert: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        name: &ServerName<'_>,
+        ocsp: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        let result = self
+            .inner
+            .verify_server_cert(cert, intermediates, name, ocsp, now);
+        let trust = result.as_ref().map(|_| ()).map_err(peer_validation_reason);
+        if let Ok(mut state) = self.result.lock() {
+            *state = Some(trust);
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+fn peer_validation_reason(error: &TlsError) -> String {
+    match error {
+        TlsError::InvalidCertificate(reason) => certificate_failure_reason(reason).to_string(),
+        TlsError::NoCertificatesPresented => "server presented no certificate".into(),
+        TlsError::General(message) => tls_failure_reason(message)
+            .unwrap_or("server certificate validation failed")
+            .into(),
+        _ => "server certificate validation failed".into(),
+    }
+}
+
+#[cfg(test)]
+fn peer_certificate(
+    req: &HttpRequest,
+    cancelled: Option<&AtomicBool>,
+) -> Result<PeerCertificate, String> {
+    inspect_peer_certificate(
+        req.clone(),
+        cancelled,
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+    )
+}
+
+fn inspect_peer_certificate(
+    req: HttpRequest,
+    cancelled: Option<&AtomicBool>,
+    dns_active: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<PeerCertificate, String> {
+    let url = Url::parse(&req.url).map_err(|_| "invalid HTTPS URL".to_string())?;
+    if url.scheme() != "https" {
+        return Err("peer_certificate requires an https URL".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("peer_certificate URL must not contain credentials".into());
+    }
+    if req.timeout.is_zero() || req.connect_timeout.is_zero() || req.connect_timeout > req.timeout {
+        return Err("invalid HTTP timeout bounds".into());
+    }
+    let deadline = Instant::now() + req.timeout;
+    let host = url
+        .host()
+        .ok_or_else(|| "HTTPS URL has no host".to_string())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "HTTPS URL has no port".to_string())?;
+    let server_name = match host {
+        Host::Domain(domain) => ServerName::try_from(domain.to_owned())
+            .map_err(|_| "invalid TLS server name".to_string())?,
+        Host::Ipv4(address) => ServerName::IpAddress(address.into()),
+        Host::Ipv6(address) => ServerName::IpAddress(address.into()),
+    };
+    let address = match host {
+        Host::Domain(domain) => format!("{domain}:{port}"),
+        Host::Ipv4(address) => format!("{address}:{port}"),
+        Host::Ipv6(address) => format!("[{address}]:{port}"),
+    };
+    let addresses = resolve_addresses(address, deadline, cancelled, dns_active)?;
+    let stream = connect(
+        addresses.into_iter(),
+        (Instant::now() + req.connect_timeout).min(deadline),
+        cancelled,
+    )?;
+    stream
+        .set_read_timeout(Some(SOCKET_POLL))
+        .map_err(io_error)?;
+    stream
+        .set_write_timeout(Some(SOCKET_POLL))
+        .map_err(io_error)?;
+    let outcome = Arc::new(std::sync::Mutex::new(None));
+    let config = inspecting_tls_config(&req, outcome.clone())?;
+    let conn = rustls::ClientConnection::new(config, server_name).map_err(tls_error)?;
+    let mut wire = Wire::new(rustls::StreamOwned::new(conn, stream), deadline, cancelled);
+    wire.flush()?;
+    let cert = wire
+        .stream
+        .conn
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .ok_or_else(|| "TLS handshake returned no peer certificate".to_string())?;
+    let trust = outcome
+        .lock()
+        .map_err(|_| "TLS verifier state unavailable".to_string())?
+        .clone()
+        .ok_or_else(|| "TLS verifier returned no result".to_string())?;
+    peer_certificate_from_der(cert, trust.is_ok(), trust.err())
+}
+
+fn peer_certificate_from_der(
+    cert: &CertificateDer<'_>,
+    trusted: bool,
+    reason: Option<String>,
+) -> Result<PeerCertificate, String> {
+    let (not_before, not_after) = certificate_validity(cert.as_ref())?;
+    let sha256 = Sha256::digest(cert.as_ref())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok(PeerCertificate {
+        sha256,
+        not_before: format_utc(not_before),
+        not_after: format_utc(not_after),
+        trusted,
+        reason,
+    })
+}
+
+fn format_utc(timestamp: i64) -> String {
+    let days = timestamp.div_euclid(86_400);
+    let seconds = timestamp.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        seconds / 3_600,
+        seconds % 3_600 / 60,
+        seconds % 60
+    )
 }
 
 #[derive(Debug)]
@@ -811,6 +1073,33 @@ impl ServerCertVerifier for CaFileVerifier {
     }
 }
 
+fn certificate_validity(cert: &[u8]) -> Result<(i64, i64), String> {
+    let (_, outer, _) = der_value(cert, 0)?;
+    let (tag, tbs, _) = der_value(outer, 0)?;
+    if tag != 0x30 {
+        return Err("malformed certificate".into());
+    }
+    let mut at = if tbs.first() == Some(&0xa0) {
+        der_value(tbs, 0)?.2
+    } else {
+        0
+    };
+    for _ in 0..3 {
+        at = der_value(tbs, at)?.2;
+    }
+    let (tag, validity, _) = der_value(tbs, at)?;
+    if tag != 0x30 {
+        return Err("malformed certificate validity".into());
+    }
+    let (before_tag, before, next) = der_value(validity, 0)?;
+    let (after_tag, after, _) = der_value(validity, next)?;
+    let before = asn1_time(before_tag, before)
+        .ok_or_else(|| "unsupported certificate validity time".to_string())?;
+    let after = asn1_time(after_tag, after)
+        .ok_or_else(|| "unsupported certificate validity time".to_string())?;
+    Ok((before, after))
+}
+
 fn verify_trusted_end_entity(
     cert: &CertificateDer<'_>,
     name: &ServerName<'_>,
@@ -818,41 +1107,7 @@ fn verify_trusted_end_entity(
 ) -> Result<(), TlsError> {
     let parsed = rustls::server::ParsedCertificate::try_from(cert)?;
     rustls::client::verify_server_name(&parsed, name)?;
-    let (_, outer, _) = der_value(cert.as_ref(), 0)
-        .map_err(|_| TlsError::General("malformed trusted server certificate".into()))?;
-    let (tag, tbs, _) = der_value(outer, 0)
-        .map_err(|_| TlsError::General("malformed trusted server certificate".into()))?;
-    if tag != 0x30 {
-        return Err(TlsError::General(
-            "malformed trusted server certificate".into(),
-        ));
-    }
-    let mut at = 0;
-    if tbs.get(at) == Some(&0xa0) {
-        at = der_value(tbs, at)
-            .map_err(|_| TlsError::General("malformed trusted server certificate".into()))?
-            .2;
-    }
-    for _ in 0..3 {
-        at = der_value(tbs, at)
-            .map_err(|_| TlsError::General("malformed trusted server certificate".into()))?
-            .2;
-    }
-    let (tag, validity, _) = der_value(tbs, at)
-        .map_err(|_| TlsError::General("malformed trusted server certificate".into()))?;
-    if tag != 0x30 {
-        return Err(TlsError::General(
-            "malformed trusted server certificate".into(),
-        ));
-    }
-    let (before_tag, before, next) = der_value(validity, 0)
-        .map_err(|_| TlsError::General("malformed certificate validity".into()))?;
-    let (after_tag, after, _) = der_value(validity, next)
-        .map_err(|_| TlsError::General("malformed certificate validity".into()))?;
-    let before = asn1_time(before_tag, before)
-        .ok_or_else(|| TlsError::General("unsupported certificate validity time".into()))?;
-    let after = asn1_time(after_tag, after)
-        .ok_or_else(|| TlsError::General("unsupported certificate validity time".into()))?;
+    let (before, after) = certificate_validity(cert.as_ref()).map_err(TlsError::General)?;
     let now = now.as_secs() as i64;
     if now < before {
         return Err(TlsError::General(
@@ -1075,7 +1330,7 @@ pub fn install(
     image: crate::image::Image,
 ) -> mlua::Result<()> {
     let http = lua.create_table()?;
-    let request_image = image;
+    let request_image = image.clone();
     http.set(
         "request",
         lua.create_function(move |lua, options: mlua::Table| {
@@ -1114,6 +1369,46 @@ pub fn install(
                 timeout,
                 connect_timeout,
                 max_bytes,
+                ca_file,
+                pin,
+            });
+            let key = format!("remuda.http.callback.{}", task.id);
+            lua.set_named_registry_value(&key, callback)?;
+            let handle = lua.create_table()?;
+            handle.set(
+                "cancel",
+                lua.create_function(move |_, _: mlua::MultiValue| {
+                    task.cancel();
+                    Ok(())
+                })?,
+            )?;
+            Ok(handle)
+        })?,
+    )?;
+    let peer_image = image.clone();
+    http.set(
+        "peer_certificate",
+        lua.create_function(move |lua, options: mlua::Table| {
+            let url: String = options.get("url")?;
+            let timeout = duration_option(&options, "timeout", None)?
+                .ok_or_else(|| mlua::Error::runtime("http.peer_certificate requires timeout"))?;
+            let connect_timeout = duration_option(
+                &options,
+                "connect_timeout",
+                Some(timeout.min(Duration::from_secs(10))),
+            )?
+            .unwrap();
+            let ca_file = options.get::<Option<String>>("ca_file")?;
+            let pin = options.get::<Option<String>>("pin")?;
+            let callback: mlua::Function = options.get("callback")?;
+            let task = peer_image.start_peer_certificate(HttpRequest {
+                method: "GET".into(),
+                url,
+                headers: Vec::new(),
+                body: Vec::new(),
+                timeout,
+                connect_timeout,
+                max_bytes: 0,
                 ca_file,
                 pin,
             });
@@ -1450,6 +1745,81 @@ mod tests {
     }
 
     #[test]
+    fn peer_certificate_lua_binding_delivers_untrusted_metadata_asynchronously() {
+        let (url, seen) = tls_stub();
+        let socket =
+            std::env::temp_dir().join(format!("unused-http-peer-image-{}", std::process::id()));
+        let image = crate::image::Image::spawn(
+            &socket,
+            std::sync::Arc::new(remuda_core::Registry::new()),
+            std::sync::Arc::new(crate::tick::Counters::default()),
+        );
+        let code = format!("remuda.http.peer_certificate{{url='{url}', timeout=2, callback=function(r) remuda._peer_done=true; remuda._peer_trusted=r.trusted; remuda._peer_sha=r.sha256; remuda._peer_reason=r.reason end}}; return 'started'");
+        assert_eq!(image.eval(&code, None).unwrap(), "started");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if image
+                .eval("return remuda._peer_done or false", None)
+                .unwrap()
+                == "true"
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peer certificate callback did not run"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            image.eval("return remuda._peer_trusted", None).unwrap(),
+            "false"
+        );
+        assert_eq!(image.eval("return #remuda._peer_sha", None).unwrap(), "64");
+        let reason = image.eval("return remuda._peer_reason", None).unwrap();
+        assert!(!reason.is_empty() && reason != "nil");
+        assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+        image.stop_for_test();
+    }
+
+    #[test]
+    fn peer_certificate_refuses_non_https_urls() {
+        assert!(
+            super::peer_certificate(&request("http://127.0.0.1/".into()), None)
+                .unwrap_err()
+                .contains("requires an https URL")
+        );
+    }
+
+    #[test]
+    fn peer_certificate_reports_trust_and_never_sends_http_bytes() {
+        let ca_file = concat!(env!("CARGO_MANIFEST_DIR"), "/src/net/testdata/test-ca.pem");
+        let (url, seen) = tls_stub();
+        let mut req = request(url);
+        req.ca_file = Some(ca_file.into());
+        let peer = super::peer_certificate(&req, None).unwrap();
+        let leaf = super::parse_pem_certs(include_str!("testdata/test-leaf.pem")).unwrap();
+        assert!(peer.trusted);
+        assert_eq!(
+            peer.sha256,
+            format!("{:x}", Sha256::digest(leaf[0].as_ref()))
+        );
+        assert!(!peer.not_before.is_empty());
+        assert!(!peer.not_after.is_empty());
+        assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+
+        let (url, seen) = tls_stub();
+        let peer = super::peer_certificate(&request(url), None).unwrap();
+        assert!(!peer.trusted);
+        assert!(peer.reason.is_some());
+        assert_eq!(
+            peer.sha256,
+            format!("{:x}", Sha256::digest(leaf[0].as_ref()))
+        );
+        assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
     fn invalid_custom_ca_fails_closed() {
         let mut req = request("https://localhost:443/".into());
         req.ca_file = Some("/this/path/does/not/exist/remuda-test-ca.pem".into());
@@ -1478,6 +1848,13 @@ mod tests {
         req.pin = Some(test_pin());
         let response = perform(req, None).unwrap();
         assert_eq!(response.status, 200);
+        let peer = response
+            .peer_certificate
+            .expect("validated HTTPS peer metadata");
+        assert!(peer.trusted);
+        assert_eq!(peer.sha256.len(), 64);
+        assert!(!peer.not_before.is_empty());
+        assert!(!peer.not_after.is_empty());
         assert!(seen.recv_timeout(Duration::from_secs(1)).unwrap());
 
         let (url, seen) = tls_stub();

@@ -35,6 +35,10 @@ pub enum ListenerStatus {
     On {
         addr: std::net::SocketAddr,
         auto: bool,
+        #[serde(default)]
+        advertise_addr: Option<std::net::SocketAddr>,
+        #[serde(default)]
+        listen_addrs: Vec<std::net::SocketAddr>,
     },
     Failed(String),
 }
