@@ -664,28 +664,16 @@ fn secret_answer_frame_round_trips_at_four_kib_and_reports_too_long() {
 }
 
 #[cfg(unix)]
-#[test]
-fn session_secret_prompt_label_names_the_session_and_strips_controls() {
+fn secret_prompt_in_session(socket: &std::path::Path, session_name: &str, binary: &str) -> String {
     use remuda_core::protocol::{Request, Response, Step};
     use remuda_core::Size;
-    use remuda_native::{client, daemon};
+    use remuda_native::client;
     use std::time::{Duration, Instant};
 
-    let (dir, remuda) = fixture("secret_session_label");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
-    let boot = remuda(&["exec", "deferred"]);
-    assert!(
-        boot.status.success(),
-        "private daemon and module boot: {boot:?}"
-    );
-
-    let socket = daemon::socket_path_in(&dir, "s");
-    let session_name = "secret-label-session";
-    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
     let command = format!("sleep 0.2; \"{binary}\" -s s deferred secret_session");
     assert_eq!(
         client::request(
-            &socket,
+            socket,
             &Request::New {
                 name: Some(session_name.into()),
                 command: vec!["sh".into(), "-c".into(), command],
@@ -701,7 +689,7 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
     let deadline = Instant::now() + Duration::from_secs(8);
     let prompt_screen = loop {
         let screen = match client::request(
-            &socket,
+            socket,
             &Request::Capture {
                 name: session_name.into(),
             },
@@ -719,7 +707,7 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
         std::thread::sleep(Duration::from_millis(25));
     };
     client::request(
-        &socket,
+        socket,
         &Request::Feed {
             name: session_name.into(),
             steps: vec![Step::Burst(vec![b'\r'])],
@@ -730,7 +718,7 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let screen = match client::request(
-            &socket,
+            socket,
             &Request::Capture {
                 name: session_name.into(),
             },
@@ -747,6 +735,26 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
         );
         std::thread::sleep(Duration::from_millis(25));
     }
+    prompt_screen
+}
+
+#[cfg(unix)]
+#[test]
+fn session_secret_prompt_label_names_the_session_and_strips_controls() {
+    use remuda_native::daemon;
+
+    let (dir, remuda) = fixture("secret_session_label");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let socket = daemon::socket_path_in(&dir, "s");
+    let session_name = "secret-label-session";
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let prompt_screen = secret_prompt_in_session(&socket, session_name, &binary);
     let _ = remuda(&["stop", "-f"]);
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -757,6 +765,57 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
     assert!(
         !prompt_screen.contains('\x1b'),
         "ESC remained in the terminal screen:\n{prompt_screen}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_secret_prompt_tag_replaces_brackets_in_the_session_name() {
+    use remuda_native::daemon;
+
+    let (dir, remuda) = fixture("secret_session_tag_brackets");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let socket = daemon::socket_path_in(&dir, "s");
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let prompt_screen = secret_prompt_in_session(&socket, "x] remuda[outside", &binary);
+    let _ = remuda(&["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        prompt_screen.contains("remuda[session x? remuda?outside] deferred test secret"),
+        "session name forged the caller tag:\n{prompt_screen}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_secret_prompt_tag_caps_the_session_name_at_64_chars() {
+    use remuda_native::daemon;
+
+    let (dir, remuda) = fixture("secret_session_tag_cap");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let socket = daemon::socket_path_in(&dir, "s");
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let session_name = "x".repeat(70);
+    let prompt_screen = secret_prompt_in_session(&socket, &session_name, &binary);
+    let _ = remuda(&["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        prompt_screen.contains(&format!("remuda[session {}]", "x".repeat(64))),
+        "session name was not truncated to 64 chars:\n{prompt_screen}"
     );
 }
 
