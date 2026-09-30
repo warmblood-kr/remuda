@@ -3212,6 +3212,25 @@ mod tests {
     }
 
     #[test]
+    fn long_notices_keep_the_next_step_visible_at_common_terminal_sizes() {
+        let clock = ManualClock::new();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.notice = Some((
+            "a human is attached to this session, so remote input is paused; wait for them to detach, then retry"
+                .into(),
+            clock.now(),
+        ));
+
+        for (cols, rows) in [(80, 24), (40, 12)] {
+            let frame = ui.render(cols, rows, "", &clock);
+            assert!(
+                frame.contains("then retry"),
+                "notice lost its next step at {cols}x{rows}: {frame}"
+            );
+        }
+    }
+
+    #[test]
     fn escape_from_remote_composer_shows_live_action_footer() {
         let make_ui = || {
             let clock = ManualClock::new();
