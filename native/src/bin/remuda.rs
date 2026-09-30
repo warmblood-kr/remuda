@@ -973,7 +973,8 @@ fn cluster_listen(
                 "cluster listen: listener stayed off after reload\nNext: run `remuda cluster` and retry `remuda cluster listen`.",
             ),
             Ok(remuda_core::protocol::ListenerStatus::Failed(reason)) => fail(format!(
-                "cluster listen: listener failed: {reason}\nNext: check `remuda cluster` and retry `remuda cluster listen`."
+                "cluster listen: listener failed: {reason}\n{}",
+                listener_failure_next_step(&reason)
             )),
             Err(error) => fail(format!(
                 "cluster listen: could not reload the daemon listener: {error}\nNext: check `remuda cluster` and retry `remuda cluster listen`."
@@ -1209,6 +1210,14 @@ fn render_cluster_init_lines(
     lines
 }
 
+fn listener_failure_next_step(reason: &str) -> &'static str {
+    if reason.contains("no private LAN address found") {
+        "Next: remuda cluster listen --bind IP"
+    } else {
+        "Next: remuda cluster listen"
+    }
+}
+
 fn render_init_listener_lines(status: &remuda_core::protocol::ListenerStatus) -> Vec<String> {
     use remuda_core::protocol::ListenerStatus;
 
@@ -1229,7 +1238,7 @@ fn render_init_listener_lines(status: &remuda_core::protocol::ListenerStatus) ->
         ListenerStatus::Off => vec!["Listener off (--no-listen)".into(), next_step_init().into()],
         ListenerStatus::Failed(reason) => vec![
             format!("Listener failed: {reason}"),
-            "Next: remuda cluster listen".into(),
+            listener_failure_next_step(reason).into(),
         ],
     }
 }
@@ -1430,7 +1439,10 @@ fn render_invite_state_error(error: &std::io::Error) -> String {
 }
 
 fn render_invite_listener_start_error(error: &std::io::Error) -> String {
-    format!("cluster invite: could not start the listener: {error}\nNext: remuda cluster listen")
+    format!(
+        "cluster invite: could not start the listener: {error}\n{}",
+        listener_failure_next_step(&error.to_string())
+    )
 }
 
 fn render_invite_listener_refusal(status: &remuda_core::protocol::ListenerStatus) -> String {
@@ -1440,9 +1452,10 @@ fn render_invite_listener_refusal(status: &remuda_core::protocol::ListenerStatus
         ListenerStatus::Off => {
             "cluster invite: listener is off\nNext: remuda cluster listen".into()
         }
-        ListenerStatus::Failed(reason) => {
-            format!("cluster invite: listener failed: {reason}\nNext: remuda cluster listen")
-        }
+        ListenerStatus::Failed(reason) => format!(
+            "cluster invite: listener failed: {reason}\n{}",
+            listener_failure_next_step(reason)
+        ),
         ListenerStatus::On { .. } => unreachable!("an active listener can accept invitations"),
     }
 }
@@ -1789,7 +1802,10 @@ fn render_join_failure(message: String, rollback_error: Option<&str>) -> String 
 }
 
 fn render_join_listener_start_error(error: &std::io::Error) -> String {
-    format!("cluster join: could not start the listener: {error}\nNext: remuda cluster listen")
+    format!(
+        "cluster join: could not start the listener: {error}\n{}",
+        listener_failure_next_step(&error.to_string())
+    )
 }
 
 fn render_join_listener_refusal(status: &remuda_core::protocol::ListenerStatus) -> String {
@@ -1797,9 +1813,10 @@ fn render_join_listener_refusal(status: &remuda_core::protocol::ListenerStatus) 
 
     match status {
         ListenerStatus::Off => "cluster join: listener is off\nNext: remuda cluster listen".into(),
-        ListenerStatus::Failed(reason) => {
-            format!("cluster join: listener failed: {reason}\nNext: remuda cluster listen")
-        }
+        ListenerStatus::Failed(reason) => format!(
+            "cluster join: listener failed: {reason}\n{}",
+            listener_failure_next_step(reason)
+        ),
         ListenerStatus::On { .. } => unreachable!("an active listener can accept joins"),
     }
 }
@@ -2676,6 +2693,24 @@ mod cluster_cli_tests {
         assert!(refusal.contains("address busy"));
         assert!(refusal.contains("remuda cluster listen"));
         assert!(!refusal.contains("remuda-join-v1"));
+    }
+
+    #[test]
+    fn no_lan_listener_refusals_suggest_an_explicit_bind() {
+        use remuda_core::protocol::ListenerStatus;
+
+        let reason = "no private LAN address found. Next: remuda cluster listen --bind IP";
+        let failed = ListenerStatus::Failed(reason.into());
+        for message in [
+            render_init_listener_lines(&failed).join("\n"),
+            render_invite_listener_refusal(&failed),
+            super::render_join_listener_refusal(&failed),
+        ] {
+            assert!(
+                message.ends_with("Next: remuda cluster listen --bind IP"),
+                "missing explicit bind recovery in: {message}"
+            );
+        }
     }
 
     #[test]

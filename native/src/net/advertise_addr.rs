@@ -20,9 +20,7 @@ impl fmt::Display for NoLanAddr {
         } else {
             formatter.write_str("no private LAN address found")?;
         }
-        formatter.write_str(
-            ". Next: set a listener with remuda cluster listen --bind IP; set a separate invite address with remuda cluster invite --addr IP",
-        )
+        formatter.write_str(". Next: remuda cluster listen --bind IP")
     }
 }
 
@@ -128,7 +126,7 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            "no private LAN address found (candidate 8.8.8.8). Next: set a listener with remuda cluster listen --bind IP; set a separate invite address with remuda cluster invite --addr IP"
+            "no private LAN address found (candidate 8.8.8.8). Next: remuda cluster listen --bind IP"
         );
     }
 
