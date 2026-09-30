@@ -34,6 +34,27 @@ local function with_owner(owner, fn, ...)
   if not result[1] then error(result[2], 0) end
   return table.unpack(result, 2, result.n)
 end
+local function timer_callback(owner, fn)
+  if owner == nil then return fn end
+  return function(...) return with_owner(owner, fn, ...) end
+end
+local native_timer_after = remuda._timer_after
+local native_timer_every = remuda._timer_every
+local native_timer_cancel_owner = remuda._timer_cancel_owner
+remuda._timer_after = nil
+remuda._timer_every = nil
+remuda._timer_cancel_owner = nil
+local function cancel_owner_timers(owner)
+  if native_timer_cancel_owner then native_timer_cancel_owner(owner) end
+end
+function remuda.after(seconds, fn)
+  local owner = current_owner
+  return native_timer_after(seconds, timer_callback(owner, fn), owner)
+end
+function remuda.every(seconds, fn)
+  local owner = current_owner
+  return native_timer_every(seconds, timer_callback(owner, fn), owner)
+end
 local extension_command_owners = {}
 
 function remuda.extension_command(name, handler)
@@ -63,6 +84,8 @@ end
 local function register(name, about, signature)
   remuda._registry[name] = { name = name, about = about, signature = signature }
 end
+register("after", "Run a callback once after a delay without blocking the Lua image; cancel with handle:cancel().", "after(seconds, fn) -> handle")
+register("every", "Run a callback periodically without blocking the Lua image; cancel with handle:cancel(). If a callback finishes late, the next tick comes one interval after it ends, so the phase shifts and ticks do not burst to catch up.", "every(seconds, fn) -> handle")
 register("tools", "The `remuda.tool` registry table, keyed by tool name.", "table")
 register("_extension_commands", "Handlers registered for installed mod commands.", "table")
 register("extension_command", "Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.", "extension_command(name, handler(args, caller)) -> nil")
@@ -1002,6 +1025,7 @@ local field_owners = {}
 -- snapshot. Its start() must rebuild only the imperative registrations it
 -- created, so discard those owner-tagged effects before running it again.
 local function clear_imperative_module_registrations(name, activation)
+  cancel_owner_timers(name)
   local declared_schedules, declared_tools, declared_advice, declared_contributions = {}, {}, {}, {}
   for _, handle in ipairs(activation.schedules or {}) do declared_schedules[handle] = true end
   for _, tool_name in ipairs(activation.tools or {}) do declared_tools[tool_name] = true end
@@ -1279,6 +1303,7 @@ function remuda._activate_module(name, candidate, reactivate)
   -- before the replacement's start can run. A cleanup error is diagnostic,
   -- not a reason to prevent reload.
   stop_module_activation(name, previous)
+  cancel_owner_timers(name)
 
   -- Snapshot what this activation replaces, so a failing `start` can put the
   -- previous activation back (#129). State mutated by that `start` stays.
@@ -1435,6 +1460,7 @@ function remuda._activate_module(name, candidate, reactivate)
 
   local function rollback()
     stop_module_activation(name, activation)
+    cancel_owner_timers(name)
     for event, registered in pairs(remuda.hooks) do
       local restored = saved_hooks[event] or {}
       local known = {}
@@ -1547,6 +1573,7 @@ function remuda._stop_modules()
   for _, pair in ipairs(active) do
     local name, module = pair[1], pair[2]
     stop_module_activation(name, module)
+    cancel_owner_timers(name)
   end
 end
 

@@ -5,6 +5,8 @@
 <p><code>advice_member(path, id) -&gt; boolean</code> — Whether advice with this id is on a path.</p>
 <h2 id="advise">advise</h2>
 <p><code>advise(path, how, fn, opts) -&gt; nil</code> — Wrap the function at a <span class="title-ref">remuda.*</span> path. `how`: aroundafterfilter_argsbefore_while|before_until. `opts`: <span class="title-ref">id</span> (required; same id replaces), <span class="title-ref">depth</span> (-100 outermost).</p>
+<h2 id="after">after</h2>
+<p><code>after(seconds, fn) -&gt; handle</code> — Run a callback once after a delay without blocking the Lua image; cancel with handle:cancel().</p>
 <h2 id="attach">attach</h2>
 <p><code>attach(name) -&gt; nil</code> — Deprecated alias for <span class="title-ref">remuda.session.attach</span>.</p>
 <h2 id="buffer">buffer</h2>
@@ -23,6 +25,8 @@
 <p><code>clear_hooks(opts) -&gt; nil</code> — Remove every hook registered under a group.</p>
 <h2 id="click">click</h2>
 <p><code>click(name, col, row, button?) -&gt; nil</code> — Send a mouse click at a terminal cell.</p>
+<h2 id="clock">clock</h2>
+<p><code>clock() -&gt; milliseconds</code> — Monotonic milliseconds since this Lua image started.</p>
 <h2 id="close">close</h2>
 <p><code>close(name) -&gt; nil</code> — Deprecated alias for <span class="title-ref">remuda.session.close</span>.</p>
 <h2 id="contribute">contribute</h2>
@@ -39,6 +43,8 @@
 <p><code>emit_until_success(event, ...) -&gt; value?</code> — Fire an event until a hook returns non-nil, and return that value. An erroring hook is no answer.</p>
 <h2 id="event_counts">event_counts</h2>
 <p><code>event_counts() -&gt; {[event]=n}</code> — How many times each event has been emitted.</p>
+<h2 id="every">every</h2>
+<p><code>every(seconds, fn) -&gt; handle</code> — Run a callback periodically without blocking the Lua image; cancel with handle:cancel(). If a callback finishes late, the next tick comes one interval after it ends, so the phase shifts and ticks do not burst to catch up.</p>
 <h2 id="exec">exec</h2>
 <p><code>exec(name) -&gt; nil</code> — Run an installed mod's entry source, by name, in this same image.</p>
 <h2 id="expect">expect</h2>

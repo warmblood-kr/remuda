@@ -27,13 +27,18 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Sender};
+use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Instant;
+
+#[path = "timers.rs"]
+pub(crate) mod timers;
 
 // `Response::Error` remains a plain string on the wire. This reserved control
 // prefix carries typed failures to the CLI without changing ordinary errors.
 const TYPED_FAILURE_PREFIX: &str = "\u{1e}REMUDA_FAIL:";
 const LUA_HOOK_INTERVAL: u32 = 10_000;
+const MAX_TIMER_CALLBACKS_PER_TURN: usize = 1;
 // About 0.6 seconds at the measured 360M instructions/second in release builds.
 const LUA_INSTRUCTION_LIMIT: u64 = 200_000_000;
 const LUA_EXECUTION_LIMIT_MESSAGE: &str = "Lua execution limit exceeded";
@@ -407,6 +412,7 @@ impl Image {
         std::thread::spawn(move || {
             let lua = Lua::new();
             let caller = Rc::new(RefCell::new(CallerContext::default()));
+            let timers = Rc::new(RefCell::new(timers::TimerService::new()));
             let budget = LuaExecutionBudget::default();
             // Everything `print` writes during one job, so it can travel back
             // to whoever asked instead of vanishing. `Rc` rather than `Arc`
@@ -425,6 +431,7 @@ impl Image {
                         counters,
                         handle.clone(),
                         Rc::clone(&caller),
+                        Rc::clone(&timers),
                     )
                     .and_then(|table| lua.globals().set("remuda", table))
                     .and_then(|()| install_execution_guards(&lua, budget.clone()))
@@ -441,18 +448,38 @@ impl Image {
                 })
                 .map_err(|e| e.to_string());
 
-            for job in inbox {
-                printed.borrow_mut().clear();
-                let answer = process_job(&lua, &budget, &handle, &printed, &ready, &job, &caller);
-                // A caller that gave up and dropped its receiver is not an
-                // error: `remuda -e` can be Ctrl-C'd mid-evaluation, and the
-                // work still ran.
-                if let Some(reply) = job.reply {
-                    let _ = reply.send(answer);
-                }
-                #[cfg(test)]
-                if matches!(job.kind, JobKind::StopImage) {
-                    break;
+            loop {
+                let timeout = timers.borrow_mut().wait_timeout();
+                let received = match timeout {
+                    Some(timeout) => inbox.recv_timeout(timeout),
+                    None => inbox.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                };
+                match received {
+                    Ok(job) => {
+                        printed.borrow_mut().clear();
+                        #[cfg(test)]
+                        let stop_image = matches!(job.kind, JobKind::StopImage);
+                        #[cfg(not(test))]
+                        let stop_image = false;
+                        let answer =
+                            process_job(&lua, &budget, &handle, &printed, &ready, &job, &caller);
+                        // A caller that gave up and dropped its receiver is not
+                        // an error: `remuda -e` can be Ctrl-C'd mid-evaluation,
+                        // and the work still ran.
+                        if let Some(reply) = job.reply {
+                            let _ = reply.send(answer);
+                        }
+                        if !stop_image {
+                            run_due_timers(&lua, &budget, &timers);
+                        }
+                        if stop_image {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {
+                        run_due_timers(&lua, &budget, &timers);
+                    }
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
         });
@@ -767,6 +794,28 @@ fn run_due_schedules(lua: &Lua, budget: &LuaExecutionBudget, now: f64) -> Result
         }
     }
     Ok(String::new())
+}
+
+fn run_due_timers(lua: &Lua, budget: &LuaExecutionBudget, timers: &timers::SharedTimerService) {
+    // Return to the image inbox between callbacks so an overdue timer batch
+    // cannot keep ordinary work queued behind every due callback.
+    for _ in 0..MAX_TIMER_CALLBACKS_PER_TURN {
+        let fire = match timers.borrow_mut().take_due(lua, Instant::now()) {
+            Ok(Some(fire)) => fire,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("remuda timer dequeue error: {error}");
+                return;
+            }
+        };
+        let callback_result = budget.run(lua, || fire.callback.call::<()>(()));
+        if let Err(error) = callback_result {
+            eprintln!("remuda timer callback error: {error}");
+        }
+        if fire.repeating {
+            timers.borrow_mut().finish_fire(fire.id, Instant::now());
+        }
+    }
 }
 
 fn install_execution_guards(lua: &Lua, budget: LuaExecutionBudget) -> mlua::Result<()> {

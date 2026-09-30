@@ -4656,6 +4656,313 @@ fn a_registered_schedule_actually_fires_through_a_real_daemon() {
     }
 }
 
+#[test]
+fn lua_timers_are_available_cancelable_and_run_after_the_current_turn() {
+    let path = scratch("lua-timer-api");
+    let _daemon = daemon_at(&path);
+
+    let scheduled = client::request(
+        &path,
+        &Request::Eval {
+            code: r#"
+                remuda._timer_fired = false
+                local handle = remuda.after(0.03, function()
+                  remuda._timer_fired = true
+                end)
+                assert(type(handle.cancel) == "function")
+                collectgarbage("collect")
+                return "scheduled"
+            "#
+            .to_string(),
+            name: None,
+        },
+    )
+    .expect("schedule a timer");
+    assert_eq!(scheduled, Response::Value("scheduled".into()));
+    assert_eq!(eval(&path, "return remuda._timer_fired"), "false");
+
+    // Real time passes in Rust; the image stays available to service another
+    // request while the timer waits.
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(eval(&path, "return remuda._timer_fired"), "true");
+
+    let canceled = client::request(
+        &path,
+        &Request::Eval {
+            code: r#"
+                remuda._canceled_timer_fired = false
+                local handle = remuda.after(0.03, function()
+                  remuda._canceled_timer_fired = true
+                end)
+                handle:cancel()
+                return "canceled"
+            "#
+            .to_string(),
+            name: None,
+        },
+    )
+    .expect("cancel a timer");
+    assert_eq!(canceled, Response::Value("canceled".into()));
+    std::thread::sleep(Duration::from_millis(60));
+    assert_eq!(eval(&path, "return remuda._canceled_timer_fired"), "false");
+}
+
+#[test]
+fn another_client_eval_returns_while_a_one_second_timer_is_pending() {
+    let path = scratch("lua-timer-nonblocking");
+    let _daemon = daemon_at(&path);
+    assert_eq!(
+        eval(&path, "remuda.after(1, function() end); return 'scheduled'",),
+        "scheduled"
+    );
+
+    let started = Instant::now();
+    assert_eq!(eval(&path, "return 'responsive'"), "responsive");
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "client eval waited for a pending timer"
+    );
+}
+
+#[test]
+fn queued_eval_is_serviced_between_due_timer_callbacks() {
+    let runtime = unique_scratch_dir("timer-batch");
+    let _cleanup = RemoveDirectoryOnDrop(runtime.clone());
+    let path = daemon::socket_path_in(&runtime, "s");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            for _ = 1, 10 do
+              remuda.after(0.01, function()
+                local total = 0
+                for i = 1, 300000 do total = total + i end
+                remuda._timer_test_total = total
+              end)
+            end
+            return 'scheduled'
+        "#,
+    );
+
+    // Let the first callback start and the remaining timers become overdue,
+    // then queue ordinary work while the image is draining that due batch.
+    std::thread::sleep(Duration::from_millis(40));
+    let started = Instant::now();
+    assert_eq!(eval(&path, "return 'responsive'"), "responsive");
+    assert!(
+        started.elapsed() < Duration::from_millis(750),
+        "queued eval was not serviced between due timer callbacks"
+    );
+}
+
+#[test]
+fn repeating_timer_keeps_firing_during_client_eval_traffic() {
+    let path = scratch("lua-timer-client-traffic");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        "remuda._traffic_timer_fires = 0; remuda.every(0.04, function() remuda._traffic_timer_fires = remuda._traffic_timer_fires + 1 end); return 'scheduled'",
+    );
+
+    let deadline = Instant::now() + Duration::from_millis(400);
+    while Instant::now() < deadline {
+        assert_eq!(eval(&path, "return 'responsive'"), "responsive");
+    }
+    let count = read_count(&path, "return remuda._traffic_timer_fires");
+    assert!(
+        count >= 5,
+        "interval was starved by eval traffic: {count} fires"
+    );
+}
+
+#[test]
+fn user_lua_cannot_cancel_another_owners_timer_and_reload_cancels_it() {
+    let runtime = unique_scratch_dir("lua-timer-owner");
+    let _cleanup = RemoveDirectoryOnDrop(runtime.clone());
+    let data = runtime.join("data");
+    let package = data.join("remuda/mods/timer_mod");
+    let entry = package.join("packages/timer_mod/init.lua");
+    std::fs::create_dir_all(entry.parent().unwrap()).expect("create installed mod tree");
+    std::fs::write(
+        package.join("extension.toml"),
+        "name = \"timer_mod\"\nentry = \"packages/timer_mod/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .expect("write lifecycle manifest");
+    std::fs::write(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function()
+            remuda.every(0.05, function()
+              remuda._timer_test.fires = remuda._timer_test.fires + 1
+            end)
+          end,
+        }"#,
+    )
+    .expect("write lifecycle mod");
+
+    let mut command = spawn::base_command(&runtime);
+    command.env("XDG_DATA_HOME", &data);
+    let _daemon = spawn::spawn_and_wait(command, &runtime);
+    let path = daemon::socket_path_in(&runtime, "s");
+    eval(&path, "remuda._timer_test = { fires = 0 }; return 'ready'");
+    eval(&path, "remuda.exec('timer_mod'); return 'loaded'");
+    let before_deadline = Instant::now() + Duration::from_secs(3);
+    let before_reload = loop {
+        let count = read_count(&path, "return remuda._timer_test.fires");
+        if count >= 1 {
+            break count;
+        }
+        assert!(
+            Instant::now() < before_deadline,
+            "owner interval did not fire before reload"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    assert_eq!(
+        eval(
+            &path,
+            "local ok = pcall(function() remuda._timer_cancel_owner('timer_mod') end); return tostring(ok)",
+        ),
+        "false",
+        "user Lua must not be able to invoke owner-wide timer cancellation"
+    );
+    let attack_deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let fires = read_count(&path, "return remuda._timer_test.fires");
+        if fires > before_reload {
+            break;
+        }
+        assert!(
+            Instant::now() < attack_deadline,
+            "the other owner's interval stopped after the cancellation attempt"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    std::fs::write(
+        &entry,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function() end,
+        }"#,
+    )
+    .expect("write replacement lifecycle mod without timer");
+    eval(&path, "remuda.reload('timer_mod'); return 'reloaded'");
+    let after_reload = read_count(&path, "return remuda._timer_test.fires");
+    std::thread::sleep(Duration::from_millis(300));
+    let settled = read_count(&path, "return remuda._timer_test.fires");
+    assert!(
+        settled == after_reload && after_reload >= before_reload,
+        "reload should cancel the old interval without losing prior fires: before={before_reload}, immediately after={after_reload}, settled={settled}"
+    );
+}
+
+#[test]
+fn lua_timers_have_bounded_inputs_and_live_timer_count() {
+    let path = scratch("lua-timer-caps");
+    let _daemon = daemon_at(&path);
+    let result = eval(
+        &path,
+        r#"
+            local callback = function() end
+            local ok, err = pcall(remuda.after, 0.009, callback)
+            local message = tostring(err)
+            assert(not ok and message:find("0.01 and 86400", 1, true), message)
+            ok, err = pcall(remuda.every, 0.009, callback)
+            message = tostring(err)
+            assert(not ok and message:find("0.01 and 86400", 1, true), message)
+            ok, err = pcall(remuda.after, 86401, callback)
+            message = tostring(err)
+            assert(not ok and message:find("0.01 and 86400", 1, true), message)
+            ok, err = pcall(remuda.every, 86401, callback)
+            message = tostring(err)
+            assert(not ok and message:find("0.01 and 86400", 1, true), message)
+            local handles = {}
+            for index = 1, 1024 do
+              handles[index] = remuda.after(86400, callback)
+            end
+            ok, err = pcall(remuda.after, 86400, callback)
+            message = tostring(err)
+            assert(not ok and message:find("1024 live timers", 1, true), message)
+            for _, handle in ipairs(handles) do handle:cancel() end
+            return "caps-ok"
+        "#,
+    );
+    assert_eq!(result, "caps-ok");
+
+    eval(
+        &path,
+        "remuda._clock_before = remuda.clock(); remuda.after(0.02, function() remuda._clock_after = remuda.clock() end); return 'clock-set'",
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    let elapsed = eval(&path, "return remuda._clock_after - remuda._clock_before")
+        .parse::<u64>()
+        .expect("monotonic millisecond delta");
+    assert!(
+        elapsed >= 10,
+        "clock did not advance in milliseconds: {elapsed}"
+    );
+}
+
+#[test]
+fn interval_skips_missed_ticks_and_callback_errors_do_not_stop_timers() {
+    let path = scratch("lua-timer-interval");
+    let _daemon = daemon_at(&path);
+    eval(
+        &path,
+        r#"
+            remuda._timer_marks = {}
+            local handle
+            handle = remuda.every(0.02, function()
+              local marks = remuda._timer_marks
+              marks[#marks + 1] = remuda.clock()
+              if #marks == 1 then
+                local until_time = os.clock() + 0.06
+                while os.clock() < until_time do end
+              end
+              if #marks == 5 then handle:cancel() end
+            end)
+            remuda.after(0.01, function() error("expected timer callback failure") end)
+            remuda.after(0.02, function() remuda._timer_after_error = true end)
+            return "scheduled"
+        "#,
+    );
+    let minimum_marks_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let marks = read_count(&path, "return #remuda._timer_marks");
+        if marks >= 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < minimum_marks_deadline,
+            "interval did not continue before the deadline: {marks} fires"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let result = eval(
+        &path,
+        r#"
+            local marks = remuda._timer_marks
+            assert(remuda._timer_after_error, "a callback error stopped later timers")
+            assert(#marks >= 3,
+              "interval did not continue: " .. #marks .. " [" .. table.concat(marks, ",") .. "]")
+            for index = 2, #marks do
+              assert(marks[index] - marks[index - 1] >= 15,
+                "interval burst-fired: " .. table.concat(marks, ","))
+            end
+            return #marks
+        "#,
+    );
+    assert!(
+        result.parse::<usize>().unwrap() <= 5,
+        "missed interval ticks were not skipped"
+    );
+}
+
 fn eval(path: &Path, code: &str) -> String {
     match client::request(
         path,
