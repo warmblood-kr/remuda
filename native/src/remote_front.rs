@@ -277,6 +277,8 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::ClusterListener(_) => Err(refusal("ClusterListener")),
         Request::Shutdown { .. } => Err(refusal("Shutdown")),
         Request::Eval { .. } => Err(refusal("Eval")),
+        Request::SecretAnswer { .. } => Err(refusal("SecretAnswer")),
+        Request::LineAnswer { .. } => Err(refusal("LineAnswer")),
     }
 }
 

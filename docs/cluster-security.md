@@ -130,6 +130,8 @@ which can read the local cluster keys and change the setting.
 Remote keys mode adds no wire operation: encoded key events and bracketed
 paste bytes use the existing authenticated `Input` request, allowlist,
 `allow_remote_control` check, per-peer aggregate limiter, and per-session
-budget. Embedded `ESC [ 200 ~` and `ESC [ 201 ~` paste markers are stripped
-before the UI wraps the payload with one bracketed-paste marker pair. The
-shared paste filter drops control characters except TAB, LF, and CR.
+budget. Embedded `ESC [ 200 ~` and `ESC [ 201 ~` paste markers are stripped.
+The UI adds one bracketed-paste marker pair only when the remote app has enabled
+mode 2004; otherwise the filtered text, including LF and CR, is sent raw as it
+would be in a local terminal, where each newline may submit a line. The shared
+paste filter drops control characters except TAB, LF, and CR.

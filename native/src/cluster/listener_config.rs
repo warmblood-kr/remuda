@@ -109,12 +109,58 @@ pub fn write(config: &ListenerConfig) -> io::Result<()> {
     write_at(&dir, config)
 }
 
+/// Remove the persisted listener configuration after verifying the local identity.
+pub fn remove() -> io::Result<()> {
+    let dir = super::storage::cluster_state_dir()?.join("cluster");
+    super::identity::load_identity_at(&dir)?;
+    remove_at(&dir)
+}
+
 /// Persist the listener configuration in one cluster state directory.
 pub fn write_at(dir: &Path, config: &ListenerConfig) -> io::Result<()> {
-    use std::fs;
-
     super::storage::verify_directory(dir)?;
     let _guard = super::storage::StateLock::acquire(dir)?;
+    write_locked(dir, config)
+}
+
+/// Restore a listener snapshot only while the current config matches `expected`.
+pub fn restore_if_current(
+    expected: Option<&ListenerConfig>,
+    snapshot: Option<ListenerConfig>,
+) -> io::Result<bool> {
+    let dir = super::storage::cluster_state_dir()?.join("cluster");
+    super::identity::load_identity_at(&dir)?;
+    restore_if_current_at(&dir, expected, snapshot)
+}
+
+/// Restore a listener snapshot under the state lock if its expected config remains current.
+pub fn restore_if_current_at(
+    dir: &Path,
+    expected: Option<&ListenerConfig>,
+    snapshot: Option<ListenerConfig>,
+) -> io::Result<bool> {
+    super::storage::verify_directory(dir)?;
+    let _guard = super::storage::StateLock::acquire(dir)?;
+    if read_at(dir)?.as_ref() != expected {
+        return Ok(false);
+    }
+    match snapshot {
+        Some(config) => write_locked(dir, &config)?,
+        None => remove_locked(dir)?,
+    }
+    Ok(true)
+}
+
+/// Remove the persisted listener configuration in one cluster state directory.
+pub fn remove_at(dir: &Path) -> io::Result<()> {
+    super::storage::verify_directory(dir)?;
+    let _guard = super::storage::StateLock::acquire(dir)?;
+    remove_locked(dir)
+}
+
+fn write_locked(dir: &Path, config: &ListenerConfig) -> io::Result<()> {
+    use std::fs;
+
     let path = dir.join(LISTENER_FILE);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -139,6 +185,43 @@ pub fn write_at(dir: &Path, config: &ListenerConfig) -> io::Result<()> {
     .map_err(io::Error::other)?;
     bytes.push(b'\n');
     super::storage::atomic_write(&path, &bytes)
+}
+
+fn remove_locked(dir: &Path) -> io::Result<()> {
+    use std::fs;
+
+    let path = dir.join(LISTENER_FILE);
+    let file = match open_listener_file(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cluster listener config is not a regular file; refusing",
+        ));
+    }
+    super::storage::check_private_file(&file, "cluster listener config", &path)?;
+    fs::remove_file(path)
+}
+
+fn open_listener_file(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(not(windows))]
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        options.open(path)
+    }
+    #[cfg(windows)]
+    {
+        super::windows_security::open_for_read(path)
+    }
 }
 
 #[cfg(all(test, unix))]

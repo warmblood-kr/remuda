@@ -41,23 +41,26 @@ impl Node {
             fs::create_dir_all(dir).unwrap();
         }
         let name = format!("{label}-{serial}");
-        let init = command(&name, &runtime, &root, &state, &home)
-            .args(["cluster", "init"])
-            .output()
-            .unwrap();
-        assert!(init.status.success(), "cluster init failed: {init:?}");
-        let key = fs::read(state.join("remuda/cluster/identity.key")).unwrap();
         let daemon = spawn_daemon(&name, &runtime, &root, &state);
         let mut node = Self {
             root,
             runtime,
             state,
             name,
-            public: key[32..].to_vec(),
-            private: key[..32].to_vec(),
+            public: Vec::new(),
+            private: Vec::new(),
             daemon,
         };
         node.wait_ready();
+        let init = node
+            .command()
+            .args(["cluster", "init", "--no-listen"])
+            .output()
+            .unwrap();
+        assert!(init.status.success(), "cluster init failed: {init:?}");
+        let key = fs::read(node.state.join("remuda/cluster/identity.key")).unwrap();
+        node.public = key[32..].to_vec();
+        node.private = key[..32].to_vec();
         node
     }
 
@@ -146,7 +149,6 @@ fn command(name: &str, runtime: &Path, root: &Path, state: &Path, home: &Path) -
 }
 
 struct Listener {
-    child: Option<Child>,
     address: SocketAddr,
 }
 
@@ -155,55 +157,46 @@ impl Listener {
         let reservation = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = reservation.local_addr().unwrap();
         drop(reservation);
-        let mut listener = Self {
-            child: None,
-            address,
+        let listener = Self { address };
+        use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
+        listener_config::write_at(
+            &node.state.join("remuda/cluster"),
+            &ListenerConfig {
+                enabled: true,
+                bind: ListenerBind::Explicit(listener.address),
+                allow_public: false,
+            },
+        )
+        .unwrap();
+        let response = remuda_native::client::request(
+            &remuda_native::daemon::socket_path_in(&node.runtime, &node.name),
+            &Request::ClusterListener(remuda_core::protocol::ListenerOp::Reload),
+        )
+        .unwrap();
+        let remuda_core::protocol::Response::ClusterListenerStatus(status) = response else {
+            panic!("unexpected listener response: {response:?}");
         };
-        listener.restart(node);
+        assert!(
+            matches!(status, remuda_core::protocol::ListenerStatus::On { addr, .. } if addr == listener.address),
+            "listener did not bind its configured address: {status:?}"
+        );
+        listener.wait_ready();
         listener
     }
 
-    fn restart(&mut self, node: &Node) {
-        assert!(self.child.is_none());
-        let address = self.address.to_string();
-        let child = node
-            .command()
-            .args(["cluster", "listen", "--bind", &address])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        self.child = Some(child);
+    fn wait_ready(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             match TcpStream::connect(self.address) {
-                Ok(stream) => {
-                    drop(stream);
-                    return;
-                }
-                Err(_) => {
-                    if let Some(status) = self.child.as_mut().unwrap().try_wait().unwrap() {
-                        panic!("listener exited before ready: {status}");
-                    }
-                    assert!(Instant::now() < deadline, "listener did not bind");
-                    std::thread::sleep(Duration::from_millis(20));
-                }
+                Ok(stream) => return drop(stream),
+                Err(_) => assert!(Instant::now() < deadline, "listener did not bind"),
             }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
-    fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-impl Drop for Listener {
-    fn drop(&mut self) {
-        self.stop();
+    fn restart(&self, _node: &Node) {
+        self.wait_ready();
     }
 }
 
@@ -464,7 +457,7 @@ fn real_ctrl_backslash_byte_returns_from_remote_composer_to_tree() {
     tui.writer.write_all(b"\x1c").unwrap();
     tui.wait_for_from(
         output_start,
-        "Remote session is read-only · q detach",
+        "Enter type · k keys · x close · q detach",
         Duration::from_secs(3),
     );
 }
@@ -606,7 +599,7 @@ fn real_remote_keys_mode_holds_multiline_paste_until_its_end() {
     tui.writer.write_all(b"\x1c").unwrap();
     tui.wait_for_from(
         keys_start,
-        "Remote session is read-only · q detach",
+        "Enter type · k keys · x close · q detach",
         Duration::from_secs(3),
     );
     tui.wait_for_from(output_start, "sent ·", Duration::from_secs(10));
@@ -692,12 +685,11 @@ fn driver_hosted_remote_tui_capture_shows_live_output_with_trailing_blanks() {
     let client_node = Node::start("driver-remote-client");
     let driver_node = Node::start("driver-remote-driver");
     let server_node = Node::start("driver-remote-server");
-    let client_listener = Listener::start(&client_node);
-    let server_listener = Listener::start(&server_node);
-    let client_address = client_listener.address.to_string();
+    let _client_listener = Listener::start(&client_node);
+    let _server_listener = Listener::start(&server_node);
     let invitation = client_node
         .command()
-        .args(["cluster", "invite", "--bind", &client_address])
+        .args(["cluster", "invite"])
         .output()
         .unwrap();
     assert!(
@@ -719,17 +711,9 @@ fn driver_hosted_remote_tui_capture_shows_live_output_with_trailing_blanks() {
         .expect("separate fingerprint and join line");
     assert!(!fingerprint.contains('\''));
     assert!(!join_line.contains('\''));
-    let server_address = server_listener.address.to_string();
     let join = server_node
         .command()
-        .args([
-            "cluster",
-            "join",
-            fingerprint,
-            join_line,
-            "--bind",
-            &server_address,
-        ])
+        .args(["cluster", "join", fingerprint, join_line])
         .output()
         .unwrap();
     assert!(join.status.success(), "cluster join failed: {join:?}");
@@ -826,7 +810,7 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
     let client_node = Node::start("remote-client");
     let mut server_node = Node::start("remote-server");
     admit_pair(&client_node, &server_node);
-    let mut listener = Listener::start(&server_node);
+    let listener = Listener::start(&server_node);
     let marker_before_down = server_node.root.join("emit-before-down");
     let shell = format!(
         "printf REMOTE_START; while [ ! -e '{}' ]; do sleep 0.02; done; while true; do printf '{BEFORE_DOWN}\\n'; sleep 0.1; done",
@@ -906,7 +890,6 @@ fn selected_remote_sync_keeps_last_screen_offline_and_resumes_after_listener_res
     assert!(proof_session(source.as_ref())
         .is_some_and(|session| session_text(&session).contains(BEFORE_DOWN)));
 
-    listener.stop();
     server_node.restart_daemon();
     listener.restart(&server_node);
     server_node.start_session("printf REMOTE_AFTER_RECONNECT; sleep 30");

@@ -250,6 +250,14 @@ fn call_response(id: Value, response: Response) -> String {
         | Response::WriteTimeout
         | Response::RemoteControlDisabled) => input_error_reply(id, input_error_message(&response)),
         Response::SyncAtCapacity => ok_reply(id, tool_error("Sync is at capacity; retry shortly")),
+        Response::PromptSecret { .. } => ok_reply(
+            id,
+            tool_error("secret prompts are not supported by MCP tool calls"),
+        ),
+        Response::PromptLine { .. } => ok_reply(
+            id,
+            tool_error("line prompts are not supported by MCP tool calls"),
+        ),
     }
 }
 

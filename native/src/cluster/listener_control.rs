@@ -41,8 +41,28 @@ pub fn stop(daemon_path: &Path) -> io::Result<ListenerStatus> {
         allow_public: false,
     });
     config.enabled = false;
+    config.allow_public = false;
     listener_config::write(&config)?;
     request(daemon_path, ListenerOp::Reload)
+}
+
+/// Result of trying to restore a listener config after a join.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    Restored(ListenerStatus),
+    SkippedChanged,
+}
+
+/// Restore a saved listener config only if the join's config remains current.
+pub fn restore(
+    daemon_path: &Path,
+    expected: Option<&ListenerConfig>,
+    snapshot: Option<ListenerConfig>,
+) -> io::Result<RestoreOutcome> {
+    if !listener_config::restore_if_current(expected, snapshot)? {
+        return Ok(RestoreOutcome::SkippedChanged);
+    }
+    request(daemon_path, ListenerOp::Reload).map(RestoreOutcome::Restored)
 }
 
 fn request(daemon_path: &Path, operation: ListenerOp) -> io::Result<ListenerStatus> {

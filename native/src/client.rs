@@ -8,6 +8,7 @@ use remuda_core::protocol::{Request, Response};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use zeroize::Zeroizing;
 
 /// Detach key: Ctrl-\ (0x1C). Chosen because almost nothing binds it, unlike
 /// Ctrl-C/D/Z, which the attached program needs. Consumed, never forwarded.
@@ -469,6 +470,287 @@ pub fn request(path: &Path, request: &Request) -> std::io::Result<Response> {
         _ => Duration::from_secs(10),
     };
     read_response_with_timeout(path, stream, timeout)
+}
+
+/// Send an Eval request and service any concealed secret prompts on its
+/// connection before returning the final response.
+pub fn request_with_secret_prompts(path: &Path, request: &Request) -> std::io::Result<Response> {
+    let stream = ipc::connect(path)?;
+    send(&stream, request)?;
+    let timeout = Duration::from_secs(305);
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(request_timeout(path, timeout));
+        }
+        let response = read_response_with_timeout(path, stream.try_clone()?, remaining)?;
+        let response = match response {
+            Response::PromptLine {
+                id,
+                label,
+                default,
+                timeout_ms,
+            } => {
+                match collect_line_from_terminal(&label, default.as_deref(), timeout_ms)? {
+                    LinePromptCollection::Answer(line, refusal) => {
+                        send_line_answer(&stream, id, line.as_deref(), refusal)?;
+                    }
+                    LinePromptCollection::Deadline => {}
+                }
+                continue;
+            }
+            response => response,
+        };
+        let Response::PromptSecret {
+            id,
+            label,
+            timeout_ms,
+        } = response
+        else {
+            return Ok(response);
+        };
+        match collect_secret_from_terminal(&label, timeout_ms)? {
+            SecretPromptCollection::Answer(secret, refusal) => {
+                send_secret_answer(&stream, id, secret.as_ref(), refusal)?;
+            }
+            SecretPromptCollection::Deadline => {}
+        }
+    }
+}
+
+enum SecretPromptCollection {
+    Answer(
+        Option<remuda_core::protocol::SecretBytes>,
+        Option<remuda_core::protocol::SecretAnswerRefusal>,
+    ),
+    Deadline,
+}
+
+enum LinePromptCollection {
+    Answer(
+        Option<String>,
+        Option<remuda_core::protocol::SecretAnswerRefusal>,
+    ),
+    Deadline,
+}
+
+fn collect_secret_from_terminal(
+    label: &str,
+    timeout_ms: u64,
+) -> std::io::Result<SecretPromptCollection> {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Ok(SecretPromptCollection::Answer(
+            None,
+            Some(remuda_core::protocol::SecretAnswerRefusal::NotATerminal),
+        ));
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    #[cfg(unix)]
+    let signal_guard = SecretPromptSignalGuard::install()?;
+    let mut expired = false;
+    let events = std::iter::from_fn(|| loop {
+        #[cfg(unix)]
+        if SECRET_PROMPT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            expired = true;
+            return None;
+        }
+        let poll_for = remaining.min(Duration::from_millis(100));
+        match crossterm::event::poll(poll_for) {
+            Ok(true) => match crossterm::event::read() {
+                Ok(event) => return Some(event),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            },
+            Ok(false) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    });
+    let answer = prompt_secret_with_events(std::io::stderr(), label, events)?;
+    #[cfg(unix)]
+    {
+        drop(signal_guard);
+        let received_signal = SECRET_PROMPT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+        if received_signal != 0 {
+            unsafe { libc::raise(received_signal) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "secret prompt interrupted by signal",
+            ));
+        }
+    }
+    if expired {
+        Ok(SecretPromptCollection::Deadline)
+    } else {
+        let (secret, refusal) = secret_answer_from_line(answer);
+        Ok(SecretPromptCollection::Answer(secret, refusal))
+    }
+}
+
+fn collect_line_from_terminal(
+    label: &str,
+    default: Option<&str>,
+    timeout_ms: u64,
+) -> std::io::Result<LinePromptCollection> {
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Ok(LinePromptCollection::Answer(
+            None,
+            Some(remuda_core::protocol::SecretAnswerRefusal::NotATerminal),
+        ));
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    #[cfg(unix)]
+    let signal_guard = SecretPromptSignalGuard::install()?;
+    let mut expired = false;
+    let events = std::iter::from_fn(|| loop {
+        #[cfg(unix)]
+        if SECRET_PROMPT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            expired = true;
+            return None;
+        }
+        let poll_for = remaining.min(Duration::from_millis(100));
+        match crossterm::event::poll(poll_for) {
+            Ok(true) => match crossterm::event::read() {
+                Ok(event) => return Some(event),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return None,
+            },
+            Ok(false) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    });
+    let answer = prompt_line_with_events(std::io::stderr(), label, default, events)?;
+    #[cfg(unix)]
+    {
+        drop(signal_guard);
+        let received_signal = SECRET_PROMPT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst);
+        if received_signal != 0 {
+            unsafe { libc::raise(received_signal) };
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "line prompt interrupted by signal",
+            ));
+        }
+    }
+    if expired {
+        Ok(LinePromptCollection::Deadline)
+    } else {
+        let answer = match answer {
+            Ok(Some(line)) => (Some(line), None),
+            Ok(None) => (None, None),
+            Err(PromptLineError::TooLong) => (
+                None,
+                Some(remuda_core::protocol::SecretAnswerRefusal::TooLong),
+            ),
+        };
+        Ok(LinePromptCollection::Answer(answer.0, answer.1))
+    }
+}
+
+#[cfg(unix)]
+static SECRET_PROMPT_SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+#[cfg(unix)]
+extern "C" fn secret_prompt_signal_handler(signal: libc::c_int) {
+    SECRET_PROMPT_SIGNAL.store(signal, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(unix)]
+struct SecretPromptSignalGuard {
+    previous: [(libc::c_int, libc::sighandler_t); 2],
+}
+
+#[cfg(unix)]
+impl SecretPromptSignalGuard {
+    fn install() -> std::io::Result<Self> {
+        use std::io;
+        SECRET_PROMPT_SIGNAL.store(0, std::sync::atomic::Ordering::SeqCst);
+        let signals = [libc::SIGTERM, libc::SIGHUP];
+        let mut previous = [(0, libc::SIG_ERR as libc::sighandler_t); 2];
+        for (index, signal) in signals.into_iter().enumerate() {
+            let old = unsafe {
+                libc::signal(
+                    signal,
+                    secret_prompt_signal_handler as *const () as libc::sighandler_t,
+                )
+            };
+            if old == libc::SIG_ERR as libc::sighandler_t {
+                for (installed_signal, old_handler) in previous[..index].iter().copied() {
+                    unsafe { libc::signal(installed_signal, old_handler) };
+                }
+                return Err(io::Error::last_os_error());
+            }
+            previous[index] = (signal, old);
+        }
+        Ok(Self { previous })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SecretPromptSignalGuard {
+    fn drop(&mut self) {
+        for (signal, handler) in self.previous {
+            unsafe { libc::signal(signal, handler) };
+        }
+    }
+}
+
+fn send_secret_answer(
+    mut stream: &Stream,
+    id: u32,
+    secret: Option<&remuda_core::protocol::SecretBytes>,
+    refusal: Option<remuda_core::protocol::SecretAnswerRefusal>,
+) -> std::io::Result<()> {
+    let request = Request::SecretAnswer {
+        id,
+        secret: secret.cloned(),
+        refusal,
+    };
+    let mut frame = Zeroizing::new(Vec::with_capacity(
+        remuda_core::protocol::SECRET_ANSWER_MAX_FRAME_BYTES + 1,
+    ));
+    serde_json::to_writer(&mut *frame, &request)?;
+    frame.push(b'\n');
+    stream.write_all(&frame)?;
+    stream.flush()
+}
+
+fn send_line_answer(
+    mut stream: &Stream,
+    id: u32,
+    line: Option<&str>,
+    refusal: Option<remuda_core::protocol::SecretAnswerRefusal>,
+) -> std::io::Result<()> {
+    let request = Request::LineAnswer {
+        id,
+        line: line.map(str::to_owned),
+        refusal,
+    };
+    let mut frame = Vec::with_capacity(remuda_core::protocol::LINE_ANSWER_MAX_FRAME_BYTES + 1);
+    serde_json::to_writer(&mut frame, &request)?;
+    frame.push(b'\n');
+    if frame.len() > remuda_core::protocol::LINE_ANSWER_MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "line answer frame is oversized",
+        ));
+    }
+    stream.write_all(&frame)?;
+    stream.flush()
 }
 
 #[cfg(unix)]
@@ -1760,14 +2042,363 @@ impl Drop for RawMode {
     }
 }
 
+const SECRET_LINE_MAX_BYTES: usize = 4 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromptLineEcho {
+    Text(char),
+    Erase,
+    Submit,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum PromptLineError {
+    TooLong,
+}
+
+fn edit_prompt_line(
+    events: impl IntoIterator<Item = crossterm::event::Event>,
+    default: Option<&str>,
+    max_bytes: usize,
+    mut echo: impl FnMut(PromptLineEcho),
+) -> Result<Option<String>, PromptLineError> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    let mut line = String::new();
+    let append = |line: &mut String, character: char, echo: &mut dyn FnMut(PromptLineEcho)| {
+        if character.is_control()
+            || remuda_core::protocol::is_secret_prompt_format_or_separator(character)
+        {
+            return Ok(());
+        }
+        let new_len = line
+            .len()
+            .checked_add(character.len_utf8())
+            .ok_or(PromptLineError::TooLong)?;
+        if new_len > max_bytes {
+            return Err(PromptLineError::TooLong);
+        }
+        line.push(character);
+        echo(PromptLineEcho::Text(character));
+        Ok(())
+    };
+
+    for event in events {
+        match event {
+            Event::Paste(text) => {
+                for character in text.chars() {
+                    append(&mut line, character, &mut echo)?;
+                }
+            }
+            Event::Key(key) => {
+                match key.kind {
+                    KeyEventKind::Release => continue,
+                    KeyEventKind::Press | KeyEventKind::Repeat => {}
+                }
+                match key.code {
+                    KeyCode::Enter => {
+                        echo(PromptLineEcho::Submit);
+                        if line.is_empty() {
+                            return Ok(Some(default.unwrap_or_default().to_owned()));
+                        }
+                        return Ok(Some(line));
+                    }
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Backspace => {
+                        if line.pop().is_some() {
+                            echo(PromptLineEcho::Erase);
+                        }
+                    }
+                    KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None);
+                    }
+                    KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None);
+                    }
+                    KeyCode::Char(character)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        append(&mut line, character, &mut echo)?;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SecretLineError {
+    TooLong,
+}
+
+fn secret_answer_from_line(
+    answer: Result<Option<Zeroizing<Vec<u8>>>, SecretLineError>,
+) -> (
+    Option<remuda_core::protocol::SecretBytes>,
+    Option<remuda_core::protocol::SecretAnswerRefusal>,
+) {
+    use remuda_core::protocol::SecretAnswerRefusal;
+
+    match answer {
+        Ok(Some(secret)) => (
+            Some(remuda_core::protocol::SecretBytes::new(secret.to_vec())),
+            None,
+        ),
+        Ok(None) => (None, None),
+        Err(SecretLineError::TooLong) => (None, Some(SecretAnswerRefusal::TooLong)),
+    }
+}
+
+/// Edit a secret line from terminal events without owning or reading a terminal.
+/// Release events are ignored; repeat events represent repeated key input.
+fn edit_secret_line(
+    events: impl IntoIterator<Item = crossterm::event::Event>,
+) -> Result<Option<Zeroizing<Vec<u8>>>, SecretLineError> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    let mut line = Zeroizing::new(Vec::with_capacity(SECRET_LINE_MAX_BYTES));
+    let line_capacity = line.capacity();
+    let append = |line: &mut Zeroizing<Vec<u8>>, bytes: &[u8]| {
+        let Some(new_len) = line.len().checked_add(bytes.len()) else {
+            return Err(SecretLineError::TooLong);
+        };
+        if new_len > SECRET_LINE_MAX_BYTES {
+            return Err(SecretLineError::TooLong);
+        }
+        line.extend_from_slice(bytes);
+        debug_assert_eq!(line.capacity(), line_capacity);
+        Ok(())
+    };
+
+    for event in events {
+        match event {
+            Event::Paste(text) => {
+                let mut paste = Zeroizing::new(text.into_bytes());
+                if paste.ends_with(b"\r\n") {
+                    let content_len = paste.len() - 2;
+                    paste.truncate(content_len);
+                } else if paste
+                    .last()
+                    .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+                {
+                    paste.pop();
+                }
+                append(&mut line, &paste)?;
+            }
+            Event::Key(key) => {
+                match key.kind {
+                    KeyEventKind::Release => continue,
+                    KeyEventKind::Press | KeyEventKind::Repeat => {}
+                }
+                match key.code {
+                    KeyCode::Enter => return Ok(Some(line)),
+                    KeyCode::Esc => return Ok(None),
+                    KeyCode::Backspace => {
+                        if let Some((last_character, _)) = std::str::from_utf8(&line)
+                            .expect("secret editor buffer is valid UTF-8")
+                            .char_indices()
+                            .next_back()
+                        {
+                            line.truncate(last_character);
+                        }
+                    }
+                    KeyCode::Char('c' | 'C') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None);
+                    }
+                    KeyCode::Char('d' | 'D') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        return Ok(None);
+                    }
+                    KeyCode::Char(character)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        let mut encoded = [0; 4];
+                        append(&mut line, character.encode_utf8(&mut encoded).as_bytes())?;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+trait SecretPromptTerminal {
+    fn enable_raw_mode(&mut self) -> std::io::Result<()>;
+    fn enable_bracketed_paste(&mut self) -> std::io::Result<()>;
+    fn write_output(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+    fn flush_output(&mut self) -> std::io::Result<()>;
+    fn disable_bracketed_paste(&mut self);
+    fn disable_raw_mode(&mut self);
+}
+
+impl SecretPromptTerminal for std::io::Stderr {
+    fn enable_raw_mode(&mut self) -> std::io::Result<()> {
+        crossterm::terminal::enable_raw_mode()
+    }
+
+    fn enable_bracketed_paste(&mut self) -> std::io::Result<()> {
+        crossterm::execute!(self, crossterm::event::EnableBracketedPaste)
+    }
+
+    fn write_output(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_all(bytes)
+    }
+
+    fn flush_output(&mut self) -> std::io::Result<()> {
+        self.flush()
+    }
+
+    fn disable_bracketed_paste(&mut self) {
+        let _ = crossterm::execute!(self, crossterm::event::DisableBracketedPaste);
+    }
+
+    fn disable_raw_mode(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+struct SecretPromptMode<T: SecretPromptTerminal> {
+    terminal: T,
+}
+
+impl<T: SecretPromptTerminal> SecretPromptMode<T> {
+    fn enable(mut terminal: T) -> std::io::Result<Self> {
+        terminal.enable_raw_mode()?;
+        let mut mode = Self { terminal };
+        mode.terminal.enable_bracketed_paste()?;
+        Ok(mode)
+    }
+
+    fn prompt(&mut self, label: &str) -> std::io::Result<()> {
+        let label: String = label
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        self.terminal.write_output(label.as_bytes())?;
+        self.terminal.write_output(b": ")?;
+        self.terminal.flush_output()
+    }
+
+    fn finish_line(&mut self) -> std::io::Result<()> {
+        self.terminal.write_output(b"\r\x1b[2K\n")?;
+        self.terminal.flush_output()
+    }
+}
+
+impl<T: SecretPromptTerminal> Drop for SecretPromptMode<T> {
+    fn drop(&mut self) {
+        self.terminal.disable_bracketed_paste();
+        self.terminal.disable_raw_mode();
+    }
+}
+
+fn prompt_secret_with_events<T, I>(
+    terminal: T,
+    label: &str,
+    events: I,
+) -> std::io::Result<Result<Option<Zeroizing<Vec<u8>>>, SecretLineError>>
+where
+    T: SecretPromptTerminal,
+    I: IntoIterator<Item = crossterm::event::Event>,
+{
+    let mut mode = SecretPromptMode::enable(terminal)?;
+    mode.prompt(label)?;
+    let answer = edit_secret_line(events);
+    mode.finish_line()?;
+    drop(mode);
+    Ok(answer)
+}
+
+fn prompt_line_with_events<T, I>(
+    terminal: T,
+    label: &str,
+    default: Option<&str>,
+    events: I,
+) -> std::io::Result<Result<Option<String>, PromptLineError>>
+where
+    T: SecretPromptTerminal,
+    I: IntoIterator<Item = crossterm::event::Event>,
+{
+    let mut mode = SecretPromptMode::enable(terminal)?;
+    let label: String = label
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    mode.terminal.write_output(label.as_bytes())?;
+    if let Some(default) = default {
+        let default: String = default
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        mode.terminal.write_output(b" [")?;
+        mode.terminal.write_output(default.as_bytes())?;
+        mode.terminal.write_output(b"]")?;
+    }
+    mode.terminal.write_output(b": ")?;
+    mode.terminal.flush_output()?;
+
+    let mut rendered = String::new();
+    let mut output_error = None;
+    let answer = edit_prompt_line(
+        events,
+        default,
+        remuda_core::protocol::LINE_ANSWER_MAX_BYTES,
+        |action| {
+            if output_error.is_some() {
+                return;
+            }
+            let result = match action {
+                PromptLineEcho::Text(character) => {
+                    rendered.push(character);
+                    let mut encoded = [0; 4];
+                    mode.terminal
+                        .write_output(character.encode_utf8(&mut encoded).as_bytes())
+                }
+                PromptLineEcho::Erase => {
+                    if let Some(character) = rendered.pop() {
+                        let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+                        if width > 0 {
+                            let erase = format!("\x1b[{width}D\x1b[{width}P");
+                            mode.terminal.write_output(erase.as_bytes())
+                        } else {
+                            Ok(())
+                        }
+                    } else {
+                        Ok(())
+                    }
+                }
+                PromptLineEcho::Submit => Ok(()),
+            };
+            if let Err(error) = result {
+                output_error = Some(error);
+            }
+        },
+    );
+    if let Some(error) = output_error {
+        return Err(error);
+    }
+    mode.terminal.write_output(b"\r\n")?;
+    mode.terminal.flush_output()?;
+    drop(mode);
+    Ok(answer)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
     use super::trace_input_read;
     use super::{
         detach_offset, interpret, report_attach_input_dropped, reset_input_modes, route_tokens,
-        truncate_terminal_text, write_input_trace, AttachInputQueue, AttachRoute,
-        ATTACH_INPUT_STALL, DETACH, RESET_INPUT_MODES,
+        truncate_terminal_text, write_input_trace, AttachInputQueue, AttachRoute, SecretPromptMode,
+        SecretPromptTerminal, ATTACH_INPUT_STALL, DETACH, RESET_INPUT_MODES,
     };
     #[cfg(unix)]
     use super::{read_response_with_timeout, request_with_timeout};
@@ -1775,17 +2406,68 @@ mod tests {
     use crate::ipc;
     #[cfg(unix)]
     use interprocess::local_socket::traits::Listener as _;
-    #[cfg(unix)]
-    use remuda_core::protocol::Request;
-    use remuda_core::protocol::Response;
+    use remuda_core::protocol::{
+        Request, Response, SecretBytes, SECRET_ANSWER_MAX_BYTES, SECRET_ANSWER_MAX_FRAME_BYTES,
+    };
     use std::path::Path;
     #[cfg(unix)]
     use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(unix)]
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     #[cfg(unix)]
     use std::time::Instant;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[derive(Clone, Default)]
+    struct RecordingSecretTerminal {
+        operations: Arc<Mutex<Vec<&'static str>>>,
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl RecordingSecretTerminal {
+        fn operations(&self) -> Vec<&'static str> {
+            self.operations.lock().unwrap().clone()
+        }
+
+        fn output(&self) -> Vec<u8> {
+            self.output.lock().unwrap().clone()
+        }
+
+        fn record(&self, operation: &'static str) {
+            self.operations.lock().unwrap().push(operation);
+        }
+    }
+
+    impl SecretPromptTerminal for RecordingSecretTerminal {
+        fn enable_raw_mode(&mut self) -> std::io::Result<()> {
+            self.record("raw:on");
+            Ok(())
+        }
+
+        fn enable_bracketed_paste(&mut self) -> std::io::Result<()> {
+            self.record("paste:on");
+            Ok(())
+        }
+
+        fn write_output(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+            self.output.lock().unwrap().extend_from_slice(bytes);
+            Ok(())
+        }
+
+        fn flush_output(&mut self) -> std::io::Result<()> {
+            self.record("flush");
+            Ok(())
+        }
+
+        fn disable_bracketed_paste(&mut self) {
+            self.record("paste:off");
+        }
+
+        fn disable_raw_mode(&mut self) {
+            self.record("raw:off");
+        }
+    }
 
     #[test]
     fn attach_input_drop_recovers_after_writer_progress() {
@@ -2311,5 +2993,509 @@ mod tests {
         let received: Vec<u8> = input_rx.try_iter().flatten().collect();
         assert_eq!(scrollback.offset.load(Ordering::SeqCst), 0);
         assert_eq!(received, paste);
+    }
+
+    fn secret_key(
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+    ) -> crossterm::event::Event {
+        crossterm::event::Event::Key(crossterm::event::KeyEvent::new(code, modifiers))
+    }
+
+    fn secret_key_with_kind(
+        code: crossterm::event::KeyCode,
+        modifiers: crossterm::event::KeyModifiers,
+        kind: crossterm::event::KeyEventKind,
+    ) -> crossterm::event::Event {
+        crossterm::event::Event::Key(crossterm::event::KeyEvent::new_with_kind(
+            code, modifiers, kind,
+        ))
+    }
+
+    fn secret_text_events(text: &str) -> Vec<crossterm::event::Event> {
+        text.chars()
+            .map(|character| {
+                secret_key(
+                    crossterm::event::KeyCode::Char(character),
+                    crossterm::event::KeyModifiers::NONE,
+                )
+            })
+            .collect()
+    }
+
+    fn edit_secret_line(
+        events: impl IntoIterator<Item = crossterm::event::Event>,
+    ) -> Result<Option<Vec<u8>>, super::SecretLineError> {
+        super::edit_secret_line(events).map(|answer| answer.map(|secret| secret.to_vec()))
+    }
+
+    #[test]
+    fn prompt_line_echoes_typed_characters_backspace_and_enter() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let events = [
+            secret_key(KeyCode::Char('a'), KeyModifiers::NONE),
+            secret_key(KeyCode::Char('é'), KeyModifiers::NONE),
+            secret_key(KeyCode::Backspace, KeyModifiers::NONE),
+            secret_key(KeyCode::Char('x'), KeyModifiers::NONE),
+            secret_key(KeyCode::Enter, KeyModifiers::NONE),
+            secret_key(KeyCode::Char('!'), KeyModifiers::NONE),
+        ];
+        let mut echo = Vec::new();
+
+        let answer = super::edit_prompt_line(events, None, 1024, |action| echo.push(action));
+
+        assert_eq!(answer, Ok(Some("ax".into())));
+        assert_eq!(
+            echo,
+            [
+                super::PromptLineEcho::Text('a'),
+                super::PromptLineEcho::Text('é'),
+                super::PromptLineEcho::Erase,
+                super::PromptLineEcho::Text('x'),
+                super::PromptLineEcho::Submit,
+            ]
+        );
+    }
+
+    #[test]
+    fn prompt_line_empty_enter_returns_default_or_empty_string() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let enter = secret_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            super::edit_prompt_line([enter.clone()], Some("https://example.test"), 1024, |_| {},),
+            Ok(Some("https://example.test".into()))
+        );
+        assert_eq!(
+            super::edit_prompt_line([enter], None, 1024, |_| {}),
+            Ok(Some(String::new()))
+        );
+    }
+
+    #[test]
+    fn prompt_line_rejects_more_than_one_kibibyte() {
+        let events = [crossterm::event::Event::Paste("x".repeat(1025))];
+
+        assert_eq!(
+            super::edit_prompt_line(events, None, 1024, |_| {}),
+            Err(super::PromptLineError::TooLong)
+        );
+    }
+
+    #[test]
+    fn prompt_line_ctrl_c_and_escape_refuse_the_answer() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        for cancel in [
+            secret_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            secret_key(KeyCode::Esc, KeyModifiers::NONE),
+        ] {
+            assert_eq!(
+                super::edit_prompt_line([cancel], None, 1024, |_| {}),
+                Ok(None)
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_line_echo_never_emits_pasted_control_characters() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let events = [
+            crossterm::event::Event::Paste("ok\u{1b}[31m".into()),
+            secret_key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let mut echo = Vec::new();
+
+        let answer = super::edit_prompt_line(events, None, 1024, |action| echo.push(action));
+
+        assert_eq!(answer, Ok(Some("ok[31m".into())));
+        assert!(echo.iter().all(|action| match action {
+            super::PromptLineEcho::Text(character) => !character.is_control(),
+            super::PromptLineEcho::Erase | super::PromptLineEcho::Submit => true,
+        }));
+        assert_eq!(
+            echo,
+            [
+                super::PromptLineEcho::Text('o'),
+                super::PromptLineEcho::Text('k'),
+                super::PromptLineEcho::Text('['),
+                super::PromptLineEcho::Text('3'),
+                super::PromptLineEcho::Text('1'),
+                super::PromptLineEcho::Text('m'),
+                super::PromptLineEcho::Submit,
+            ]
+        );
+    }
+
+    #[test]
+    fn prompt_line_echo_drops_format_characters() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let events = [
+            crossterm::event::Event::Paste("ok\u{202e}txt.exe".into()),
+            secret_key(KeyCode::Enter, KeyModifiers::NONE),
+        ];
+        let mut echo = Vec::new();
+
+        let answer = super::edit_prompt_line(events, None, 1024, |action| echo.push(action));
+
+        assert_eq!(answer, Ok(Some("oktxt.exe".into())));
+        assert_eq!(
+            echo,
+            [
+                super::PromptLineEcho::Text('o'),
+                super::PromptLineEcho::Text('k'),
+                super::PromptLineEcho::Text('t'),
+                super::PromptLineEcho::Text('x'),
+                super::PromptLineEcho::Text('t'),
+                super::PromptLineEcho::Text('.'),
+                super::PromptLineEcho::Text('e'),
+                super::PromptLineEcho::Text('x'),
+                super::PromptLineEcho::Text('e'),
+                super::PromptLineEcho::Submit,
+            ]
+        );
+    }
+
+    #[test]
+    fn secret_line_enter_submits_and_ignores_later_events() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut events = secret_text_events("secret");
+        events.push(secret_key(KeyCode::Enter, KeyModifiers::NONE));
+        events.extend(secret_text_events("ignored"));
+
+        assert_eq!(edit_secret_line(events), Ok(Some(b"secret".to_vec())));
+    }
+
+    #[test]
+    fn secret_line_backspace_edits_the_previous_character() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut events = secret_text_events("aé");
+        events.push(secret_key(KeyCode::Backspace, KeyModifiers::NONE));
+        events.extend(secret_text_events("b"));
+        events.push(secret_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(edit_secret_line(events), Ok(Some(b"ab".to_vec())));
+    }
+
+    #[test]
+    fn secret_line_ctrl_c_ctrl_d_and_escape_cancel() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let cancel_events = [
+            secret_key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            secret_key(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            secret_key(KeyCode::Esc, KeyModifiers::NONE),
+        ];
+        for cancel in cancel_events {
+            let mut events = secret_text_events("partial");
+            events.push(cancel);
+            assert_eq!(edit_secret_line(events), Ok(None));
+        }
+    }
+
+    #[test]
+    fn secret_line_rejects_more_than_four_kibibytes() {
+        let events = [crossterm::event::Event::Paste("x".repeat(4 * 1024 + 1))];
+
+        assert_eq!(
+            edit_secret_line(events),
+            Err(super::SecretLineError::TooLong)
+        );
+        assert_eq!(
+            super::secret_answer_from_line(Err(super::SecretLineError::TooLong)),
+            (
+                None,
+                Some(remuda_core::protocol::SecretAnswerRefusal::TooLong)
+            )
+        );
+        assert_eq!(
+            super::secret_answer_from_line(Ok(None)),
+            (None, None),
+            "Ctrl-C, Ctrl-D, and Esc remain ordinary refusals"
+        );
+    }
+
+    #[test]
+    fn secret_line_accepts_exactly_four_kibibytes() {
+        let mut events = vec![crossterm::event::Event::Paste("x".repeat(4 * 1024))];
+        events.push(secret_key(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        assert_eq!(edit_secret_line(events), Ok(Some(vec![b'x'; 4 * 1024])));
+    }
+
+    #[test]
+    fn secret_line_backspace_removes_a_whole_multibyte_character() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut events = secret_text_events("a🦀");
+        events.push(secret_key(KeyCode::Backspace, KeyModifiers::NONE));
+        events.extend(secret_text_events("b"));
+        events.push(secret_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(edit_secret_line(events), Ok(Some(b"ab".to_vec())));
+    }
+
+    #[test]
+    fn secret_line_ignores_release_and_accepts_repeat_key_events() {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+
+        let events = [
+            secret_key_with_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Press),
+            secret_key_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ),
+            secret_key_with_kind(KeyCode::Char('b'), KeyModifiers::NONE, KeyEventKind::Repeat),
+            secret_key_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Press),
+        ];
+
+        assert_eq!(edit_secret_line(events), Ok(Some(b"ab".to_vec())));
+    }
+
+    #[test]
+    fn secret_line_paste_inserts_text_without_a_trailing_newline() {
+        let events = [
+            crossterm::event::Event::Paste("pasted secret".into()),
+            secret_key(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ];
+
+        assert_eq!(
+            edit_secret_line(events),
+            Ok(Some(b"pasted secret".to_vec()))
+        );
+    }
+
+    #[test]
+    fn secret_line_paste_inserts_text_without_its_trailing_newline() {
+        let events = [
+            crossterm::event::Event::Paste("pasted secret\n".into()),
+            secret_key(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        ];
+
+        assert_eq!(
+            edit_secret_line(events),
+            Ok(Some(b"pasted secret".to_vec()))
+        );
+    }
+
+    #[test]
+    fn secret_line_preserves_multibyte_characters_as_utf8() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut events = secret_text_events("päss🔐");
+        events.push(secret_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            edit_secret_line(events),
+            Ok(Some("päss🔐".as_bytes().to_vec()))
+        );
+    }
+
+    #[test]
+    fn secret_prompt_mode_restores_terminal_after_normal_return() {
+        let terminal = RecordingSecretTerminal::default();
+        let result = (|| -> std::io::Result<()> {
+            let _mode = SecretPromptMode::enable(terminal.clone())?;
+            Ok(())
+        })();
+
+        assert!(result.is_ok());
+        assert_eq!(
+            terminal.operations(),
+            vec!["raw:on", "paste:on", "paste:off", "raw:off"]
+        );
+    }
+
+    #[test]
+    fn secret_prompt_mode_restores_terminal_after_early_error() {
+        let terminal = RecordingSecretTerminal::default();
+        let result = (|| -> std::io::Result<()> {
+            let _mode = SecretPromptMode::enable(terminal.clone())?;
+            Err(std::io::Error::other("test error"))
+        })();
+
+        assert!(result.is_err());
+        assert_eq!(
+            terminal.operations(),
+            vec!["raw:on", "paste:on", "paste:off", "raw:off"]
+        );
+    }
+
+    #[test]
+    fn secret_prompt_mode_restores_terminal_when_editor_returns_none() {
+        let terminal = RecordingSecretTerminal::default();
+        let answer: std::io::Result<_> = (|| {
+            let _mode = SecretPromptMode::enable(terminal.clone())?;
+            Ok(super::edit_secret_line([secret_key(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            )]))
+        })();
+
+        assert!(matches!(answer, Ok(Ok(None))));
+        assert_eq!(
+            terminal.operations(),
+            vec!["raw:on", "paste:on", "paste:off", "raw:off"]
+        );
+    }
+
+    #[test]
+    fn secret_prompt_mode_restores_terminal_during_unwinding() {
+        let terminal = RecordingSecretTerminal::default();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _mode = SecretPromptMode::enable(terminal.clone()).unwrap();
+            panic!("test panic");
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(
+            terminal.operations(),
+            vec!["raw:on", "paste:on", "paste:off", "raw:off"]
+        );
+    }
+
+    #[test]
+    fn secret_prompt_prints_sanitized_label_clears_line_and_returns_secret() {
+        use crossterm::event::{Event, KeyCode, KeyModifiers};
+        let terminal = RecordingSecretTerminal::default();
+        let key = secret_key(KeyCode::Enter, KeyModifiers::NONE);
+        let paste = Event::Paste("S3CRET".into());
+        let answer =
+            super::prompt_secret_with_events(terminal.clone(), "Pass\u{1b}\nword", [paste, key])
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert_eq!(answer.as_slice(), b"S3CRET");
+        assert_eq!(terminal.output(), b"Password: \r\x1b[2K\n");
+        assert_eq!(
+            terminal.operations(),
+            [
+                "raw:on",
+                "paste:on",
+                "flush",
+                "flush",
+                "paste:off",
+                "raw:off"
+            ]
+        );
+    }
+
+    #[test]
+    fn prompt_line_prints_default_and_echoes_visible_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::default();
+        let mut events = secret_text_events("ab");
+        events.push(secret_key(KeyCode::Backspace, KeyModifiers::NONE));
+        events.extend(secret_text_events("c"));
+        events.push(secret_key(KeyCode::Enter, KeyModifiers::NONE));
+
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            "Homeserver",
+            Some("https://hs.example"),
+            events,
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some("ac".into())));
+        assert_eq!(
+            terminal.output(),
+            b"Homeserver [https://hs.example]: ab\x1b[1D\x1b[1Pc\r\n"
+        );
+        assert_eq!(
+            terminal.operations(),
+            [
+                "raw:on",
+                "paste:on",
+                "flush",
+                "flush",
+                "paste:off",
+                "raw:off"
+            ]
+        );
+    }
+
+    #[test]
+    fn secret_answer_and_prompt_round_trip() {
+        let answer = Request::SecretAnswer {
+            id: 19,
+            secret: Some(SecretBytes::new(b"S3CRET-probe".to_vec())),
+            refusal: None,
+        };
+        let answer_wire = serde_json::to_vec(&answer).unwrap();
+        let decoded_answer: Request = serde_json::from_slice(&answer_wire).unwrap();
+        assert_eq!(decoded_answer, answer);
+
+        let prompt = Response::PromptSecret {
+            id: 19,
+            label: "Bot password".into(),
+            timeout_ms: 5_000,
+        };
+        let prompt_wire = serde_json::to_vec(&prompt).unwrap();
+        let decoded_prompt: Response = serde_json::from_slice(&prompt_wire).unwrap();
+        assert_eq!(decoded_prompt, prompt);
+    }
+
+    #[test]
+    fn secret_answer_at_the_byte_cap_fits_its_serialized_frame_limit() {
+        let answer = Request::SecretAnswer {
+            id: 7,
+            secret: Some(SecretBytes::new(vec![0xff; SECRET_ANSWER_MAX_BYTES])),
+            refusal: None,
+        };
+        let mut frame = serde_json::to_vec(&answer).unwrap();
+        frame.push(b'\n');
+
+        let parsed: serde_json::Value = serde_json::from_slice(&frame[..frame.len() - 1]).unwrap();
+        let encoded_secret = parsed["SecretAnswer"]["secret"]
+            .as_str()
+            .expect("secret answer uses a compact string encoding");
+        assert_eq!(encoded_secret.len(), 5_464);
+        assert_eq!(frame.len(), 5_502);
+        assert!(frame.len() <= SECRET_ANSWER_MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn secret_answer_rejects_oversized_payload_frames() {
+        let oversized_answer = Request::SecretAnswer {
+            id: 7,
+            secret: Some(SecretBytes::new(vec![0; SECRET_ANSWER_MAX_BYTES + 1])),
+            refusal: None,
+        };
+        assert!(serde_json::to_vec(&oversized_answer).is_err());
+
+        let encoded_oversized_secret = format!("{}=", "A".repeat(5_463));
+        let frame =
+            format!(r#"{{"SecretAnswer":{{"id":7,"secret":"{encoded_oversized_secret}"}}}}"#);
+        assert!(serde_json::from_str::<Request>(&frame).is_err());
+    }
+
+    #[test]
+    fn secret_answer_debug_redacts_secret_bytes() {
+        let answer = Request::SecretAnswer {
+            id: 7,
+            secret: Some(SecretBytes::new(b"S3CRET-probe".to_vec())),
+            refusal: None,
+        };
+
+        let debug = format!("{answer:?}");
+        assert!(!debug.contains("S3CRET-probe"));
+        assert!(debug.contains("REDACTED"));
     }
 }

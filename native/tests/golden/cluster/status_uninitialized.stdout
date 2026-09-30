@@ -1,2 +1,2 @@
 This node is not in a cluster; run `remuda cluster init`.
-Listener: off (daemon not running)
+Listener: off (Next: remuda cluster listen --bind IP)

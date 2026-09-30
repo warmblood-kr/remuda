@@ -23,7 +23,7 @@ use_node() {
 use_node "$D/a" # Use "$D/b" in terminal B
 ```
 
-Initialize A with `remuda -s node-a cluster init` and B with `remuda -s node-b cluster init`; note A's printed node name. On A enable input with `remuda -s node-a cluster control on`, then create a `demo` session with `remuda -s node-a -e 'remuda.session.new("demo", {"sh", "-c", "while IFS= read -r line; do printf '\''FROM_B:%s\\n'\'' "$line"; done"})'`. Start `remuda -s node-a cluster listen --bind 127.0.0.1:7441` on A and `remuda -s node-b cluster listen --bind 127.0.0.1:7442` on B, each in its own terminal, and keep them running. The invite in step 1 supplies the live fingerprint and one-line invite used in step 2.
+Initialize A with `remuda -s node-a cluster init` and B with `remuda -s node-b cluster init`; note A's printed node name. On A enable input with `remuda -s node-a cluster control on`, then create a `demo` session with `remuda -s node-a -e 'remuda.session.new("demo", {"sh", "-c", "while IFS= read -r line; do printf '\''FROM_B:%s\\n'\'' "$line"; done"})'`. Configure the daemon listener on A with `remuda -s node-a cluster listen --bind 127.0.0.1:7441` and on B with `remuda -s node-b cluster listen --bind 127.0.0.1:7442`. Each command returns after the daemon reloads its listener; the daemon keeps listening. Add `--foreground` only when you want the command itself to hold the listener in that terminal. The invite in step 1 supplies the live fingerprint and one-line invite used in step 2.
 
 1. On A, run `remuda -s node-a cluster invite --bind 127.0.0.1:7441`.
    Expected: A prints its node fingerprint and a one-line `remuda-join-v1` invite.
