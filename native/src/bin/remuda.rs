@@ -332,17 +332,41 @@ fn unknown_command(word: &str) -> ExitCode {
         eprintln!(
             "remuda: that looks like a join line; run: remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
         );
-    } else if is_command_word(word) {
-        match suggest_command(word) {
-            Some(suggestion) => {
-                eprintln!("remuda: unknown command '{word}'. Did you mean 'remuda {suggestion}'?")
-            }
-            None => {
-                eprintln!("remuda: unknown command '{word}'. Run 'remuda help' for commands.")
-            }
-        }
     } else {
-        eprintln!("remuda: unknown command. Run 'remuda help' for commands.");
+        let command_word = is_command_word(word);
+        if command_word {
+            eprintln!("remuda: no command or mod named {word}.");
+        } else {
+            eprintln!("remuda: no command or mod with that name.");
+        }
+
+        let suggestion = if command_word {
+            let command_suggestion = suggest_command(word).map(|name| format!("remuda {name}"));
+            command_suggestion.or_else(|| {
+                let installed_mod_names = remuda_native::packages::manifests()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|manifest| manifest.name)
+                    .collect::<Vec<_>>();
+                let installed_mod_name_refs = installed_mod_names
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                closest_word(word, &installed_mod_name_refs).map(|name| format!("remuda {name}"))
+            })
+        } else {
+            None
+        };
+        if let Some(suggestion) = suggestion {
+            eprintln!("Did you mean: {suggestion}?");
+        }
+
+        let next = if command_word {
+            format!("Next: if {word} is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list.")
+        } else {
+            "Next: if this is a mod, install it with remuda mod install OWNER/REPO; installed mods: remuda mod list.".to_string()
+        };
+        eprintln!("{next}");
     }
     ExitCode::FAILURE
 }
@@ -704,6 +728,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                 println!("{}", cluster_init_message(created));
                 println!("Node: {}", identity.node_name);
                 println!("Fingerprint: {}", identity.node_fp);
+                println!("{}", next_step_init());
                 ExitCode::SUCCESS
             }
             Err(error) => fail(format!("cluster init: {error}")),
@@ -742,25 +767,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         ClusterCommand::Listen {
             bind_addr,
             allow_public,
-        } => with_daemon(server, path, |daemon_path| {
-            let config = remuda_native::net::listener::ListenerConfig {
-                bind_addr,
-                allow_unspecified: allow_public,
-            };
-            match remuda_native::net::listener::bind(config, daemon_path) {
-                Ok(listener) => {
-                    eprintln!(
-                        "remuda: cluster listener on {}",
-                        listener.local_addr().unwrap_or(bind_addr)
-                    );
-                    match listener.serve() {
-                        Ok(()) => ExitCode::SUCCESS,
-                        Err(error) => fail(format!("cluster listener: {error}")),
-                    }
-                }
-                Err(error) => fail(format!("cluster listener: {error}")),
-            }
-        }),
+        } => cluster_listen(server, path, bind_addr, allow_public),
         ClusterCommand::Call {
             target,
             address,
@@ -772,8 +779,17 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             ExitCode::SUCCESS
         }
         ClusterCommand::UnknownVerb(verb) => {
-            eprintln!("remuda: unknown cluster command '{verb}'");
+            if verb.starts_with("remuda-join-v1") {
+                eprintln!(
+                    "remuda: that looks like a join line; run: remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
+                );
+            } else if is_command_word(&verb) {
+                eprintln!("remuda: unknown cluster command '{verb}'");
+            } else {
+                eprintln!("remuda: unknown cluster command");
+            }
             eprint!("{}", cluster_usage(""));
+            eprintln!("Next: use one of the listed cluster commands.");
             ExitCode::from(2)
         }
         ClusterCommand::Invalid { verb, reason } => {
@@ -782,6 +798,42 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn cluster_listen(
+    server: &str,
+    path: &Path,
+    bind_addr: std::net::SocketAddr,
+    allow_public: bool,
+) -> ExitCode {
+    with_daemon(server, path, |daemon_path| {
+        let config = remuda_native::net::listener::ListenerConfig {
+            bind_addr,
+            allow_unspecified: allow_public,
+        };
+        match remuda_native::net::listener::bind(config, daemon_path) {
+            Ok(listener) => {
+                eprintln!(
+                    "remuda: cluster listener on {}",
+                    listener.local_addr().unwrap_or(bind_addr)
+                );
+                eprintln!("{}", next_step_listen());
+                match listener.serve() {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => fail(describe_cluster_error(
+                        "listen",
+                        &error,
+                        ClusterErrorContext::Address(bind_addr),
+                    )),
+                }
+            }
+            Err(error) => fail(describe_cluster_error(
+                "listen",
+                &error,
+                ClusterErrorContext::Address(bind_addr),
+            )),
+        }
+    })
 }
 
 fn cluster_status() -> ExitCode {
@@ -800,6 +852,9 @@ fn cluster_status() -> ExitCode {
                     let (setting, trust) = remote_control_status_lines(enabled);
                     println!("{setting}");
                     println!("{trust}");
+                    if let Some(next_step) = next_step_status(members) {
+                        println!("{next_step}");
+                    }
                     ExitCode::SUCCESS
                 }
                 Err(error) => fail(format!("cluster status: {error}")),
@@ -811,14 +866,22 @@ fn cluster_status() -> ExitCode {
 
 fn cluster_invite(bind_addr: std::net::SocketAddr) -> ExitCode {
     match remuda_native::cluster::mint_join_line(bind_addr) {
-        Ok(line) => match line.encode() {
-            Ok(line) => {
-                println!("Join line (expires in 10 minutes):\n{line}");
+        Ok(line) => match invite_message(&line) {
+            Ok(message) => {
+                println!("{message}");
                 ExitCode::SUCCESS
             }
-            Err(error) => fail(format!("cluster invite: {error}")),
+            Err(error) => fail(describe_cluster_error(
+                "invite",
+                &error,
+                ClusterErrorContext::Address(bind_addr),
+            )),
         },
-        Err(error) => fail(format!("cluster invite: {error}")),
+        Err(error) => fail(describe_cluster_error(
+            "invite",
+            &error,
+            ClusterErrorContext::Address(bind_addr),
+        )),
     }
 }
 
@@ -831,9 +894,136 @@ fn cluster_join_command(
         Ok(()) => {
             println!("Joined cluster.");
             report_cluster_pushes();
+            println!("{}", next_step_join());
             ExitCode::SUCCESS
         }
-        Err(error) => fail(format!("cluster join: {error}")),
+        Err(error) => fail(describe_cluster_error(
+            "join",
+            &error,
+            ClusterErrorContext::Join(invitation),
+        )),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ClusterErrorContext<'a> {
+    Address(std::net::SocketAddr),
+    Join(&'a remuda_native::cluster::join_line::JoinLine),
+}
+
+impl ClusterErrorContext<'_> {
+    fn address(self) -> std::net::SocketAddr {
+        match self {
+            Self::Address(address) => address,
+            Self::Join(invitation) => invitation.issuer_addr,
+        }
+    }
+}
+
+fn describe_cluster_error(
+    verb: &str,
+    error: &std::io::Error,
+    context: ClusterErrorContext<'_>,
+) -> String {
+    let kind = error.kind();
+    let detail = error.to_string();
+    let detail = match context {
+        ClusterErrorContext::Join(invitation) => {
+            detail.replace(invitation.token.as_str(), "[redacted]")
+        }
+        ClusterErrorContext::Address(_) => detail,
+    };
+    match verb {
+        "join" => {
+            let address = context.address();
+            let reason = match kind {
+                std::io::ErrorKind::ConnectionRefused => Some("connection refused"),
+                std::io::ErrorKind::TimedOut => Some("connection timed out"),
+                _ => None,
+            };
+            if let Some(reason) = reason {
+                return format!(
+                    "cluster join: cannot reach {address} ({reason}).\nNext: on the inviting machine, check `remuda cluster listen` is running on that address."
+                );
+            }
+            if kind == std::io::ErrorKind::PermissionDenied && detail == "join was refused" {
+                return "cluster join: the invitation was refused (join lines work once and expire after 10 minutes).\nNext: run `remuda cluster invite` on the inviting machine again.".into();
+            }
+            if kind == std::io::ErrorKind::PermissionDenied
+                && detail.starts_with("issuer fingerprint mismatch:")
+            {
+                let ClusterErrorContext::Join(invitation) = context else {
+                    return "cluster join: issuer fingerprint mismatch.\nNext: ask the inviting machine to run `remuda cluster` and read its Fingerprint line.".into();
+                };
+                let mismatch = describe_fingerprint_mismatch(&detail, invitation);
+                return format!(
+                    "cluster join: {mismatch}.\nNext: ask the inviting machine to run `remuda cluster` and read its Fingerprint line."
+                );
+            }
+            format!("cluster join: {detail}.\nNext: check the invitation and try again.")
+        }
+        "listen" => {
+            let address = context.address();
+            if kind == std::io::ErrorKind::PermissionDenied
+                && detail == "wildcard listener bind requires explicit public-bind opt-in"
+                && address.ip().is_unspecified()
+            {
+                return "cluster listener: binding all interfaces needs --allow-public (or use this machine's LAN IP).\nNext: add --allow-public or bind this machine's LAN IP.".into();
+            }
+            if kind == std::io::ErrorKind::AddrNotAvailable {
+                return format!(
+                    "cluster listener: {} is not an address of this machine.\nNext: run `remuda cluster listen --bind IP:7441` with this machine's IP.",
+                    address.ip()
+                );
+            }
+            format!("cluster listener: {detail}.\nNext: check the bind address and run `remuda cluster listen` again.")
+        }
+        "invite" => {
+            let address = context.address();
+            if kind == std::io::ErrorKind::InvalidData
+                && detail == "invalid cluster join line"
+                && address.ip().is_unspecified()
+            {
+                return "cluster invite: use an address of this machine that the other machine can reach, e.g. --bind 192.168.1.20:7441.\nNext: rerun `remuda cluster invite` with that address.".into();
+            }
+            format!("cluster invite: {detail}.\nNext: check the bind address and run `remuda cluster invite` again.")
+        }
+        _ => format!("cluster {verb}: operation failed.\nNext: run `remuda help` for commands."),
+    }
+}
+
+fn describe_fingerprint_mismatch(
+    detail: &str,
+    invitation: &remuda_native::cluster::join_line::JoinLine,
+) -> String {
+    let expected = detail
+        .strip_prefix("issuer fingerprint mismatch: expected ")
+        .and_then(|rest| rest.split_once(", received ").map(|(expected, _)| expected))
+        .unwrap_or("the supplied fingerprint");
+    let token = invitation.token.as_str();
+    let expected = safe_fingerprint_field(expected, token);
+    let received = safe_fingerprint_field(
+        &remuda_native::cluster::encoding::fingerprint(&invitation.issuer_static_pubkey),
+        token,
+    );
+    let declared = safe_fingerprint_field(&invitation.issuer_fingerprint, token);
+    format!(
+        "issuer fingerprint mismatch: expected {expected}, received {received} (invitation declares {declared})"
+    )
+}
+
+fn safe_fingerprint_field(value: &str, token: &str) -> String {
+    if value.starts_with("SHA256:")
+        && value.len() <= 64
+        && value.is_ascii()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b':'))
+        && !value.contains(token)
+    {
+        value.to_owned()
+    } else {
+        "the supplied fingerprint".into()
     }
 }
 
@@ -1180,15 +1370,42 @@ fn cluster_init_message(created: bool) -> &'static str {
     }
 }
 
+fn invite_message(line: &remuda_native::cluster::join_line::JoinLine) -> std::io::Result<String> {
+    let encoded = line.encode()?;
+    Ok(format!(
+        "Invitation for one machine, valid 10 minutes. Run this on the other machine:\n\n  remuda cluster join '{}' '{}'\n\nFingerprint of this machine: {} (the other machine must show the same one)\n\nNext: after it joins, run `remuda cluster nodes` here to see it.",
+        line.issuer_fingerprint,
+        encoded,
+        line.issuer_fingerprint
+    ))
+}
+
+fn next_step_init() -> &'static str {
+    "Next: remuda cluster invite (on this machine), or join an existing cluster with the command another machine's invite prints."
+}
+
+fn next_step_join() -> &'static str {
+    "Next: remuda cluster remote"
+}
+
+fn next_step_status(members: usize) -> Option<&'static str> {
+    (members == 1).then_some("Next: remuda cluster invite")
+}
+
+fn next_step_listen() -> &'static str {
+    "Keep this running; open another terminal for invite/join."
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_types)]
 mod cluster_cli_tests {
     #[cfg(unix)]
     use super::cluster_join_with_private_loader;
     use super::{
-        cluster_init_message, cluster_usage, confirmation_answer_is_yes, parse_addr_default_port,
-        parse_cluster_command, remote_control_status_lines, revoke_confirmation, write_nodes_table,
-        ClusterCommand,
+        cluster_init_message, cluster_usage, confirmation_answer_is_yes, invite_message,
+        next_step_init, next_step_join, next_step_listen, next_step_status,
+        parse_addr_default_port, parse_cluster_command, remote_control_status_lines,
+        revoke_confirmation, write_nodes_table, ClusterCommand,
     };
     #[cfg(unix)]
     use remuda_native::cluster::join_line::JoinLine;
@@ -1478,6 +1695,82 @@ mod cluster_cli_tests {
             parse_cluster_command(&["join", &fingerprint, &line, "--bind", "0.0.0.0:9443"]),
             ClusterCommand::Invalid { .. }
         ));
+    }
+
+    #[test]
+    fn invite_message_prints_a_shell_parseable_join_command_and_next_step() {
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let invitation = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.4:9443".parse().unwrap(),
+            issuer_fingerprint: fingerprint.clone(),
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        };
+        let output = invite_message(&invitation).unwrap();
+        let command = output
+            .lines()
+            .find(|line| line.starts_with("  remuda cluster join "))
+            .unwrap()
+            .trim();
+        let encoded = invitation.encode().unwrap();
+        assert!(!fingerprint.contains('\''));
+        assert!(!encoded.contains('\''));
+        assert_eq!(
+            output,
+            format!(
+                "Invitation for one machine, valid 10 minutes. Run this on the other machine:\n\n  remuda cluster join '{fingerprint}' '{encoded}'\n\nFingerprint of this machine: {fingerprint} (the other machine must show the same one)\n\nNext: after it joins, run `remuda cluster nodes` here to see it."
+            )
+        );
+        let args = shell_split_single_quotes(command);
+        assert_eq!(&args[..2], &["remuda", "cluster"]);
+        assert_eq!(
+            parse_cluster_command(&args[2..].iter().map(String::as_str).collect::<Vec<_>>(),),
+            ClusterCommand::Join {
+                fingerprint,
+                invitation,
+                bind_addr: None,
+            }
+        );
+    }
+
+    #[test]
+    fn next_steps_cover_init_join_and_single_member_status() {
+        assert_eq!(
+            next_step_init(),
+            "Next: remuda cluster invite (on this machine), or join an existing cluster with the command another machine's invite prints."
+        );
+        assert_eq!(next_step_join(), "Next: remuda cluster remote");
+        assert_eq!(
+            next_step_listen(),
+            "Keep this running; open another terminal for invite/join."
+        );
+        assert_eq!(next_step_status(1), Some("Next: remuda cluster invite"));
+        assert_eq!(next_step_status(2), None);
+    }
+
+    fn shell_split_single_quotes(command: &str) -> Vec<String> {
+        let mut args = Vec::new();
+        let mut word = String::new();
+        let mut quoted = false;
+        for character in command.chars() {
+            match character {
+                '\'' => quoted = !quoted,
+                ' ' if !quoted => {
+                    if !word.is_empty() {
+                        args.push(std::mem::take(&mut word));
+                    }
+                }
+                _ => word.push(character),
+            }
+        }
+        assert!(!quoted);
+        if !word.is_empty() {
+            args.push(word);
+        }
+        args
     }
 
     #[cfg(unix)]
@@ -3273,8 +3566,12 @@ fn fail(message: impl std::fmt::Display) -> ExitCode {
         eprintln!("{text}");
         return ExitCode::from(code);
     }
-    eprintln!("remuda: {message}");
+    eprintln!("{}", format_failure(&message));
     ExitCode::FAILURE
+}
+
+fn format_failure(message: &str) -> String {
+    format!("remuda: {message}")
 }
 
 /// Prints `1..=n`, one per line, flushing after each and sleeping
@@ -3302,6 +3599,160 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct TestErrorMessage(String);
+
+    impl std::fmt::Display for TestErrorMessage {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt(formatter)
+        }
+    }
+
+    impl std::error::Error for TestErrorMessage {}
+
+    #[test]
+    fn cluster_error_mappings_are_actionable() {
+        let issuer_addr = "192.0.2.8:7441".parse().unwrap();
+        let wildcard_addr = "0.0.0.0:7441".parse().unwrap();
+        let unavailable_addr = "192.0.2.99:7441".parse().unwrap();
+        let cases = [
+            (
+                "join",
+                std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+                ClusterErrorContext::Address(issuer_addr),
+                "cannot reach 192.0.2.8:7441 (connection refused).",
+            ),
+            (
+                "join",
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout"),
+                ClusterErrorContext::Address(issuer_addr),
+                "cannot reach 192.0.2.8:7441 (connection timed out).",
+            ),
+            (
+                "join",
+                std::io::Error::new(std::io::ErrorKind::PermissionDenied, "join was refused"),
+                ClusterErrorContext::Address(issuer_addr),
+                "the invitation was refused (join lines work once and expire after 10 minutes).",
+            ),
+            (
+                "listen",
+                std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "wildcard listener bind requires explicit public-bind opt-in",
+                ),
+                ClusterErrorContext::Address(wildcard_addr),
+                "binding all interfaces needs --allow-public",
+            ),
+            (
+                "listen",
+                std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "unavailable"),
+                ClusterErrorContext::Address(unavailable_addr),
+                "192.0.2.99 is not an address of this machine.",
+            ),
+            (
+                "invite",
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid cluster join line"),
+                ClusterErrorContext::Address(wildcard_addr),
+                "use an address of this machine that the other machine can reach",
+            ),
+        ];
+
+        for (verb, error, address, expected) in cases {
+            let message = describe_cluster_error(verb, &error, address);
+            assert!(message.contains(expected), "{verb}: {message}");
+            assert!(message.contains("Next:"), "{verb}: {message}");
+        }
+    }
+
+    #[test]
+    fn generic_join_error_keeps_detail_and_has_one_cli_prefix() {
+        let address = "192.0.2.8:7441".parse().unwrap();
+        let error = std::io::Error::other("connection reset by peer");
+        let description =
+            describe_cluster_error("join", &error, ClusterErrorContext::Address(address));
+        assert_eq!(
+            description,
+            "cluster join: connection reset by peer.\nNext: check the invitation and try again."
+        );
+
+        let printed = format_failure(&description);
+        assert_eq!(printed.matches("remuda: ").count(), 1, "{printed}");
+        assert_eq!(
+            printed,
+            "remuda: cluster join: connection reset by peer.\nNext: check the invitation and try again."
+        );
+    }
+
+    #[test]
+    fn fingerprint_mismatch_explains_how_to_check_the_pin() {
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let invitation = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.8:7441".parse().unwrap(),
+            issuer_fingerprint: fingerprint,
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        };
+        let error = invitation.verify_pin("SHA256:wrong").unwrap_err();
+        let message =
+            describe_cluster_error("join", &error, ClusterErrorContext::Join(&invitation));
+        assert!(message.contains("issuer fingerprint mismatch: expected SHA256:wrong"));
+        assert!(message.contains(
+            "Next: ask the inviting machine to run `remuda cluster` and read its Fingerprint line."
+        ));
+    }
+
+    #[test]
+    fn join_error_messages_never_include_invitation_line_or_token() {
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let invitation = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.8:7441".parse().unwrap(),
+            issuer_fingerprint: fingerprint,
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        };
+        let line = invitation.encode().unwrap();
+        let error = std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused");
+        let message =
+            describe_cluster_error("join", &error, ClusterErrorContext::Join(&invitation));
+        assert!(!message.contains(&line), "error echoed the invitation line");
+        assert!(
+            !message.contains(invitation.token.as_str()),
+            "error echoed the invitation token"
+        );
+
+        let error = invitation
+            .verify_pin(invitation.token.as_str())
+            .expect_err("the bearer token is not the issuer fingerprint");
+        let message =
+            describe_cluster_error("join", &error, ClusterErrorContext::Join(&invitation));
+        assert!(
+            !message.contains(invitation.token.as_str()),
+            "pin error echoed the invitation token"
+        );
+        assert!(
+            !message.contains(&line),
+            "pin error echoed the invitation line"
+        );
+
+        let error = std::io::Error::other(TestErrorMessage(line.clone()));
+        let message =
+            describe_cluster_error("join", &error, ClusterErrorContext::Join(&invitation));
+        assert!(
+            !message.contains(&line),
+            "generic join error echoed the invitation line"
+        );
+        assert!(
+            !message.contains(invitation.token.as_str()),
+            "generic join error echoed the invitation token"
+        );
+    }
 
     #[test]
     fn suggest_command_qualifies_cluster_verbs() {
