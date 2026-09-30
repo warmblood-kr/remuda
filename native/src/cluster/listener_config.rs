@@ -1,20 +1,19 @@
 //! Persistent local settings for the cluster listener.
 
-#[cfg(test)]
+use serde::{Deserialize, Serialize};
 use std::io;
-#[cfg(test)]
 use std::net::SocketAddr;
-#[cfg(test)]
 use std::path::Path;
 
-#[cfg(test)]
+const LISTENER_FILE: &str = "listener.json";
+const LISTENER_MAX_BYTES: u64 = 4096;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ListenerBind {
     Auto,
     Explicit(SocketAddr),
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ListenerConfig {
     pub enabled: bool,
@@ -22,24 +21,124 @@ pub struct ListenerConfig {
     pub allow_public: bool,
 }
 
-#[cfg(test)]
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredListenerConfig {
+    enabled: bool,
+    bind: String,
+    allow_public: bool,
+}
+
+/// Read the listener configuration, returning `None` when it is not stored.
 pub fn read() -> io::Result<Option<ListenerConfig>> {
-    Ok(None)
+    read_at(&super::storage::cluster_state_dir()?.join("cluster"))
 }
 
-#[cfg(test)]
-pub fn read_at(_dir: &Path) -> io::Result<Option<ListenerConfig>> {
-    Ok(None)
+/// Read the listener configuration from one cluster state directory.
+pub fn read_at(dir: &Path) -> io::Result<Option<ListenerConfig>> {
+    use std::fs;
+    #[cfg(not(windows))]
+    use std::fs::OpenOptions;
+    use std::io::Read;
+
+    match fs::symlink_metadata(dir) {
+        Ok(_) => super::storage::verify_directory(dir)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let path = dir.join(LISTENER_FILE);
+    #[cfg(not(windows))]
+    let file = {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        match options.open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    };
+    #[cfg(windows)]
+    let file = match super::windows_security::open_for_read(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    super::storage::check_private_file(&file, "cluster listener config", &path)?;
+    if file.metadata()?.len() > LISTENER_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cluster listener config exceeds byte cap",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(LISTENER_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > LISTENER_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "cluster listener config exceeds byte cap",
+        ));
+    }
+    let stored = serde_json::from_slice::<StoredListenerConfig>(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let bind = if stored.bind == "auto" {
+        ListenerBind::Auto
+    } else {
+        ListenerBind::Explicit(stored.bind.parse().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid cluster listener bind address: {error}"),
+            )
+        })?)
+    };
+    Ok(Some(ListenerConfig {
+        enabled: stored.enabled,
+        bind,
+        allow_public: stored.allow_public,
+    }))
 }
 
-#[cfg(test)]
-pub fn write(_config: &ListenerConfig) -> io::Result<()> {
-    Ok(())
+/// Persist the listener configuration after verifying the local identity.
+pub fn write(config: &ListenerConfig) -> io::Result<()> {
+    let dir = super::storage::cluster_state_dir()?.join("cluster");
+    super::identity::load_identity_at(&dir)?;
+    write_at(&dir, config)
 }
 
-#[cfg(test)]
-pub fn write_at(_dir: &Path, _config: &ListenerConfig) -> io::Result<()> {
-    Ok(())
+/// Persist the listener configuration in one cluster state directory.
+pub fn write_at(dir: &Path, config: &ListenerConfig) -> io::Result<()> {
+    use std::fs;
+
+    super::storage::verify_directory(dir)?;
+    let _guard = super::storage::StateLock::acquire(dir)?;
+    let path = dir.join(LISTENER_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "cluster listener config is a symlink; refusing",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let bind = match &config.bind {
+        ListenerBind::Auto => "auto".to_owned(),
+        ListenerBind::Explicit(address) => address.to_string(),
+    };
+    let mut bytes = serde_json::to_vec(&StoredListenerConfig {
+        enabled: config.enabled,
+        bind,
+        allow_public: config.allow_public,
+    })
+    .map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    super::storage::atomic_write(&path, &bytes)
 }
 
 #[cfg(all(test, unix))]

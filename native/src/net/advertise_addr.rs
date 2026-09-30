@@ -1,31 +1,60 @@
 //! Select a private address for advertising a cluster listener.
 
-#[cfg(test)]
-use std::net::{IpAddr, SocketAddr};
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 
-#[cfg(test)]
 pub const CLUSTER_DEFAULT_PORT: u16 = 7441;
 
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoLanAddr {
     pub candidate: Option<IpAddr>,
 }
 
-#[cfg(test)]
-pub fn is_private_lan(_address: IpAddr) -> bool {
-    false
+impl fmt::Display for NoLanAddr {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.candidate {
+            Some(candidate) => write!(
+                formatter,
+                "no private LAN address found (candidate {candidate})"
+            ),
+            None => formatter.write_str("no private LAN address found"),
+        }
+    }
 }
 
-#[cfg(test)]
+impl std::error::Error for NoLanAddr {}
+
+/// Return whether an address belongs to a private LAN or shared CGNAT range.
+pub fn is_private_lan(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_private()
+                || (address.octets()[0] == 100
+                    && (address.octets()[1] & 0b1100_0000) == 0b0100_0000)
+        }
+        IpAddr::V6(address) => (address.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
+/// Select the default-route address only when it is safe to advertise on a LAN.
 pub fn auto_bind() -> Result<SocketAddr, NoLanAddr> {
-    Err(NoLanAddr { candidate: None })
+    let socket = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+        .map_err(|_| NoLanAddr { candidate: None })?;
+    socket
+        .connect(SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 1), 9))
+        .map_err(|_| NoLanAddr { candidate: None })?;
+    let candidate = socket.local_addr().ok().map(|address| address.ip());
+    match candidate {
+        Some(address) if is_private_lan(address) => {
+            Ok(SocketAddr::new(address, CLUSTER_DEFAULT_PORT))
+        }
+        candidate => Err(NoLanAddr { candidate }),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{auto_bind, is_private_lan, CLUSTER_DEFAULT_PORT};
-    #[cfg(test)]
     use std::net::{IpAddr, SocketAddr};
 
     #[test]
