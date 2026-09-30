@@ -21,11 +21,14 @@ pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_HEADER_COUNT: usize = 64;
 pub const MAX_BODY_BYTES: usize = 65_535;
 pub const MAX_GLOBAL_REQUESTS: usize = 64;
+pub const MAX_PREAUTH_REQUESTS: usize = 64;
 pub const MAX_PEER_REQUESTS: usize = 8;
 pub const MAX_PREAUTH_PER_IP: usize = 4;
+pub const MAX_PREAUTH_PER_IPV6_48: usize = 16;
 pub const MAX_JOIN_ATTEMPTS_PER_IP: usize = 10;
 const JOIN_ATTEMPT_WINDOW: Duration = Duration::from_secs(60);
 const MAX_JOIN_ATTEMPT_IPS: usize = 4096;
+const PREAUTH_EVICT_MIN_AGE: Duration = Duration::from_millis(250);
 pub const MAX_HELD_REQUEST: Duration = Duration::from_secs(30);
 const MAX_REGISTRY_UPDATE_JSON_BYTES: usize = 48 * 1024;
 const MAX_REGISTRY_PAGE_ENTRIES: usize = 32;
@@ -66,6 +69,25 @@ pub fn peer_prefix(address: std::net::IpAddr) -> std::net::IpAddr {
     }
 }
 
+fn peer_ipv6_48(address: std::net::IpAddr) -> Option<std::net::IpAddr> {
+    match address {
+        std::net::IpAddr::V4(_) => None,
+        std::net::IpAddr::V6(address) if address.to_ipv4_mapped().is_none() => {
+            let segments = address.segments();
+            Some(std::net::IpAddr::V6(std::net::Ipv6Addr::new(
+                segments[0],
+                segments[1],
+                segments[2],
+                0,
+                0,
+                0,
+                0,
+                0,
+            )))
+        }
+        std::net::IpAddr::V6(_) => None,
+    }
+}
 /// Listener address and opt-in for wildcard binding.
 /// An opted-in IPv6 wildcard may accept IPv4 on dual-stack systems.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,7 +205,12 @@ struct MemberRegistryCache {
 #[derive(Default)]
 struct RequestLimiter {
     active_global: AtomicUsize,
+    global_limit_override: AtomicUsize,
     active_ips: Mutex<HashMap<std::net::IpAddr, usize>>,
+    active_ipv6_48: Mutex<HashMap<std::net::IpAddr, usize>>,
+    active_preauth: Mutex<VecDeque<PreauthEntry>>,
+    next_preauth_id: AtomicUsize,
+    preauth_limit_override: AtomicUsize,
     active_peers: Mutex<HashMap<String, usize>>,
     join_attempts: Mutex<HashMap<std::net::IpAddr, VecDeque<Instant>>>,
     registry_requests: Mutex<HashMap<String, RegistryTokenBucket>>,
@@ -243,6 +270,18 @@ struct RegistryTokenBucket {
 
 struct GlobalPermit(Arc<RequestLimiter>);
 
+struct PreauthPermit {
+    limiter: Arc<RequestLimiter>,
+    id: usize,
+}
+
+struct PreauthEntry {
+    id: usize,
+    socket: TcpStream,
+    prefix: std::net::IpAddr,
+    accepted_at: Instant,
+}
+
 struct PeerPermit {
     limiter: Arc<RequestLimiter>,
     fingerprint: String,
@@ -251,6 +290,7 @@ struct PeerPermit {
 struct IpPermit {
     limiter: Arc<RequestLimiter>,
     address: std::net::IpAddr,
+    ipv6_48: Option<std::net::IpAddr>,
 }
 
 struct InboundRequest {
@@ -269,6 +309,26 @@ struct ConnectionLimits {
 struct ConnectionPolicy {
     limits: ConnectionLimits,
     control_source: ControlSource,
+}
+
+struct ConnectionHandlerContext {
+    remote_addr: SocketAddr,
+    state: Arc<ListenerState>,
+    preauth_permit: PreauthPermit,
+    ip_permit: Arc<IpPermit>,
+    authorize: MemberAuthorizer,
+    dispatch: FrameDispatcher,
+    policy: ConnectionPolicy,
+}
+
+struct AdmittedRequestContext {
+    state: Arc<ListenerState>,
+    peer_fp: String,
+    member_permit: Arc<GlobalPermit>,
+    authorize: MemberAuthorizer,
+    dispatch: FrameDispatcher,
+    control_source: ControlSource,
+    limits: ConnectionLimits,
 }
 
 /// Refuse wildcard binds unless the operator opted in explicitly.
@@ -522,28 +582,85 @@ impl RequestLimiter {
     }
 
     fn acquire_ip(self: &Arc<Self>, address: std::net::IpAddr) -> Option<Arc<IpPermit>> {
+        let address = peer_prefix(address);
+        let ipv6_48 = peer_ipv6_48(address);
         let mut ips = self
             .active_ips
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let active = ips.entry(address).or_default();
-        if *active >= MAX_PREAUTH_PER_IP {
+        let mut ipv6_48s = self
+            .active_ipv6_48
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if ips.get(&address).copied().unwrap_or_default() >= MAX_PREAUTH_PER_IP
+            || ipv6_48
+                .and_then(|prefix| ipv6_48s.get(&prefix).copied())
+                .unwrap_or_default()
+                >= MAX_PREAUTH_PER_IPV6_48
+        {
             return None;
         }
-        *active += 1;
+        *ips.entry(address).or_default() += 1;
+        if let Some(prefix) = ipv6_48 {
+            *ipv6_48s.entry(prefix).or_default() += 1;
+        }
         Some(Arc::new(IpPermit {
             limiter: self.clone(),
             address,
+            ipv6_48,
         }))
     }
 
     fn acquire_global(self: &Arc<Self>) -> Option<Arc<GlobalPermit>> {
+        let limit = configured_limit(&self.global_limit_override, MAX_GLOBAL_REQUESTS);
         self.active_global
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < MAX_GLOBAL_REQUESTS).then_some(count + 1)
+                (count < limit).then_some(count + 1)
             })
             .ok()
             .map(|_| Arc::new(GlobalPermit(self.clone())))
+    }
+
+    fn acquire_preauth(
+        self: &Arc<Self>,
+        stream: &TcpStream,
+        address: std::net::IpAddr,
+    ) -> io::Result<Option<PreauthPermit>> {
+        let control_stream = stream.try_clone()?;
+        let mut active = self
+            .active_preauth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let limit = configured_limit(&self.preauth_limit_override, MAX_PREAUTH_REQUESTS);
+        if active.len() >= limit {
+            let prefix = peer_prefix(address);
+            let Some(victim) = preauth_victim_index(&active, prefix, limit, Instant::now()) else {
+                return Ok(None);
+            };
+            let evicted = active
+                .remove(victim)
+                .expect("selected pre-auth victim exists");
+            let _ = evicted.socket.shutdown(Shutdown::Both);
+        }
+        let id = self.next_preauth_id.fetch_add(1, Ordering::Relaxed);
+        active.push_back(PreauthEntry {
+            id,
+            socket: control_stream,
+            prefix: peer_prefix(address),
+            accepted_at: Instant::now(),
+        });
+        Ok(Some(PreauthPermit {
+            limiter: self.clone(),
+            id,
+        }))
+    }
+
+    fn release_preauth(&self, id: usize) {
+        let mut active = self
+            .active_preauth
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active.retain(|entry| entry.id != id);
     }
 
     fn acquire_peer(self: &Arc<Self>, fingerprint: &str) -> Option<Arc<PeerPermit>> {
@@ -601,9 +718,52 @@ impl RequestLimiter {
     }
 }
 
+fn configured_limit(override_value: &AtomicUsize, default: usize) -> usize {
+    match override_value.load(Ordering::Relaxed) {
+        0 => default,
+        value => value,
+    }
+}
+
+fn preauth_victim_index(
+    active: &VecDeque<PreauthEntry>,
+    incoming_prefix: std::net::IpAddr,
+    pool_limit: usize,
+    now: Instant,
+) -> Option<usize> {
+    let mut counts = HashMap::new();
+    for entry in active {
+        *counts.entry(entry.prefix).or_insert(0usize) += 1;
+    }
+    let incoming_count = counts.get(&incoming_prefix).copied().unwrap_or_default();
+    let distinct_prefixes = counts.len() + usize::from(!counts.contains_key(&incoming_prefix));
+    let fair_share = (pool_limit / distinct_prefixes.max(1)).max(1);
+    if incoming_count >= fair_share {
+        return None;
+    }
+    let most_populated = counts.values().copied().max()?;
+    active
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| counts.get(&entry.prefix) == Some(&most_populated))
+        .filter(|(_, entry)| {
+            now.saturating_duration_since(entry.accepted_at) >= PREAUTH_EVICT_MIN_AGE
+        })
+        // If prefixes tie, preserve older in-flight work such as a slow
+        // member request and evict the newest eligible holder first.
+        .max_by_key(|(index, entry)| (entry.accepted_at, *index))
+        .map(|(index, _)| index)
+}
+
 impl Drop for GlobalPermit {
     fn drop(&mut self) {
         self.0.active_global.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for PreauthPermit {
+    fn drop(&mut self) {
+        self.limiter.release_preauth(self.id);
     }
 }
 
@@ -634,6 +794,19 @@ impl Drop for IpPermit {
             *active -= 1;
             if *active == 0 {
                 ips.remove(&self.address);
+            }
+        }
+        if let Some(prefix) = self.ipv6_48 {
+            let mut prefixes = self
+                .limiter
+                .active_ipv6_48
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(active) = prefixes.get_mut(&prefix) {
+                *active -= 1;
+                if *active == 0 {
+                    prefixes.remove(&prefix);
+                }
             }
         }
     }
@@ -1002,38 +1175,42 @@ fn spawn_connection_handler(
     dispatch: FrameDispatcher,
     policy: ConnectionPolicy,
 ) -> io::Result<()> {
+    let _ = stream.set_write_timeout(Some(policy.limits.idle_read));
     let Some(ip_permit) = state.limiter.acquire_ip(remote_addr.ip()) else {
         return write_http_response(stream, 429, b"source address request capacity reached");
     };
-    let Some(global_permit) = state.limiter.acquire_global() else {
-        return write_http_response(stream, 503, b"request capacity reached");
+    let Some(preauth_permit) = state.limiter.acquire_preauth(&stream, remote_addr.ip())? else {
+        return write_http_response(stream, 429, b"pre-auth capacity reached");
     };
     std::thread::Builder::new()
         .name("remuda-cluster-listener".into())
         .spawn(move || {
-            let _ip_permit = ip_permit;
             handle_connection_with(
                 stream,
-                remote_addr,
-                state,
-                global_permit,
-                authorize,
-                dispatch,
-                policy,
+                ConnectionHandlerContext {
+                    remote_addr,
+                    state,
+                    preauth_permit,
+                    ip_permit,
+                    authorize,
+                    dispatch,
+                    policy,
+                },
             );
         })
         .map(|_| ())
 }
 
-fn handle_connection_with(
-    stream: TcpStream,
-    remote_addr: SocketAddr,
-    state: Arc<ListenerState>,
-    global_permit: Arc<GlobalPermit>,
-    authorize: MemberAuthorizer,
-    dispatch: FrameDispatcher,
-    policy: ConnectionPolicy,
-) {
+fn handle_connection_with(stream: TcpStream, context: ConnectionHandlerContext) {
+    let ConnectionHandlerContext {
+        remote_addr,
+        state,
+        preauth_permit,
+        ip_permit,
+        authorize,
+        dispatch,
+        policy,
+    } = context;
     let ConnectionPolicy {
         control_source,
         limits,
@@ -1050,27 +1227,77 @@ fn handle_connection_with(
     };
     let peer_fp = cluster::encoding::fingerprint(&opened.peer_static);
     let admitted = authorize(&opened.peer_static).is_ok();
-    let now = crate::SystemWallClock::new().unix_seconds() as i64;
-    if !admitted && !state.charge_unknown_peer(remote_addr.ip()) {
+    let member_permit = if admitted {
+        acquire_member_permit(&state, preauth_permit, ip_permit)
+    } else {
+        None
+    };
+    if admitted && member_permit.is_none() {
         return ignore_response_error(write_http_response(
             stream,
-            429,
-            b"join attempt rate limit reached",
+            503,
+            b"request capacity reached",
         ));
     }
-    let replay = state.check_and_insert_replay(
-        admitted,
-        &peer_fp,
-        opened.ephemeral,
-        opened.timestamp_seconds,
-        now,
-    );
-    if replay.is_err() {
-        return ignore_response_error(write_http_response(stream, 409, b"replayed or stale frame"));
+    if let Err((status, body)) =
+        check_request_replay(&state, remote_addr, admitted, &peer_fp, &opened)
+    {
+        return ignore_response_error(write_http_response(stream, status, body));
     }
     if !admitted {
         return handle_unknown_peer_join(stream, state, opened);
     }
+    handle_admitted_request(
+        stream,
+        opened,
+        AdmittedRequestContext {
+            state,
+            peer_fp,
+            member_permit: member_permit.expect("authorized request holds member capacity"),
+            authorize,
+            dispatch,
+            control_source,
+            limits,
+        },
+    );
+}
+
+fn check_request_replay(
+    state: &ListenerState,
+    remote_addr: SocketAddr,
+    admitted: bool,
+    peer_fp: &str,
+    opened: &frame::OpenedRequest,
+) -> Result<(), (u16, &'static [u8])> {
+    if !admitted && !state.charge_unknown_peer(remote_addr.ip()) {
+        return Err((429, b"join attempt rate limit reached"));
+    }
+    let now = crate::SystemWallClock::new().unix_seconds() as i64;
+    state
+        .check_and_insert_replay(
+            admitted,
+            peer_fp,
+            opened.ephemeral,
+            opened.timestamp_seconds,
+            now,
+        )
+        .map_err(|_| (409, &b"replayed or stale frame"[..]))
+}
+
+fn handle_admitted_request(
+    stream: TcpStream,
+    opened: frame::OpenedRequest,
+    context: AdmittedRequestContext,
+) {
+    let AdmittedRequestContext {
+        state,
+        peer_fp,
+        member_permit,
+        authorize,
+        dispatch,
+        control_source,
+        limits,
+    } = context;
     // The cluster listener has two protocol verbs which the local
     // remote-control front must refuse. Decode and authorize them here,
     // after the member check above, instead of using that front's combined
@@ -1104,7 +1331,7 @@ fn handle_connection_with(
     let peer_static = opened.peer_static.clone();
     let dispatch_worker = dispatch.clone();
     let authorize_worker = authorize.clone();
-    let worker_global = global_permit.clone();
+    let worker_global = member_permit.clone();
     let worker_peer = peer_permit.clone();
     let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
     let worker = std::thread::Builder::new()
@@ -1137,6 +1364,16 @@ fn handle_connection_with(
         return send_encrypted_response(stream, opened, &refused);
     }
     send_encrypted_response(stream, opened, &response)
+}
+
+fn acquire_member_permit(
+    state: &ListenerState,
+    preauth_permit: PreauthPermit,
+    ip_permit: Arc<IpPermit>,
+) -> Option<Arc<GlobalPermit>> {
+    drop(preauth_permit);
+    drop(ip_permit);
+    state.limiter.acquire_global()
 }
 
 fn handle_unknown_peer_join(
@@ -1569,6 +1806,50 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn synthetic_tcp_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (server, client)
+    }
+
+    #[cfg(unix)]
+    fn spawn_synthetic_connection(
+        server: &SocketTestServer,
+        remote_ip: std::net::IpAddr,
+        authorize: &MemberAuthorizer,
+        dispatch: &FrameDispatcher,
+    ) -> (TcpStream, bool) {
+        let (stream, mut client) = synthetic_tcp_pair();
+        let result = spawn_connection_handler(
+            stream,
+            SocketAddr::new(remote_ip, 12345),
+            server.state.clone(),
+            authorize.clone(),
+            dispatch.clone(),
+            ConnectionPolicy {
+                control_source: ControlSource::DefaultStateDir,
+                limits: ConnectionLimits {
+                    outer_hold: socket_test_timeout(),
+                    post_dispatch_hold: socket_test_timeout(),
+                    idle_read: socket_test_timeout(),
+                    total_read: socket_test_timeout(),
+                },
+            },
+        );
+        assert!(result.is_ok());
+        client.set_nonblocking(true).unwrap();
+        let mut response = [0; 256];
+        let accepted = match client.read(&mut response) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+            Ok(_) => false,
+            Err(error) => panic!("unexpected synthetic connection probe error: {error}"),
+        };
+        (client, accepted)
+    }
+
+    #[cfg(unix)]
     fn read_http_response(stream: &mut TcpStream) -> io::Result<(u16, Vec<u8>)> {
         let mut reader = std::io::BufReader::new(stream);
         let mut line = String::new();
@@ -1694,6 +1975,27 @@ mod tests {
     #[cfg(unix)]
     fn socket_test_timeout() -> Duration {
         Duration::from_secs(1)
+    }
+
+    #[cfg(unix)]
+    fn wait_for_preauth_count(limiter: &RequestLimiter, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if limiter
+                .active_preauth
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
+                == expected
+            {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pre-auth permit count did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[cfg(unix)]
@@ -2303,6 +2605,291 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn production_serve_until_member_request_evicts_idle_preauth_connection() {
+        let (server, peer) = production_socket_server();
+        server
+            .state
+            .limiter
+            .global_limit_override
+            .store(1, Ordering::Relaxed);
+        server
+            .state
+            .limiter
+            .preauth_limit_override
+            .store(1, Ordering::Relaxed);
+        let authorize: MemberAuthorizer = Arc::new(|_| Ok(()));
+        let dispatch: FrameDispatcher =
+            Arc::new(|_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()));
+        let idle_ip = "192.0.2.10".parse().unwrap();
+        let (mut idle, accepted) =
+            spawn_synthetic_connection(&server, idle_ip, &authorize, &dispatch);
+        assert!(accepted);
+        std::thread::sleep(PREAUTH_EVICT_MIN_AGE + Duration::from_millis(50));
+
+        let member_ip = "198.51.100.10".parse().unwrap();
+        let (mut member_client, accepted) =
+            spawn_synthetic_connection(&server, member_ip, &authorize, &dispatch);
+        assert!(accepted);
+        let member = sealed_list_request(&peer, &server);
+        write_http_request(&mut member_client, &member.message);
+        member_client.set_nonblocking(false).unwrap();
+        member_client
+            .set_read_timeout(Some(socket_test_timeout()))
+            .unwrap();
+        assert_eq!(read_http_response(&mut member_client).unwrap().0, 200);
+
+        idle.set_nonblocking(false).unwrap();
+        idle.set_read_timeout(Some(socket_test_timeout())).unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(idle.read(&mut byte).unwrap(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_serve_until_refuses_to_evict_a_young_preauth_holder() {
+        let (server, _) = production_socket_server();
+        server
+            .state
+            .limiter
+            .preauth_limit_override
+            .store(1, Ordering::Relaxed);
+        let mut holder = TcpStream::connect(server.address).unwrap();
+        holder
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while server.state.limiter.active_preauth.lock().unwrap().len() != 1
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let mut newcomer = TcpStream::connect(server.address).unwrap();
+        newcomer
+            .set_read_timeout(Some(socket_test_timeout()))
+            .unwrap();
+        assert_eq!(
+            read_http_response(&mut newcomer).unwrap(),
+            (429, b"pre-auth capacity reached".to_vec())
+        );
+        let mut byte = [0; 1];
+        assert!(matches!(
+            holder.read(&mut byte).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        ));
+        assert_eq!(server.state.limiter.active_preauth.lock().unwrap().len(), 1);
+        drop(holder);
+        wait_for_preauth_count(&server.state.limiter, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preauth_permit_releases_on_bad_request_bad_frame_replay_and_503() {
+        let (server, peer, _) = socket_server(
+            |_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+        );
+
+        assert_eq!(
+            server.send_raw(b"bad", b"Content-Length: 0\r\n").unwrap().0,
+            400
+        );
+        wait_for_preauth_count(&server.state.limiter, 0);
+        assert_eq!(
+            server.send_raw(b"bad", b"Content-Length: 3\r\n").unwrap().0,
+            400
+        );
+        wait_for_preauth_count(&server.state.limiter, 0);
+
+        let request = sealed_list_request(&peer, &server);
+        let body = request.message.clone();
+        assert_eq!(server.exchange(request).0, 200);
+        wait_for_preauth_count(&server.state.limiter, 0);
+        let headers = format!("Content-Length: {}\r\n", body.len());
+        assert_eq!(server.send_raw(&body, headers.as_bytes()).unwrap().0, 409);
+        wait_for_preauth_count(&server.state.limiter, 0);
+
+        server
+            .state
+            .limiter
+            .global_limit_override
+            .store(1, Ordering::Relaxed);
+        let held_global = server.state.limiter.acquire_global().unwrap();
+        assert_eq!(server.exchange(sealed_list_request(&peer, &server)).0, 503);
+        wait_for_preauth_count(&server.state.limiter, 0);
+        drop(held_global);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn member_releases_ip_and_preauth_permits_before_dispatch() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let member = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let authorize: MemberAuthorizer = Arc::new(|_| Ok(()));
+        let dispatch: FrameDispatcher = Arc::new(move |_, _| {
+            entered_tx.send(()).unwrap();
+            release_rx
+                .lock()
+                .unwrap()
+                .recv()
+                .map_err(|_| io::Error::other("dispatch test interrupted"))?;
+            Ok(serde_json::to_vec(&Response::Ok).unwrap())
+        });
+        let server = SocketTestServer::start(
+            responder.private,
+            responder.public,
+            authorize.clone(),
+            dispatch.clone(),
+            ConnectionLimits {
+                outer_hold: socket_test_timeout(),
+                post_dispatch_hold: socket_test_timeout(),
+                idle_read: socket_test_timeout(),
+                total_read: socket_test_timeout(),
+            },
+        );
+        let member_ip = "198.51.100.42".parse().unwrap();
+        let (mut client, accepted) =
+            spawn_synthetic_connection(&server, member_ip, &authorize, &dispatch);
+        assert!(accepted);
+        let request = sealed_list_request(&member, &server);
+        write_http_request(&mut client, &request.message);
+        entered_rx.recv_timeout(socket_test_timeout()).unwrap();
+        assert!(server.state.limiter.active_ips.lock().unwrap().is_empty());
+        assert!(server
+            .state
+            .limiter
+            .active_preauth
+            .lock()
+            .unwrap()
+            .is_empty());
+
+        release_tx.send(()).unwrap();
+        client.set_nonblocking(false).unwrap();
+        client
+            .set_read_timeout(Some(socket_test_timeout()))
+            .unwrap();
+        let (status, body) = read_http_response(&mut client).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Response>(&frame::open_response(request, &body).unwrap())
+                .unwrap(),
+            Response::Ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_serve_until_four_prefix_churn_preserves_member_200() {
+        let responder = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let member = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let member_public = member.public.clone();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let wait_for_release = Arc::new(AtomicBool::new(true));
+        let wait_for_release_authorizer = wait_for_release.clone();
+        let authorize: MemberAuthorizer = Arc::new(move |key| {
+            if key != member_public {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "unknown test key",
+                ));
+            }
+            if wait_for_release_authorizer.swap(false, Ordering::AcqRel) {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv()
+                    .map_err(|_| io::Error::other("member test interrupted"))?;
+            }
+            Ok(())
+        });
+        let dispatch: FrameDispatcher =
+            Arc::new(|_, _| Ok(serde_json::to_vec(&Response::Ok).unwrap()));
+        let server = SocketTestServer::start(
+            responder.private,
+            responder.public,
+            authorize.clone(),
+            dispatch.clone(),
+            ConnectionLimits {
+                outer_hold: socket_test_timeout(),
+                post_dispatch_hold: socket_test_timeout(),
+                idle_read: socket_test_timeout(),
+                total_read: socket_test_timeout(),
+            },
+        );
+        server
+            .state
+            .limiter
+            .preauth_limit_override
+            .store(8, Ordering::Relaxed);
+
+        let prefixes = ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"]
+            .map(|ip| ip.parse::<std::net::IpAddr>().unwrap());
+        let mut attackers = Vec::new();
+        for ip in prefixes {
+            for _ in 0..2 {
+                let (client, accepted) =
+                    spawn_synthetic_connection(&server, ip, &authorize, &dispatch);
+                assert!(accepted);
+                attackers.push((ip, client));
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while server.state.limiter.active_preauth.lock().unwrap().len() != 8
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(260));
+
+        let member_ip = "198.51.100.10".parse().unwrap();
+        let (mut member_client, accepted) =
+            spawn_synthetic_connection(&server, member_ip, &authorize, &dispatch);
+        assert!(accepted);
+        let sealed = sealed_list_request(&member, &server);
+        write_http_request(&mut member_client, &sealed.message);
+        entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        for index in 0..32 {
+            let ip = prefixes[index % prefixes.len()];
+            let (client, accepted) = spawn_synthetic_connection(&server, ip, &authorize, &dispatch);
+            if accepted {
+                attackers.push((ip, client));
+            }
+        }
+
+        release_tx.send(()).unwrap();
+        member_client.set_nonblocking(false).unwrap();
+        member_client
+            .set_read_timeout(Some(socket_test_timeout()))
+            .unwrap();
+        let (status, body) = read_http_response(&mut member_client).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_slice::<Response>(&frame::open_response(sealed, &body).unwrap())
+                .unwrap(),
+            Response::Ok
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn accept_loop_survives_a_connection_handler_error() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -2682,6 +3269,96 @@ mod tests {
     }
 
     #[test]
+    fn request_limiter_caps_pre_auth_connections_per_ipv6_64() {
+        let limiter = Arc::new(RequestLimiter::default());
+        let first: std::net::IpAddr = "2001:db8:1:2::10".parse().unwrap();
+        let second: std::net::IpAddr = "2001:db8:1:2:abcd::20".parse().unwrap();
+        let other_prefix: std::net::IpAddr = "2001:db8:1:3::10".parse().unwrap();
+        let permits = (0..MAX_PREAUTH_PER_IP)
+            .map(|_| limiter.acquire_ip(first).unwrap())
+            .collect::<Vec<_>>();
+        assert!(limiter.acquire_ip(second).is_none());
+        assert!(limiter.acquire_ip(other_prefix).is_some());
+        drop(permits);
+        assert!(limiter.acquire_ip(second).is_some());
+    }
+
+    #[test]
+    fn request_limiter_caps_pre_auth_connections_per_ipv6_48() {
+        let limiter = Arc::new(RequestLimiter::default());
+        let permits = (0..MAX_PREAUTH_PER_IPV6_48)
+            .map(|index| {
+                let subnet = (index / MAX_PREAUTH_PER_IP) as u16;
+                let host = (index % MAX_PREAUTH_PER_IP + 1) as u16;
+                let address = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0xabcd, subnet, 0, 0, 0, host);
+                limiter.acquire_ip(std::net::IpAddr::V6(address)).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(limiter
+            .acquire_ip("2001:db8:abcd:4::1".parse().unwrap())
+            .is_none());
+        assert!(limiter
+            .acquire_ip("2001:db8:abce::1".parse().unwrap())
+            .is_some());
+        drop(permits);
+        assert!(limiter
+            .acquire_ip("2001:db8:abcd:4::1".parse().unwrap())
+            .is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preauth_victim_uses_fair_share_age_and_newest_tie_break() {
+        let now = Instant::now();
+        let member_prefix = "198.51.100.1".parse().unwrap();
+        let prefixes = [
+            "192.0.2.1",
+            "192.0.2.2",
+            "192.0.2.3",
+            "192.0.2.4",
+            "192.0.2.5",
+            "192.0.2.6",
+            "192.0.2.7",
+        ]
+        .map(|ip| ip.parse::<std::net::IpAddr>().unwrap());
+        let mut active = VecDeque::new();
+        for (index, prefix) in std::iter::once(member_prefix).chain(prefixes).enumerate() {
+            let (socket, client) = synthetic_tcp_pair();
+            drop(client);
+            active.push_back(PreauthEntry {
+                id: index,
+                socket,
+                prefix,
+                accepted_at: if index == 0 {
+                    now - Duration::from_secs(2)
+                } else {
+                    now - Duration::from_millis(500 - index as u64)
+                },
+            });
+        }
+
+        assert_eq!(
+            preauth_victim_index(&active, "203.0.113.1".parse().unwrap(), 8, now),
+            Some(7),
+            "equal-count prefixes evict the newest eligible holder, preserving older work"
+        );
+        assert_eq!(
+            preauth_victim_index(&active, member_prefix, 8, now),
+            None,
+            "a prefix already at its fair share cannot evict"
+        );
+
+        for entry in &mut active {
+            entry.accepted_at = now - Duration::from_millis(10);
+        }
+        assert_eq!(
+            preauth_victim_index(&active, "203.0.113.1".parse().unwrap(), 8, now),
+            None,
+            "young holders are not eviction candidates"
+        );
+    }
+
+    #[test]
     fn request_limiter_caps_join_attempts_per_ip_for_a_monotonic_minute() {
         let limiter = RequestLimiter::default();
         let address = "192.0.2.44".parse().unwrap();
@@ -2812,6 +3489,46 @@ mod tests {
                 Some("198.51.100.20:9443".into())
             )]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unknown_joins_do_not_acquire_member_global_capacity() {
+        let (server, _, _) = socket_server(
+            |_, _| panic!("unknown join must not reach member dispatch"),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+            socket_test_timeout(),
+        );
+        server
+            .state
+            .limiter
+            .global_limit_override
+            .store(1, Ordering::Relaxed);
+        let held = server.state.limiter.acquire_global().unwrap();
+        let token_store =
+            JoinTokenStore::open_at(&server.state_dir, Arc::new(crate::SystemWallClock::new()))
+                .unwrap();
+        let minted = token_store.mint().unwrap();
+        let unknown = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "join": { "token": minted.token.as_str() }
+        }))
+        .unwrap();
+
+        let (status, response) =
+            server.exchange(sealed_payload_request(&unknown, &server, &payload));
+        assert_eq!(status, 200);
+        assert_eq!(response, b"{\"joined\":false}");
+        assert_eq!(
+            server.state.limiter.active_global.load(Ordering::Acquire),
+            1
+        );
+        wait_for_preauth_count(&server.state.limiter, 0);
+        drop(held);
     }
 
     #[cfg(unix)]
