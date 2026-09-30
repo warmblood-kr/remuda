@@ -112,6 +112,12 @@ remuda.extension_command("deferred", function(args)
       end
     end }
     return reply
+  elseif args[1] == "secret_short" then
+    local reply = remuda.pending { timeout = 0.5 }
+    reply:prompt_secret { label = "short secret", callback = function(secret, err)
+      if err then reply:reject(err) else reply:resolve(0, "secret accepted", "") end
+    end }
+    return reply
   elseif args[1] == "secret_cap" or args[1] == "secret_over_cap" then
     local reply = remuda.pending { timeout = 5 }
     reply:prompt_secret { label = "secret cap test", callback = function(secret, err)
@@ -148,6 +154,123 @@ end)
             .expect("run remuda")
     };
     (dir, run)
+}
+
+#[cfg(unix)]
+fn secret_prompt_client_exits_and_restores_tty(
+    runtime: &std::path::Path,
+    signal: Option<libc::c_int>,
+) -> (bool, bool) {
+    use std::io::Read as _;
+
+    let pty = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("open secret prompt pty");
+    let mut command = portable_pty::CommandBuilder::new(env!("CARGO_BIN_EXE_remuda"));
+    command.args(["-s", "s", "deferred", "secret_short"]);
+    command.env("REMUDA_RUNTIME_DIR", runtime);
+    command.env("XDG_DATA_HOME", runtime.join("data"));
+    command.env("HOME", runtime);
+    let mut child = pty
+        .slave
+        .spawn_command(command)
+        .expect("spawn secret client");
+    let pid = child.process_id().expect("secret client pid");
+    drop(pty.slave);
+    let mut reader = pty
+        .master
+        .try_clone_reader()
+        .expect("clone secret pty reader");
+    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let reader_output = output.clone();
+    std::thread::spawn(move || {
+        let mut buffer = [0; 1024];
+        while let Ok(count) = reader.read(&mut buffer) {
+            if count == 0 {
+                break;
+            }
+            reader_output
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buffer[..count]);
+        }
+    });
+
+    let flags = || {
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::tcgetattr(pty.master.as_raw_fd().unwrap(), &mut termios) };
+        assert_eq!(result, 0, "read secret prompt terminal mode");
+        termios.c_lflag & libc::ECHO != 0 && termios.c_lflag & libc::ICANON != 0
+    };
+    let prompt_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !output
+        .lock()
+        .unwrap()
+        .windows(b"short secret".len())
+        .any(|w| w == b"short secret")
+        && std::time::Instant::now() < prompt_deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let prompt_shown = output
+        .lock()
+        .unwrap()
+        .windows(b"short secret".len())
+        .any(|w| w == b"short secret");
+    if signal.is_some() && prompt_shown {
+        unsafe { libc::kill(pid as libc::pid_t, signal.unwrap()) };
+    }
+
+    let exit_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut exited = false;
+    while std::time::Instant::now() < exit_deadline {
+        if child.try_wait().expect("poll secret client").is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    (exited, flags())
+}
+
+#[cfg(unix)]
+#[test]
+fn secret_prompt_deadline_and_termination_signals_restore_the_tty() {
+    let (dir, remuda) = fixture("secret-tty-lifecycle");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let deadline_case = secret_prompt_client_exits_and_restores_tty(&dir, None);
+    let term_case = secret_prompt_client_exits_and_restores_tty(&dir, Some(libc::SIGTERM));
+    let hup_case = secret_prompt_client_exits_and_restores_tty(&dir, Some(libc::SIGHUP));
+    let _ = remuda(&["stop", "-f"]);
+
+    assert!(
+        deadline_case.0,
+        "client did not exit at its pending deadline"
+    );
+    assert!(deadline_case.1, "deadline left terminal in raw mode");
+    assert!(
+        term_case.0 && term_case.1,
+        "SIGTERM did not restore terminal: {term_case:?}"
+    );
+    assert!(
+        hup_case.0 && hup_case.1,
+        "SIGHUP did not restore terminal: {hup_case:?}"
+    );
 }
 
 #[test]
