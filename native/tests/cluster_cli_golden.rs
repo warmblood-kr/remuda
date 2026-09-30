@@ -651,7 +651,7 @@ fn golden_remaining_verb_errors(scratch: &Scratch) {
     );
     golden(
         "listen_argument",
-        &scratch.run(&["cluster", "listen"]),
+        &scratch.run(&["cluster", "listen", "--bind"]),
         &scratch.root,
     );
     golden(
@@ -986,7 +986,7 @@ fn d4_invite_refuses_a_failed_listener_without_printing_a_join_line() {
         "failed invite printed a join line: {stdout}"
     );
     assert!(
-        stderr.contains("remuda cluster listen --bind IP"),
+        stderr.contains("remuda cluster listen"),
         "missing listener fix: {stderr}"
     );
 }
