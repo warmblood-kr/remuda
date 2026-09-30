@@ -628,7 +628,7 @@ impl ClusterUi {
         frame.push(pane_header);
         let queue_rows: Vec<&PendingBatch> = self.input_queue.items().rev().take(3).collect();
         let notice_lines = self.active_notice_lines(now, width);
-        let footer_rows = if self.composer_focused { 2 } else { 1 };
+        let footer_rows = self.footer_row_count(width);
         let reserved = frame.len() + queue_rows.len() + notice_lines.len() + footer_rows;
         let screen_rows = height.saturating_sub(reserved);
         frame.extend(
@@ -704,16 +704,32 @@ impl ClusterUi {
                     .remote_session(target)
                     .is_some_and(|(_, session)| session.alive)
         }) {
-            frame.push("Enter type · k keys · x close · q detach".into());
+            frame.push("Enter · k keys · x close · q detach".into());
         } else if self.remote_active.is_some() {
-            frame.push("Remote session is read-only · q detach".into());
+            frame.push("Read-only · q detach".into());
         } else if self.ended.is_some() {
-            frame.push("Input is disabled · x clears ended session · q detaches".into());
+            frame.push("Input disabled · x clear · q detach".into());
         } else if self.composer_focused {
             frame.push(self.composer_line());
             frame.push("Enter send · Ctrl-C clear · Esc list".into());
         } else {
-            frame.push(self.footer());
+            frame.extend(self.footer(width));
+        }
+    }
+
+    fn footer_row_count(&self, width: usize) -> usize {
+        if self.composer_focused {
+            2
+        } else if self.confirmation.prompt(width).is_some()
+            || self.remote_active.is_some()
+            || self.ended.is_some()
+            || self.query.is_some()
+        {
+            1
+        } else if width < 52 {
+            2
+        } else {
+            1
         }
     }
 
@@ -1588,11 +1604,19 @@ impl ClusterUi {
             .count()
     }
 
-    fn footer(&self) -> String {
+    fn footer(&self, width: usize) -> Vec<String> {
         let attention = if self.attention_only { "on" } else { "off" };
         match &self.query {
-            Some(query) => format!("search: {query} · Esc clear · Enter select"),
-            None => format!("↑/↓ move · ←/→ tree · Enter · k keys · x close · / search · ! attention: {attention} · q detach"),
+            Some(query) => {
+                let suffix = " · Esc clear · Enter select";
+                let available = width.saturating_sub(UnicodeWidthStr::width("search: ") + UnicodeWidthStr::width(suffix));
+                vec![format!("search: {}{suffix}", ellipsize(query, available))]
+            }
+            None if width < 52 => vec![
+                "↑↓ move · ←→ tree · Enter select".into(),
+                "k keys x close / find ! attn q detach".into(),
+            ],
+            None => vec![format!("↑/↓ move · ←/→ tree · Enter · k keys · x close · / search · ! attention: {attention} · q detach")],
         }
     }
 
@@ -2437,6 +2461,22 @@ mod tests {
         assert!(hint.contains("Ctrl-\\ back"), "hint lost exit binding: {hint:?}");
         assert!(hint.contains('…'), "long target should be elided: {hint:?}");
         assert!(hint.chars().count() <= 40, "hint too wide: {hint:?}");
+    }
+
+    #[test]
+    fn default_footer_keeps_action_keys_at_40_columns() {
+        let clock = ManualClock::new();
+        let ui = ClusterUi::new("studio", sessions(), clock.now());
+        let frame = ui.render(40, 24, "", &clock);
+        let footer = frame
+            .lines()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ");
+        for binding in ["↑", "←", "Enter", "k", "x", "/", "!", "q"] {
+            assert!(footer.contains(binding), "footer lost {binding}: {footer:?}");
+        }
     }
 
     #[test]
