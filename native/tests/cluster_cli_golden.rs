@@ -469,6 +469,46 @@ fn cluster_cli_output_matches_goldens() {
     golden_remaining_verb_errors(&scratch);
 }
 
+#[test]
+fn listen_off_without_daemon_saves_config_without_starting_one() {
+    use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
+
+    let scratch = Scratch::new();
+    let daemon = start_daemon(&scratch);
+    assert!(scratch
+        .run(&["cluster", "init", "--no-listen"])
+        .status
+        .success());
+    let original = ListenerConfig {
+        enabled: true,
+        bind: ListenerBind::Explicit("127.0.0.1:0".parse().unwrap()),
+        allow_public: false,
+    };
+    let cluster_dir = scratch.root.join("state/remuda/cluster");
+    listener_config::write_at(&cluster_dir, &original).unwrap();
+    drop(daemon);
+
+    let output = scratch.run(&["cluster", "listen", "--off"]);
+    assert!(output.status.success(), "listen --off failed: {output:?}");
+    assert_eq!(
+        listener_config::read_at(&cluster_dir).unwrap(),
+        Some(ListenerConfig {
+            enabled: false,
+            ..original
+        })
+    );
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("Cluster listener stays off (daemon not running)."));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Next:"));
+    assert!(
+        remuda_native::ipc::connect(&remuda_native::daemon::socket_path_in(
+            &scratch.runtime,
+            &scratch.name
+        ))
+        .is_err()
+    );
+}
+
 fn golden_uninitialized_cases(scratch: &Scratch) {
     golden(
         "status_uninitialized",
@@ -606,6 +646,11 @@ fn golden_remaining_verb_errors(scratch: &Scratch) {
         &scratch.root,
     );
     golden(
+        "listen_off",
+        &scratch.run(&["cluster", "listen", "--off"]),
+        &scratch.root,
+    );
+    golden(
         "call_usage",
         &scratch.run(&["cluster", "call", "node-example", "list"]),
         &scratch.root,
@@ -680,6 +725,73 @@ fn cluster_join_and_peer_call_outputs_match_goldens() {
     .expect("write modified registry");
     let bad_auth = joiner.run(&["cluster", "call", &label, "list", "--addr", &address_text]);
     golden("call_error_5", &bad_auth, &joiner.root);
+}
+
+#[test]
+fn failed_join_restores_the_exact_saved_listener_config() {
+    use remuda_native::cluster::listener_config::{ListenerBind, ListenerConfig};
+
+    let inviter = Scratch::new();
+    let inviter_daemon = start_daemon(&inviter);
+    assert!(inviter
+        .run(&["cluster", "init", "--no-listen"])
+        .status
+        .success());
+    let invite = inviter.run(&["cluster", "invite", "--bind", "127.0.0.1:0"]);
+    assert!(invite.status.success(), "invite failed: {invite:?}");
+    let (fingerprint, join_line) = invitation_command_args(&invite);
+    drop(inviter_daemon);
+
+    let missing_file_result = failed_join_with_listener_config(&fingerprint, &join_line, None);
+    let saved = ListenerConfig {
+        enabled: true,
+        bind: ListenerBind::Explicit("127.0.0.1:0".parse().unwrap()),
+        allow_public: false,
+    };
+    let saved_file_result =
+        failed_join_with_listener_config(&fingerprint, &join_line, Some(saved.clone()));
+
+    assert_eq!(missing_file_result, None, "failure created listener.json");
+    assert_eq!(
+        saved_file_result,
+        Some(saved),
+        "failure changed the saved listener config"
+    );
+}
+
+fn failed_join_with_listener_config(
+    fingerprint: &str,
+    join_line: &str,
+    initial: Option<remuda_native::cluster::listener_config::ListenerConfig>,
+) -> Option<remuda_native::cluster::listener_config::ListenerConfig> {
+    use remuda_native::cluster::listener_config;
+
+    let joiner = Scratch::new();
+    let _joiner_daemon = start_daemon(&joiner);
+    assert!(joiner
+        .run(&["cluster", "init", "--no-listen"])
+        .status
+        .success());
+    let cluster_dir = joiner.root.join("state/remuda/cluster");
+    let config_path = cluster_dir.join("listener.json");
+    match initial {
+        Some(config) => listener_config::write_at(&cluster_dir, &config).unwrap(),
+        None => fs::remove_file(&config_path).unwrap(),
+    }
+
+    let failed = joiner.run(&[
+        "cluster",
+        "join",
+        fingerprint,
+        join_line,
+        "--bind",
+        "127.0.0.1:0",
+    ]);
+    assert!(
+        !failed.status.success(),
+        "join to stopped inviter succeeded: {failed:?}"
+    );
+    listener_config::read_at(&cluster_dir).unwrap()
 }
 
 fn initialized_node(scratch: &Scratch) -> TrackedChild {

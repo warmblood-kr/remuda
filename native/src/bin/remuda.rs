@@ -477,6 +477,7 @@ enum ClusterCommand {
         yes: bool,
     },
     Remote(Option<String>),
+    ListenOff,
     Listen {
         bind_addr: std::net::SocketAddr,
         allow_public: bool,
@@ -681,6 +682,9 @@ fn parse_cluster_remote(args: &[&str]) -> Result<ClusterCommand, String> {
 }
 
 fn parse_cluster_listen(args: &[&str]) -> Result<ClusterCommand, String> {
+    if args == ["--off"] {
+        return Ok(ClusterCommand::ListenOff);
+    }
     let (allow_public, address) = match args {
         ["--bind", address] => (false, *address),
         [flag] if flag.starts_with("--bind=") => (false, &flag[7..]),
@@ -779,7 +783,7 @@ pub fn cluster_usage(verb: &str) -> String {
         "revoke" => "usage: remuda cluster revoke NODE|FINGERPRINT [--yes]\nexample: remuda cluster revoke node-abcd1234\n".into(),
         "control" => "usage: remuda cluster control on|off\nexample: remuda cluster control off\n".into(),
         "remote" => "usage: remuda cluster remote [NODE/SESSION]\nexample: remuda cluster remote\n".into(),
-        "listen" => format!("usage: remuda cluster listen --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20\n"),
+        "listen" => format!("usage: remuda cluster listen --bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20\nusage: remuda cluster listen --off\nexample: remuda cluster listen --off\n"),
         "call" => format!("usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--json]\nexample: remuda cluster call node-abcd1234 list --addr 192.168.1.20\n"),
         _ => "usage: remuda cluster <command>\n  init\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n".into(),
     }
@@ -824,6 +828,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into());
             cluster_remote(server, path, &node, target.as_deref())
         }
+        ClusterCommand::ListenOff => cluster_listen_off(server, path),
         ClusterCommand::Listen {
             bind_addr,
             allow_public,
@@ -932,6 +937,57 @@ fn cluster_listen(
             )),
         }
     })
+}
+
+fn cluster_listen_off(server: &str, path: &Path) -> ExitCode {
+    match remuda_native::ipc::connect(path) {
+        Ok(_) => with_existing_daemon(server, path, |daemon_path| {
+            match remuda_native::cluster::listener_control::stop(daemon_path) {
+                Ok(remuda_core::protocol::ListenerStatus::Off) => {
+                    println!("Cluster listener off.");
+                    println!("Next: run `remuda cluster invite` when you are ready to admit a peer.");
+                    ExitCode::SUCCESS
+                }
+                Ok(remuda_core::protocol::ListenerStatus::On { addr, .. }) => fail(format!(
+                    "cluster listen --off: listener remains on at {addr}\nNext: check `remuda cluster` and try `remuda cluster listen --off` again."
+                )),
+                Ok(remuda_core::protocol::ListenerStatus::Failed(reason)) => fail(format!(
+                    "cluster listen --off: listener reload failed: {reason}\nNext: check `remuda cluster` and try `remuda cluster listen --off` again."
+                )),
+                Err(error) => fail(format!(
+                    "cluster listen --off: could not stop listener: {error}\nNext: check `remuda cluster` and try `remuda cluster listen --off` again."
+                )),
+            }
+        }),
+        Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => {
+            let config = match remuda_native::cluster::listener_control::config() {
+                Ok(config) => config.unwrap_or(ListenerConfig {
+                    enabled: false,
+                    bind: ListenerBind::Auto,
+                    allow_public: false,
+                }),
+                Err(error) => {
+                    return fail(format!(
+                        "cluster listen --off: cannot read listener config: {error}\nNext: start the remuda daemon and retry `remuda cluster listen --off`."
+                    ));
+                }
+            };
+            let mut config = config;
+            config.enabled = false;
+            if let Err(error) = remuda_native::cluster::listener_config::write(&config) {
+                return fail(format!(
+                    "cluster listen --off: cannot save disabled listener config: {error}\nNext: start the remuda daemon and retry `remuda cluster listen --off`."
+                ));
+            }
+            println!("Cluster listener stays off (daemon not running).");
+            println!("Next: run `remuda cluster invite` when you are ready to admit a peer.");
+            ExitCode::SUCCESS
+        }
+        Err(error) => fail(format!(
+            "cannot connect to remuda daemon at {}: {error}; refusing to start a second daemon\nNext: check `remuda cluster` and try `remuda cluster listen --off` again.",
+            path.display()
+        )),
+    }
 }
 
 fn cluster_status(server: &str, path: &Path) -> ExitCode {
@@ -2397,10 +2453,18 @@ mod cluster_cli_tests {
     }
 
     #[test]
+    fn listen_off_is_a_cluster_command() {
+        assert_eq!(
+            parse_cluster_command(&["listen", "--off"]),
+            ClusterCommand::ListenOff
+        );
+    }
+
+    #[test]
     fn cluster_usage_has_one_verb_per_line_and_examples() {
         assert_eq!(
             cluster_usage("listen"),
-            "usage: remuda cluster listen --bind IP[:PORT] (default port 7441) [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20\n"
+            "usage: remuda cluster listen --bind IP[:PORT] (default port 7441) [--allow-public]\nexample: remuda cluster listen --bind 192.168.1.20\nusage: remuda cluster listen --off\nexample: remuda cluster listen --off\n"
         );
         for verb in ["invite", "join", "call"] {
             let usage = cluster_usage(verb);
