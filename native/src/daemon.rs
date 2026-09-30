@@ -1697,7 +1697,20 @@ fn deferred_reply(
             let caller = prompt
                 .caller_session
                 .as_deref()
-                .map(sanitize_secret_prompt_text)
+                .map(|session| {
+                    let name: String = sanitize_secret_prompt_text(session)
+                        .chars()
+                        .map(|character| {
+                            if matches!(character, '[' | ']') {
+                                '?'
+                            } else {
+                                character
+                            }
+                        })
+                        .take(64)
+                        .collect();
+                    format!("session {name}")
+                })
                 .unwrap_or_else(|| "outside".to_string());
             let caller_label: String = sanitize_secret_prompt_text(&prompt.label)
                 .chars()

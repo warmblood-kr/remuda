@@ -759,7 +759,7 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(
-        prompt_screen.contains("remuda[secret-label-session] deferred test secret"),
+        prompt_screen.contains("remuda[session secret-label-session] deferred test secret"),
         "session prompt label omitted its provenance tag or retained ESC:\n{prompt_screen}"
     );
     assert!(
@@ -816,6 +816,32 @@ fn session_secret_prompt_tag_caps_the_session_name_at_64_chars() {
     assert!(
         prompt_screen.contains(&format!("remuda[session {}]", "x".repeat(64))),
         "session name was not truncated to 64 chars:\n{prompt_screen}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_secret_prompt_tag_preserves_non_ascii_session_names() {
+    use remuda_native::daemon;
+
+    let (dir, remuda) = fixture("secret_session_tag_unicode");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let socket = daemon::socket_path_in(&dir, "s");
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let session_name = "東京🦀";
+    let prompt_screen = secret_prompt_in_session(&socket, session_name, &binary);
+    let _ = remuda(&["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        prompt_screen.contains("remuda[session 東京🦀] deferred test secret"),
+        "non-ASCII session name changed in the caller tag:\n{prompt_screen}"
     );
 }
 
