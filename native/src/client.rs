@@ -1844,14 +1844,59 @@ fn edit_secret_line(
     Ok(None)
 }
 
+trait SecretPromptTerminal {
+    fn enable_raw_mode(&mut self) -> std::io::Result<()>;
+    fn enable_bracketed_paste(&mut self) -> std::io::Result<()>;
+    fn disable_bracketed_paste(&mut self);
+    fn disable_raw_mode(&mut self);
+}
+
+impl SecretPromptTerminal for std::io::Stdout {
+    fn enable_raw_mode(&mut self) -> std::io::Result<()> {
+        crossterm::terminal::enable_raw_mode()
+    }
+
+    fn enable_bracketed_paste(&mut self) -> std::io::Result<()> {
+        crossterm::execute!(self, crossterm::event::EnableBracketedPaste)
+    }
+
+    fn disable_bracketed_paste(&mut self) {
+        let _ = crossterm::execute!(self, crossterm::event::DisableBracketedPaste);
+    }
+
+    fn disable_raw_mode(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+struct SecretPromptMode<T: SecretPromptTerminal> {
+    terminal: T,
+}
+
+impl<T: SecretPromptTerminal> SecretPromptMode<T> {
+    fn enable(mut terminal: T) -> std::io::Result<Self> {
+        terminal.enable_raw_mode()?;
+        let mut mode = Self { terminal };
+        mode.terminal.enable_bracketed_paste()?;
+        Ok(mode)
+    }
+}
+
+impl<T: SecretPromptTerminal> Drop for SecretPromptMode<T> {
+    fn drop(&mut self) {
+        self.terminal.disable_bracketed_paste();
+        self.terminal.disable_raw_mode();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
     use super::trace_input_read;
     use super::{
         detach_offset, interpret, report_attach_input_dropped, reset_input_modes, route_tokens,
-        truncate_terminal_text, write_input_trace, AttachInputQueue, AttachRoute,
-        ATTACH_INPUT_STALL, DETACH, RESET_INPUT_MODES,
+        truncate_terminal_text, write_input_trace, AttachInputQueue, AttachRoute, SecretPromptMode,
+        SecretPromptTerminal, ATTACH_INPUT_STALL, DETACH, RESET_INPUT_MODES,
     };
     #[cfg(unix)]
     use super::{read_response_with_timeout, request_with_timeout};
@@ -1867,9 +1912,43 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     #[cfg(unix)]
     use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
     #[cfg(unix)]
     use std::time::Instant;
     use std::time::{Duration, UNIX_EPOCH};
+
+    #[derive(Clone, Default)]
+    struct RecordingSecretTerminal(Arc<Mutex<Vec<&'static str>>>);
+
+    impl RecordingSecretTerminal {
+        fn operations(&self) -> Vec<&'static str> {
+            self.0.lock().unwrap().clone()
+        }
+
+        fn record(&self, operation: &'static str) {
+            self.0.lock().unwrap().push(operation);
+        }
+    }
+
+    impl SecretPromptTerminal for RecordingSecretTerminal {
+        fn enable_raw_mode(&mut self) -> std::io::Result<()> {
+            self.record("raw:on");
+            Ok(())
+        }
+
+        fn enable_bracketed_paste(&mut self) -> std::io::Result<()> {
+            self.record("paste:on");
+            Ok(())
+        }
+
+        fn disable_bracketed_paste(&mut self) {
+            self.record("paste:off");
+        }
+
+        fn disable_raw_mode(&mut self) {
+            self.record("raw:off");
+        }
+    }
 
     #[test]
     fn attach_input_drop_recovers_after_writer_progress() {
@@ -2563,6 +2642,69 @@ mod tests {
         assert_eq!(
             edit_secret_line(events),
             Ok(Some("päss🔐".as_bytes().to_vec()))
+        );
+    }
+
+    #[test]
+    fn secret_prompt_mode_restores_terminal_after_normal_return() {
+        let terminal = RecordingSecretTerminal::default();
+        let result = (|| -> std::io::Result<()> {
+            let _mode = SecretPromptMode::enable(terminal.clone())?;
+            Ok(())
+        })();
+
+        assert!(result.is_ok());
+        assert_eq!(
+            terminal.operations(),
+            vec!["raw:on", "paste:on", "paste:off", "raw:off"]
+        );
+    }
+
+    #[test]
+    fn secret_prompt_mode_restores_terminal_after_early_error() {
+        let terminal = RecordingSecretTerminal::default();
+        let result = (|| -> std::io::Result<()> {
+            let _mode = SecretPromptMode::enable(terminal.clone())?;
+            Err(std::io::Error::other("test error"))
+        })();
+
+        assert!(result.is_err());
+        assert_eq!(
+            terminal.operations(),
+            vec!["raw:on", "paste:on", "paste:off", "raw:off"]
+        );
+    }
+
+    #[test]
+    fn secret_prompt_mode_restores_terminal_when_editor_returns_none() {
+        let terminal = RecordingSecretTerminal::default();
+        let answer: std::io::Result<_> = (|| {
+            let _mode = SecretPromptMode::enable(terminal.clone())?;
+            Ok(super::edit_secret_line([secret_key(
+                crossterm::event::KeyCode::Esc,
+                crossterm::event::KeyModifiers::NONE,
+            )]))
+        })();
+
+        assert!(matches!(answer, Ok(Ok(None))));
+        assert_eq!(
+            terminal.operations(),
+            vec!["raw:on", "paste:on", "paste:off", "raw:off"]
+        );
+    }
+
+    #[test]
+    fn secret_prompt_mode_restores_terminal_during_unwinding() {
+        let terminal = RecordingSecretTerminal::default();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _mode = SecretPromptMode::enable(terminal.clone()).unwrap();
+            panic!("test panic");
+        }));
+
+        assert!(panic.is_err());
+        assert_eq!(
+            terminal.operations(),
+            vec!["raw:on", "paste:on", "paste:off", "raw:off"]
         );
     }
 }
