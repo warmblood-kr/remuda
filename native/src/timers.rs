@@ -162,10 +162,13 @@ impl TimerService {
         };
         // Advance from the prior deadline. If execution fell behind, move to
         // the first future deadline on that same cadence and skip missed ticks.
+        // If that deadline is too close to the completed callback, preserve a
+        // full interval between callbacks rather than firing a catch-up tick.
         let mut next = timer.deadline + interval;
         while next <= now {
             next += interval;
         }
+        next = next.max(now + interval);
         timer.deadline = next;
         self.deadlines.push(Reverse(Deadline { at: next, id }));
     }
