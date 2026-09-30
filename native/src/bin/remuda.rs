@@ -1319,6 +1319,62 @@ mod cluster_cli_tests {
         ));
     }
 
+    #[test]
+    fn cluster_join_accepts_line_without_fingerprint() {
+        let key = [7; 32];
+        let fingerprint = remuda_native::cluster::encoding::fingerprint(&key);
+        let invitation = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.4:9443".parse().unwrap(),
+            issuer_fingerprint: fingerprint,
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        };
+        let line = invitation.encode().unwrap();
+        assert!(matches!(
+            parse_cluster_command(&["join", &line]),
+            ClusterCommand::Join {
+                fingerprint: None,
+                bind_addr: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn join_prompt_shows_fingerprint_and_address_without_token() {
+        let key = [7; 32];
+        let invitation = remuda_native::cluster::join_line::JoinLine {
+            issuer_addr: "192.0.2.4:9443".parse().unwrap(),
+            issuer_fingerprint: remuda_native::cluster::encoding::fingerprint(&key),
+            issuer_static_pubkey: key,
+            token: zeroize::Zeroizing::new(remuda_native::cluster::encoding::encode_base64(
+                &[9; 32],
+            )),
+        };
+        let prompt = join_prompt(&invitation);
+        let node = remuda_native::cluster::node_label(&invitation.issuer_fingerprint);
+        assert!(prompt.contains(&format!("Joining {node} at 192.0.2.4:9443")));
+        assert!(prompt.contains(&invitation.issuer_fingerprint));
+        assert!(prompt.contains(
+            "Check the inviting machine shows this fingerprint (run remuda cluster there). Continue? [y/N]"
+        ));
+        assert!(!prompt.contains(invitation.token.as_str()));
+    }
+
+    #[test]
+    fn join_confirmation_requires_both_ttys_and_only_yes_proceeds() {
+        assert!(join_confirmation(false, false).is_err());
+        assert!(join_confirmation(false, true).is_err());
+        assert!(join_confirmation(true, false).is_err());
+        assert_eq!(join_confirmation(true, true), Ok(true));
+        assert!(confirmation_answer_is_yes("y\n"));
+        assert!(confirmation_answer_is_yes("yes\n"));
+        assert!(!confirmation_answer_is_yes("n\n"));
+        assert!(!confirmation_answer_is_yes(""));
+    }
+
     #[cfg(unix)]
     #[test]
     #[allow(clippy::disallowed_types)]
