@@ -453,6 +453,14 @@ fn normalizer_self_test_removes_token_shaped_material() {
 #[test]
 fn cluster_cli_output_matches_goldens() {
     let scratch = Scratch::new();
+    golden_uninitialized_cases(&scratch);
+    golden_initialized_cases(&scratch);
+    golden_invite_join_cases(&scratch);
+    golden_revoke_cancel_case(&scratch);
+    golden_remaining_verb_errors(&scratch);
+}
+
+fn golden_uninitialized_cases(scratch: &Scratch) {
     golden(
         "status_uninitialized",
         &scratch.run(&["cluster"]),
@@ -474,6 +482,9 @@ fn cluster_cli_output_matches_goldens() {
         &scratch.run(&["cluster", "revoke", "node-missing", "--yes"]),
         &scratch.root,
     );
+}
+
+fn golden_initialized_cases(scratch: &Scratch) {
     golden("init", &scratch.run(&["cluster", "init"]), &scratch.root);
     golden(
         "init_existing",
@@ -486,6 +497,9 @@ fn cluster_cli_output_matches_goldens() {
         &scratch.root,
     );
     golden("nodes", &scratch.run(&["cluster", "nodes"]), &scratch.root);
+}
+
+fn golden_invite_join_cases(scratch: &Scratch) {
     let invite = scratch.run(&["cluster", "invite", "--bind", "127.0.0.1:7441"]);
     golden("invite", &invite, &scratch.root);
     golden(
@@ -514,6 +528,9 @@ fn cluster_cli_output_matches_goldens() {
         &scratch.run(&["cluster", "join", "SHA256:wrong", &join_line]),
         &scratch.root,
     );
+}
+
+fn golden_revoke_cancel_case(scratch: &Scratch) {
     golden(
         "nodes_usage",
         &scratch.run(&["cluster", "nodes", "extra"]),
@@ -531,12 +548,15 @@ fn cluster_cli_output_matches_goldens() {
     );
     let peer = Scratch::new();
     peer.run(&["cluster", "init"]);
-    let peer_label = add_peer_for_revoke(&scratch, &peer);
+    let peer_label = add_peer_for_revoke(scratch, &peer);
     golden(
         "revoke_cancel",
-        &run_tty_cancel_revoke(&scratch, &peer_label),
+        &run_tty_cancel_revoke(scratch, &peer_label),
         &scratch.root,
     );
+}
+
+fn golden_remaining_verb_errors(scratch: &Scratch) {
     golden(
         "control_off",
         &scratch.run(&["cluster", "control", "off"]),
