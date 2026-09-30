@@ -326,13 +326,31 @@ fn help_command() -> ExitCode {
 }
 
 fn unknown_command(word: &str) -> ExitCode {
-    match suggest_command(word) {
-        Some(suggestion) => {
-            eprintln!("remuda: unknown command '{word}'. Did you mean 'remuda {suggestion}'?")
+    if word.starts_with("remuda-join-v1") {
+        eprintln!(
+            "remuda: that looks like a join line; run: remuda cluster join FINGERPRINT 'remuda-join-v1 …'"
+        );
+    } else if is_command_word(word) {
+        match suggest_command(word) {
+            Some(suggestion) => {
+                eprintln!("remuda: unknown command '{word}'. Did you mean 'remuda {suggestion}'?")
+            }
+            None => {
+                eprintln!("remuda: unknown command '{word}'. Run 'remuda help' for commands.")
+            }
         }
-        None => eprintln!("remuda: unknown command '{word}'. Run 'remuda help' for commands."),
+    } else {
+        eprintln!("remuda: unknown command. Run 'remuda help' for commands.");
     }
     ExitCode::FAILURE
+}
+
+fn is_command_word(word: &str) -> bool {
+    !word.is_empty()
+        && word.len() <= 32
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
 fn suggest_command(word: &str) -> Option<String> {

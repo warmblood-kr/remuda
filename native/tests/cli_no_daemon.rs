@@ -103,6 +103,38 @@ fn unrelated_unknown_verb_gets_concise_help() {
 }
 
 #[test]
+fn quoted_join_line_unknown_word_does_not_echo_its_token() {
+    let dir = scratch("unknown-join-line");
+    let token = "secret-join-token-331";
+    let join_line = format!("remuda-join-v1 192.0.2.4:7441 SHA256:issuer PUBKEY {token}");
+    let out = remuda(&dir, &[&join_line]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(!stderr.contains(token), "diagnostic echoed secret material");
+    assert!(
+        stderr.contains("that looks like a join line; run: remuda cluster join FINGERPRINT"),
+        "missing join-line hint"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn long_whitespace_unknown_word_is_not_echoed() {
+    let dir = scratch("unknown-long-word");
+    let token = "secret-join-token-331";
+    let word = format!("not a command with sensitive suffix {token}");
+    let out = remuda(&dir, &[&word]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stderr.trim(),
+        "remuda: unknown command. Run 'remuda help' for commands."
+    );
+    assert!(!stderr.contains(token), "diagnostic echoed secret material");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn help_flags_write_usage_to_stdout_and_mod_commands_to_stderr() {
     let dir = scratch("help-output");
     let mod_dir = dir.join("data/remuda/mods/probe");
