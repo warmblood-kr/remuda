@@ -285,6 +285,7 @@ impl RemoteTui {
             command.arg(target);
         }
         command.env("REMUDA_RUNTIME_DIR", &node.runtime);
+        command.env("XDG_RUNTIME_DIR", &node.runtime);
         command.env("HOME", node.root.join("home"));
         command.env("XDG_CONFIG_HOME", node.root.join("config"));
         command.env("XDG_DATA_HOME", node.root.join("data"));
@@ -466,6 +467,70 @@ fn real_ctrl_backslash_byte_returns_from_remote_composer_to_tree() {
         "Remote session is read-only · q detach",
         Duration::from_secs(3),
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn real_remote_keys_mode_forwards_character_escape_and_ctrl_c() {
+    let client_node = Node::start("keys-live-client");
+    let server_node = Node::start("keys-live-server");
+    admit_pair(&client_node, &server_node);
+    let listener = Listener::start(&server_node);
+    let control = server_node
+        .command()
+        .args(["cluster", "control", "on"])
+        .output()
+        .unwrap();
+    assert!(
+        control.status.success(),
+        "cluster control failed: {control:?}"
+    );
+    server_node.start_named_session(
+        "proof",
+        "stty raw -echo; printf 'READY\\r\\n'; while :; do byte=$(dd bs=1 count=1 2>/dev/null | od -An -tu1 | tr -d ' '); case \"$byte\" in 121) printf '\\r\\ngot=y\\r\\n' ;; 27) printf '\\r\\ngot=esc\\r\\n' ;; 3) printf '\\r\\ngot=ctrl-c\\r\\n' ;; esac; done",
+    );
+
+    let registry_path = client_node
+        .state
+        .join("remuda/cluster/authorized_nodes.json");
+    let mut registry: Registry =
+        serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    let server = registry
+        .authorized_nodes
+        .iter_mut()
+        .find(|entry| entry.node_fp == server_node.fingerprint())
+        .unwrap();
+    server.endpoint = Some(listener.address.to_string());
+    fs::write(
+        &registry_path,
+        serde_json::to_vec_pretty(&registry).unwrap(),
+    )
+    .unwrap();
+
+    let server_label = remuda_native::cluster::node_label(&server_node.fingerprint());
+    let mut tui = RemoteTui::start(&client_node, None);
+    tui.wait_for(&server_label, Duration::from_secs(10));
+    tui.writer.write_all(b"\x1b[B\x1b[C").unwrap();
+    tui.wait_for("proof", Duration::from_secs(10));
+    tui.writer.write_all(b"\x1b[B\r").unwrap();
+    tui.wait_for("remote live · reachable", Duration::from_secs(10));
+    tui.wait_for(&format!("$ {server_label}/proof>"), Duration::from_secs(3));
+    tui.writer.write_all(b"\x1c").unwrap();
+    tui.writer.write_all(b"k").unwrap();
+    tui.wait_for(
+        &format!("KEYS {server_label}/proof · Ctrl-\\ back"),
+        Duration::from_secs(3),
+    );
+
+    let output_start = tui.output_len();
+    tui.writer.write_all(b"y").unwrap();
+    tui.wait_for_from(output_start, "got=y", Duration::from_secs(10));
+    let output_start = tui.output_len();
+    tui.writer.write_all(b"\x1b").unwrap();
+    tui.wait_for_from(output_start, "got=esc", Duration::from_secs(10));
+    let output_start = tui.output_len();
+    tui.writer.write_all(b"\x03").unwrap();
+    tui.wait_for_from(output_start, "got=ctrl-c", Duration::from_secs(10));
 }
 
 #[test]
