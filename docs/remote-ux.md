@@ -6,25 +6,33 @@ The approved command tree is `remuda cluster init`, `remuda cluster join <line>`
 
 ## Journey 0: form a cluster
 
-On the first machine, initialize a cluster of one. `remuda cluster init` creates the node key pair and starts the cluster endpoint on the VPN address. Bare `remuda cluster` shows cluster status after initialization, or the init hint when no cluster exists. Initialization prints the address, public-key fingerprint, and a short-lived, single-use join line:
+On the first machine, initialize a cluster of one. `remuda cluster init` creates the node key pair. Bare `remuda cluster` shows cluster status after initialization, or the init hint when no cluster exists. Initialization prints the node and public-key fingerprint, then points to the next step. Invite prints one complete command to paste on the other machine:
 
 ```text
 $ remuda cluster init
 Cluster initialized
 Node: studio
-Address: 100.80.0.12:7443
 Fingerprint: SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=
-Join line (expires in 10 minutes; single use):
-remuda-join://100.80.0.12:7443?fingerprint=SHA256%3AQmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU%3D&token=eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu
+Next: remuda cluster invite (on this machine), or join an existing cluster with the command another machine's invite prints.
+
+$ remuda cluster invite --bind 100.80.0.12:7443
+Invitation for one machine, valid 10 minutes. Run this on the other machine:
+
+  remuda cluster join 'SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=' 'remuda-join-v1 100.80.0.12:7443 SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= a2V5LWV4YW1wbGU= eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
+
+Fingerprint of this machine: SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= (the other machine must show the same one)
+
+Next: after it joins, run `remuda cluster nodes` here to see it.
 ```
 
-The operator shares the join line with the intended machine over a trusted channel. The line is a bearer secret: it is shown once, expires quickly, and is consumed once. On the joining machine, run `remuda cluster join <line>` with the received line. The first node's fingerprint is pinned before the secure channel is established, then the joiner registers its own public key. No public discovery or NAT traversal is implied; both nodes are expected to reach one another on the same VPN.
+The operator shares the printed command with the intended machine over a trusted channel. Its invitation expires in 10 minutes and can be used once. Before accepting the join, compare the separately printed fingerprint with `remuda cluster` on the inviting machine over an independent channel or screen. The fingerprint copied inside the join command is not an independent trust check. The joiner then registers its own public key. No public discovery or NAT traversal is implied; both nodes are expected to reach one another on the same VPN.
 
 ```text
-$ remuda cluster join 'remuda-join://100.80.0.12:7443?fingerprint=SHA256%3AQmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU%3D&token=eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
-Pinned cluster node fingerprint verified
+$ remuda cluster join 'SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=' 'remuda-join-v1 100.80.0.12:7443 SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU= a2V5LWV4YW1wbGU= eyJleGFtcGxlLW9uZS10aW1lLXRva2Vu'
+Invitation fingerprint matches its included public key
 Joining cluster…
 Joined cluster as node: field-laptop
+Next: remuda cluster remote
 ```
 
 Every member knows the public keys of every cluster member through a replicated, signed `authorized_nodes` list. Any member can admit or revoke a node; membership changes are pushed to peers, and nodes fetch the current list at startup. Operators can inspect membership and revoke a node key from any member:
@@ -206,7 +214,7 @@ the bounded input path.
 
 - The allowlisted request front comes first, initially on a local socket. It exposes only the operations required by this UX; never forward the general daemon protocol or arbitrary Lua remotely. The network listener is a later layer over that restricted front.
 - If the listener needs TCP, allow exactly one scoped clippy TCP-ban exception in its module (`#[allow]` at that module), with a `clippy.toml` and documentation note that names #191. Bind only to the configured VPN address; never default to `0.0.0.0`. Start the listener only after `remuda cluster init`.
-- Join commands pin the first node’s key fingerprint and carry a one-time, expiring token that authorizes the joining node. Subsequent requests authenticate with registered node keys. Revoking a node key immediately rejects its later requests.
+- The invite output carries a one-time, expiring token and prints the first node’s fingerprint separately for comparison with `remuda cluster` on the inviting machine. The copied fingerprint in the join command is not an independent trust check. Subsequent requests authenticate with registered node keys. Revoking a node key immediately rejects its later requests.
 
 ## Prior art
 
@@ -220,14 +228,14 @@ These references inform the user experience and trust boundaries; they are patte
 
 ### Cluster joining and identity
 
-- [kubeadm join](https://kubernetes.io/docs/reference/setup-tools/kubeadm/kubeadm-join/) puts a bootstrap token and `--discovery-token-ca-cert-hash` pin in one copyable command. Borrow the one-line join UX and the rule that a token alone must not establish trust in an unknown server. Remuda pins the node fingerprint before using the one-time token; do not offer an unsafe skip-verification switch.
+- [kubeadm join](https://kubernetes.io/docs/reference/setup-tools/kubeadm/kubeadm-join/) puts a bootstrap token and `--discovery-token-ca-cert-hash` pin in one copyable command. Borrow the one-line join UX and the rule that a token alone must not establish trust in an unknown server. Remuda asks the operator to compare the separately printed node fingerprint with `remuda cluster` on the inviting machine before accepting; do not offer an unsafe skip-verification switch.
 - [K3s](https://docs.k3s.io/quick-start) makes joining a node a concise install command with `K3S_URL` and `K3S_TOKEN`. Borrow combining installation and joining in one pasteable line. Reject an unscoped, long-lived shared cluster secret; Remuda’s bootstrap token is one-use and expires, then the registered node key identifies that node.
 - [Tailscale auth keys and node keys](https://tailscale.com/docs/features/access-control/auth-keys) distinguish a provisioning credential from the key a node uses afterward, and surface key expiry/revocation. [Headscale pre-auth keys](https://headscale.net/stable/ref/registration/) also default to one use and a limited lifetime. Borrow separate one-time join credentials, node identity, expiry, and a visible revoke action. Do not assume VPN membership alone grants Remuda session access; the Remuda node registry still authorizes requests.
-- [Nebula](https://nebula.defined.net/docs/guides/quick-start/) uses CA-signed host certificates with host names, addresses, and groups, plus lighthouses for discovery. Borrow human-readable node identities and explicit membership. Reject making a CA ceremony, lighthouse, NAT traversal, or discovery service a prerequisite: this first cluster assumes VPN reachability and pins its first node directly.
+- [Nebula](https://nebula.defined.net/docs/guides/quick-start/) uses CA-signed host certificates with host names, addresses, and groups, plus lighthouses for discovery. Borrow human-readable node identities and explicit membership. Reject making a CA ceremony, lighthouse, NAT traversal, or discovery service a prerequisite: this first cluster assumes VPN reachability and an out-of-band fingerprint comparison with the inviting machine.
 - [Syncthing](https://docs.syncthing.net/users/security) turns a certificate fingerprint into a human-friendly Device ID and requires peers to know/approve device identities; its [introducer](https://docs.syncthing.net/users/introducer.html) can propagate new devices. Borrow a short identity label backed by a fingerprint and a visible node list. Do not silently trust transitive introductions: every Remuda node join is explicit, and revocation names the affected node.
-- [Magic Wormhole](https://magic-wormhole.readthedocs.io/en/latest/welcome.html) uses a one-time, human-sized PAKE code to establish a protected transfer. Borrow short-lived, single-use bootstrap material and clear expiry errors. Remuda’s join command also pins the first node’s fingerprint; do not rely on a short code alone to authenticate the cluster or add a public mailbox/relay service to this VPN-first UX.
+- [Magic Wormhole](https://magic-wormhole.readthedocs.io/en/latest/welcome.html) uses a one-time, human-sized PAKE code to establish a protected transfer. Borrow short-lived, single-use bootstrap material and clear expiry errors. Remuda prints the first node’s fingerprint separately for an out-of-band comparison; do not rely on the copied command or a short code alone to authenticate the cluster or add a public mailbox/relay service to this VPN-first UX.
 - [WireGuard](https://www.wireguard.com/protocol/) demonstrates the Noise IK handshake with static peer keys; the [Noise Protocol Framework](https://www.noiseprotocol.org/) provides reviewed protocol patterns. Borrow established handshake primitives and pinned node keys. Do not invent cryptographic primitives or treat an encrypted channel as authorization: the request allowlist, node registry, and revocation checks remain required.
-- [OpenSSH known_hosts and authorized_keys](https://man.openbsd.org/ssh) make host-key checking and an operator-managed authorized-key list familiar. Borrow a displayed, pinned fingerprint and a registry with explicit revocation. Reject SSH as the remote transport for this design, and never silently accept a changed key (TOFU); a mismatch stops the join with an actionable error.
+- [OpenSSH known_hosts and authorized_keys](https://man.openbsd.org/ssh) make host-key checking and an operator-managed authorized-key list familiar. Borrow a displayed fingerprint checked against the inviting machine and a registry with explicit revocation. Reject SSH as the remote transport for this design, and never silently accept a changed key (TOFU); a mismatch stops the join with an actionable error.
 
 ### Tree navigation prior art
 
