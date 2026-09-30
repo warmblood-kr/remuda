@@ -637,7 +637,7 @@ impl ClusterUi {
         );
         frame.extend(notice_lines);
         frame.extend(queue_rows.into_iter().rev().map(queue_line));
-        self.append_footer(&mut frame);
+        self.append_footer(&mut frame, width);
         frame
             .into_iter()
             .map(|line| truncate(&line, width))
@@ -694,8 +694,8 @@ impl ClusterUi {
             .map_or_else(Vec::new, |(notice, _)| wrap_to_two_lines(notice, width))
     }
 
-    fn append_footer(&self, frame: &mut Vec<String>) {
-        if let Some(prompt) = self.confirmation.prompt() {
+    fn append_footer(&self, frame: &mut Vec<String>, width: usize) {
+        if let Some(prompt) = self.confirmation.prompt(width) {
             frame.push(prompt);
         } else if self.remote_active.is_some() && self.composer_focused {
             frame.push(self.composer_line());
@@ -2363,6 +2363,30 @@ mod tests {
     }
 
     #[test]
+    fn close_prompt_keeps_choices_visible_at_40_columns() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let clock = ManualClock::new();
+        let mut snapshot = remote_snapshot(
+            RemoteState::Reachable,
+            Duration::ZERO,
+            Some(remote_screen("remote")),
+        );
+        snapshot.nodes[0].name = "laptop-with-a-very-long-name".into();
+        let mut ui = ClusterUi::new("studio", sessions(), clock.now());
+        ui.remote_synced(&FakeRemoteSource(Mutex::new(snapshot)));
+        ui.remote_input_enabled = true;
+        ui.select_target(Some("fp-laptop/build")).unwrap();
+        key_event(&mut ui, KeyCode::Char('x'), KeyModifiers::NONE, clock.now());
+
+        let frame = ui.render(40, 24, "", &clock);
+        let prompt = frame.lines().last().expect("close prompt is rendered");
+        assert!(prompt.ends_with("y / n"), "prompt lost choices: {prompt:?}");
+        assert!(prompt.contains('…'), "long target should be elided: {prompt:?}");
+        assert!(prompt.chars().count() <= 40, "prompt too wide: {prompt:?}");
+    }
+
+    #[test]
     fn keys_mode_capture_disables_on_ctrl_backslash_and_session_loss() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
@@ -3417,7 +3441,7 @@ mod tests {
         let (mut ui, _, _) = make_ui();
         ui.key(crossterm::event::KeyCode::Char('x'));
         assert!(
-            ui.confirmation.prompt().is_some(),
+            ui.confirmation.prompt(40).is_some(),
             "x should start close confirmation"
         );
 

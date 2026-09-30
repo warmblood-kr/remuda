@@ -1,4 +1,5 @@
 use crossterm::event::KeyCode;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 #[derive(Default)]
 pub struct Confirmation {
@@ -16,10 +17,34 @@ impl Confirmation {
         self.target = Some((name, instance_id));
     }
 
-    pub fn prompt(&self) -> Option<String> {
-        self.target
-            .as_ref()
-            .map(|(name, _)| format!("kill {name}? it is running — y / n"))
+    pub fn prompt(&self, width: usize) -> Option<String> {
+        self.target.as_ref().map(|(name, _)| {
+            let prefix = "kill ";
+            let suffix = "? y / n";
+            let available = width.saturating_sub(
+                UnicodeWidthStr::width(prefix) + UnicodeWidthStr::width(suffix),
+            );
+            let name_width = UnicodeWidthStr::width(name.as_str());
+            let target = if name_width <= available {
+                name.clone()
+            } else if available == 0 {
+                String::new()
+            } else {
+                let mut target = String::new();
+                let mut used = 0;
+                for ch in name.chars() {
+                    let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if used + ch_width + 1 > available {
+                        break;
+                    }
+                    target.push(ch);
+                    used += ch_width;
+                }
+                target.push('…');
+                target
+            };
+            format!("{prefix}{target}{suffix}")
+        })
     }
 
     pub fn handle(&mut self, key: KeyCode) -> Option<Decision> {
@@ -42,8 +67,8 @@ mod tests {
         let mut confirmation = Confirmation::default();
         confirmation.begin("dev".into(), "instance-1".into());
         assert_eq!(
-            confirmation.prompt().as_deref(),
-            Some("kill dev? it is running — y / n")
+            confirmation.prompt(80).as_deref(),
+            Some("kill dev? y / n")
         );
         assert_eq!(
             confirmation.handle(KeyCode::Char('y')),
