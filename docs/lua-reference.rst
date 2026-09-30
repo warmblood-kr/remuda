@@ -174,7 +174,7 @@ hooks
 http
 ----
 
-``http.request(options) -> {cancel()}`` — Start bounded HTTP requests; pin_only = true on http.request or http.peer_certificate replaces chain validation while preserving hostname, validity-date, and TLS signature checks. A valid SPKI pin and HTTPS are required; plain pin remains additive, and ca_file does not contribute chain trust in pin-only mode.
+``http.request(options) -> {cancel()}`` — Start an asynchronous bounded HTTP request; completion is delivered on the Lua image queue. pin_only must be a boolean; when true on http.request or http.peer_certificate, it replaces chain validation while preserving hostname, validity-date, and TLS signature checks. A valid SPKI pin and HTTPS are required; plain pin remains additive, and ca_file does not contribute chain trust in pin-only mode.
 
 input
 -----

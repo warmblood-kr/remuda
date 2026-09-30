@@ -1372,7 +1372,15 @@ fn tls_options(
 ) -> mlua::Result<(Option<String>, Option<String>, bool)> {
     let ca_file = options.get::<Option<String>>("ca_file")?;
     let pin = options.get::<Option<String>>("pin")?;
-    let pin_only = options.get::<Option<bool>>("pin_only")?.unwrap_or(false);
+    let pin_only = match options.get::<mlua::Value>("pin_only")? {
+        mlua::Value::Nil => false,
+        mlua::Value::Boolean(value) => value,
+        _ => {
+            return Err(mlua::Error::runtime(format!(
+                "{api} pin_only must be a boolean.\nNext: set pin_only to true or false"
+            )));
+        }
+    };
     if pin_only {
         let Some(value) = pin.as_deref() else {
             return Err(mlua::Error::runtime(pin_only_error(api)));
@@ -2138,6 +2146,36 @@ mod tests {
             listener.accept().is_err(),
             "pin_only without pin must not connect"
         );
+    }
+
+    #[test]
+    fn pin_only_lua_option_requires_boolean_for_both_apis() {
+        let socket = std::env::temp_dir().join(format!(
+            "unused-http-pin-only-type-image-{}",
+            std::process::id()
+        ));
+        let image = crate::image::Image::spawn(
+            &socket,
+            std::sync::Arc::new(remuda_core::Registry::new()),
+            std::sync::Arc::new(crate::tick::Counters::default()),
+        );
+        let pin = pin_of(include_str!("testdata/selfsigned-ca.pem"));
+        for api in ["request", "peer_certificate"] {
+            let name = format!("http.{api}");
+            for value in ["'false'", "0"] {
+                let code = if api == "request" {
+                    format!(
+                        "local ok, err = pcall(function() remuda.http.request{{method='GET', url='https://127.0.0.1:1/', timeout=1, pin='{pin}', pin_only={value}, callback=function() end}} end); assert(not ok, 'http.request accepted non-boolean pin_only'); assert(tostring(err):find('{name}', 1, true), tostring(err)); assert(tostring(err):find('must be a boolean', 1, true), tostring(err)); assert(tostring(err):find('Next:', 1, true), tostring(err)); return true"
+                    )
+                } else {
+                    format!(
+                        "local ok, err = pcall(function() remuda.http.peer_certificate{{url='https://127.0.0.1:1/', timeout=1, pin='{pin}', pin_only={value}, callback=function() end}} end); assert(not ok, 'http.peer_certificate accepted non-boolean pin_only'); assert(tostring(err):find('{name}', 1, true), tostring(err)); assert(tostring(err):find('must be a boolean', 1, true), tostring(err)); assert(tostring(err):find('Next:', 1, true), tostring(err)); return true"
+                    )
+                };
+                assert_eq!(image.eval(&code, None).unwrap(), "true");
+            }
+        }
+        image.stop_for_test();
     }
 
     #[test]
