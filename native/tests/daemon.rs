@@ -1373,15 +1373,20 @@ fn attach_input_stall_drop_recovers_after_the_child_resumes_reading() {
         held.write_raw(barrier)
             .expect("send one ordered drain barrier after the child read total stabilizes");
         let enqueue_deadline = Instant::now() + Duration::from_secs(3);
-        while !barrier_result_path.exists() {
+        let barrier_result = loop {
+            if let Ok(result) = std::fs::read_to_string(&barrier_result_path) {
+                if !result.is_empty() {
+                    break result;
+                }
+            }
             assert!(
                 Instant::now() < enqueue_deadline,
                 "attach key pump did not classify the single drain barrier"
             );
             std::thread::sleep(Duration::from_millis(20));
-        }
+        };
         assert_eq!(
-            std::fs::read_to_string(&barrier_result_path).unwrap(),
+            barrier_result,
             "queued",
             "recovered attach queue dropped the single drain barrier"
         );
