@@ -609,6 +609,10 @@ fn close_is_refused_while_attached_and_the_session_survives() {
         "tearing the pty out from under an attached human is worse than \
          making them detach first"
     );
+    assert_eq!(
+        AgentError::Attached.to_string(),
+        "a human is attached to this session; detach it first (Ctrl-\\ in that terminal), then retry"
+    );
     assert!(
         alive.load(Ordering::SeqCst),
         "a refused close must not have touched the process"

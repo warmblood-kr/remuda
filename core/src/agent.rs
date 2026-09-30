@@ -232,7 +232,10 @@ impl fmt::Display for AgentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AgentError::Exited => write!(f, "agent process has exited"),
-            AgentError::Attached => write!(f, "a human is attached to this session"),
+            AgentError::Attached => write!(
+                f,
+                "a human is attached to this session; detach it first (Ctrl-\\ in that terminal), then retry"
+            ),
             AgentError::Busy => write!(f, "a session input write is already in flight"),
             AgentError::WriteTimeout { timeout } => {
                 write!(
