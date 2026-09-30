@@ -1,10 +1,11 @@
 # remuda installer for Windows — also the upgrader. `remuda upgrade` re-runs
 # this exact script, so there is one download-and-verify path rather than two.
 #
-#   irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
+#   $env:REMUDA_CHANNEL='nightly'; $env:REMUDA_INSTALL_BUTLER='1'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
 #
 #   $env:REMUDA_CHANNEL     stable|nightly  default: the channel already installed, else stable
 #   $env:REMUDA_INSTALL_DIR <dir>           default: ~\.local\bin
+#   $env:REMUDA_INSTALL_BUTLER=1            also install warmblood-kr/remuda-butler
 #
 # This mirrors docs/install.sh: resolve the channel version first, then verify
 # its checksum before installing the binary.
