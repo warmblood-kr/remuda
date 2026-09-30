@@ -108,6 +108,14 @@ fn start_daemon(scratch: &Scratch) -> TrackedChild {
     daemon
 }
 
+fn wait_until_child_exits(child: &mut std::process::Child, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while child.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "child did not exit in time");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn golden(name: &str, output: &Output, root: &Path) {
     // REMUDA_BLESS_GOLDEN=1 rewrites fixtures; the default path compares only.
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden/cluster");
@@ -1119,6 +1127,106 @@ fn d4_failed_join_turns_off_a_listener_enabled_by_the_join_command() {
         remuda_native::cluster::listener_control::status(&daemon_path),
         ListenerStatus::Off,
         "failed join left its newly enabled listener running"
+    );
+}
+
+#[test]
+fn d4_sigint_during_join_restores_listener_config_and_exits_130() {
+    use remuda_core::protocol::ListenerStatus;
+    use remuda_native::cluster::{encoding, join_line::JoinLine, listener_config};
+    use std::process::Stdio;
+    use zeroize::Zeroizing;
+
+    struct ChildGuard(Option<std::process::Child>);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(child) = self.0.as_mut() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let scratch = Scratch::new();
+    let _daemon = initialized_node(&scratch);
+    let cluster_dir = scratch.root.join("state/remuda/cluster");
+    let saved_config = listener_config::read_at(&cluster_dir).unwrap();
+    assert!(matches!(saved_config, Some(ref config) if !config.enabled));
+
+    let fake_issuer = TcpListener::bind("127.0.0.1:0").expect("bind fake issuer");
+    fake_issuer.set_nonblocking(true).unwrap();
+    let issuer_addr = fake_issuer.local_addr().unwrap();
+    let key = fs::read(scratch.root.join("state/remuda/cluster/identity.key")).unwrap();
+    let issuer_public: [u8; 32] = key[32..].try_into().unwrap();
+    let fingerprint = encoding::fingerprint(&issuer_public);
+    let invitation = JoinLine {
+        issuer_addr,
+        issuer_fingerprint: fingerprint.clone(),
+        issuer_static_pubkey: issuer_public,
+        token: Zeroizing::new(encoding::encode_base64(&[7; 32])),
+    }
+    .encode()
+    .unwrap();
+    let (connected_tx, connected_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            match fake_issuer.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "join did not connect to fake issuer"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("fake issuer accept failed: {error}"),
+            }
+        };
+        connected_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        drop(stream);
+    });
+    let bind_addr = unused_loopback_addr().to_string();
+    let child = scratch
+        .command(&[
+            "cluster",
+            "join",
+            &fingerprint,
+            &invitation,
+            "--bind",
+            &bind_addr,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start isolated join command");
+    let mut child = ChildGuard(Some(child));
+    connected_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("join never connected to fake issuer");
+    let child_pid = child.0.as_ref().unwrap().id() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(child_pid, libc::SIGINT) }, 0);
+    wait_until_child_exits(child.0.as_mut().unwrap(), Duration::from_secs(3));
+    let output = child.0.take().unwrap().wait_with_output().unwrap();
+    release_tx.send(()).unwrap();
+    server.join().unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Join cancelled."), "{stderr}");
+    assert!(stderr.contains("Next:"), "{stderr}");
+    assert_eq!(
+        listener_config::read_at(&cluster_dir).unwrap(),
+        saved_config
+    );
+    assert_eq!(
+        remuda_native::cluster::listener_control::status(&remuda_native::daemon::socket_path_in(
+            &scratch.runtime,
+            &scratch.name
+        )),
+        ListenerStatus::Off
     );
 }
 
