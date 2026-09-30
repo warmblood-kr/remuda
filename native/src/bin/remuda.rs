@@ -316,6 +316,7 @@ remuda — terminal orchestration for coding agents
   remuda --version
 
 Run `remuda mod list` for installed mods and `remuda doc` for the live Lua API.
+Next: run `remuda run -n NAME COMMAND` to start a session, or `remuda ls` to inspect sessions.
 ";
 
 const UPGRADE_HELP: &str = "\
