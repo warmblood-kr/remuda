@@ -314,9 +314,9 @@ fn help_command() -> ExitCode {
                 .filter_map(|mod_spec| mod_spec.command)
                 .collect();
             if !commands.is_empty() {
-                eprintln!("Installed mod commands:");
+                println!("Installed mod commands:");
                 for command in commands {
-                    eprintln!("  remuda {command} [--agent AGENT] [--headless]");
+                    println!("  remuda {command} [--agent AGENT] [--headless]");
                 }
             }
             ExitCode::SUCCESS
@@ -347,12 +347,18 @@ fn suggest_command(word: &str) -> Option<String> {
         "run", "attach", "ls", "send", "resize", "stop", "mod", "doc", "repl", "lua", "exec",
         "mcp", "upgrade", "cluster",
     ];
-    TOP_LEVEL_VERBS
+    closest_word(word, TOP_LEVEL_VERBS).map(str::to_owned)
+}
+
+fn closest_word<'a>(word: &str, candidates: &[&'a str]) -> Option<&'a str> {
+    let word_length = word.chars().count();
+    candidates
         .iter()
-        .map(|candidate| (levenshtein(word, candidate), *candidate))
-        .filter(|(distance, _)| *distance <= 2)
+        .copied()
+        .map(|candidate| (levenshtein(word, candidate), candidate))
+        .filter(|(distance, _)| *distance <= 2 && *distance < word_length)
         .min_by_key(|(distance, candidate)| (*distance, *candidate))
-        .map(|(_, candidate)| candidate.to_string())
+        .map(|(_, candidate)| candidate)
 }
 
 fn levenshtein(left: &str, right: &str) -> usize {
@@ -2894,6 +2900,14 @@ mod tests {
     fn suggest_command_uses_distance_for_top_level_verbs() {
         assert_eq!(suggest_command("atach").as_deref(), Some("attach"));
         assert_eq!(suggest_command("zzzz"), None);
+    }
+
+    #[test]
+    fn closest_word_uses_a_shorter_distance_and_breaks_ties_by_name() {
+        assert_eq!(closest_word("x", &["ls"]), None);
+        assert_eq!(closest_word("atach", &["attach"]), Some("attach"));
+        assert_eq!(closest_word("cot", &["cut", "bot"]), Some("bot"));
+        assert_eq!(suggest_command("nodes"), Some("cluster nodes".into()));
     }
 
     #[test]

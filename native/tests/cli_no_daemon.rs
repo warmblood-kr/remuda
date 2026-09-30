@@ -105,10 +105,22 @@ fn unrelated_unknown_verb_gets_concise_help() {
 #[test]
 fn help_flags_write_usage_to_stdout() {
     let dir = scratch("help-output");
+    let mod_dir = dir.join("data/remuda/mods/probe");
+    std::fs::create_dir_all(&mod_dir).unwrap();
+    std::fs::write(
+        mod_dir.join("extension.toml"),
+        "name = \"probe\"\nentry = \"packages/probe/init.lua\"\napi = \"remuda-lua-v1\"\ncommand = \"probe\"\n",
+    )
+    .unwrap();
     for args in [&["help"][..], &["--help"], &["-h"]] {
         let out = remuda(&dir, args);
         assert!(out.status.success(), "{args:?}: {out:?}");
         assert!(String::from_utf8_lossy(&out.stdout).contains("terminal orchestration"));
+        assert!(
+            String::from_utf8_lossy(&out.stdout)
+                .contains("Installed mod commands:\n  remuda probe"),
+            "{args:?}: {out:?}"
+        );
         assert!(out.stderr.is_empty(), "{args:?}: {out:?}");
     }
     let _ = std::fs::remove_dir_all(dir);
