@@ -986,6 +986,11 @@ fn authorize_remote_request_with_control(
         }
         _ => {}
     }
+    // Listener lifecycle is a local daemon operation. Even an admitted peer
+    // must not be able to query or reconfigure this node's task.
+    if matches!(request, Request::ClusterListener(_)) {
+        return Err(Response::error("remote front refuses ClusterListener"));
+    }
     // Registry replication is a cluster-listener protocol operation handled
     // directly by dispatch_payload. It is intentionally unavailable through
     // the local remote-control front, whose allowlist serves a different API.
@@ -2502,6 +2507,49 @@ mod tests {
         assert_eq!(
             authorize_remote_request_with_control(&input, false),
             Err(Response::RemoteControlDisabled)
+        );
+    }
+
+    #[test]
+    fn admitted_network_peer_cannot_control_the_local_listener() {
+        use crate::cluster::{AuthorizedNode, NodeState, Registry};
+
+        let pair = snow::Builder::new("Noise_IK_25519_ChaChaPoly_SHA256".parse().unwrap())
+            .generate_keypair()
+            .unwrap();
+        let fingerprint = crate::cluster::encoding::fingerprint(&pair.public);
+        let registry = Registry {
+            authorized_nodes: vec![AuthorizedNode {
+                node_fp: fingerprint.clone(),
+                static_pubkey: crate::cluster::encoding::encode_base64(&pair.public),
+                delivered_by: None,
+                format_major: 1,
+                format_minor: 0,
+                optional_fields: std::collections::BTreeMap::new(),
+                endpoint: None,
+                state: NodeState::Admitted,
+                version: 1,
+                by: fingerprint,
+            }],
+        };
+        assert!(authorize_key_in_registry(&registry, &pair.public).is_ok());
+
+        let request = Request::ClusterListener(remuda_core::protocol::ListenerOp::Status);
+        let payload = serde_json::to_vec(&request).unwrap();
+        let network_response = dispatch_payload(
+            &payload,
+            &pair.public,
+            Path::new("unused-local-daemon.sock"),
+            &RequestLimiter::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Response>(&network_response).unwrap(),
+            Response::error("remote front refuses ClusterListener")
+        );
+        assert_eq!(
+            authorize_remote_request_with_source(&request, &ControlSource::DefaultStateDir),
+            Err(Response::error("remote front refuses ClusterListener"))
         );
     }
 

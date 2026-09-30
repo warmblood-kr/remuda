@@ -236,9 +236,11 @@ fn call_response(id: Value, response: Response) -> String {
                 "applied"
             }),
         ),
-        Response::ClusterRegistryPage { .. } | Response::ClusterRegistryAck { .. } => ok_reply(
+        Response::ClusterRegistryPage { .. }
+        | Response::ClusterRegistryAck { .. }
+        | Response::ClusterListenerStatus(_) => ok_reply(
             id,
-            tool_error("cluster registry responses are not exposed over MCP"),
+            tool_error("cluster control responses are not exposed over MCP"),
         ),
         Response::Sessions(sessions) => ok_reply(id, sessions_text(sessions)),
         response @ (Response::Uncertain

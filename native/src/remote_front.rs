@@ -274,6 +274,7 @@ pub fn authorize(request: &Request) -> Result<(), String> {
         Request::Version => Err(refusal("Version")),
         Request::ClusterRegistrySync { .. } => Err(refusal("ClusterRegistrySync")),
         Request::ClusterRegistryUpdate { .. } => Err(refusal("ClusterRegistryUpdate")),
+        Request::ClusterListener(_) => Err(refusal("ClusterListener")),
         Request::Shutdown { .. } => Err(refusal("Shutdown")),
         Request::Eval { .. } => Err(refusal("Eval")),
     }
@@ -441,6 +442,7 @@ mod tests {
             Request::ClusterRegistryUpdate {
                 update_json: "private-registry-update".into(),
             },
+            Request::ClusterListener(remuda_core::protocol::ListenerOp::Status),
             Request::Shutdown {
                 requester_daemon_id: None,
                 requester_session_id: None,
@@ -487,6 +489,13 @@ mod tests {
             })
             .unwrap_err(),
             "remote front refuses ClusterRegistryUpdate"
+        );
+        assert_eq!(
+            authorize(&Request::ClusterListener(
+                remuda_core::protocol::ListenerOp::Reload
+            ))
+            .unwrap_err(),
+            "remote front refuses ClusterListener"
         );
     }
 

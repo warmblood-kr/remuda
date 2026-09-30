@@ -25,7 +25,8 @@ use interprocess::local_socket::traits::Stream as LocalStream;
 #[cfg(unix)]
 use interprocess::local_socket::ListenerNonblockingMode;
 use remuda_core::agent::Result as AgentResult;
-use remuda_core::protocol::{collapse_runs, Request, Response, StyledScreen};
+pub use remuda_core::protocol::ListenerStatus;
+use remuda_core::protocol::{collapse_runs, ListenerOp, Request, Response, StyledScreen};
 use remuda_core::{Clock, Registry, Session, Size};
 use std::collections::HashMap;
 use std::io::{BufReader, Read, Write};
@@ -268,7 +269,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
     #[cfg(unix)]
     let listener = prepare_unix_listener(listener, path)?;
     let anti_entropy = Arc::new(AntiEntropyTask::start()?);
-    let listener_task = Arc::new(ListenerTask::start(path));
+    let listener_task = Arc::new(DaemonListenerControl::new(ListenerTask::start(path)));
     let socket_owner = Arc::new(SocketOwnership::capture(path)?);
 
     let registry = Arc::new(Registry::new());
@@ -308,11 +309,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
             registry,
             image,
             counters,
-            (
-                socket_owner,
-                anti_entropy,
-                Arc::clone(&listener_task.status),
-            ),
+            (socket_owner, anti_entropy, Arc::clone(&listener_task)),
         );
     }
     #[cfg(windows)]
@@ -324,7 +321,7 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
             let counters = Arc::clone(&counters);
             let socket_owner = Arc::clone(&socket_owner);
             let anti_entropy = anti_entropy.clone();
-            let listener_status = Arc::clone(&listener_task.status);
+            let listener_task = Arc::clone(&listener_task);
             std::thread::spawn(move || {
                 let _ = handle(
                     stream,
@@ -333,11 +330,15 @@ fn serve_inner(path: &Path, runtime: Option<&Path>) -> std::io::Result<()> {
                     &counters,
                     socket_owner,
                     anti_entropy,
-                    listener_status,
+                    listener_task,
                 );
             });
         }
-        listener_task.stop_and_join();
+        listener_task
+            .task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .stop_and_join();
         anti_entropy.stop_and_join();
         socket_owner.cleanup();
         Ok(())
@@ -420,19 +421,10 @@ fn anti_entropy_interval() -> Duration {
     Duration::from_secs(60 + u64::from(std::process::id() % 11))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ListenerStatus {
-    Off,
-    On {
-        addr: std::net::SocketAddr,
-        auto: bool,
-    },
-    Failed(String),
-}
-
 const LISTENER_HOST_LOCK_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct ListenerTask {
+    daemon_path: PathBuf,
     status: Arc<Mutex<ListenerStatus>>,
     stop: std::sync::mpsc::Sender<()>,
     thread: Mutex<Option<JoinHandle<()>>>,
@@ -446,15 +438,24 @@ impl ListenerTask {
     fn start_with_retry_interval(daemon_path: &Path, retry_interval: Duration) -> Self {
         let status = Arc::new(Mutex::new(ListenerStatus::Off));
         let (stop, stopped) = std::sync::mpsc::channel();
+        let (ready, startup) = std::sync::mpsc::channel();
         let status_for_thread = Arc::clone(&status);
         let daemon_path = daemon_path.to_path_buf();
+        let thread_path = daemon_path.clone();
+        let ready_on_error = ready.clone();
         let thread = std::thread::Builder::new()
             .name("remuda-cluster-listener".into())
             .spawn(move || {
-                let result =
-                    start_listener(&daemon_path, &status_for_thread, stopped, retry_interval);
+                let result = start_listener(
+                    &thread_path,
+                    &status_for_thread,
+                    stopped,
+                    retry_interval,
+                    &ready,
+                );
                 if let Err(reason) = result {
                     set_listener_status(&status_for_thread, ListenerStatus::Failed(reason));
+                    let _ = ready_on_error.send(());
                 }
             });
         let thread = match thread {
@@ -467,15 +468,35 @@ impl ListenerTask {
                 None
             }
         };
-        Self {
+        let started = thread.is_some();
+        let task = Self {
+            daemon_path,
             status,
             stop,
             thread: Mutex::new(thread),
+        };
+        if started {
+            match startup.recv_timeout(Duration::from_secs(30)) {
+                Ok(()) => {}
+                Err(error) => set_listener_status(
+                    &task.status,
+                    ListenerStatus::Failed(format!("listener startup did not finish: {error}")),
+                ),
+            }
         }
+        task
     }
 
     pub fn status(&self) -> ListenerStatus {
         listener_status(&self.status)
+    }
+
+    fn restart(&mut self) -> ListenerStatus {
+        let daemon_path = self.daemon_path.clone();
+        self.stop_and_join();
+        set_listener_status(&self.status, ListenerStatus::Off);
+        *self = Self::start(&daemon_path);
+        self.status()
     }
 
     fn stop_and_join(&self) {
@@ -497,6 +518,32 @@ impl Drop for ListenerTask {
     }
 }
 
+struct DaemonListenerControl {
+    task: Mutex<ListenerTask>,
+}
+
+impl DaemonListenerControl {
+    fn new(task: ListenerTask) -> Self {
+        Self {
+            task: Mutex::new(task),
+        }
+    }
+
+    fn status(&self) -> ListenerStatus {
+        self.task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .status()
+    }
+
+    fn reload(&self) -> ListenerStatus {
+        self.task
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .restart()
+    }
+}
+
 /// Read the listener's current daemon-owned status word.
 pub fn listener_status(status: &Arc<Mutex<ListenerStatus>>) -> ListenerStatus {
     status
@@ -514,12 +561,16 @@ fn start_listener(
     status: &Arc<Mutex<ListenerStatus>>,
     stopped: std::sync::mpsc::Receiver<()>,
     retry_interval: Duration,
+    ready: &std::sync::mpsc::Sender<()>,
 ) -> Result<(), String> {
     use crate::cluster::listener_config::ListenerBind;
 
     let config = match crate::cluster::listener_config::read() {
         Ok(Some(config)) if config.enabled => config,
-        Ok(_) => return Ok(()),
+        Ok(_) => {
+            let _ = ready.send(());
+            return Ok(());
+        }
         Err(error) => return Err(format!("read listener config: {error}")),
     };
     let (address, auto) = match config.bind {
@@ -540,6 +591,7 @@ fn start_listener(
                     status,
                     ListenerStatus::Failed("hosted by another daemon".into()),
                 );
+                let _ = ready.send(());
                 match stopped.recv_timeout(retry_interval) {
                     Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
@@ -565,6 +617,7 @@ fn start_listener(
                 auto,
             },
         );
+        let _ = ready.send(());
 
         let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let serve_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1070,13 +1123,13 @@ fn serve_unix(
     lifecycle: (
         Arc<SocketOwnership>,
         Arc<AntiEntropyTask>,
-        Arc<Mutex<ListenerStatus>>,
+        Arc<DaemonListenerControl>,
     ),
 ) -> ! {
     use std::io::Read as _;
     use std::os::fd::AsRawFd;
 
-    let (socket_owner, anti_entropy, listener_status) = lifecycle;
+    let (socket_owner, anti_entropy, listener_task) = lifecycle;
     let detached = unsafe { libc::getsid(0) == libc::getpid() };
     let mut signal_bytes = [0u8; 1];
     'poll_loop: loop {
@@ -1150,7 +1203,7 @@ fn serve_unix(
                     let counters = Arc::clone(&counters);
                     let socket_owner = Arc::clone(&socket_owner);
                     let anti_entropy = Arc::clone(&anti_entropy);
-                    let listener_status = Arc::clone(&listener_status);
+                    let listener_task = Arc::clone(&listener_task);
                     std::thread::spawn(move || {
                         let _ = handle(
                             stream,
@@ -1159,7 +1212,7 @@ fn serve_unix(
                             &counters,
                             socket_owner,
                             anti_entropy,
-                            listener_status,
+                            listener_task,
                         );
                     });
                 }
@@ -1313,7 +1366,7 @@ fn handle(
     counters: &crate::tick::Counters,
     socket_owner: Arc<SocketOwnership>,
     anti_entropy: Arc<AntiEntropyTask>,
-    listener_status: Arc<Mutex<ListenerStatus>>,
+    listener_task: Arc<DaemonListenerControl>,
 ) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let Some(request) = read_request(&stream, &mut reader)? else {
@@ -1328,7 +1381,7 @@ fn handle(
         image,
         socket_owner,
         anti_entropy,
-        listener_status,
+        listener_task,
         request,
     )
 }
@@ -1341,7 +1394,7 @@ fn handle_request(
     image: &Image,
     socket_owner: Arc<SocketOwnership>,
     anti_entropy: Arc<AntiEntropyTask>,
-    _listener_status: Arc<Mutex<ListenerStatus>>,
+    listener_task: Arc<DaemonListenerControl>,
     request: Request,
 ) -> std::io::Result<()> {
     match request {
@@ -1357,6 +1410,15 @@ fn handle_request(
         Request::ClusterRegistrySync { .. } | Request::ClusterRegistryUpdate { .. } => {
             refuse_cluster_registry(&stream)
         }
+
+        Request::ClusterListener(ListenerOp::Status) => reply(
+            &stream,
+            &Response::ClusterListenerStatus(listener_task.status()),
+        ),
+        Request::ClusterListener(ListenerOp::Reload) => reply(
+            &stream,
+            &Response::ClusterListenerStatus(listener_task.reload()),
+        ),
 
         request @ Request::Shutdown { .. } => {
             handle_shutdown(stream, registry, image, socket_owner, anti_entropy, request)
