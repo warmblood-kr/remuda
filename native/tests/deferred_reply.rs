@@ -98,9 +98,13 @@ remuda.extension_command("deferred", function(args)
       reply:resolve(0, string.rep("x", 16 * 1024 * 1024), "")
     end }
     return reply
-  elseif args[1] == "secret" then
+  elseif args[1] == "secret" or args[1] == "secret_session" then
     local reply = remuda.pending { timeout = 5 }
-    reply:prompt_secret { label = "deferred test secret", callback = function(secret, err)
+    local label = "deferred test secret"
+    if args[1] == "secret_session" then
+      label = "deferred " .. string.char(27) .. "test secret"
+    end
+    reply:prompt_secret { label = label, callback = function(secret, err)
       if err then
         reply:reject("secret prompt " .. err .. "\nNext: remuda deferred --password-file PATH")
       else
@@ -414,6 +418,107 @@ fn secret_prompt_non_tty_fallback_and_answer_do_not_leak() {
         stderr.lines().last(),
         Some("Next: remuda deferred --password-file PATH"),
         "non-TTY error must end with a concrete password-file Next line: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn session_secret_prompt_label_names_the_session_and_strips_controls() {
+    use remuda_core::protocol::{Request, Response, Step};
+    use remuda_core::Size;
+    use remuda_native::{client, daemon};
+    use std::time::{Duration, Instant};
+
+    let (dir, remuda) = fixture("secret_session_label");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+
+    let socket = daemon::socket_path_in(&dir, "s");
+    let session_name = "secret-label-session";
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let command = format!("sleep 0.2; \"{binary}\" -s s deferred secret_session");
+    assert_eq!(
+        client::request(
+            &socket,
+            &Request::New {
+                name: Some(session_name.into()),
+                command: vec!["sh".into(), "-c".into(), command],
+                size: Size::new(80, 24),
+                cwd: None,
+                env: None,
+            },
+        )
+        .expect("start secret-prompt session"),
+        Response::Value(session_name.into())
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let prompt_screen = loop {
+        let screen = match client::request(
+            &socket,
+            &Request::Capture {
+                name: session_name.into(),
+            },
+        ) {
+            Ok(Response::Screen(screen)) => screen,
+            other => panic!("capture failed: {other:?}"),
+        };
+        if screen.contains("deferred test secret") {
+            break screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "secret prompt did not appear:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    client::request(
+        &socket,
+        &Request::Feed {
+            name: session_name.into(),
+            steps: vec![Step::Burst(vec![b'\r'])],
+        },
+    )
+    .expect("submit empty secret answer");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let screen = match client::request(
+            &socket,
+            &Request::Capture {
+                name: session_name.into(),
+            },
+        ) {
+            Ok(Response::Screen(screen)) => screen,
+            other => panic!("capture failed: {other:?}"),
+        };
+        if screen.contains("secret accepted") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "secret reply did not finish:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = remuda(&["stop", "-f"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        prompt_screen.contains(session_name),
+        "session prompt label omitted its caller name:\n{prompt_screen}"
+    );
+    assert!(
+        prompt_screen.contains("deferred test secret"),
+        "sanitized label text was not visible:\n{prompt_screen}"
+    );
+    assert!(
+        !prompt_screen.contains('\x1b'),
+        "ESC remained in the terminal screen:\n{prompt_screen}"
     );
 }
 
