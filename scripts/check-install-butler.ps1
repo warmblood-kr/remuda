@@ -39,6 +39,30 @@ function tar {
     $global:LASTEXITCODE = 0
 }
 
+# Runs the installer with $onlyPath as the whole PATH. Its output comes back as
+# plain lines (no formatter to wrap a long one); a failure as its message.
+function Install-With($onlyPath) {
+    $env:PATH = $onlyPath
+    $result = @{ Failed = $null; Out = '' }
+    try {
+        $result.Out = (& { Get-Content -Raw $script | Invoke-Expression } 6>&1 | ForEach-Object { "$_" }) -join "`n"
+    } catch {
+        $result.Failed = "$_"
+    }
+    $result
+}
+function Hint-Lines($out) {
+    @($out -split "`r?`n" | Where-Object { $_ -like '*git*' -and $_ -like '*remuda mod install warmblood-kr/remuda-butler --force*' })
+}
+
+# A PATH with a git.exe on it, for the other side of the gate. It only has to
+# be found; nothing in this check lets the installer get as far as running it.
+$withGit = Join-Path $scratch 'path-with-git'
+New-Item -ItemType Directory -Force -Path $withGit | Out-Null
+$gitStub = Join-Path $withGit 'git.exe'
+Set-Content -Path $gitStub -Value 'not a real git'
+if ($env:OS -ne 'Windows_NT') { chmod +x $gitStub }
+
 $savedPath = $env:PATH
 $failures = @()
 try {
@@ -48,22 +72,21 @@ try {
     $env:XDG_DATA_HOME = Join-Path $scratch 'data'
     $env:REMUDA_NO_MODIFY_PATH = '1'
     $env:REMUDA_INSTALL_BUTLER = '1'
+
     # No git anywhere on PATH: an empty directory is all of it.
-    $env:PATH = $noGit
+    $without = Install-With $noGit
+    if ($without.Failed) { $failures += "without git: the install failed instead of finishing without the Butler mod: $($without.Failed)" }
+    if (-not (Test-Path (Join-Path $installDir 'remuda.exe'))) { $failures += "without git: remuda.exe was not installed" }
+    if ((Hint-Lines $without.Out).Count -ne 1) { $failures += "without git: no single line names git and the command to finish with" }
+    if ($without.Out -like '*Next: remuda butler doctor*') { $failures += "without git: it pointed at 'remuda butler doctor' though the Butler mod is not installed" }
 
-    $failed = $null
-    $out = try {
-        & { Get-Content -Raw $script | Invoke-Expression } 6>&1 | Out-String
-    } catch {
-        $failed = "$_"
-    }
+    # With git, the Butler step must be attempted, not explained away. The
+    # stand-in remuda.exe cannot run, so "attempted" shows up as a failure.
+    $with = Install-With $withGit
+    if (-not $with.Failed) { $failures += "with git: the Butler step was not attempted" }
+    if ((Hint-Lines $with.Out).Count -ne 0) { $failures += "with git: it still said git is missing" }
 
-    if ($failed) { $failures += "the install failed instead of finishing without the Butler mod: $failed" }
-    if (-not (Test-Path (Join-Path $installDir 'remuda.exe'))) { $failures += "remuda.exe was not installed" }
-    $hint = @($out -split "`r?`n" | Where-Object { $_ -like '*git*' -and $_ -like '*remuda mod install warmblood-kr/remuda-butler --force*' })
-    if ($hint.Count -ne 1) { $failures += "no single line names git and the command to finish with" }
-    if ($out -like '*Next: remuda butler doctor*') { $failures += "it pointed at 'remuda butler doctor' though the Butler mod is not installed" }
-    if ($failures) { $failures += "installer output:`n$out" }
+    if ($failures) { $failures += "output without git:`n$($without.Out)`noutput with git:`n$($with.Out)`n$($with.Failed)" }
 } finally {
     $env:PATH = $savedPath
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $scratch
@@ -74,4 +97,4 @@ if ($failures) {
     $failures | ForEach-Object { Write-Host "  $_" }
     exit 1
 }
-Write-Host "ok - docs/install.ps1 without git: Remuda installed, the Butler step explained in one line"
+Write-Host "ok - docs/install.ps1 without git: Remuda installed, the Butler step explained in one line; with git: attempted"
