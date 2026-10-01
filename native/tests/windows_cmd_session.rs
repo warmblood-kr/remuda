@@ -1,9 +1,9 @@
 //! A `.cmd` file as the program of a session (through the pty) and of
 //! `remuda.process.run`: what the program behind the batch file receives.
 //! The fixture is shaped like an npm shim: it hands `%*` to a real program,
-//! which records its argv. Each case states what SHOULD hold: plain arguments
-//! arrive intact; hostile ones arrive intact or are refused in one line; no
-//! argument ever runs a second command.
+//! which records its argv. A session delivers the arguments cmd.exe reads as
+//! text and refuses the rest in one line; `process.run` (std) delivers or
+//! refuses; no argument ever runs a second command.
 #![cfg(windows)]
 
 use remuda_core::protocol::{Request, Response};
@@ -21,47 +21,41 @@ const MARKER: &str = "marker.txt";
 struct Case {
     name: &'static str,
     args: &'static [&'static str],
-    /// A hostile case may be refused; a plain one must be delivered.
-    hostile: bool,
+    /// The session route must refuse it; `process.run` may refuse or deliver.
+    refused: bool,
+}
+
+const fn delivered(name: &'static str, args: &'static [&'static str]) -> Case {
+    Case {
+        name,
+        args,
+        refused: false,
+    }
+}
+
+const fn refused(name: &'static str, args: &'static [&'static str]) -> Case {
+    Case {
+        name,
+        args,
+        refused: true,
+    }
 }
 
 const CASES: &[Case] = &[
-    Case {
-        name: "none",
-        args: &[],
-        hostile: false,
-    },
-    Case {
-        name: "plain",
-        args: &["plain", "two words"],
-        hostile: false,
-    },
-    Case {
-        name: "quote",
-        args: &["say \"hi\""],
-        hostile: true,
-    },
-    Case {
-        name: "newline",
-        args: &["line1\necho INJECTED>marker.txt"],
-        hostile: true,
-    },
-    Case {
-        name: "percent",
-        args: &["100%", "%OS%"],
-        hostile: true,
-    },
-    Case {
-        name: "amp",
-        args: &["a&echo INJECTED>marker.txt"],
-        hostile: true,
-    },
-    Case {
-        name: "quote-amp",
-        args: &["\"&echo INJECTED>marker.txt&rem "],
-        hostile: true,
-    },
+    delivered("none", &[]),
+    delivered("plain", &["plain", "two words"]),
+    delivered("quote", &["say \"hi\""]),
+    // It holds a space, so the pty quotes it and cmd.exe reads `&` as text.
+    delivered("amp-quoted", &["a&echo INJECTED>marker.txt"]),
+    refused("newline", &["line1\necho INJECTED>marker.txt"]),
+    refused("percent", &["100%", "%OS%"]),
+    refused("amp-bare", &["a&echo.INJECTED>marker.txt"]),
+    refused("quote-amp", &["\"&echo INJECTED>marker.txt&rem "]),
 ];
+
+/// What the session route says when it refuses, on the first line.
+const REFUSAL: &str = "cannot be passed to a .cmd or .bat program safely";
+const NEXT: &str = "Next: start the .exe, or pass this text in a file.";
 
 /// Not a test of its own: the program behind the fixture. The batch file
 /// starts this test binary again with the arguments after `--`, and this
@@ -149,30 +143,39 @@ fn wait_for(file: &Path) -> bool {
 }
 
 /// What is wrong with one case, if anything. `refusal` is the error text when
-/// the word did not start the program.
-fn judge(case: &Case, dir: &Path, refusal: Option<&str>) -> Option<String> {
-    if let Some(message) = refusal {
-        if !case.hostile {
-            return Some(format!("refused: {message:?}"));
+/// the word did not start the program; `strict` is the session route, where
+/// the rule decides which cases are refused and how the refusal reads.
+fn judge(case: &Case, dir: &Path, refusal: Option<&str>, strict: bool) -> Option<String> {
+    let Some(message) = refusal else {
+        if strict && case.refused {
+            return Some("started, but this argument must be refused".into());
         }
-        if message.contains('\n') {
-            return Some(format!("the refusal is not one line: {message:?}"));
-        }
-    } else {
         let finished = wait_for(&dir.join("done.txt"));
         let want = format!("{:?}", case.args);
-        match std::fs::read_to_string(dir.join("argv.txt")) {
-            Ok(got) if got == want => {}
-            Ok(got) => return Some(format!("arguments arrived as {got}, want {want}")),
-            Err(_) => return Some(format!("no arguments recorded (finished: {finished})")),
-        }
+        return match std::fs::read_to_string(dir.join("argv.txt")) {
+            Ok(got) if got == want => None,
+            Ok(got) => Some(format!("arguments arrived as {got}, want {want}")),
+            Err(_) => Some(format!("no arguments recorded (finished: {finished})")),
+        };
+    };
+    // Only the first line: a Rust error read through pcall carries a traceback.
+    let first = message.lines().next().unwrap_or_default();
+    if !case.refused {
+        return Some(format!("refused: {first:?}"));
     }
-    None
+    if strict && !(first.contains(REFUSAL) && first.contains(NEXT)) {
+        return Some(format!("the refusal does not say what to do: {first:?}"));
+    }
+    // The argument may be a prompt: it is never echoed.
+    case.args
+        .iter()
+        .any(|arg| first.contains(arg))
+        .then(|| format!("the refusal shows the argument: {first:?}"))
 }
 
 /// Runs every case through `start` (Lua source for one case, given its argv
 /// and directory; it must return `started` or raise) and reports them all.
-fn run_cases(tag: &str, start: impl Fn(&str, &str, &str) -> String) {
+fn run_cases(tag: &str, strict: bool, start: impl Fn(&str, &str, &str) -> String) {
     let scratch = Scratch::new(tag);
     let _daemon = spawn::Daemon::spawn(&scratch.0);
     let mut wrong = Vec::new();
@@ -186,7 +189,7 @@ fn run_cases(tag: &str, start: impl Fn(&str, &str, &str) -> String) {
         );
         let said = outcome(&scratch.0, &code);
         let refusal = (said != "started").then_some(said.as_str());
-        let verdict = judge(case, &dir, refusal);
+        let verdict = judge(case, &dir, refusal, strict);
         let injected = dir.join(MARKER).exists();
         // Straight to stderr, so the facts are in the log for a passing case too.
         let _ = writeln!(
@@ -208,17 +211,50 @@ fn run_cases(tag: &str, start: impl Fn(&str, &str, &str) -> String) {
 
 #[test]
 fn a_cmd_file_as_a_session_gets_its_arguments_or_a_refusal() {
-    run_cases("session", |name, argv, dir| {
+    run_cases("session", true, |name, argv, dir| {
         format!(r#"remuda.new("cmd-{name}", {argv}, {dir}) return "started""#)
     });
 }
 
 #[test]
 fn a_cmd_file_through_process_run_gets_its_arguments_or_a_refusal() {
-    run_cases("run", |_, argv, dir| {
+    run_cases("run", false, |_, argv, dir| {
         format!(
             r#"remuda.process.run({{ argv = {argv}, cwd = {dir}, timeout = 15 }})
             return "started""#
         )
     });
+}
+
+/// A bare name that the pty resolves to a `.cmd` through PATHEXT follows the
+/// same rule as a path that ends in `.cmd`.
+#[test]
+fn a_bare_name_that_finds_a_cmd_file_follows_the_same_rule() {
+    let scratch = Scratch::new("bare");
+    let _daemon = spawn::Daemon::spawn(&scratch.0);
+    let start = |case: &str, arg: &str| {
+        let dir = scratch.0.join(case);
+        write_fixture(&dir);
+        let dir_lua = lua_string(dir.to_str().expect("utf-8 scratch path"));
+        let said = outcome(
+            &scratch.0,
+            &format!(
+                r#"remuda.new("bare-{case}", {{ "args", {} }}, {dir_lua}, {{ PATH = {dir_lua} }})
+                return "started""#,
+                lua_string(arg)
+            ),
+        );
+        (dir, said)
+    };
+
+    let (dir, said) = start("plain", "two words");
+    assert_eq!(said, "started");
+    assert!(wait_for(&dir.join("done.txt")), "the .cmd did not run");
+    let got = std::fs::read_to_string(dir.join("argv.txt")).expect("recorded argv");
+    assert_eq!(got, r#"["two words"]"#);
+
+    let (dir, said) = start("percent", "%OS%");
+    let first = said.lines().next().unwrap_or_default();
+    assert!(first.contains(REFUSAL) && first.contains(NEXT), "{said:?}");
+    assert!(!dir.join("argv.txt").exists(), "the refused program ran");
 }

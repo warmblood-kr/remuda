@@ -2621,6 +2621,8 @@ fn spawn(
             builder.env(k, v);
         }
     }
+    #[cfg(windows)]
+    refuse_unsafe_batch_arguments(&mut builder, &argv)?;
 
     let agent = PtyAgent::spawn(builder, size).map_err(|e| e.to_string())?;
     Ok(Session::new_with_id(
@@ -2629,6 +2631,54 @@ fn spawn(
         Box::new(agent),
         Arc::new(SystemClock::new()),
     ))
+}
+
+/// The file portable-pty will start for `program` (portable-pty 0.9.0,
+/// `cmdbuilder.rs:581-607`): in each PATH directory the name as given, then
+/// with each PATHEXT extension in place of its own; else the name as given.
+#[cfg(windows)]
+fn pty_program(builder: &CommandBuilder, program: &str) -> std::ffi::OsString {
+    use std::ffi::OsStr;
+    if let Some(path) = builder.get_env("PATH") {
+        let extensions = builder.get_env("PATHEXT").unwrap_or(OsStr::new(".EXE"));
+        for dir in std::env::split_paths(path) {
+            let exact = dir.join(program);
+            if exact.exists() {
+                return exact.into_os_string();
+            }
+            for extension in std::env::split_paths(extensions) {
+                let extension = extension.to_string_lossy();
+                let candidate = exact.with_extension(extension.trim_start_matches('.'));
+                if candidate.exists() {
+                    return candidate.into_os_string();
+                }
+            }
+        }
+    }
+    program.into()
+}
+
+/// Windows runs a `.cmd` or `.bat` program with cmd.exe, so its arguments
+/// must be ones cmd.exe reads as text. The program is pinned to the file the
+/// check looked at, so the pty starts that file and no other.
+#[cfg(windows)]
+fn refuse_unsafe_batch_arguments(
+    builder: &mut CommandBuilder,
+    argv: &[String],
+) -> Result<(), String> {
+    use crate::cmd_arguments::{batch_arguments_refusal, is_batch_file};
+    let program = pty_program(builder, &argv[0]);
+    let shown = program.to_string_lossy().into_owned();
+    if !is_batch_file(&shown) {
+        return Ok(());
+    }
+    let mut words = argv.to_vec();
+    words[0] = shown;
+    if let Some(refusal) = batch_arguments_refusal(&words) {
+        return Err(refusal);
+    }
+    builder.get_argv_mut()[0] = program;
+    Ok(())
 }
 
 /// Hand this connection over to a human. A later attach displaces this one;
