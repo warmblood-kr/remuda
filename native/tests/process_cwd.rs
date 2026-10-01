@@ -196,35 +196,41 @@ fn a_symlink_to_a_directory_is_a_directory() {
     assert!(listed.contains(MARKER), "{listed}");
 }
 
-/// MEASURED, not designed: how a relative `argv[1]` resolves once `cwd` is
-/// set. On Unix the child changes directory before it execs, so `./tool`
-/// is the one in `cwd`.
-#[cfg(unix)]
+/// With `cwd`, a relative program path would resolve differently per OS
+/// (std calls that case platform specific and unstable), so it is refused.
 #[test]
-fn unix_resolves_a_relative_program_against_cwd() {
-    use std::os::unix::fs::PermissionsExt;
+fn a_relative_program_path_with_cwd_is_refused_on_every_os() {
     let node = Node::start("rel");
-    let tool = node.work.join("tool");
-    std::fs::write(&tool, "#!/bin/sh\necho ran-from-cwd\n").expect("write tool");
-    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    let ran = node.eval(&format!(
-        "return remuda.process.run({{ argv = {{ './tool' }}, cwd = {} }}).stdout",
-        lua_string(&node.work)
-    ));
-    assert!(ran.contains("ran-from-cwd"), "{ran}");
-}
+    let cwd = lua_string(&node.work);
+    let mut relative = vec!["'./tool'", "'bin/tool'"];
+    if cfg!(windows) {
+        relative.extend(["'.\\\\tool.cmd'", "'bin\\\\tool'"]);
+    }
+    for program in relative {
+        for word in ["remuda.process.run", "remuda.process"] {
+            let message = node.error_of(&format!(
+                "{word}({{ argv = {{ {program} }}, cwd = {cwd} }})"
+            ));
+            assert!(
+                message.contains("with cwd needs an absolute program path or a bare command name")
+                    && message.contains("Next: pass the full path of the program."),
+                "{word} {program}: {message}"
+            );
+            assert!(!message.contains('\n'), "one line: {message}");
+        }
+        // Without cwd the word is unchanged: no such refusal.
+        let message = node.error_of(&format!("remuda.process.run({{ argv = {{ {program} }} }})"));
+        assert!(!message.contains("with cwd needs"), "{program}: {message}");
+    }
 
-/// MEASURED on CI only: on Windows a relative `argv[1]` is looked up from the
-/// daemon's own directory, not from `cwd`, so the tool in `cwd` is not found.
-#[cfg(windows)]
-#[test]
-fn windows_resolves_a_relative_program_against_the_daemons_directory() {
-    let node = Node::start("rel");
-    std::fs::write(node.work.join("tool.cmd"), "@echo ran-from-cwd\r\n").expect("write tool");
-    let outcome = node.eval(&format!(
-        "local ok, result = pcall(remuda.process.run, {{ argv = {{ '.\\\\tool.cmd' }}, cwd = {} }})
-         return tostring(ok) .. '|' .. tostring(ok and result.stdout or result)",
-        lua_string(&node.work)
+    // A bare command name is searched on PATH and still runs in cwd.
+    let bare = if cfg!(windows) {
+        "{ 'cmd.exe', '/c', 'dir', '/b' }"
+    } else {
+        "{ 'ls' }"
+    };
+    let listed = node.eval(&format!(
+        "return remuda.process.run({{ argv = {bare}, cwd = {cwd} }}).stdout"
     ));
-    assert!(outcome.starts_with("false|"), "{outcome}");
+    assert!(listed.contains(MARKER), "{listed}");
 }
