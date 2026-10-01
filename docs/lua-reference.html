@@ -59,6 +59,8 @@
 <p><code>feed(name, steps) -&gt; nil</code> — Deliver a sequence of bursts and pauses as one indivisible act.</p>
 <h2 id="fs">fs</h2>
 <p><code>table</code> — Atomic replacement of files for trusted Lua callers.</p>
+<h2 id="fs.lock">fs.lock</h2>
+<p><code>fs.lock(path) -&gt; handle | nil, 'held', info | nil, error</code> — Take an exclusive, non-blocking OS advisory lock on the file at an absolute path the caller chooses; it is held until handle:release() or until this daemon exits, and the same path returns the same handle. The lock file is created owner-only, stays empty and is not opened through a symlink. The owner's line (session, pid, since) is kept in PATH.info and returned as info when another process holds the lock: it is message text only, never decide on it. Any other failure returns nil, error. It guards against accidents, such as a second daemon of the same user; it is not a security boundary: a hostile process of that user can delete the lock file while it is held, and a second owner can then lock a new file there.</p>
 <h2 id="fs.mkdir_new">fs.mkdir_new</h2>
 <p><code>fs.mkdir_new(path) -&gt; true | nil, 'exists' | nil, error</code> — Create one new directory without creating parents or trusting an existing path.</p>
 <h2 id="fs.write_atomic">fs.write_atomic</h2>

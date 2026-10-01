@@ -616,6 +616,20 @@ fn registry_documentation_formats_are_live_and_structured() {
         .unwrap()
         .iter()
         .any(|entry| entry["name"] == "session.resize"));
+    let fs_lock = document["runtime"]["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "fs.lock")
+        .expect("fs.lock is documented");
+    assert!(fs_lock["description"]
+        .as_str()
+        .unwrap()
+        .contains("message text only"));
+    assert!(fs_lock["description"]
+        .as_str()
+        .unwrap()
+        .contains("not a security boundary"));
     let random_bytes = document["runtime"]["functions"]
         .as_array()
         .unwrap()
