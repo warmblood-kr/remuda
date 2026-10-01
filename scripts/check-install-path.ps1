@@ -18,7 +18,11 @@ if ($env:OS -ne 'Windows_NT') {
 }
 
 $script = Join-Path (Split-Path -Parent $PSScriptRoot) 'docs/install.ps1'
-$scratch = Join-Path ([IO.Path]::GetTempPath()) ("remuda-check-install-path-" + [guid]::NewGuid())
+# A Hangul directory name, because that is what a real profile is called
+# (C:\Users\<name>) and the path goes through the registry and back. Spelled
+# as code points: Windows PowerShell reads this file as ANSI, not UTF-8.
+$hangul = -join [char[]](0xC0AC, 0xC6A9, 0xC790)
+$scratch = Join-Path ([IO.Path]::GetTempPath()) ("remuda-check-install-path-$hangul-" + [guid]::NewGuid())
 $installDir = Join-Path $scratch 'bin'
 New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 
