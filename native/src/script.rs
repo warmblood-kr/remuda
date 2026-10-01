@@ -137,7 +137,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "_input_type_text",
-        "Deliver text and submit it while holding one input lock; returns 'submitted' or 'unverified'.",
+        "Deliver text and submit it while holding one input lock; returns 'submitted', 'unverified' or 'late'.",
         "_input_type_text(name, text, settle?) -> status",
     ),
     (
@@ -508,6 +508,7 @@ fn input_bindings(
                 .map(|outcome| match outcome {
                     InputSubmitOutcome::Submitted => "submitted",
                     InputSubmitOutcome::Unverified => "unverified",
+                    InputSubmitOutcome::Late => "late",
                 })
                 .map_err(|error| mlua::Error::runtime(error.to_string()))
         })?,
@@ -531,6 +532,7 @@ fn input_bindings(
                     .map(|outcome| match outcome {
                         InputSubmitOutcome::Submitted => "submitted",
                         InputSubmitOutcome::Unverified => "unverified",
+                        InputSubmitOutcome::Late => "late",
                     })
                     .map_err(|error| mlua::Error::runtime(error.to_string()))
             },

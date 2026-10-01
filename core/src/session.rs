@@ -82,6 +82,9 @@ pub enum InputSubmitOutcome {
     Submitted,
     /// Return was sent, but the visible screen did not verify submission.
     Unverified,
+    /// The text is still being written to a slow child; Return follows when it lands,
+    /// or is dropped after the late-submit bound.
+    Late,
 }
 
 struct PendingInput {
@@ -298,7 +301,10 @@ impl Session {
     /// The complete text/submit sequence shares one input lock. Backends
     /// without a rendered screen keep the historical single-burst behavior.
     pub fn send_line(&self, text: &str) -> Result<()> {
-        self.type_text(text, Duration::ZERO).map(|_| ())
+        match self.type_text(text, Duration::ZERO)? {
+            InputSubmitOutcome::Late => Err(AgentError::SubmitPending),
+            InputSubmitOutcome::Submitted | InputSubmitOutcome::Unverified => Ok(()),
+        }
     }
 
     /// Deliver a normalized text burst, bracketed when the child enabled mode
@@ -392,7 +398,7 @@ impl Session {
                         .unwrap_or(ChainOutcome::Unsupported)
                 };
                 match outcome {
-                    ChainOutcome::Chained => return Ok(InputSubmitOutcome::Unverified),
+                    ChainOutcome::Chained => return Ok(InputSubmitOutcome::Late),
                     ChainOutcome::Landed => {}
                     ChainOutcome::Unsupported => return Err(error),
                 }

@@ -222,6 +222,8 @@ pub enum AgentError {
     LateSubmitAbandoned {
         bound: core::time::Duration,
     },
+    /// Text is still being written; its Return will follow if it lands in time.
+    SubmitPending,
     /// A `feed` act's `Pause`s summed past the caller's cap — refused before
     /// anything is written, not clamped, so a seconds/millis mixup errors
     /// instead of silently running a shorter pause than asked for.
@@ -250,6 +252,10 @@ impl fmt::Display for AgentError {
             AgentError::LateSubmitAbandoned { bound } => {
                 write!(f, "text write stalled over {bound:?}; Return was not sent")
             }
+            AgentError::SubmitPending => write!(
+                f,
+                "text is still being written to a slow pane; Return follows when it lands or is dropped after the bound; check the pane before resending"
+            ),
             AgentError::PauseTooLong { total, cap } => {
                 write!(f, "feed's pauses total {total:?}, over the {cap:?} cap")
             }

@@ -255,7 +255,7 @@ impl AgentWriter for PtyInputWriter {
             state.follow_up = None;
             state.follow_up_open = false;
             state.late_submit_abandoned = true;
-            return ChainOutcome::Landed;
+            return ChainOutcome::Unsupported;
         }
         state.follow_up = Some((follow_up.to_vec(), settle));
         ChainOutcome::Chained
