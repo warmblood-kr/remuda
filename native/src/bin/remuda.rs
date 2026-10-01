@@ -292,8 +292,14 @@ disconnecting a human.
 In a script they live on one table, and a refusal is raised, not returned:
 
   remuda.session.new(\"build\", {\"make\", \"-j4\"})
-  while not remuda.capture(\"build\"):find(\"$ \") do remuda.sleep(0.2) end
-  remuda.session.close(\"build\")
+  local function close_when_ready()
+    if remuda.capture(\"build\"):find(\"%$ %s*$\") then
+      remuda.session.close(\"build\")
+    else
+      remuda.after(0.2, close_when_ready)
+    end
+  end
+  remuda.after(0.2, close_when_ready)
 
 `mcp` is for a program running inside a session to reach the manager holding
 it — a client spawns it and owns both pipes, so there is nothing to type here.

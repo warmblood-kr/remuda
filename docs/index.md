@@ -40,6 +40,9 @@ exposed by `remuda mod list`.
 The same herd is reachable over MCP — `new`, `ls`, `send`, `capture` — so an
 agent can drive other agents.
 
+What a running agent can change about its own environment, and which of those
+changes survive a daemon restart, is in [Self-modification](self-modification.md).
+
 ### Design notes
 
 The reasoning behind each slice is written down as it was built, including the

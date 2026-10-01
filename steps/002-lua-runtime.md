@@ -1,5 +1,7 @@
 # 002 — a programming runtime, with the atomic functions wired to it
 
+> Note (2026-10): remuda.sleep has since been removed; the examples below use it as it existed then. Use remuda.after or the wait_for tool.
+
 정수님, 2026-09-10: *"그 다음에는 이 pty manager layer에 programming runtime을
 심어서 코드를 실행할 수 있게 만들고 atomic function들을 물려서 연결합니다. 일종의
 programmable tmux 같은 컨셉이랄까요?"*

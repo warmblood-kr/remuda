@@ -1,5 +1,7 @@
 # 008 — a real agent, end to end
 
+> Note (2026-10): remuda.sleep has since been removed; the examples below use it as it existed then. Use remuda.after or the wait_for tool.
+
 정수님, 2026-09-10: *"그러면 그 lua 런타임 안에서 실제로 세션에 클로드 코드를
 띄우고, 그 목록을 관리하고, 프롬프트를 입력하고, 결과화면을 읽어오는걸 합시다."*
 And, approving the plan to measure before splitting repos: *"좋아요. 맞는 말들이네요.
