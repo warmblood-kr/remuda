@@ -246,11 +246,6 @@ list_dir
 
 ``list_dir(dir) -> {string...}`` — List a directory's entries.
 
-load_extension_command
-----------------------
-
-``load_extension_command(name, owner) -> boolean`` — Load the installed mod that owns a mod command unless its handler is already registered. Fails with one line and a Next: line when the mod cannot be loaded.
-
 ls
 --
 

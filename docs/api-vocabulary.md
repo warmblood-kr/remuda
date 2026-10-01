@@ -37,7 +37,6 @@ The inventory below covers every name in `native/src/script.rs` `BINDINGS` (79 n
 | `advise`, `unadvise`, `advice_member`, `advice_list` | Composite | Wrap/unwrap a function at a named path and inspect advice. Promote to `remuda.advice.add/remove/member/list`. |
 | `contribute`, `contributions` | Composite + registry | Add and read named entries at extension points. Promote to `remuda.extension.contribute/contributions`. |
 | `extension_command` | Composite | Register a command exposed by a mod. Promote to `remuda.extension.command`. |
-| `load_extension_command` | Composite | `exec` + the command table: load the installed mod that owns a command unless its handler is registered. The CLI calls it before dispatch so a first mod subcommand works (#394). |
 | `process`, `processes`, `kill` | Composite + query | Start a managed child process, list running process ids, and terminate one. Promote to `remuda.process.start/list/kill`. The low-level `_process_spawn` binding exists but is internal; the public composite validates the spec and wraps it. |
 | `request_counts`, `schedule_fires`, `schedule_skips` | Diagnostic composites | Read daemon request counts, schedule firing counts, and ticker skips. Promote to `remuda.diagnostics.request_counts/schedule_fires/schedule_skips`; document these as diagnostics, not control primitives. |
 

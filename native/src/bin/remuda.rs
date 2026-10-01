@@ -4746,13 +4746,13 @@ fn extension_command(
 }
 
 /// Load the mod behind a command on its first use, and say so: loading runs
-/// the mod's `start` (#394). The policy is Lua's `load_extension_command`.
+/// the mod's `start` (#394). The policy is Lua's `_load_extension_command`.
 fn load_extension_command(path: &Path, command: &str, package: &str) -> Result<(), ExitCode> {
     // ponytail: one extra local round trip per mod subcommand, so the notice
     // can reach the caller's stderr; fold it into the dispatch reply if that
     // ever shows up in timings.
     let load = format!(
-        "return remuda.load_extension_command({}, {})",
+        "return remuda._load_extension_command({}, {})",
         serde_json::to_string(command).expect("command serializes"),
         serde_json::to_string(package).expect("mod name serializes")
     );

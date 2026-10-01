@@ -2,7 +2,7 @@
 
 ## 2026-10-01
 
-- A mod subcommand (for example `remuda butler doctor`) now loads its mod when it is not loaded yet, so it works as the first command after an install. The load is announced in one line, `remuda: started mod NAME`, because it runs the mod's `start`. A mod that cannot be loaded prints one line and a `Next:` line instead of a Lua traceback. New Lua word: `remuda.load_extension_command(name, owner)`.
+- A mod subcommand (for example `remuda butler doctor`) now loads its mod when it is not loaded yet, so it works as the first command after an install. The load is announced in one line, `remuda: started mod NAME`, because it runs the mod's `start`. A mod that cannot be loaded prints one line and a `Next:` line instead of a Lua traceback.
 
 ## 2026-09-29
 

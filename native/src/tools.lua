@@ -96,7 +96,7 @@ register("_dispatch_extension_command", "Dispatch arguments and caller context t
 -- nothing else, never a path). A failed load leaves no handler behind.
 -- ponytail: no wait for a declared `ready` callback; if a handler ever needs
 -- readiness, load from the CLI instead (probe, `remuda exec`, dispatch).
-function remuda.load_extension_command(name, owner)
+function remuda._load_extension_command(name, owner)
   if remuda._extension_commands[name] then return false end
   local loaded, err = pcall(remuda.exec, owner)
   if loaded and remuda._extension_commands[name] then return true end
@@ -106,7 +106,7 @@ function remuda.load_extension_command(name, owner)
   remuda.fail("remuda: mod " .. tostring(owner) .. " could not be loaded: " .. reason
     .. "\nNext: remuda mod info " .. tostring(owner))
 end
-register("load_extension_command", "Load the installed mod that owns a mod command unless its handler is already registered. Fails with one line and a Next: line when the mod cannot be loaded.", "load_extension_command(name, owner) -> boolean")
+register("_load_extension_command", "Load the installed mod that owns a mod command unless its handler is already registered. Fails with one line and a Next: line when the mod cannot be loaded.", "_load_extension_command(name, owner) -> boolean")
 register("pending", "Return a bounded handle for an extension command's deferred result, including secret and visible line prompts.", "pending({timeout?, on_cancel?}) -> handle")
 register("_pending_create", "Create a private pending reply handle.", "_pending_create(timeout?) -> id, handle")
 register("_pending_events", "Drain pending completion and cancellation notifications.", "_pending_events() -> {{id, reason?}...}")
