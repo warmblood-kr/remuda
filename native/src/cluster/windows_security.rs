@@ -876,6 +876,217 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "remuda-cluster-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).unwrap();
+        root
+    }
+
+    /// Owner and DACL of a directory as SDDL text, to compare before and after.
+    fn directory_sddl(path: &Path) -> String {
+        use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
+
+        let directory = open_for_check(path, true, false).unwrap();
+        let (_owner, descriptor) = security_descriptor(directory.as_raw_handle()).unwrap();
+        let mut text = ptr::null_mut();
+        let mut len = 0;
+        let converted = unsafe {
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor.0.cast(),
+                1,
+                windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION,
+                &mut text,
+                &mut len,
+            )
+        };
+        assert_ne!(converted, 0, "SDDL of {}: {}", path.display(), last_error());
+        let memory = LocalMemory(text.cast());
+        let units = unsafe { std::slice::from_raw_parts(text, len as usize) };
+        let sddl = String::from_utf16_lossy(units)
+            .trim_end_matches('\0')
+            .to_owned();
+        drop(memory);
+        sddl
+    }
+
+    fn is_owner_only(path: &Path, directory: bool) -> bool {
+        is_owner_acl_conforming(&open_for_check(path, directory, false).unwrap()).unwrap()
+    }
+
+    /// A same-user round trip with plain `std::fs`: list, create, append, read.
+    fn assert_plainly_usable(dir: &Path) {
+        let fail =
+            |what: &str, error: io::Error| -> ! { panic!("{what} in {}: {error}", dir.display()) };
+        if let Err(error) = std::fs::read_dir(dir).map(Iterator::count) {
+            fail("list", error);
+        }
+        let probe = dir.join("plain-probe.txt");
+        if let Err(error) = std::fs::write(&probe, b"one") {
+            fail("create a file", error);
+        }
+        let appended = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&probe)
+            .and_then(|mut file| file.write_all(b"two"));
+        if let Err(error) = appended {
+            fail("write a file", error);
+        }
+        match std::fs::read(&probe) {
+            Ok(bytes) => assert_eq!(bytes, b"onetwo"),
+            Err(error) => fail("read a file", error),
+        }
+        if let Err(error) = std::fs::remove_file(&probe) {
+            fail("remove a file", error);
+        }
+    }
+
+    /// Give FILE an owner the current token does not accept. `None` means the
+    /// runner cannot do that; in CI that is a failure, not a skip.
+    fn assign_unrelated_owner(file: &File) -> Option<Handle> {
+        let in_ci = std::env::var_os("CI").is_some();
+        let privilege = match enable_restore_privilege() {
+            Ok(token) => token,
+            Err(error) if in_ci => panic!("CI runner must enable SeRestorePrivilege: {error}"),
+            Err(error) => {
+                eprintln!("skipping: cannot enable SeRestorePrivilege: {error}");
+                return None;
+            }
+        };
+        let user = UserSid::current().unwrap();
+        for candidate in ["O:SY", "O:BG", "O:BA"] {
+            let (sid, _descriptor) = owner_sid_from_sddl(candidate).unwrap();
+            if !user.accepts_owner(sid) && set_owner_from_sddl(file, candidate).is_ok() {
+                return Some(privilege);
+            }
+        }
+        assert!(!in_ci, "CI runner could not assign a non-token owner");
+        eprintln!("skipping: cannot assign a non-token owner");
+        None
+    }
+
+    // The base `remuda` dir also holds mods, the channel file and the update
+    // cache: only `cluster` inside it is private state.
+    #[test]
+    fn creating_the_cluster_dir_leaves_a_plain_base_and_its_siblings_alone() {
+        use super::super::storage;
+
+        let root = scratch("narrow");
+        let base = root.join("remuda");
+        let mods = base.join("mods");
+        let channel = base.join("channel");
+        std::fs::create_dir_all(&mods).unwrap();
+        std::fs::write(&channel, b"nightly").unwrap();
+        let before = directory_sddl(&base);
+
+        storage::check_base_directory(&base).unwrap();
+        assert_eq!(
+            directory_sddl(&base),
+            before,
+            "checking the base dir changed its ACL"
+        );
+        let cluster = base.join("cluster");
+        storage::create_private_directory(&cluster).unwrap();
+        storage::verify_directory(&cluster).unwrap();
+        let key = cluster.join("identity.key");
+        storage::atomic_write(&key, b"key").unwrap();
+
+        assert_eq!(
+            directory_sddl(&base),
+            before,
+            "creating the cluster dir changed the base dir's ACL"
+        );
+        assert!(!is_owner_only(&base, true));
+        assert_eq!(std::fs::read(&channel).unwrap(), b"nightly");
+        std::fs::write(&channel, b"stable").unwrap();
+        assert_plainly_usable(&mods);
+        assert_plainly_usable(&base);
+        assert!(is_owner_only(&cluster, true));
+        assert!(is_owner_only(&key, false));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn base_directory_check_refuses_a_reparse_point_and_a_file() {
+        use super::super::storage::check_base_directory;
+        use std::os::windows::fs::symlink_dir;
+
+        let root = scratch("base-type");
+        let holder = root.join("file");
+        std::fs::create_dir(&holder).unwrap();
+        let file_base = holder.join("remuda");
+        std::fs::write(&file_base, b"not a directory").unwrap();
+        let error = check_base_directory(&file_base).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+
+        let target = root.join("target");
+        let link = root.join("remuda");
+        std::fs::create_dir(&target).unwrap();
+        match symlink_dir(&target, &link) {
+            Ok(()) => {
+                let error = check_base_directory(&link).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            }
+            Err(error) => eprintln!(
+                "skipping base reparse check: cannot create symlink on this runner: {error}"
+            ),
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // An older version made the base dir owner-only. It is never loosened, and
+    // what plain `std::fs` creates in it afterwards must still be usable.
+    #[test]
+    fn an_already_protected_base_is_left_protected_and_new_children_work() {
+        use super::super::storage;
+
+        let root = scratch("protected-base");
+        let base = root.join("remuda");
+        create_directory(&base).unwrap();
+        let before = directory_sddl(&base);
+
+        storage::check_base_directory(&base).unwrap();
+        storage::create_private_directory(&base.join("cluster")).unwrap();
+
+        assert_eq!(directory_sddl(&base), before);
+        assert!(is_owner_only(&base, true));
+        let mods = base.join("mods");
+        std::fs::create_dir(&mods).unwrap();
+        assert_plainly_usable(&mods);
+        assert_plainly_usable(&base);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // A base dir made by an elevated installer is owned by another SID.
+    #[test]
+    fn a_base_owned_by_another_sid_no_longer_blocks_the_cluster_dir() {
+        use super::super::storage;
+
+        let root = scratch("foreign-base");
+        let base = root.join("remuda");
+        std::fs::create_dir(&base).unwrap();
+        let handle = open_for_owner_update(&base, true).unwrap();
+        let Some(_privilege) = assign_unrelated_owner(&handle) else {
+            drop(handle);
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        };
+        drop(handle);
+        let before = directory_sddl(&base);
+
+        storage::check_base_directory(&base).unwrap();
+        let cluster = base.join("cluster");
+        storage::create_private_directory(&cluster).unwrap();
+
+        assert_eq!(directory_sddl(&base), before);
+        assert!(is_owner_only(&cluster, true));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn refuses_file_and_cluster_directory_reparse_points() {
         use std::os::windows::fs::{symlink_dir, symlink_file};

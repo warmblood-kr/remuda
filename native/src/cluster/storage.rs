@@ -64,11 +64,17 @@ pub(super) fn cluster_state_dir() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LOCALAPPDATA is not set"))?;
     let dir = PathBuf::from(base).join("remuda");
     match fs::symlink_metadata(&dir) {
-        Ok(_) => verify_directory(&dir)?,
+        Ok(_) => check_base_directory(&dir)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
     Ok(dir)
+}
+
+/// Check the base `remuda` directory that holds `cluster`.
+#[cfg(windows)]
+pub(super) fn check_base_directory(dir: &Path) -> io::Result<()> {
+    verify_directory(dir)
 }
 
 #[cfg(windows)]
