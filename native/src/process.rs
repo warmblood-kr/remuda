@@ -16,7 +16,7 @@ use crate::child_guard;
 use crate::image::Image;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -183,8 +183,11 @@ pub fn checked_cwd(
         ));
     }
     // std calls a relative program path with a working directory platform
-    // specific and unstable, so that one combination is refused.
-    if Path::new(program).is_relative() && program.contains(std::path::is_separator) {
+    // specific and unstable, so that one combination is refused. A Windows
+    // drive-relative name (`C:tool`) is such a path without a separator.
+    let path = Path::new(program);
+    let drive = matches!(path.components().next(), Some(Component::Prefix(_)));
+    if path.is_relative() && (drive || program.contains(std::path::is_separator)) {
         return Err(format!(
             "{word} with cwd needs an absolute program path or a bare command name. \
              Next: pass the full path of the program."

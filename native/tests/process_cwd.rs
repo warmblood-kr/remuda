@@ -204,7 +204,19 @@ fn a_relative_program_path_with_cwd_is_refused_on_every_os() {
     let cwd = lua_string(&node.work);
     let mut relative = vec!["'./tool'", "'bin/tool'"];
     if cfg!(windows) {
-        relative.extend(["'.\\\\tool.cmd'", "'bin\\\\tool'"]);
+        // Drive-relative: no separator needed to be a relative path there.
+        relative.extend([
+            "'.\\\\tool.cmd'",
+            "'bin\\\\tool'",
+            "'C:tool'",
+            "'C:bin\\\\tool'",
+        ]);
+    } else {
+        // Elsewhere `C:tool` is an ordinary bare name, searched on PATH.
+        let message = node.error_of(&format!(
+            "remuda.process.run({{ argv = {{ 'C:tool' }}, cwd = {cwd} }})"
+        ));
+        assert!(!message.contains("with cwd needs"), "{message}");
     }
     for program in relative {
         for word in ["remuda.process.run", "remuda.process"] {
