@@ -521,6 +521,119 @@ pub(super) fn validate_open_object(file: &File, path: &Path, directory: bool) ->
     Ok(())
 }
 
+/// Rights that let an account change what the base directory holds, or who
+/// may: add file, add subdirectory, delete child, delete, write DAC, write
+/// owner, generic write, generic all.
+const BASE_WRITE_RIGHTS: [(u32, &str); 8] = [
+    (0x0000_0002, "may add files in"),
+    (0x0000_0004, "may add directories in"),
+    (0x0000_0040, "may delete entries of"),
+    (0x0001_0000, "may delete"),
+    (0x0004_0000, "may change the ACL of"),
+    (0x0008_0000, "may take ownership of"),
+    (0x4000_0000, "may write to"),
+    (0x1000_0000, "has full control of"),
+];
+
+/// Check the base `remuda` directory without changing it: a directory, not a
+/// reparse point, owned and writable only by the user, SYSTEM and
+/// Administrators. Anyone else could plant, swap or rename `cluster` in it.
+pub(super) fn check_base_directory(path: &Path) -> io::Result<()> {
+    let file = open_for_check(path, true, false)?;
+    validate_open_object(&file, path, true)?;
+    let user = UserSid::current()?;
+    let user_text = String::from_utf16_lossy(&user.text[..user.text.len() - 1]);
+    // The SID as text when it is none of the three trusted ones.
+    let untrusted = |sid: *mut c_void| -> io::Result<Option<String>> {
+        let text = sid_text(sid)?;
+        let trusted = text == user_text || text == "S-1-5-18" || text == "S-1-5-32-544";
+        Ok((!trusted).then_some(text))
+    };
+    let refusal = |sid: &str, what: &str| {
+        let shown = path.display().to_string();
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "cluster refused: account {sid} {what} {}\nNext: remove that access from this directory, or set LOCALAPPDATA to a directory only you can change",
+                crate::text::strip_terminal_controls(&shown)
+            ),
+        )
+    };
+
+    let (owner, descriptor) = security_descriptor(file.as_raw_handle())?;
+    if let Some(sid) = untrusted(owner)? {
+        return Err(refusal(&sid, "owns"));
+    }
+    let mut present = 0;
+    let mut dacl = ptr::null_mut();
+    let mut defaulted = 0;
+    if unsafe {
+        GetSecurityDescriptorDacl(descriptor.0.cast(), &mut present, &mut dacl, &mut defaulted)
+    } == 0
+    {
+        return Err(last_error());
+    }
+    if present == 0 || dacl.is_null() {
+        // No DACL at all: everyone (S-1-1-0) has full control.
+        return Err(refusal("S-1-1-0", "has full control (no ACL) of"));
+    }
+    let mut info = ACL_SIZE_INFORMATION::default();
+    if unsafe {
+        GetAclInformation(
+            dacl,
+            (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            windows_sys::Win32::Security::AclSizeInformation,
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    for index in 0..info.AceCount {
+        let mut ace = ptr::null_mut();
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+            return Err(last_error());
+        }
+        let ace = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
+        // Allow entries only (0, or 9 with a condition; same layout). An
+        // inherit-only entry (0x08) grants nothing on this directory itself.
+        if !matches!(ace.Header.AceType, 0 | 9) || ace.Header.AceFlags & 0x08 != 0 {
+            continue;
+        }
+        let Some((_, what)) = BASE_WRITE_RIGHTS
+            .iter()
+            .find(|(right, _)| ace.Mask & right != 0)
+        else {
+            continue;
+        };
+        let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
+        if let Some(sid) = untrusted(sid)? {
+            return Err(refusal(&sid, what));
+        }
+    }
+    Ok(())
+}
+
+fn sid_text(sid: *mut c_void) -> io::Result<String> {
+    if sid.is_null() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "missing SID"));
+    }
+    let mut text = ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
+        return Err(last_error());
+    }
+    let memory = LocalMemory(text.cast());
+    let mut len = 0;
+    unsafe {
+        while *text.add(len) != 0 {
+            len += 1;
+        }
+    }
+    let sid = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+    drop(memory);
+    Ok(sid)
+}
+
 fn security_descriptor(handle: HANDLE) -> io::Result<(*mut c_void, LocalMemory)> {
     let mut owner = ptr::null_mut();
     let mut descriptor = ptr::null_mut();
