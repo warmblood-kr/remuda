@@ -828,7 +828,23 @@ fn is_busy_tracks_streaming_output_then_goes_idle() {
     )
     .expect("start streaming session");
 
-    std::thread::sleep(Duration::from_secs(1));
+    let busy_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = script::eval_source(
+            &path,
+            "=streaming-busy-wait",
+            "local s = remuda.session('streaming'); local row = remuda.ls()[1]; return tostring(s.is_busy) .. ':' .. tostring(row.idle > 0.8)",
+        )
+        .expect("poll streaming state");
+        if state == "true:true" {
+            break;
+        }
+        assert!(
+            Instant::now() < busy_deadline,
+            "session did not produce output while input idle: {state}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     script::run_source(
         &path,
         "=streaming-busy-check",

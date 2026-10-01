@@ -336,7 +336,13 @@ fn frozen_api_fixtures_v1_through_v4_and_new_v5_surface_run() {
         std::fs::write(&fixture, source).unwrap();
         script::run(&path, &fixture).unwrap_or_else(|error| panic!("{version} fixture: {error}"));
         match version {
-            "v1" => wait_for_fixture_output(&path, version, &["42-v1", "64-v1"]),
+            "v1" => {
+                wait_for_fixture_output(&path, version, &["42-v1", "64-v1"]);
+                eval(
+                    &path,
+                    "remuda._api_v1_assert_output(); return 'v1 output verified'",
+                );
+            }
             "v2" => wait_for_fixture_output(&path, version, &["9-v2", "one-v2", "two-v2"]),
             _ => {}
         }

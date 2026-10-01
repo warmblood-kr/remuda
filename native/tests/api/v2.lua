@@ -1,7 +1,8 @@
 -- v2.lua: widens v1 with `remuda.feed` and `remuda.tools.type_text`.
 --
--- API v2 compatibility fixture. Timing waits for asynchronous session output
--- are performed by Rust in the fixture harness.
+-- Like v1.lua, this file is FROZEN once merged — widening the API again means
+-- adding `v3.lua` next to this file, never editing this one.
+-- 2026-10-01: owner-approved break: remuda.sleep was deleted (owner decision 2026-09-30); calling it raises the use-remuda.after error.
 
 local name = "api-v2-" .. tostring(os.time())
 

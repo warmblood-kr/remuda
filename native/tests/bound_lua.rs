@@ -156,7 +156,7 @@ fn abandoned_suspended_coroutines_are_not_kept_alive_between_jobs() {
 }
 
 #[test]
-fn an_infinite_tool_callback_errors_and_the_image_answers_the_next_request() {
+fn tool_callback_instruction_limit_is_enforced() {
     let image = image();
     image
         .eval(
