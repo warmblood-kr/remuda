@@ -1,3 +1,6 @@
+# Also checks the per-user default paths (%LOCALAPPDATA%), the old-install note
+# and, when elevated, that the data dir is handed to the user.
+#
 # Runs docs/install.ps1 the way the one-liner does (`| iex`) against a stubbed
 # network, and asserts the install dir ends up on PATH: in this session, and on
 # Windows persisted for the user, so a NEW PowerShell finds `remuda` too.
@@ -51,14 +54,14 @@ function tar {
 # Each takes out only this check's own entry, from the value as it is now -
 # for the user: unexpanded and as the kind it is, then Explorer is told, the
 # way the installer does - so a developer's own PATH comes back as it was.
-function Remove-FromSessionPath {
-    $env:PATH = @(($env:PATH -split ';') | Where-Object { $_ -ne $installDir }) -join ';'
+function Remove-FromSessionPath($dir = $installDir) {
+    $env:PATH = @(($env:PATH -split ';') | Where-Object { $_ -ne $dir }) -join ';'
 }
-function Remove-FromUserPath {
+function Remove-FromUserPath($dir = $installDir) {
     $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
     if ($envKey.GetValueNames() -contains 'Path') {
         $kind = $envKey.GetValueKind('Path')
-        $kept = @(($envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';') | Where-Object { $_ -ne $installDir }) -join ';'
+        $kept = @(($envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';') | Where-Object { $_ -ne $dir }) -join ';'
         if ($kept) { $envKey.SetValue('Path', $kept, $kind) } else { $envKey.DeleteValue('Path', $false) }
     }
     $envKey.Close()
@@ -77,6 +80,26 @@ $cases = @(
     @{ Name = 'new shell, on the user PATH only'; Before = { Remove-FromSessionPath }; Want = 1 },
     @{ Name = 'on the session PATH only'; Before = { Remove-FromUserPath }; Want = 1 }
 )
+
+# With no override at all the installer picks the per-user defaults. Each case
+# gets its own profile and, unless Local is $false, its own LOCALAPPDATA; the
+# profile is what the installer must fall back to when LOCALAPPDATA is empty.
+# Hangul AND a space in the path, as a real %LOCALAPPDATA% can have.
+$defaultCases = @(
+    @{ Name = 'default paths'; Local = $true },
+    @{ Name = 'default paths, data dir already there'; Local = $true; PreCreate = $true },
+    @{ Name = 'LOCALAPPDATA empty -> profile\AppData\Local'; Local = $false },
+    @{ Name = 'XDG_DATA_HOME still wins for the channel file'; Local = $true; Xdg = $true },
+    @{ Name = 'older install beside it'; Local = $true; OldExe = $true; OldShare = $true },
+    @{ Name = 'older install, no old data dir'; Local = $true; OldExe = $true },
+    @{ Name = 'installing INTO the old dir is not an older install'; Local = $true; OldExe = $true; IntoOld = $true }
+)
+$me = [Security.Principal.WindowsIdentity]::GetCurrent()
+$elevated = ([Security.Principal.WindowsPrincipal]$me).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+$was = @{}
+foreach ($name in 'LOCALAPPDATA', 'USERPROFILE', 'XDG_DATA_HOME', 'REMUDA_INSTALL_DIR', 'REMUDA_NO_MODIFY_PATH') {
+    $was[$name] = [Environment]::GetEnvironmentVariable($name)
+}
 
 $failures = @()
 try {
@@ -100,7 +123,73 @@ try {
             $failures += "$($case.Name): install dir is on the user's persisted PATH $($user.Count) times, want $($case.Want)"
         }
     }
+
+    $n = 0
+    foreach ($case in $defaultCases) {
+        $n++
+        $profileDir = Join-Path $scratch "profile-$n"
+        $localDir = Join-Path $scratch "app data $hangul $n"
+        $base = if ($case.Local) { $localDir } else { Join-Path $profileDir 'AppData\Local' }
+        $dataHome = if ($case.Xdg) { Join-Path $scratch "xdg-$n" } else { $base }
+        $oldBin = Join-Path $profileDir '.local\bin'
+        $exeDir = if ($case.IntoOld) { $oldBin } else { Join-Path $base 'Programs\remuda\bin' }
+        $oldShare = Join-Path $profileDir '.local\share\remuda'
+        New-Item -ItemType Directory -Force -Path $profileDir, $base | Out-Null
+        if ($case.OldExe -and -not $case.IntoOld) {
+            New-Item -ItemType Directory -Force -Path $oldBin | Out-Null
+            Set-Content -Path (Join-Path $oldBin 'remuda.exe') -Value 'an older install'
+        }
+        if ($case.OldShare) { New-Item -ItemType Directory -Force -Path $oldShare | Out-Null }
+        if ($case.PreCreate) { New-Item -ItemType Directory -Force -Path (Join-Path $dataHome 'remuda') | Out-Null }
+
+        $env:LOCALAPPDATA = if ($case.Local) { $localDir } else { $null }
+        $env:USERPROFILE = $profileDir
+        $env:XDG_DATA_HOME = if ($case.Xdg) { $dataHome } else { $null }
+        $env:REMUDA_INSTALL_DIR = if ($case.IntoOld) { $oldBin } else { $null }
+        $env:REMUDA_NO_MODIFY_PATH = $null
+        try {
+            $out = & { Get-Content -Raw $script | Invoke-Expression } *>&1 | Out-String
+            $why = "default paths, $($case.Name)"
+
+            $exe = Join-Path $exeDir 'remuda.exe'
+            if (-not (Test-Path -LiteralPath $exe)) { $failures += "${why}: no remuda.exe at $exe" }
+            $channelFile = Join-Path (Join-Path $dataHome 'remuda') 'channel'
+            if (-not (Test-Path -LiteralPath $channelFile)) {
+                $failures += "${why}: no channel file at $channelFile"
+            } elseif ((Get-Content -Raw -LiteralPath $channelFile).Trim() -ne 'stable') {
+                $failures += "${why}: channel file does not say stable"
+            }
+            $session = @(($env:PATH -split ';') | Where-Object { $_ -eq $exeDir })
+            if ($session.Count -ne 1) { $failures += "${why}: $exeDir is on this session's PATH $($session.Count) times, want 1" }
+            $user = @(([Environment]::GetEnvironmentVariable('PATH', 'User') -split ';') | Where-Object { $_ -eq $exeDir })
+            if ($user.Count -ne 1) { $failures += "${why}: $exeDir is on the user's persisted PATH $($user.Count) times, want 1" }
+
+            # The cluster code refuses a data dir owned by Administrators, so
+            # an elevated install must hand it to the user - found or created.
+            $owner = (Get-Acl -LiteralPath (Join-Path $dataHome 'remuda')).GetOwner([Security.Principal.SecurityIdentifier])
+            if ($owner.Value -ne $me.User.Value) { $failures += "${why}: $(Join-Path $dataHome 'remuda') is owned by $owner, want $($me.User)" }
+            $warned = $out -match 'elevated shell is not needed'
+            if ($elevated -and -not $warned) { $failures += "${why}: elevated, but no warning that an elevated shell is not needed" }
+            if (-not $elevated -and $warned) { $failures += "${why}: not elevated, but warned about elevation" }
+
+            $noted = $out -match 'older install'
+            if ($case.OldExe -and -not $case.IntoOld) {
+                if (-not $noted) { $failures += "${why}: no note about the older install" }
+                if (-not (Test-Path -LiteralPath (Join-Path $oldBin 'remuda.exe'))) { $failures += "${why}: the older install was deleted" }
+            } elseif ($noted) {
+                $failures += "${why}: a note about an older install, with none there"
+            }
+            $moved = $out -match 'not moved'
+            if ($case.OldShare -and -not $moved) { $failures += "${why}: the note does not say the old channel and mods were not moved" }
+            if (-not $case.OldShare -and $moved) { $failures += "${why}: says data was not moved, with no old data dir" }
+            if ($case.OldShare -and -not (Test-Path -LiteralPath $oldShare)) { $failures += "${why}: the old data dir was removed" }
+        } finally {
+            Remove-FromSessionPath $exeDir
+            Remove-FromUserPath $exeDir
+        }
+    }
 } finally {
+    foreach ($name in $was.Keys) { [Environment]::SetEnvironmentVariable($name, $was[$name]) }
     Remove-FromUserPath
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $scratch
 }
@@ -110,4 +199,4 @@ if ($failures) {
     $failures | ForEach-Object { Write-Host "  $_" }
     exit 1
 }
-Write-Host "ok - docs/install.ps1 puts its install dir on PATH, unless told not to"
+Write-Host "ok - docs/install.ps1 puts its install dir on PATH, unless told not to, and installs per-user by default"
