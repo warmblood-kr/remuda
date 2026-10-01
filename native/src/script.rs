@@ -1459,14 +1459,13 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
         "_process_spawn",
         lua.create_function(
             move |_,
-                  (argv, on_line, on_exit, cwd): (
+                  (mut argv, on_line, on_exit, cwd): (
                 Vec<String>,
                 Option<String>,
                 Option<String>,
                 Option<String>,
             )| {
-                let program = argv.first().map_or("", String::as_str);
-                let cwd = match crate::process::checked_cwd("process", cwd.as_deref(), program) {
+                let cwd = match crate::process::checked_cwd("process", cwd.as_deref(), &mut argv) {
                     Ok(cwd) => cwd,
                     Err(refused) => return Ok((None, Some(refused))),
                 };
@@ -1482,18 +1481,17 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
         "_process_run",
         lua.create_function(
             |lua,
-             (argv, stdin, timeout, cwd): (
+             (mut argv, stdin, timeout, cwd): (
                 Vec<String>,
                 Option<mlua::LuaString>,
                 f64,
                 Option<String>,
             )| {
-                let program = argv.first().map_or("", String::as_str);
-                let cwd = match crate::process::checked_cwd("process.run", cwd.as_deref(), program)
-                {
-                    Ok(cwd) => cwd,
-                    Err(refused) => return Ok((Value::Nil, Some(refused))),
-                };
+                let cwd =
+                    match crate::process::checked_cwd("process.run", cwd.as_deref(), &mut argv) {
+                        Ok(cwd) => cwd,
+                        Err(refused) => return Ok((Value::Nil, Some(refused))),
+                    };
                 let output = crate::process::run_sync(
                     argv,
                     stdin.map(|value| value.as_bytes().to_vec()),

@@ -24,10 +24,21 @@ impl std::fmt::Display for Refusal {
             ),
             Self::NotFound(name) => write!(
                 f,
-                "'{name}' is not on PATH. \
-                 Next: install it, or add its folder to PATH and restart remuda."
+                "{} is not on PATH. \
+                 Next: install it, or add its folder to PATH and restart remuda.",
+                shown(name)
             ),
         }
+    }
+}
+
+/// The name for a message: quoted when it is plainly a name, else not echoed.
+pub fn shown(name: &str) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    if !name.is_empty() && name.len() <= 64 && name.chars().all(plain) {
+        format!("'{name}'")
+    } else {
+        "the command".to_owned()
     }
 }
 
@@ -49,8 +60,110 @@ pub fn find(
     rules: &Rules,
     is_command: &dyn Fn(&str) -> bool,
 ) -> Result<String, Refusal> {
-    let _ = (rules, is_command);
+    if !is_bare_name(name, rules.windows) {
+        return Err(Refusal::BareName);
+    }
+    let path = rules.path.ok_or(Refusal::NoPath)?;
+    let (separator, slash) = if rules.windows {
+        (';', '\\')
+    } else {
+        (':', '/')
+    };
+    let extensions = if rules.windows {
+        executable_extensions(rules.pathext)
+    } else {
+        Vec::new()
+    };
+    let lower = name.to_ascii_lowercase();
+    let named_with_extension = extensions
+        .iter()
+        .any(|extension| lower.ends_with(&extension.to_ascii_lowercase()));
+    for dir in path
+        .split(separator)
+        .filter(|dir| is_absolute(dir, rules.windows))
+    {
+        let joined = dir.ends_with('/') || (rules.windows && dir.ends_with('\\'));
+        let base = if joined {
+            format!("{dir}{name}")
+        } else {
+            format!("{dir}{slash}{name}")
+        };
+        if (!rules.windows || named_with_extension) && is_command(&base) {
+            return Ok(base);
+        }
+        for extension in &extensions {
+            let candidate = format!("{base}{extension}");
+            if is_command(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
     Err(Refusal::NotFound(name.to_owned()))
+}
+
+/// [`find`] with this process's PATH and PATHEXT and the real file system. A
+/// candidate is looked at (`metadata`), never opened and never executed.
+pub fn find_on_path(name: &str) -> Result<String, Refusal> {
+    let path = std::env::var_os("PATH").map(|value| value.to_string_lossy().into_owned());
+    let pathext = std::env::var_os("PATHEXT").map(|value| value.to_string_lossy().into_owned());
+    let rules = Rules {
+        windows: cfg!(windows),
+        path: path.as_deref(),
+        pathext: pathext.as_deref(),
+    };
+    find(name, &rules, &|candidate| {
+        let Ok(meta) = std::fs::metadata(candidate) else {
+            return false;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            meta.is_file() && meta.permissions().mode() & 0o111 != 0
+        }
+        #[cfg(not(unix))]
+        meta.is_file()
+    })
+}
+
+/// A command name and nothing else: no separator, no control character, and
+/// on Windows no drive or stream colon.
+fn is_bare_name(name: &str, windows: bool) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && !name.contains(['/', '\\'])
+        && !name.contains(char::is_control)
+        && !(windows && name.contains(':'))
+}
+
+/// Unix: starts at the root. Windows: `X:\`, `X:/`, or a `\\server\share`;
+/// `\bin` and `C:bin` depend on the current drive or directory, so they are not.
+fn is_absolute(dir: &str, windows: bool) -> bool {
+    if !windows {
+        return dir.starts_with('/');
+    }
+    let bytes = dir.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    drive || dir.starts_with(r"\\")
+}
+
+/// PATHEXT as a list; the default when it is unset or names no extension.
+fn executable_extensions(pathext: Option<&str>) -> Vec<&str> {
+    let listed = |text: &'static str| -> Vec<&'static str> { text.split(';').collect() };
+    let given: Vec<&str> = pathext
+        .unwrap_or("")
+        .split(';')
+        .filter(|extension| extension.len() > 1 && extension.starts_with('.'))
+        .collect();
+    if given.is_empty() {
+        listed(DEFAULT_PATHEXT)
+    } else {
+        given
+    }
 }
 
 #[cfg(test)]
@@ -196,9 +309,9 @@ mod tests {
             Err(Refusal::NotFound("notes.txt".into()))
         );
         // A forward slash or a UNC share is absolute too.
-        let fs = only(&["C:/bin/claude.EXE", r"\\server\share\codex.EXE"]);
+        let fs = only(&[r"C:/bin\claude.EXE", r"\\server\share\codex.EXE"]);
         let rules = windows(r"C:/bin;\\server\share", None);
-        assert_eq!(find("claude", &rules, &fs).unwrap(), "C:/bin/claude.EXE");
+        assert_eq!(find("claude", &rules, &fs).unwrap(), r"C:/bin\claude.EXE");
         assert_eq!(
             find("codex", &rules, &fs).unwrap(),
             r"\\server\share\codex.EXE"

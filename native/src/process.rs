@@ -165,16 +165,18 @@ pub fn run_sync(
 }
 
 /// Check the optional `cwd` of `process.run` and `process`: an absolute path
-/// to an existing directory, and with it a program that is an absolute path
-/// or a bare name. The messages never echo the path: the caller passed it.
+/// to an existing directory. With it, a bare `argv[0]` is replaced by its
+/// absolute path on PATH, and a relative program path is refused.
 pub fn checked_cwd(
     word: &str,
     cwd: Option<&str>,
-    program: &str,
+    argv: &mut [String],
 ) -> Result<Option<PathBuf>, String> {
     let Some(cwd) = cwd else {
         return Ok(None);
     };
+    let program = argv.first().cloned().unwrap_or_default();
+    let program = program.as_str();
     let dir = Path::new(cwd);
     if !dir.is_absolute() || !std::fs::metadata(dir).is_ok_and(|meta| meta.is_dir()) {
         return Err(format!(
@@ -192,6 +194,19 @@ pub fn checked_cwd(
             "{word} with cwd needs an absolute program path or a bare command name. \
              Next: pass the full path of the program."
         ));
+    }
+    // A bare name: the child would search PATH from inside `cwd`, where a
+    // relative PATH entry finds a file planted there. Search here instead,
+    // absolute entries only, and start that exact file.
+    if path.is_relative() {
+        let found = crate::find_command::find_on_path(program).map_err(|_| {
+            format!(
+                "{word} with cwd could not find {} on PATH. \
+                 Next: pass the full path of the program.",
+                crate::find_command::shown(program)
+            )
+        })?;
+        argv[0] = found;
     }
     Ok(Some(dir.to_path_buf()))
 }
