@@ -742,6 +742,40 @@ fn cluster_join_and_peer_call_outputs_match_goldens() {
 }
 
 #[test]
+fn rerunning_a_join_line_on_a_member_says_already_a_member_without_network() {
+    let inviter = Scratch::new();
+    let inviter_daemon = initialized_node(&inviter);
+    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve inviter port");
+    let address = reservation.local_addr().expect("read reserved address");
+    drop(reservation);
+    let invite = inviter.run(&["cluster", "invite", "--bind", &address.to_string()]);
+    assert!(invite.status.success(), "invite failed: {invite:?}");
+    let (fingerprint, join_line) = invitation_command_args(&invite);
+
+    let joiner = Scratch::new();
+    let _joiner_daemon = initialized_node(&joiner);
+    let joined = joiner.run(&["cluster", "join", &fingerprint, &join_line]);
+    assert!(joined.status.success(), "first join failed: {joined:?}");
+
+    // The issuer is gone: any network attempt would fail, so success proves none.
+    drop(inviter_daemon);
+    let again = joiner.run(&["cluster", "join", &fingerprint, &join_line]);
+    let stdout = String::from_utf8_lossy(&again.stdout);
+    let stderr = String::from_utf8_lossy(&again.stderr);
+    assert!(again.status.success(), "rerun should be a no-op: {again:?}");
+    let label = remuda_native::cluster::node_label(&fingerprint);
+    assert!(
+        stdout.contains(&format!("Already a member of {label}'s cluster."))
+            && stdout.contains("Next: remuda cluster nodes"),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("invalid join response"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn failed_join_restores_the_exact_saved_listener_config() {
     use remuda_native::cluster::listener_config::{ListenerBind, ListenerConfig};
 
