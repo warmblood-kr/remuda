@@ -76,11 +76,34 @@ pub fn cmd_argument_refusal(arg: &str) -> Option<&'static str> {
     quoted.then_some("its double quotes do not pair up")
 }
 
+/// Why `program` cannot be the path of a batch file, or `None` when it can.
+/// The argument rule, and one more: cmd.exe cuts a command NAME at `=`, `,`
+/// and `;` outside quotes, and then starts a different file (measured).
+pub fn cmd_program_refusal(program: &str) -> Option<&'static str> {
+    if let Some(reason) = cmd_argument_refusal(program) {
+        return Some(reason);
+    }
+    let mut quoted = false;
+    for c in pty_text(program).chars() {
+        match c {
+            '"' => quoted = !quoted,
+            '=' | ',' | ';' if !quoted => {
+                return Some("it has a cmd.exe separator (= , ;) outside quotes");
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// The one-line refusal for the argv of a batch file, or `None` when every
 /// word is safe. It names the position, never the text: that may be a prompt.
 pub fn batch_arguments_refusal(argv: &[String]) -> Option<String> {
     argv.iter().enumerate().find_map(|(index, word)| {
-        let reason = cmd_argument_refusal(word)?;
+        let reason = match index {
+            0 => cmd_program_refusal(word)?,
+            _ => cmd_argument_refusal(word)?,
+        };
         Some(match index {
             0 => format!(
                 "the path of a .cmd or .bat program cannot be passed to cmd.exe safely: \
@@ -195,6 +218,36 @@ mod tests {
             refusal,
             "the path of a .cmd or .bat program cannot be passed to cmd.exe safely: it has a \
              cmd.exe special character outside quotes. Next: move or rename the folder, or \
+             start the .exe."
+        );
+    }
+
+    #[test]
+    fn a_program_path_cmd_would_cut_is_refused() {
+        let separator = Some("it has a cmd.exe separator (= , ;) outside quotes");
+        for (program, reason) in [
+            (r"C:\npm\claude.cmd", None),
+            (r"C:\Program Files\a=b\x.cmd", None),
+            (r"C:\tools=x\agent.cmd", separator),
+            (r"C:\a,b\x.cmd", separator),
+            (r"C:\a;b\x.cmd", separator),
+            (
+                r"C:\a&b\x.cmd",
+                Some("it has a cmd.exe special character outside quotes"),
+            ),
+            (r"C:\100%\x.cmd", Some("it contains %")),
+        ] {
+            assert_eq!(cmd_program_refusal(program), reason, "{program:?}");
+        }
+        // In an argument the three only split batch parameters; `%*` keeps them.
+        for arg in ["a=b", "a,b", "a;b", "--flag=value"] {
+            assert_eq!(cmd_argument_refusal(arg), None, "{arg:?}");
+        }
+        let argv = ["C:\\a=b\\x.cmd".to_string(), "a=b".to_string()];
+        assert_eq!(
+            batch_arguments_refusal(&argv).unwrap(),
+            "the path of a .cmd or .bat program cannot be passed to cmd.exe safely: it has a \
+             cmd.exe separator (= , ;) outside quotes. Next: move or rename the folder, or \
              start the .exe."
         );
     }

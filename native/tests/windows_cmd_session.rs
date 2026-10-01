@@ -294,6 +294,11 @@ fn a_program_path_with_a_cmd_separator_runs_that_file_or_is_refused() {
                 "{case}: started, but the arguments arrived as {argv:?}"
             ));
         }
+        // A refusal says what to do about the path, on its first line.
+        let first = said.lines().next().unwrap_or_default();
+        if !started && !first.contains("Next: move or rename the folder, or start the .exe.") {
+            wrong.push(format!("{case}: refused without the Next: step: {first:?}"));
+        }
     };
 
     for (case, name) in [("equals", "a=b"), ("comma", "a,b"), ("semicolon", "a;b")] {
