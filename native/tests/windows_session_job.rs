@@ -1,7 +1,8 @@
-//! Who a caller is on Windows, for processes that belong to a session: the
-//! session's own child, a grandchild whose parent has exited, and a child that
-//! asks to leave the session's job. All of them are `session`, never
-//! `outside`. A command in an ordinary terminal still reads `unknown` here.
+//! A session's processes on Windows. While the session is listed they are
+//! `session` callers, also one whose parent has exited or that asks to leave
+//! the job. When the session ends (its program exits, it is closed, or the
+//! daemon stops) everything it started ends with it. A command in an ordinary
+//! terminal still reads `unknown` here.
 #![cfg(windows)]
 
 use remuda_core::protocol::{Request, Response};
@@ -102,26 +103,112 @@ fn a_session_child_is_a_session_caller() {
     assert_eq!(kind, "session");
 }
 
-/// `start` without /b gives the new process its own console, so it is not
-/// closed with the session's pty when the session's child exits at once.
-#[test]
-fn a_session_grandchild_whose_parent_exited_is_a_session_caller() {
-    let scratch = Scratch::new("grand");
-    let _daemon = spawn::Daemon::spawn(&scratch.0);
+/// A session whose program starts a process in its own console (`start`
+/// without /b, so the pty's end does not close it) and then lives for `life`
+/// seconds. That process marks `started.txt`, waits `wait` seconds, then asks.
+fn session_with_a_lingering_process(dir: &Path, out: &Path, life: u32, wait: u32) -> PathBuf {
+    let linger = dir.join("linger.cmd");
+    let body = format!(
+        "@echo off\r\n>\"{}\" echo started\r\nping -n {} 127.0.0.1 >nul\r\n\"{}\" -s s -e \"{ASK}\" >\"{}\" 2>&1\r\n",
+        dir.join("started.txt").display(),
+        wait + 1,
+        env!("CARGO_BIN_EXE_remuda"),
+        out.display()
+    );
+    std::fs::write(&linger, body).expect("write linger.cmd");
+    let session = dir.join("session.cmd");
+    let body = format!(
+        "@echo off\r\nstart \"\" /min cmd.exe /c \"{}\"\r\nping -n {} 127.0.0.1 >nul\r\n",
+        linger.display(),
+        life + 1
+    );
+    std::fs::write(&session, body).expect("write session.cmd");
+    session
+}
+
+/// The PIDs of the lingering processes of this scratch directory, from the
+/// system's process list.
+fn lingering(dir: &Path) -> Vec<u32> {
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("scratch name");
+    let list = format!(
+        "Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'cmd.exe' -and \
+         $_.CommandLine -like '*{name}*linger.cmd*' }} | ForEach-Object {{ $_.ProcessId }}"
+    );
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &list])
+        .output()
+        .expect("list processes");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect()
+}
+
+/// Starts a session with a lingering process, ends it with `end`, and
+/// requires that the lingering process is gone and never asks.
+fn the_lingering_process_ends_with(tag: &str, life: u32, end: impl FnOnce(&Path, spawn::Daemon)) {
+    const WAIT: u32 = 12;
+    let scratch = Scratch::new(tag);
+    let daemon = spawn::Daemon::spawn(&scratch.0);
     let out = scratch.0.join("kind.txt");
-    let script = asking_script(&scratch.0, &out, 3);
+    let session = session_with_a_lingering_process(&scratch.0, &out, life, WAIT);
     start(
         &scratch.0,
         format!(
-            "return remuda.new('grand', {{ 'cmd.exe', '/c', 'start', '', '/min', 'cmd.exe', '/c', {} }})",
-            lua(&script)
+            "return remuda.new('linger', {{ 'cmd.exe', '/c', {} }})",
+            lua(&session)
         ),
     );
-    let kind = answer(&out);
+    let began = Instant::now();
+    assert_eq!(answer(&scratch.0.join("started.txt")), "started");
+    let before = lingering(&scratch.0);
+
+    end(&scratch.0, daemon);
+    // Past the moment it would have asked, had it lived.
+    while began.elapsed() < Duration::from_secs(u64::from(WAIT) + 6) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let after = lingering(&scratch.0);
+    let asked = std::fs::read_to_string(&out).unwrap_or_default();
     fact(format_args!(
-        "grandchild after its parent exited: kind {kind:?}"
+        "lingering process, session ended by {tag}: alive before {before:?}; alive after {after:?}; asked {:?}",
+        asked.trim()
     ));
-    assert_eq!(kind, "session");
+    assert!(!before.is_empty(), "the lingering process never ran");
+    assert!(after.is_empty(), "it outlived its session: {after:?}");
+    assert!(
+        asked.trim().is_empty(),
+        "it asked after its session ended: {asked:?}"
+    );
+}
+
+/// A session ends when its own program exits: the daemon reaps it. What the
+/// session started ends with it.
+#[test]
+fn what_a_session_started_ends_when_its_program_exits() {
+    the_lingering_process_ends_with("exit", 4, |_, daemon| {
+        // Nothing to do: the session's program exits by itself.
+        std::thread::sleep(Duration::from_secs(6));
+        drop(daemon);
+    });
+}
+
+#[test]
+fn what_a_session_started_ends_when_the_session_is_closed() {
+    the_lingering_process_ends_with("close", 120, |dir, daemon| {
+        start(dir, "remuda.close('linger') return 'closed'".to_string());
+        // The daemon stays up: the session's end alone must do it.
+        std::thread::sleep(Duration::from_secs(8));
+        drop(daemon);
+    });
+}
+
+#[test]
+fn what_a_session_started_ends_when_the_daemon_stops() {
+    the_lingering_process_ends_with("daemon", 120, |_, daemon| drop(daemon));
 }
 
 /// Not a test of its own: the program of the breakaway session. It starts the
