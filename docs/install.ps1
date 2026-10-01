@@ -166,24 +166,6 @@ try {
 
     $installDir = if ($env:REMUDA_INSTALL_DIR) { $env:REMUDA_INSTALL_DIR } else { Join-Path $localAppData 'Programs\remuda\bin' }
     New-Item -ItemType Directory -Force -Path $installDir, $dataDir | Out-Null
-    # The cluster code refuses a remuda data dir that an elevated shell made
-    # Administrators-owned, so an elevated install hands it to the user.
-    $me = [Security.Principal.WindowsIdentity]::GetCurrent()
-    if (([Security.Principal.WindowsPrincipal]$me).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        Write-Host 'install.ps1: an elevated shell is not needed for this per-user install'
-        # Best effort, and never through a junction: that would hand its target over.
-        if ((Get-Item -Force -LiteralPath $dataDir).Attributes -band [IO.FileAttributes]::ReparsePoint) {
-            Write-Host "install.ps1: $dataDir is a junction or link - its owner was left alone"
-        } else {
-            try {
-                $acl = Get-Acl -LiteralPath $dataDir
-                $acl.SetOwner($me.User)
-                Set-Acl -LiteralPath $dataDir -AclObject $acl
-            } catch {
-                Write-Host "install.ps1: could not make you the owner of $dataDir - $($_.Exception.Message)"
-            }
-        }
-    }
     # Absolute, because it is about to be written to PATH, where a relative
     # entry means a different directory in every shell.
     $installDir = (Get-Item -Force -LiteralPath $installDir).FullName

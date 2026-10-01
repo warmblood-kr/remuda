@@ -1,5 +1,4 @@
-# Also checks the per-user default paths (%LOCALAPPDATA%) and, when elevated,
-# that the data dir is handed to the user.
+# Also checks the per-user default paths (%LOCALAPPDATA%).
 #
 # Runs docs/install.ps1 the way the one-liner does (`| iex`) against a stubbed
 # network, and asserts the install dir ends up on PATH: in this session, and on
@@ -87,13 +86,9 @@ $cases = @(
 # Hangul AND a space in the path, as a real %LOCALAPPDATA% can have.
 $defaultCases = @(
     @{ Name = 'default paths'; Local = $true },
-    @{ Name = 'default paths, data dir already there'; Local = $true; PreCreate = $true },
     @{ Name = 'LOCALAPPDATA empty -> profile\AppData\Local'; Local = $false },
-    @{ Name = 'XDG_DATA_HOME still wins for the channel file'; Local = $true; Xdg = $true },
-    @{ Name = 'a junction at <data>\remuda keeps its target'; Local = $true; Junction = $true }
+    @{ Name = 'XDG_DATA_HOME still wins for the channel file'; Local = $true; Xdg = $true }
 )
-$me = [Security.Principal.WindowsIdentity]::GetCurrent()
-$elevated = ([Security.Principal.WindowsPrincipal]$me).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $was = @{}
 foreach ($name in 'LOCALAPPDATA', 'USERPROFILE', 'XDG_DATA_HOME', 'REMUDA_INSTALL_DIR', 'REMUDA_NO_MODIFY_PATH') {
     $was[$name] = [Environment]::GetEnvironmentVariable($name)
@@ -131,22 +126,13 @@ try {
         $dataHome = if ($case.Xdg) { Join-Path $scratch "xdg-$n" } else { $base }
         $exeDir = Join-Path $base 'Programs\remuda\bin'
         New-Item -ItemType Directory -Force -Path $profileDir, $base | Out-Null
-        if ($case.Junction) {
-            # Elevated, the installer must not hand a junction's TARGET to the user.
-            $target = Join-Path $scratch "junction-target-$n"
-            New-Item -ItemType Directory -Force -Path $target | Out-Null
-            New-Item -ItemType Junction -Path (Join-Path $dataHome 'remuda') -Target $target | Out-Null
-            $ownerBefore = (Get-Acl -LiteralPath $target).GetOwner([Security.Principal.SecurityIdentifier])
-        }
-        if ($case.PreCreate) { New-Item -ItemType Directory -Force -Path (Join-Path $dataHome 'remuda') | Out-Null }
-
         $env:LOCALAPPDATA = if ($case.Local) { $localDir } else { $null }
         $env:USERPROFILE = $profileDir
         $env:XDG_DATA_HOME = if ($case.Xdg) { $dataHome } else { $null }
         $env:REMUDA_INSTALL_DIR = $null
         $env:REMUDA_NO_MODIFY_PATH = $null
         try {
-            $out = & { Get-Content -Raw $script | Invoke-Expression } *>&1 | Out-String
+            & { Get-Content -Raw $script | Invoke-Expression } *>&1 | Out-Null
             $why = "default paths, $($case.Name)"
 
             $exe = Join-Path $exeDir 'remuda.exe'
@@ -162,15 +148,6 @@ try {
             $user = @(([Environment]::GetEnvironmentVariable('PATH', 'User') -split ';') | Where-Object { $_ -eq $exeDir })
             if ($user.Count -ne 1) { $failures += "${why}: $exeDir is on the user's persisted PATH $($user.Count) times, want 1" }
 
-            # The cluster code refuses a data dir owned by Administrators, so
-            # an elevated install must hand it to the user - found or created.
-            $owner = (Get-Acl -LiteralPath (Join-Path $dataHome 'remuda')).GetOwner([Security.Principal.SecurityIdentifier])
-            $wantOwner = if ($case.Junction) { $ownerBefore } else { $me.User }
-            if ($owner.Value -ne $wantOwner.Value) { $failures += "${why}: $(Join-Path $dataHome 'remuda') is owned by $owner, want $wantOwner" }
-            if ($case.Junction -and $elevated -and -not ($out -match 'junction')) { $failures += "${why}: no warning that the data dir is a junction" }
-            $warned = $out -match 'elevated shell is not needed'
-            if ($elevated -and -not $warned) { $failures += "${why}: elevated, but no warning that an elevated shell is not needed" }
-            if (-not $elevated -and $warned) { $failures += "${why}: not elevated, but warned about elevation" }
         } finally {
             Remove-FromSessionPath $exeDir
             Remove-FromUserPath $exeDir
