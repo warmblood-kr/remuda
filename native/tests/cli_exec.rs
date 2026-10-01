@@ -743,3 +743,65 @@ fn loaded_legacy_mod_is_not_rerun_by_a_subcommand() {
     assert_eq!(String::from_utf8_lossy(&first.stdout), "1\n");
     assert_eq!(String::from_utf8_lossy(&second.stdout), "1\n", "{second:?}");
 }
+
+// SEC review of #406 (L2): the failure line carries the mod's own error text.
+#[test]
+fn mod_load_failure_line_is_terminal_safe() {
+    let home = FreshHome::new(
+        "esc",
+        LIFECYCLE,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function() error("\27[31mexploded\27[0m\rspoofed") end,
+        }"#,
+    );
+
+    let first = home.remuda(&["sample", "doctor"]);
+
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(!first.status.success(), "{first:?}");
+    assert!(stderr.contains("exploded"), "{first:?}");
+    assert!(
+        !stderr.contains('\x1b') && !stderr.contains('\r'),
+        "{first:?}"
+    );
+}
+
+// SEC review of #406: a mod that is loaded but has not registered its command.
+// `exec` leaves an active lifecycle mod alone, so `start` runs once. A legacy
+// entry has no loaded state, so `exec` runs it again, as `remuda exec` does.
+#[test]
+fn loaded_mod_without_its_command_fails_cleanly_and_lifecycle_start_runs_once() {
+    let late_lifecycle = r#"return {
+      api = "remuda-module-v1", state_version = 1,
+      initialize = function() return {} end,
+      start = function() remuda._sample_runs = (remuda._sample_runs or 0) + 1 end,
+    }"#;
+    let late_legacy = "remuda._sample_runs = (remuda._sample_runs or 0) + 1";
+    for (label, manifest_extra, entry, runs) in [
+        ("late", LIFECYCLE, late_lifecycle, "1"),
+        ("lateleg", "", late_legacy, "2"),
+    ] {
+        let home = FreshHome::new(label, manifest_extra, entry);
+
+        let first = home.remuda(&["sample", "doctor"]);
+        let second = home.remuda(&["sample", "doctor"]);
+        let counted = home.remuda(&["-e", "return remuda._sample_runs"]);
+
+        for output in [&first, &second] {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{output:?}");
+            assert!(
+                stderr.contains("did not register the command sample\nNext: "),
+                "{output:?}"
+            );
+            assert!(!stderr.contains("started mod"), "{output:?}");
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&counted.stdout).trim(),
+            runs,
+            "{label}: {counted:?}"
+        );
+    }
+}
