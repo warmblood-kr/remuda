@@ -13,7 +13,7 @@ impl Drop for PrivateDaemonCleanup {
                 .args(["-s", "s", "stop", "-f"])
                 .env("REMUDA_RUNTIME_DIR", &self.0)
                 .env("XDG_DATA_HOME", self.0.join("data"))
-                .env("LOCALAPPDATA", &self.0)
+                .env("XDG_CACHE_HOME", self.0.join("cache"))
                 .env("HOME", &self.0)
                 .output();
         }
@@ -191,7 +191,7 @@ end)
             .args(args)
             .env("REMUDA_RUNTIME_DIR", &run_dir)
             .env("XDG_DATA_HOME", run_dir.join("data"))
-            .env("LOCALAPPDATA", &run_dir)
+            .env("XDG_CACHE_HOME", run_dir.join("cache"))
             .env("HOME", &run_dir)
             .output()
             .expect("run remuda")
@@ -218,7 +218,7 @@ fn secret_prompt_client_exits_and_restores_tty(
     command.args(["-s", "s", "deferred", "secret_short"]);
     command.env("REMUDA_RUNTIME_DIR", runtime);
     command.env("XDG_DATA_HOME", runtime.join("data"));
-    command.env("LOCALAPPDATA", runtime);
+    command.env("XDG_CACHE_HOME", runtime.join("cache"));
     command.env("HOME", runtime);
     let mut child = pty
         .slave
@@ -1433,37 +1433,13 @@ fn session_prompt_line_shows_tagged_label_and_sanitized_default() {
     assert!(reply_screen.contains("line: default"), "{reply_screen}");
 }
 
-/// Who is asking and who may answer, for a denied path (Windows only).
-fn acl_report(path: &std::path::Path) -> String {
-    if !cfg!(windows) {
-        return String::new();
-    }
-    let run = |program: &str, args: &[&std::ffi::OsStr]| {
-        let out = std::process::Command::new(program).args(args).output();
-        out.map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-            .unwrap_or_default()
-    };
-    let parent = path.parent().unwrap_or(path);
-    format!(
-        "{}{}{}",
-        run("whoami", &["/user".as_ref()]),
-        run("icacls", &[path.as_os_str()]),
-        run("icacls", &[parent.as_os_str()])
-    )
-}
-
 fn assert_no_secret_in_files(root: &std::path::Path, secret: &[u8]) {
-    let entries = fs::read_dir(root).unwrap_or_else(|error| {
-        panic!("read_dir {}: {error}\n{}", root.display(), acl_report(root))
-    });
-    for entry in entries {
+    for entry in fs::read_dir(root).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
             assert_no_secret_in_files(&path, secret);
         } else if path.is_file() {
-            let contents = fs::read(&path).unwrap_or_else(|error| {
-                panic!("read {}: {error}\n{}", path.display(), acl_report(&path))
-            });
+            let contents = fs::read(&path).unwrap();
             assert!(
                 !contents
                     .windows(secret.len())
@@ -1492,7 +1468,7 @@ fn shutdown_answers_waiters_and_runs_shutdown_cancellation_callback() {
         .arg(&cancellation_file)
         .env("REMUDA_RUNTIME_DIR", &dir)
         .env("XDG_DATA_HOME", dir.join("data"))
-        .env("LOCALAPPDATA", &dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
         .env("HOME", &dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
