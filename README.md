@@ -107,7 +107,8 @@ $env:REMUDA_CHANNEL='nightly'; $env:REMUDA_INSTALL_BUTLER='1'; irm https://warmb
 ```
 
 The tarball is verified against `SHA256SUMS`, Remuda is installed in
-`~\.local\bin` (added to your user `PATH`), and the Butler mod is installed. Set
+`%LOCALAPPDATA%\Programs\remuda\bin` (added to your user `PATH`), and the Butler
+mod is installed. Set
 `$env:REMUDA_INSTALL_DIR` to put Remuda elsewhere, and
 `$env:REMUDA_NO_MODIFY_PATH='1'` to have the installer leave `PATH` alone and
 only say so when the directory is not on it. `remuda upgrade` re-runs the
@@ -148,7 +149,8 @@ one-liner without it would hit the missing `stable` default and fail. Once a
 `stable` build exists, switch by passing `REMUDA_CHANNEL=stable` (sh) or
 setting `$env:REMUDA_CHANNEL='stable'` (PowerShell) instead.
 
-The chosen channel is remembered in `$XDG_DATA_HOME/remuda/channel`, so
+The chosen channel is remembered in `$XDG_DATA_HOME/remuda/channel` (on Windows
+`%LOCALAPPDATA%\remuda\channel`), so
 upgrading stays on the track you picked:
 
 ```sh

@@ -21,3 +21,7 @@
   (`%LOCALAPPDATA%\remuda\mods`) and the update-check cache
   (`%LOCALAPPDATA%\remuda\cache`). `XDG_DATA_HOME` and `XDG_CACHE_HOME` still
   win. Nothing is migrated.
+- The Windows installer now installs per user: `remuda.exe` goes to
+  `%LOCALAPPDATA%\Programs\remuda\bin` and the channel file to
+  `%LOCALAPPDATA%\remuda` (was `~\.local\bin` and `~\.local\share\remuda`).
+  `REMUDA_INSTALL_DIR` and `XDG_DATA_HOME` still win.
