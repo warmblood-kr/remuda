@@ -2278,10 +2278,17 @@ local function process_run(spec)
   if type(timeout) ~= "number" or timeout ~= timeout or timeout <= 0 or timeout > 30 then
     error("process.run timeout must be positive and at most 30 seconds", 2)
   end
+  local stdin_hold_until_lines = spec.stdin_hold_until_lines
+  if stdin_hold_until_lines ~= nil and (type(stdin_hold_until_lines) ~= "number"
+      or stdin_hold_until_lines ~= stdin_hold_until_lines
+      or stdin_hold_until_lines % 1 ~= 0
+      or stdin_hold_until_lines < 1 or stdin_hold_until_lines > 1000) then
+    error("process.run stdin_hold_until_lines must be an integer from 1 through 1000. Next: pass a whole number in that range.", 2)
+  end
   if spec.cwd ~= nil and (type(spec.cwd) ~= "string" or not utf8.len(spec.cwd)) then
     error("process.run cwd must be an absolute path to an existing directory. Next: pass the directory's full path.", 2)
   end
-  local result, refused = remuda._process_run(spec.argv, spec.stdin, timeout, spec.cwd)
+  local result, refused = remuda._process_run(spec.argv, spec.stdin, timeout, spec.cwd, stdin_hold_until_lines)
   if result == nil then error(refused, 2) end
   return result
 end
@@ -2289,7 +2296,7 @@ remuda.process = setmetatable({ run = process_run }, {
   __call = function(_, spec) return process_start(spec) end,
 })
 register("process", "Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output. `cwd`, when given, is an absolute path to an existing directory where the child starts; with it argv[1] must be an absolute path or a bare command name, and a bare name is searched on the absolute entries of PATH only (never in cwd). Use this word, not process.run, for a command that can take longer than 30 seconds.", "process{argv, on_line?, on_exit?, cwd?} -> id; process.run(spec) -> {code, stdout, stderr, timed_out}")
-register("process.run", "Run argv directly without a shell; inherits the daemon's environment and, unless `cwd` is given, its working directory. `cwd` is an absolute path to an existing directory where the child starts; with it argv[1] must be an absolute path or a bare command name, and a bare name is searched on the absolute entries of PATH only (never in cwd). Blocks the Lua image until exit or timeout (default 5s, max 30s; longer commands use remuda.process), captures each stream up to 1 MiB. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.", "process.run{argv, stdin?, timeout?, cwd?} -> {code, stdout, stderr, timed_out, signal?}")
+register("process.run", "Run argv directly without a shell; inherits the daemon's environment and, unless `cwd` is given, its working directory. `cwd` is an absolute path to an existing directory where the child starts; with it argv[1] must be an absolute path or a bare command name, and a bare name is searched on the absolute entries of PATH only (never in cwd). Blocks the Lua image until exit or timeout (default 5s, max 30s; longer commands use remuda.process), captures each stream up to 1 MiB. `stdin_hold_until_lines`, when set to an integer from 1 through 1000, keeps stdin open until stdout has that many newlines, the child exits, or timeout. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.", "process.run{argv, stdin?, timeout?, cwd?, stdin_hold_until_lines?} -> {code, stdout, stderr, timed_out, signal?}")
 
 -- Everything defined so far is core's; a mod may not replace it (#145).
 for key in pairs(remuda) do core_fields[key] = true end

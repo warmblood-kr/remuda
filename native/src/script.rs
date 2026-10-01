@@ -364,8 +364,8 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "_process_run",
-        "Run an argv process synchronously with a bounded timeout and captured output; internal, called by `remuda.process.run`.",
-        "_process_run(argv, stdin?, timeout, cwd?) -> result | nil, refusal",
+        "Run an argv process synchronously with a bounded timeout and captured output; internal, called by `remuda.process.run`. Its optional stdin_hold_until_lines keeps stdin open until stdout has that many newlines, the child exits, or timeout.",
+        "_process_run(argv, stdin?, timeout, cwd?, stdin_hold_until_lines?) -> result | nil, refusal",
     ),
     (
         "_process_spawn",
@@ -1484,11 +1484,12 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
         "_process_run",
         lua.create_function(
             |lua,
-             (mut argv, stdin, timeout, cwd): (
+             (mut argv, stdin, timeout, cwd, stdin_hold_until_lines): (
                 Vec<String>,
                 Option<mlua::LuaString>,
                 f64,
                 Option<String>,
+                Option<f64>,
             )| {
                 let cwd =
                     match crate::process::checked_cwd("process.run", cwd.as_deref(), &mut argv) {
@@ -1500,6 +1501,7 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
                     stdin.map(|value| value.as_bytes().to_vec()),
                     timeout,
                     cwd,
+                    stdin_hold_until_lines.map(|lines| lines as usize),
                 )
                 .map_err(mlua::Error::runtime)?;
                 let result = lua.create_table()?;

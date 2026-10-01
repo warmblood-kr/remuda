@@ -3,6 +3,8 @@
 
 use remuda_core::protocol::{Request, Response};
 use remuda_native::{client, daemon};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -168,6 +170,73 @@ fn process_run_refuses_a_bad_cwd_in_one_line_without_the_path() {
             "remuda.process.run({{ argv = {argv}, cwd = {bad} }})"
         ));
         assert_refused(&message, &node.work);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_stdin_hold_times_out_when_child_never_prints() {
+    let node = Node::start("stdin-hold-timeout");
+    let child = node.dir.0.join("read-until-eof");
+    std::fs::write(&child, "#!/bin/sh\ncat >/dev/null\n").expect("write child script");
+    let mut permissions = std::fs::metadata(&child)
+        .expect("child metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&child, permissions).expect("make child executable");
+
+    let started = Instant::now();
+    let result = node.eval(&format!(
+        "local r = remuda.process.run({{ argv = {{ {} }}, stdin = 'payload', timeout = 2, stdin_hold_until_lines = 1 }})
+         return tostring(r.timed_out) .. '|' .. tostring(r.code)",
+        lua_string(&child)
+    ));
+    let elapsed = started.elapsed();
+
+    assert_eq!(result.split('|').next(), Some("true"), "result: {result}");
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "returned after {elapsed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_stdin_hold_returns_reply_line() {
+    let node = Node::start("stdin-hold-reply");
+    let child = node.dir.0.join("read-one-line");
+    std::fs::write(
+        &child,
+        "#!/bin/sh\nread -r request\nexec 3<&0\n( cat <&3 >/dev/null; kill $$ ) >/dev/null 2>&1 &\nsleep 1\nprintf 'reply\\n'\n",
+    )
+    .expect("write child script");
+    let mut permissions = std::fs::metadata(&child)
+        .expect("child metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&child, permissions).expect("make child executable");
+
+    let result = node.eval(&format!(
+        "return remuda.process.run({{ argv = {{ {} }}, stdin = 'request\\n', timeout = 5, stdin_hold_until_lines = 1 }}).stdout",
+        lua_string(&child)
+    ));
+
+    assert_eq!(result, "reply\n");
+}
+
+#[test]
+fn process_run_stdin_hold_refuses_out_of_range_line_counts_in_one_line() {
+    let node = Node::start("stdin-hold-invalid");
+    for count in [0, 1001] {
+        let error = node.error_of(&format!(
+            "remuda.process.run({{ argv = {{ '/bin/cat' }}, stdin_hold_until_lines = {count} }})"
+        ));
+        assert!(error.contains("stdin_hold_until_lines"), "{error}");
+        assert!(
+            error.contains("Next: pass a whole number in that range"),
+            "{error}"
+        );
+        assert!(!error.contains('\n'), "error must be one line: {error}");
     }
 }
 
