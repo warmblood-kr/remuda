@@ -8,7 +8,11 @@
   double quotes. Before, such an argument could be cut, expanded, or run as a
   second command. The refusal is one line that names the argument's position
   and ends with `Next: start the .exe, or pass this text in a file.` Other
-  arguments, and `.exe` programs, are unchanged.
+  arguments, and `.exe` programs, are unchanged. Limits: the guarantee ends at
+  the batch file's own lines (it holds for a file that hands its arguments on
+  as `%*` or `"%~1"`, as npm shims do); the machine's cmd.exe settings still
+  apply (AutoRun commands, and delayed expansion, where an argument with `!`
+  may arrive changed).
 - Windows: `remuda.exe` now declares UTF-8 as its code page, so a path with
   non-ASCII characters (for example a Korean user folder) is the same string in
   Lua's `os.getenv`, `io.open` and `os.rename` as in the `remuda.*` words.
