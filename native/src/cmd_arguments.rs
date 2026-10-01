@@ -12,6 +12,13 @@ pub fn is_batch_file(program: &str) -> bool {
     name.ends_with(".cmd") || name.ends_with(".bat")
 }
 
+/// The file name portable-pty tries for one PATHEXT entry (portable-pty 0.9.0,
+/// `cmdbuilder.rs:594-598`): the entry without its FIRST character, whatever
+/// it is, replaces the extension. `None` where portable-pty itself panics.
+pub fn pty_candidate(base: &std::path::Path, entry: &str) -> Option<std::path::PathBuf> {
+    Some(base.with_extension(entry.get(1..)?))
+}
+
 /// The text portable-pty puts on the command line for `arg` (portable-pty
 /// 0.9.0, `cmdbuilder.rs:702-745`): bare unless empty or holding a space,
 /// tab, LF, VT or `"`; inside quotes `"` becomes `\"`.
@@ -74,14 +81,16 @@ pub fn cmd_argument_refusal(arg: &str) -> Option<&'static str> {
 pub fn batch_arguments_refusal(argv: &[String]) -> Option<String> {
     argv.iter().enumerate().find_map(|(index, word)| {
         let reason = cmd_argument_refusal(word)?;
-        let which = match index {
-            0 => "the program path".to_owned(),
-            _ => format!("argument {index}"),
-        };
-        Some(format!(
-            "{which} cannot be passed to a .cmd or .bat program safely: {reason}. \
-             Next: start the .exe, or pass this text in a file."
-        ))
+        Some(match index {
+            0 => format!(
+                "the path of a .cmd or .bat program cannot be passed to cmd.exe safely: \
+                 {reason}. Next: move or rename the folder, or start the .exe."
+            ),
+            _ => format!(
+                "argument {index} cannot be passed to a .cmd or .bat program safely: \
+                 {reason}. Next: start the .exe, or pass this text in a file."
+            ),
+        })
     })
 }
 
@@ -182,6 +191,30 @@ mod tests {
         );
         assert!(!refusal.contains("secret") && !refusal.contains('\n'));
         let refusal = batch_arguments_refusal(&argv(&[r"C:\a&b\x.cmd"])).unwrap();
-        assert!(refusal.starts_with("the program path cannot"), "{refusal}");
+        assert_eq!(
+            refusal,
+            "the path of a .cmd or .bat program cannot be passed to cmd.exe safely: it has a \
+             cmd.exe special character outside quotes. Next: move or rename the folder, or \
+             start the .exe."
+        );
+    }
+
+    #[test]
+    fn a_pathext_entry_gives_the_candidate_portable_pty_tries() {
+        let base = std::path::Path::new("tool.cmd");
+        for (entry, name) in [
+            (".CMD", Some("tool.CMD")),
+            // Not "tool.cmd": the first character is dropped whatever it is.
+            ("cmd", Some("tool.md")),
+            ("..cmd", Some("tool..cmd")),
+            ("", None),
+        ] {
+            let candidate = pty_candidate(base, entry);
+            assert_eq!(
+                candidate.as_deref(),
+                name.map(std::path::Path::new),
+                "{entry:?}"
+            );
+        }
     }
 }
