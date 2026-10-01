@@ -12,3 +12,6 @@
   environment), or `nil, error` if it is empty, not UTF-8, or holds a control,
   line-separator or bidi-control character. It is not sanitized for
   identifiers; callers slug it.
+- On Windows the data home is now `%LOCALAPPDATA%` (channel file at
+  `%LOCALAPPDATA%\remuda\channel`, mods in `%LOCALAPPDATA%\remuda\mods`)
+  instead of `%USERPROFILE%\.local\share`; `XDG_DATA_HOME` still wins.
