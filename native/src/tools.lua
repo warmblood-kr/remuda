@@ -1939,10 +1939,10 @@ function remuda.type_text(session, text, settle)
   return remuda._input_type_text(session, tostring(text), settle or 0.1)
 end
 remuda.input.type_text = remuda.type_text
-register("input.type_text", "Type text, honor the settle pause, then return 'submitted', 'unverified' or 'late'.", "input.type_text(session, text, settle?) -> status")
+register("input.type_text", "Type text, honor the settle pause, then return 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.", "input.type_text(session, text, settle?) -> status")
 register(
   "type_text",
-  "Type text into a session and submit it with Return; returns 'submitted', 'unverified' or 'late'.",
+  "Type text into a session and submit it with Return; returns 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.",
   "type_text(session, text, settle?) -> status"
 )
 

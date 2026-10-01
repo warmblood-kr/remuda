@@ -137,7 +137,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "_input_type_text",
-        "Deliver text and submit it while holding one input lock; returns 'submitted', 'unverified' or 'late'.",
+        "Deliver text and submit it while holding one input lock; returns 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.",
         "_input_type_text(name, text, settle?) -> status",
     ),
     (

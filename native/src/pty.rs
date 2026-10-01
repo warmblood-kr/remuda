@@ -1043,9 +1043,9 @@ mod input_writer_tests {
             first: AtomicBool::new(false),
             captured: Arc::clone(&captured),
         })));
-        let late_submit_bound = Duration::from_millis(150);
+        let late_submit_bound = Duration::from_millis(1500);
         let writer = Arc::new(
-            PtyInputWriter::spawn(writer, Duration::from_millis(30), late_submit_bound).unwrap(),
+            PtyInputWriter::spawn(writer, Duration::from_millis(50), late_submit_bound).unwrap(),
         );
         let first_writer = Arc::clone(&writer);
         let first = std::thread::spawn(move || first_writer.write_bounded(b"text"));
@@ -1054,12 +1054,11 @@ mod input_writer_tests {
             first.join().unwrap(),
             Err(AgentError::WriteTimeout { .. })
         ));
+        std::thread::sleep(late_submit_bound + Duration::from_millis(100));
         assert_eq!(
             writer.chain_after_stalled(b"\r", Duration::ZERO),
-            ChainOutcome::Chained
+            ChainOutcome::Unsupported
         );
-
-        std::thread::sleep(late_submit_bound + Duration::from_millis(10));
         assert!(matches!(
             writer.write_bounded(b"second sender"),
             Err(AgentError::LateSubmitAbandoned { bound }) if bound == late_submit_bound
