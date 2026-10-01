@@ -612,3 +612,203 @@ fn extension_command_separator_passes_dash_as_a_literal_argument() {
     assert_eq!(output.stdout, b"y|--|-|no-stdin\n");
     cleanup_stdin_fixture(&dir);
 }
+
+/// #394: a fresh isolated home whose FIRST command is the mod subcommand under
+/// test. Dropping it stops its private daemon, also when an assert panics.
+struct FreshHome(std::path::PathBuf);
+
+impl FreshHome {
+    fn new(label: &str, manifest_extra: &str, entry: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("rc-first-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mod_dir = dir.join("data/remuda/mods/sample");
+        fs::create_dir_all(mod_dir.join("packages/sample")).unwrap();
+        fs::write(
+            mod_dir.join("extension.toml"),
+            format!(
+                "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\ncommand = \"sample\"\n{manifest_extra}"
+            ),
+        )
+        .unwrap();
+        fs::write(mod_dir.join("packages/sample/init.lua"), entry).unwrap();
+        Self(dir)
+    }
+
+    fn remuda(&self, args: &[&str]) -> Output {
+        stdin_cli(&self.0, args)
+            .env("REMUDA_NO_UPDATE_CHECK", "1")
+            .output()
+            .expect("run remuda")
+    }
+}
+
+impl Drop for FreshHome {
+    fn drop(&mut self) {
+        let _ = self.remuda(&["stop", "-f"]);
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+const LIFECYCLE: &str = "lifecycle = \"remuda-module-v1\"\n";
+
+#[test]
+fn first_mod_subcommand_on_a_fresh_daemon_loads_the_mod() {
+    for (label, args, expected) in [
+        ("doctor", &["sample", "doctor"][..], "handled doctor\n"),
+        (
+            "matrix",
+            &["sample", "matrix", "setup"][..],
+            "handled matrix setup\n",
+        ),
+    ] {
+        let home = FreshHome::new(
+            label,
+            LIFECYCLE,
+            r#"return {
+              api = "remuda-module-v1", state_version = 1,
+              initialize = function() return {} end,
+              start = function()
+                remuda.extension_command("sample", function(args)
+                  return "handled " .. table.concat(args, " ")
+                end)
+              end,
+            }"#,
+        );
+
+        let first = home.remuda(args);
+
+        let stderr = String::from_utf8_lossy(&first.stderr);
+        assert!(!stderr.contains("stack traceback"), "{first:?}");
+        assert!(first.status.success(), "{first:?}");
+        assert_eq!(String::from_utf8_lossy(&first.stdout), expected);
+
+        // The load is never silent, and it happens once.
+        let second = home.remuda(args);
+        let notice = "remuda: started mod sample\n";
+        assert!(stderr.contains(notice), "{first:?}");
+        assert!(
+            !String::from_utf8_lossy(&second.stderr).contains(notice),
+            "{second:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&second.stdout), expected);
+    }
+}
+
+#[test]
+fn mod_subcommand_that_cannot_load_prints_one_line_and_next() {
+    let failing_start = r#"return {
+      api = "remuda-module-v1", state_version = 1,
+      initialize = function() return {} end,
+      start = function() error("start exploded") end,
+    }"#;
+    // A legacy entry registers its command, then fails.
+    let failing_entry =
+        "remuda.extension_command('sample', function() return 'half' end)\nerror('entry exploded')";
+    for (label, manifest_extra, entry) in [
+        ("fail", LIFECYCLE, failing_start),
+        ("half", "", failing_entry),
+    ] {
+        cannot_load_prints_one_line_and_next(&FreshHome::new(label, manifest_extra, entry));
+    }
+}
+
+fn cannot_load_prints_one_line_and_next(home: &FreshHome) {
+    let first = home.remuda(&["sample", "doctor"]);
+    let registered = home.remuda(&["-e", "return remuda._extension_commands.sample == nil"]);
+
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    // The autostart notice is the daemon's, not the failure's.
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.starts_with("remuda: started a daemon"))
+        .collect();
+    assert!(!first.status.success(), "{first:?}");
+    assert!(!stderr.contains("stack traceback"), "{first:?}");
+    assert_eq!(lines.len(), 2, "one line plus Next: {first:?}");
+    assert!(lines[0].contains("sample"), "{first:?}");
+    assert!(lines[1].starts_with("Next: "), "{first:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&registered.stdout).trim(),
+        "true",
+        "a failed load left a half-registered command: {registered:?}"
+    );
+}
+
+#[test]
+fn loaded_legacy_mod_is_not_rerun_by_a_subcommand() {
+    let home = FreshHome::new(
+        "legacy",
+        "",
+        "remuda._sample_runs = (remuda._sample_runs or 0) + 1\n\
+         remuda.extension_command('sample', function() return tostring(remuda._sample_runs) end)",
+    );
+
+    let first = home.remuda(&["sample", "count"]);
+    let second = home.remuda(&["sample", "count"]);
+
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(String::from_utf8_lossy(&first.stdout), "1\n");
+    assert_eq!(String::from_utf8_lossy(&second.stdout), "1\n", "{second:?}");
+}
+
+// SEC review of #406 (L2): the failure line carries the mod's own error text.
+#[test]
+fn mod_load_failure_line_is_terminal_safe() {
+    let home = FreshHome::new(
+        "esc",
+        LIFECYCLE,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function() error("\27[31mexploded\27[0m\rspoofed") end,
+        }"#,
+    );
+
+    let first = home.remuda(&["sample", "doctor"]);
+
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(!first.status.success(), "{first:?}");
+    assert!(stderr.contains("exploded"), "{first:?}");
+    assert!(
+        !stderr.contains('\x1b') && !stderr.contains('\r'),
+        "{first:?}"
+    );
+}
+
+// SEC review of #406: a mod that is loaded but has not registered its command.
+// `exec` leaves an active lifecycle mod alone, so `start` runs once. A legacy
+// entry has no loaded state, so `exec` runs it again, as `remuda exec` does.
+#[test]
+fn loaded_mod_without_its_command_fails_cleanly_and_lifecycle_start_runs_once() {
+    let late_lifecycle = r#"return {
+      api = "remuda-module-v1", state_version = 1,
+      initialize = function() return {} end,
+      start = function() remuda._sample_runs = (remuda._sample_runs or 0) + 1 end,
+    }"#;
+    let late_legacy = "remuda._sample_runs = (remuda._sample_runs or 0) + 1";
+    for (label, manifest_extra, entry, runs) in [
+        ("late", LIFECYCLE, late_lifecycle, "1"),
+        ("lateleg", "", late_legacy, "2"),
+    ] {
+        let home = FreshHome::new(label, manifest_extra, entry);
+
+        let first = home.remuda(&["sample", "doctor"]);
+        let second = home.remuda(&["sample", "doctor"]);
+        let counted = home.remuda(&["-e", "return remuda._sample_runs"]);
+
+        for output in [&first, &second] {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{output:?}");
+            assert!(
+                stderr.contains("did not register the command sample\nNext: "),
+                "{output:?}"
+            );
+            assert!(!stderr.contains("started mod"), "{output:?}");
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&counted.stdout).trim(),
+            runs,
+            "{label}: {counted:?}"
+        );
+    }
+}

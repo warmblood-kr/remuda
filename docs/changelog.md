@@ -3,6 +3,7 @@
 ## 2026-10-01
 
 - `reply:prompt_line` accepts an optional `preface`: text shown above the prompt on stderr, each line indented by two spaces and untagged, at most 32 lines of 256 characters (over a limit is an error). The label is unchanged: one line, cut at 256 characters. See `docs/deferred-reply.md`.
+- A mod subcommand (for example `remuda butler doctor`) now loads its mod when it is not loaded yet, so it works as the first command after an install. The load is announced in one line, `remuda: started mod NAME`, because it runs the mod's `start`. A mod that cannot be loaded prints one line and a `Next:` line instead of a Lua traceback.
 
 ## 2026-09-29
 
