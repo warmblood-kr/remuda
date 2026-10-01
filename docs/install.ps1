@@ -149,6 +149,9 @@ try {
 
     $installDir = if ($env:REMUDA_INSTALL_DIR) { $env:REMUDA_INSTALL_DIR } else { Join-Path $HOME '.local\bin' }
     New-Item -ItemType Directory -Force -Path $installDir, $dataDir | Out-Null
+    # Absolute, because it is about to be written to PATH, where a relative
+    # entry means a different directory in every shell.
+    $installDir = (Get-Item -Force -LiteralPath $installDir).FullName
     $installed = Join-Path $installDir 'remuda.exe'
 
     # Windows refuses to overwrite a RUNNING executable but allows renaming it,
@@ -168,10 +171,28 @@ try {
     Set-Content -Path $channelFile -Value $channel -NoNewline
 
     Write-Host "install.ps1: remuda $version -> $installed ($channel channel)"
-    $onPath = ($env:PATH -split ';') -contains $installDir
-    if (-not $onPath) {
-        Write-Host "install.ps1: $installDir is not on your PATH - add it, e.g."
-        Write-Host ('  [Environment]::SetEnvironmentVariable(''PATH'', "$env:PATH;' + $installDir + '", ''User'')')
+    # Nothing on a stock Windows has ~\.local\bin on PATH, and a hint to add it
+    # is one more step between the one-liner and `remuda` being a command. So
+    # persist it for the user, and add it to this session for the next step.
+    # Read from the registry unexpanded and written back as the kind it was,
+    # so the user's own entries survive as-is; only the User PATH is touched.
+    $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+    $userPath = $envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+    $pathKind = if ($envKey.GetValueNames() -contains 'Path') { $envKey.GetValueKind('Path') } else { 'ExpandString' }
+    if (($userPath -split ';') -notcontains $installDir) {
+        $newUserPath = if ($userPath) { $userPath.TrimEnd(';') + ';' + $installDir } else { $installDir }
+        $envKey.SetValue('Path', $newUserPath, $pathKind)
+        # A registry write alone reaches nobody. Explorer re-reads the
+        # environment on WM_SETTINGCHANGE, which .NET broadcasts when it sets a
+        # User variable - so set and clear a throwaway one.
+        $nudge = 'REMUDA_PATH_' + [guid]::NewGuid().ToString('N')
+        [Environment]::SetEnvironmentVariable($nudge, '1', 'User')
+        [Environment]::SetEnvironmentVariable($nudge, [NullString]::Value, 'User')
+        Write-Host "install.ps1: added $installDir to your user PATH - a terminal app that is already open may need a restart to see it"
+    }
+    $envKey.Close()
+    if (($env:PATH -split ';') -notcontains $installDir) {
+        $env:PATH = $env:PATH.TrimEnd(';') + ';' + $installDir
     }
 
     if ($env:REMUDA_INSTALL_BUTLER -eq '1') {

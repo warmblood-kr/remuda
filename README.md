@@ -107,7 +107,7 @@ $env:REMUDA_CHANNEL='nightly'; $env:REMUDA_INSTALL_BUTLER='1'; irm https://warmb
 ```
 
 The tarball is verified against `SHA256SUMS`, Remuda is installed in
-`~\.local\bin`, and the Butler mod is installed. Set
+`~\.local\bin` (added to your user `PATH`), and the Butler mod is installed. Set
 `$env:REMUDA_INSTALL_DIR` to put Remuda elsewhere. No Matrix token or config is
 required for this install; the command ends by printing
 `Next: remuda butler doctor`. The daemon speaks over a named pipe instead of a
