@@ -92,7 +92,8 @@ $defaultCases = @(
     @{ Name = 'XDG_DATA_HOME still wins for the channel file'; Local = $true; Xdg = $true },
     @{ Name = 'older install beside it'; Local = $true; OldExe = $true; OldShare = $true },
     @{ Name = 'older install, no old data dir'; Local = $true; OldExe = $true },
-    @{ Name = 'installing INTO the old dir is not an older install'; Local = $true; OldExe = $true; IntoOld = $true }
+    @{ Name = 'installing INTO the old dir is not an older install'; Local = $true; OldExe = $true; IntoOld = $true },
+    @{ Name = 'a junction at <data>\remuda keeps its target'; Local = $true; Junction = $true }
 )
 $me = [Security.Principal.WindowsIdentity]::GetCurrent()
 $elevated = ([Security.Principal.WindowsPrincipal]$me).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -140,6 +141,13 @@ try {
             Set-Content -Path (Join-Path $oldBin 'remuda.exe') -Value 'an older install'
         }
         if ($case.OldShare) { New-Item -ItemType Directory -Force -Path $oldShare | Out-Null }
+        if ($case.Junction) {
+            # Elevated, the installer must not hand a junction's TARGET to the user.
+            $target = Join-Path $scratch "junction-target-$n"
+            New-Item -ItemType Directory -Force -Path $target | Out-Null
+            New-Item -ItemType Junction -Path (Join-Path $dataHome 'remuda') -Target $target | Out-Null
+            $ownerBefore = (Get-Acl -LiteralPath $target).GetOwner([Security.Principal.SecurityIdentifier])
+        }
         if ($case.PreCreate) { New-Item -ItemType Directory -Force -Path (Join-Path $dataHome 'remuda') | Out-Null }
 
         $env:LOCALAPPDATA = if ($case.Local) { $localDir } else { $null }
@@ -167,7 +175,9 @@ try {
             # The cluster code refuses a data dir owned by Administrators, so
             # an elevated install must hand it to the user - found or created.
             $owner = (Get-Acl -LiteralPath (Join-Path $dataHome 'remuda')).GetOwner([Security.Principal.SecurityIdentifier])
-            if ($owner.Value -ne $me.User.Value) { $failures += "${why}: $(Join-Path $dataHome 'remuda') is owned by $owner, want $($me.User)" }
+            $wantOwner = if ($case.Junction) { $ownerBefore } else { $me.User }
+            if ($owner.Value -ne $wantOwner.Value) { $failures += "${why}: $(Join-Path $dataHome 'remuda') is owned by $owner, want $wantOwner" }
+            if ($case.Junction -and $elevated -and -not ($out -match 'junction')) { $failures += "${why}: no warning that the data dir is a junction" }
             $warned = $out -match 'elevated shell is not needed'
             if ($elevated -and -not $warned) { $failures += "${why}: elevated, but no warning that an elevated shell is not needed" }
             if (-not $elevated -and $warned) { $failures += "${why}: not elevated, but warned about elevation" }
