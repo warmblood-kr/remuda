@@ -88,21 +88,21 @@ Lua, not bound from Rust.
 remuda.new("build", {"sh"})
 remuda.send("build", "echo $((6*7))-ready")
 
-local function wait(name, pattern)
-  for _ = 1, 500 do
+local function wait(name, pattern, done)
+  local function poll()
     local screen = remuda.capture(name)
-    if screen:find(pattern) then return screen end
-    remuda.sleep(0.02)
+    if screen:find(pattern) then return done(screen) end
+    remuda.after(0.02, poll)
   end
-  error("never saw " .. pattern .. " in " .. name)
+  poll()
 end
 
-wait("build", "42%-ready")
-
-if remuda.capture("build"):find("42%-ready") then
-  remuda.send("build", "echo $((11*11))-and-the-next-step-depended-on-it")
-end
-wait("build", "121%-and")
+wait("build", "42%-ready", function(screen)
+  if screen:find("42%-ready") then
+    remuda.send("build", "echo $((11*11))-and-the-next-step-depended-on-it")
+  end
+  wait("build", "121%-and", function() end)
+end)
 
 for _, s in ipairs(remuda.ls()) do
   print(string.format("%-10s %dx%d  alive=%s", s.name, s.cols, s.rows, tostring(s.alive)))

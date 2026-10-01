@@ -143,11 +143,18 @@ Prediction 4 held, and the shape of the gap is now concrete rather than
 suspected. The wait is written in Lua and works:
 
 ```lua
-local function wait_for(name, pattern, limit)
-  for i = 1, limit do
-    if remuda.capture(name):find(pattern) then return i end
-    remuda.sleep(0.5)
+local function wait_for(name, pattern, limit, done)
+  local polls = 0
+  local function poll()
+    polls = polls + 1
+    if remuda.capture(name):find(pattern) then return done(polls) end
+    if polls < limit then
+      remuda.after(0.5, poll)
+    else
+      done(nil)
+    end
   end
+  poll()
 end
 ```
 
@@ -157,8 +164,10 @@ all**; the folder is already trusted. Positive control, same function, a pattern
 that must match:
 
 ```
-wait_for("agent3", "Claude Code v", 40)  →  3      ← the poll itself works
-wait_for("agent2", "trust this folder", 40)  →  nil ← the oracle was wrong
+wait_for("agent3", "Claude Code v", 40, function(polls) print(polls or "nil") end)
+  →  3      ← the poll itself works
+wait_for("agent2", "trust this folder", 40, function(polls) print(polls or "nil") end)
+  →  nil    ← the oracle was wrong
 ```
 
 So the failure was not the loop; it was that the caller must know what the
@@ -194,9 +203,8 @@ The bullet above filed readiness under *convenience*: no verb for it, so the
 caller writes a poll loop. That is the wrong weight, and this step contains the
 counter-example it needed.
 
-`wait_for` calls `remuda.sleep(0.5)` **on the image thread**. For the 20 seconds
-of a 40-poll wait, no other Lua can run — not for this session, not for any
-other client. That is precisely the failure this project exists to escape:
+`wait_for` schedules each retry with `remuda.after(0.5, ...)` without blocking
+the image thread. That is precisely the failure this project exists to escape:
 Emacs freezes not because it has one thread, but because blocking work runs on
 the same thread as everything else (`cc-butler.el:232` comments out
 `shell-command-to-string` as "blocks in C with no timeout"; `matrix-bridge.el:29`
@@ -228,4 +236,3 @@ claim above is wrong.
 No code changed. Nothing was added to make the test pass, on purpose: the value
 of the measurement is that every verb it used was already there, so the gaps it
 found are the design's gaps and not a missing feature's.
-

@@ -2,7 +2,7 @@ use remuda_core::Registry;
 use remuda_native::{image::Image, tick::Counters};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn image() -> Image {
     Image::spawn(
@@ -65,21 +65,38 @@ fn a_coroutine_resumed_in_a_later_job_is_bounded() {
 }
 
 #[test]
-fn time_in_rust_sleep_does_not_consume_the_instruction_budget() {
+fn a_timer_wait_does_not_consume_the_instruction_budget() {
     let image = image();
     let answer = image
         .submit(
-            "remuda.sleep(2.2); local sum = 0; for i = 1, 100000 do sum = sum + i end; return sum",
+            "remuda.after(2.2, function() local sum = 0; for i = 1, 100000 do sum = sum + i end; remuda._timer_test_sum = sum end); return 'scheduled'",
             None,
         )
-        .expect("queue sleep and short loop");
+        .expect("queue timer and return without waiting for it");
     assert_eq!(
         answer
-            .recv_timeout(Duration::from_secs(4))
-            .expect("sleep and short loop complete within the test bound")
-            .expect("Rust sleep time is outside the Lua instruction budget"),
-        "5000050000"
+            .recv_timeout(Duration::from_secs(1))
+            .expect("scheduling a timer must return promptly")
+            .expect("schedule timer"),
+        "scheduled"
     );
+
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let answer = image
+            .submit("return tostring(remuda._timer_test_sum)", None)
+            .expect("queue timer result query");
+        let result = answer
+            .recv_timeout(Duration::from_secs(1))
+            .expect("timer result query returns promptly")
+            .expect("read timer result");
+        if result != "nil" {
+            assert_eq!(result, "5000050000");
+            break;
+        }
+        assert!(Instant::now() < deadline, "timer callback did not run");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]

@@ -95,6 +95,50 @@ fn capture(path: &Path, name: &str) -> String {
     }
 }
 
+fn wait_for_screen(
+    path: &Path,
+    name: &str,
+    description: &str,
+    mut ready: impl FnMut(&str) -> bool,
+) -> String {
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let screen = capture(path, name);
+        if ready(&screen) {
+            return screen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "never saw {description} on screen:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn wait_for_fixture_output(path: &Path, version: &str, needles: &[&str]) {
+    let prefix = format!("api-{version}-");
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        let session = match client::request(path, &Request::List).expect("list fixture sessions") {
+            Response::Sessions(sessions) => sessions
+                .into_iter()
+                .find(|session| session.name.starts_with(&prefix)),
+            other => panic!("list fixture sessions: {other:?}"),
+        };
+        if let Some(session) = session {
+            let screen = capture(path, &session.name);
+            if needles.iter().all(|needle| screen.contains(needle)) {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{version} fixture output did not reach {needles:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// `request_counts()`'s three fields, read back through one `Eval` — the
 /// same "one object, read from Lua" a runtime caller gets, just parsed here
 /// instead of eyeballed.
@@ -595,6 +639,11 @@ fn every_frozen_api_version_still_runs() {
     for version in versions {
         script::run(&path, &version)
             .unwrap_or_else(|e| panic!("{} no longer runs: {e}", version.display()));
+        match version.file_stem().and_then(|stem| stem.to_str()) {
+            Some("v1") => wait_for_fixture_output(&path, "v1", &["42-v1", "64-v1"]),
+            Some("v2") => wait_for_fixture_output(&path, "v2", &["9-v2", "one-v2", "two-v2"]),
+            _ => {}
+        }
     }
 }
 
@@ -614,20 +663,20 @@ fn a_script_reacts_to_what_a_session_shows() {
         remuda.new("driven", {"sh"})
         remuda.send("driven", "echo $((6*7))-first")
 
-        local deadline = 500
-        while deadline > 0 and not remuda.capture("driven"):find("42%-first") do
-          remuda.sleep(0.02)
-          deadline = deadline - 1
-        end
-        if deadline == 0 then error("the first answer never appeared") end
-
-        -- The branch is the part shell cannot do: what is sent next depends on
-        -- what came back.
-        if remuda.capture("driven"):find("42%-first") then
+        local tries = 500
+        local function react_to_first_answer()
+          if remuda.capture("driven"):find("42%-first") then
+            -- The branch is the part shell cannot do: what is sent next depends
+            -- on what came back.
           remuda.send("driven", "echo $((11*11))-second")
-        else
-          remuda.send("driven", "echo WRONG-BRANCH")
+          elseif tries == 0 then
+            error("the first answer never appeared")
+          else
+            tries = tries - 1
+            remuda.after(0.02, react_to_first_answer)
+          end
         end
+        remuda.after(0.02, react_to_first_answer)
     "#;
 
     script::run(&path, &write(&dir, "react.lua", source)).expect("script");
@@ -770,27 +819,58 @@ fn is_busy_tracks_streaming_output_then_goes_idle() {
     let path = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&path, &dir);
 
-    let source = r#"
+    script::run_source(
+        &path,
+        "=streaming-busy-start",
+        r#"
         remuda.new("streaming", {"sh", "-c", "i=0; while [ $i -lt 20 ]; do printf x; sleep 0.1; i=$((i + 1)); done; sleep 30"})
+        "#,
+    )
+    .expect("start streaming session");
+
+    std::thread::sleep(Duration::from_secs(1));
+    script::run_source(
+        &path,
+        "=streaming-busy-check",
+        r#"
         local s = remuda.session("streaming")
-        remuda.sleep(1.0)
         assert(s.is_busy, "a session producing output without input must stay busy")
         local row = remuda.ls()[1]
         assert(row.idle > 0.8, "ls().idle must keep its since-input meaning")
         assert(row.output_idle < 2.0, "ls().output_idle must track recent output")
+        "#,
+    )
+    .expect("streaming session is busy while output arrives");
 
-        for _ = 1, 100 do
-            if not s.is_busy then break end
-            remuda.sleep(0.1)
-        end
+    let deadline = Instant::now() + Duration::from_secs(7);
+    loop {
+        let busy = script::eval_source(
+            &path,
+            "=streaming-busy-poll",
+            "return tostring(remuda.session('streaming').is_busy)",
+        )
+        .expect("read streaming state");
+        if busy == "false" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "session output never became idle"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    script::run_source(
+        &path,
+        "=streaming-busy-final",
+        r#"
+        local s = remuda.session("streaming")
         assert(not s.is_busy, "a session quiet for more than 2s must become idle")
-        row = remuda.ls()[1]
+        local row = remuda.ls()[1]
         assert(row.idle > 3.0, "output must not reset since-input idle")
         assert(row.output_idle >= 2.0, "output_idle must age after streaming stops")
-    "#;
-
-    script::run_source(&path, "=streaming-busy", source)
-        .expect("is_busy follows output and becomes idle after output stops");
+        "#,
+    )
+    .expect("is_busy follows output and becomes idle after output stops");
 }
 
 #[test]
@@ -832,21 +912,22 @@ fn capture_styled_marks_dim_spans_and_reports_the_cursor() {
     let dir = scratch("styled");
     let path = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&path, &dir);
+    script::run_source(&path, "=styled-new", "remuda.new('styled', {'sh'})")
+        .expect("start styled session");
+    wait_for_screen(&path, "styled", "shell prompt", |screen| {
+        screen.chars().any(|character| !character.is_whitespace())
+    });
+    script::run_source(
+        &path,
+        "=styled-type",
+        "remuda.send('styled', \"printf '\\\\033[2mgh%sst\\\\033[0m-plain\\\\n' o\")",
+    )
+    .expect("send styled output command");
+    wait_for_screen(&path, "styled", "ghost-plain", |screen| {
+        screen.contains("ghost-plain")
+    });
+
     let code = r#"
-        -- Wait on what the screen shows, never on timing: first the shell's
-        -- prompt (so the command is not typed before sh reads), then the
-        -- output row itself. A timeout fails loudly with the screen.
-        local function await(pattern)
-          for _ = 1, 1000 do
-            if remuda.capture("styled"):find(pattern) then return end
-            remuda.sleep(0.02)
-          end
-          error("never saw " .. pattern .. " on screen:\n" .. remuda.capture("styled"))
-        end
-        remuda.new("styled", {"sh"})
-        await("%S")
-        remuda.send("styled", "printf '\\033[2mgh%sst\\033[0m-plain\\n' o")
-        await("ghost%-plain")
         local screen, dim = remuda.capture_styled("styled"), {}
         for _, row in ipairs(screen.rows) do
           if row[1] and row[1].text:find("^ghost") then -- the output, not the echo
@@ -860,15 +941,6 @@ fn capture_styled_marks_dim_spans_and_reports_the_cursor() {
         local c = screen.cursor
         return table.concat(dim, " ") .. " cursor=" .. type(c.row) .. "," .. type(c.col) .. "," .. type(c.visible)
     "#;
-    let got = match client::request(
-        &path,
-        &Request::Eval {
-            code: code.into(),
-            name: None,
-        },
-    ) {
-        Ok(Response::Value(value)) => value,
-        other => panic!("eval: {other:?}"),
-    };
+    let got = script::eval_source(&path, "=styled-capture", code).expect("capture styled screen");
     assert_eq!(got, "ghost=true -plain=false cursor=number,number,boolean");
 }
