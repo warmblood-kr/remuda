@@ -13,6 +13,8 @@ pub mod cluster_tui;
 pub mod daemon;
 pub mod dist;
 pub(crate) mod fs_atomic;
+pub mod fs_lock;
+pub mod hostname;
 pub mod image;
 pub mod ipc;
 pub mod json;

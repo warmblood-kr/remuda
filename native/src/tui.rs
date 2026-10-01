@@ -231,6 +231,10 @@ impl Ui {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         let selected = self.selected;
+        // Whatever left focus on the list, step from the viewport that is drawn.
+        if self.focus == Focus::List && self.list_first_visible.is_some() {
+            self.list_first_visible = Some(list_viewport(self, self.preview_rows));
+        }
         let action = if self.focus == Focus::Session {
             self.session_key(key)
         } else {
@@ -274,13 +278,10 @@ impl Ui {
 
         let preview_offset = if self.list_visible { list_w + 1 } else { 0 };
         if self.list_visible && col <= list_w {
-            // A focused session owns the selection; follow_focus would snap it back.
-            if self.focus != Focus::Session {
-                match event.kind {
-                    MouseEventKind::ScrollUp => self.scroll_list(-1, body),
-                    MouseEventKind::ScrollDown => self.scroll_list(1, body),
-                    _ => {}
-                }
+            match event.kind {
+                MouseEventKind::ScrollUp => self.scroll_list(-1, body),
+                MouseEventKind::ScrollDown => self.scroll_list(1, body),
+                _ => {}
             }
             if matches!(
                 event.kind,
@@ -364,6 +365,10 @@ impl Ui {
         let first = list_viewport(self, body);
         let first = first.saturating_add_signed(delta).min(max_first);
         self.list_first_visible = Some(first);
+        // A focused session owns the selection; only the viewport moves.
+        if self.focus == Focus::Session {
+            return;
+        }
 
         let before = self.selected;
         if self.selected < first {
@@ -2347,7 +2352,10 @@ fn list_viewport(ui: &Ui, body: u16) -> usize {
     let Some(first) = ui.list_first_visible.map(|first| first.min(max_first)) else {
         return follows_selection;
     };
-    if ui.selected >= first && ui.selected < first.saturating_add(visible) {
+    // A focused session lets the wheel scroll the list past the selection.
+    if ui.focus == Focus::Session
+        || (ui.selected >= first && ui.selected < first.saturating_add(visible))
+    {
         first
     } else {
         follows_selection

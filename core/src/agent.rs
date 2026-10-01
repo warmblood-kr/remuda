@@ -218,6 +218,12 @@ pub enum AgentError {
     WriteTimeout {
         timeout: core::time::Duration,
     },
+    /// A stalled text write outlived its submit bound; its Return was dropped.
+    LateSubmitAbandoned {
+        bound: core::time::Duration,
+    },
+    /// Text is still being written; its Return will follow if it lands in time.
+    SubmitPending,
     /// A `feed` act's `Pause`s summed past the caller's cap — refused before
     /// anything is written, not clamped, so a seconds/millis mixup errors
     /// instead of silently running a shorter pause than asked for.
@@ -243,6 +249,16 @@ impl fmt::Display for AgentError {
                     "PTY write exceeded {timeout:?}; delivery may be partial or late"
                 )
             }
+            AgentError::LateSubmitAbandoned { bound } => {
+                write!(
+                    f,
+                    "an earlier write to this pane stalled for over {bound:?} and its Return was not sent; the pane may hold unsent text; this text was not typed"
+                )
+            }
+            AgentError::SubmitPending => write!(
+                f,
+                "text is still being written to a slow pane; Return follows when it lands or is dropped after the bound; check the pane before resending"
+            ),
             AgentError::PauseTooLong { total, cap } => {
                 write!(f, "feed's pauses total {total:?}, over the {cap:?} cap")
             }
@@ -253,9 +269,25 @@ impl fmt::Display for AgentError {
 
 pub type Result<T> = core::result::Result<T, AgentError>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChainOutcome {
+    Chained,
+    Landed,
+    Unsupported,
+}
+
 /// A backend writer that can wait independently of the locked process object.
 pub trait AgentWriter: Send + Sync {
     fn write_bounded(&self, bytes: &[u8]) -> Result<()>;
+    /// Ask the write that timed out to be followed by FOLLOW_UP once it lands.
+    /// `Landed` means the timed-out write is no longer the active write; `Unsupported` means it cannot chain.
+    fn chain_after_stalled(
+        &self,
+        _follow_up: &[u8],
+        _settle: core::time::Duration,
+    ) -> ChainOutcome {
+        ChainOutcome::Unsupported
+    }
     /// Write these bytes once and wait for their actual completion. Interactive
     /// input uses this path so a timeout cannot silently drop a keystroke or
     /// cause a possibly partial write to be replayed.

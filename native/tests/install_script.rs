@@ -33,3 +33,44 @@ fn both_installers_offer_the_gated_butler_setup_and_next_steps() {
         );
     }
 }
+
+// The only place the installer itself runs: on the Windows runner, under both
+// shells a user can have. Each script explains what it asserts.
+#[cfg(windows)]
+fn passes_under_both_shells(check: &str) {
+    let check = format!("{}/../scripts/{check}", env!("CARGO_MANIFEST_DIR"));
+    for shell in ["powershell", "pwsh"] {
+        let output = std::process::Command::new(shell)
+            // CI's step shell is pwsh. Windows PowerShell started under its
+            // PSModulePath did not find Get-FileHash; a user opens it directly,
+            // so give it the same clean start.
+            .env_remove("PSModulePath")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", &check])
+            .output()
+            .unwrap_or_else(|error| panic!("cannot run {shell}: {error}"));
+        assert!(
+            output.status.success(),
+            "{shell}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn the_windows_installer_puts_its_install_dir_on_path() {
+    passes_under_both_shells("check-install-path.ps1");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_failed_windows_install_leaves_the_session_open() {
+    passes_under_both_shells("check-install-die.ps1");
+}
+
+#[cfg(windows)]
+#[test]
+fn a_windows_install_without_git_explains_the_butler_step() {
+    passes_under_both_shells("check-install-butler.ps1");
+}

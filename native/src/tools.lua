@@ -138,7 +138,10 @@ local function new_pending_handle(timeout, on_cancel)
     if prompt.default ~= nil and type(prompt.default) ~= "string" then
       error("prompt_line default must be a string", 2)
     end
-    local prompt_id = native_handle:prompt_line(prompt.label, prompt.default)
+    if prompt.preface ~= nil and type(prompt.preface) ~= "string" then
+      error("prompt_line preface must be a string", 2)
+    end
+    local prompt_id = native_handle:prompt_line(prompt.label, prompt.default, prompt.preface)
     local callbacks = pending_line_handlers[id] or {}
     pending_line_handlers[id] = callbacks
     callbacks[prompt_id] = prompt.callback
@@ -1956,10 +1959,10 @@ function remuda.type_text(session, text, settle)
   return remuda._input_type_text(session, tostring(text), settle or 0.1)
 end
 remuda.input.type_text = remuda.type_text
-register("input.type_text", "Type text, honor the settle pause, then return 'submitted' or 'unverified'.", "input.type_text(session, text, settle?) -> status")
+register("input.type_text", "Type text, honor the settle pause, then return 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.", "input.type_text(session, text, settle?) -> status")
 register(
   "type_text",
-  "Type text into a session and submit it with Return; returns 'submitted' or 'unverified'.",
+  "Type text into a session and submit it with Return; returns 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.",
   "type_text(session, text, settle?) -> status"
 )
 
