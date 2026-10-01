@@ -2096,9 +2096,11 @@ mod tests {
             url.replace("localhost", "127.0.0.1"),
             Some(pin_of(include_str!("testdata/selfsigned-ca.pem"))),
         );
-        assert!(perform(req, None)
-            .unwrap_err()
-            .contains("TLS request failed"));
+        let error = perform(req, None).unwrap_err();
+        assert!(
+            error.contains("TLS request failed: server hostname mismatch"),
+            "{error}"
+        );
         assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
     }
 
