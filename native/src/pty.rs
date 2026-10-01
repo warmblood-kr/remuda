@@ -89,24 +89,28 @@ impl PtyInputWriter {
     }
 
     fn submit(&self, bytes: &[u8]) -> Result<Receiver<Result<()>>> {
+        self.submit_inner(bytes, false)
+    }
+
+    fn submit_bounded(&self, bytes: &[u8]) -> Result<Receiver<Result<()>>> {
+        self.submit_inner(bytes, true)
+    }
+
+    fn submit_inner(
+        &self,
+        bytes: &[u8],
+        report_completed_abandonment: bool,
+    ) -> Result<Receiver<Result<()>>> {
         {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.active_since.is_some() {
-                if state
-                    .active_since
-                    .is_some_and(|started| started.elapsed() >= self.late_submit_bound)
-                    && state.follow_up.is_some()
-                {
-                    state.follow_up = None;
-                    state.follow_up_open = false;
-                    state.late_submit_abandoned = true;
-                }
-                if state.late_submit_abandoned {
-                    return Err(AgentError::LateSubmitAbandoned {
-                        bound: self.late_submit_bound,
-                    });
-                }
                 return Err(AgentError::Busy);
+            }
+            if report_completed_abandonment && state.late_submit_abandoned {
+                state.late_submit_abandoned = false;
+                return Err(AgentError::LateSubmitAbandoned {
+                    bound: self.late_submit_bound,
+                });
             }
             state.active_since = Some(Instant::now());
             state.follow_up = None;
@@ -128,6 +132,19 @@ impl PtyInputWriter {
                 Err(AgentError::Io("pty writer worker stopped".into()))
             }
         }
+    }
+
+    fn note_late_submit_abandoned(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let past_bound = state
+            .active_since
+            .is_some_and(|started| started.elapsed() >= self.late_submit_bound);
+        if past_bound && state.follow_up.is_some() {
+            state.follow_up = None;
+            state.follow_up_open = false;
+            state.late_submit_abandoned = true;
+        }
+        state.active_since.is_some() && state.late_submit_abandoned
     }
 }
 
@@ -152,7 +169,7 @@ fn run_writer(
                 state.follow_up_open = false;
                 let too_late = state
                     .active_since
-                    .is_some_and(|started| started.elapsed() > late_submit_bound);
+                    .is_some_and(|started| started.elapsed() >= late_submit_bound);
                 if result.is_ok() && !too_late {
                     state.follow_up.take()
                 } else {
@@ -188,7 +205,10 @@ struct BusyReset<'a>(&'a Mutex<WriterState>);
 
 impl Drop for BusyReset<'_> {
     fn drop(&mut self) {
-        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = WriterState::default();
+        let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.active_since = None;
+        state.follow_up = None;
+        state.follow_up_open = false;
     }
 }
 
@@ -212,8 +232,13 @@ impl AgentWriter for PtyInputWriter {
 
     fn write_bounded(&self, bytes: &[u8]) -> Result<()> {
         let receiver = loop {
-            match self.submit(bytes) {
+            match self.submit_bounded(bytes) {
                 Ok(receiver) => break receiver,
+                Err(AgentError::Busy) if self.note_late_submit_abandoned() => {
+                    return Err(AgentError::LateSubmitAbandoned {
+                        bound: self.late_submit_bound,
+                    });
+                }
                 Err(AgentError::Busy) if self.is_timed_out() => {
                     // This request never reached the PTY worker. Leave it
                     // retryable; only a timeout of our submitted receiver is
@@ -923,6 +948,10 @@ mod input_writer_tests {
             writer.write_bounded(b"second sender"),
             Err(AgentError::LateSubmitAbandoned { bound }) if bound == late_submit_bound
         ));
+        assert!(matches!(
+            writer.write_to_completion_while(b"attach key", &|| false),
+            Err(AgentError::Busy)
+        ));
 
         release_tx.send(()).unwrap();
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -932,6 +961,13 @@ mod input_writer_tests {
         }
         assert_eq!(*captured.lock().unwrap(), b"text");
         assert!(!writer.is_busy());
+        assert!(matches!(
+            writer.write_bounded(b"first after late write"),
+            Err(AgentError::LateSubmitAbandoned { bound }) if bound == late_submit_bound
+        ));
+        assert_eq!(*captured.lock().unwrap(), b"text");
+        writer.write_bounded(b"second after late write").unwrap();
+        assert_eq!(*captured.lock().unwrap(), b"textsecond after late write");
     }
 
     #[test]
