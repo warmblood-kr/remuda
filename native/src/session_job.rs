@@ -1,8 +1,9 @@
 //! A session's processes on Windows, held together by a job object. A parent
 //! PID stops naming a session once the parent has exited; a job does not: a
 //! process a member starts is in the job, stays in it when its parent exits,
-//! and cannot leave it (the job sets no breakaway limit). The decisions are
-//! plain functions, tested on every platform; the Windows calls are below them.
+//! and cannot leave it (the job sets no breakaway limit). The job is closed
+//! with its session, and that ends every process still in it. The decisions
+//! are plain functions, tested on every platform; the Windows calls are below.
 
 use std::io;
 
@@ -99,6 +100,8 @@ mod windows {
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     };
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
@@ -146,9 +149,9 @@ mod windows {
         }
     }
 
-    /// One session's job. It sets NO limit: no breakaway is allowed (neither
-    /// JOB_OBJECT_LIMIT_BREAKAWAY_OK nor the silent form), and nothing is
-    /// killed when the handle closes.
+    /// One session's job. Its one limit is kill-on-close: when this handle,
+    /// the only one, closes, every process in the job ends. No breakaway is
+    /// allowed (neither JOB_OBJECT_LIMIT_BREAKAWAY_OK nor the silent form).
     pub struct SessionJob(HANDLE);
 
     // SAFETY: a job handle names a kernel object; the calls made on it here
@@ -158,12 +161,30 @@ mod windows {
 
     impl SessionJob {
         pub fn new() -> io::Result<Self> {
-            // SAFETY: null attributes and name ask for a private, unnamed job.
+            // SAFETY: null attributes and name ask for a private, unnamed job
+            // whose handle no child inherits.
             let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
             if handle.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Self(handle))
+            // From here Drop closes the handle, on the error path too.
+            let job = Self(handle);
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            // SAFETY: `limits` is the structure this information class takes,
+            // and the pointer and length are valid for the call.
+            let set = unsafe {
+                SetInformationJobObject(
+                    job.0,
+                    JobObjectExtendedLimitInformation,
+                    (&raw const limits).cast(),
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+            if set == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(job)
         }
 
         pub(crate) fn assign(&self, process: HANDLE) -> io::Result<()> {

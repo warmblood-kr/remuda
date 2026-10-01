@@ -445,7 +445,8 @@ impl PtyAgent {
         // No child_guard here on purpose — this child already dies with the
         // daemon by kernel accident (the master fd closes on any daemon
         // exit, SIGHUP-ing this session leader). See child_guard.rs and
-        // native/tests/pty_survives_daemon_death.rs, which pins it.
+        // native/tests/pty_survives_daemon_death.rs, which pins it. On Windows
+        // the session's job (kill on close) ends the child and what it started.
         crate::child_guard::documented_pty_hangup_accident();
         drop(pair.slave); // Or the master never sees EOF when the child exits.
 
