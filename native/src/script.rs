@@ -364,8 +364,8 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "_process_run",
-        "Run an argv process synchronously with a bounded timeout and captured output; internal, called by `remuda.process.run`.",
-        "_process_run(argv, stdin?, timeout, cwd?) -> result | nil, refusal",
+        "Run an argv process synchronously with a bounded timeout and captured output; internal, called by `remuda.process.run`. Its optional stdin_hold_until_lines keeps stdin open until stdout has that many newlines, the child exits, or timeout.",
+        "_process_run(argv, stdin?, timeout, cwd?, stdin_hold_until_lines?) -> result | nil, refusal",
     ),
     (
         "_process_spawn",
@@ -1448,6 +1448,19 @@ fn request_count_bindings(
     )
 }
 
+fn parse_stdin_hold_until_lines(value: Value) -> Result<Option<usize>, String> {
+    match value {
+        Value::Nil => Ok(None),
+        Value::Integer(lines) if (1..=1000).contains(&lines) => Ok(Some(lines as usize)),
+        Value::Number(lines)
+            if lines.is_finite() && lines.fract() == 0.0 && (1.0..=1000.0).contains(&lines) =>
+        {
+            Ok(Some(lines as usize))
+        }
+        _ => Err("process.run stdin_hold_until_lines must be an integer from 1 through 1000. Next: pass a whole number in that range.".to_string()),
+    }
+}
+
 /// `remuda.process`'s Rust half — split out of `bindings` to stay under its
 /// line cap.
 // `remuda.process` itself (the validated, Lua-facing spec-table word) lives
@@ -1484,12 +1497,18 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
         "_process_run",
         lua.create_function(
             |lua,
-             (mut argv, stdin, timeout, cwd): (
+             (mut argv, stdin, timeout, cwd, stdin_hold_until_lines): (
                 Vec<String>,
                 Option<mlua::LuaString>,
                 f64,
                 Option<String>,
+                Value,
             )| {
+                let stdin_hold_until_lines =
+                    match parse_stdin_hold_until_lines(stdin_hold_until_lines) {
+                        Ok(lines) => lines,
+                        Err(refused) => return Ok((Value::Nil, Some(refused))),
+                    };
                 let cwd =
                     match crate::process::checked_cwd("process.run", cwd.as_deref(), &mut argv) {
                         Ok(cwd) => cwd,
@@ -1500,6 +1519,7 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
                     stdin.map(|value| value.as_bytes().to_vec()),
                     timeout,
                     cwd,
+                    stdin_hold_until_lines,
                 )
                 .map_err(mlua::Error::runtime)?;
                 let result = lua.create_table()?;
