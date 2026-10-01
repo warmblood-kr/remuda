@@ -386,9 +386,9 @@ impl Session {
                         .agent
                         .lock()
                         .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-                    agent
-                        .input_writer()
-                        .is_some_and(|writer| writer.chain_after_stalled(crate::keys::RETURN_BYTES))
+                    agent.input_writer().is_some_and(|writer| {
+                        writer.chain_after_stalled(crate::keys::RETURN_BYTES, settle)
+                    })
                 };
                 if chained {
                     return Ok(InputSubmitOutcome::Unverified);

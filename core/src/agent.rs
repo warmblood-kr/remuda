@@ -258,7 +258,7 @@ pub trait AgentWriter: Send + Sync {
     fn write_bounded(&self, bytes: &[u8]) -> Result<()>;
     /// Ask a write that already exceeded its bound to be followed by FOLLOW_UP once it lands.
     /// Returns false when no write is in flight (it already landed) or the backend cannot chain.
-    fn chain_after_stalled(&self, _follow_up: &[u8]) -> bool {
+    fn chain_after_stalled(&self, _follow_up: &[u8], _settle: core::time::Duration) -> bool {
         false
     }
     /// Write these bytes once and wait for their actual completion. Interactive

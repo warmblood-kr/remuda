@@ -53,7 +53,7 @@ struct WriteTask {
 #[derive(Default)]
 struct WriterState {
     active_since: Option<Instant>,
-    follow_up: Option<Vec<u8>>,
+    follow_up: Option<(Vec<u8>, Duration)>,
     follow_up_open: bool,
 }
 
@@ -131,10 +131,13 @@ fn run_writer(receiver: Receiver<WriteTask>, writer: SharedWriter, state: Arc<Mu
                 }
             };
             if let Some(follow_up) = follow_up {
-                std::thread::sleep(Duration::from_millis(100));
+                let (bytes, settle) = follow_up;
+                if !settle.is_zero() {
+                    std::thread::sleep(settle);
+                }
                 match writer.lock() {
                     Ok(mut writer) => writer
-                        .write_all(&follow_up)
+                        .write_all(&bytes)
                         .and_then(|()| writer.flush())
                         .map_err(io)?,
                     Err(_) => return Err(io("pty writer lock poisoned")),
@@ -157,10 +160,10 @@ impl Drop for BusyReset<'_> {
 }
 
 impl AgentWriter for PtyInputWriter {
-    fn chain_after_stalled(&self, follow_up: &[u8]) -> bool {
+    fn chain_after_stalled(&self, follow_up: &[u8], settle: Duration) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.active_since.is_some() && state.follow_up_open {
-            state.follow_up = Some(follow_up.to_vec());
+            state.follow_up = Some((follow_up.to_vec(), settle));
             true
         } else {
             false
@@ -810,7 +813,7 @@ mod input_writer_tests {
         })));
         let writer = Arc::new(PtyInputWriter::spawn(writer, Duration::from_millis(100)).unwrap());
 
-        assert!(!writer.chain_after_stalled(b"\r"));
+        assert!(!writer.chain_after_stalled(b"\r", Duration::ZERO));
         let first_writer = Arc::clone(&writer);
         let first = std::thread::spawn(move || first_writer.write_bounded(b"text"));
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -819,7 +822,8 @@ mod input_writer_tests {
             Err(AgentError::WriteTimeout { .. })
         ));
 
-        assert!(writer.chain_after_stalled(b"\r"));
+        let settle = Duration::from_millis(25);
+        assert!(writer.chain_after_stalled(b"\r", settle));
         assert!(matches!(
             writer.write_bounded(b"second sender"),
             Err(AgentError::Busy)
@@ -833,7 +837,7 @@ mod input_writer_tests {
         }
         assert_eq!(*captured.lock().unwrap(), b"text\r");
         assert!(!writer.is_busy());
-        assert!(!writer.chain_after_stalled(b"\r"));
+        assert!(!writer.chain_after_stalled(b"\r", Duration::ZERO));
     }
 
     #[test]
