@@ -175,34 +175,35 @@ try {
     # Nothing on a stock Windows has ~\.local\bin on PATH, and a hint to add it
     # is one more step between the one-liner and `remuda` being a command. So
     # persist it for the user, and add it to this session for the next step.
-    # Already on this session's PATH means there is nothing to do, however it
-    # got there - which is also what keeps `remuda upgrade` from undoing an
-    # opt-out. REMUDA_NO_MODIFY_PATH is that opt-out.
-    if (($env:PATH -split ';') -notcontains $installDir) {
-        if ($env:REMUDA_NO_MODIFY_PATH) {
+    # The session's PATH is not asked whether to persist: a launcher can put
+    # the dir there for one shell only. REMUDA_NO_MODIFY_PATH opts out, and
+    # `remuda upgrade` runs this too - set it for the user to opt out for good.
+    $onPath = ($env:PATH -split ';') -contains $installDir
+    if ($env:REMUDA_NO_MODIFY_PATH) {
+        if (-not $onPath) {
             Write-Host "install.ps1: $installDir is not on your PATH - add it, e.g."
             Write-Host "  [Environment]::SetEnvironmentVariable('PATH', [Environment]::GetEnvironmentVariable('PATH', 'User') + ';$installDir', 'User')"
-        } else {
-            # Read from the registry unexpanded and written back as the kind it
-            # was, so the user's own entries survive as-is; only the User PATH
-            # is touched.
-            $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
-            $userPath = $envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
-            $pathKind = if ($envKey.GetValueNames() -contains 'Path') { $envKey.GetValueKind('Path') } else { 'ExpandString' }
-            if (($userPath -split ';') -notcontains $installDir) {
-                $newUserPath = if ($userPath) { $userPath.TrimEnd(';') + ';' + $installDir } else { $installDir }
-                $envKey.SetValue('Path', $newUserPath, $pathKind)
-                # A registry write alone reaches nobody. Explorer re-reads the
-                # environment on WM_SETTINGCHANGE, which .NET broadcasts when it
-                # sets a User variable - so set and clear a throwaway one.
-                $nudge = 'REMUDA_PATH_' + [guid]::NewGuid().ToString('N')
-                [Environment]::SetEnvironmentVariable($nudge, '1', 'User')
-                [Environment]::SetEnvironmentVariable($nudge, [NullString]::Value, 'User')
-                Write-Host "install.ps1: added $installDir to your user PATH - a terminal app that is already open may need a restart to see it"
-            }
-            $envKey.Close()
-            $env:PATH = $env:PATH.TrimEnd(';') + ';' + $installDir
         }
+    } else {
+        # Read from the registry unexpanded and written back as the kind it
+        # was, so the user's own entries survive as-is; only the User PATH is
+        # touched.
+        $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+        $userPath = $envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+        $pathKind = if ($envKey.GetValueNames() -contains 'Path') { $envKey.GetValueKind('Path') } else { 'ExpandString' }
+        if (($userPath -split ';') -notcontains $installDir) {
+            $newUserPath = if ($userPath) { $userPath.TrimEnd(';') + ';' + $installDir } else { $installDir }
+            $envKey.SetValue('Path', $newUserPath, $pathKind)
+            # A registry write alone reaches nobody. Explorer re-reads the
+            # environment on WM_SETTINGCHANGE, which .NET broadcasts when it
+            # sets a User variable - so set and clear a throwaway one.
+            $nudge = 'REMUDA_PATH_' + [guid]::NewGuid().ToString('N')
+            [Environment]::SetEnvironmentVariable($nudge, '1', 'User')
+            [Environment]::SetEnvironmentVariable($nudge, [NullString]::Value, 'User')
+            Write-Host "install.ps1: added $installDir to your user PATH - a terminal app that is already open may need a restart to see it"
+        }
+        $envKey.Close()
+        if (-not $onPath) { $env:PATH = $env:PATH.TrimEnd(';') + ';' + $installDir }
     }
 
     if ($env:REMUDA_INSTALL_BUTLER -eq '1') {
