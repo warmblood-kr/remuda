@@ -121,7 +121,10 @@ local function new_pending_handle(timeout, on_cancel)
     if prompt.default ~= nil and type(prompt.default) ~= "string" then
       error("prompt_line default must be a string", 2)
     end
-    local prompt_id = native_handle:prompt_line(prompt.label, prompt.default)
+    if prompt.preface ~= nil and type(prompt.preface) ~= "string" then
+      error("prompt_line preface must be a string", 2)
+    end
+    local prompt_id = native_handle:prompt_line(prompt.label, prompt.default, prompt.preface)
     local callbacks = pending_line_handlers[id] or {}
     pending_line_handlers[id] = callbacks
     callbacks[prompt_id] = prompt.callback
