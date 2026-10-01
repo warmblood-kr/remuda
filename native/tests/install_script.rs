@@ -68,3 +68,9 @@ fn the_windows_installer_puts_its_install_dir_on_path() {
 fn a_failed_windows_install_leaves_the_session_open() {
     passes_under_both_shells("check-install-die.ps1");
 }
+
+#[cfg(windows)]
+#[test]
+fn a_windows_install_without_git_explains_the_butler_step() {
+    passes_under_both_shells("check-install-butler.ps1");
+}
