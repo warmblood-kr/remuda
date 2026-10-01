@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `remuda _codex_tui` accepts `-c KEY=VALUE` after `--status PATH [--model M]`
+  and forwards each one to the `codex app-server` it starts, so a mod can give a
+  Codex session an MCP server; `remuda _codex_tui --help` prints the usage line.
 - Nightly installs and upgrades now use immutable, versioned releases selected
   by `latest.json`; the newest ten are retained. Older installer copies still
   use the rolling `nightly` URL and may see a brief 404 while that compatibility
