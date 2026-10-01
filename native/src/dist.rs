@@ -214,8 +214,8 @@ fn cache_path() -> PathBuf {
     cache_path_for(cfg!(windows), &|name| std::env::var_os(name))
 }
 
-/// Where the channel file and mods live; `None` when no home can be found.
-pub(crate) fn data_home() -> Option<PathBuf> {
+/// The data home, parent of `remuda/`: `$XDG_DATA_HOME`, else `%LOCALAPPDATA%` on Windows or `$HOME/.local/share`; `None` if unknown.
+pub fn data_home() -> Option<PathBuf> {
     data_home_for(cfg!(windows), &|name| std::env::var_os(name))
 }
 
