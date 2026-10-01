@@ -4082,8 +4082,15 @@ fn list_wheel_scrolls_while_a_session_is_focused_without_moving_selection() {
     }
     assert_eq!(ui.selected, 0, "the focused session keeps the selection");
     let frame = render(&ui, "", "test", 80, 24);
-    assert!(frame.contains("session-29"), "last session missing: {frame:?}");
-    assert!(!frame.contains("session-0"), "first session still visible: {frame:?}");
+    assert!(
+        frame.contains("session-29"),
+        "last session missing: {frame:?}"
+    );
+    // The status line names the focused session-0, so probe session-1 instead.
+    assert!(
+        !frame.contains("session-1 "),
+        "top of the list still visible: {frame:?}"
+    );
 
     assert_eq!(
         ui.on_mouse(
@@ -4117,7 +4124,11 @@ fn returning_to_list_normalizes_the_focused_viewport() {
     assert_eq!(ui.list_first_visible, Some(0));
     ui.on_key(press(KeyCode::Down));
     assert_eq!(ui.selected, 1);
-    assert_eq!(ui.list_first_visible, Some(0), "down must not jump the viewport");
+    assert_eq!(
+        ui.list_first_visible,
+        Some(0),
+        "down must not jump the viewport"
+    );
 }
 
 #[test]
