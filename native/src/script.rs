@@ -880,9 +880,9 @@ fn pending_bindings(
         "_pending_create",
         lua.create_function(move |lua, timeout: Option<f64>| {
             let seconds = timeout.unwrap_or(30.0);
-            if !seconds.is_finite() || seconds <= 0.0 || seconds > 300.0 {
+            if !seconds.is_finite() || seconds <= 0.0 || seconds > 301.0 {
                 return Err(mlua::Error::runtime(
-                    "pending timeout must be a positive number no greater than 300 seconds",
+                    "pending timeout must be a positive number no greater than 301 seconds",
                 ));
             }
             let duration = Duration::from_secs_f64(seconds.max(0.000_000_001));
