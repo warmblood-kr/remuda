@@ -2132,6 +2132,78 @@ mod tests {
     }
 
     #[test]
+    fn pin_only_over_plain_http_is_refused_before_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/test",
+            listener.local_addr().unwrap().port()
+        );
+        let pin = pin_of(include_str!("testdata/selfsigned-ca.pem"));
+        let error = perform(pin_only_request(url, Some(pin)), None).unwrap_err();
+        assert!(error.contains("TLS options require HTTPS"), "{error}");
+        assert!(
+            listener.accept().is_err(),
+            "pin_only over http must not connect"
+        );
+    }
+
+    #[test]
+    fn pin_only_with_malformed_pin_is_refused_before_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!(
+            "https://localhost:{}/test",
+            listener.local_addr().unwrap().port()
+        );
+        let digest = pin_of(include_str!("testdata/selfsigned-ca.pem"));
+        let base64 = digest.strip_prefix("sha256/").unwrap();
+        for pin in [
+            base64.to_string(),
+            format!("sha1/{base64}"),
+            "sha256/not base64!".to_string(),
+            format!(
+                "sha256/{}",
+                base64::engine::general_purpose::STANDARD.encode([0u8; 16])
+            ),
+        ] {
+            let error =
+                perform(pin_only_request(url.clone(), Some(pin.clone())), None).unwrap_err();
+            assert!(
+                error.contains("http.request pin_only requires a valid pin")
+                    && error.contains("Next:"),
+                "{pin}: {error}"
+            );
+        }
+        assert!(
+            listener.accept().is_err(),
+            "pin_only with a malformed pin must not connect"
+        );
+    }
+
+    #[test]
+    fn pin_only_ignores_ca_file() {
+        let pin = pin_of(include_str!("testdata/selfsigned-ca.pem"));
+        let test_ca = concat!(env!("CARGO_MANIFEST_DIR"), "/src/net/testdata/test-ca.pem");
+        for ca_file in [test_ca, "/this/path/does/not/exist/remuda-test-ca.pem"] {
+            let (url, seen) = selfsigned_stub("localhost");
+            let mut req = pin_only_request(url, Some(pin.clone()));
+            req.ca_file = Some(ca_file.into());
+            assert_eq!(perform(req, None).unwrap().status, 200, "{ca_file}");
+            assert!(seen.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+
+        // A CA that does trust the server adds no trust when the pin differs.
+        let (url, seen) = tls_stub();
+        let mut req = pin_only_request(url, Some(pin));
+        req.ca_file = Some(test_ca.into());
+        assert!(perform(req, None)
+            .unwrap_err()
+            .contains("SPKI pin mismatch"));
+        assert!(!seen.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+
+    #[test]
     fn pin_only_without_pin_is_refused_before_connecting() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
