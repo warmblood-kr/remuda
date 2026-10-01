@@ -20,6 +20,7 @@ fn captured_output_ends_when_the_cli_exits_not_the_daemon() {
             .args(args)
             .env("REMUDA_RUNTIME_DIR", &dir)
             .env("HOME", &dir)
+            .env("LOCALAPPDATA", &dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
