@@ -8,3 +8,7 @@
   release is replaced.
 - Nightly builds are not published for ARM Linux (`aarch64-linux`) or Intel
   macOS (`x86_64-apple-darwin`); those platforms must build from source.
+- Lua: `remuda.fs.lock(path)` takes an exclusive, non-blocking OS lock that is
+  held until `handle:release()` or until the daemon exits, so a mod can tell
+  that another live daemon already owns its home. When the lock is held it
+  returns `nil, "held", info`; the info line is message text only.

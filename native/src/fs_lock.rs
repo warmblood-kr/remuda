@@ -24,6 +24,11 @@ pub fn info_line(session: &str) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs());
     let pid = std::process::id();
+    let odd = |c: char| c.is_whitespace() || unsafe_to_show(c);
+    let session: String = session
+        .chars()
+        .map(|c| if odd(c) { '?' } else { c })
+        .collect();
     format!("{INFO_PREFIX}session={session} pid={pid} since={since}")
 }
 
@@ -34,15 +39,118 @@ pub fn sidecar(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Take the lock at `path` or report who holds it. Never blocks.
-pub fn acquire(path: &Path, _info: &str) -> io::Result<Outcome> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
+/// Take the lock at `path` or report who holds it. Never blocks. Only the
+/// kernel lock decides; the sidecar text is written and read for messages.
+pub fn acquire(path: &Path, info: &str) -> io::Result<Outcome> {
+    let refuse = |why: &str| io::Error::new(io::ErrorKind::InvalidInput, why.to_owned());
+    if !path.is_absolute() {
+        return Err(refuse("the lock path must be absolute"));
+    }
+    let file = open_lock_file(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() != 0 {
+        return Err(refuse("the lock path is not an empty lock file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o177 != 0 {
+            return Err(refuse("the lock file is not private (run chmod 600 on it)"));
+        }
+    }
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(Outcome::Held(holder_info(path))),
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
+    }
+    // Any error from here drops `file`, which gives the lock back.
+    let found = read_sidecar(path)?.unwrap_or_default();
+    if !found.is_empty() && !found.starts_with(INFO_PREFIX.as_bytes()) {
+        return Err(refuse(
+            "the lock's .info file is not a remuda lock info file",
+        ));
+    }
+    write_sidecar(&sidecar(path), info.as_bytes())?;
     Ok(Outcome::Acquired(file))
+}
+
+/// The holder's info line for a message: ours by prefix, one line, at most
+/// [`INFO_LIMIT`] bytes, with nothing that can drive a terminal.
+fn holder_info(path: &Path) -> String {
+    let bytes = read_sidecar(path).ok().flatten().unwrap_or_default();
+    let text = String::from_utf8_lossy(&bytes);
+    let line = text.lines().next().unwrap_or("");
+    if !line.starts_with(INFO_PREFIX) {
+        return String::new();
+    }
+    let mut safe = String::new();
+    for c in line
+        .chars()
+        .map(|c| if unsafe_to_show(c) { '?' } else { c })
+    {
+        if safe.len() + c.len_utf8() > INFO_LIMIT {
+            break;
+        }
+        safe.push(c);
+    }
+    safe
+}
+
+const INFO_LIMIT: usize = 256;
+
+/// Cc, U+2028/U+2029 and every Bidi_Control character.
+fn unsafe_to_show(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}')
+        || matches!(c, '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
+/// The first bytes of the sidecar, or `None` when there is none.
+fn read_sidecar(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = match options.open(sidecar(path)) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let mut bytes = Vec::new();
+    file.take(INFO_LIMIT as u64).read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+#[cfg(not(windows))]
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+#[cfg(windows)]
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    crate::cluster::windows_security::create_or_open_lock(path)
+}
+
+#[cfg(not(windows))]
+fn write_sidecar(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    crate::fs_atomic::write_atomic_lua_private(path, bytes)
+}
+
+#[cfg(windows)]
+fn write_sidecar(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    crate::fs_atomic::write_atomic_private(path, bytes)
 }
 
 #[cfg(test)]
@@ -54,10 +162,8 @@ mod tests {
     struct Scratch(PathBuf);
     impl Scratch {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir()
-                .canonicalize()
-                .unwrap()
-                .join(format!("remuda-fs-lock-{}-{tag}", std::process::id()));
+            let dir =
+                std::env::temp_dir().join(format!("remuda-fs-lock-{}-{tag}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
@@ -90,9 +196,10 @@ mod tests {
         let first = info_line("first");
         let _owner = acquired(acquire(&path, &first).unwrap());
         assert_eq!(held(acquire(&path, &info_line("second")).unwrap()), first);
+        // Its length, not its bytes: Windows refuses a read of a locked file.
         assert_eq!(
-            fs::read(&path).unwrap(),
-            b"",
+            fs::metadata(&path).unwrap().len(),
+            0,
             "the lock file is never written"
         );
         assert_eq!(fs::read_to_string(sidecar(&path)).unwrap(), first);

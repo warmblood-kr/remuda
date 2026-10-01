@@ -8,36 +8,49 @@ use std::path::{Path, PathBuf};
 #[path = "daemon_support/spawn.rs"]
 mod spawn;
 
-/// A directory of our own, short enough for `sun_path` (~108 bytes).
-fn scratch(tag: &str) -> PathBuf {
-    let root = if cfg!(unix) {
-        PathBuf::from("/tmp")
-    } else {
-        std::env::temp_dir()
-    };
-    let dir = root
-        .canonicalize()
-        .expect("canonical temp directory")
-        .join(format!("remuda-l{}-{tag}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("create scratch");
-    dir
+/// A directory of our own, short enough for `sun_path` (~108 bytes), removed
+/// when the test ends, passing or not.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        // macOS refuses a runtime directory reached through the /tmp symlink.
+        let root = if cfg!(unix) {
+            PathBuf::from("/tmp")
+                .canonicalize()
+                .expect("canonical /tmp")
+        } else {
+            std::env::temp_dir()
+        };
+        let dir = root.join(format!("remuda-l{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch");
+        Self(dir)
+    }
 }
 
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// One daemon process in its own runtime directory. Fields drop in order:
+/// the daemon is killed before its directory is removed.
 struct Node {
-    dir: PathBuf,
     daemon: spawn::Daemon,
+    dir: Scratch,
 }
 
 impl Node {
     fn start(tag: &str) -> Self {
-        let dir = scratch(tag);
-        let daemon = spawn::Daemon::spawn(&dir);
-        Self { dir, daemon }
+        let dir = Scratch::new(tag);
+        let daemon = spawn::Daemon::spawn(&dir.0);
+        Self { daemon, dir }
     }
 
     fn eval(&self, code: &str) -> String {
-        let socket = daemon::socket_path_in(&self.dir, "s");
+        let socket = daemon::socket_path_in(&self.dir.0, "s");
         let request = Request::Eval {
             code: code.to_string(),
             name: None,
@@ -51,26 +64,22 @@ impl Node {
     /// Ask for the lock and describe the answer as one line of text.
     fn lock(&self, path: &Path) -> String {
         self.eval(&format!(
-            "local handle, why, info = remuda.fs.lock({:?})
-             if handle then _G.kept = handle return 'acquired' end
+            "local handle, why, info = remuda.fs.lock({})
+             if handle then return 'acquired' end
              return tostring(why) .. '|' .. tostring(info)",
-            path.to_str().expect("utf-8 scratch path")
+            lua_string(path)
         ))
     }
 }
 
-impl Drop for Node {
-    fn drop(&mut self) {
-        let _ = self.daemon.0.kill();
-        let _ = self.daemon.0.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
+fn lua_string(path: &Path) -> String {
+    format!("{:?}", path.to_str().expect("utf-8 scratch path"))
 }
 
 #[test]
 fn a_second_daemon_sees_held_with_the_first_daemons_session_and_pid() {
-    let shared = scratch("held-shared");
-    let path = shared.join("lock");
+    let shared = Scratch::new("held-shared");
+    let path = shared.0.join("lock");
     let first = Node::start("held-a");
     let second = Node::start("held-b");
 
@@ -81,17 +90,16 @@ fn a_second_daemon_sees_held_with_the_first_daemons_session_and_pid() {
         first.daemon.0.id()
     );
     assert!(answer.starts_with(&expected), "{answer:?}");
-
-    let _ = std::fs::remove_dir_all(&shared);
 }
 
 #[test]
 fn the_lock_is_released_when_the_owning_daemon_is_killed() {
-    let shared = scratch("kill-shared");
-    let path = shared.join("lock");
+    let shared = Scratch::new("kill-shared");
+    let path = shared.0.join("lock");
     let mut first = Node::start("kill-a");
     let second = Node::start("kill-b");
 
+    // The owner drops every Lua reference at once; the daemon still holds it.
     assert_eq!(first.lock(&path), "acquired");
     assert!(second.lock(&path).starts_with("held|"));
 
@@ -99,27 +107,30 @@ fn the_lock_is_released_when_the_owning_daemon_is_killed() {
     first.daemon.0.kill().expect("kill the owning daemon");
     first.daemon.0.wait().expect("reap the owning daemon");
     assert_eq!(second.lock(&path), "acquired");
-
-    let _ = std::fs::remove_dir_all(&shared);
 }
 
 #[test]
 fn the_same_daemon_gets_the_same_handle_and_release_frees_it() {
-    let shared = scratch("same-shared");
-    let path = shared.join("lock");
+    let shared = Scratch::new("same-shared");
+    let path = shared.0.join("lock");
     let first = Node::start("same-a");
     let second = Node::start("same-b");
-    let quoted = format!("{:?}", path.to_str().expect("utf-8 scratch path"));
+    let quoted = lua_string(&path);
 
     let same = first.eval(&format!(
         "local a = assert(remuda.fs.lock({quoted}))
          local b = assert(remuda.fs.lock({quoted}))
-         _G.kept = nil
+         local id = tostring(a)
+         a, b = nil, nil
          collectgarbage() collectgarbage()
          local c = assert(remuda.fs.lock({quoted}))
-         return tostring(rawequal(a, b) and rawequal(a, c)) .. '|' .. tostring(a.path == {quoted})"
+         return tostring(id == tostring(c)) .. '|' .. tostring(c.path == {quoted})"
     ));
     assert_eq!(same, "true|true");
+    let twice = first.eval(&format!(
+        "return tostring(rawequal(remuda.fs.lock({quoted}), remuda.fs.lock({quoted})))"
+    ));
+    assert_eq!(twice, "true");
     // Dropping every Lua reference did not give the lock away.
     assert!(second.lock(&path).starts_with("held|"));
 
@@ -129,6 +140,4 @@ fn the_same_daemon_gets_the_same_handle_and_release_frees_it() {
     ));
     assert_eq!(released, "true|false");
     assert_eq!(second.lock(&path), "acquired");
-
-    let _ = std::fs::remove_dir_all(&shared);
 }
