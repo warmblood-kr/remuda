@@ -35,11 +35,27 @@ impl Drop for Scratch {
     }
 }
 
-/// One daemon process in its own runtime directory. Fields drop in order:
-/// the daemon is killed before its directory is removed.
+/// One daemon process in its own runtime directory. It is asked to stop when
+/// the test ends; the fields then drop in order, the daemon before its directory.
 struct Node {
     daemon: spawn::Daemon,
     dir: Scratch,
+}
+
+/// A clean stop, so the daemon runs its own exit code. Nothing here may
+/// panic; a daemon that does not leave is killed by `spawn::Daemon`'s drop.
+impl Drop for Node {
+    fn drop(&mut self) {
+        let socket = daemon::socket_path_in(&self.dir.0, "s");
+        let stop = Request::Shutdown {
+            requester_daemon_id: None,
+            requester_session_id: None,
+            requester_session_name: None,
+            override_hosted: false,
+        };
+        let _ = client::request(&socket, &stop);
+        let _ = self.daemon.left_on_its_own();
+    }
 }
 
 impl Node {
