@@ -607,7 +607,8 @@ pub(super) fn check_base_directory(path: &Path) -> io::Result<()> {
             continue;
         };
         let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
-        if let Some(sid) = untrusted(sid)? {
+        // An entry for OWNER RIGHTS (S-1-3-4) applies to the owner, checked above.
+        if let Some(sid) = untrusted(sid)?.filter(|sid| sid != "S-1-3-4") {
             return Err(refusal(&sid, what));
         }
     }

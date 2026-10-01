@@ -83,6 +83,11 @@ On Windows, `cluster init` and `cluster` status refuse to access identity
 storage until owner-only ACL hardening is implemented. Track that work in
 warmblood-kr/remuda#214. Windows has no identity-storage ACL hardening in PR6.
 
+On Windows the cluster refuses, changing nothing, when an account other than
+you, SYSTEM or Administrators owns `%LOCALAPPDATA%\remuda` or may write to it.
+A managed machine that adds a write entry for a domain group on profile
+directories is refused for that reason; the message names the SID.
+
 ## Remote control
 
 Each node stores its local `allow_remote_control` setting in the private
