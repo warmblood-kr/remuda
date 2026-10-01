@@ -626,6 +626,10 @@ fn registry_documentation_formats_are_live_and_structured() {
         .as_str()
         .unwrap()
         .contains("message text only"));
+    assert!(fs_lock["description"]
+        .as_str()
+        .unwrap()
+        .contains("not a security boundary"));
     let random_bytes = document["runtime"]["functions"]
         .as_array()
         .unwrap()

@@ -256,15 +256,71 @@ mod tests {
     }
 
     #[test]
-    fn a_sidecar_that_is_not_ours_is_refused_and_left_unchanged() {
+    fn a_foreign_sidecar_is_overwritten_once_the_lock_is_held() {
         let scratch = Scratch::new("sidecar");
         let path = scratch.0.join("lock");
-        fs::write(sidecar(&path), b"precious").unwrap();
-        assert!(acquire(&path, &info_line("s")).is_err());
-        assert_eq!(fs::read(sidecar(&path)).unwrap(), b"precious");
-        // The refusal released the lock: a clean sidecar lets the next one in.
-        fs::remove_file(sidecar(&path)).unwrap();
+        fs::write(sidecar(&path), b"somebody else's text").unwrap();
+        let ours = info_line("s");
+        let _owner = acquired(acquire(&path, &ours).unwrap());
+        assert_eq!(fs::read_to_string(sidecar(&path)).unwrap(), ours);
+    }
+
+    #[test]
+    fn a_directory_at_the_sidecar_fails_with_one_line_naming_it() {
+        let scratch = Scratch::new("sidecar-dir");
+        let path = scratch.0.join("lock");
+        fs::create_dir(sidecar(&path)).unwrap();
+        let error = acquire(&path, &info_line("s")).unwrap_err().to_string();
+        let named = sidecar(&path).display().to_string();
+        assert!(error.contains(&named) && !error.contains('\n'), "{error}");
+        // The failure gave the lock back.
+        fs::remove_dir(sidecar(&path)).unwrap();
         let _owner = acquired(acquire(&path, &info_line("s")).unwrap());
+    }
+
+    /// Run `work` on its own thread; a call that blocks fails the test.
+    #[cfg(unix)]
+    fn without_blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(work()));
+        result
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the call blocked")
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &std::path::Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is a valid NUL-terminated path for this call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_sidecar_gives_an_empty_holder_info_without_blocking() {
+        let scratch = Scratch::new("fifo-held");
+        let path = scratch.0.join("lock");
+        let _owner = acquired(acquire(&path, &info_line("s")).unwrap());
+        fs::remove_file(sidecar(&path)).unwrap();
+        make_fifo(&sidecar(&path));
+        let asked = path.clone();
+        let outcome = without_blocking(move || acquire(&asked, &info_line("t")));
+        assert_eq!(held(outcome.unwrap()), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_sidecar_is_replaced_when_the_lock_is_taken() {
+        let scratch = Scratch::new("fifo-free");
+        let path = scratch.0.join("lock");
+        make_fifo(&sidecar(&path));
+        let (asked, ours) = (path.clone(), info_line("s"));
+        let line = ours.clone();
+        let outcome = without_blocking(move || acquire(&asked, &line));
+        let _owner = acquired(outcome.unwrap());
+        assert!(fs::symlink_metadata(sidecar(&path)).unwrap().is_file());
+        assert_eq!(fs::read_to_string(sidecar(&path)).unwrap(), ours);
     }
 
     #[test]
