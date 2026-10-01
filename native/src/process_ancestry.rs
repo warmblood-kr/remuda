@@ -55,6 +55,22 @@ pub(crate) fn peer_pid(stream: &crate::ipc::Stream) -> io::Result<Option<u32>> {
     }
 }
 
+/// Windows: the client, opened, if it is still the process that connected.
+/// The pipe gives a PID, which can be reused once the client exits; the open
+/// handle keeps it from being reused while the caller holds it.
+#[cfg(windows)]
+pub(crate) fn current_peer(
+    stream: &crate::ipc::Stream,
+    accepted: std::time::SystemTime,
+) -> Option<(u32, crate::session_job::Opened)> {
+    use crate::session_job::{file_time, peer_is_current, Opened};
+    let pid = peer_pid(stream).ok().flatten().filter(|pid| *pid > 1)?;
+    let process = Opened::query(pid).ok()?;
+    let created = process.created().ok()?;
+    let again = peer_pid(stream).ok().flatten()?;
+    peer_is_current(created, file_time(accepted), pid, again).then_some((pid, process))
+}
+
 #[derive(Debug)]
 pub(crate) enum Ancestry {
     Inside,
@@ -229,7 +245,7 @@ fn parent_pid(pid: u32) -> io::Result<Option<u32>> {
 }
 
 #[cfg(windows)]
-fn process_parents() -> io::Result<std::collections::HashMap<u32, u32>> {
+pub(crate) fn process_parents() -> io::Result<std::collections::HashMap<u32, u32>> {
     // Toolhelp parent PIDs are advisory: Windows may retain a stale PID after
     // its parent exits, and a later process can reuse that PID.
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE};

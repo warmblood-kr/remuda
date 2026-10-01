@@ -397,6 +397,33 @@ pub struct PtyAgent {
     output_version: Arc<AtomicU64>,
     exit_info: Option<ExitInfo>,
     master: Option<Box<dyn MasterPty + Send>>,
+    /// Windows: what makes a process this session's own after its parent
+    /// has exited. Held for as long as the session is listed.
+    #[cfg(windows)]
+    job: crate::session_job::SessionJob,
+}
+
+/// Windows: the session's job, holding the child and what it has already
+/// started. If that cannot be done the child is killed and the session is
+/// refused: its orphans could not be told from outside processes.
+#[cfg(windows)]
+fn session_job_for(
+    child: &mut (dyn Child + Send + Sync),
+) -> Result<crate::session_job::SessionJob> {
+    use crate::session_job::{set_up, SessionJob};
+    let handle = child.as_raw_handle();
+    let pid = child.process_id();
+    let assign = |job: &SessionJob| {
+        let (Some(handle), Some(pid)) = (handle, pid) else {
+            return Err(std::io::Error::other("the child has no process handle"));
+        };
+        job.assign(handle)?;
+        job.sweep(pid, handle)
+    };
+    let kill = || {
+        let _ = child.kill();
+    };
+    set_up(SessionJob::new(), assign, kill).map_err(AgentError::Io)
 }
 
 impl PtyAgent {
@@ -411,7 +438,10 @@ impl PtyAgent {
             })
             .map_err(io)?;
 
-        let child = pair.slave.spawn_command(command).map_err(io)?;
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut child = pair.slave.spawn_command(command).map_err(io)?;
+        #[cfg(windows)]
+        let job = session_job_for(child.as_mut())?;
         // No child_guard here on purpose — this child already dies with the
         // daemon by kernel accident (the master fd closes on any daemon
         // exit, SIGHUP-ing this session leader). See child_guard.rs and
@@ -459,6 +489,8 @@ impl PtyAgent {
             output_version,
             exit_info: None,
             master: Some(pair.master),
+            #[cfg(windows)]
+            job,
         })
     }
 }
@@ -800,6 +832,11 @@ impl AgentProcess for PtyAgent {
 
     fn process_id(&self) -> Option<u32> {
         self.child.process_id()
+    }
+
+    #[cfg(windows)]
+    fn owns_process(&self, pid: u32) -> bool {
+        self.job.contains(pid)
     }
 }
 

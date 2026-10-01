@@ -68,6 +68,162 @@ pub fn peer_is_current(created: u64, accepted: u64, pid_before: u32, pid_after: 
     created < accepted && pid_before == pid_after
 }
 
+/// `at` as a Windows file time: 100 ns ticks since 1601, the unit of a
+/// process's creation time.
+pub fn file_time(at: std::time::SystemTime) -> u64 {
+    const UNIX_EPOCH_AS_FILE_TIME: u64 = 116_444_736_000_000_000;
+    let since = at.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    UNIX_EPOCH_AS_FILE_TIME + (since.as_nanos() / 100) as u64
+}
+
+#[cfg(windows)]
+pub(crate) use self::windows::Opened;
+#[cfg(windows)]
+pub use self::windows::SessionJob;
+
+#[cfg(windows)]
+mod windows {
+    use super::{early_descendants, Listed};
+    use std::io;
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+        PROCESS_TERMINATE,
+    };
+
+    /// When the process behind `process` was created, as a file time.
+    pub(crate) fn created(process: HANDLE) -> io::Result<u64> {
+        let mut times = [FILETIME::default(); 4];
+        let [created, exited, kernel, user] = &mut times;
+        // SAFETY: the handle is live for the call and the four out-pointers
+        // are distinct, valid FILETIMEs.
+        if unsafe { GetProcessTimes(process, created, exited, kernel, user) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((u64::from(times[0].dwHighDateTime) << 32) | u64::from(times[0].dwLowDateTime))
+    }
+
+    /// A process opened by PID. While it is open its PID cannot be reused.
+    pub(crate) struct Opened(HANDLE);
+
+    impl Opened {
+        pub(crate) fn open(pid: u32, access: u32) -> io::Result<Self> {
+            // SAFETY: no pointer is passed; a null result is the error.
+            let handle = unsafe { OpenProcess(access, 0, pid) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self(handle))
+        }
+
+        pub(crate) fn query(pid: u32) -> io::Result<Self> {
+            Self::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)
+        }
+
+        pub(crate) fn created(&self) -> io::Result<u64> {
+            created(self.0)
+        }
+    }
+
+    impl Drop for Opened {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from OpenProcess and is closed once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// One session's job. It sets NO limit: no breakaway is allowed (neither
+    /// JOB_OBJECT_LIMIT_BREAKAWAY_OK nor the silent form), and nothing is
+    /// killed when the handle closes.
+    pub struct SessionJob(HANDLE);
+
+    // SAFETY: a job handle names a kernel object; the calls made on it here
+    // are safe from any thread, and the handle is closed once, in Drop.
+    unsafe impl Send for SessionJob {}
+    unsafe impl Sync for SessionJob {}
+
+    impl SessionJob {
+        pub fn new() -> io::Result<Self> {
+            // SAFETY: null attributes and name ask for a private, unnamed job.
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(Self(handle))
+        }
+
+        pub(crate) fn assign(&self, process: HANDLE) -> io::Result<()> {
+            // SAFETY: both handles are live for the call.
+            if unsafe { AssignProcessToJobObject(self.0, process) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        fn holds(&self, process: HANDLE) -> io::Result<bool> {
+            let mut inside = 0;
+            // SAFETY: both handles are live and `inside` is a valid BOOL.
+            if unsafe { IsProcessInJob(process, self.0, &mut inside) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(inside != 0)
+        }
+
+        /// Whether `pid` is in this job. A process that cannot be opened or
+        /// asked about is not counted as ours.
+        pub fn contains(&self, pid: u32) -> bool {
+            Opened::query(pid).is_ok_and(|process| self.holds(process.0).unwrap_or(false))
+        }
+
+        /// Puts what `child` started before it was assigned into the job too.
+        /// One level is certain; a deeper process whose parent has already
+        /// exited is not found (a suspended start would close that).
+        pub(crate) fn sweep(&self, child_pid: u32, child: HANDLE) -> io::Result<()> {
+            let root_created = created(child)?;
+            let parents = crate::process_ancestry::process_parents()?;
+            // A process that cannot be opened is another user's, not a child
+            // this session started a moment ago.
+            let list: Vec<Listed> = parents
+                .iter()
+                .filter_map(|(&pid, &parent)| {
+                    let created = Opened::query(pid).ok()?.created().ok()?;
+                    Some(Listed {
+                        pid,
+                        parent,
+                        created,
+                    })
+                })
+                .collect();
+            let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_QUOTA | PROCESS_TERMINATE;
+            for pid in early_descendants(&list, child_pid, root_created) {
+                // Gone already, or its PID now names another process: skip.
+                let Ok(process) = Opened::open(pid, access) else {
+                    continue;
+                };
+                let listed = list
+                    .iter()
+                    .find(|row| row.pid == pid)
+                    .map(|row| row.created);
+                if process.created().ok() != listed || self.holds(process.0)? {
+                    continue;
+                }
+                self.assign(process.0)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for SessionJob {
+        fn drop(&mut self) {
+            // SAFETY: the handle came from CreateJobObjectW and is closed once.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,6 +307,14 @@ mod tests {
             },
         ];
         assert_eq!(early_descendants(&list, 10, 100), [11, 10]);
+    }
+
+    #[test]
+    fn a_file_time_counts_100_ns_ticks_from_1601() {
+        let epoch = std::time::UNIX_EPOCH;
+        assert_eq!(file_time(epoch), 116_444_736_000_000_000);
+        let later = epoch + std::time::Duration::from_secs(1);
+        assert_eq!(file_time(later), 116_444_736_010_000_000);
     }
 
     #[test]
