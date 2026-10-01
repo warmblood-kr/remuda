@@ -562,10 +562,13 @@ fn hostname_returns_the_os_host_name() {
         "function",
         "remuda.hostname is missing"
     );
-    let name = eval("return assert(remuda.hostname())");
+    let name = eval("local name = assert(remuda.hostname()) return name");
     assert!(!name.is_empty(), "the host name is empty");
     assert!(!name.chars().any(char::is_control), "{name:?}");
-    assert_eq!(eval("return assert(remuda.hostname())"), name);
+    assert_eq!(
+        eval("local name = assert(remuda.hostname()) return name"),
+        name
+    );
 
     // An independent read of the same OS source, not the environment.
     #[cfg(unix)]
