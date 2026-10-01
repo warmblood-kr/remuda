@@ -176,6 +176,11 @@ hooks
 
 ``table`` — Deprecated for reading: use `hook_list`. The `remuda.on` table, keyed by event name; it becomes read-only once no mod edits it by hand.
 
+hostname
+--------
+
+``hostname() -> string, nil | nil, error`` — The OS host name, read from the OS itself (not the environment). Returned unchanged and not sanitized for use in identifiers; callers slug it. Returns nil, error if the OS call fails or the name is empty, not UTF-8, or holds a control, line-separator (U+2028, U+2029) or bidi-control (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) character.
+
 http
 ----
 

@@ -6,6 +6,7 @@
 #   $env:REMUDA_CHANNEL     stable|nightly  default: the channel already installed, else stable
 #   $env:REMUDA_INSTALL_DIR <dir>           default: ~\.local\bin
 #   $env:REMUDA_INSTALL_BUTLER=1            also install warmblood-kr/remuda-butler
+#   $env:REMUDA_NO_MODIFY_PATH=1            leave PATH alone; say so if the install dir is not on it
 #
 # This mirrors docs/install.sh: resolve the channel version first, then verify
 # its checksum before installing the binary.
@@ -149,6 +150,9 @@ try {
 
     $installDir = if ($env:REMUDA_INSTALL_DIR) { $env:REMUDA_INSTALL_DIR } else { Join-Path $HOME '.local\bin' }
     New-Item -ItemType Directory -Force -Path $installDir, $dataDir | Out-Null
+    # Absolute, because it is about to be written to PATH, where a relative
+    # entry means a different directory in every shell.
+    $installDir = (Get-Item -Force -LiteralPath $installDir).FullName
     $installed = Join-Path $installDir 'remuda.exe'
 
     # Windows refuses to overwrite a RUNNING executable but allows renaming it,
@@ -168,10 +172,37 @@ try {
     Set-Content -Path $channelFile -Value $channel -NoNewline
 
     Write-Host "install.ps1: remuda $version -> $installed ($channel channel)"
+    # Nothing on a stock Windows has ~\.local\bin on PATH, and a hint to add it
+    # is one more step between the one-liner and `remuda` being a command. So
+    # persist it for the user, and add it to this session for the next step.
+    # The session's PATH is not asked whether to persist: a launcher can put
+    # the dir there for one shell only. REMUDA_NO_MODIFY_PATH opts out, and
+    # `remuda upgrade` runs this too - set it for the user to opt out for good.
     $onPath = ($env:PATH -split ';') -contains $installDir
-    if (-not $onPath) {
-        Write-Host "install.ps1: $installDir is not on your PATH - add it, e.g."
-        Write-Host ('  [Environment]::SetEnvironmentVariable(''PATH'', "$env:PATH;' + $installDir + '", ''User'')')
+    if ($env:REMUDA_NO_MODIFY_PATH) {
+        if (-not $onPath) {
+            Write-Host "install.ps1: $installDir is not on your PATH - add it, or run this again without REMUDA_NO_MODIFY_PATH to have it added"
+        }
+    } else {
+        # Read from the registry unexpanded and written back as the kind it
+        # was, so the user's own entries survive as-is; only the User PATH is
+        # touched.
+        $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+        $userPath = $envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+        $pathKind = if ($envKey.GetValueNames() -contains 'Path') { $envKey.GetValueKind('Path') } else { 'ExpandString' }
+        if (($userPath -split ';') -notcontains $installDir) {
+            $newUserPath = if ($userPath) { $userPath.TrimEnd(';') + ';' + $installDir } else { $installDir }
+            $envKey.SetValue('Path', $newUserPath, $pathKind)
+            # A registry write alone reaches nobody. Explorer re-reads the
+            # environment on WM_SETTINGCHANGE, which .NET broadcasts when it
+            # sets a User variable - so set and clear a throwaway one.
+            $nudge = 'REMUDA_PATH_' + [guid]::NewGuid().ToString('N')
+            [Environment]::SetEnvironmentVariable($nudge, '1', 'User')
+            [Environment]::SetEnvironmentVariable($nudge, [NullString]::Value, 'User')
+            Write-Host "install.ps1: added $installDir to your user PATH - a terminal app that is already open may need a restart to see it"
+        }
+        $envKey.Close()
+        if (-not $onPath) { $env:PATH = $env:PATH.TrimEnd(';') + ';' + $installDir }
     }
 
     if ($env:REMUDA_INSTALL_BUTLER -eq '1') {
