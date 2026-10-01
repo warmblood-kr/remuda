@@ -48,11 +48,23 @@ const MARKER: &str = "remuda-cwd-marker.txt";
 
 impl Node {
     fn start(tag: &str) -> Self {
+        Self::start_with_path(tag, None)
+    }
+
+    /// `path`, when given, becomes the daemon's PATH; `{bin}` in it stands
+    /// for this node's own `bin` directory.
+    fn start_with_path(tag: &str, path: Option<&str>) -> Self {
         let dir = Scratch::new(tag);
         let work = dir.0.join("work");
         std::fs::create_dir_all(&work).expect("create work directory");
         std::fs::write(work.join(MARKER), "x").expect("write marker");
-        let daemon = spawn::Daemon::spawn(&dir.0);
+        let mut command = spawn::base_command(&dir.0);
+        if let Some(path) = path {
+            let bin = dir.0.join("bin");
+            std::fs::create_dir_all(&bin).expect("create bin directory");
+            command.env("PATH", path.replace("{bin}", bin.to_str().unwrap()));
+        }
+        let daemon = spawn::spawn_and_wait(command, &dir.0);
         Self {
             _daemon: daemon,
             dir,
@@ -143,7 +155,15 @@ fn process_run_refuses_a_bad_cwd_in_one_line_without_the_path() {
         ));
         assert_refused(&message, bad);
     }
-    for bad in ["'work'", "'.'", "''", "42", "{}"] {
+    for bad in [
+        "'work'",
+        "'.'",
+        "''",
+        "42",
+        "{}",
+        "'/tmp/\\255'",
+        "'/tmp\\0'",
+    ] {
         let message = node.error_of(&format!(
             "remuda.process.run({{ argv = {argv}, cwd = {bad} }})"
         ));
@@ -245,4 +265,61 @@ fn a_relative_program_path_with_cwd_is_refused_on_every_os() {
         "return remuda.process.run({{ argv = {bare}, cwd = {cwd} }}).stdout"
     ));
     assert!(listed.contains(MARKER), "{listed}");
+}
+
+/// A program `mytool` that says who it is and leaves `ran.txt` where it ran.
+fn write_mytool(dir: &Path, says: &str) {
+    if cfg!(windows) {
+        let body = format!("@echo {says}\r\n@echo x> ran.txt\r\n");
+        std::fs::write(dir.join("mytool.cmd"), body).expect("write mytool");
+    } else {
+        let file = dir.join("mytool");
+        std::fs::write(&file, format!("#!/bin/sh\necho {says}\necho x > ran.txt\n"))
+            .expect("write mytool");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod mytool");
+        }
+    }
+}
+
+const PATH_SEPARATOR: &str = if cfg!(windows) { ";" } else { ":" };
+
+/// SEC L1: a relative PATH entry would be resolved in the child's directory,
+/// which is now `cwd`. A file planted there must never be what runs.
+#[test]
+fn a_bare_name_with_cwd_runs_the_one_on_an_absolute_path_entry() {
+    let path = [".", "", "{bin}"].join(PATH_SEPARATOR);
+    let node = Node::start_with_path("planted", Some(&path));
+    write_mytool(&node.work, "planted");
+    write_mytool(&node.dir.0.join("bin"), "real");
+    let said = node.eval(&format!(
+        "return remuda.process.run({{ argv = {{ 'mytool' }}, cwd = {} }}).stdout",
+        lua_string(&node.work)
+    ));
+    assert!(said.contains("real") && !said.contains("planted"), "{said}");
+    // The real one ran in cwd; the planted one never ran anywhere.
+    assert!(node.work.join("ran.txt").exists(), "it did not run in cwd");
+}
+
+#[test]
+fn a_bare_name_found_only_through_a_relative_path_entry_is_refused() {
+    let path = [".", ""].join(PATH_SEPARATOR);
+    let node = Node::start_with_path("only-dot", Some(&path));
+    write_mytool(&node.work, "planted");
+    for word in ["remuda.process.run", "remuda.process"] {
+        let message = node.error_of(&format!(
+            "{word}({{ argv = {{ 'mytool' }}, cwd = {} }})",
+            lua_string(&node.work)
+        ));
+        assert!(
+            message.contains("with cwd could not find")
+                && message.contains("Next: pass the full path of the program."),
+            "{word}: {message}"
+        );
+        assert!(!message.contains('\n'), "one line: {message}");
+    }
+    assert!(!node.work.join("ran.txt").exists(), "the planted file ran");
 }
