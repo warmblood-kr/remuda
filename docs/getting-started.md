@@ -21,6 +21,11 @@ $env:REMUDA_CHANNEL='nightly'; $env:REMUDA_INSTALL_BUTLER='1'; irm https://warmb
 You should see, as the last line, `Next: remuda butler doctor`.
 If not: nightly has no Intel Mac or ARM Linux binary; build from source
 there. Remuda lands in `~/.local/bin`; make sure that directory is on `PATH`.
+If it is not, on macOS or Debian run:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
 
 ## 2. Check your coding agents
 
@@ -101,22 +106,35 @@ You should see: the Butler answers in the room. TODO(lead): exact first
 message to suggest and what the reply looks like.
 
 If nothing comes back: on the computer run `remuda butler status`. It prints
-`butler: up (claude)` when the Butler is ready. `launching` means wait. If it
-prints `failed`, see step 6.
+`butler: up (claude)` when the Butler is ready. `launching` means wait; it
+can take about a minute. If it prints `failed`, see step 6. If it prints `up`
+but nothing comes back, run `remuda butler sessions` and see step 6.
 
 Next: once it answers, go on to step 5.
 
 ## 5. Add your second and third machines
 
 Do steps 1 and 2 on machines B and C. The machines must reach each other,
-for example over your VPN. Then, on every machine:
+for example over your VPN.
+
+The next command sets up the cluster on this machine. It also opens a
+network listener on this machine's local network (LAN) address, port 7441.
+Only admitted machines can connect to it. On every machine:
 
 ```sh
 remuda cluster init
 ```
 
 You should see `Cluster initialized`, then this machine's `Node:` and
-`Fingerprint:`. Then go on to the invitation.
+`Fingerprint:`. You should also see the listener lines, where `IP` is this
+machine's LAN address:
+
+```text
+Listening on IP:7441
+Only admitted machines can connect; turn off: remuda cluster listen --off
+```
+
+Then go on to the invitation.
 
 On A, create one invitation per machine:
 
@@ -141,8 +159,8 @@ address (10.x, 172.16-31.x, 192.168.x) on its default route. It never picks a
 VPN address in 100.64.0.0/10 (Tailscale and similar). If the machines reach
 each other only over such a VPN, or the invite fails with `listener is
 waiting for a private LAN address`, give the VPN address yourself:
-`remuda cluster invite --bind VPN_IP_OF_A` on A, and add
-`--bind VPN_IP_OF_B` to the join line on B.
+`remuda cluster invite --bind VPN_IP_OF_A:7441` on A, and add
+`--bind VPN_IP_OF_B:7441` to the join line on B.
 
 Run that `remuda cluster join` line on B. The first argument is A's
 fingerprint: the join refuses if A's key does not match it. If you sent the
@@ -157,6 +175,18 @@ You should see:
 Joined node-... (fingerprint SHA256:...).
 Next: remuda cluster remote
 ```
+
+The join may also print extra lines like
+`Registry push reached peer SHA256:...`.
+
+If not: a refused join prints:
+
+```text
+remuda: cluster join: the invitation was refused (join lines work once and expire after 10 minutes).
+Next: run `remuda cluster invite` on the inviting machine again.
+```
+
+The invitation was used or expired: run `remuda cluster invite` on A again.
 
 Run `remuda cluster invite` on A again, and run the new join line on C.
 Each invitation works for one machine only.
@@ -177,8 +207,8 @@ You should see three rows in state `admitted`; `*` marks this machine
  node-egrdsjir   SHA256:EgrD...    admitted 1        SHA256:BwWl...
 ```
 
-If a join fails with `Next: check the invitation and try again.`, the
-invitation was used or expired: run `remuda cluster invite` on A again.
+`remuda cluster` shows `Remote control: enabled`. An admitted machine can
+type into and close every session, so join only machines you trust.
 [cluster-demo.md](cluster-demo.md) also covers remote input and revoke.
 
 ## 6. When something goes wrong
@@ -188,7 +218,10 @@ The Butler tries Claude first, then Codex. On the computer,
 `BUTLER ATTEMPTS`.
 
 - **Agent not logged in.** The attempt shows `claude: login (...)` and the
-  Butler moves on to Codex. Fix: `claude auth login` (or `codex login`), then
+  Butler moves on to Codex. A Claude that is not logged in may instead show
+  `claude: timeout (readiness prompt not observed within 15 seconds; last
+  screen: Welcome to Claude Code ...)`. The fix is the same in both cases.
+  Fix: `claude auth login` (or `codex login`), then
   `remuda butler doctor`. On the phone: TODO(lead): what the Butler says.
 - **Stuck prompt or modal.** The Butler answers known startup dialogs itself,
   including the workspace trust question for the folder it launched in. An
