@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 90] = [
+pub const BINDINGS: [&str; 91] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -90,6 +90,7 @@ pub const BINDINGS: [&str; 90] = [
     "fs",
     "hook_list",
     "hooks",
+    "hostname",
     "http",
     "input",
     "insert",
@@ -346,6 +347,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "random_bytes(n) -> string",
     ),
     (
+        "hostname",
+        "The OS host name, read from the OS itself (not the environment). Returned unchanged and not sanitized for use in identifiers; callers slug it. Returns nil, error if the OS call fails or the name is empty, not UTF-8, or holds a control, line-separator (U+2028, U+2029) or bidi-control (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) character.",
+        "hostname() -> string, nil | nil, error",
+    ),
+    (
         "_registry",
         "The word registry itself: name, about and signature for every bound word.",
         "table",
@@ -556,6 +562,7 @@ pub(crate) fn bindings(
     timer_bindings(lua, &table, timers)?;
     caller_binding(lua, &table, caller)?;
     random_bytes_binding(lua, &table)?;
+    hostname_binding(lua, &table)?;
 
     // In-process, not a loopback: the image always runs inside the same
     // daemon this `Registry` belongs to (image.rs), so asking over the wire
@@ -856,6 +863,16 @@ fn random_bytes_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
                 mlua::Error::runtime(format!("remuda.random_bytes OS CSPRNG failed: {error}"))
             })?;
             lua.create_string(bytes)
+        })?,
+    )
+}
+
+fn hostname_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
+    table.set(
+        "hostname",
+        lua.create_function(|_, ()| match crate::hostname::hostname() {
+            Ok(name) => Ok((Some(name), None)),
+            Err(error) => Ok((None, Some(error.to_string()))),
         })?,
     )
 }

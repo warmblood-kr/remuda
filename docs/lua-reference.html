@@ -67,6 +67,8 @@
 <p><code>hook_list(event?) -&gt; {{event, group, id, depth, owner, src, errors, last_error}...}</code> — Copies of the registered hooks, for one event or all, in run order.</p>
 <h2 id="hooks">hooks</h2>
 <p><code>table</code> — Deprecated for reading: use <span class="title-ref">hook_list</span>. The <span class="title-ref">remuda.on</span> table, keyed by event name; it becomes read-only once no mod edits it by hand.</p>
+<h2 id="hostname">hostname</h2>
+<p><code>hostname() -&gt; string, nil | nil, error</code> — The OS host name, read from the OS itself (not the environment). Returned unchanged and not sanitized for use in identifiers; callers slug it. Returns nil, error if the OS call fails or the name is empty, not UTF-8, or holds a control, line-separator (U+2028, U+2029) or bidi-control (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) character.</p>
 <h2 id="http">http</h2>
 <p><code>http.request(options) -&gt; {cancel()}</code> — Start an asynchronous bounded HTTP request; completion is delivered on the Lua image queue. pin_only must be a boolean; when true on http.request or http.peer_certificate, it replaces chain validation while preserving hostname, validity-date, and TLS signature checks. A valid SPKI pin and HTTPS are required; plain pin remains additive, and ca_file does not contribute chain trust in pin-only mode.</p>
 <h2 id="input">input</h2>
