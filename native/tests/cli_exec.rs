@@ -689,16 +689,23 @@ fn first_mod_subcommand_on_a_fresh_daemon_loads_the_mod() {
 
 #[test]
 fn mod_subcommand_that_cannot_load_prints_one_line_and_next() {
-    let home = FreshHome::new(
-        "fail",
-        LIFECYCLE,
-        r#"return {
-          api = "remuda-module-v1", state_version = 1,
-          initialize = function() return {} end,
-          start = function() error("start exploded") end,
-        }"#,
-    );
+    let failing_start = r#"return {
+      api = "remuda-module-v1", state_version = 1,
+      initialize = function() return {} end,
+      start = function() error("start exploded") end,
+    }"#;
+    // A legacy entry registers its command, then fails.
+    let failing_entry =
+        "remuda.extension_command('sample', function() return 'half' end)\nerror('entry exploded')";
+    for (label, manifest_extra, entry) in [
+        ("fail", LIFECYCLE, failing_start),
+        ("half", "", failing_entry),
+    ] {
+        cannot_load_prints_one_line_and_next(&FreshHome::new(label, manifest_extra, entry));
+    }
+}
 
+fn cannot_load_prints_one_line_and_next(home: &FreshHome) {
     let first = home.remuda(&["sample", "doctor"]);
     let registered = home.remuda(&["-e", "return remuda._extension_commands.sample == nil"]);
 
