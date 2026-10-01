@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Windows: a session whose program is a `.cmd` or `.bat` file (for example an
+  npm-installed agent) now refuses an argument that cmd.exe would act on
+  instead of passing it as text: a line break, `%`, or `& | < > ^ ( )` outside
+  double quotes. Before, such an argument could be cut, expanded, or run as a
+  second command. The refusal is one line that names the argument's position
+  and ends with `Next: start the .exe, or pass this text in a file.` Other
+  arguments, and `.exe` programs, are unchanged.
 - Windows: `remuda.exe` now declares UTF-8 as its code page, so a path with
   non-ASCII characters (for example a Korean user folder) is the same string in
   Lua's `os.getenv`, `io.open` and `os.rename` as in the `remuda.*` words.
