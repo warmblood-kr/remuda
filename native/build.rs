@@ -12,6 +12,26 @@ fn main() {
     let build = std::env::var("REMUDA_BUILD").unwrap_or_else(|_| git_build());
     println!("cargo:rustc-env=REMUDA_BUILD={build}");
     println!("cargo:rustc-env=REMUDA_BUILD_VERSION={version}+{build}");
+    embed_utf8_manifest();
+}
+
+/// Windows: `remuda.exe` declares UTF-8 as its ANSI code page, so Lua's C
+/// runtime (`os`, `io`) and the Rust-backed words agree on non-ASCII paths.
+/// MSVC linker only (no Windows GNU build is shipped); needs Windows 10 1903.
+fn embed_utf8_manifest() {
+    println!("cargo:rerun-if-changed=remuda.exe.manifest");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    if os != "windows" || env != "msvc" {
+        return;
+    }
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("Cargo sets manifest"))
+        .join("remuda.exe.manifest");
+    println!("cargo:rustc-link-arg-bins=/MANIFEST:EMBED");
+    println!(
+        "cargo:rustc-link-arg-bins=/MANIFESTINPUT:{}",
+        manifest.display()
+    );
 }
 
 fn watch_git_head() {
