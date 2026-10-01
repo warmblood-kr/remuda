@@ -12,6 +12,7 @@ fn unknown_top_level_name_reports_mod_install_next_step() {
         .env("REMUDA_RUNTIME_DIR", &dir)
         .env("XDG_DATA_HOME", dir.join("data"))
         .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("LOCALAPPDATA", &dir)
         .env("HOME", &dir)
         .output()
         .expect("run remuda");
@@ -44,6 +45,7 @@ fn unsafe_unknown_name_is_not_echoed() {
             .env("REMUDA_RUNTIME_DIR", &dir)
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("LOCALAPPDATA", &dir)
             .env("HOME", &dir)
             .output()
             .expect("run remuda");
@@ -85,6 +87,7 @@ fn unsafe_unknown_name_never_looks_up_or_reports_half_installed_mod_paths() {
             .env("REMUDA_RUNTIME_DIR", &dir)
             .env("XDG_DATA_HOME", &data)
             .env("XDG_CONFIG_HOME", dir.join("config"))
+            .env("LOCALAPPDATA", &dir)
             .env("HOME", &dir)
             .output()
             .expect("run remuda");
@@ -131,6 +134,7 @@ fn unknown_name_can_suggest_an_installed_mod() {
         .env("REMUDA_RUNTIME_DIR", &dir)
         .env("XDG_DATA_HOME", dir.join("data"))
         .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("LOCALAPPDATA", &dir)
         .env("HOME", &dir)
         .output()
         .expect("run remuda");

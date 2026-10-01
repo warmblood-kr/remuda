@@ -13,6 +13,7 @@ impl Drop for PrivateDaemonCleanup {
                 .args(["-s", "s", "stop", "-f"])
                 .env("REMUDA_RUNTIME_DIR", &self.0)
                 .env("XDG_DATA_HOME", self.0.join("data"))
+                .env("LOCALAPPDATA", &self.0)
                 .env("HOME", &self.0)
                 .output();
         }
@@ -215,6 +216,7 @@ end)
             .args(args)
             .env("REMUDA_RUNTIME_DIR", &run_dir)
             .env("XDG_DATA_HOME", run_dir.join("data"))
+            .env("LOCALAPPDATA", &run_dir)
             .env("HOME", &run_dir)
             .output()
             .expect("run remuda")
@@ -241,6 +243,7 @@ fn secret_prompt_client_exits_and_restores_tty(
     command.args(["-s", "s", "deferred", "secret_short"]);
     command.env("REMUDA_RUNTIME_DIR", runtime);
     command.env("XDG_DATA_HOME", runtime.join("data"));
+    command.env("LOCALAPPDATA", runtime);
     command.env("HOME", runtime);
     let mut child = pty
         .slave
@@ -1490,6 +1493,7 @@ fn shutdown_answers_waiters_and_runs_shutdown_cancellation_callback() {
         .arg(&cancellation_file)
         .env("REMUDA_RUNTIME_DIR", &dir)
         .env("XDG_DATA_HOME", dir.join("data"))
+        .env("LOCALAPPDATA", &dir)
         .env("HOME", &dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

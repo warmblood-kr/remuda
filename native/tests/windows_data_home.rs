@@ -45,6 +45,16 @@ fn remuda(runtime: &Path, local: &Path, args: &[&str]) -> Output {
         .expect("run remuda")
 }
 
+/// `icacls` marks inherited entries `(I)`; the cluster's hardened DACL has none.
+fn inherits_acl(dir: &Path) -> bool {
+    let out = Command::new("icacls")
+        .arg(dir)
+        .output()
+        .expect("run icacls");
+    assert!(out.status.success(), "icacls failed: {out:?}");
+    String::from_utf8_lossy(&out.stdout).contains("(I)")
+}
+
 fn lists(out: &Output, name: &str) -> bool {
     out.status.success() && String::from_utf8_lossy(&out.stdout).contains(name)
 }
@@ -69,6 +79,10 @@ fn cluster_hardening_leaves_the_channel_and_mods_readable() {
     let channel = local.join("remuda").join("channel");
     fs::write(&channel, "nightly\n").unwrap();
 
+    assert!(
+        inherits_acl(&local.join("remuda")),
+        "scratch dir should start with inherited ACLs"
+    );
     let daemon = spawn::spawn_and_wait(
         {
             let mut cmd = spawn::base_command(&root);
@@ -85,6 +99,10 @@ fn cluster_hardening_leaves_the_channel_and_mods_readable() {
         "cluster init wrote no identity under the scratch LOCALAPPDATA, so nothing was hardened"
     );
 
+    assert!(
+        !inherits_acl(&local.join("remuda")),
+        "cluster init did not harden the shared remuda dir"
+    );
     assert_eq!(fs::read_to_string(&channel).unwrap(), "nightly\n");
     assert!(fs::read_to_string(mod_root.join("extension.toml")).is_ok());
     assert!(fs::read_to_string(mod_root.join("packages/hello/init.lua")).is_ok());
