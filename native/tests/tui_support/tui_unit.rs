@@ -4108,25 +4108,54 @@ fn list_wheel_scrolls_while_a_session_is_focused_without_moving_selection() {
     assert_eq!(ui.selected, 23, "click follows the scrolled row");
 }
 
-#[test]
-fn returning_to_list_normalizes_the_focused_viewport() {
+/// The session name drawn in the first list row of a rendered frame.
+fn top_list_row(ui: &Ui) -> String {
+    let frame = render(ui, "", "test", 80, 24);
+    let row = frame.split("\x1b[1;1H").nth(1).expect("first row");
+    let row = row.strip_prefix("\x1b[7m").unwrap_or(row);
+    row.chars()
+        .take_while(|c| !c.is_whitespace() && *c != '\x1b')
+        .collect()
+}
+
+fn thirty_sessions_with_a_stale_viewport() -> Ui {
     let mut ui = make_ui(
         (0..30)
             .map(|index| row(&format!("session-{index}"), true, false))
             .collect(),
     );
-    ui.focus = Focus::Session;
     ui.selected = 0;
     ui.list_first_visible = Some(20);
+    ui
+}
+
+#[test]
+fn returning_to_list_normalizes_the_focused_viewport() {
+    let mut ui = thirty_sessions_with_a_stale_viewport();
+    ui.focus = Focus::Session;
     let detach = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
     assert_eq!(ui.on_key(detach), Action::Nothing);
     assert_eq!(ui.focus, Focus::List);
-    assert_eq!(ui.list_first_visible, Some(0));
+    assert_eq!(top_list_row(&ui), "session-0");
     ui.on_key(press(KeyCode::Down));
     assert_eq!(ui.selected, 1);
     assert_eq!(
-        ui.list_first_visible,
-        Some(0),
+        top_list_row(&ui),
+        "session-0",
+        "down must not jump the viewport"
+    );
+}
+
+#[test]
+fn a_stale_viewport_does_not_jump_the_list_on_the_next_key() {
+    let mut ui = thirty_sessions_with_a_stale_viewport();
+    assert_eq!(ui.focus, Focus::List);
+    assert_eq!(top_list_row(&ui), "session-0");
+    ui.on_key(press(KeyCode::Down));
+    assert_eq!(ui.selected, 1);
+    assert_eq!(
+        top_list_row(&ui),
+        "session-0",
         "down must not jump the viewport"
     );
 }
