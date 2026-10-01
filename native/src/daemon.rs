@@ -2633,31 +2633,34 @@ fn spawn(
     ))
 }
 
-/// The file portable-pty will start for `program` (portable-pty 0.9.0,
+/// The file portable-pty will find for `program` (portable-pty 0.9.0,
 /// `cmdbuilder.rs:581-607`): in each PATH directory the name as given, then
-/// with each PATHEXT extension in place of its own; else the name as given.
+/// with each PATHEXT extension in place of its own. `None`: the name as given.
 #[cfg(windows)]
-fn pty_program(builder: &CommandBuilder, program: &str) -> std::ffi::OsString {
+fn pty_program(builder: &CommandBuilder, program: &str) -> Option<std::path::PathBuf> {
     use std::ffi::OsStr;
     if let Some(path) = builder.get_env("PATH") {
         let extensions = builder.get_env("PATHEXT").unwrap_or(OsStr::new(".EXE"));
         for dir in std::env::split_paths(path) {
             let exact = dir.join(program);
             if exact.exists() {
-                return exact.into_os_string();
+                return Some(exact);
             }
             for entry in std::env::split_paths(extensions) {
                 // An entry portable-pty would panic on is skipped here.
                 let candidate = entry
                     .to_str()
                     .and_then(|entry| crate::cmd_arguments::pty_candidate(&exact, entry));
-                if let Some(candidate) = candidate.filter(|candidate| candidate.exists()) {
-                    return candidate.into_os_string();
+                if candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.exists())
+                {
+                    return candidate;
                 }
             }
         }
     }
-    program.into()
+    None
 }
 
 /// Windows runs a `.cmd` or `.bat` program with cmd.exe, so its arguments
@@ -2669,7 +2672,20 @@ fn refuse_unsafe_batch_arguments(
     argv: &[String],
 ) -> Result<(), String> {
     use crate::cmd_arguments::{batch_arguments_refusal, is_batch_file};
-    let program = pty_program(builder, &argv[0]);
+    let program = match pty_program(builder, &argv[0]) {
+        // A hit through a relative PATH entry is relative to the daemon's own
+        // directory, where `exists` looked. Pinned as it is, the pty would
+        // join it onto every PATH directory again and another file could win.
+        Some(found) => std::path::absolute(&found)
+            .map_err(|error| {
+                format!(
+                    "the program path could not be made absolute: {error}. \
+                     Next: pass the full path of the program."
+                )
+            })?
+            .into_os_string(),
+        None => argv[0].clone().into(),
+    };
     let shown = program.to_string_lossy().into_owned();
     builder.get_argv_mut()[0] = program;
     if !is_batch_file(&shown) {
