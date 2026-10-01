@@ -27,6 +27,100 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
+struct SessionAutoStartScratch {
+    root: PathBuf,
+    server: Option<String>,
+}
+
+impl SessionAutoStartScratch {
+    fn new(tag: &str, server: Option<String>) -> Self {
+        let base = if Path::new("/private/tmp").is_dir() {
+            PathBuf::from("/private/tmp")
+        } else {
+            std::env::temp_dir().canonicalize().unwrap()
+        };
+        let root = base.join(format!("r453-session-{}-{tag}", std::process::id()));
+        let mut builder = std::fs::DirBuilder::new();
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&root).unwrap();
+        Self { root, server }
+    }
+
+    fn socket(&self, server: &str) -> PathBuf {
+        remuda_native::daemon::socket_path_in(&self.root, server)
+    }
+}
+
+impl Drop for SessionAutoStartScratch {
+    fn drop(&mut self) {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
+        if let Some(server) = &self.server {
+            command.args(["-s", server]);
+        }
+        let _ = command
+            .args(["stop", "-f", "--yes"])
+            .env("REMUDA_RUNTIME_DIR", &self.root)
+            .env("XDG_RUNTIME_DIR", &self.root)
+            .env("HOME", &self.root)
+            .env("XDG_CONFIG_HOME", self.root.join("config"))
+            .env("XDG_DATA_HOME", self.root.join("data"))
+            .env_remove("REMUDA_SESSION_ID")
+            .env_remove("REMUDA_SESSION_CAPABILITY")
+            .output();
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn session_client(root: &Path, args: &[&str], session_env: &str) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .args(args)
+        .env("REMUDA_RUNTIME_DIR", root)
+        .env("XDG_RUNTIME_DIR", root)
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("REMUDA_NO_UPDATE_CHECK", "1")
+        .env(session_env, "present")
+        .output()
+        .expect("run session client")
+}
+
+#[test]
+fn session_clients_block_default_autostart_but_explicit_other_still_starts() {
+    for (index, session_env) in ["REMUDA_SESSION_ID", "REMUDA_SESSION_CAPABILITY"]
+        .into_iter()
+        .enumerate()
+    {
+        let scratch = SessionAutoStartScratch::new(&format!("default-{index}"), None);
+        let socket = scratch.socket("default");
+        let out = session_client(&scratch.root, &["-e", "return true"], session_env);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "{session_env} must prevent implicit default autostart: {out:?}"
+        );
+        assert!(
+            stderr.contains(&socket.display().to_string()),
+            "error must name the socket tried: {stderr}"
+        );
+        assert!(
+            stderr.contains("start a daemon outside this session"),
+            "error must say how to proceed: {stderr}"
+        );
+        assert!(!socket.exists(), "session client started a default daemon");
+    }
+
+    let server = format!("other-{}", std::process::id());
+    let scratch = SessionAutoStartScratch::new("explicit-other", Some(server.clone()));
+    let out = session_client(
+        &scratch.root,
+        &["-s", &server, "-e", "return true"],
+        "REMUDA_SESSION_ID",
+    );
+    assert!(out.status.success(), "explicit other server must autostart: {out:?}");
+    assert!(scratch.socket(&server).exists(), "explicit other daemon did not start");
+}
+
 /// Run `args` against a stand-in at the private server's socket that only
 /// records connections, hanging up at once so a connecting CLI fails fast.
 fn touches_daemon(tag: &str, args: &[&str]) -> (Output, bool) {
