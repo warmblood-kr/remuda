@@ -16,6 +16,7 @@ use crate::child_guard;
 use crate::image::Image;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -56,6 +57,7 @@ pub fn run_sync(
     argv: Vec<String>,
     stdin: Option<Vec<u8>>,
     timeout_seconds: f64,
+    cwd: Option<PathBuf>,
 ) -> Result<RunOutput, String> {
     validate_run(&argv, timeout_seconds)?;
     let (stdout_permit, stderr_permit) = reserve_run_reader_workers()?;
@@ -69,6 +71,9 @@ pub fn run_sync(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(dir) = &cwd {
+        command.current_dir(dir);
+    }
     child_guard::harden(&mut command);
 
     #[cfg(windows)]
@@ -157,6 +162,53 @@ pub fn run_sync(
         timed_out,
         signal: exit_signal(&child_status),
     })
+}
+
+/// Check the optional `cwd` of `process.run` and `process`: an absolute path
+/// to an existing directory. With it, a bare `argv[0]` is replaced by its
+/// absolute path on PATH, and a relative program path is refused.
+pub fn checked_cwd(
+    word: &str,
+    cwd: Option<&str>,
+    argv: &mut [String],
+) -> Result<Option<PathBuf>, String> {
+    let Some(cwd) = cwd else {
+        return Ok(None);
+    };
+    let program = argv.first().cloned().unwrap_or_default();
+    let program = program.as_str();
+    let dir = Path::new(cwd);
+    if !dir.is_absolute() || !std::fs::metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+        return Err(format!(
+            "{word} cwd must be an absolute path to an existing directory. \
+             Next: pass the directory's full path."
+        ));
+    }
+    // std calls a relative program path with a working directory platform
+    // specific and unstable, so that one combination is refused. A Windows
+    // drive-relative name (`C:tool`) is such a path without a separator.
+    let path = Path::new(program);
+    let drive = matches!(path.components().next(), Some(Component::Prefix(_)));
+    if path.is_relative() && (drive || program.contains(std::path::is_separator)) {
+        return Err(format!(
+            "{word} with cwd needs an absolute program path or a bare command name. \
+             Next: pass the full path of the program."
+        ));
+    }
+    // A bare name: the child would search PATH from inside `cwd`, where a
+    // relative PATH entry finds a file planted there. Search here instead,
+    // absolute entries only, and start that exact file.
+    if path.is_relative() {
+        let found = crate::find_command::find_on_path(program).map_err(|_| {
+            format!(
+                "{word} with cwd could not find {} on PATH. \
+                 Next: pass the full path of the program.",
+                crate::find_command::shown(program)
+            )
+        })?;
+        argv[0] = found;
+    }
+    Ok(Some(dir.to_path_buf()))
 }
 
 fn validate_run(argv: &[String], timeout_seconds: f64) -> Result<(), String> {
@@ -535,6 +587,7 @@ mod run_tests {
             ],
             None,
             2.0,
+            None,
         )
         .expect("the child should start and exit before its deadline");
 
@@ -578,6 +631,7 @@ mod run_tests {
             ],
             Some(paths.into_bytes()),
             3.0,
+            None,
         )
         .expect("process.run should return after the leader exits");
         assert!(
@@ -708,6 +762,7 @@ mod run_tests {
             ],
             None,
             1.0,
+            None,
         )
         .expect("process.run should return after the leader exits");
         assert!(
@@ -992,6 +1047,7 @@ impl Processes {
         argv: Vec<String>,
         on_line: Option<String>,
         on_exit: Option<String>,
+        cwd: Option<PathBuf>,
     ) -> Result<u64, String> {
         let (program, args) = argv
             .split_first()
@@ -1002,6 +1058,9 @@ impl Processes {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if let Some(dir) = &cwd {
+            command.current_dir(dir);
+        }
         // Every plain-pipe child funnels through the one seam that keeps it
         // from outliving this daemon — see child_guard.rs.
         child_guard::harden(&mut command);

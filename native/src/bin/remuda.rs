@@ -267,7 +267,8 @@ in Lua, where they cost no front page:
   remuda -e 'remuda.session.close(\"build\")'
 
 Installs follow a channel — `stable` (release tags) or `nightly` (every commit
-on main) — recorded at $XDG_DATA_HOME/remuda/channel by the install script.
+on main) — recorded at $XDG_DATA_HOME/remuda/channel (on Windows
+%LOCALAPPDATA%\\remuda\\channel) by the install script.
 Every command checks for a newer one at most once a day, in a detached child
 that no command waits for. REMUDA_NO_UPDATE_CHECK=1 turns it off.
 

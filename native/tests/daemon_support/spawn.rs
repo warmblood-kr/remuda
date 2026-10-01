@@ -34,6 +34,7 @@ pub fn base_command(dir: &Path) -> std::process::Command {
     cmd.args(["-s", "s", "daemon"])
         .env("REMUDA_RUNTIME_DIR", dir)
         .env("HOME", &home)
+        .env("LOCALAPPDATA", &home)
         .env_remove("XDG_CONFIG_HOME")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
