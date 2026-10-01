@@ -630,6 +630,16 @@ fn registry_documentation_formats_are_live_and_structured() {
         .as_str()
         .unwrap()
         .contains("not a security boundary"));
+    let find_command = document["runtime"]["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "system.find_command")
+        .expect("system.find_command is documented");
+    assert!(find_command["description"]
+        .as_str()
+        .unwrap()
+        .contains("never executed"));
     let random_bytes = document["runtime"]["functions"]
         .as_array()
         .unwrap()
