@@ -137,8 +137,8 @@ try {
 
     # Not Get-FileHash: Windows PowerShell started underneath PowerShell 7 -
     # `remuda upgrade` typed into pwsh - does not find it. .NET is always there.
-    $sha256 = [Security.Cryptography.SHA256]::Create()
     $download = [IO.File]::OpenRead((Join-Path $tmp $asset))
+    $sha256 = [Security.Cryptography.SHA256]::Create()
     try {
         $actual = [BitConverter]::ToString($sha256.ComputeHash($download)) -replace '-', ''
     } finally {

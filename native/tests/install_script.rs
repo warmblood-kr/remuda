@@ -82,11 +82,19 @@ fn a_windows_install_without_git_explains_the_butler_step() {
 fn a_windows_install_checks_its_download_in_powershell_started_from_pwsh() {
     passes_under_both_shells("check-install-hash.ps1");
 
-    let module_path = std::process::Command::new("pwsh")
-        .args(["-NoProfile", "-Command", "$env:PSModulePath"])
+    let pwsh = std::process::Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $env:PSModulePath",
+        ])
         .output()
         .expect("cannot run pwsh");
-    let module_path = String::from_utf8_lossy(&module_path.stdout);
+    let module_path = String::from_utf8_lossy(&pwsh.stdout);
+    assert!(
+        pwsh.status.success() && !module_path.trim().is_empty(),
+        "pwsh did not say what its PSModulePath is"
+    );
     let check = format!(
         "{}/../scripts/check-install-hash.ps1",
         env!("CARGO_MANIFEST_DIR")

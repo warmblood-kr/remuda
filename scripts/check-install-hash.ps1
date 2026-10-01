@@ -18,9 +18,10 @@ New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 $fakeAsset = Join-Path $scratch 'asset'
 Set-Content -Path $fakeAsset -Value 'stands in for the release tarball'
 $sha256 = [Security.Cryptography.SHA256]::Create()
-$goodSum = [BitConverter]::ToString($sha256.ComputeHash([IO.File]::ReadAllBytes($fakeAsset))) -replace '-', ''
+# Lowercase, as sha256sum writes it. The wrong one differs in a single digit.
+$goodSum = ([BitConverter]::ToString($sha256.ComputeHash([IO.File]::ReadAllBytes($fakeAsset))) -replace '-', '').ToLowerInvariant()
 $sha256.Dispose()
-$badSum = '0' * 64
+$badSum = $(if ($goodSum[0] -eq '0') { '1' } else { '0' }) + $goodSum.Substring(1)
 
 # Functions shadow cmdlets and applications, and `iex` runs the installer in
 # a scope that sees them, so these are what it calls instead of the network
