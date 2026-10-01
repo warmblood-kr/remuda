@@ -2646,10 +2646,12 @@ fn pty_program(builder: &CommandBuilder, program: &str) -> std::ffi::OsString {
             if exact.exists() {
                 return exact.into_os_string();
             }
-            for extension in std::env::split_paths(extensions) {
-                let extension = extension.to_string_lossy();
-                let candidate = exact.with_extension(extension.trim_start_matches('.'));
-                if candidate.exists() {
+            for entry in std::env::split_paths(extensions) {
+                // An entry portable-pty would panic on is skipped here.
+                let candidate = entry
+                    .to_str()
+                    .and_then(|entry| crate::cmd_arguments::pty_candidate(&exact, entry));
+                if let Some(candidate) = candidate.filter(|candidate| candidate.exists()) {
                     return candidate.into_os_string();
                 }
             }
@@ -2660,7 +2662,7 @@ fn pty_program(builder: &CommandBuilder, program: &str) -> std::ffi::OsString {
 
 /// Windows runs a `.cmd` or `.bat` program with cmd.exe, so its arguments
 /// must be ones cmd.exe reads as text. The program is pinned to the file the
-/// check looked at, so the pty starts that file and no other.
+/// check looked at, batch file or not, so the pty never searches again.
 #[cfg(windows)]
 fn refuse_unsafe_batch_arguments(
     builder: &mut CommandBuilder,
@@ -2669,16 +2671,13 @@ fn refuse_unsafe_batch_arguments(
     use crate::cmd_arguments::{batch_arguments_refusal, is_batch_file};
     let program = pty_program(builder, &argv[0]);
     let shown = program.to_string_lossy().into_owned();
+    builder.get_argv_mut()[0] = program;
     if !is_batch_file(&shown) {
         return Ok(());
     }
     let mut words = argv.to_vec();
     words[0] = shown;
-    if let Some(refusal) = batch_arguments_refusal(&words) {
-        return Err(refusal);
-    }
-    builder.get_argv_mut()[0] = program;
-    Ok(())
+    batch_arguments_refusal(&words).map_or(Ok(()), Err)
 }
 
 /// Hand this connection over to a human. A later attach displaces this one;
