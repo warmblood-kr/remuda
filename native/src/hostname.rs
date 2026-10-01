@@ -3,15 +3,21 @@
 use std::io;
 
 /// Accept a host name as the OS reported it, or refuse it: empty, not UTF-8,
-/// or holding a control character. Everything else passes through unchanged.
+/// or holding a control, line-separator or bidi-control character.
+/// Everything else passes through unchanged.
 pub fn validate(name: &[u8]) -> io::Result<String> {
     let refuse = |why| io::Error::new(io::ErrorKind::InvalidData, why);
     let name = std::str::from_utf8(name).map_err(|_| refuse("the host name is not UTF-8"))?;
     if name.is_empty() {
         return Err(refuse("the host name is empty"));
     }
-    if name.chars().any(char::is_control) {
-        return Err(refuse("the host name holds a control character"));
+    // Cc, then U+2028/U+2029 and the bidi embeddings, overrides and isolates.
+    let unsafe_to_show =
+        |c: char| c.is_control() || matches!(c, '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    if name.chars().any(unsafe_to_show) {
+        return Err(refuse(
+            "the host name holds a control, line-separator or bidi-control character",
+        ));
     }
     Ok(name.to_owned())
 }
@@ -75,6 +81,14 @@ mod tests {
         ];
         for name in refused {
             assert!(validate(name).is_err(), "accepted {name:?}");
+        }
+        // Not category Cc, but they split or reorder what a terminal shows.
+        for unit in (0x2028..=0x202E).chain(0x2066..=0x2069) {
+            let name = format!("a{}b", char::from_u32(unit).unwrap());
+            assert!(validate(name.as_bytes()).is_err(), "accepted U+{unit:04X}");
+        }
+        for neighbour in ['\u{2027}', '\u{202F}', '\u{2065}', '\u{206A}'] {
+            assert!(validate(format!("a{neighbour}b").as_bytes()).is_ok());
         }
     }
 }
