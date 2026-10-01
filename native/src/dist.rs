@@ -249,7 +249,7 @@ fn cache_path_for(windows: bool, env: Env) -> PathBuf {
 /// Windows keeps app data in `%LOCALAPPDATA%`; elsewhere `$HOME` (or
 /// `%USERPROFILE%`) plus the XDG layout `unix_sub`.
 fn home_dir_for(windows: bool, env: Env, unix_sub: &str) -> Option<PathBuf> {
-    if false && windows {
+    if windows {
         return set(env, "LOCALAPPDATA")
             .or_else(|| set(env, "USERPROFILE").map(|home| home.join("AppData").join("Local")));
     }
