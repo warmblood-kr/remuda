@@ -605,3 +605,124 @@ fn extension_command_separator_passes_dash_as_a_literal_argument() {
     assert_eq!(output.stdout, b"y|--|-|no-stdin\n");
     cleanup_stdin_fixture(&dir);
 }
+
+/// #394: a fresh isolated home whose FIRST command is the mod subcommand under
+/// test. Dropping it stops its private daemon, also when an assert panics.
+struct FreshHome(std::path::PathBuf);
+
+impl FreshHome {
+    fn new(label: &str, manifest_extra: &str, entry: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("rc-first-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mod_dir = dir.join("data/remuda/mods/sample");
+        fs::create_dir_all(mod_dir.join("packages/sample")).unwrap();
+        fs::write(
+            mod_dir.join("extension.toml"),
+            format!(
+                "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\ncommand = \"sample\"\n{manifest_extra}"
+            ),
+        )
+        .unwrap();
+        fs::write(mod_dir.join("packages/sample/init.lua"), entry).unwrap();
+        Self(dir)
+    }
+
+    fn remuda(&self, args: &[&str]) -> Output {
+        stdin_cli(&self.0, args)
+            .env("REMUDA_NO_UPDATE_CHECK", "1")
+            .output()
+            .expect("run remuda")
+    }
+}
+
+impl Drop for FreshHome {
+    fn drop(&mut self) {
+        let _ = self.remuda(&["stop", "-f"]);
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+const LIFECYCLE: &str = "lifecycle = \"remuda-module-v1\"\n";
+
+#[test]
+fn first_mod_subcommand_on_a_fresh_daemon_loads_the_mod() {
+    for (label, args, expected) in [
+        ("doctor", &["sample", "doctor"][..], "handled doctor\n"),
+        (
+            "matrix",
+            &["sample", "matrix", "setup"][..],
+            "handled matrix setup\n",
+        ),
+    ] {
+        let home = FreshHome::new(
+            label,
+            LIFECYCLE,
+            r#"return {
+              api = "remuda-module-v1", state_version = 1,
+              initialize = function() return {} end,
+              start = function()
+                remuda.extension_command("sample", function(args)
+                  return "handled " .. table.concat(args, " ")
+                end)
+              end,
+            }"#,
+        );
+
+        let first = home.remuda(args);
+
+        let stderr = String::from_utf8_lossy(&first.stderr);
+        assert!(!stderr.contains("stack traceback"), "{first:?}");
+        assert!(first.status.success(), "{first:?}");
+        assert_eq!(String::from_utf8_lossy(&first.stdout), expected);
+    }
+}
+
+#[test]
+fn mod_subcommand_that_cannot_load_prints_one_line_and_next() {
+    let home = FreshHome::new(
+        "fail",
+        LIFECYCLE,
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          start = function() error("start exploded") end,
+        }"#,
+    );
+
+    let first = home.remuda(&["sample", "doctor"]);
+    let registered = home.remuda(&["-e", "return remuda._extension_commands.sample == nil"]);
+
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    // The autostart notice is the daemon's, not the failure's.
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.starts_with("remuda: started a daemon"))
+        .collect();
+    assert!(!first.status.success(), "{first:?}");
+    assert!(!stderr.contains("stack traceback"), "{first:?}");
+    assert_eq!(lines.len(), 2, "one line plus Next: {first:?}");
+    assert!(lines[0].contains("sample"), "{first:?}");
+    assert!(lines[1].starts_with("Next: "), "{first:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&registered.stdout).trim(),
+        "true",
+        "a failed load left a half-registered command: {registered:?}"
+    );
+}
+
+#[test]
+fn loaded_legacy_mod_is_not_rerun_by_a_subcommand() {
+    let home = FreshHome::new(
+        "legacy",
+        "",
+        "remuda._sample_runs = (remuda._sample_runs or 0) + 1\n\
+         remuda.extension_command('sample', function() return tostring(remuda._sample_runs) end)",
+    );
+
+    let first = home.remuda(&["sample", "count"]);
+    let second = home.remuda(&["sample", "count"]);
+
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(String::from_utf8_lossy(&first.stdout), "1\n");
+    assert_eq!(String::from_utf8_lossy(&second.stdout), "1\n", "{second:?}");
+}
