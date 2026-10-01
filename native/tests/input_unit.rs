@@ -234,8 +234,8 @@ fn type_text_delivers_and_submits_when_the_child_drains_slowly() {
     let dir = scratch("slow-drain");
     let socket = daemon::socket_path_in(&dir, "s");
     let _daemon = daemon_at(&socket, &dir);
-    // Larger than any PTY input queue, so the write blocks until the child reads.
-    let bytes = 8000;
+    // Larger than the macOS and Linux PTY input queues, so the write blocks until the child reads.
+    let bytes = 300_000;
     let child = format!(
         "stty raw -echo; printf READY; sleep 3; \
          printf 'GOT:%s ' $(head -c {bytes} | wc -c); \
@@ -258,8 +258,9 @@ fn type_text_delivers_and_submits_when_the_child_drains_slowly() {
         &socket,
         "input-unit-slow-drain",
         &format!(
-            "local ok, err = pcall(remuda.type_text, 'slow-drain', string.rep('x', {bytes}))\n\
-             assert(ok, 'type_text raised: ' .. tostring(err))"
+            "local ok, status = pcall(remuda.type_text, 'slow-drain', string.rep('x', {bytes}))\n\
+             assert(ok, 'type_text raised: ' .. tostring(status))\n\
+             assert(status == 'late', 'a stalled text write must report late, got ' .. tostring(status))"
         ),
     )
     .expect("type_text must not fail while the child is only slow");
