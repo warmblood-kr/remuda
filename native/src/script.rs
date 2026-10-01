@@ -20,7 +20,7 @@ use crate::client;
 use mlua::{Lua, Table, Value};
 use remuda_core::keys;
 use remuda_core::protocol::{Request, Response, Step};
-use remuda_core::InputSubmitOutcome;
+use remuda_core::{InputSubmitOutcome, DEFAULT_INPUT_SETTLE};
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
@@ -518,7 +518,7 @@ fn input_bindings(
         "_input_type_text",
         lua.create_function(
             move |_, (name, text, settle): (String, String, Option<f64>)| {
-                let settle = settle.unwrap_or(0.1);
+                let settle = settle.unwrap_or(DEFAULT_INPUT_SETTLE.as_secs_f64());
                 if !settle.is_finite() || !(0.0..=5.0).contains(&settle) {
                     return Err(mlua::Error::runtime(
                         "settle must be between 0 and 5 seconds",

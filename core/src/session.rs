@@ -87,6 +87,9 @@ pub enum InputSubmitOutcome {
     Late,
 }
 
+/// Pause between pasted text and its Return when the caller gives none.
+pub const DEFAULT_INPUT_SETTLE: Duration = Duration::from_millis(100);
+
 struct PendingInput {
     tail: String,
     baseline_occurrences: usize,
@@ -394,7 +397,12 @@ impl Session {
                         .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
                     agent
                         .input_writer()
-                        .map(|writer| writer.chain_after_stalled(crate::keys::RETURN_BYTES, settle))
+                        .map(|writer| {
+                            writer.chain_after_stalled(
+                                crate::keys::RETURN_BYTES,
+                                settle.max(DEFAULT_INPUT_SETTLE),
+                            )
+                        })
                         .unwrap_or(ChainOutcome::Unsupported)
                 };
                 match outcome {
