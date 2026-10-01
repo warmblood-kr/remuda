@@ -4737,7 +4737,31 @@ fn extension_command(
         "return remuda._dispatch_extension_command({}, {{{arguments}}}, {{env = {{{env}}}{stdin_field}}})",
         serde_json::to_string(command).expect("command serializes")
     );
-    with_daemon(server, path, |path| eval_once(path, &code))
+    with_daemon(server, path, |path| {
+        match load_extension_command(path, command, &package) {
+            Ok(()) => eval_once(path, &code),
+            Err(failed) => failed,
+        }
+    })
+}
+
+/// Load the mod behind a command on its first use, and say so: loading runs
+/// the mod's `start` (#394). The policy is Lua's `load_extension_command`.
+fn load_extension_command(path: &Path, command: &str, package: &str) -> Result<(), ExitCode> {
+    let load = format!(
+        "return remuda.load_extension_command({}, {})",
+        serde_json::to_string(command).expect("command serializes"),
+        serde_json::to_string(package).expect("mod name serializes")
+    );
+    match remuda_native::script::eval_source(path, "=remuda mod command", &load) {
+        Ok(loaded) => {
+            if loaded.trim_end() == "true" {
+                eprintln!("remuda: started mod {package}");
+            }
+            Ok(())
+        }
+        Err(error) => Err(fail(error)),
+    }
 }
 
 /// Encode arbitrary bytes as a quoted Lua string with fixed-width decimal

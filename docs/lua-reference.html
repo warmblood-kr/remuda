@@ -97,6 +97,8 @@
 <p><code>kill(id) -&gt; nil</code> — Terminate a process started with <span class="title-ref">remuda.process</span>, by id.</p>
 <h2 id="list_dir">list_dir</h2>
 <p><code>list_dir(dir) -&gt; {string...}</code> — List a directory's entries.</p>
+<h2 id="load_extension_command">load_extension_command</h2>
+<p><code>load_extension_command(name, owner) -&gt; boolean</code> — Load the installed mod that owns a mod command unless its handler is already registered. Fails with one line and a Next: line when the mod cannot be loaded.</p>
 <h2 id="ls">ls</h2>
 <p><code>ls() -&gt; {session...}</code> — Deprecated alias for <span class="title-ref">remuda.session.list</span>.</p>
 <h2 id="mkdir">mkdir</h2>
