@@ -51,12 +51,12 @@ $dataDir = Join-Path $dataDir 'remuda'
 $channelFile = Join-Path $dataDir 'channel'
 
 $channel = $env:REMUDA_CHANNEL
-if (-not $channel -and (Test-Path $channelFile)) {
+if (-not $channel -and (Test-Path -LiteralPath $channelFile)) {
     # Test-Path only proves the file exists, not that it has content — an
     # empty channel file makes Get-Content -Raw return $null, and $null.Trim()
     # is the same "cannot call a method on a null-valued expression" crash as
     # the arch bug below.
-    $raw = Get-Content -Raw $channelFile
+    $raw = Get-Content -Raw -LiteralPath $channelFile
     if ($raw) { $channel = $raw.Trim() }
 }
 if (-not $channel) { $channel = 'stable' }
@@ -170,10 +170,19 @@ try {
     # Administrators-owned, so an elevated install hands it to the user.
     $me = [Security.Principal.WindowsIdentity]::GetCurrent()
     if (([Security.Principal.WindowsPrincipal]$me).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        $acl = Get-Acl -LiteralPath $dataDir
-        $acl.SetOwner($me.User)
-        Set-Acl -LiteralPath $dataDir -AclObject $acl
         Write-Host 'install.ps1: an elevated shell is not needed for this per-user install'
+        # Best effort, and never through a junction: that would hand its target over.
+        if ((Get-Item -Force -LiteralPath $dataDir).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            Write-Host "install.ps1: $dataDir is a junction or link - its owner was left alone"
+        } else {
+            try {
+                $acl = Get-Acl -LiteralPath $dataDir
+                $acl.SetOwner($me.User)
+                Set-Acl -LiteralPath $dataDir -AclObject $acl
+            } catch {
+                Write-Host "install.ps1: could not make you the owner of $dataDir - $($_.Exception.Message)"
+            }
+        }
     }
     # Absolute, because it is about to be written to PATH, where a relative
     # entry means a different directory in every shell.
@@ -194,7 +203,7 @@ try {
     Get-ChildItem -Path $installDir -Filter '.remuda.exe.old-*' -Force -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
 
-    Set-Content -Path $channelFile -Value $channel -NoNewline
+    Set-Content -LiteralPath $channelFile -Value $channel -NoNewline
 
     Write-Host "install.ps1: remuda $version -> $installed ($channel channel)"
     # Earlier versions installed under the profile. Say so, never delete.
@@ -204,7 +213,7 @@ try {
         $moved = if (Test-Path -LiteralPath $oldData) { "; its channel and mods in $oldData were not moved" } else { '' }
         Write-Host "install.ps1: an older install is at $oldExe and can shadow this one on PATH - delete it$moved"
     }
-    # Nothing on a stock Windows has ~\.local\bin on PATH, and a hint to add it
+    # Nothing on a stock Windows has %LOCALAPPDATA%\Programs\remuda\bin on PATH, and a hint to add it
     # is one more step between the one-liner and `remuda` being a command. So
     # persist it for the user, and add it to this session for the next step.
     # The session's PATH is not asked whether to persist: a launcher can put
