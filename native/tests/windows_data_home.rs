@@ -1,5 +1,5 @@
-//! On Windows the data home is `%LOCALAPPDATA%`, shared with the cluster's
-//! hardened `remuda` directory. Runs on `windows-latest` only.
+//! The binary reads mods from `%LOCALAPPDATA%\remuda`, and channel, mods and
+//! cache stay readable once the cluster has made `remuda\cluster` private.
 #![cfg(windows)]
 
 use std::fs;
