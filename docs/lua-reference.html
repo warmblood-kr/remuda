@@ -76,7 +76,7 @@
 <h2 id="input.text">input.text</h2>
 <p><code>input.text(session, text) -&gt; nil</code> — Deliver text as one burst, using bracketed paste when enabled by the child.</p>
 <h2 id="input.type_text">input.type_text</h2>
-<p><code>input.type_text(session, text, settle?) -&gt; status</code> — Type text, honor the settle pause, then return 'submitted', 'unverified' or 'late'.</p>
+<p><code>input.type_text(session, text, settle?) -&gt; status</code> — Type text, honor the settle pause, then return 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.</p>
 <h2 id="insert">insert</h2>
 <p><code>insert(name, text) -&gt; nil</code> — Insert raw bytes into a session with nothing appended.</p>
 <h2 id="json">json</h2>
@@ -148,7 +148,7 @@
 <h2 id="tools">tools</h2>
 <p><code>table</code> — The <span class="title-ref">remuda.tool</span> registry table, keyed by tool name.</p>
 <h2 id="type_text">type_text</h2>
-<p><code>type_text(session, text, settle?) -&gt; status</code> — Type text into a session and submit it with Return; returns 'submitted', 'unverified' or 'late'.</p>
+<p><code>type_text(session, text, settle?) -&gt; status</code> — Type text into a session and submit it with Return; returns 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.</p>
 <h2 id="unadvise">unadvise</h2>
 <p><code>unadvise(path, id) -&gt; nil</code> — Remove the advice with this id from a path; the last one removed restores the original.</p>
 <h2 id="wait_for">wait_for</h2>

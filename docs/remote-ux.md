@@ -194,7 +194,10 @@ Sync returns the selected session’s latest snapshot plus an output version; a 
 
 PTY writes have a two-second caller deadline. A `WriteTimeout` means the bytes
 may have been partially written or may finish later; `Send` and `SendLine` are
-not idempotent, so callers must not blindly replay them. An idempotent `Input`
+not idempotent, so callers must not blindly replay them. A `SendLine` whose text
+write stalls answers with a pending error instead: the text is still being
+written and its Return follows when it lands, or is dropped if that takes more
+than 30 seconds; check the pane before resending. An idempotent `Input`
 retry uses the same client ID and sequence and receives `Uncertain` after a
 timed-out attempt, even if its worker finishes later. A `Busy` response means
 the session already has one in-flight write and did not queue this request;

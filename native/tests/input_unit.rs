@@ -226,25 +226,22 @@ fn type_text_still_submits_plain_shell_commands_and_long_wrapped_text() {
     assert!(wait_screen(&socket, "plain-shell", "WRAPPED_OK").contains("WRAPPED_OK"));
 }
 
-/// A child that is slow to drain its input (an agent still starting up) must
-/// still receive the whole task and its Return. Today the 2 s bounded PTY
-/// write times out, type_text raises, and the text lands later without Return.
-#[test]
-fn type_text_delivers_and_submits_when_the_child_drains_slowly() {
-    let dir = scratch("slow-drain");
-    let socket = daemon::socket_path_in(&dir, "s");
-    let _daemon = daemon_at(&socket, &dir);
-    // Larger than the macOS and Linux PTY input queues, so the write blocks until the child reads.
-    let bytes = 300_000;
+// Larger than the macOS and Linux PTY input queues, so the write blocks until the child reads.
+const SLOW_DRAIN_BYTES: usize = 300_000;
+
+/// Start a child that reads nothing for six seconds, then counts the text and
+/// shows the byte that follows it. The stall is three times the 2 s write
+/// bound, so a loaded machine still starts the write well inside it.
+fn start_slow_drain(socket: &Path, dir: &Path, name: &str) {
     let child = format!(
-        "stty raw -echo; printf READY; sleep 3; \
-         printf 'GOT:%s ' $(head -c {bytes} | wc -c); \
+        "stty raw -echo; printf READY; sleep 6; \
+         printf 'GOT:%s ' $(head -c {SLOW_DRAIN_BYTES} | wc -c); \
          printf 'RET:%s' \"$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' ')\"; sleep 5"
     );
     client::request(
-        &socket,
+        socket,
         &Request::New {
-            name: Some("slow-drain".into()),
+            name: Some(name.into()),
             command: vec!["sh".into(), "-c".into(), child],
             size: Size::new(80, 24),
             cwd: Some(dir.display().to_string()),
@@ -252,25 +249,19 @@ fn type_text_delivers_and_submits_when_the_child_drains_slowly() {
         },
     )
     .expect("start slow-draining child");
-    wait_screen(&socket, "slow-drain", "READY");
+    wait_screen(socket, name, "READY");
+}
 
-    script::run_source(
-        &socket,
-        "input-unit-slow-drain",
-        &format!(
-            "local ok, status = pcall(remuda.type_text, 'slow-drain', string.rep('x', {bytes}))\n\
-             assert(ok, 'type_text raised: ' .. tostring(status))\n\
-             assert(status == 'late', 'a stalled text write must report late, got ' .. tostring(status))"
-        ),
-    )
-    .expect("type_text must not fail while the child is only slow");
-
-    let deadline = Instant::now() + Duration::from_secs(8);
+fn wait_text_then_return(socket: &Path, name: &str) {
+    let deadline = Instant::now() + Duration::from_secs(25);
     loop {
-        let screen = capture(&socket, "slow-drain");
+        let screen = capture(socket, name);
         if screen.contains("RET:0d") {
-            assert!(screen.contains(&format!("GOT:{bytes}")), "{screen}");
-            break;
+            assert!(
+                screen.contains(&format!("GOT:{SLOW_DRAIN_BYTES}")),
+                "{screen}"
+            );
+            return;
         }
         assert!(
             Instant::now() < deadline,
@@ -278,4 +269,56 @@ fn type_text_delivers_and_submits_when_the_child_drains_slowly() {
         );
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// A child that is slow to drain its input (an agent still starting up) must
+/// still receive the whole task and its Return. type_text reports 'late'
+/// instead of raising, and the Return follows when the text has landed.
+#[test]
+fn type_text_delivers_and_submits_when_the_child_drains_slowly() {
+    let dir = scratch("slow-drain");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&socket, &dir);
+    start_slow_drain(&socket, &dir, "slow-drain");
+
+    script::run_source(
+        &socket,
+        "input-unit-slow-drain",
+        &format!(
+            "local ok, status = pcall(remuda.type_text, 'slow-drain', string.rep('x', {SLOW_DRAIN_BYTES}))\n\
+             assert(ok, 'type_text raised: ' .. tostring(status))\n\
+             assert(status == 'late', 'a stalled text write must report late, got ' .. tostring(status))"
+        ),
+    )
+    .expect("type_text must not fail while the child is only slow");
+
+    wait_text_then_return(&socket, "slow-drain");
+}
+
+/// SendLine (CLI send, MCP send) must not report success for a stalled write:
+/// it answers with the pending error, and the Return still follows the text.
+#[test]
+fn send_line_reports_pending_when_the_child_drains_slowly() {
+    let dir = scratch("slow-send");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&socket, &dir);
+    start_slow_drain(&socket, &dir, "slow-send");
+
+    let response = client::request(
+        &socket,
+        &Request::SendLine {
+            name: "slow-send".into(),
+            text: "x".repeat(SLOW_DRAIN_BYTES),
+        },
+    )
+    .expect("the daemon answers a stalled SendLine");
+    match response {
+        Response::Error(message) => assert!(
+            message.contains("still being written to a slow pane"),
+            "SendLine must answer with the pending error: {message}"
+        ),
+        other => panic!("a stalled SendLine must not report success: {other:?}"),
+    }
+
+    wait_text_then_return(&socket, "slow-send");
 }
