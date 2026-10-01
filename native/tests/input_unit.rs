@@ -225,3 +225,56 @@ fn type_text_still_submits_plain_shell_commands_and_long_wrapped_text() {
     .expect("type wrapped command");
     assert!(wait_screen(&socket, "plain-shell", "WRAPPED_OK").contains("WRAPPED_OK"));
 }
+
+/// A child that is slow to drain its input (an agent still starting up) must
+/// still receive the whole task and its Return. Today the 2 s bounded PTY
+/// write times out, type_text raises, and the text lands later without Return.
+#[test]
+fn type_text_delivers_and_submits_when_the_child_drains_slowly() {
+    let dir = scratch("slow-drain");
+    let socket = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&socket, &dir);
+    // Larger than any PTY input queue, so the write blocks until the child reads.
+    let bytes = 8000;
+    let child = format!(
+        "stty raw -echo; printf READY; sleep 3; \
+         printf 'GOT:%s ' $(head -c {bytes} | wc -c); \
+         printf 'RET:%s' \"$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' ')\"; sleep 5"
+    );
+    client::request(
+        &socket,
+        &Request::New {
+            name: Some("slow-drain".into()),
+            command: vec!["sh".into(), "-c".into(), child],
+            size: Size::new(80, 24),
+            cwd: Some(dir.display().to_string()),
+            env: None,
+        },
+    )
+    .expect("start slow-draining child");
+    wait_screen(&socket, "slow-drain", "READY");
+
+    script::run_source(
+        &socket,
+        "input-unit-slow-drain",
+        &format!(
+            "local ok, err = pcall(remuda.type_text, 'slow-drain', string.rep('x', {bytes}))\n\
+             assert(ok, 'type_text raised: ' .. tostring(err))"
+        ),
+    )
+    .expect("type_text must not fail while the child is only slow");
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let screen = capture(&socket, "slow-drain");
+        if screen.contains("RET:0d") {
+            assert!(screen.contains(&format!("GOT:{bytes}")), "{screen}");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no Return after the text:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
