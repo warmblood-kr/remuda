@@ -4,7 +4,7 @@
 #   $env:REMUDA_CHANNEL='nightly'; $env:REMUDA_INSTALL_BUTLER='1'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
 #
 #   $env:REMUDA_CHANNEL     stable|nightly  default: the channel already installed, else stable
-#   $env:REMUDA_INSTALL_DIR <dir>           default: ~\.local\bin
+#   $env:REMUDA_INSTALL_DIR <dir>           default: %LOCALAPPDATA%\Programs\remuda\bin
 #   $env:REMUDA_INSTALL_BUTLER=1            also install warmblood-kr/remuda-butler
 #   $env:REMUDA_NO_MODIFY_PATH=1            leave PATH alone; say so if the install dir is not on it
 #
@@ -42,7 +42,11 @@ function Fetch($url, $outFile) {
     }
 }
 
-$dataDir = if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { Join-Path $HOME '.local\share' }
+# Per-user app data, where the remuda binary itself looks for the channel file
+# (dist.rs): XDG_DATA_HOME, else %LOCALAPPDATA%, else <profile>\AppData\Local.
+$profileDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+$localAppData = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $profileDir 'AppData\Local' }
+$dataDir = if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { $localAppData }
 $dataDir = Join-Path $dataDir 'remuda'
 $channelFile = Join-Path $dataDir 'channel'
 
@@ -160,8 +164,17 @@ try {
     $unpacked = Join-Path $tmp 'remuda.exe'
     if (-not (Test-Path $unpacked)) { Die "$asset does not contain remuda.exe" }
 
-    $installDir = if ($env:REMUDA_INSTALL_DIR) { $env:REMUDA_INSTALL_DIR } else { Join-Path $HOME '.local\bin' }
+    $installDir = if ($env:REMUDA_INSTALL_DIR) { $env:REMUDA_INSTALL_DIR } else { Join-Path $localAppData 'Programs\remuda\bin' }
     New-Item -ItemType Directory -Force -Path $installDir, $dataDir | Out-Null
+    # The cluster code refuses a remuda data dir that an elevated shell made
+    # Administrators-owned, so an elevated install hands it to the user.
+    $me = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if (([Security.Principal.WindowsPrincipal]$me).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $acl = Get-Acl -LiteralPath $dataDir
+        $acl.SetOwner($me.User)
+        Set-Acl -LiteralPath $dataDir -AclObject $acl
+        Write-Host 'install.ps1: an elevated shell is not needed for this per-user install'
+    }
     # Absolute, because it is about to be written to PATH, where a relative
     # entry means a different directory in every shell.
     $installDir = (Get-Item -Force -LiteralPath $installDir).FullName
@@ -184,6 +197,13 @@ try {
     Set-Content -Path $channelFile -Value $channel -NoNewline
 
     Write-Host "install.ps1: remuda $version -> $installed ($channel channel)"
+    # Earlier versions installed under the profile. Say so, never delete.
+    $oldExe = Join-Path $profileDir '.local\bin\remuda.exe'
+    if ((Test-Path -LiteralPath $oldExe) -and ((Get-Item -LiteralPath $oldExe -Force).FullName -ine $installed)) {
+        $oldData = Join-Path $profileDir '.local\share\remuda'
+        $moved = if (Test-Path -LiteralPath $oldData) { "; its channel and mods in $oldData were not moved" } else { '' }
+        Write-Host "install.ps1: an older install is at $oldExe and can shadow this one on PATH - delete it$moved"
+    }
     # Nothing on a stock Windows has ~\.local\bin on PATH, and a hint to add it
     # is one more step between the one-liner and `remuda` being a command. So
     # persist it for the user, and add it to this session for the next step.
