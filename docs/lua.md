@@ -343,6 +343,9 @@ contributes = {
 
 ## Periodic schedules
 
+`if remuda.sleep` now raises the migration error instead of returning `nil`;
+use `remuda.after` to schedule non-blocking work.
+
 `remuda.schedule({every, after?, name?, run})` runs a callback on the daemon's
 periodic tick. `after` is an optional finite, non-negative number of seconds
 from schedule creation to the first callback; later callbacks are spaced by

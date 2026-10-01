@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 91] = [
+pub const BINDINGS: [&str; 90] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -114,7 +114,6 @@ pub const BINDINGS: [&str; 91] = [
     "schedules",
     "send",
     "session",
-    "sleep",
     "tool",
     "tools",
     "type_text",
@@ -345,11 +344,6 @@ const WORDS: &[(&str, &str, &str)] = &[
         "random_bytes",
         "Return n binary-safe bytes from the OS CSPRNG. n must be a whole number from 1 through 65536; integer-valued Lua floats such as 32.0 are accepted. Raises a Lua error if the OS source fails.",
         "random_bytes(n) -> string",
-    ),
-    (
-        "sleep",
-        "Block the calling image for a number of seconds.",
-        "sleep(seconds) -> nil",
     ),
     (
         "_registry",
@@ -638,8 +632,8 @@ pub(crate) fn bindings(
     // A sequence of bursts and pauses delivered as one indivisible act — the
     // primitive `send`/`insert` are the one-`Burst` case of. `steps` is a Lua
     // array of `{burst = "..."}` / `{pause = seconds}` entries, in order.
-    // Like `sleep`, this blocks the calling Image — for as long as `steps`'s
-    // pauses sum to: `client::request` waits synchronously for the daemon's
+    // This blocks the calling Image — for as long as `steps`'s pauses sum to:
+    // `client::request` waits synchronously for the daemon's
     // reply, and the daemon does not answer until the whole act is done. The
     // daemon refuses a total pause over a few seconds rather than trust a
     // units mistake (or a runaway caller) not to hold an Image hostage.
@@ -685,20 +679,32 @@ pub(crate) fn bindings(
     registry_bindings(lua, &table)?;
     process_bindings(lua, &table, image)?;
 
-    // Blocks the whole Image while this Rust call sleeps. The Lua instruction
-    // budget does not count time spent in Rust bindings, C-library functions,
-    // or Lua 5.4 `__gc` finalizers (which run with hooks disabled); it bounds
-    // Lua VM instructions only. A long `string.find` backtrack or `string.rep`
-    // can therefore still occupy the image until that call returns. Loops of
-    // cheap Rust/C binding calls take longer to reach the 200M-instruction
-    // limit too, and the hook cannot interrupt one blocking call.
-    // Each coroutine create/resume also reserves 10K instructions; this caps
-    // generators at roughly 20K such operations in one job.
-    // This is not a wait or timer primitive; remuda has no periodic-execution
-    // mechanism yet, and a sleep-and-poll loop holds the Image hostage too.
-    sleep_binding(lua, &table)?;
+    removed_sleep_error(lua, &table)?;
 
     Ok(table)
+}
+
+fn removed_sleep_error(lua: &Lua, table: &Table) -> mlua::Result<()> {
+    let metatable = lua.create_table()?;
+    metatable.set(
+        "__index",
+        lua.create_function(|_, (_table, key): (Table, Value)| {
+            let is_sleep = match key {
+                Value::String(key) => key
+                    .to_str()
+                    .map(|key| key.as_ref() == "sleep")
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if is_sleep {
+                return Err(mlua::Error::runtime(
+                    "remuda.sleep was removed; use remuda.after(seconds, callback) instead",
+                ));
+            }
+            Ok(Value::Nil)
+        })?,
+    )?;
+    table.set_metatable(Some(metatable))
 }
 
 fn session_resize_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Result<()> {
@@ -779,20 +785,6 @@ fn close_binding(lua: &Lua, table: &Table, path: std::path::PathBuf) -> mlua::Re
                     },
                 )?,
             )
-        })?,
-    )
-}
-
-fn sleep_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
-    table.set(
-        "sleep",
-        lua.create_function(|_, seconds: f64| {
-            // Negative or NaN durations do nothing instead of panicking in
-            // `Duration::from_secs_f64`.
-            if seconds.is_finite() && seconds > 0.0 {
-                std::thread::sleep(Duration::from_secs_f64(seconds));
-            }
-            Ok(())
         })?,
     )
 }
@@ -1438,8 +1430,8 @@ fn ask(socket: &Path, request: Request) -> mlua::Result<Response> {
 }
 
 /// A Lua array of `{burst = "..."}` / `{pause = seconds}` entries into the
-/// wire `Step`s `feed` delivers — `pause` is seconds, matching `sleep`, and
-/// travels the wire as whole milliseconds.
+/// wire `Step`s `feed` delivers — `pause` is seconds, like event-loop timers,
+/// and travels the wire as whole milliseconds.
 fn lua_steps_to_wire(steps: Table) -> mlua::Result<Vec<Step>> {
     let mut wire = Vec::with_capacity(steps.raw_len());
     for step in steps.sequence_values::<Table>() {

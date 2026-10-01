@@ -361,11 +361,6 @@ session.resize
 
 ``session.resize(name, cols, rows) -> true | nil, err`` — Resize a session's terminal (cols 20..1000, rows 24..500).
 
-sleep
------
-
-``sleep(seconds) -> nil`` — Block the calling image for a number of seconds.
-
 tool
 ----
 
@@ -389,7 +384,7 @@ unadvise
 wait_for
 --------
 
-``wait_for(session, pattern, seconds?) -> string`` — Wait until a session's screen matches a Lua pattern, then answer with that screen. Fails when the deadline passes instead of answering with a screen that does not match. Use it after `send` rather than guessing a sleep.
+``wait_for(session, pattern, seconds?) -> string`` — Wait until a session's screen matches a Lua pattern, then answer with that screen. Fails when the deadline passes instead of answering with a screen that does not match. Use it after `send` rather than guessing a delay.
 
 window
 ------

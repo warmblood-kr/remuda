@@ -2132,7 +2132,7 @@ remuda.tool({
   name = "wait_for",
   about = "Wait until a session's screen matches a Lua pattern, then answer with "
     .. "that screen. Fails when the deadline passes instead of answering with a "
-    .. "screen that does not match. Use it after `send` rather than guessing a sleep.",
+    .. "screen that does not match. Use it after `send` rather than guessing a delay.",
   args = {
     session = "The session to watch.",
     pattern = "A Lua pattern the screen must match. `%$ %s*$` is a shell prompt.",
