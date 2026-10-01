@@ -6,7 +6,7 @@
 #   $env:REMUDA_CHANNEL     stable|nightly  default: the channel already installed, else stable
 #   $env:REMUDA_INSTALL_DIR <dir>           default: ~\.local\bin
 #   $env:REMUDA_INSTALL_BUTLER=1            also install warmblood-kr/remuda-butler
-#   $env:REMUDA_NO_MODIFY_PATH=1            leave PATH alone; print how to add the install dir
+#   $env:REMUDA_NO_MODIFY_PATH=1            leave PATH alone; say so if the install dir is not on it
 #
 # This mirrors docs/install.sh: resolve the channel version first, then verify
 # its checksum before installing the binary.
@@ -181,8 +181,7 @@ try {
     $onPath = ($env:PATH -split ';') -contains $installDir
     if ($env:REMUDA_NO_MODIFY_PATH) {
         if (-not $onPath) {
-            Write-Host "install.ps1: $installDir is not on your PATH - add it, e.g."
-            Write-Host "  [Environment]::SetEnvironmentVariable('PATH', [Environment]::GetEnvironmentVariable('PATH', 'User') + ';$installDir', 'User')"
+            Write-Host "install.ps1: $installDir is not on your PATH - add it, or run this again without REMUDA_NO_MODIFY_PATH to have it added"
         }
     } else {
         # Read from the registry unexpanded and written back as the kind it

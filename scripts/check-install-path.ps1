@@ -48,35 +48,13 @@ function tar {
     $global:LASTEXITCODE = 0
 }
 
-$failures = @()
-try {
-    $env:PROCESSOR_ARCHITECTURE = 'AMD64'
-    $env:REMUDA_CHANNEL = 'stable'
-    $env:REMUDA_INSTALL_DIR = $installDir
-    $env:XDG_DATA_HOME = Join-Path $scratch 'data'
-    $env:REMUDA_INSTALL_BUTLER = $null
-
-    # Opted out first, while the dir is on no PATH yet: it must stay off both.
-    # Then twice without: the second run is `remuda upgrade`, which must not
-    # add it again.
-    foreach ($case in @('REMUDA_NO_MODIFY_PATH=1', 0), @('run 1', 1), @('run 2', 1)) {
-        $label, $want = $case
-        $env:REMUDA_NO_MODIFY_PATH = if ($want -eq 0) { '1' } else { $null }
-        Get-Content -Raw $script | Invoke-Expression
-
-        $session = @(($env:PATH -split ';') | Where-Object { $_ -eq $installDir })
-        if ($session.Count -ne $want) {
-            $failures += "${label}: install dir is on this session's PATH $($session.Count) times, want $want"
-        }
-        $user = @(([Environment]::GetEnvironmentVariable('PATH', 'User') -split ';') | Where-Object { $_ -eq $installDir })
-        if ($user.Count -ne $want) {
-            $failures += "${label}: install dir is on the user's persisted PATH $($user.Count) times, want $want"
-        }
-    }
-} finally {
-    # Take out only what the installer put in, from the value as it is now,
-    # unexpanded and as the kind it is, so a developer's own PATH comes back
-    # as it was; then tell Explorer, the way the installer does.
+# Each takes out only this check's own entry, from the value as it is now -
+# for the user: unexpanded and as the kind it is, then Explorer is told, the
+# way the installer does - so a developer's own PATH comes back as it was.
+function Remove-FromSessionPath {
+    $env:PATH = @(($env:PATH -split ';') | Where-Object { $_ -ne $installDir }) -join ';'
+}
+function Remove-FromUserPath {
     $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
     if ($envKey.GetValueNames() -contains 'Path') {
         $kind = $envKey.GetValueKind('Path')
@@ -87,6 +65,43 @@ try {
     $nudge = 'REMUDA_PATH_' + [guid]::NewGuid().ToString('N')
     [Environment]::SetEnvironmentVariable($nudge, '1', 'User')
     [Environment]::SetEnvironmentVariable($nudge, [NullString]::Value, 'User')
+}
+
+# In order, each starting from what the one before left. Opted out comes first,
+# while the dir is on no PATH yet. Want is how many times the dir must then be
+# on the session's PATH and on the user's persisted one.
+$cases = @(
+    @{ Name = 'REMUDA_NO_MODIFY_PATH=1'; OptOut = '1'; Want = 0 },
+    @{ Name = 'fresh install'; Want = 1 },
+    @{ Name = 'remuda upgrade'; Want = 1 },
+    @{ Name = 'new shell, on the user PATH only'; Before = { Remove-FromSessionPath }; Want = 1 },
+    @{ Name = 'on the session PATH only'; Before = { Remove-FromUserPath }; Want = 1 }
+)
+
+$failures = @()
+try {
+    $env:PROCESSOR_ARCHITECTURE = 'AMD64'
+    $env:REMUDA_CHANNEL = 'stable'
+    $env:REMUDA_INSTALL_DIR = $installDir
+    $env:XDG_DATA_HOME = Join-Path $scratch 'data'
+    $env:REMUDA_INSTALL_BUTLER = $null
+
+    foreach ($case in $cases) {
+        if ($case.Before) { & $case.Before }
+        $env:REMUDA_NO_MODIFY_PATH = $case.OptOut
+        Get-Content -Raw $script | Invoke-Expression
+
+        $session = @(($env:PATH -split ';') | Where-Object { $_ -eq $installDir })
+        if ($session.Count -ne $case.Want) {
+            $failures += "$($case.Name): install dir is on this session's PATH $($session.Count) times, want $($case.Want)"
+        }
+        $user = @(([Environment]::GetEnvironmentVariable('PATH', 'User') -split ';') | Where-Object { $_ -eq $installDir })
+        if ($user.Count -ne $case.Want) {
+            $failures += "$($case.Name): install dir is on the user's persisted PATH $($user.Count) times, want $($case.Want)"
+        }
+    }
+} finally {
+    Remove-FromUserPath
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $scratch
 }
 
