@@ -1005,12 +1005,14 @@ pub fn requirement_order(name: &str) -> Result<Vec<String>, String> {
 }
 
 fn mods_dir() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| home.map(|home| PathBuf::from(home).join(".local/share")))
-        .ok_or_else(|| "HOME or XDG_DATA_HOME is required for mods".to_string())?;
+    let base = crate::dist::data_home().ok_or_else(|| {
+        if cfg!(windows) {
+            "LOCALAPPDATA or XDG_DATA_HOME is required for mods"
+        } else {
+            "HOME or XDG_DATA_HOME is required for mods"
+        }
+        .to_string()
+    })?;
     let remuda = base.join("remuda");
     let mods = remuda.join("mods");
     let legacy = remuda.join("extensions");

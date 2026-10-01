@@ -43,6 +43,7 @@ impl Daemon {
             .args(["-s", "s", "daemon"])
             .env("REMUDA_RUNTIME_DIR", &dir)
             .env("HOME", &dir)
+            .env("LOCALAPPDATA", &dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&log).unwrap())
