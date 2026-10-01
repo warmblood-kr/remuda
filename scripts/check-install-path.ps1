@@ -56,17 +56,21 @@ try {
     $env:XDG_DATA_HOME = Join-Path $scratch 'data'
     $env:REMUDA_INSTALL_BUTLER = $null
 
-    # Twice: the second run is `remuda upgrade`, which must not add it again.
-    foreach ($run in 1, 2) {
+    # Opted out first, while the dir is on no PATH yet: it must stay off both.
+    # Then twice without: the second run is `remuda upgrade`, which must not
+    # add it again.
+    foreach ($case in @('REMUDA_NO_MODIFY_PATH=1', 0), @('run 1', 1), @('run 2', 1)) {
+        $label, $want = $case
+        $env:REMUDA_NO_MODIFY_PATH = if ($want -eq 0) { '1' } else { $null }
         Get-Content -Raw $script | Invoke-Expression
 
         $session = @(($env:PATH -split ';') | Where-Object { $_ -eq $installDir })
-        if ($session.Count -ne 1) {
-            $failures += "run ${run}: install dir is on this session's PATH $($session.Count) times, want 1"
+        if ($session.Count -ne $want) {
+            $failures += "${label}: install dir is on this session's PATH $($session.Count) times, want $want"
         }
         $user = @(([Environment]::GetEnvironmentVariable('PATH', 'User') -split ';') | Where-Object { $_ -eq $installDir })
-        if ($user.Count -ne 1) {
-            $failures += "run ${run}: install dir is on the user's persisted PATH $($user.Count) times, want 1"
+        if ($user.Count -ne $want) {
+            $failures += "${label}: install dir is on the user's persisted PATH $($user.Count) times, want $want"
         }
     }
 } finally {
@@ -87,8 +91,8 @@ try {
 }
 
 if ($failures) {
-    Write-Host "install.ps1: does not put its install dir on PATH"
+    Write-Host "install.ps1: wrong PATH handling"
     $failures | ForEach-Object { Write-Host "  $_" }
     exit 1
 }
-Write-Host "ok - docs/install.ps1 puts its install dir on PATH"
+Write-Host "ok - docs/install.ps1 puts its install dir on PATH, unless told not to"
