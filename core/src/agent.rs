@@ -218,6 +218,10 @@ pub enum AgentError {
     WriteTimeout {
         timeout: core::time::Duration,
     },
+    /// A stalled text write outlived its submit bound; its Return was dropped.
+    LateSubmitAbandoned {
+        bound: core::time::Duration,
+    },
     /// A `feed` act's `Pause`s summed past the caller's cap — refused before
     /// anything is written, not clamped, so a seconds/millis mixup errors
     /// instead of silently running a shorter pause than asked for.
@@ -242,6 +246,9 @@ impl fmt::Display for AgentError {
                     f,
                     "PTY write exceeded {timeout:?}; delivery may be partial or late"
                 )
+            }
+            AgentError::LateSubmitAbandoned { bound } => {
+                write!(f, "text write stalled over {bound:?}; Return was not sent")
             }
             AgentError::PauseTooLong { total, cap } => {
                 write!(f, "feed's pauses total {total:?}, over the {cap:?} cap")
