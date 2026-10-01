@@ -4063,9 +4063,9 @@ fn a_type_forced_refresh_with_a_real_session_and_a_shown_buffer_costs_one_daemon
 }
 
 #[test]
-fn list_wheel_is_ignored_while_a_session_is_focused() {
+fn list_wheel_scrolls_while_a_session_is_focused_without_moving_selection() {
     let mut ui = make_ui(
-        (0..12)
+        (0..30)
             .map(|index| row(&format!("session-{index}"), true, false))
             .collect(),
     );
@@ -4077,19 +4077,61 @@ fn list_wheel_is_ignored_while_a_session_is_focused() {
         modifiers: KeyModifiers::NONE,
     };
 
-    assert_eq!(ui.on_mouse(down, 80, 24), Action::Nothing);
-    assert_eq!(ui.list_first_visible, None);
+    for _ in 0..40 {
+        assert_eq!(ui.on_mouse(down, 80, 24), Action::Nothing);
+    }
     assert_eq!(ui.selected, 0, "the focused session keeps the selection");
+    let frame = render(&ui, "", "test", 80, 24);
+    assert!(frame.contains("session-29"), "last session missing: {frame:?}");
+    assert!(!frame.contains("session-0"), "first session still visible: {frame:?}");
+
+    assert_eq!(
+        ui.on_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            80,
+            24,
+        ),
+        Action::Focus("session-23".into())
+    );
+    assert_eq!(ui.selected, 23, "click follows the scrolled row");
 }
 
 #[test]
-fn list_wheel_is_safe_with_zero_or_one_session() {
-    for count in [0, 1] {
+fn returning_to_list_normalizes_the_focused_viewport() {
+    let mut ui = make_ui(
+        (0..30)
+            .map(|index| row(&format!("session-{index}"), true, false))
+            .collect(),
+    );
+    ui.focus = Focus::Session;
+    ui.selected = 0;
+    ui.list_first_visible = Some(20);
+    let detach = KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL);
+    assert_eq!(ui.on_key(detach), Action::Nothing);
+    assert_eq!(ui.focus, Focus::List);
+    assert_eq!(ui.list_first_visible, Some(0));
+    ui.on_key(press(KeyCode::Down));
+    assert_eq!(ui.selected, 1);
+    assert_eq!(ui.list_first_visible, Some(0), "down must not jump the viewport");
+}
+
+#[test]
+fn list_wheel_is_a_no_op_when_the_list_fits_in_either_focus() {
+    for (count, focus) in [0, 1, 6]
+        .into_iter()
+        .flat_map(|count| [(count, Focus::List), (count, Focus::Session)])
+    {
         let mut ui = make_ui(
             (0..count)
                 .map(|index| row(&format!("session-{index}"), true, false))
                 .collect(),
         );
+        ui.focus = focus;
         for kind in [MouseEventKind::ScrollDown, MouseEventKind::ScrollUp] {
             let wheel = MouseEvent {
                 kind,
