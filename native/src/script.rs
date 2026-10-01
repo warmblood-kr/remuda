@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 90] = [
+pub const BINDINGS: [&str; 91] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -90,6 +90,7 @@ pub const BINDINGS: [&str; 90] = [
     "fs",
     "hook_list",
     "hooks",
+    "hostname",
     "http",
     "input",
     "insert",
@@ -214,6 +215,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "fs.mkdir_new",
         "Create one new directory without creating parents or trusting an existing path.",
         "fs.mkdir_new(path) -> true | nil, 'exists' | nil, error",
+    ),
+    (
+        "fs.lock",
+        "Take an exclusive, non-blocking OS advisory lock on the file at an absolute path the caller chooses; it is held until handle:release() or until this daemon exits, and the same path returns the same handle. The lock file is created owner-only, stays empty and is not opened through a symlink. The owner's line (session, pid, since) is kept in PATH.info and returned as info when another process holds the lock: it is message text only, never decide on it. Any other failure returns nil, error. It guards against accidents, such as a second daemon of the same user; it is not a security boundary: a hostile process of that user can delete the lock file while it is held, and a second owner can then lock a new file there.",
+        "fs.lock(path) -> handle | nil, 'held', info | nil, error",
     ),
     (
         "ls",
@@ -344,6 +350,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "random_bytes",
         "Return n binary-safe bytes from the OS CSPRNG. n must be a whole number from 1 through 65536; integer-valued Lua floats such as 32.0 are accepted. Raises a Lua error if the OS source fails.",
         "random_bytes(n) -> string",
+    ),
+    (
+        "hostname",
+        "The OS host name, read from the OS itself (not the environment). Returned unchanged and not sanitized for use in identifiers; callers slug it. Returns nil, error if the OS call fails or the name is empty, not UTF-8, or holds a control, line-separator (U+2028, U+2029) or bidi-control (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) character.",
+        "hostname() -> string, nil | nil, error",
     ),
     (
         "_registry",
@@ -558,6 +569,7 @@ pub(crate) fn bindings(
     timer_bindings(lua, &table, timers)?;
     caller_binding(lua, &table, caller)?;
     random_bytes_binding(lua, &table)?;
+    hostname_binding(lua, &table)?;
 
     // In-process, not a loopback: the image always runs inside the same
     // daemon this `Registry` belongs to (image.rs), so asking over the wire
@@ -679,6 +691,7 @@ pub(crate) fn bindings(
     tick_bindings(lua, &table, counters.clone())?;
     request_count_bindings(lua, &table, counters)?;
     registry_bindings(lua, &table)?;
+    fs_lock_binding(lua, &table, socket)?;
     process_bindings(lua, &table, image)?;
 
     removed_sleep_error(lua, &table)?;
@@ -858,6 +871,16 @@ fn random_bytes_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
                 mlua::Error::runtime(format!("remuda.random_bytes OS CSPRNG failed: {error}"))
             })?;
             lua.create_string(bytes)
+        })?,
+    )
+}
+
+fn hostname_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
+    table.set(
+        "hostname",
+        lua.create_function(|_, ()| match crate::hostname::hostname() {
+            Ok(name) => Ok((Some(name), None)),
+            Err(error) => Ok((None, Some(error.to_string()))),
         })?,
     )
 }
@@ -1281,6 +1304,78 @@ fn fs_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
         )?,
     )?;
     table.set("fs", fs)
+}
+
+/// Where the image keeps every held `remuda.fs.lock`, path -> handle, so a
+/// lock outlives the Lua references to it and one path has one handle.
+const FS_LOCKS: &str = "remuda.fs.locks";
+
+/// A held lock: the open file is the lock, and dropping it releases.
+struct FsLock {
+    path: String,
+    file: RefCell<Option<std::fs::File>>,
+}
+
+impl mlua::UserData for FsLock {
+    fn add_fields<F: mlua::UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("path", |_, this| Ok(this.path.clone()));
+    }
+
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("release", |lua, this, ()| {
+            let Some(file) = this.file.borrow_mut().take() else {
+                return Ok(false);
+            };
+            drop(file);
+            let held: Table = lua.named_registry_value(FS_LOCKS)?;
+            held.set(this.path.as_str(), Value::Nil)?;
+            Ok(true)
+        });
+    }
+}
+
+/// The daemon's session name, read back from `daemon::socket_path_in`.
+fn session_of(socket: &Path) -> String {
+    let name = if cfg!(windows) {
+        // `remuda-<16 hex>-<server>`: the server follows the 24-byte prefix.
+        let pipe = socket.file_name().unwrap_or_default().to_string_lossy();
+        pipe.get(24..).unwrap_or(&pipe).to_owned()
+    } else {
+        let stem = socket.file_stem().unwrap_or_default();
+        stem.to_string_lossy().into_owned()
+    };
+    name
+}
+
+fn fs_lock_binding(lua: &Lua, table: &Table, socket: &Path) -> mlua::Result<()> {
+    use crate::fs_lock::{acquire, info_line, Outcome};
+
+    let session = session_of(socket);
+    if lua.named_registry_value::<Value>(FS_LOCKS)?.is_nil() {
+        lua.set_named_registry_value(FS_LOCKS, lua.create_table()?)?;
+    }
+    let fs: Table = table.get("fs")?;
+    fs.set(
+        "lock",
+        lua.create_function(move |lua, path: String| {
+            let held: Table = lua.named_registry_value(FS_LOCKS)?;
+            if let Some(handle) = held.get::<Option<mlua::AnyUserData>>(path.as_str())? {
+                return Ok((Value::UserData(handle), None, None));
+            }
+            match acquire(Path::new(&path), &info_line(&session)) {
+                Ok(Outcome::Acquired(file)) => {
+                    let handle = lua.create_userdata(FsLock {
+                        path: path.clone(),
+                        file: RefCell::new(Some(file)),
+                    })?;
+                    held.set(path, &handle)?;
+                    Ok((Value::UserData(handle), None, None))
+                }
+                Ok(Outcome::Held(info)) => Ok((Value::Nil, Some("held".to_string()), Some(info))),
+                Err(error) => Ok((Value::Nil, Some(error.to_string()), None)),
+            }
+        })?,
+    )
 }
 
 fn mkdir_new(path: &Path, raw_path: &str) -> std::io::Result<()> {

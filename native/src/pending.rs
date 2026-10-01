@@ -50,6 +50,7 @@ pub struct SecretPromptEvent {
 pub struct LinePrompt {
     pub id: u32,
     pub label: String,
+    pub preface: Vec<String>,
     pub default: Option<String>,
     pub caller_session: Option<String>,
 }
@@ -514,6 +515,40 @@ fn serve_line_prompt(
         });
 }
 
+pub const PREFACE_MAX_LINES: usize = 32;
+pub const PREFACE_MAX_LINE_CHARS: usize = 256;
+
+/// Split a prompt preface into terminal-safe lines: the label's sanitizer per
+/// line, so only the newline survives, as the separator. Over a cap is an
+/// error to the mod; nothing is cut silently.
+fn preface_lines(preface: Option<&str>) -> Result<Vec<String>, String> {
+    let text = preface.unwrap_or_default();
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+    let lines: Vec<String> = text
+        .split('\n')
+        .map(remuda_core::protocol::sanitize_secret_prompt_text)
+        .collect();
+    if lines.len() > PREFACE_MAX_LINES {
+        return Err(format!(
+            "prompt_line preface has {} lines; the limit is {PREFACE_MAX_LINES} lines",
+            lines.len()
+        ));
+    }
+    if let Some(line) = lines
+        .iter()
+        .position(|line| line.chars().count() > PREFACE_MAX_LINE_CHARS)
+    {
+        return Err(format!(
+            "prompt_line preface line {} is too long; the limit is {PREFACE_MAX_LINE_CHARS} characters per line",
+            line + 1
+        ));
+    }
+    Ok(lines)
+}
+
 pub struct PendingHandle {
     id: u64,
     result_tx: Sender<Completion>,
@@ -562,7 +597,13 @@ impl PendingHandle {
         Ok(prompt_id)
     }
 
-    fn prompt_line(&self, label: String, default: Option<String>) -> mlua::Result<u32> {
+    fn prompt_line(
+        &self,
+        label: String,
+        default: Option<String>,
+        preface: Option<String>,
+    ) -> mlua::Result<u32> {
+        let preface = preface_lines(preface.as_deref()).map_err(mlua::Error::runtime)?;
         if self.state.status.load(Ordering::SeqCst) != 0 {
             return Err(mlua::Error::runtime("pending reply is no longer active"));
         }
@@ -579,6 +620,7 @@ impl PendingHandle {
             .send(LinePrompt {
                 id: prompt_id,
                 label,
+                preface,
                 default,
                 caller_session: self.caller_session.clone(),
             })
@@ -631,7 +673,9 @@ impl UserData for PendingHandle {
         });
         methods.add_method(
             "prompt_line",
-            |_, this, (label, default): (String, Option<String>)| this.prompt_line(label, default),
+            |_, this, (label, default, preface): (String, Option<String>, Option<String>)| {
+                this.prompt_line(label, default, preface)
+            },
         );
         methods.add_method(
             "resolve",
@@ -679,6 +723,29 @@ impl UserData for PendingHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preface_caps_are_exact_and_nothing_is_cut() {
+        let lines = |count: usize| "x\n".repeat(count);
+        assert_eq!(preface_lines(None), Ok(Vec::new()));
+        assert_eq!(preface_lines(Some("")), Ok(Vec::new()));
+        assert_eq!(
+            preface_lines(Some("a\x1b[1m\r\n\n b\u{202e}\n")),
+            Ok(vec!["a[1m".to_string(), String::new(), " b".to_string()])
+        );
+        assert_eq!(
+            preface_lines(Some(&lines(PREFACE_MAX_LINES))).map(|lines| lines.len()),
+            Ok(PREFACE_MAX_LINES)
+        );
+        assert!(preface_lines(Some(&lines(PREFACE_MAX_LINES + 1)))
+            .is_err_and(|error| error.contains("33 lines; the limit is 32 lines")));
+        assert!(preface_lines(Some(&"x".repeat(PREFACE_MAX_LINE_CHARS))).is_ok());
+        assert!(preface_lines(Some(&format!(
+            "ok\n{}",
+            "x".repeat(PREFACE_MAX_LINE_CHARS + 1)
+        )))
+        .is_err_and(|error| error.contains("line 2 is too long; the limit is 256")));
+    }
 
     #[test]
     fn waiter_does_not_report_timeout_after_completion_claim() {

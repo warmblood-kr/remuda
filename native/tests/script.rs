@@ -542,6 +542,47 @@ fn random_bytes_returns_csprng_bytes_and_rejects_invalid_lengths() {
 }
 
 #[test]
+fn hostname_returns_the_os_host_name() {
+    let dir = scratch("hostname");
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path, &dir);
+    let eval = |code: &str| match client::request(
+        &path,
+        &Request::Eval {
+            code: code.to_string(),
+            name: None,
+        },
+    ) {
+        Ok(Response::Value(value)) => value,
+        other => panic!("hostname evaluation failed: {other:?}"),
+    };
+
+    assert_eq!(
+        eval("return type(remuda.hostname)"),
+        "function",
+        "remuda.hostname is missing"
+    );
+    let name = eval("local name = assert(remuda.hostname()) return name");
+    assert!(!name.is_empty(), "the host name is empty");
+    assert!(!name.chars().any(char::is_control), "{name:?}");
+    assert_eq!(
+        eval("local name = assert(remuda.hostname()) return name"),
+        name
+    );
+
+    // An independent read of the same OS source, not the environment.
+    #[cfg(unix)]
+    {
+        let mut buffer = [0u8; 256];
+        // SAFETY: the pointer and length describe this writable buffer.
+        let status = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+        assert_eq!(status, 0, "gethostname failed");
+        let end = buffer.iter().position(|byte| *byte == 0).unwrap();
+        assert_eq!(name.as_bytes(), &buffer[..end]);
+    }
+}
+
+#[test]
 fn registry_documentation_formats_are_live_and_structured() {
     let dir = scratch("registry-docs");
     let path = daemon::socket_path_in(&dir, "s");
@@ -575,6 +616,20 @@ fn registry_documentation_formats_are_live_and_structured() {
         .unwrap()
         .iter()
         .any(|entry| entry["name"] == "session.resize"));
+    let fs_lock = document["runtime"]["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "fs.lock")
+        .expect("fs.lock is documented");
+    assert!(fs_lock["description"]
+        .as_str()
+        .unwrap()
+        .contains("message text only"));
+    assert!(fs_lock["description"]
+        .as_str()
+        .unwrap()
+        .contains("not a security boundary"));
     let random_bytes = document["runtime"]["functions"]
         .as_array()
         .unwrap()
@@ -589,6 +644,16 @@ fn registry_documentation_formats_are_live_and_structured() {
         .as_str()
         .unwrap()
         .contains("65536"));
+    let hostname = document["runtime"]["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "hostname")
+        .expect("hostname is documented");
+    assert!(hostname["description"]
+        .as_str()
+        .unwrap()
+        .contains("not sanitized"));
     for section in ["functions", "variables"] {
         assert!(
             document["runtime"][section]

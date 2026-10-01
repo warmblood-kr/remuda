@@ -443,6 +443,10 @@ pub enum Response {
     PromptLine {
         id: u32,
         label: String,
+        /// Lines shown above the prompt, indented and untagged. An older
+        /// client ignores them.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        preface: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         default: Option<String>,
         /// Remaining lifetime of the pending reply when this prompt was sent.

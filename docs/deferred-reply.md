@@ -116,6 +116,28 @@ reloaded. Its captured closures may still resolve or reject it, and it remains
 subject to its timeout and client lifecycle. Module stop or reload does not
 silently discard or extend the pending reply.
 
+## Prompts
+
+While a reply is pending, the handle can ask the caller's terminal one
+question at a time: `reply:prompt_secret { label, callback }` or
+`reply:prompt_line { label, default?, preface?, callback }`.
+
+- The label is one short line. Control characters (newlines included) and
+  invisible formatting characters are removed, and the caller's text is cut at
+  256 characters. The daemon prefixes it with its own tag, `remuda[outside]` or
+  `remuda[session NAME]`, and the CLI appends ` [default]` and `: `.
+- `preface` is optional text shown above the prompt, for example a summary
+  before `Continue?`. Lines are separated by `\n`; one trailing newline is
+  ignored. Each line goes through the same sanitizer as the label and is
+  printed on stderr, indented by two spaces and without a tag, so a preface
+  line can never pass for the daemon's prompt line. A line that is empty after
+  sanitizing keeps its row.
+- A preface may have at most 32 lines of at most 256 characters each. Over a
+  limit, `prompt_line` raises an error; nothing is cut silently.
+- A CLI older than the daemon ignores the preface and shows only the prompt.
+  On a daemon older than this feature the field is ignored, so keep the label
+  meaningful on its own.
+
 ## Command clients
 
 The CLI extension-command caller waits for the deferred result and prints it

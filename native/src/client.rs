@@ -489,10 +489,12 @@ pub fn request_with_secret_prompts(path: &Path, request: &Request) -> std::io::R
             Response::PromptLine {
                 id,
                 label,
+                preface,
                 default,
                 timeout_ms,
             } => {
-                match collect_line_from_terminal(&label, default.as_deref(), timeout_ms)? {
+                match collect_line_from_terminal(&label, &preface, default.as_deref(), timeout_ms)?
+                {
                     LinePromptCollection::Answer(line, refusal) => {
                         send_line_answer(&stream, id, line.as_deref(), refusal)?;
                     }
@@ -596,6 +598,7 @@ fn collect_secret_from_terminal(
 
 fn collect_line_from_terminal(
     label: &str,
+    preface: &[String],
     default: Option<&str>,
     timeout_ms: u64,
 ) -> std::io::Result<LinePromptCollection> {
@@ -633,7 +636,7 @@ fn collect_line_from_terminal(
             Err(_) => return None,
         }
     });
-    let answer = prompt_line_with_events(std::io::stderr(), label, default, events)?;
+    let answer = prompt_line_with_events(std::io::stderr(), label, preface, default, events)?;
     #[cfg(unix)]
     {
         drop(signal_guard);
@@ -2320,6 +2323,7 @@ where
 fn prompt_line_with_events<T, I>(
     terminal: T,
     label: &str,
+    preface: &[String],
     default: Option<&str>,
     events: I,
 ) -> std::io::Result<Result<Option<String>, PromptLineError>>
@@ -2328,6 +2332,17 @@ where
     I: IntoIterator<Item = crossterm::event::Event>,
 {
     let mut mode = SecretPromptMode::enable(terminal)?;
+    // The mod's own text: indented and untagged, so a line can never pass for
+    // the daemon-tagged prompt line below it.
+    for line in preface {
+        let line: String = line
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect();
+        mode.terminal.write_output(b"  ")?;
+        mode.terminal.write_output(line.as_bytes())?;
+        mode.terminal.write_output(b"\r\n")?;
+    }
     let label: String = label
         .chars()
         .filter(|character| !character.is_control())
@@ -3408,6 +3423,7 @@ mod tests {
         let answer = super::prompt_line_with_events(
             terminal.clone(),
             "Homeserver",
+            &[],
             Some("https://hs.example"),
             events,
         )
@@ -3428,6 +3444,31 @@ mod tests {
                 "paste:off",
                 "raw:off"
             ]
+        );
+    }
+
+    #[test]
+    fn prompt_line_prints_the_preface_indented_above_the_label() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::default();
+        let events = vec![secret_key(KeyCode::Enter, KeyModifiers::NONE)];
+        let preface = ["Will join\x1b[2K the room".to_string(), String::new()];
+
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            "Continue?",
+            &preface,
+            Some("N"),
+            events,
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some("N".into())));
+        // Each line keeps its row; a control character never reaches the terminal.
+        assert_eq!(
+            terminal.output(),
+            b"  Will join[2K the room\r\n  \r\nContinue? [N]: \r\n"
         );
     }
 

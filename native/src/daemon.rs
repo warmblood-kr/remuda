@@ -1870,6 +1870,7 @@ fn deferred_reply(
                 &Response::PromptLine {
                     id: prompt.id,
                     label,
+                    preface: prompt.preface.clone(),
                     default,
                     timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
                 },
