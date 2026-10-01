@@ -212,7 +212,9 @@ try {
         # `remuda mod install` clones with git, and a stock Windows has none.
         # Remuda itself is installed by now, so say what is missing and how to
         # finish, rather than fail the install on git's behalf.
-        if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
+        # git.exe as an application, because that is all `remuda` will look
+        # for: a `git` function, alias or .cmd shim would not help it.
+        if (-not (Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue)) {
             Write-Host 'install.ps1: the Butler mod needs git, which is not installed - install it (winget install --id Git.Git -e, or https://git-scm.com/download/win), open a new PowerShell, then: remuda mod install warmblood-kr/remuda-butler --force'
         } else {
             & $installed mod install warmblood-kr/remuda-butler --force
