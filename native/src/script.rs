@@ -1448,6 +1448,19 @@ fn request_count_bindings(
     )
 }
 
+fn parse_stdin_hold_until_lines(value: Value) -> Result<Option<usize>, String> {
+    match value {
+        Value::Nil => Ok(None),
+        Value::Integer(lines) if (1..=1000).contains(&lines) => Ok(Some(lines as usize)),
+        Value::Number(lines)
+            if lines.is_finite() && lines.fract() == 0.0 && (1.0..=1000.0).contains(&lines) =>
+        {
+            Ok(Some(lines as usize))
+        }
+        _ => Err("process.run stdin_hold_until_lines must be an integer from 1 through 1000. Next: pass a whole number in that range.".to_string()),
+    }
+}
+
 /// `remuda.process`'s Rust half — split out of `bindings` to stay under its
 /// line cap.
 // `remuda.process` itself (the validated, Lua-facing spec-table word) lives
@@ -1491,23 +1504,11 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
                 Option<String>,
                 Value,
             )| {
-                let stdin_hold_until_lines = match stdin_hold_until_lines {
-                    Value::Nil => None,
-                    Value::Integer(lines) if (1..=1000).contains(&lines) => Some(lines as usize),
-                    Value::Number(lines)
-                        if lines.is_finite()
-                            && lines.fract() == 0.0
-                            && (1.0..=1000.0).contains(&lines) =>
-                    {
-                        Some(lines as usize)
-                    }
-                    _ => {
-                        return Ok((
-                            Value::Nil,
-                            Some("process.run stdin_hold_until_lines must be an integer from 1 through 1000. Next: pass a whole number in that range.".to_string()),
-                        ));
-                    }
-                };
+                let stdin_hold_until_lines =
+                    match parse_stdin_hold_until_lines(stdin_hold_until_lines) {
+                        Ok(lines) => lines,
+                        Err(refused) => return Ok((Value::Nil, Some(refused))),
+                    };
                 let cwd =
                     match crate::process::checked_cwd("process.run", cwd.as_deref(), &mut argv) {
                         Ok(cwd) => cwd,

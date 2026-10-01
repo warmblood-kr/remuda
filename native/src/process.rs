@@ -17,7 +17,7 @@ use crate::image::Image;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -125,27 +125,10 @@ pub fn run_sync(
         let exited = child_exited.clone();
         let release = stdin_release.clone();
         let newlines = stdout_newlines.clone();
+        let state =
+            StdinWriterState::new(stdin_hold_until_lines, deadline, newlines, exited, release);
         std::thread::spawn(move || {
-            let mut child_stdin = child_stdin;
-            if let Some(input) = stdin {
-                let _ = child_stdin.write_all(&input);
-            }
-            if let Some(target) = stdin_hold_until_lines {
-                while newlines.load(Ordering::Acquire) < target
-                    && !exited.load(Ordering::Acquire)
-                    && Instant::now() < deadline
-                {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                if Instant::now() >= deadline && !exited.load(Ordering::Acquire) {
-                    while !release.load(Ordering::Acquire) {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                }
-            }
-            // Dropping stdin signals EOF to children which read until end.
-            drop(child_stdin);
-            done.store(true, Ordering::Release);
+            finish_stdin_write(child_stdin, stdin, state, done);
         })
     };
 
@@ -187,6 +170,59 @@ pub fn run_sync(
         timed_out,
         signal: exit_signal(&child_status),
     })
+}
+
+struct StdinWriterState {
+    hold_until_lines: Option<usize>,
+    deadline: Instant,
+    newlines: Arc<AtomicUsize>,
+    child_exited: Arc<AtomicBool>,
+    release: Arc<AtomicBool>,
+}
+
+impl StdinWriterState {
+    fn new(
+        hold_until_lines: Option<usize>,
+        deadline: Instant,
+        newlines: Arc<AtomicUsize>,
+        child_exited: Arc<AtomicBool>,
+        release: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            hold_until_lines,
+            deadline,
+            newlines,
+            child_exited,
+            release,
+        }
+    }
+}
+
+fn finish_stdin_write(
+    mut child_stdin: ChildStdin,
+    input: Option<Vec<u8>>,
+    state: StdinWriterState,
+    done: Arc<AtomicBool>,
+) {
+    if let Some(input) = input {
+        let _ = child_stdin.write_all(&input);
+    }
+    if let Some(target) = state.hold_until_lines {
+        while state.newlines.load(Ordering::Acquire) < target
+            && !state.child_exited.load(Ordering::Acquire)
+            && Instant::now() < state.deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if Instant::now() >= state.deadline && !state.child_exited.load(Ordering::Acquire) {
+            while !state.release.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+    // Dropping stdin signals EOF to children which read until end.
+    drop(child_stdin);
+    done.store(true, Ordering::Release);
 }
 
 /// Check the optional `cwd` of `process.run` and `process`: an absolute path
