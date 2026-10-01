@@ -51,12 +51,12 @@ $dataDir = Join-Path $dataDir 'remuda'
 $channelFile = Join-Path $dataDir 'channel'
 
 $channel = $env:REMUDA_CHANNEL
-if (-not $channel -and (Test-Path -LiteralPath $channelFile)) {
+if (-not $channel -and (Test-Path $channelFile)) {
     # Test-Path only proves the file exists, not that it has content — an
     # empty channel file makes Get-Content -Raw return $null, and $null.Trim()
     # is the same "cannot call a method on a null-valued expression" crash as
     # the arch bug below.
-    $raw = Get-Content -Raw -LiteralPath $channelFile
+    $raw = Get-Content -Raw $channelFile
     if ($raw) { $channel = $raw.Trim() }
 }
 if (-not $channel) { $channel = 'stable' }
@@ -203,16 +203,9 @@ try {
     Get-ChildItem -Path $installDir -Filter '.remuda.exe.old-*' -Force -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
 
-    Set-Content -LiteralPath $channelFile -Value $channel -NoNewline
+    Set-Content -Path $channelFile -Value $channel -NoNewline
 
     Write-Host "install.ps1: remuda $version -> $installed ($channel channel)"
-    # Earlier versions installed under the profile. Say so, never delete.
-    $oldExe = Join-Path $profileDir '.local\bin\remuda.exe'
-    if ((Test-Path -LiteralPath $oldExe) -and ((Get-Item -LiteralPath $oldExe -Force).FullName -ine $installed)) {
-        $oldData = Join-Path $profileDir '.local\share\remuda'
-        $moved = if (Test-Path -LiteralPath $oldData) { "; its channel and mods in $oldData were not moved" } else { '' }
-        Write-Host "install.ps1: an older install is at $oldExe and can shadow this one on PATH - delete it$moved"
-    }
     # Nothing on a stock Windows has %LOCALAPPDATA%\Programs\remuda\bin on PATH, and a hint to add it
     # is one more step between the one-liner and `remuda` being a command. So
     # persist it for the user, and add it to this session for the next step.

@@ -24,7 +24,6 @@
 - The Windows installer now installs per user: `remuda.exe` goes to
   `%LOCALAPPDATA%\Programs\remuda\bin` and the channel file to
   `%LOCALAPPDATA%\remuda` (was `~\.local\bin` and `~\.local\share\remuda`).
-  `REMUDA_INSTALL_DIR` and `XDG_DATA_HOME` still win. An older install is
-  reported, never moved or deleted; delete it so it cannot shadow the new one
-  on `PATH`. Run from an elevated shell, it hands the data directory to the
-  current user and says an elevated shell is not needed.
+  `REMUDA_INSTALL_DIR` and `XDG_DATA_HOME` still win. Run from an elevated
+  shell, it hands the data directory to the current user and says an elevated
+  shell is not needed.

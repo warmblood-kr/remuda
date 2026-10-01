@@ -1,5 +1,5 @@
-# Also checks the per-user default paths (%LOCALAPPDATA%), the old-install note
-# and, when elevated, that the data dir is handed to the user.
+# Also checks the per-user default paths (%LOCALAPPDATA%) and, when elevated,
+# that the data dir is handed to the user.
 #
 # Runs docs/install.ps1 the way the one-liner does (`| iex`) against a stubbed
 # network, and asserts the install dir ends up on PATH: in this session, and on
@@ -90,9 +90,6 @@ $defaultCases = @(
     @{ Name = 'default paths, data dir already there'; Local = $true; PreCreate = $true },
     @{ Name = 'LOCALAPPDATA empty -> profile\AppData\Local'; Local = $false },
     @{ Name = 'XDG_DATA_HOME still wins for the channel file'; Local = $true; Xdg = $true },
-    @{ Name = 'older install beside it'; Local = $true; OldExe = $true; OldShare = $true },
-    @{ Name = 'older install, no old data dir'; Local = $true; OldExe = $true },
-    @{ Name = 'installing INTO the old dir is not an older install'; Local = $true; OldExe = $true; IntoOld = $true },
     @{ Name = 'a junction at <data>\remuda keeps its target'; Local = $true; Junction = $true }
 )
 $me = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -132,15 +129,8 @@ try {
         $localDir = Join-Path $scratch "app data $hangul $n"
         $base = if ($case.Local) { $localDir } else { Join-Path $profileDir 'AppData\Local' }
         $dataHome = if ($case.Xdg) { Join-Path $scratch "xdg-$n" } else { $base }
-        $oldBin = Join-Path $profileDir '.local\bin'
-        $exeDir = if ($case.IntoOld) { $oldBin } else { Join-Path $base 'Programs\remuda\bin' }
-        $oldShare = Join-Path $profileDir '.local\share\remuda'
+        $exeDir = Join-Path $base 'Programs\remuda\bin'
         New-Item -ItemType Directory -Force -Path $profileDir, $base | Out-Null
-        if ($case.OldExe -and -not $case.IntoOld) {
-            New-Item -ItemType Directory -Force -Path $oldBin | Out-Null
-            Set-Content -Path (Join-Path $oldBin 'remuda.exe') -Value 'an older install'
-        }
-        if ($case.OldShare) { New-Item -ItemType Directory -Force -Path $oldShare | Out-Null }
         if ($case.Junction) {
             # Elevated, the installer must not hand a junction's TARGET to the user.
             $target = Join-Path $scratch "junction-target-$n"
@@ -153,7 +143,7 @@ try {
         $env:LOCALAPPDATA = if ($case.Local) { $localDir } else { $null }
         $env:USERPROFILE = $profileDir
         $env:XDG_DATA_HOME = if ($case.Xdg) { $dataHome } else { $null }
-        $env:REMUDA_INSTALL_DIR = if ($case.IntoOld) { $oldBin } else { $null }
+        $env:REMUDA_INSTALL_DIR = $null
         $env:REMUDA_NO_MODIFY_PATH = $null
         try {
             $out = & { Get-Content -Raw $script | Invoke-Expression } *>&1 | Out-String
@@ -181,18 +171,6 @@ try {
             $warned = $out -match 'elevated shell is not needed'
             if ($elevated -and -not $warned) { $failures += "${why}: elevated, but no warning that an elevated shell is not needed" }
             if (-not $elevated -and $warned) { $failures += "${why}: not elevated, but warned about elevation" }
-
-            $noted = $out -match 'older install'
-            if ($case.OldExe -and -not $case.IntoOld) {
-                if (-not $noted) { $failures += "${why}: no note about the older install" }
-                if (-not (Test-Path -LiteralPath (Join-Path $oldBin 'remuda.exe'))) { $failures += "${why}: the older install was deleted" }
-            } elseif ($noted) {
-                $failures += "${why}: a note about an older install, with none there"
-            }
-            $moved = $out -match 'not moved'
-            if ($case.OldShare -and -not $moved) { $failures += "${why}: the note does not say the old channel and mods were not moved" }
-            if (-not $case.OldShare -and $moved) { $failures += "${why}: says data was not moved, with no old data dir" }
-            if ($case.OldShare -and -not (Test-Path -LiteralPath $oldShare)) { $failures += "${why}: the old data dir was removed" }
         } finally {
             Remove-FromSessionPath $exeDir
             Remove-FromUserPath $exeDir
