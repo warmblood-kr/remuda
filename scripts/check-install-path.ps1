@@ -30,7 +30,10 @@ New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 
 $fakeAsset = Join-Path $scratch 'asset'
 Set-Content -Path $fakeAsset -Value 'stands in for the release tarball'
-$fakeSum = (Get-FileHash -Algorithm SHA256 $fakeAsset).Hash
+# Not Get-FileHash, for the reason docs/install.ps1 gives.
+$sha256 = [Security.Cryptography.SHA256]::Create()
+$fakeSum = [BitConverter]::ToString($sha256.ComputeHash([IO.File]::ReadAllBytes($fakeAsset))) -replace '-', ''
+$sha256.Dispose()
 
 # Functions shadow cmdlets and applications, and `iex` runs the installer in
 # this scope, so these are what it calls instead of the network and tar.
