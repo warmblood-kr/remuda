@@ -231,6 +231,10 @@ impl Ui {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         let selected = self.selected;
+        // Whatever left focus on the list, step from the viewport that is drawn.
+        if self.focus == Focus::List && self.list_first_visible.is_some() {
+            self.list_first_visible = Some(list_viewport(self, self.preview_rows));
+        }
         let action = if self.focus == Focus::Session {
             self.session_key(key)
         } else {
@@ -526,7 +530,6 @@ impl Ui {
         }
         if is_detach(key) {
             self.focus = Focus::List;
-            self.track_list_selection();
             self.notice = None;
             return Action::Nothing;
         }
@@ -548,10 +551,7 @@ impl Ui {
             }
             // With sessions closing themselves on exit, this is how a ride
             // ordinarily ends: you type `exit`, and you are on the list.
-            None => {
-                self.focus = Focus::List;
-                self.track_list_selection();
-            }
+            None => self.focus = Focus::List,
         }
     }
 
