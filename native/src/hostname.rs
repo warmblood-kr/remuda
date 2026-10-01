@@ -11,9 +11,12 @@ pub fn validate(name: &[u8]) -> io::Result<String> {
     if name.is_empty() {
         return Err(refuse("the host name is empty"));
     }
-    // Cc, then U+2028/U+2029 and the bidi embeddings, overrides and isolates.
-    let unsafe_to_show =
-        |c: char| c.is_control() || matches!(c, '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+    // Cc, then U+2028/U+2029 and every Bidi_Control character.
+    let unsafe_to_show = |c: char| {
+        c.is_control()
+            || matches!(c, '\u{061C}' | '\u{200E}' | '\u{200F}')
+            || matches!(c, '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    };
     if name.chars().any(unsafe_to_show) {
         return Err(refuse(
             "the host name holds a control, line-separator or bidi-control character",
@@ -83,12 +86,18 @@ mod tests {
             assert!(validate(name).is_err(), "accepted {name:?}");
         }
         // Not category Cc, but they split or reorder what a terminal shows.
-        for unit in (0x2028..=0x202E).chain(0x2066..=0x2069) {
+        let marks = [0x061C, 0x200E, 0x200F];
+        for unit in (0x2028..=0x202E).chain(0x2066..=0x2069).chain(marks) {
             let name = format!("a{}b", char::from_u32(unit).unwrap());
             assert!(validate(name.as_bytes()).is_err(), "accepted U+{unit:04X}");
         }
-        for neighbour in ['\u{2027}', '\u{202F}', '\u{2065}', '\u{206A}'] {
-            assert!(validate(format!("a{neighbour}b").as_bytes()).is_ok());
+        // U+200D is the joiner real text uses; it and the other neighbours pass.
+        for neighbour in [
+            '\u{061B}', '\u{061D}', '\u{200C}', '\u{200D}', '\u{2010}', '\u{2027}', '\u{202F}',
+            '\u{2065}', '\u{206A}',
+        ] {
+            let name = format!("a{neighbour}b");
+            assert!(validate(name.as_bytes()).is_ok(), "refused {neighbour:?}");
         }
     }
 }
