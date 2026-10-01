@@ -20,8 +20,8 @@
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use remuda_core::agent::{
-    AgentError, AgentProcess, AgentWriter, Color, Cursor, ExitInfo, MouseEncoding, MouseMode,
-    MouseState, OutputSignal, OutputWakeup, Result, ScreenSnapshot, Size, StyledCell,
+    AgentError, AgentProcess, AgentWriter, ChainOutcome, Color, Cursor, ExitInfo, MouseEncoding,
+    MouseMode, MouseState, OutputSignal, OutputWakeup, Result, ScreenSnapshot, Size, StyledCell,
     VersionedSnapshot,
 };
 use std::io::{Read, Write};
@@ -47,12 +47,16 @@ pub const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_LATE_SUBMIT_BOUND: Duration = Duration::from_secs(30);
 
 struct WriteTask {
+    sequence: u64,
     bytes: Vec<u8>,
     result: Sender<Result<()>>,
 }
 
 #[derive(Default)]
 struct WriterState {
+    next_sequence: u64,
+    active_sequence: Option<u64>,
+    stalled_sequence: Option<u64>,
     active_since: Option<Instant>,
     follow_up: Option<(Vec<u8>, Duration)>,
     follow_up_open: bool,
@@ -88,11 +92,11 @@ impl PtyInputWriter {
         })
     }
 
-    fn submit(&self, bytes: &[u8]) -> Result<Receiver<Result<()>>> {
+    fn submit(&self, bytes: &[u8]) -> Result<(u64, Receiver<Result<()>>)> {
         self.submit_inner(bytes, false)
     }
 
-    fn submit_bounded(&self, bytes: &[u8]) -> Result<Receiver<Result<()>>> {
+    fn submit_bounded(&self, bytes: &[u8]) -> Result<(u64, Receiver<Result<()>>)> {
         self.submit_inner(bytes, true)
     }
 
@@ -100,8 +104,8 @@ impl PtyInputWriter {
         &self,
         bytes: &[u8],
         report_completed_abandonment: bool,
-    ) -> Result<Receiver<Result<()>>> {
-        {
+    ) -> Result<(u64, Receiver<Result<()>>)> {
+        let sequence = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.active_since.is_some() {
                 return Err(AgentError::Busy);
@@ -112,26 +116,44 @@ impl PtyInputWriter {
                     bound: self.late_submit_bound,
                 });
             }
+            state.next_sequence = state.next_sequence.wrapping_add(1);
+            let sequence = state.next_sequence;
+            state.active_sequence = Some(sequence);
             state.active_since = Some(Instant::now());
             state.follow_up = None;
             state.follow_up_open = true;
-        }
+            sequence
+        };
         let (result, receiver) = channel();
         let task = WriteTask {
+            sequence,
             bytes: bytes.to_vec(),
             result,
         };
         match self.sender.try_send(task) {
-            Ok(()) => Ok(receiver),
+            Ok(()) => Ok((sequence, receiver)),
             Err(TrySendError::Full(_)) => {
-                *self.state.lock().unwrap_or_else(|p| p.into_inner()) = WriterState::default();
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                state.active_sequence = None;
+                state.active_since = None;
+                state.follow_up = None;
+                state.follow_up_open = false;
                 Err(AgentError::Busy)
             }
             Err(TrySendError::Disconnected(_)) => {
-                *self.state.lock().unwrap_or_else(|p| p.into_inner()) = WriterState::default();
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                state.active_sequence = None;
+                state.active_since = None;
+                state.follow_up = None;
+                state.follow_up_open = false;
                 Err(AgentError::Io("pty writer worker stopped".into()))
             }
         }
+    }
+
+    fn record_stalled_sequence(&self, sequence: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.stalled_sequence = Some(sequence);
     }
 
     fn note_late_submit_abandoned(&self) -> bool {
@@ -170,10 +192,14 @@ fn run_writer(
                 let too_late = state
                     .active_since
                     .is_some_and(|started| started.elapsed() >= late_submit_bound);
-                if result.is_ok() && !too_late {
+                if result.is_ok() && state.active_sequence == Some(task.sequence) && !too_late {
                     state.follow_up.take()
                 } else {
-                    if result.is_ok() && too_late && state.follow_up.is_some() {
+                    if result.is_ok()
+                        && state.active_sequence == Some(task.sequence)
+                        && too_late
+                        && state.follow_up.is_some()
+                    {
                         state.late_submit_abandoned = true;
                     }
                     state.follow_up = None;
@@ -206,6 +232,7 @@ struct BusyReset<'a>(&'a Mutex<WriterState>);
 impl Drop for BusyReset<'_> {
     fn drop(&mut self) {
         let mut state = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        state.active_sequence = None;
         state.active_since = None;
         state.follow_up = None;
         state.follow_up_open = false;
@@ -213,27 +240,31 @@ impl Drop for BusyReset<'_> {
 }
 
 impl AgentWriter for PtyInputWriter {
-    fn chain_after_stalled(&self, follow_up: &[u8], settle: Duration) -> bool {
+    fn chain_after_stalled(&self, follow_up: &[u8], settle: Duration) -> ChainOutcome {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.active_since.is_some() && state.follow_up_open {
-            let too_late = state
-                .active_since
-                .is_some_and(|started| started.elapsed() >= self.late_submit_bound);
-            if !too_late {
-                state.follow_up = Some((follow_up.to_vec(), settle));
-                return true;
-            }
+        let Some(active_sequence) = state.active_sequence else {
+            return ChainOutcome::Landed;
+        };
+        if Some(active_sequence) != state.stalled_sequence || !state.follow_up_open {
+            return ChainOutcome::Landed;
+        }
+        let too_late = state
+            .active_since
+            .is_some_and(|started| started.elapsed() >= self.late_submit_bound);
+        if too_late {
             state.follow_up = None;
             state.follow_up_open = false;
             state.late_submit_abandoned = true;
+            return ChainOutcome::Landed;
         }
-        false
+        state.follow_up = Some((follow_up.to_vec(), settle));
+        ChainOutcome::Chained
     }
 
     fn write_bounded(&self, bytes: &[u8]) -> Result<()> {
-        let receiver = loop {
+        let (sequence, receiver) = loop {
             match self.submit_bounded(bytes) {
-                Ok(receiver) => break receiver,
+                Ok(submission) => break submission,
                 Err(AgentError::Busy) if self.note_late_submit_abandoned() => {
                     return Err(AgentError::LateSubmitAbandoned {
                         bound: self.late_submit_bound,
@@ -251,9 +282,12 @@ impl AgentWriter for PtyInputWriter {
         };
         match receiver.recv_timeout(self.timeout) {
             Ok(result) => result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(AgentError::WriteTimeout {
-                timeout: self.timeout,
-            }),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.record_stalled_sequence(sequence);
+                Err(AgentError::WriteTimeout {
+                    timeout: self.timeout,
+                })
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 Err(AgentError::Io("pty writer worker stopped".into()))
             }
@@ -270,7 +304,7 @@ impl AgentWriter for PtyInputWriter {
                 return Err(AgentError::Attached);
             }
             match self.submit(bytes) {
-                Ok(receiver) => loop {
+                Ok((_, receiver)) => loop {
                     if cancelled() {
                         return Err(AgentError::Attached);
                     }
@@ -782,6 +816,12 @@ mod input_writer_tests {
         captured: Arc<Mutex<Vec<u8>>>,
     }
 
+    struct SequentialStallWrite {
+        started: Sender<Vec<u8>>,
+        release: Mutex<Receiver<()>>,
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
     struct PanickingWrite;
 
     impl Write for PanickingWrite {
@@ -820,6 +860,19 @@ mod input_writer_tests {
                 self.release.lock().unwrap().recv().unwrap();
                 self.finished.send(()).unwrap();
             }
+            self.captured.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Write for SequentialStallWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.started.send(bytes.to_vec()).unwrap();
+            self.release.lock().unwrap().recv().unwrap();
             self.captured.lock().unwrap().extend_from_slice(bytes);
             Ok(bytes.len())
         }
@@ -890,7 +943,10 @@ mod input_writer_tests {
                 .unwrap(),
         );
 
-        assert!(!writer.chain_after_stalled(b"\r", Duration::ZERO));
+        assert_eq!(
+            writer.chain_after_stalled(b"\r", Duration::ZERO),
+            ChainOutcome::Landed
+        );
         let first_writer = Arc::clone(&writer);
         let first = std::thread::spawn(move || first_writer.write_bounded(b"text"));
         started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -900,7 +956,10 @@ mod input_writer_tests {
         ));
 
         let settle = Duration::from_millis(25);
-        assert!(writer.chain_after_stalled(b"\r", settle));
+        assert_eq!(
+            writer.chain_after_stalled(b"\r", settle),
+            ChainOutcome::Chained
+        );
         assert!(matches!(
             writer.write_bounded(b"second sender"),
             Err(AgentError::Busy)
@@ -914,7 +973,61 @@ mod input_writer_tests {
         }
         assert_eq!(*captured.lock().unwrap(), b"text\r");
         assert!(!writer.is_busy());
-        assert!(!writer.chain_after_stalled(b"\r", Duration::ZERO));
+        assert_eq!(
+            writer.chain_after_stalled(b"\r", Duration::ZERO),
+            ChainOutcome::Landed
+        );
+    }
+
+    #[test]
+    fn chain_after_stalled_does_not_follow_a_later_write() {
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(SequentialStallWrite {
+            started: started_tx,
+            release: Mutex::new(release_rx),
+            captured: Arc::clone(&captured),
+        })));
+        let writer = Arc::new(
+            PtyInputWriter::spawn(writer, Duration::from_millis(100), PTY_LATE_SUBMIT_BOUND)
+                .unwrap(),
+        );
+
+        let first_writer = Arc::clone(&writer);
+        let first = std::thread::spawn(move || first_writer.write_bounded(b"text"));
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            b"text"
+        );
+        assert!(matches!(
+            first.join().unwrap(),
+            Err(AgentError::WriteTimeout { .. })
+        ));
+
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while writer.is_busy() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(*captured.lock().unwrap(), b"text");
+
+        let second_writer = Arc::clone(&writer);
+        let second = std::thread::spawn(move || {
+            second_writer.write_to_completion_while(b"human key", &|| false)
+        });
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            b"human key"
+        );
+        assert_eq!(
+            writer.chain_after_stalled(b"\r", Duration::ZERO),
+            ChainOutcome::Landed
+        );
+
+        release_tx.send(()).unwrap();
+        second.join().unwrap().unwrap();
+        assert_eq!(*captured.lock().unwrap(), b"texthuman key");
     }
 
     #[test]
@@ -941,7 +1054,10 @@ mod input_writer_tests {
             first.join().unwrap(),
             Err(AgentError::WriteTimeout { .. })
         ));
-        assert!(writer.chain_after_stalled(b"\r", Duration::ZERO));
+        assert_eq!(
+            writer.chain_after_stalled(b"\r", Duration::ZERO),
+            ChainOutcome::Chained
+        );
 
         std::thread::sleep(late_submit_bound + Duration::from_millis(10));
         assert!(matches!(

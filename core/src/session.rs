@@ -4,8 +4,8 @@
 //! attachment at a time.
 
 use crate::agent::{
-    AgentError, AgentProcess, Cursor, ExitInfo, MouseState, OutputWakeup, Result, ScreenSnapshot,
-    Size, StyledCell, VersionedSnapshot,
+    AgentError, AgentProcess, ChainOutcome, Cursor, ExitInfo, MouseState, OutputWakeup, Result,
+    ScreenSnapshot, Size, StyledCell, VersionedSnapshot,
 };
 use crate::clock::Clock;
 use crate::input::{InputBatch, InputDeduplicator, InputError, InputOutcome, InputRateLimiter};
@@ -380,18 +380,21 @@ impl Session {
         let baseline = self.tail_occurrences(&tail);
         match self.input_text_locked(&body) {
             Ok(()) => {}
-            Err(AgentError::WriteTimeout { .. }) => {
-                let chained = {
+            Err(error @ AgentError::WriteTimeout { .. }) => {
+                let outcome = {
                     let mut agent = self
                         .agent
                         .lock()
                         .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
-                    agent.input_writer().is_some_and(|writer| {
-                        writer.chain_after_stalled(crate::keys::RETURN_BYTES, settle)
-                    })
+                    agent
+                        .input_writer()
+                        .map(|writer| writer.chain_after_stalled(crate::keys::RETURN_BYTES, settle))
+                        .unwrap_or(ChainOutcome::Unsupported)
                 };
-                if chained {
-                    return Ok(InputSubmitOutcome::Unverified);
+                match outcome {
+                    ChainOutcome::Chained => return Ok(InputSubmitOutcome::Unverified),
+                    ChainOutcome::Landed => {}
+                    ChainOutcome::Unsupported => return Err(error),
                 }
             }
             Err(error) => return Err(error),
