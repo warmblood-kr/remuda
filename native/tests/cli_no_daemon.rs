@@ -51,6 +51,36 @@ impl SessionAutoStartScratch {
     }
 }
 
+fn daemon_pids_for_runtime(runtime: &Path) -> Vec<u32> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,comm="])
+        .output()
+        .expect("list processes for the private runtime");
+    assert!(output.status.success(), "ps failed: {output:?}");
+    let runtime_marker = format!("REMUDA_RUNTIME_DIR={}", runtime.display());
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let pid = fields.next()?.parse::<u32>().ok()?;
+            let executable = fields.next()?;
+            (Path::new(executable)
+                .file_name()
+                .and_then(|name| name.to_str())
+                == Some("remuda"))
+            .then_some(pid)
+        })
+        .filter(|pid| {
+            let pid = pid.to_string();
+            let output = Command::new("ps")
+                .args(["eww", "-p", &pid, "-o", "command="])
+                .output()
+                .expect("inspect remuda process environment");
+            String::from_utf8_lossy(&output.stdout).contains(&runtime_marker)
+        })
+        .collect()
+}
+
 impl Drop for SessionAutoStartScratch {
     fn drop(&mut self) {
         let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
@@ -67,6 +97,11 @@ impl Drop for SessionAutoStartScratch {
             .env_remove("REMUDA_SESSION_ID")
             .env_remove("REMUDA_SESSION_CAPABILITY")
             .output();
+        for pid in daemon_pids_for_runtime(&self.root) {
+            let _ = Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -104,10 +139,16 @@ fn session_clients_block_default_autostart_but_explicit_other_still_starts() {
             "error must name the socket tried: {stderr}"
         );
         assert!(
-            stderr.contains("start a daemon outside this session"),
+            stderr.contains("Next:")
+                && stderr.contains("outside the session")
+                && stderr.contains("pass -s NAME"),
             "error must say how to proceed: {stderr}"
         );
         assert!(!socket.exists(), "session client started a default daemon");
+        assert!(
+            daemon_pids_for_runtime(&scratch.root).is_empty(),
+            "session client left a daemon process running"
+        );
     }
 
     let server = format!("other-{}", std::process::id());
@@ -117,8 +158,14 @@ fn session_clients_block_default_autostart_but_explicit_other_still_starts() {
         &["-s", &server, "-e", "return true"],
         "REMUDA_SESSION_ID",
     );
-    assert!(out.status.success(), "explicit other server must autostart: {out:?}");
-    assert!(scratch.socket(&server).exists(), "explicit other daemon did not start");
+    assert!(
+        out.status.success(),
+        "explicit other server must autostart: {out:?}"
+    );
+    assert!(
+        scratch.socket(&server).exists(),
+        "explicit other daemon did not start"
+    );
 }
 
 /// Run `args` against a stand-in at the private server's socket that only
