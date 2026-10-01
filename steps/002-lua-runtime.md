@@ -1,5 +1,7 @@
 # 002 — a programming runtime, with the atomic functions wired to it
 
+> Note (2026-10): remuda.sleep has since been removed; the examples below use it as it existed then. Use remuda.after or the wait_for tool.
+
 정수님, 2026-09-10: *"그 다음에는 이 pty manager layer에 programming runtime을
 심어서 코드를 실행할 수 있게 만들고 atomic function들을 물려서 연결합니다. 일종의
 programmable tmux 같은 컨셉이랄까요?"*
@@ -88,21 +90,21 @@ Lua, not bound from Rust.
 remuda.new("build", {"sh"})
 remuda.send("build", "echo $((6*7))-ready")
 
-local function wait(name, pattern, done)
-  local function poll()
+local function wait(name, pattern)
+  for _ = 1, 500 do
     local screen = remuda.capture(name)
-    if screen:find(pattern) then return done(screen) end
-    remuda.after(0.02, poll)
+    if screen:find(pattern) then return screen end
+    remuda.sleep(0.02)
   end
-  poll()
+  error("never saw " .. pattern .. " in " .. name)
 end
 
-wait("build", "42%-ready", function(screen)
-  if screen:find("42%-ready") then
-    remuda.send("build", "echo $((11*11))-and-the-next-step-depended-on-it")
-  end
-  wait("build", "121%-and", function() end)
-end)
+wait("build", "42%-ready")
+
+if remuda.capture("build"):find("42%-ready") then
+  remuda.send("build", "echo $((11*11))-and-the-next-step-depended-on-it")
+end
+wait("build", "121%-and")
 
 for _, s in ipairs(remuda.ls()) do
   print(string.format("%-10s %dx%d  alive=%s", s.name, s.cols, s.rows, tostring(s.alive)))
