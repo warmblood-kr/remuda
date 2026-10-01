@@ -1201,6 +1201,33 @@ mod tests {
         }
     }
 
+    // A directory with no DACL at all gives everyone full access: the most
+    // open case, so it is refused like a writable one.
+    #[test]
+    fn a_base_with_no_dacl_is_refused() {
+        let root = scratch("null-dacl-base");
+        let base = root.join("remuda");
+        std::fs::create_dir(&base).unwrap();
+        let handle = open_for_check(&base, true, true).unwrap();
+        let result = unsafe {
+            SetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION
+                    | windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(result, 0, "remove the DACL: {result}");
+        drop(handle);
+
+        assert_base_refused(&base, "S-1-1-0", "no DACL");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     // Read-type access, such as an application package SID with read and
     // execute, and inherit-only entries do not let anyone change the base.
     #[test]
