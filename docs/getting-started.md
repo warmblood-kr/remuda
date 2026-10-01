@@ -159,8 +159,9 @@ address (10.x, 172.16-31.x, 192.168.x) on its default route. It never picks a
 VPN address in 100.64.0.0/10 (Tailscale and similar). If the machines reach
 each other only over such a VPN, or the invite fails with `listener is
 waiting for a private LAN address`, give the VPN address yourself:
-`remuda cluster invite --bind VPN_IP_OF_A:7441` on A, and add
-`--bind VPN_IP_OF_B:7441` to the join line on B.
+`remuda cluster invite --bind VPN_IP_OF_A` on A, and add
+`--bind VPN_IP_OF_B` to the join line on B. The port is optional
+(`IP:PORT`); the default is 7441.
 
 Run that `remuda cluster join` line on B. The first argument is A's
 fingerprint: the join refuses if A's key does not match it. If you sent the
