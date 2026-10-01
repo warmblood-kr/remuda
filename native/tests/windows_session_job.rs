@@ -190,3 +190,28 @@ fn a_command_outside_every_session_still_reads_unknown() {
     fact(format_args!("plain command: kind {kind:?}"));
     assert_eq!(kind, "unknown");
 }
+
+/// The same grandchild while its session is still LISTED (the daemon is told
+/// to keep exited sessions): the session's job is what answers, since the
+/// parent is gone. What happens once a session is removed is decided apart.
+#[test]
+fn a_grandchild_of_a_listed_session_is_a_session_caller() {
+    let scratch = Scratch::new("kept");
+    let mut command = spawn::base_command(&scratch.0);
+    command.env("REMUDA_KEEP_EXITED", "1");
+    let _daemon = spawn::spawn_and_wait(command, &scratch.0);
+    let out = scratch.0.join("kind.txt");
+    let script = asking_script(&scratch.0, &out, 3);
+    start(
+        &scratch.0,
+        format!(
+            "return remuda.new('kept', {{ 'cmd.exe', '/c', 'start', '', '/min', 'cmd.exe', '/c', {} }})",
+            lua(&script)
+        ),
+    );
+    let kind = answer(&out);
+    fact(format_args!(
+        "grandchild of a listed session: kind {kind:?}"
+    ));
+    assert_eq!(kind, "session");
+}
