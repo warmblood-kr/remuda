@@ -16,3 +16,8 @@
   held until `handle:release()` or until the daemon exits, so a mod can tell
   that another live daemon already owns its home. When the lock is held it
   returns `nil, "held", info`; the info line is message text only.
+- On Windows the data directory moved from `%USERPROFILE%\.local\share` to
+  `%LOCALAPPDATA%`: the channel file (`%LOCALAPPDATA%\remuda\channel`), mods
+  (`%LOCALAPPDATA%\remuda\mods`) and the update-check cache
+  (`%LOCALAPPDATA%\remuda\cache`). `XDG_DATA_HOME` and `XDG_CACHE_HOME` still
+  win. Nothing is migrated.

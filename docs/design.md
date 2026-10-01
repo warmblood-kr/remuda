@@ -123,7 +123,8 @@ against that daemon afterward. There is no registry: a name either resolves
 to an entry file or it doesn't.
 
 Today, resolution checks only validated packages installed below
-`${XDG_DATA_HOME:-$HOME/.local/share}/remuda/mods/<name>`; mods are not
+`${XDG_DATA_HOME:-$HOME/.local/share}/remuda/mods/<name>` (on Windows
+`%LOCALAPPDATA%\remuda\mods\<name>`); mods are not
 embedded in the `remuda` binary. `remuda mod install OWNER/REPO` clones a GitHub repository shallowly, validates its
 `extension.toml` and `packages/<name>/init.lua` tree, and swaps the complete
 mod directory into place. A running Lua image is not changed by an

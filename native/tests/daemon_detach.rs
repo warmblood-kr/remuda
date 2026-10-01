@@ -16,6 +16,7 @@ fn auto_started_daemon_leads_its_own_session() {
             .args(args)
             .env("REMUDA_RUNTIME_DIR", &dir)
             .env("HOME", &dir)
+            .env("LOCALAPPDATA", &dir)
             .output()
             .expect("run remuda")
     };

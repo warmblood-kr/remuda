@@ -111,7 +111,7 @@ The declaration format is in [In-process mod lifecycle](lua.md#in-process-mod-li
 |---|---|---|
 | Globals, tools and advice defined through a door above | daemon memory | no |
 | The same definitions written in `~/.config/remuda/init.lua` | disk, evaluated once at daemon boot | yes |
-| A mod's declared hooks, tools, schedules and advice | the mod's files under `${XDG_DATA_HOME:-~/.local/share}/remuda/mods/NAME` | once the mod is loaded again |
+| A mod's declared hooks, tools, schedules and advice | the mod's files under `${XDG_DATA_HOME:-~/.local/share}/remuda/mods/NAME` (Windows: `%LOCALAPPDATA%\remuda\mods\NAME`) | once the mod is loaded again |
 | A lifecycle mod's state table | daemon memory | no; it is kept across `remuda.reload` only |
 
 The core writes none of your ad-hoc definitions to disk. To keep one, put it
