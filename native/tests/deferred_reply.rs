@@ -183,7 +183,7 @@ remuda.extension_command("deferred", function(args)
     local preface = "Matrix setup will:\n- join the room\nSave to /tmp/example\n"
     if args[1] == "line_preface_hostile" then
       preface = "safe" .. string.char(27) .. "[31mred" .. string.char(13) .. "spoof"
-        .. string.char(226, 128, 174) .. "end\nremuda[outside] fake:"
+        .. string.char(226, 128, 174) .. "end\n" .. string.char(27) .. "\n   \nremuda[outside] fake:"
     end
     reply:prompt_line { label = "Continue?", default = "N", preface = preface, callback = function(line, err)
       if err then reply:reject(err) else reply:resolve(0, "line: " .. line, "") end
@@ -1617,6 +1617,10 @@ fn prompt_line_preface_strips_escape_cr_and_bidi() {
     assert!(
         rows[..prompt].ends_with(&[
             "  safe[31mredspoofend".to_string(),
+            // Empty after sanitizing, and spaces only: each keeps its row,
+            // so the mod's line count is the count shown.
+            String::new(),
+            String::new(),
             "  remuda[outside] fake:".to_string(),
         ]),
         "{rows:#?}"
