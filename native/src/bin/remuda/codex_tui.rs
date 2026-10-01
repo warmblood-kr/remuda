@@ -10,18 +10,37 @@ use std::os::unix::net::UnixStream;
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-pub fn run(args: &[&str]) -> ExitCode {
-    let Some((&"--status", status)) = args.first().zip(args.get(1)) else {
-        eprintln!("remuda: Codex TUI needs --status PATH");
-        return ExitCode::FAILURE;
+/// Butler probes `--help` for `-c KEY=VALUE` to learn whether this core can
+/// pass config overrides through, so that substring is a contract.
+const USAGE: &str = "remuda: Codex TUI takes --status PATH [--model M] [-c KEY=VALUE]...";
+
+/// Status path, model and app-server config overrides; `None` is a usage error.
+fn parse_args<'a>(args: &[&'a str]) -> Option<(&'a str, Option<&'a str>, Vec<&'a str>)> {
+    let ["--status", status, rest @ ..] = args else {
+        return None;
     };
-    let model = match args.get(2..) {
-        Some(["--model", model]) => Some(*model),
-        Some([]) | None => None,
-        _ => {
-            eprintln!("remuda: Codex TUI takes --status PATH [--model M]");
-            return ExitCode::FAILURE;
-        }
+    let (mut rest, mut model) = (rest, None);
+    if let ["--model", value, tail @ ..] = rest {
+        model = Some(*value);
+        rest = tail;
+    }
+    let mut config = Vec::new();
+    while let ["-c", value, tail @ ..] = rest {
+        config.push(*value);
+        rest = tail;
+    }
+    rest.is_empty().then_some((*status, model, config))
+}
+
+pub fn run(args: &[&str]) -> ExitCode {
+    if args == ["--help"] {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    // The arguments are never echoed: a config value can carry a session token.
+    let Some((status, model, config)) = parse_args(args) else {
+        eprintln!("{USAGE}");
+        return ExitCode::FAILURE;
     };
     // The selected model is useful status even before the first prompt. The
     // app-server does not announce a thread (or its model) until a thread is
@@ -30,7 +49,7 @@ pub fn run(args: &[&str]) -> ExitCode {
     seed_status(status, model);
     let socket = std::env::temp_dir().join(format!("remuda-codex-{}.sock", std::process::id()));
     let address = format!("unix://{}", socket.display());
-    let (server_args, client_args) = codex_args(&address, model);
+    let (server_args, client_args) = codex_args(&address, model, &config);
     let mut server_command = Command::new("codex");
     server_command
         .args(&server_args)
@@ -149,13 +168,17 @@ fn seed_status(status: &str, model: Option<&str>) {
 }
 
 /// Argv for the app-server and the TUI client.  A chosen model goes to both:
-/// the server's config default and the client's thread override.
-fn codex_args(address: &str, model: Option<&str>) -> (Vec<String>, Vec<String>) {
+/// the server's config default and the client's thread override.  Config
+/// overrides go to the server alone, verbatim, after the model's.
+fn codex_args(address: &str, model: Option<&str>, config: &[&str]) -> (Vec<String>, Vec<String>) {
     let mut server = vec!["app-server".into(), "--listen".into(), address.into()];
     let mut client = vec!["--remote".into(), address.into(), "--approve-for-me".into()];
     if let Some(model) = model {
         server.extend(["-c".into(), format!("model={model:?}")]);
         client.extend(["-m".into(), model.into()]);
+    }
+    for value in config {
+        server.extend(["-c".into(), (*value).into()]);
     }
     (server, client)
 }
@@ -581,7 +604,7 @@ mod tests {
     #[test]
     fn model_reaches_both_the_app_server_and_the_client() {
         assert_eq!(
-            codex_args("unix://s", None),
+            codex_args("unix://s", None, &[]),
             (
                 vec!["app-server".into(), "--listen".into(), "unix://s".into()],
                 vec![
@@ -591,9 +614,76 @@ mod tests {
                 ],
             )
         );
-        let (server, client) = codex_args("unix://s", Some("gpt-5.5"));
+        let (server, client) = codex_args("unix://s", Some("gpt-5.5"), &[]);
         assert_eq!(server[3..], ["-c", "model=\"gpt-5.5\""]);
         assert_eq!(client[3..], ["-m", "gpt-5.5"]);
+    }
+
+    #[test]
+    fn config_overrides_reach_only_the_app_server_after_the_model() {
+        let config = ["a=1", r#"b={x="y"}"#];
+        let (server, client) = codex_args("unix://s", Some("gpt-5.5"), &config);
+        assert_eq!(
+            server[3..],
+            ["-c", "model=\"gpt-5.5\"", "-c", "a=1", "-c", r#"b={x="y"}"#]
+        );
+        assert_eq!(client, codex_args("unix://s", Some("gpt-5.5"), &[]).1);
+        let (server, client) = codex_args("unix://s", None, &config);
+        assert_eq!(server[3..], ["-c", "a=1", "-c", r#"b={x="y"}"#]);
+        assert_eq!(client, codex_args("unix://s", None, &[]).1);
+    }
+
+    #[test]
+    fn arguments_parse_status_then_model_then_config_overrides() {
+        assert_eq!(parse_args(&["--status", "p"]), Some(("p", None, vec![])));
+        assert_eq!(
+            parse_args(&["--status", "p", "--model", "m"]),
+            Some(("p", Some("m"), vec![]))
+        );
+        assert_eq!(
+            parse_args(&[
+                "--status",
+                "p",
+                "--model",
+                "m",
+                "-c",
+                "a=1",
+                "-c",
+                "b=--model"
+            ]),
+            Some(("p", Some("m"), vec!["a=1", "b=--model"]))
+        );
+        assert_eq!(
+            parse_args(&["--status", "p", "-c", "a=1"]),
+            Some(("p", None, vec!["a=1"]))
+        );
+    }
+
+    #[test]
+    fn malformed_arguments_are_a_usage_error() {
+        for args in [
+            &[][..],
+            &["--status"],
+            &["--model", "m"],
+            &["--status", "p", "--model"],
+            &["--status", "p", "-c"],
+            &["--status", "p", "-c", "a=1", "-c"],
+            &["--status", "p", "-c", "a=1", "--model", "m"],
+            &["--status", "p", "--bogus"],
+            &["--status", "p", "--help"],
+        ] {
+            assert_eq!(parse_args(args), None, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn help_succeeds_without_spawning_codex_and_names_the_config_flag() {
+        // Butler probes this output for `-c KEY=VALUE` to detect support.
+        assert!(USAGE.contains("-c KEY=VALUE"));
+        assert_eq!(
+            format!("{:?}", run(&["--help"])),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
     }
 
     #[test]
