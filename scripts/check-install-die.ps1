@@ -18,16 +18,28 @@ $env:REMUDA_CHECK_INSTALLER = $script
 $message = "install.ps1: unknown channel 'no-such-channel'"
 $failures = @()
 
+# One line: Windows PowerShell renders a child's stderr as wrapped error records.
+function Run($arguments) {
+    ((& $shell -NoProfile -ExecutionPolicy Bypass @arguments 2>&1 | Out-String) -replace '\s+', ' ')
+}
+
 # As the one-liner: the session must outlive the failure, and be told why.
 $piped = 'try { Get-Content -Raw $env:REMUDA_CHECK_INSTALLER | Invoke-Expression } catch { Write-Output $_ }; Write-Output SESSION-SURVIVED'
-$out = (& $shell -NoProfile -ExecutionPolicy Bypass -Command $piped 2>&1 | Out-String)
+$out = Run '-Command', $piped
 if ($out -notlike '*SESSION-SURVIVED*') { $failures += "piped to iex: the failure ended the session:`n$out" }
 if ($out -notlike "*$message*") { $failures += "piped to iex: the failure did not say why:`n$out" }
 
 # As a file: nonzero, and the same reason.
-$out = (& $shell -NoProfile -ExecutionPolicy Bypass -File $script 2>&1 | Out-String)
+$out = Run '-File', $script
 if ($LASTEXITCODE -eq 0) { $failures += "run as a file: a failed install exited 0" }
 if ($out -notlike "*$message*") { $failures += "run as a file: the failure did not say why:`n$out" }
+
+# As `remuda upgrade` runs it (native/src/dist.rs): a file, inside a command
+# that passes the exit code on.
+$env:REMUDA_CHECK_SHELL = $shell
+$out = Run '-Command', '& $env:REMUDA_CHECK_SHELL -NoProfile -ExecutionPolicy Bypass -File $env:REMUDA_CHECK_INSTALLER; exit $LASTEXITCODE'
+if ($LASTEXITCODE -eq 0) { $failures += "run as remuda upgrade does: a failed install exited 0" }
+if ($out -notlike "*$message*") { $failures += "run as remuda upgrade does: the failure did not say why:`n$out" }
 
 if ($failures) {
     Write-Host "install.ps1: a failure does the wrong thing to its shell"
