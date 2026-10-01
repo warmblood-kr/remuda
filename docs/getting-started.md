@@ -51,7 +51,8 @@ The wizard asks four things:
 2. `Your Matrix user ID (for example @alice:example.org):`, your own account.
 3. For an `https://` homeserver, `HTTPS trust: enter a 64-character SHA-256
    certificate pin or an absolute CA file path:`
-   - Self-signed certificate: the pin. Compute it from the server's
+   - Self-signed certificate: the pin. It is the SHA-256 of the server key
+     (SPKI), not a hash of the certificate file. Compute it from the server's
      certificate and copy the 64 hex digits after `=`:
 
      ```sh
@@ -59,8 +60,17 @@ The wizard asks four things:
      ```
 
    - Private CA: the absolute path of the CA file.
-   - A certificate from a public CA: TODO(lead): setup has no flag-free path;
-     HTTPS always needs a pin or a CA file. Say which one to use here.
+   - A certificate from a public CA (for example Let's Encrypt): for now,
+     enter your system's CA bundle as the CA file. It keeps full chain
+     checking, and keeps working when the certificate is renewed (a pin breaks
+     if the server key changes):
+     - macOS: `/etc/ssl/cert.pem`
+     - Debian: `/etc/ssl/certs/ca-certificates.crt`
+     - Windows: TODO(lead): Windows keeps its CA roots in the certificate
+       store, not in a file; no path to give yet.
+
+     A path with no pin or CA file for publicly trusted certificates is
+     pending.
 4. A summary, then `Continue? Type Y to continue, or N to cancel [N]:`. Type `Y`.
 
 The wizard creates a bot account, so it then asks for the server's
@@ -75,6 +85,7 @@ Next: accept the invite in Element; the relay is running, so write to the Butler
 If not, follow the `Next:` line it prints: on a pin mismatch, recompute the
 pin; if registration is disabled, ask the admin for a bot account.
 
+<!-- Re-check the next two sentences after team-1's receive-rule change lands. -->
 Rooms are open: anyone can invite the Butler. The sender allowlist decides
 trust; it starts with only you, and other senders' messages are quarantined.
 
@@ -94,6 +105,8 @@ If nothing comes back: on the computer run `remuda butler status`. It prints
 `butler: up (claude)` when the Butler is ready. `launching` means wait. If it
 prints `failed`, see step 6.
 
+Next: once it answers, go on to step 5.
+
 ## 5. Add your second and third machines
 
 Do steps 1 and 2 on machines B and C. The machines must reach each other,
@@ -104,7 +117,7 @@ remuda cluster init
 ```
 
 You should see `Cluster initialized`, then this machine's `Node:` and
-`Fingerprint:`.
+`Fingerprint:`. Then go on to the invitation.
 
 On A, create one invitation per machine:
 
@@ -118,10 +131,33 @@ You should see:
 Invitation for one machine, valid 10 minutes. Run this on the other machine:
 
   remuda cluster join 'SHA256:...' 'remuda-join-v1 ...'
+
+Fingerprint of this machine: SHA256:... (the other machine must show the same one)
+
+Next: after it joins, run `remuda cluster nodes` here to see it.
 ```
 
-Run that `remuda cluster join` line on B. You should see
-`Joined node-... (fingerprint SHA256:...).` with A's fingerprint.
+The invitation advertises A's local network address: the first private
+address (10.x, 172.16-31.x, 192.168.x) on its default route. It never picks a
+VPN address in 100.64.0.0/10 (Tailscale and similar). If the machines reach
+each other only over such a VPN, or the invite fails with `listener is
+waiting for a private LAN address`, give the VPN address yourself:
+`remuda cluster invite --bind VPN_IP_OF_A` on A, and add
+`--bind VPN_IP_OF_B` to the join line on B.
+
+Run that `remuda cluster join` line on B. The first argument is A's
+fingerprint: the join refuses if A's key does not match it. If you sent the
+line over a channel you do not fully trust, first check that it matches the
+`Fingerprint:` line `remuda cluster` prints on A. (If you run `remuda cluster
+join` with only the `remuda-join-v1` line, it shows A's fingerprint and asks
+`Continue? [y/N]`; type `y` only if it matches A.)
+
+You should see:
+
+```text
+Joined node-... (fingerprint SHA256:...).
+Next: remuda cluster remote
+```
 
 Run `remuda cluster invite` on A again, and run the new join line on C.
 Each invitation works for one machine only.
@@ -132,7 +168,8 @@ Check membership on any machine:
 remuda cluster nodes
 ```
 
-You should see three rows in state `admitted`; `*` marks this machine:
+You should see three rows in state `admitted`; `*` marks this machine
+(fingerprints are shortened here; the real table shows them in full):
 
 ```text
  NODE            FINGERPRINT       STATE    VERSION  BY
