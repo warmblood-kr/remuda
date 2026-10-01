@@ -227,7 +227,7 @@ fn process_run_stdin_hold_returns_reply_line() {
 #[test]
 fn process_run_stdin_hold_refuses_out_of_range_line_counts_in_one_line() {
     let node = Node::start("stdin-hold-invalid");
-    for count in [0, 1001] {
+    for count in ["0", "1001", "-1", "1.5", "0 / 0", "'1'"] {
         let error = node.error_of(&format!(
             "remuda.process.run({{ argv = {{ '/bin/cat' }}, stdin_hold_until_lines = {count} }})"
         ));
@@ -238,6 +238,72 @@ fn process_run_stdin_hold_refuses_out_of_range_line_counts_in_one_line() {
         );
         assert!(!error.contains('\n'), "error must be one line: {error}");
     }
+}
+
+#[test]
+fn process_run_stdin_hold_binding_rejects_invalid_numbers() {
+    let node = Node::start("stdin-hold-binding-invalid");
+    for count in ["1.5", "0 / 0", "math.huge", "-1", "1001", "'1'"] {
+        let error = node.error_of(&format!(
+            "local result, refused = remuda._process_run({{ '/bin/cat' }}, nil, 0.1, nil, {count}); if result == nil then error(refused, 2) end"
+        ));
+        assert!(
+            error.contains("stdin_hold_until_lines must be an integer from 1 through 1000"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Next: pass a whole number in that range"),
+            "{error}"
+        );
+        assert!(!error.contains('\n'), "error must be one line: {error}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_stdin_hold_returns_promptly_when_child_exits_early() {
+    let node = Node::start("stdin-hold-early-exit");
+    let started = Instant::now();
+    let result = node.eval(
+        "local r = remuda.process.run({ argv = { '/bin/echo', 'one' }, stdin = 'payload', timeout = 5, stdin_hold_until_lines = 2 })
+         return tostring(r.timed_out) .. '|' .. r.stdout",
+    );
+
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "returned after {:?}",
+        started.elapsed()
+    );
+    assert_eq!(result, "false|one\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn process_run_stdin_hold_accepts_two_and_one_thousand_lines() {
+    let node = Node::start("stdin-hold-lines");
+    let child = node.dir.0.join("two-lines-then-read");
+    std::fs::write(
+        &child,
+        "#!/bin/sh\nprintf 'one\\ntwo\\n'\ncat >/dev/null\nprintf 'done\\n'\n",
+    )
+    .expect("write child script");
+    let mut permissions = std::fs::metadata(&child)
+        .expect("child metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&child, permissions).expect("make child executable");
+
+    let two = node.eval(&format!(
+        "return remuda.process.run({{ argv = {{ {} }}, stdin = 'payload', timeout = 3, stdin_hold_until_lines = 2 }}).stdout",
+        lua_string(&child)
+    ));
+    assert_eq!(two, "one\ntwo\ndone\n");
+
+    let thousand = node.eval(
+        "local r = remuda.process.run({ argv = { '/usr/bin/seq', '1000' }, timeout = 3, stdin_hold_until_lines = 1000 })
+         return tostring(r.code) .. '|' .. tostring(r.timed_out) .. '|' .. tostring(select(2, r.stdout:gsub('\\n', '')))",
+    );
+    assert_eq!(thousand, "0|false|1000");
 }
 
 #[test]
