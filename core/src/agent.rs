@@ -250,7 +250,10 @@ impl fmt::Display for AgentError {
                 )
             }
             AgentError::LateSubmitAbandoned { bound } => {
-                write!(f, "text write stalled over {bound:?}; Return was not sent")
+                write!(
+                    f,
+                    "an earlier write to this pane stalled for over {bound:?} and its Return was not sent; the pane may hold unsent text; this text was not typed"
+                )
             }
             AgentError::SubmitPending => write!(
                 f,
