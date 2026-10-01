@@ -154,3 +154,22 @@ fn a_daemon_under_a_hangul_runtime_directory_can_use_its_data_home() {
     }
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
+
+/// Whether `text` is in `bytes`, as UTF-8 or as UTF-16LE (a resource may hold
+/// either).
+fn holds(bytes: &[u8], text: &str) -> bool {
+    let wide: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    [text.as_bytes(), wide.as_slice()]
+        .iter()
+        .any(|needle| bytes.windows(needle.len()).any(|window| window == *needle))
+}
+
+/// The manifest is plain text inside the exe: our code page entry is there,
+/// and the linker's default execution level survived the merge with it.
+#[test]
+fn the_built_exe_carries_the_code_page_and_the_default_execution_level() {
+    let exe = std::fs::read(env!("CARGO_BIN_EXE_remuda")).expect("read remuda.exe");
+    for text in ["activeCodePage", "asInvoker"] {
+        assert!(holds(&exe, text), "remuda.exe has no {text:?}");
+    }
+}

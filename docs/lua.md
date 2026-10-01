@@ -88,6 +88,9 @@ On Windows 10 version 1903 and later those C-library words (`os.getenv`,
 `io.open`, `os.rename`, `os.remove`) read and return paths in UTF-8, the same
 bytes the `remuda.*` words use; on older Windows they use the system code page,
 so a non-ASCII path from one side is not valid on the other.
+Bytes that are not valid UTF-8, given to `io.open` or `os.rename` on Windows,
+are replaced by the system with U+FFFD, so two different invalid byte strings
+can name the same file: do not treat byte-distinct paths as file-distinct there.
 
 ## New directory creation
 

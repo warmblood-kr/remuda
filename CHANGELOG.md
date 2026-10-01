@@ -7,7 +7,9 @@
   Lua's `os.getenv`, `io.open` and `os.rename` as in the `remuda.*` words.
   Before, `os.getenv` returned bytes that `remuda.mkdir`, `remuda.fs.lock` and
   `remuda.process.run` refused ("invalid utf-8 sequence"). Needs Windows 10
-  version 1903 or later; older systems behave as before.
+  version 1903 or later; older systems behave as before. A non-ASCII path that
+  a mod stored in a file under the old code page will not match after this
+  change.
 - `remuda _codex_tui` accepts `-c KEY=VALUE` after `--status PATH [--model M]`
   and forwards each one to the `codex app-server` it starts, so a mod can give a
   Codex session an MCP server; `remuda _codex_tui --help` prints the usage line.
