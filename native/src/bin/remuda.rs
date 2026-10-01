@@ -1525,6 +1525,21 @@ fn cluster_join_command(
             ClusterErrorContext::Join(invitation),
         ));
     }
+    // A pasted-twice join line: the issuer is already in our registry, so
+    // there is nothing to send (its member reply is not a join response).
+    if let Ok(Some((identity, registry))) = remuda_native::cluster::nodes() {
+        if registry.authorized_nodes.iter().any(|entry| {
+            entry.node_fp == invitation.issuer_fingerprint
+                && entry.node_fp != identity.node_fp
+                && entry.state == remuda_native::cluster::NodeState::Admitted
+        }) {
+            println!(
+                "Already a member of {}'s cluster.\nNext: remuda cluster nodes",
+                remuda_native::cluster::node_label(&invitation.issuer_fingerprint)
+            );
+            return ExitCode::SUCCESS;
+        }
+    }
     with_daemon(server, path, |daemon_path| {
         cluster_join_with_listener(daemon_path, fingerprint, invitation, bind_addr)
     })
