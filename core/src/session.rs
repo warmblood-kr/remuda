@@ -378,7 +378,24 @@ impl Session {
             *pending = None;
         }
         let baseline = self.tail_occurrences(&tail);
-        self.input_text_locked(&body)?;
+        match self.input_text_locked(&body) {
+            Ok(()) => {}
+            Err(AgentError::WriteTimeout { .. }) => {
+                let chained = {
+                    let mut agent = self
+                        .agent
+                        .lock()
+                        .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+                    agent
+                        .input_writer()
+                        .is_some_and(|writer| writer.chain_after_stalled(crate::keys::RETURN_BYTES))
+                };
+                if chained {
+                    return Ok(InputSubmitOutcome::Unverified);
+                }
+            }
+            Err(error) => return Err(error),
+        }
         if !settle.is_zero() {
             self.clock.sleep(settle);
         }
