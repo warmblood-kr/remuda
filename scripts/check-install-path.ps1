@@ -147,7 +147,6 @@ try {
             if ($session.Count -ne 1) { $failures += "${why}: $exeDir is on this session's PATH $($session.Count) times, want 1" }
             $user = @(([Environment]::GetEnvironmentVariable('PATH', 'User') -split ';') | Where-Object { $_ -eq $exeDir })
             if ($user.Count -ne 1) { $failures += "${why}: $exeDir is on the user's persisted PATH $($user.Count) times, want 1" }
-
         } finally {
             Remove-FromSessionPath $exeDir
             Remove-FromUserPath $exeDir
