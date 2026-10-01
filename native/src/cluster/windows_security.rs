@@ -1341,6 +1341,27 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    // An entry for OWNER RIGHTS (S-1-3-4, "OW") applies to the owner, and the
+    // owner is checked on its own.
+    #[test]
+    fn a_write_entry_for_owner_rights_is_accepted() {
+        use super::super::storage;
+
+        let root = scratch("owner-rights-base");
+        let base = root.join("remuda");
+        std::fs::create_dir(&base).unwrap();
+        set_explicit_aces(&base, "(A;;FA;;;OW)");
+        let before = directory_sddl(&base);
+
+        storage::check_base_directory(&base).unwrap();
+        let cluster = base.join("cluster");
+        storage::create_private_directory(&cluster).unwrap();
+
+        assert_eq!(directory_sddl(&base), before);
+        assert!(is_owner_only(&cluster, true));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     // Read-type access, such as an application package SID with read and
     // execute, and inherit-only entries do not let anyone change the base.
     #[test]
