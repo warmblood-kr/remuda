@@ -80,6 +80,10 @@ fn cluster_hardening_leaves_the_channel_and_mods_readable() {
     let init = remuda(&root, &local, &["cluster", "init", "--no-listen"]);
     assert!(init.status.success(), "cluster init failed: {init:?}");
     drop(daemon);
+    assert!(
+        local.join("remuda/cluster/identity.key").is_file(),
+        "cluster init wrote no identity under the scratch LOCALAPPDATA, so nothing was hardened"
+    );
 
     assert_eq!(fs::read_to_string(&channel).unwrap(), "nightly\n");
     assert!(fs::read_to_string(mod_root.join("extension.toml")).is_ok());
