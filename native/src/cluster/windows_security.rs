@@ -945,9 +945,10 @@ mod tests {
         }
     }
 
-    /// Give FILE an owner the current token does not accept. `None` means the
-    /// runner cannot do that; in CI that is a failure, not a skip.
-    fn assign_unrelated_owner(file: &File) -> Option<Handle> {
+    /// Give the directory the first owner of CANDIDATES (SDDL, like "O:BA")
+    /// the runner can assign. `None` means it cannot; in CI that is a failure,
+    /// not a skip.
+    fn assign_owner(directory: &Path, candidates: &[&str]) -> Option<Handle> {
         let in_ci = std::env::var_os("CI").is_some();
         let privilege = match enable_restore_privilege() {
             Ok(token) => token,
@@ -957,16 +958,54 @@ mod tests {
                 return None;
             }
         };
-        let user = UserSid::current().unwrap();
-        for candidate in ["O:SY", "O:BG", "O:BA"] {
-            let (sid, _descriptor) = owner_sid_from_sddl(candidate).unwrap();
-            if !user.accepts_owner(sid) && set_owner_from_sddl(file, candidate).is_ok() {
+        let handle = open_for_owner_update(directory, true).unwrap();
+        for candidate in candidates {
+            if set_owner_from_sddl(&handle, candidate).is_ok() {
                 return Some(privilege);
             }
         }
-        assert!(!in_ci, "CI runner could not assign a non-token owner");
-        eprintln!("skipping: cannot assign a non-token owner");
+        assert!(!in_ci, "CI runner could not assign any of {candidates:?}");
+        eprintln!("skipping: cannot assign any of {candidates:?}");
         None
+    }
+
+    /// Replace the directory's explicit ACEs with ACES (SDDL, like
+    /// "(A;;0x40;;;WD)"); the inherited ones stay.
+    fn set_explicit_aces(directory: &Path, aces: &str) {
+        use windows_sys::Win32::Security::UNPROTECTED_DACL_SECURITY_INFORMATION;
+
+        let sddl: Vec<u16> = format!("D:{aces}").encode_utf16().chain(Some(0)).collect();
+        let mut descriptor = ptr::null_mut();
+        let parsed = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        };
+        assert_ne!(parsed, 0, "SDDL {aces}: {}", last_error());
+        let descriptor = LocalMemory(descriptor.cast());
+        let mut present = 0;
+        let mut dacl = ptr::null_mut();
+        let mut defaulted = 0;
+        let found = unsafe {
+            GetSecurityDescriptorDacl(descriptor.0.cast(), &mut present, &mut dacl, &mut defaulted)
+        };
+        assert_ne!(found, 0, "DACL of {aces}: {}", last_error());
+        let handle = open_for_check(directory, true, true).unwrap();
+        let result = unsafe {
+            SetSecurityInfo(
+                handle.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                dacl,
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(result, 0, "set ACEs {aces} on {}", directory.display());
     }
 
     // The base `remuda` dir also holds mods, the channel file and the update
@@ -1061,21 +1100,123 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    // A base dir made by an elevated installer is owned by another SID.
+    // A base dir made by an elevated installer is owned by Administrators.
     #[test]
-    fn a_base_owned_by_another_sid_no_longer_blocks_the_cluster_dir() {
+    fn a_base_owned_by_administrators_or_system_is_accepted() {
         use super::super::storage;
 
-        let root = scratch("foreign-base");
+        let root = scratch("admin-base");
         let base = root.join("remuda");
         std::fs::create_dir(&base).unwrap();
-        let handle = open_for_owner_update(&base, true).unwrap();
-        let Some(_privilege) = assign_unrelated_owner(&handle) else {
-            drop(handle);
+        let Some(_privilege) = assign_owner(&base, &["O:BA", "O:SY"]) else {
             std::fs::remove_dir_all(root).unwrap();
             return;
         };
-        drop(handle);
+        let before = directory_sddl(&base);
+
+        storage::check_base_directory(&base).unwrap();
+        let cluster = base.join("cluster");
+        storage::create_private_directory(&cluster).unwrap();
+
+        assert_eq!(directory_sddl(&base), before);
+        assert!(is_owner_only(&cluster, true));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The refusal: one line that names the SID, then a `Next:` line; nothing
+    /// is changed and nothing is created in the base.
+    fn assert_base_refused(base: &Path, sid: &str, what: &str) {
+        use super::super::storage;
+
+        let before = directory_sddl(base);
+        let error = storage::check_base_directory(base).unwrap_err();
+        let text = error.to_string();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::PermissionDenied,
+            "{what}: {text}"
+        );
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{what}: one line plus Next: {text:?}");
+        assert!(lines[0].contains(sid), "{what}: {text:?}");
+        assert!(lines[1].starts_with("Next: "), "{what}: {text:?}");
+        assert!(
+            !text.chars().any(|c| c.is_control() && c != '\n'),
+            "{text:?}"
+        );
+
+        let cluster = base.join("cluster");
+        assert!(
+            storage::create_private_directory(&cluster).is_err(),
+            "{what}: the cluster dir was created under a refused base"
+        );
+        assert!(!cluster.exists(), "{what}: cluster exists");
+        assert_eq!(directory_sddl(base), before, "{what}: the base ACL changed");
+    }
+
+    // The owner of a directory can always rewrite its DACL.
+    #[test]
+    fn a_base_owned_by_another_account_is_refused() {
+        let root = scratch("foreign-base");
+        let base = root.join("remuda");
+        std::fs::create_dir(&base).unwrap();
+        // Guests, then Anonymous: neither is the user, SYSTEM or Administrators.
+        let Some(_privilege) = assign_owner(&base, &["O:BG", "O:AN"]) else {
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        };
+        let owner = directory_sddl(&base);
+        let sid = if owner.starts_with("O:BG") {
+            "S-1-5-32-546"
+        } else {
+            "S-1-5-7"
+        };
+
+        assert_base_refused(&base, sid, "owner");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // With any of these rights another account could plant, swap or rename
+    // `cluster`, or give itself the rest (write DAC, write owner).
+    #[test]
+    fn a_base_another_sid_can_write_to_is_refused_and_left_unchanged() {
+        for (right, mask) in [
+            ("add file", "0x2"),
+            ("add subdirectory", "0x4"),
+            ("delete child", "0x40"),
+            ("delete", "SD"),
+            ("write DAC", "WD"),
+            ("write owner", "WO"),
+            ("generic write", "GW"),
+            ("generic all", "GA"),
+        ] {
+            let root = scratch("writable-base");
+            let base = root.join("remuda");
+            std::fs::create_dir(&base).unwrap();
+            // WD in the last field is Everyone, S-1-1-0.
+            set_explicit_aces(&base, &format!("(A;;{mask};;;WD)"));
+
+            assert_base_refused(&base, "S-1-1-0", right);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    // Read-type access, such as an application package SID with read and
+    // execute, and inherit-only entries do not let anyone change the base.
+    #[test]
+    fn read_access_for_other_sids_does_not_block_the_cluster_dir() {
+        use super::super::storage;
+
+        let root = scratch("readable-base");
+        let base = root.join("remuda");
+        std::fs::create_dir(&base).unwrap();
+        // Everyone and ALL APPLICATION PACKAGES: read and execute. Everyone
+        // also gets an inherit-only full-control entry, which grants nothing
+        // on the base itself.
+        set_explicit_aces(
+            &base,
+            "(A;;0x1200a9;;;WD)(A;;0x1200a9;;;AC)(A;OICIIO;FA;;;WD)",
+        );
         let before = directory_sddl(&base);
 
         storage::check_base_directory(&base).unwrap();
