@@ -171,6 +171,31 @@ remuda.extension_command("deferred", function(args)
       if err then reply:reject(err) else reply:resolve(0, line, "") end
     end }
     return reply
+  elseif args[1] == "line_label_long" then
+    local reply = remuda.pending { timeout = 5 }
+    local label = string.rep("A", 150) .. "\n" .. string.rep("B", 150) .. "\n" .. string.rep("C", 98)
+    reply:prompt_line { label = label, default = "N", callback = function(line, err)
+      if err then reply:reject(err) else reply:resolve(0, "line: " .. line, "") end
+    end }
+    return reply
+  elseif args[1] == "line_preface" or args[1] == "line_preface_hostile" then
+    local reply = remuda.pending { timeout = 5 }
+    local preface = "Matrix setup will:\n- join the room\nSave to /tmp/example\n"
+    if args[1] == "line_preface_hostile" then
+      preface = "safe" .. string.char(27) .. "[31mred" .. string.char(13) .. "spoof"
+        .. string.char(226, 128, 174) .. "end\nremuda[outside] fake:"
+    end
+    reply:prompt_line { label = "Continue?", default = "N", preface = preface, callback = function(line, err)
+      if err then reply:reject(err) else reply:resolve(0, "line: " .. line, "") end
+    end }
+    return reply
+  elseif args[1] == "line_preface_lines" or args[1] == "line_preface_width" then
+    local reply = remuda.pending { timeout = 5 }
+    local preface = args[1] == "line_preface_lines" and string.rep("x\n", 33) or string.rep("x", 257)
+    local ok, err = pcall(function()
+      reply:prompt_line { label = "Continue?", preface = preface, callback = function() end }
+    end)
+    return ok and "accepted" or ("refused: " .. tostring(err))
   elseif args[1] == "shutdown_wait" then
     local path = args[2]
     return remuda.pending { timeout = 30, on_cancel = function(reason)
@@ -1492,4 +1517,184 @@ fn shutdown_answers_waiters_and_runs_shutdown_cancellation_callback() {
         "{output:?}"
     );
     assert_eq!(cancellation, "shutdown");
+}
+
+/// The pane of a session running `remuda deferred WORD`, once WAIT_FOR shows.
+#[cfg(unix)]
+fn prompt_pane_for_word(tag: &str, word: &str, columns: u16, wait_for: &str) -> Vec<String> {
+    use remuda_core::protocol::{Request, Response};
+    use remuda_core::Size;
+    use remuda_native::{client, daemon};
+    use std::time::{Duration, Instant};
+
+    let (dir, remuda) = fixture(tag);
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(
+        boot.status.success(),
+        "private daemon and module boot: {boot:?}"
+    );
+    let socket = daemon::socket_path_in(&dir, "s");
+    let name = "preface-pane";
+    let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
+    let command = format!("sleep 0.2; \"{binary}\" -s s deferred {word}; sleep 30");
+    let started = client::request(
+        &socket,
+        &Request::New {
+            name: Some(name.into()),
+            command: vec!["sh".into(), "-c".into(), command],
+            size: Size::new(columns, 24),
+            cwd: None,
+            env: None,
+        },
+    )
+    .expect("start prompt session");
+    assert_eq!(started, Response::Value(name.into()));
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let screen = match client::request(&socket, &Request::Capture { name: name.into() }) {
+            Ok(Response::Screen(screen)) => screen,
+            other => panic!("capture failed: {other:?}"),
+        };
+        if screen.contains(wait_for) {
+            return screen
+                .lines()
+                .map(|row| row.trim_end().to_string())
+                .collect();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{wait_for:?} did not appear:\n{screen}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(unix)]
+const PREFACE_PROMPT: &str = "remuda[session preface-pane] Continue? [N]:";
+
+// butler #186, the control experiment: a prompt label stays one short line.
+#[cfg(unix)]
+#[test]
+fn prompt_line_label_stays_one_line_cut_at_256() {
+    let rows = prompt_pane_for_word("label_long", "line_label_long", 400, "[N]:");
+    let expected = format!(
+        "remuda[session preface-pane] {}{} [N]:",
+        "A".repeat(150),
+        "B".repeat(106)
+    );
+    assert!(rows.contains(&expected), "{rows:#?}");
+    assert!(!rows.iter().any(|row| row.contains('C')), "{rows:#?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn prompt_line_preface_shows_indented_lines_above_the_prompt() {
+    let rows = prompt_pane_for_word("preface", "line_preface", 80, "Continue?");
+    let prompt = rows
+        .iter()
+        .position(|row| row == PREFACE_PROMPT)
+        .unwrap_or_else(|| panic!("no tagged prompt row: {rows:#?}"));
+    assert!(
+        rows[..prompt].ends_with(&[
+            "  Matrix setup will:".to_string(),
+            "  - join the room".to_string(),
+            "  Save to /tmp/example".to_string(),
+        ]),
+        "{rows:#?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn prompt_line_preface_strips_escape_cr_and_bidi() {
+    let rows = prompt_pane_for_word("preface_hostile", "line_preface_hostile", 80, "Continue?");
+    let prompt = rows
+        .iter()
+        .position(|row| row == PREFACE_PROMPT)
+        .unwrap_or_else(|| panic!("no tagged prompt row: {rows:#?}"));
+    assert!(
+        rows[..prompt].ends_with(&[
+            "  safe[31mredspoofend".to_string(),
+            "  remuda[outside] fake:".to_string(),
+        ]),
+        "{rows:#?}"
+    );
+    // Only the daemon's own prompt row may start with the tag.
+    let tagged = rows.iter().filter(|row| row.starts_with("remuda[")).count();
+    assert_eq!(tagged, 1, "{rows:#?}");
+}
+
+#[test]
+fn prompt_line_preface_over_the_cap_is_an_error() {
+    let (dir, remuda) = fixture("preface_caps");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(boot.status.success(), "{boot:?}");
+
+    for (word, cap) in [
+        ("line_preface_lines", "32 lines"),
+        ("line_preface_width", "256 characters"),
+    ] {
+        let output = remuda(&["deferred", word]);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with("refused: ") && stdout.contains("preface") && stdout.contains(cap),
+            "{word}: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn prompt_line_wire_is_compatible_without_a_preface() {
+    use remuda_core::protocol::{Request, Response};
+    use remuda_native::ipc::TryClone;
+    use std::io::{BufRead, BufReader, Write};
+
+    // An older daemon's frame, without the field, still parses.
+    let old: Response = serde_json::from_str(
+        r#"{"PromptLine":{"id":1,"label":"remuda[outside] x","timeout_ms":5}}"#,
+    )
+    .expect("old-style PromptLine");
+    assert!(matches!(old, Response::PromptLine { .. }), "{old:?}");
+
+    let (dir, remuda) = fixture("preface_wire");
+    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let boot = remuda(&["exec", "deferred"]);
+    assert!(boot.status.success(), "{boot:?}");
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+    let prompt_frame = |word: &str| -> serde_json::Value {
+        let mut stream = remuda_native::ipc::connect(&socket).expect("private daemon socket");
+        let mut reader = BufReader::new(stream.try_clone().expect("clone private socket"));
+        let request = Request::Eval {
+            code: format!(
+                "return remuda._dispatch_extension_command('deferred', {{'{word}'}}, {{}})"
+            ),
+            name: None,
+        };
+        let mut frame = serde_json::to_vec(&request).unwrap();
+        frame.push(b'\n');
+        stream.write_all(&frame).unwrap();
+        let mut prompt = Vec::new();
+        reader.read_until(b'\n', &mut prompt).unwrap();
+        let prompt: serde_json::Value = serde_json::from_slice(&prompt).unwrap();
+        prompt
+            .get("PromptLine")
+            .expect("PromptLine response")
+            .clone()
+    };
+
+    let plain = prompt_frame("line_answers");
+    assert!(plain.get("preface").is_none(), "{plain}");
+    let with_preface = prompt_frame("line_preface");
+    assert_eq!(with_preface["label"], "remuda[outside] Continue?");
+    assert_eq!(
+        with_preface["preface"],
+        serde_json::json!([
+            "Matrix setup will:",
+            "- join the room",
+            "Save to /tmp/example"
+        ])
+    );
 }
