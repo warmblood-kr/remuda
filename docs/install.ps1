@@ -16,9 +16,12 @@ $ErrorActionPreference = 'Stop'
 $Repo  = 'warmblood-kr/remuda'
 $Index = 'https://warmblood-kr.github.io/remuda/latest.json'
 
+# Not `exit`: piped to iex, this script IS the user's session, and exit closes
+# their window with the message in it. An uncaught throw stops the script,
+# leaves the error on screen, and still exits 1 when run as a file - which is
+# how `remuda upgrade` runs it.
 function Die($message) {
-    Write-Host "install.ps1: $message" -ForegroundColor Red
-    exit 1
+    throw "install.ps1: $message"
 }
 
 # `-UseBasicParsing` for Windows PowerShell 5.1, which is what a fresh machine
