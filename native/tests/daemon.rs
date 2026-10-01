@@ -2384,8 +2384,8 @@ fn session_output_wakes_coalesce_while_lua_is_busy_and_list_stays_responsive() {
                 if name == "chatty" then
                     remuda._session_output_test_calls = remuda._session_output_test_calls + 1
                     if remuda._session_output_test_calls == 1 then
-                        local busy_until = os.clock() + 0.5
-                        while os.clock() < busy_until do end
+                        local busy_until = remuda.clock() + 500
+                        while remuda.clock() < busy_until do end
                     end
                 end
             end, { group = "session-output-test", id = "coalesce" })
