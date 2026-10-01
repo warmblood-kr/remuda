@@ -328,3 +328,45 @@ fn wait_for_short(file: &Path) -> bool {
     }
     false
 }
+
+/// A program found through a RELATIVE PATH entry is started as the file the
+/// daemon found, by its full path: the pty must not join the relative hit
+/// onto another PATH directory, where a different file could win.
+#[test]
+fn a_program_found_through_a_relative_path_entry_is_pinned_absolute() {
+    let scratch = Scratch::new("rel");
+    // The daemon's own directory is what a relative PATH entry is read from.
+    let mut command = spawn::base_command(&scratch.0);
+    command.current_dir(&scratch.0);
+    let _daemon = spawn::spawn_and_wait(command, &scratch.0);
+
+    let script = "@echo off\r\n>\"%~dp0zero.txt\" echo %0\r\n";
+    let real = scratch.0.join("bin");
+    let decoy = scratch.0.join("other").join("bin");
+    for dir in [&real, &decoy] {
+        std::fs::create_dir_all(dir).expect("create bin");
+        std::fs::write(dir.join("tool.cmd"), script).expect("write tool.cmd");
+    }
+    // `other` is searched first and has no `tool`; `bin` is the relative hit.
+    let path = format!("{};bin", scratch.0.join("other").display());
+    let said = outcome(
+        &scratch.0,
+        &format!(
+            r#"remuda.new("rel", {{ "tool" }}, nil, {{ PATH = {} }}) return "started""#,
+            lua_string(&path)
+        ),
+    );
+    let ran_real = wait_for(&real.join("zero.txt"));
+    let ran_decoy = wait_for_short(&decoy.join("zero.txt"));
+    let zero = std::fs::read_to_string(real.join("zero.txt")).unwrap_or_default();
+    let zero = zero.trim().trim_matches('"');
+    let _ = writeln!(
+        std::io::stderr(),
+        "FACT program relative-path: said {said:?}; real ran {ran_real}; decoy ran {ran_decoy}; pinned argv[0] {zero:?}"
+    );
+    assert!(ran_real && !ran_decoy, "the file the daemon found must run");
+    assert!(
+        Path::new(zero).is_absolute(),
+        "the pty was given a relative program: {zero:?}"
+    );
+}
