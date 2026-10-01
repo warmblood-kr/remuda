@@ -154,7 +154,7 @@ fs
 fs.lock
 -------
 
-``fs.lock(path) -> handle | nil, 'held', info | nil, error`` — Take an exclusive, non-blocking OS advisory lock on the file at an absolute path the caller chooses; it is held until handle:release() or until this daemon exits, and the same path returns the same handle. The lock file is created owner-only, stays empty and is not opened through a symlink. The owner's line (session, pid, since) is kept in PATH.info and returned as info when another process holds the lock: it is message text only, never decide on it. Any other failure returns nil, error.
+``fs.lock(path) -> handle | nil, 'held', info | nil, error`` — Take an exclusive, non-blocking OS advisory lock on the file at an absolute path the caller chooses; it is held until handle:release() or until this daemon exits, and the same path returns the same handle. The lock file is created owner-only, stays empty and is not opened through a symlink. The owner's line (session, pid, since) is kept in PATH.info and returned as info when another process holds the lock: it is message text only, never decide on it. Any other failure returns nil, error. It guards against accidents, such as a second daemon of the same user; it is not a security boundary: a hostile process of that user can delete the lock file while it is held, and a second owner can then lock a new file there.
 
 fs.mkdir_new
 ------------

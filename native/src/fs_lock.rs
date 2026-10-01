@@ -63,31 +63,38 @@ pub fn acquire(path: &Path, info: &str) -> io::Result<Outcome> {
         Err(std::fs::TryLockError::WouldBlock) => return Ok(Outcome::Held(holder_info(path))),
         Err(std::fs::TryLockError::Error(error)) => return Err(error),
     }
-    // Any error from here drops `file`, which gives the lock back.
-    let found = read_sidecar(path)?.unwrap_or_default();
-    if !found.is_empty() && !found.starts_with(INFO_PREFIX.as_bytes()) {
-        return Err(refuse(
-            "the lock's .info file is not a remuda lock info file",
-        ));
-    }
-    write_sidecar(&sidecar(path), info.as_bytes())?;
+    // The lock is ours, so our line replaces whatever sat at the sidecar; it
+    // is never read first. An error here drops `file`: the lock goes back.
+    let info_path = sidecar(path);
+    write_sidecar(&info_path, info.as_bytes()).map_err(|error| {
+        let shown = info_path.display().to_string();
+        let shown: String = shown.chars().map(shown_char).collect();
+        let next = "Next: remove or move that path, then retry";
+        let text = format!("cannot write the lock info file {shown}: {error}. {next}");
+        io::Error::new(error.kind(), text)
+    })?;
     Ok(Outcome::Acquired(file))
+}
+
+fn shown_char(c: char) -> char {
+    if unsafe_to_show(c) {
+        '?'
+    } else {
+        c
+    }
 }
 
 /// The holder's info line for a message: ours by prefix, one line, at most
 /// [`INFO_LIMIT`] bytes, with nothing that can drive a terminal.
 fn holder_info(path: &Path) -> String {
-    let bytes = read_sidecar(path).ok().flatten().unwrap_or_default();
+    let bytes = read_sidecar(path);
     let text = String::from_utf8_lossy(&bytes);
     let line = text.lines().next().unwrap_or("");
     if !line.starts_with(INFO_PREFIX) {
         return String::new();
     }
     let mut safe = String::new();
-    for c in line
-        .chars()
-        .map(|c| if unsafe_to_show(c) { '?' } else { c })
-    {
+    for c in line.chars().map(shown_char) {
         if safe.len() + c.len_utf8() > INFO_LIMIT {
             break;
         }
@@ -105,8 +112,9 @@ fn unsafe_to_show(c: char) -> bool {
         || matches!(c, '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
-/// The first bytes of the sidecar, or `None` when there is none.
-fn read_sidecar(path: &Path) -> io::Result<Option<Vec<u8>>> {
+/// The first bytes of the sidecar when it is a regular file, else nothing.
+/// The open never blocks, so a FIFO planted there cannot hang the caller.
+fn read_sidecar(path: &Path) -> Vec<u8> {
     use std::io::Read;
 
     let mut options = std::fs::OpenOptions::new();
@@ -114,16 +122,17 @@ fn read_sidecar(path: &Path) -> io::Result<Option<Vec<u8>>> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let file = match options.open(sidecar(path)) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    let Ok(file) = options.open(sidecar(path)) else {
+        return Vec::new();
     };
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return Vec::new();
+    }
     let mut bytes = Vec::new();
-    file.take(INFO_LIMIT as u64).read_to_end(&mut bytes)?;
-    Ok(Some(bytes))
+    let _ = file.take(INFO_LIMIT as u64).read_to_end(&mut bytes);
+    bytes
 }
 
 #[cfg(not(windows))]
