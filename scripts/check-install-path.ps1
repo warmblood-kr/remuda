@@ -1,0 +1,90 @@
+# Runs docs/install.ps1 the way the one-liner does (`| iex`) against a stubbed
+# network, and asserts the install dir ends up on PATH: in this session, and on
+# Windows persisted for the user, so a NEW PowerShell finds `remuda` too.
+#
+# The installer ends by printing `Next: remuda butler doctor`. With the install
+# dir on no PATH that next step is a CommandNotFoundException, and reopening the
+# terminal does not help. Run it yourself, under either shell:
+#   powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-install-path.ps1
+#   pwsh -NoProfile -File scripts/check-install-path.ps1
+
+$ErrorActionPreference = 'Stop'
+
+# The User PATH lives in the Windows registry; there is nothing to assert, and
+# no installer to run, anywhere else.
+if ($env:OS -ne 'Windows_NT') {
+    Write-Host "skip - docs/install.ps1 only runs on Windows"
+    exit 0
+}
+
+$script = Join-Path (Split-Path -Parent $PSScriptRoot) 'docs/install.ps1'
+$scratch = Join-Path ([IO.Path]::GetTempPath()) ("remuda-check-install-path-" + [guid]::NewGuid())
+$installDir = Join-Path $scratch 'bin'
+New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+
+$fakeAsset = Join-Path $scratch 'asset'
+Set-Content -Path $fakeAsset -Value 'stands in for the release tarball'
+$fakeSum = (Get-FileHash -Algorithm SHA256 $fakeAsset).Hash
+
+# Functions shadow cmdlets and applications, and `iex` runs the installer in
+# this scope, so these are what it calls instead of the network and tar.
+function Invoke-WebRequest {
+    param([switch]$UseBasicParsing, $Uri, $OutFile)
+    if ($Uri -like '*/latest.json') {
+        Set-Content -Path $OutFile -Value '{"stable":"9.9.9","nightly":"9.9.9"}'
+    } elseif ($Uri -like '*/SHA256SUMS') {
+        Set-Content -Path $OutFile -Value "$fakeSum  ./remuda-9.9.9-x86_64-pc-windows-msvc.tar.gz"
+    } else {
+        Copy-Item $fakeAsset $OutFile
+    }
+}
+function tar {
+    # Called as: tar -xzf <asset> -C <dir>
+    Set-Content -Path (Join-Path $args[3] 'remuda.exe') -Value 'not a real binary'
+    $global:LASTEXITCODE = 0
+}
+
+$failures = @()
+try {
+    $env:PROCESSOR_ARCHITECTURE = 'AMD64'
+    $env:REMUDA_CHANNEL = 'stable'
+    $env:REMUDA_INSTALL_DIR = $installDir
+    $env:XDG_DATA_HOME = Join-Path $scratch 'data'
+    $env:REMUDA_INSTALL_BUTLER = $null
+
+    # Twice: the second run is `remuda upgrade`, which must not add it again.
+    foreach ($run in 1, 2) {
+        Get-Content -Raw $script | Invoke-Expression
+
+        $session = @(($env:PATH -split ';') | Where-Object { $_ -eq $installDir })
+        if ($session.Count -ne 1) {
+            $failures += "run ${run}: install dir is on this session's PATH $($session.Count) times, want 1"
+        }
+        $user = @(([Environment]::GetEnvironmentVariable('PATH', 'User') -split ';') | Where-Object { $_ -eq $installDir })
+        if ($user.Count -ne 1) {
+            $failures += "run ${run}: install dir is on the user's persisted PATH $($user.Count) times, want 1"
+        }
+    }
+} finally {
+    # Take out only what the installer put in, from the value as it is now,
+    # unexpanded and as the kind it is, so a developer's own PATH comes back
+    # as it was; then tell Explorer, the way the installer does.
+    $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
+    if ($envKey.GetValueNames() -contains 'Path') {
+        $kind = $envKey.GetValueKind('Path')
+        $kept = @(($envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';') | Where-Object { $_ -and $_ -ne $installDir })
+        if ($kept) { $envKey.SetValue('Path', ($kept -join ';'), $kind) } else { $envKey.DeleteValue('Path', $false) }
+    }
+    $envKey.Close()
+    $nudge = 'REMUDA_PATH_' + [guid]::NewGuid().ToString('N')
+    [Environment]::SetEnvironmentVariable($nudge, '1', 'User')
+    [Environment]::SetEnvironmentVariable($nudge, [NullString]::Value, 'User')
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $scratch
+}
+
+if ($failures) {
+    Write-Host "install.ps1: does not put its install dir on PATH"
+    $failures | ForEach-Object { Write-Host "  $_" }
+    exit 1
+}
+Write-Host "ok - docs/install.ps1 puts its install dir on PATH"

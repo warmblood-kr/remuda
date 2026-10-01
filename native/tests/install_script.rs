@@ -33,3 +33,26 @@ fn both_installers_offer_the_gated_butler_setup_and_next_steps() {
         );
     }
 }
+
+// The only place the installer itself runs: on the Windows runner, under both
+// shells a user can have. The script it drives explains what it asserts.
+#[cfg(windows)]
+#[test]
+fn the_windows_installer_puts_its_install_dir_on_path() {
+    let check = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../scripts/check-install-path.ps1"
+    );
+    for shell in ["powershell", "pwsh"] {
+        let output = std::process::Command::new(shell)
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", check])
+            .output()
+            .unwrap_or_else(|error| panic!("cannot run {shell}: {error}"));
+        assert!(
+            output.status.success(),
+            "{shell}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
