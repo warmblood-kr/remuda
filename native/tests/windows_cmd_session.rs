@@ -258,3 +258,68 @@ fn a_bare_name_that_finds_a_cmd_file_follows_the_same_rule() {
     assert!(first.contains(REFUSAL) && first.contains(NEXT), "{said:?}");
     assert!(!dir.join("argv.txt").exists(), "the refused program ran");
 }
+
+/// cmd.exe may split a command NAME at `=`, `,` and `;`: a program in such a
+/// directory must be the file that runs, or be refused, never the `a.cmd`
+/// beside it. One more fact: an argument holding 0x1A (end of a batch file).
+#[test]
+fn a_program_path_with_a_cmd_separator_runs_that_file_or_is_refused() {
+    let scratch = Scratch::new("prog");
+    let _daemon = spawn::Daemon::spawn(&scratch.0);
+    let mut wrong = Vec::new();
+    let mut fact = |case: &str, dir: &Path, arg: &str, decoy: &Path| {
+        let program = write_fixture(dir);
+        let said = outcome(
+            &scratch.0,
+            &format!(
+                r#"remuda.new("prog-{case}", {}, {}) return "started""#,
+                lua_argv(&program, &[arg]),
+                lua_string(dir.to_str().expect("utf-8 scratch path"))
+            ),
+        );
+        let started = said == "started";
+        let finished = started && wait_for(&dir.join("done.txt"));
+        let argv = std::fs::read_to_string(dir.join("argv.txt")).ok();
+        // A decoy needs a moment too when the right file never ran.
+        let decoy_ran = wait_for_short(decoy);
+        let _ = writeln!(
+            std::io::stderr(),
+            "FACT program {case}: said {said:?}; finished {finished}; argv {argv:?}; decoy {decoy_ran}"
+        );
+        if decoy_ran {
+            wrong.push(format!("{case}: another file ran"));
+        }
+        if started && argv.as_deref() != Some(format!("{:?}", [arg]).as_str()) {
+            wrong.push(format!(
+                "{case}: started, but the arguments arrived as {argv:?}"
+            ));
+        }
+    };
+
+    for (case, name) in [("equals", "a=b"), ("comma", "a,b"), ("semicolon", "a;b")] {
+        let root = scratch.0.join(case);
+        std::fs::create_dir_all(&root).expect("create case root");
+        // What cmd.exe would start if it cut the name at the separator.
+        let decoy = root.join("decoy.txt");
+        std::fs::write(
+            root.join("a.cmd"),
+            "@echo off\r\n>\"%~dp0decoy.txt\" echo decoy\r\n",
+        )
+        .expect("write the decoy");
+        fact(case, &root.join(name), "plain", &decoy);
+    }
+    let dir = scratch.0.join("sub");
+    fact("ctrl-z", &dir, "a\u{1a}b", &dir.join("decoy.txt"));
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+fn wait_for_short(file: &Path) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if file.exists() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
