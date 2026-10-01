@@ -1433,13 +1433,37 @@ fn session_prompt_line_shows_tagged_label_and_sanitized_default() {
     assert!(reply_screen.contains("line: default"), "{reply_screen}");
 }
 
+/// Who is asking and who may answer, for a denied path (Windows only).
+fn acl_report(path: &std::path::Path) -> String {
+    if !cfg!(windows) {
+        return String::new();
+    }
+    let run = |program: &str, args: &[&std::ffi::OsStr]| {
+        let out = std::process::Command::new(program).args(args).output();
+        out.map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let parent = path.parent().unwrap_or(path);
+    format!(
+        "{}{}{}",
+        run("whoami", &["/user".as_ref()]),
+        run("icacls", &[path.as_os_str()]),
+        run("icacls", &[parent.as_os_str()])
+    )
+}
+
 fn assert_no_secret_in_files(root: &std::path::Path, secret: &[u8]) {
-    for entry in fs::read_dir(root).unwrap() {
+    let entries = fs::read_dir(root).unwrap_or_else(|error| {
+        panic!("read_dir {}: {error}\n{}", root.display(), acl_report(root))
+    });
+    for entry in entries {
         let path = entry.unwrap().path();
         if path.is_dir() {
             assert_no_secret_in_files(&path, secret);
         } else if path.is_file() {
-            let contents = fs::read(&path).unwrap();
+            let contents = fs::read(&path).unwrap_or_else(|error| {
+                panic!("read {}: {error}\n{}", path.display(), acl_report(&path))
+            });
             assert!(
                 !contents
                     .windows(secret.len())
