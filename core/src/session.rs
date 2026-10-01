@@ -4,8 +4,8 @@
 //! attachment at a time.
 
 use crate::agent::{
-    AgentError, AgentProcess, Cursor, ExitInfo, MouseState, OutputWakeup, Result, ScreenSnapshot,
-    Size, StyledCell, VersionedSnapshot,
+    AgentError, AgentProcess, ChainOutcome, Cursor, ExitInfo, MouseState, OutputWakeup, Result,
+    ScreenSnapshot, Size, StyledCell, VersionedSnapshot,
 };
 use crate::clock::Clock;
 use crate::input::{InputBatch, InputDeduplicator, InputError, InputOutcome, InputRateLimiter};
@@ -82,7 +82,13 @@ pub enum InputSubmitOutcome {
     Submitted,
     /// Return was sent, but the visible screen did not verify submission.
     Unverified,
+    /// The text is still being written to a slow child; Return follows when it lands,
+    /// or is dropped after the late-submit bound.
+    Late,
 }
+
+/// Pause between pasted text and its Return when the caller gives none.
+pub const DEFAULT_INPUT_SETTLE: Duration = Duration::from_millis(100);
 
 struct PendingInput {
     tail: String,
@@ -298,7 +304,10 @@ impl Session {
     /// The complete text/submit sequence shares one input lock. Backends
     /// without a rendered screen keep the historical single-burst behavior.
     pub fn send_line(&self, text: &str) -> Result<()> {
-        self.type_text(text, Duration::ZERO).map(|_| ())
+        match self.type_text(text, Duration::ZERO)? {
+            InputSubmitOutcome::Late => Err(AgentError::SubmitPending),
+            InputSubmitOutcome::Submitted | InputSubmitOutcome::Unverified => Ok(()),
+        }
     }
 
     /// Deliver a normalized text burst, bracketed when the child enabled mode
@@ -378,7 +387,32 @@ impl Session {
             *pending = None;
         }
         let baseline = self.tail_occurrences(&tail);
-        self.input_text_locked(&body)?;
+        match self.input_text_locked(&body) {
+            Ok(()) => {}
+            Err(error @ AgentError::WriteTimeout { .. }) => {
+                let outcome = {
+                    let mut agent = self
+                        .agent
+                        .lock()
+                        .map_err(|_| AgentError::Io("session lock poisoned".into()))?;
+                    agent
+                        .input_writer()
+                        .map(|writer| {
+                            writer.chain_after_stalled(
+                                crate::keys::RETURN_BYTES,
+                                settle.max(DEFAULT_INPUT_SETTLE),
+                            )
+                        })
+                        .unwrap_or(ChainOutcome::Unsupported)
+                };
+                match outcome {
+                    ChainOutcome::Chained => return Ok(InputSubmitOutcome::Late),
+                    ChainOutcome::Landed => {}
+                    ChainOutcome::Unsupported => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
         if !settle.is_zero() {
             self.clock.sleep(settle);
         }

@@ -20,7 +20,7 @@ use crate::client;
 use mlua::{Lua, Table, Value};
 use remuda_core::keys;
 use remuda_core::protocol::{Request, Response, Step};
-use remuda_core::InputSubmitOutcome;
+use remuda_core::{InputSubmitOutcome, DEFAULT_INPUT_SETTLE};
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
@@ -138,7 +138,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "_input_type_text",
-        "Deliver text and submit it while holding one input lock; returns 'submitted' or 'unverified'.",
+        "Deliver text and submit it while holding one input lock; returns 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.",
         "_input_type_text(name, text, settle?) -> status",
     ),
     (
@@ -519,6 +519,7 @@ fn input_bindings(
                 .map(|outcome| match outcome {
                     InputSubmitOutcome::Submitted => "submitted",
                     InputSubmitOutcome::Unverified => "unverified",
+                    InputSubmitOutcome::Late => "late",
                 })
                 .map_err(|error| mlua::Error::runtime(error.to_string()))
         })?,
@@ -528,7 +529,7 @@ fn input_bindings(
         "_input_type_text",
         lua.create_function(
             move |_, (name, text, settle): (String, String, Option<f64>)| {
-                let settle = settle.unwrap_or(0.1);
+                let settle = settle.unwrap_or(DEFAULT_INPUT_SETTLE.as_secs_f64());
                 if !settle.is_finite() || !(0.0..=5.0).contains(&settle) {
                     return Err(mlua::Error::runtime(
                         "settle must be between 0 and 5 seconds",
@@ -542,6 +543,7 @@ fn input_bindings(
                     .map(|outcome| match outcome {
                         InputSubmitOutcome::Submitted => "submitted",
                         InputSubmitOutcome::Unverified => "unverified",
+                        InputSubmitOutcome::Late => "late",
                     })
                     .map_err(|error| mlua::Error::runtime(error.to_string()))
             },
