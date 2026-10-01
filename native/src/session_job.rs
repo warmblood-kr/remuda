@@ -19,9 +19,20 @@ pub struct Listed {
 /// from processes outside every session.
 pub fn refusal(step: &str, error: &io::Error) -> String {
     format!(
-        "the session was not started: its job object could not be {step} ({error}). \
+        "{REFUSED} its job object could not be {step} ({error}). \
          Next: start remuda from an ordinary terminal, not from inside a restricted job."
     )
+}
+
+const REFUSED: &str = "the session was not started:";
+
+/// What a failed spawn says to the caller. The job refusal is a whole line
+/// of its own, so it is shown without the agent error's prefix.
+pub fn spawn_error_line(error: remuda_core::AgentError) -> String {
+    match error {
+        remuda_core::AgentError::Io(line) if line.starts_with(REFUSED) => line,
+        other => other.to_string(),
+    }
 }
 
 /// Fail closed: the job, with the child assigned to it, or the child killed
@@ -244,6 +255,23 @@ mod tests {
              Next: start remuda from an ordinary terminal, not from inside a restricted job."
         );
         assert!(!refused.contains('\n'));
+    }
+
+    #[test]
+    fn the_job_refusal_is_shown_without_the_agent_error_prefix() {
+        use remuda_core::AgentError;
+        let line = refusal("assigned", &denied());
+        assert_eq!(spawn_error_line(AgentError::Io(line.clone())), line);
+        assert!(line.starts_with("the session was not started: its job object"));
+        // Every other spawn failure reads as before.
+        assert_eq!(
+            spawn_error_line(AgentError::Io("no such program".into())),
+            "agent io error: no such program"
+        );
+        assert_eq!(
+            spawn_error_line(AgentError::Exited),
+            AgentError::Exited.to_string()
+        );
     }
 
     #[test]

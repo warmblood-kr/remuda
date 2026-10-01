@@ -2647,7 +2647,7 @@ fn spawn(
         }
     }
 
-    let agent = PtyAgent::spawn(builder, size).map_err(|e| e.to_string())?;
+    let agent = PtyAgent::spawn(builder, size).map_err(crate::session_job::spawn_error_line)?;
     Ok(Session::new_with_id(
         name,
         session_id,
