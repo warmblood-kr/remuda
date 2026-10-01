@@ -1539,11 +1539,23 @@ fn cluster_join_command(
                 && entry.node_fp != identity.node_fp
                 && entry.state == remuda_native::cluster::NodeState::Admitted
         }) {
-            println!(
-                "Already a member of {}'s cluster.\nNext: remuda cluster nodes",
-                remuda_native::cluster::node_label(&invitation.issuer_fingerprint)
-            );
-            return ExitCode::SUCCESS;
+            // A revoked node keeps no tombstone of itself: the notice is the
+            // only local sign (none yet if revoked while offline). An
+            // unreadable notice falls through to the network path.
+            match remuda_native::cluster::control::revoked_notice() {
+                Ok(None) => {
+                    println!(
+                        "Already a member of {}'s cluster.\nNext: remuda cluster nodes",
+                        remuda_native::cluster::node_label(&invitation.issuer_fingerprint)
+                    );
+                    return ExitCode::SUCCESS;
+                }
+                Ok(Some(notice)) => {
+                    let _ = write_revocation_notice(&mut std::io::stderr().lock(), &notice);
+                    return ExitCode::FAILURE;
+                }
+                Err(_) => {}
+            }
         }
     }
     with_daemon(server, path, |daemon_path| {
