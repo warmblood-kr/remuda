@@ -80,8 +80,8 @@ try {
     $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
     if ($envKey.GetValueNames() -contains 'Path') {
         $kind = $envKey.GetValueKind('Path')
-        $kept = @(($envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';') | Where-Object { $_ -and $_ -ne $installDir })
-        if ($kept) { $envKey.SetValue('Path', ($kept -join ';'), $kind) } else { $envKey.DeleteValue('Path', $false) }
+        $kept = @(($envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';') | Where-Object { $_ -ne $installDir }) -join ';'
+        if ($kept) { $envKey.SetValue('Path', $kept, $kind) } else { $envKey.DeleteValue('Path', $false) }
     }
     $envKey.Close()
     $nudge = 'REMUDA_PATH_' + [guid]::NewGuid().ToString('N')
