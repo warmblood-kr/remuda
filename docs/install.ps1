@@ -4,7 +4,7 @@
 #   $env:REMUDA_CHANNEL='nightly'; $env:REMUDA_INSTALL_BUTLER='1'; irm https://warmblood-kr.github.io/remuda/install.ps1 | iex
 #
 #   $env:REMUDA_CHANNEL     stable|nightly  default: the channel already installed, else stable
-#   $env:REMUDA_INSTALL_DIR <dir>           default: ~\.local\bin
+#   $env:REMUDA_INSTALL_DIR <dir>           default: %LOCALAPPDATA%\Programs\remuda\bin
 #   $env:REMUDA_INSTALL_BUTLER=1            also install warmblood-kr/remuda-butler
 #   $env:REMUDA_NO_MODIFY_PATH=1            leave PATH alone; say so if the install dir is not on it
 #
@@ -42,7 +42,11 @@ function Fetch($url, $outFile) {
     }
 }
 
-$dataDir = if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { Join-Path $HOME '.local\share' }
+# Per-user app data, where the remuda binary itself looks for the channel file
+# (dist.rs): XDG_DATA_HOME, else %LOCALAPPDATA%, else <profile>\AppData\Local.
+$profileDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { $HOME }
+$localAppData = if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { Join-Path $profileDir 'AppData\Local' }
+$dataDir = if ($env:XDG_DATA_HOME) { $env:XDG_DATA_HOME } else { $localAppData }
 $dataDir = Join-Path $dataDir 'remuda'
 $channelFile = Join-Path $dataDir 'channel'
 
@@ -135,7 +139,16 @@ try {
     }
     if (-not $expected) { Die "$asset is not listed in SHA256SUMS" }
 
-    $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $tmp $asset)).Hash
+    # Not Get-FileHash: Windows PowerShell started underneath PowerShell 7 -
+    # `remuda upgrade` typed into pwsh - does not find it. .NET is always there.
+    $download = [IO.File]::OpenRead((Join-Path $tmp $asset))
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $actual = [BitConverter]::ToString($sha256.ComputeHash($download)) -replace '-', ''
+    } finally {
+        $download.Dispose()
+        $sha256.Dispose()
+    }
     if ($actual -ine $expected) {
         Die "checksum mismatch on $asset - refusing to install"
     }
@@ -151,7 +164,7 @@ try {
     $unpacked = Join-Path $tmp 'remuda.exe'
     if (-not (Test-Path $unpacked)) { Die "$asset does not contain remuda.exe" }
 
-    $installDir = if ($env:REMUDA_INSTALL_DIR) { $env:REMUDA_INSTALL_DIR } else { Join-Path $HOME '.local\bin' }
+    $installDir = if ($env:REMUDA_INSTALL_DIR) { $env:REMUDA_INSTALL_DIR } else { Join-Path $localAppData 'Programs\remuda\bin' }
     New-Item -ItemType Directory -Force -Path $installDir, $dataDir | Out-Null
     # Absolute, because it is about to be written to PATH, where a relative
     # entry means a different directory in every shell.
@@ -175,7 +188,7 @@ try {
     Set-Content -Path $channelFile -Value $channel -NoNewline
 
     Write-Host "install.ps1: remuda $version -> $installed ($channel channel)"
-    # Nothing on a stock Windows has ~\.local\bin on PATH, and a hint to add it
+    # Nothing on a stock Windows has %LOCALAPPDATA%\Programs\remuda\bin on PATH, and a hint to add it
     # is one more step between the one-liner and `remuda` being a command. So
     # persist it for the user, and add it to this session for the next step.
     # The session's PATH is not asked whether to persist: a launcher can put
@@ -209,9 +222,18 @@ try {
     }
 
     if ($env:REMUDA_INSTALL_BUTLER -eq '1') {
-        & $installed mod install warmblood-kr/remuda-butler --force
-        if ($LASTEXITCODE -ne 0) { Die 'could not install the Butler mod (Next: remuda mod install warmblood-kr/remuda-butler --force)' }
-        Write-Output 'Next: remuda butler doctor'
+        # `remuda mod install` clones with git, and a stock Windows has none.
+        # Remuda itself is installed by now, so say what is missing and how to
+        # finish, rather than fail the install on git's behalf.
+        # git.exe as an application, because that is all `remuda` will look
+        # for: a `git` function, alias or .cmd shim would not help it.
+        if (-not (Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue)) {
+            Write-Host 'install.ps1: the Butler mod needs git, which is not installed - install it (winget install --id Git.Git -e, or https://git-scm.com/download/win), open a new PowerShell, then: remuda mod install warmblood-kr/remuda-butler --force'
+        } else {
+            & $installed mod install warmblood-kr/remuda-butler --force
+            if ($LASTEXITCODE -ne 0) { Die 'could not install the Butler mod (Next: remuda mod install warmblood-kr/remuda-butler --force)' }
+            Write-Output 'Next: remuda butler doctor'
+        }
     }
 } finally {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp

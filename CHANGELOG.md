@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `remuda _codex_tui` accepts `-c KEY=VALUE` after `--status PATH [--model M]`
+  and forwards each one to the `codex app-server` it starts, so a mod can give a
+  Codex session an MCP server; `remuda _codex_tui --help` prints the usage line.
 - Nightly installs and upgrades now use immutable, versioned releases selected
   by `latest.json`; the newest ten are retained. Older installer copies still
   use the rolling `nightly` URL and may see a brief 404 while that compatibility
@@ -16,6 +19,16 @@
   held until `handle:release()` or until the daemon exits, so a mod can tell
   that another live daemon already owns its home. When the lock is held it
   returns `nil, "held", info`; the info line is message text only.
+- On Windows the data directory moved from `%USERPROFILE%\.local\share` to
+  `%LOCALAPPDATA%`: the channel file (`%LOCALAPPDATA%\remuda\channel`), mods
+  (`%LOCALAPPDATA%\remuda\mods`) and the update-check cache
+  (`%LOCALAPPDATA%\remuda\cache`). `XDG_DATA_HOME` and `XDG_CACHE_HOME` still
+  win. Nothing is migrated.
+- The Windows installer now installs per user: `remuda.exe` goes to
+  `%LOCALAPPDATA%\Programs\remuda\bin` and the channel file to
+  `%LOCALAPPDATA%\remuda` (was `~\.local\bin` and `~\.local\share\remuda`).
+  `REMUDA_INSTALL_DIR` and `XDG_DATA_HOME` still win.
 - Lua: `remuda.process.run{...}` and `remuda.process{...}` take an optional
   `cwd`, an absolute path to an existing directory where the child starts.
-  With `cwd`, the program must be an absolute path or a bare command name.
+  With `cwd`, the program must be an absolute path or a bare command name,
+  and a bare name is searched on the absolute entries of PATH only.

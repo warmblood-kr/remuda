@@ -1,3 +1,5 @@
+# Also checks the per-user default paths (%LOCALAPPDATA%).
+#
 # Runs docs/install.ps1 the way the one-liner does (`| iex`) against a stubbed
 # network, and asserts the install dir ends up on PATH: in this session, and on
 # Windows persisted for the user, so a NEW PowerShell finds `remuda` too.
@@ -28,7 +30,10 @@ New-Item -ItemType Directory -Force -Path $scratch | Out-Null
 
 $fakeAsset = Join-Path $scratch 'asset'
 Set-Content -Path $fakeAsset -Value 'stands in for the release tarball'
-$fakeSum = (Get-FileHash -Algorithm SHA256 $fakeAsset).Hash
+# Not Get-FileHash, for the reason docs/install.ps1 gives.
+$sha256 = [Security.Cryptography.SHA256]::Create()
+$fakeSum = [BitConverter]::ToString($sha256.ComputeHash([IO.File]::ReadAllBytes($fakeAsset))) -replace '-', ''
+$sha256.Dispose()
 
 # Functions shadow cmdlets and applications, and `iex` runs the installer in
 # this scope, so these are what it calls instead of the network and tar.
@@ -51,14 +56,14 @@ function tar {
 # Each takes out only this check's own entry, from the value as it is now -
 # for the user: unexpanded and as the kind it is, then Explorer is told, the
 # way the installer does - so a developer's own PATH comes back as it was.
-function Remove-FromSessionPath {
-    $env:PATH = @(($env:PATH -split ';') | Where-Object { $_ -ne $installDir }) -join ';'
+function Remove-FromSessionPath($dir = $installDir) {
+    $env:PATH = @(($env:PATH -split ';') | Where-Object { $_ -ne $dir }) -join ';'
 }
-function Remove-FromUserPath {
+function Remove-FromUserPath($dir = $installDir) {
     $envKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment', $true)
     if ($envKey.GetValueNames() -contains 'Path') {
         $kind = $envKey.GetValueKind('Path')
-        $kept = @(($envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';') | Where-Object { $_ -ne $installDir }) -join ';'
+        $kept = @(($envKey.GetValue('Path', '', 'DoNotExpandEnvironmentNames') -split ';') | Where-Object { $_ -ne $dir }) -join ';'
         if ($kept) { $envKey.SetValue('Path', $kept, $kind) } else { $envKey.DeleteValue('Path', $false) }
     }
     $envKey.Close()
@@ -77,6 +82,20 @@ $cases = @(
     @{ Name = 'new shell, on the user PATH only'; Before = { Remove-FromSessionPath }; Want = 1 },
     @{ Name = 'on the session PATH only'; Before = { Remove-FromUserPath }; Want = 1 }
 )
+
+# With no override at all the installer picks the per-user defaults. Each case
+# gets its own profile and, unless Local is $false, its own LOCALAPPDATA; the
+# profile is what the installer must fall back to when LOCALAPPDATA is empty.
+# Hangul AND a space in the path, as a real %LOCALAPPDATA% can have.
+$defaultCases = @(
+    @{ Name = 'default paths'; Local = $true },
+    @{ Name = 'LOCALAPPDATA empty -> profile\AppData\Local'; Local = $false },
+    @{ Name = 'XDG_DATA_HOME still wins for the channel file'; Local = $true; Xdg = $true }
+)
+$was = @{}
+foreach ($name in 'LOCALAPPDATA', 'USERPROFILE', 'XDG_DATA_HOME', 'REMUDA_INSTALL_DIR', 'REMUDA_NO_MODIFY_PATH') {
+    $was[$name] = [Environment]::GetEnvironmentVariable($name)
+}
 
 $failures = @()
 try {
@@ -100,7 +119,44 @@ try {
             $failures += "$($case.Name): install dir is on the user's persisted PATH $($user.Count) times, want $($case.Want)"
         }
     }
+
+    $n = 0
+    foreach ($case in $defaultCases) {
+        $n++
+        $profileDir = Join-Path $scratch "profile-$n"
+        $localDir = Join-Path $scratch "app data $hangul $n"
+        $base = if ($case.Local) { $localDir } else { Join-Path $profileDir 'AppData\Local' }
+        $dataHome = if ($case.Xdg) { Join-Path $scratch "xdg-$n" } else { $base }
+        $exeDir = Join-Path $base 'Programs\remuda\bin'
+        New-Item -ItemType Directory -Force -Path $profileDir, $base | Out-Null
+        $env:LOCALAPPDATA = if ($case.Local) { $localDir } else { $null }
+        $env:USERPROFILE = $profileDir
+        $env:XDG_DATA_HOME = if ($case.Xdg) { $dataHome } else { $null }
+        $env:REMUDA_INSTALL_DIR = $null
+        $env:REMUDA_NO_MODIFY_PATH = $null
+        try {
+            & { Get-Content -Raw $script | Invoke-Expression } *>&1 | Out-Null
+            $why = "default paths, $($case.Name)"
+
+            $exe = Join-Path $exeDir 'remuda.exe'
+            if (-not (Test-Path -LiteralPath $exe)) { $failures += "${why}: no remuda.exe at $exe" }
+            $channelFile = Join-Path (Join-Path $dataHome 'remuda') 'channel'
+            if (-not (Test-Path -LiteralPath $channelFile)) {
+                $failures += "${why}: no channel file at $channelFile"
+            } elseif ((Get-Content -Raw -LiteralPath $channelFile).Trim() -ne 'stable') {
+                $failures += "${why}: channel file does not say stable"
+            }
+            $session = @(($env:PATH -split ';') | Where-Object { $_ -eq $exeDir })
+            if ($session.Count -ne 1) { $failures += "${why}: $exeDir is on this session's PATH $($session.Count) times, want 1" }
+            $user = @(([Environment]::GetEnvironmentVariable('PATH', 'User') -split ';') | Where-Object { $_ -eq $exeDir })
+            if ($user.Count -ne 1) { $failures += "${why}: $exeDir is on the user's persisted PATH $($user.Count) times, want 1" }
+        } finally {
+            Remove-FromSessionPath $exeDir
+            Remove-FromUserPath $exeDir
+        }
+    }
 } finally {
+    foreach ($name in $was.Keys) { [Environment]::SetEnvironmentVariable($name, $was[$name]) }
     Remove-FromUserPath
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $scratch
 }
@@ -110,4 +166,4 @@ if ($failures) {
     $failures | ForEach-Object { Write-Host "  $_" }
     exit 1
 }
-Write-Host "ok - docs/install.ps1 puts its install dir on PATH, unless told not to"
+Write-Host "ok - docs/install.ps1 puts its install dir on PATH, unless told not to, and installs per-user by default"

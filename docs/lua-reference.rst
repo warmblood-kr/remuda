@@ -204,7 +204,7 @@ input.text
 input.type_text
 ---------------
 
-``input.type_text(session, text, settle?) -> status`` — Type text, honor the settle pause, then return 'submitted' or 'unverified'.
+``input.type_text(session, text, settle?) -> status`` — Type text, honor the settle pause, then return 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.
 
 insert
 ------
@@ -384,7 +384,7 @@ tools
 type_text
 ---------
 
-``type_text(session, text, settle?) -> status`` — Type text into a session and submit it with Return; returns 'submitted' or 'unverified'.
+``type_text(session, text, settle?) -> status`` — Type text into a session and submit it with Return; returns 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.
 
 unadvise
 --------
