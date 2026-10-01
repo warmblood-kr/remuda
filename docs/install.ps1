@@ -135,7 +135,16 @@ try {
     }
     if (-not $expected) { Die "$asset is not listed in SHA256SUMS" }
 
-    $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $tmp $asset)).Hash
+    # Not Get-FileHash: Windows PowerShell started underneath PowerShell 7 -
+    # `remuda upgrade` typed into pwsh - does not find it. .NET is always there.
+    $download = [IO.File]::OpenRead((Join-Path $tmp $asset))
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+        $actual = [BitConverter]::ToString($sha256.ComputeHash($download)) -replace '-', ''
+    } finally {
+        $download.Dispose()
+        $sha256.Dispose()
+    }
     if ($actual -ine $expected) {
         Die "checksum mismatch on $asset - refusing to install"
     }

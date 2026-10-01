@@ -74,3 +74,40 @@ fn a_failed_windows_install_leaves_the_session_open() {
 fn a_windows_install_without_git_explains_the_butler_step() {
     passes_under_both_shells("check-install-butler.ps1");
 }
+
+// `remuda upgrade` typed into PowerShell 7 runs the installer in Windows
+// PowerShell with pwsh's PSModulePath, where there is no Get-FileHash.
+#[cfg(windows)]
+#[test]
+fn a_windows_install_checks_its_download_in_powershell_started_from_pwsh() {
+    passes_under_both_shells("check-install-hash.ps1");
+
+    let pwsh = std::process::Command::new("pwsh")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "[Console]::OutputEncoding = [Text.Encoding]::UTF8; $env:PSModulePath",
+        ])
+        .output()
+        .expect("cannot run pwsh");
+    let module_path = String::from_utf8_lossy(&pwsh.stdout);
+    assert!(
+        pwsh.status.success() && !module_path.trim().is_empty(),
+        "pwsh did not say what its PSModulePath is"
+    );
+    let check = format!(
+        "{}/../scripts/check-install-hash.ps1",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let output = std::process::Command::new("powershell")
+        .env("PSModulePath", module_path.trim())
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", &check])
+        .output()
+        .expect("cannot run powershell");
+    assert!(
+        output.status.success(),
+        "powershell under pwsh's PSModulePath: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
