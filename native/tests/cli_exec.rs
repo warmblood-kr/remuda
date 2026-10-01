@@ -674,6 +674,16 @@ fn first_mod_subcommand_on_a_fresh_daemon_loads_the_mod() {
         assert!(!stderr.contains("stack traceback"), "{first:?}");
         assert!(first.status.success(), "{first:?}");
         assert_eq!(String::from_utf8_lossy(&first.stdout), expected);
+
+        // The load is never silent, and it happens once.
+        let second = home.remuda(args);
+        let notice = "remuda: started mod sample\n";
+        assert!(stderr.contains(notice), "{first:?}");
+        assert!(
+            !String::from_utf8_lossy(&second.stderr).contains(notice),
+            "{second:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&second.stdout), expected);
     }
 }
 
