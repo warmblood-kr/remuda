@@ -16,3 +16,6 @@
   held until `handle:release()` or until the daemon exits, so a mod can tell
   that another live daemon already owns its home. When the lock is held it
   returns `nil, "held", info`; the info line is message text only.
+- Lua: `remuda.process.run{...}` and `remuda.process{...}` take an optional
+  `cwd`, an absolute path to an existing directory where the child starts.
+  With `cwd`, the program must be an absolute path or a bare command name.

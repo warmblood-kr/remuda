@@ -16,6 +16,7 @@ use crate::child_guard;
 use crate::image::Image;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -56,6 +57,7 @@ pub fn run_sync(
     argv: Vec<String>,
     stdin: Option<Vec<u8>>,
     timeout_seconds: f64,
+    cwd: Option<PathBuf>,
 ) -> Result<RunOutput, String> {
     validate_run(&argv, timeout_seconds)?;
     let (stdout_permit, stderr_permit) = reserve_run_reader_workers()?;
@@ -69,6 +71,9 @@ pub fn run_sync(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if let Some(dir) = &cwd {
+        command.current_dir(dir);
+    }
     child_guard::harden(&mut command);
 
     #[cfg(windows)]
@@ -157,6 +162,35 @@ pub fn run_sync(
         timed_out,
         signal: exit_signal(&child_status),
     })
+}
+
+/// Check the optional `cwd` of `process.run` and `process`: an absolute path
+/// to an existing directory, and with it a program that is an absolute path
+/// or a bare name. The messages never echo the path: the caller passed it.
+pub fn checked_cwd(
+    word: &str,
+    cwd: Option<&str>,
+    program: &str,
+) -> Result<Option<PathBuf>, String> {
+    let Some(cwd) = cwd else {
+        return Ok(None);
+    };
+    let dir = Path::new(cwd);
+    if !dir.is_absolute() || !std::fs::metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+        return Err(format!(
+            "{word} cwd must be an absolute path to an existing directory. \
+             Next: pass the directory's full path."
+        ));
+    }
+    // std calls a relative program path with a working directory platform
+    // specific and unstable, so that one combination is refused.
+    if Path::new(program).is_relative() && program.contains(std::path::is_separator) {
+        return Err(format!(
+            "{word} with cwd needs an absolute program path or a bare command name. \
+             Next: pass the full path of the program."
+        ));
+    }
+    Ok(Some(dir.to_path_buf()))
 }
 
 fn validate_run(argv: &[String], timeout_seconds: f64) -> Result<(), String> {
@@ -535,6 +569,7 @@ mod run_tests {
             ],
             None,
             2.0,
+            None,
         )
         .expect("the child should start and exit before its deadline");
 
@@ -578,6 +613,7 @@ mod run_tests {
             ],
             Some(paths.into_bytes()),
             3.0,
+            None,
         )
         .expect("process.run should return after the leader exits");
         assert!(
@@ -708,6 +744,7 @@ mod run_tests {
             ],
             None,
             1.0,
+            None,
         )
         .expect("process.run should return after the leader exits");
         assert!(
@@ -992,6 +1029,7 @@ impl Processes {
         argv: Vec<String>,
         on_line: Option<String>,
         on_exit: Option<String>,
+        cwd: Option<PathBuf>,
     ) -> Result<u64, String> {
         let (program, args) = argv
             .split_first()
@@ -1002,6 +1040,9 @@ impl Processes {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if let Some(dir) = &cwd {
+            command.current_dir(dir);
+        }
         // Every plain-pipe child funnels through the one seam that keeps it
         // from outliving this daemon — see child_guard.rs.
         child_guard::harden(&mut command);
