@@ -1519,6 +1519,31 @@ fn shutdown_answers_waiters_and_runs_shutdown_cancellation_callback() {
     assert_eq!(cancellation, "shutdown");
 }
 
+/// Kills the pane's prompt client by its recorded PID. A session outlives its
+/// daemon, and a client with an unanswered prompt does not exit on its own.
+#[cfg(unix)]
+struct PaneClient(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for PaneClient {
+    fn drop(&mut self) {
+        use std::time::{Duration, Instant};
+
+        let Some(pid) = fs::read_to_string(&self.0)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())
+        else {
+            return;
+        };
+        // The client holds SIGTERM while it prompts, so only SIGKILL ends it.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { libc::kill(pid, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
 /// The pane of a session running `remuda deferred WORD`, once WAIT_FOR shows.
 #[cfg(unix)]
 fn prompt_pane_for_word(tag: &str, word: &str, columns: u16, wait_for: &str) -> Vec<String> {
@@ -1529,6 +1554,10 @@ fn prompt_pane_for_word(tag: &str, word: &str, columns: u16, wait_for: &str) -> 
 
     let (dir, remuda) = fixture(tag);
     let _cleanup = PrivateDaemonCleanup(dir.clone());
+    // Declared after the daemon cleanup, so it is dropped (and the client
+    // killed) before the daemon stops.
+    let pid_file = dir.join("pane.pid");
+    let _client = PaneClient(pid_file.clone());
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -1537,7 +1566,11 @@ fn prompt_pane_for_word(tag: &str, word: &str, columns: u16, wait_for: &str) -> 
     let socket = daemon::socket_path_in(&dir, "s");
     let name = "preface-pane";
     let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
-    let command = format!("sleep 0.2; \"{binary}\" -s s deferred {word}; sleep 30");
+    // `exec`, so the recorded shell PID is the client's.
+    let command = format!(
+        "echo $$ > \"{}\"; sleep 0.2; exec \"{binary}\" -s s deferred {word}",
+        pid_file.display()
+    );
     let started = client::request(
         &socket,
         &Request::New {
