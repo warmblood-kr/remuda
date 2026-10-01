@@ -79,9 +79,9 @@ unreachable peers do not make the local mutation fail. Each daemon also pulls
 from configured admitted peers at startup and about once per minute with
 per-process jitter, so offline peers can catch up without a restart.
 
-On Windows, `cluster init` and `cluster` status refuse to access identity
-storage until owner-only ACL hardening is implemented. Track that work in
-warmblood-kr/remuda#214. Windows has no identity-storage ACL hardening in PR6.
+On Windows the private state lives in `%LOCALAPPDATA%\remuda\cluster`. That
+directory and its files are owner-only and protected from inherited access.
+The base `%LOCALAPPDATA%\remuda` directory is checked, never changed.
 
 On Windows the cluster refuses, changing nothing, when an account other than
 you, SYSTEM or Administrators owns `%LOCALAPPDATA%\remuda` or may write to it.
