@@ -28,3 +28,7 @@
   `%LOCALAPPDATA%\Programs\remuda\bin` and the channel file to
   `%LOCALAPPDATA%\remuda` (was `~\.local\bin` and `~\.local\share\remuda`).
   `REMUDA_INSTALL_DIR` and `XDG_DATA_HOME` still win.
+- Lua: `remuda.process.run{...}` and `remuda.process{...}` take an optional
+  `cwd`, an absolute path to an existing directory where the child starts.
+  With `cwd`, the program must be an absolute path or a bare command name,
+  and a bare name is searched on the absolute entries of PATH only.

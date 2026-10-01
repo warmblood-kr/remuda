@@ -12,6 +12,7 @@ pub mod cluster_remote;
 pub mod cluster_tui;
 pub mod daemon;
 pub mod dist;
+pub mod find_command;
 pub(crate) mod fs_atomic;
 pub mod fs_lock;
 pub mod hostname;

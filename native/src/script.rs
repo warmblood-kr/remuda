@@ -364,12 +364,12 @@ const WORDS: &[(&str, &str, &str)] = &[
     (
         "_process_run",
         "Run an argv process synchronously with a bounded timeout and captured output; internal, called by `remuda.process.run`.",
-        "_process_run(argv, stdin?, timeout) -> result",
+        "_process_run(argv, stdin?, timeout, cwd?) -> result | nil, refusal",
     ),
     (
         "_process_spawn",
         "Spawn a plain-pipe child process; internal, wrapped by `remuda.process`.",
-        "_process_spawn(argv, on_line?, on_exit?) -> id",
+        "_process_spawn(argv, on_line?, on_exit?, cwd?) -> id | nil, refusal",
     ),
     (
         "_process_drain",
@@ -1460,10 +1460,21 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
     table.set(
         "_process_spawn",
         lua.create_function(
-            move |_, (argv, on_line, on_exit): (Vec<String>, Option<String>, Option<String>)| {
-                spawner
-                    .spawn(spawn_image.clone(), argv, on_line, on_exit)
-                    .map_err(mlua::Error::external)
+            move |_,
+                  (mut argv, on_line, on_exit, cwd): (
+                Vec<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            )| {
+                let cwd = match crate::process::checked_cwd("process", cwd.as_deref(), &mut argv) {
+                    Ok(cwd) => cwd,
+                    Err(refused) => return Ok((None, Some(refused))),
+                };
+                let id = spawner
+                    .spawn(spawn_image.clone(), argv, on_line, on_exit, cwd)
+                    .map_err(mlua::Error::external)?;
+                Ok((Some(id), None))
             },
         )?,
     )?;
@@ -1471,11 +1482,23 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
     table.set(
         "_process_run",
         lua.create_function(
-            |lua, (argv, stdin, timeout): (Vec<String>, Option<mlua::LuaString>, f64)| {
+            |lua,
+             (mut argv, stdin, timeout, cwd): (
+                Vec<String>,
+                Option<mlua::LuaString>,
+                f64,
+                Option<String>,
+            )| {
+                let cwd =
+                    match crate::process::checked_cwd("process.run", cwd.as_deref(), &mut argv) {
+                        Ok(cwd) => cwd,
+                        Err(refused) => return Ok((Value::Nil, Some(refused))),
+                    };
                 let output = crate::process::run_sync(
                     argv,
                     stdin.map(|value| value.as_bytes().to_vec()),
                     timeout,
+                    cwd,
                 )
                 .map_err(mlua::Error::runtime)?;
                 let result = lua.create_table()?;
@@ -1486,7 +1509,7 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
                 if let Some(signal) = output.signal {
                     result.set("signal", signal)?;
                 }
-                Ok(result)
+                Ok((Value::Table(result), None))
             },
         )?,
     )?;

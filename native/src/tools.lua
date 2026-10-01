@@ -2236,7 +2236,12 @@ local function process_start(spec)
   if spec.on_exit ~= nil and (type(spec.on_exit) ~= "string" or spec.on_exit == "") then
     error("a process's `on_exit`, when given, must be a non-empty string", 2)
   end
-  return remuda._process_spawn(spec.argv, spec.on_line, spec.on_exit)
+  if spec.cwd ~= nil and (type(spec.cwd) ~= "string" or not utf8.len(spec.cwd)) then
+    error("process cwd must be an absolute path to an existing directory. Next: pass the directory's full path.", 2)
+  end
+  local id, refused = remuda._process_spawn(spec.argv, spec.on_line, spec.on_exit, spec.cwd)
+  if id == nil then error(refused, 2) end
+  return id
 end
 local function process_run(spec)
   if type(spec) ~= "table" then error("process.run needs a spec table", 2) end
@@ -2256,13 +2261,18 @@ local function process_run(spec)
   if type(timeout) ~= "number" or timeout ~= timeout or timeout <= 0 or timeout > 30 then
     error("process.run timeout must be positive and at most 30 seconds", 2)
   end
-  return remuda._process_run(spec.argv, spec.stdin, timeout)
+  if spec.cwd ~= nil and (type(spec.cwd) ~= "string" or not utf8.len(spec.cwd)) then
+    error("process.run cwd must be an absolute path to an existing directory. Next: pass the directory's full path.", 2)
+  end
+  local result, refused = remuda._process_run(spec.argv, spec.stdin, timeout, spec.cwd)
+  if result == nil then error(refused, 2) end
+  return result
 end
 remuda.process = setmetatable({ run = process_run }, {
   __call = function(_, spec) return process_start(spec) end,
 })
-register("process", "Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output.", "process(spec) -> id; process.run(spec) -> {code, stdout, stderr, timed_out}")
-register("process.run", "Run argv directly without a shell; inherits the daemon's environment and working directory. Blocks the Lua image until exit or timeout (default 5s, max 30s), captures each stream up to 1 MiB. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.", "process.run{argv, stdin?, timeout?} -> {code, stdout, stderr, timed_out, signal?}")
+register("process", "Spawn an asynchronous plain-pipe child; process.run executes argv synchronously with bounded timeout and output. `cwd`, when given, is an absolute path to an existing directory where the child starts; with it argv[1] must be an absolute path or a bare command name, and a bare name is searched on the absolute entries of PATH only (never in cwd). Use this word, not process.run, for a command that can take longer than 30 seconds.", "process{argv, on_line?, on_exit?, cwd?} -> id; process.run(spec) -> {code, stdout, stderr, timed_out}")
+register("process.run", "Run argv directly without a shell; inherits the daemon's environment and, unless `cwd` is given, its working directory. `cwd` is an absolute path to an existing directory where the child starts; with it argv[1] must be an absolute path or a bare command name, and a bare name is searched on the absolute entries of PATH only (never in cwd). Blocks the Lua image until exit or timeout (default 5s, max 30s; longer commands use remuda.process), captures each stream up to 1 MiB. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.", "process.run{argv, stdin?, timeout?, cwd?} -> {code, stdout, stderr, timed_out, signal?}")
 
 -- Everything defined so far is core's; a mod may not replace it (#145).
 for key in pairs(remuda) do core_fields[key] = true end
