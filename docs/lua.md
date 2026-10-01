@@ -84,6 +84,10 @@ non-boolean value raise a Lua argument error. On Windows, `private` is ignored
 and the file uses the normal inherited ACL.
 This word does not restrict paths: the Lua runtime already provides trusted
 scripts with `io.open` and `os.rename`.
+On Windows 10 version 1903 and later those C-library words (`os.getenv`,
+`io.open`, `os.rename`, `os.remove`) read and return paths in UTF-8, the same
+bytes the `remuda.*` words use; on older Windows they use the system code page,
+so a non-ASCII path from one side is not valid on the other.
 
 ## New directory creation
 
