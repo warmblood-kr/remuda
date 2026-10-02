@@ -248,9 +248,8 @@ impl InputQueue {
                         batch.busy_retries += 1;
                         schedule_retry(batch, now, "input busy; retrying")
                     } else {
-                        let reason = format!(
-                            "input busy after {MAX_BUSY_RETRIES} retries; no bytes were written"
-                        );
+                        let reason =
+                            format!("busy after {MAX_BUSY_RETRIES} retries; no bytes were written");
                         batch.state = QueueState::Failed;
                         batch.status = reason.clone();
                         Some(QueueEvent::Failed { seq, reason })

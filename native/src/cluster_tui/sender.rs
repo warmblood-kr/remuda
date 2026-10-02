@@ -832,8 +832,7 @@ mod tests {
 
         let batch = queue.items().next().unwrap();
         assert_eq!(batch.state, QueueState::Failed);
-        assert!(batch.status.contains("busy"));
-        assert!(batch.status.contains("no bytes were written"));
+        assert_eq!(batch.status, "busy after 3 retries; no bytes were written");
     }
 
     #[test]
