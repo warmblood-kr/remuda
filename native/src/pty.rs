@@ -1230,6 +1230,64 @@ mod input_writer_tests {
     }
 
     #[test]
+    fn late_completion_refreshes_a_too_late_chain_abandonment() {
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let (finished_tx, finished_rx) = channel();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(StalledWrite {
+            started: Mutex::new(Some(started_tx)),
+            release: Mutex::new(release_rx),
+            finished: finished_tx,
+            first: AtomicBool::new(false),
+            captured: Arc::clone(&captured),
+        })));
+        let late_submit_bound = PTY_LATE_SUBMIT_BOUND;
+        let clock = Arc::new(remuda_core::ManualClock::new());
+        let writer = Arc::new(
+            PtyInputWriter::spawn(writer, Duration::from_millis(50), late_submit_bound).unwrap(),
+        );
+        writer.set_clock(clock.clone());
+
+        let first_writer = Arc::clone(&writer);
+        let first = std::thread::spawn(move || first_writer.write_bounded(b"text"));
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            first.join().unwrap(),
+            Err(AgentError::WriteTimeout { .. })
+        ));
+        {
+            let mut state = writer.state.lock().unwrap();
+            state.active_since =
+                Some(Instant::now() - late_submit_bound - Duration::from_millis(1));
+        }
+        assert_eq!(
+            writer.chain_after_stalled(b"\r", Duration::ZERO),
+            ChainOutcome::Unsupported
+        );
+        clock.advance(late_submit_bound + Duration::from_millis(1));
+
+        release_tx.send(()).unwrap();
+        finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while writer.is_busy() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!writer.is_busy());
+        assert!(matches!(
+            writer.write_bounded(b"first after late completion"),
+            Err(AgentError::LateSubmitAbandoned { bound }) if bound == late_submit_bound
+        ));
+        writer
+            .write_bounded(b"second after late completion")
+            .unwrap();
+        assert_eq!(
+            *captured.lock().unwrap(),
+            b"textsecond after late completion"
+        );
+    }
+
+    #[test]
     fn worker_panic_resets_busy_instead_of_sticking_the_session() {
         let writer: SharedWriter = Arc::new(Mutex::new(Box::new(PanickingWrite)));
         let writer =
