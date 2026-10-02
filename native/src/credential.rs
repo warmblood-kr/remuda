@@ -1,6 +1,7 @@
 //! `remuda.system.credential`: small secrets in the OS credential store.
 //!
-//! The service is always `"remuda"` and the account is the caller's name.
+//! The service is always `"remuda"` and the account is the caller's name; on
+//! Windows that is user name `remuda` and target name `remuda:` + name.
 //! Bad arguments raise a Lua error; a store that cannot answer returns
 //! `nil, reason`, where reason starts with `not_found`, `unavailable: ` or
 //! `denied: `. No error or reason ever carries the secret.
@@ -74,7 +75,105 @@ mod store {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+mod store {
+    use std::io;
+    use std::ptr;
+    use windows_sys::Win32::Security::Credentials::{
+        CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE,
+        CRED_TYPE_GENERIC,
+    };
+    use zeroize::{Zeroize, Zeroizing};
+
+    pub(super) const BACKEND: Option<&str> = Some("wincred");
+
+    const ERROR_NOT_FOUND: i32 = 1168;
+    // ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD and ERROR_LOGON_FAILURE.
+    const DENIED: [i32; 3] = [5, 1314, 1326];
+
+    // Only valid right after a Cred* call returned FALSE. A session with no
+    // logon session, such as SSH or WinRM (ERROR_NO_SUCH_LOGON_SESSION), is
+    // `unavailable`, like every failure that is not a miss or a refusal.
+    fn reason() -> String {
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(ERROR_NOT_FOUND) => "not_found".to_string(),
+            Some(code) if DENIED.contains(&code) => format!("denied: {error}"),
+            _ => format!("unavailable: {error}"),
+        }
+    }
+
+    // A generic credential's target name, NUL-terminated UTF-16.
+    fn target(name: &str) -> Vec<u16> {
+        wide(&format!("remuda:{name}"))
+    }
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain([0]).collect()
+    }
+
+    pub(super) fn put(name: &str, secret: &[u8]) -> Result<(), String> {
+        let mut target = target(name);
+        let mut user = wide("remuda");
+        let credential = CREDENTIALW {
+            Type: CRED_TYPE_GENERIC,
+            TargetName: target.as_mut_ptr(),
+            CredentialBlobSize: u32::try_from(secret.len())
+                .map_err(|_| "unavailable: the secret is too long".to_string())?,
+            CredentialBlob: secret.as_ptr().cast_mut(),
+            // This machine only: ENTERPRISE would roam the secret with the profile.
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            UserName: user.as_mut_ptr(),
+            ..Default::default()
+        };
+        // SAFETY: `credential` and the NUL-terminated strings and the blob it
+        // points to outlive the call, which only reads them.
+        if unsafe { CredWriteW(&credential, 0) } == 0 {
+            return Err(reason());
+        }
+        Ok(())
+    }
+
+    pub(super) fn get(name: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+        let target = target(name);
+        let mut credential: *mut CREDENTIALW = ptr::null_mut();
+        // SAFETY: `target` is NUL-terminated and `credential` is a valid out
+        // pointer; both outlive the call.
+        if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) } == 0 {
+            return Err(reason());
+        }
+        // SAFETY: CredReadW succeeded, so `credential` points to one CREDENTIALW
+        // whose blob, when not null, is CredentialBlobSize writable bytes that
+        // nothing else borrows. Nothing between the read and CredFree can
+        // return early, and `credential` is not used after CredFree.
+        let secret = unsafe {
+            let blob = (*credential).CredentialBlob;
+            let secret = if blob.is_null() {
+                Vec::new()
+            } else {
+                let bytes =
+                    std::slice::from_raw_parts_mut(blob, (*credential).CredentialBlobSize as usize);
+                let secret = bytes.to_vec();
+                bytes.zeroize();
+                secret
+            };
+            CredFree(credential.cast());
+            secret
+        };
+        Ok(Zeroizing::new(secret))
+    }
+
+    pub(super) fn delete(name: &str) -> Result<(), String> {
+        let target = target(name);
+        // SAFETY: `target` is NUL-terminated and outlives the call.
+        if unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) } == 0 {
+            return Err(reason());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 mod store {
     pub(super) const BACKEND: Option<&str> = None;
 
