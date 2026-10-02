@@ -593,6 +593,11 @@ fn validate_cli_spec(spec: &crate::cli_parse::Spec) -> mlua::Result<()> {
 
     let mut verb_names = HashSet::new();
     for verb in &spec.verbs {
+        if verb.name == "help" {
+            return Err(mlua::Error::runtime(
+                "remuda.cli.parse verb name 'help' is reserved",
+            ));
+        }
         if !cli_spec_valid_token(&verb.name, false) || !verb_names.insert(verb.name.as_str()) {
             return Err(mlua::Error::runtime(format!(
                 "remuda.cli.parse verb name is invalid or duplicated: {:?}",
@@ -2017,6 +2022,11 @@ mod binding_tests {
         rejects_cli_spec(
             r#"return {name="remuda", options={{long="help",help="a"}}, verbs={go={next="remuda"}}}"#,
         );
+    }
+
+    #[test]
+    fn cli_spec_rejects_reserved_help_verb() {
+        rejects_cli_spec(r#"return {name="remuda", verbs={help={next="remuda"}}}"#);
     }
 
     #[test]
