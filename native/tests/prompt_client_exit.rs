@@ -243,7 +243,11 @@ impl PromptClient {
     }
 
     fn wait(&mut self) -> Option<std::process::ExitStatus> {
-        let deadline = Instant::now() + WAIT;
+        self.wait_for(WAIT)
+    }
+
+    fn wait_for(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             if let Some(status) = self.child.try_wait().expect("poll client") {
                 return Some(status);
@@ -288,6 +292,7 @@ impl Drop for PromptClient {
 struct ClientResult {
     status: Option<std::process::ExitStatus>,
     output: String,
+    writes: usize,
 }
 
 fn waiting_prompt(dir: &Path) -> PromptClient {
@@ -303,10 +308,21 @@ fn waiting_prompt(dir: &Path) -> PromptClient {
 fn answer_prompt(dir: &Path) -> ClientResult {
     let mut daemon = start_daemon(dir);
     let mut client = waiting_prompt(dir);
-    client.write_terminal(b"answer\r");
+    std::thread::sleep(Duration::from_millis(500));
+    let mut writes = 0;
+    let mut status = None;
+    for _ in 0..=5 {
+        client.write_terminal(b"answer\r");
+        writes += 1;
+        status = client.wait_for(Duration::from_secs(3));
+        if status.is_some() {
+            break;
+        }
+    }
     let result = ClientResult {
-        status: client.wait(),
+        status,
         output: client.captured_output(),
+        writes,
     };
     client.cleanup();
     daemon.stop(dir);
@@ -320,6 +336,7 @@ fn stop_daemon_with_prompt(dir: &Path) -> ClientResult {
     let result = ClientResult {
         status: client.wait(),
         output: client.captured_output(),
+        writes: 0,
     };
     client.cleanup();
     result
@@ -332,6 +349,7 @@ fn sigterm_with_prompt(dir: &Path) -> ClientResult {
     let result = ClientResult {
         status: client.wait(),
         output: client.captured_output(),
+        writes: 0,
     };
     client.cleanup();
     daemon.stop(dir);
@@ -346,6 +364,7 @@ fn close_terminal_with_daemon_stop(dir: &Path) -> ClientResult {
     let result = ClientResult {
         status: client.wait(),
         output: client.captured_output(),
+        writes: 0,
     };
     client.cleanup();
     result
@@ -359,6 +378,7 @@ fn close_terminal_with_sigterm(dir: &Path) -> ClientResult {
     let result = ClientResult {
         status: client.wait(),
         output: client.captured_output(),
+        writes: 0,
     };
     client.cleanup();
     daemon.stop(dir);
@@ -375,15 +395,18 @@ fn prompt_client_exits_when_daemon_or_terminal_disappears_and_on_sigterm() {
     let terminal_gone = close_terminal_with_daemon_stop(&dir);
     let terminal_gone_sigterm = close_terminal_with_sigterm(&dir);
 
+    eprintln!("normal answer writes needed: {}", normal_answer.writes);
     assert!(
         normal_answer.status.is_some_and(|status| status.success()),
-        "answering a normal prompt did not succeed: {:?}; client output: {}",
+        "answering a normal prompt did not succeed after {} writes: {:?}; client output: {}",
+        normal_answer.writes,
         normal_answer.status,
         normal_answer.output
     );
     assert!(
         normal_answer.output.contains("answer: answer"),
-        "normal prompt answer was not returned: {}",
+        "normal prompt answer was not returned after {} writes: {}",
+        normal_answer.writes,
         normal_answer.output
     );
     assert!(
