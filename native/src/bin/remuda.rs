@@ -5811,6 +5811,15 @@ fn mod_cli_flag(values: &serde_json::Map<String, serde_json::Value>, key: &str) 
     values.get(key).and_then(serde_json::Value::as_bool) == Some(true)
 }
 
+fn reload_then_lines<R, L>(reload: R, lines: L) -> Result<Vec<String>, String>
+where
+    R: FnOnce() -> Result<(), String>,
+    L: FnOnce() -> Vec<String>,
+{
+    reload()?;
+    Ok(lines())
+}
+
 fn mod_install_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     let values = match mod_cli_parse("install", args) {
         Ok(values) => values,
@@ -5822,24 +5831,42 @@ fn mod_install_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     let reload = mod_cli_flag(&values, "reload");
     match remuda_native::packages::install(repository, reference, force) {
         Ok(report) => {
-            println!(
-                "installed mod {} {} from {} at {}",
-                report.manifest.name, report.manifest.version, report.repository, report.commit
-            );
             if reload {
-                match reload_mod_in_daemon(server, path, &report.manifest.name) {
-                    Ok(()) => println!(
-                        "reloaded mod {} in the running daemon",
-                        report.manifest.name
-                    ),
+                match reload_then_lines(
+                    || reload_mod_in_daemon(server, path, &report.manifest.name),
+                    || {
+                        vec![
+                            format!(
+                                "installed mod {} {} from {} at {}",
+                                report.manifest.name,
+                                report.manifest.version,
+                                report.repository,
+                                report.commit
+                            ),
+                            format!(
+                                "reloaded mod {} in the running daemon",
+                                report.manifest.name
+                            ),
+                        ]
+                    },
+                ) {
+                    Ok(lines) => {
+                        for line in lines {
+                            println!("{line}");
+                        }
+                    }
                     Err(error) => {
                         return fail(format!(
                             "installed mod {}, but its running copy was not replaced: {error}",
                             report.manifest.name
-                        ))
+                        ));
                     }
                 }
             } else {
+                println!(
+                    "installed mod {} {} from {} at {}",
+                    report.manifest.name, report.manifest.version, report.repository, report.commit
+                );
                 if report.manifest.lifecycle.is_some() {
                     println!(
                         "use `remuda -e \"remuda.reload('{}')\"` to reload in-process, or restart the daemon",
@@ -6055,22 +6082,40 @@ fn mod_update_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     };
     match result {
         Ok(report) => {
-            println!(
-                "updated mod {} {} from {} at {}",
-                report.manifest.name, report.manifest.version, report.repository, report.commit
-            );
             if reload {
-                match reload_mod_in_daemon(server, path, &report.manifest.name) {
-                    Ok(()) => {
-                        println!("update outcomes: updated [{}]; reloaded [{}]; failed none; not attempted none", report.manifest.name, report.manifest.name);
+                match reload_then_lines(
+                    || reload_mod_in_daemon(server, path, &report.manifest.name),
+                    || {
+                        vec![
+                            format!(
+                                "updated mod {} {} from {} at {}",
+                                report.manifest.name,
+                                report.manifest.version,
+                                report.repository,
+                                report.commit
+                            ),
+                            format!("update outcomes: updated [{}]; reloaded [{}]; failed none; not attempted none", report.manifest.name, report.manifest.name),
+                        ]
+                    },
+                ) {
+                    Ok(lines) => {
+                        for line in lines {
+                            println!("{line}");
+                        }
                         ExitCode::SUCCESS
                     }
-                    Err(error) => fail(format!(
-                        "update outcomes: updated [{}]; reloaded none; failed {}: {}; not attempted none",
-                        report.manifest.name, report.manifest.name, error
-                    )),
+                    Err(error) => {
+                        fail(format!(
+                            "update outcomes: updated [{}]; reloaded none; failed {}: {}; not attempted none",
+                            report.manifest.name, report.manifest.name, error
+                        ))
+                    }
                 }
             } else {
+                println!(
+                    "updated mod {} {} from {} at {}",
+                    report.manifest.name, report.manifest.version, report.repository, report.commit
+                );
                 println!(
                     "update outcomes: updated [{}]; reloaded none; failed none; not attempted none",
                     report.manifest.name
@@ -6313,6 +6358,31 @@ mod mod_cli_tests {
 
     fn parse_mod(words: &[&str]) -> Report {
         parse(&mod_cli_spec(), words)
+    }
+
+    #[test]
+    fn reload_lines_are_built_only_after_reload_succeeds() {
+        let mut failed_lines_built = 0;
+        let failed = super::reload_then_lines(
+            || Err("reload failed".to_string()),
+            || {
+                failed_lines_built += 1;
+                vec!["installed mod sample".to_string()]
+            },
+        );
+        assert_eq!(failed_lines_built, 0);
+        assert_eq!(failed, Err("reload failed".to_string()));
+
+        let mut successful_lines_built = 0;
+        let succeeded = super::reload_then_lines(
+            || Ok(()),
+            || {
+                successful_lines_built += 1;
+                vec!["updated mod sample".to_string()]
+            },
+        );
+        assert_eq!(successful_lines_built, 1);
+        assert_eq!(succeeded, Ok(vec!["updated mod sample".to_string()]));
     }
 
     #[test]
