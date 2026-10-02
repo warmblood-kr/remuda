@@ -481,6 +481,47 @@ mod tests {
     }
 
     #[test]
+    fn memory_handles_reject_unsafe_names_and_namespace_aliases() {
+        let lua = lua_with_storage();
+        lua.load(
+            r#"
+            local s = remuda.storage
+            for _, namespace in ipairs({"", ".", "..", "a/b", "a\\b"}) do
+                assert(not pcall(function() s.get(namespace) end))
+            end
+            local files = s.get("safe"):data()
+            for _, name in ipairs({"colon:name", "star*name", "question?name", "less<name", "greater>name", "pipe|name", 'quote"name', "trail.", "trail ", "CON", "prn", "AUX.txt", "nul.txt", "COM1", "com9.log", "LPT1", "lpt9.log"}) do
+                assert(not pcall(function() files:write(name, "x") end), name)
+            end
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn memory_writes_enforce_folded_names_and_size_limits_without_echoing_input() {
+        let lua = lua_with_storage();
+        lua.load(
+            r#"
+            local files = remuda.storage.get("safe"):data()
+            files:write("token", "x")
+            local ok, err = pcall(function() files:write("Token", "x") end)
+            assert(not ok and not tostring(err):find("Token", 1, true))
+            local payload = string.rep("s", 1024 * 1024 + 1)
+            ok, err = pcall(function() files:write("large", payload) end)
+            assert(not ok and not tostring(err):find(payload, 1, true) and not tostring(err):find("large", 1, true))
+            local limited = remuda.storage.get("limit"):data()
+            for i = 1, 1024 do limited:write("entry" .. i, "x") end
+            ok, err = pcall(function() limited:write("overflow", "secret-bytes") end)
+            assert(not ok and not tostring(err):find("overflow", 1, true) and not tostring(err):find("secret-bytes", 1, true))
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
     fn memory_secret_handles_validate_names_and_have_no_path() {
         let lua = lua_with_storage();
         lua.load(
