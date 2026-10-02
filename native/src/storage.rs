@@ -1,9 +1,11 @@
 //! Per-kind user directory resolution and Lua bindings.
 
 use mlua::{Lua, Table, UserData, UserDataMethods};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub(crate) type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;
@@ -132,27 +134,31 @@ pub(crate) fn user_file_path_for(
 }
 
 pub(crate) fn bindings(lua: &Lua) -> mlua::Result<Table> {
+    bindings_with_env(lua, &|name| std::env::var_os(name))
+}
+
+fn bindings_with_env(lua: &Lua, env: Env<'_>) -> mlua::Result<Table> {
+    let environment = Arc::new(
+        [
+            "REMUDA_STORAGE_ROOT",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "HOME",
+            "LOCALAPPDATA",
+            "USERPROFILE",
+        ]
+        .into_iter()
+        .filter_map(|name| env(name).map(|value| (name.to_string(), value)))
+        .collect::<HashMap<_, _>>(),
+    );
     let storage = lua.create_table()?;
-    storage.set(
-        "dir",
-        lua.create_function(|_, kind: String| {
-            match resolve_dir_for(&kind, cfg!(windows), &|name| std::env::var_os(name)) {
-                Ok(path) => match path.into_os_string().into_string() {
-                    Ok(path) => Ok((Some(path), None::<String>)),
-                    Err(_) => Ok((
-                        None::<String>,
-                        Some("unavailable: resolved path is not valid UTF-8".to_string()),
-                    )),
-                },
-                Err(error) if error.starts_with("unavailable: ") => {
-                    Ok((None::<String>, Some(error)))
-                }
-                Err(error) => Err(mlua::Error::runtime(error)),
-            }
-        })?,
-    )?;
+    register_dir_binding(lua, &storage)?;
     let files = Arc::new(Mutex::new(BTreeMap::new()));
+    let roots = Arc::new(Mutex::new(None::<Arc<FileRoots>>));
     let get_files = files.clone();
+    let get_roots = roots.clone();
     storage.set(
         "get",
         lua.create_function(move |lua, namespace: String| {
@@ -160,41 +166,114 @@ pub(crate) fn bindings(lua: &Lua) -> mlua::Result<Table> {
             lua.create_userdata(StorageView {
                 namespace,
                 files: get_files.clone(),
+                roots: get_roots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
             })
         })?,
     )?;
+    let default_files = files.clone();
+    let default_roots = roots.clone();
     storage.set(
         "default",
         lua.create_function(move |lua, ()| {
             lua.create_userdata(StorageView {
                 namespace: "default".into(),
-                files: files.clone(),
+                files: default_files.clone(),
+                roots: default_roots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
             })
         })?,
     )?;
+    let set_roots = roots.clone();
+    let memory_roots = roots.clone();
+    let backend_env = environment.clone();
     storage.set(
         "set_default",
-        lua.create_function(|_, backend: String| {
-            (backend == "memory")
-                .then_some(true)
-                .ok_or_else(|| mlua::Error::runtime("only the memory backend is available"))
+        lua.create_function(move |_, backend: String| {
+            let selected = match backend.as_str() {
+                "memory" => None,
+                "xdg" => Some(Arc::new(
+                    file_roots(&|name| backend_env.get(name).cloned())
+                        .map_err(mlua::Error::runtime)?,
+                )),
+                _ => return Err(mlua::Error::runtime("unknown storage backend")),
+            };
+            *set_roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = selected;
+            Ok(true)
         })?,
     )?;
-    storage.set("backend", lua.create_function(|_, ()| Ok("memory"))?)?;
+    storage.set(
+        "backend",
+        lua.create_function(move |_, ()| {
+            Ok(
+                if memory_roots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some()
+                {
+                    "xdg"
+                } else {
+                    "memory"
+                },
+            )
+        })?,
+    )?;
+    register_path_binding(lua, &storage, roots)?;
+    Ok(storage)
+}
+
+fn register_dir_binding(lua: &Lua, storage: &Table) -> mlua::Result<()> {
+    storage.set(
+        "dir",
+        lua.create_function(|_, kind: String| {
+            match resolve_dir_for(&kind, cfg!(windows), &|name| std::env::var_os(name)) {
+                Ok(path) => match path.into_os_string().into_string() {
+                    Ok(path) => Ok((Some(path), None::<String>)),
+                    Err(_) => Ok((
+                        None,
+                        Some("unavailable: resolved path is not valid UTF-8".to_string()),
+                    )),
+                },
+                Err(error) if error.starts_with("unavailable: ") => Ok((None, Some(error))),
+                Err(error) => Err(mlua::Error::runtime(error)),
+            }
+        })?,
+    )?;
+    Ok(())
+}
+
+fn register_path_binding(
+    lua: &Lua,
+    storage: &Table,
+    path_roots: Arc<Mutex<Option<Arc<FileRoots>>>>,
+) -> mlua::Result<()> {
     storage.set(
         "path",
-        lua.create_function(|_, (kind, name): (String, String)| {
-            if !matches!(
-                kind.as_str(),
-                "config" | "data" | "state" | "cache" | "secret"
-            ) {
-                return Err(mlua::Error::runtime("remuda.storage.path: unknown kind"));
+        lua.create_function(move |_, (kind, name): (String, String)| {
+            if kind == "secret" {
+                checked_name(&name)?;
+                return Ok(None::<String>);
             }
+            let Some(kind) = Kind::parse(&kind) else {
+                return Err(mlua::Error::runtime("remuda.storage.path: unknown kind"));
+            };
             checked_name(&name)?;
-            Ok(None::<String>)
+            Ok(path_roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(|roots| roots.get(kind.as_str()))
+                .map(|root| root.join("storage").join("default").join(name))
+                .and_then(|path| path.into_os_string().into_string().ok()))
         })?,
     )?;
-    Ok(storage)
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -219,10 +298,104 @@ impl HandleKind {
 }
 
 type MemoryFiles = Arc<Mutex<BTreeMap<(String, String, String), Vec<u8>>>>;
+type FileRoots = BTreeMap<&'static str, PathBuf>;
+const ATOMIC_TEMP_PREFIX: &str = ".remuda-atomic-";
+const MAX_STORAGE_VALUE_BYTES: usize = 1024 * 1024;
+
+fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
+    let override_root = env("REMUDA_STORAGE_ROOT")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from);
+    if override_root
+        .as_ref()
+        .is_some_and(|root| !root.is_absolute())
+    {
+        return Err("REMUDA_STORAGE_ROOT must be an absolute path".into());
+    }
+    [Kind::Config, Kind::Data, Kind::State, Kind::Cache]
+        .into_iter()
+        .map(|kind| {
+            let root = match &override_root {
+                Some(root) => root.join(kind.as_str()),
+                None => resolve_dir_for(kind.as_str(), cfg!(windows), env)?,
+            };
+            Ok((kind.as_str(), root))
+        })
+        .collect()
+}
+
+fn collect_files(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    prefix: &str,
+    names: &mut Vec<String>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            collect_files(base, &path, prefix, names)?;
+        } else if kind.is_file()
+            && !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(ATOMIC_TEMP_PREFIX))
+        {
+            if let Some(name) = path.strip_prefix(base).ok().and_then(lua_relative_name) {
+                if name.starts_with(prefix) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn lua_relative_name(path: &Path) -> Option<String> {
+    path.components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()
+        .map(|components| components.join("/"))
+}
+
+fn read_regular_file(path: &Path) -> io::Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe file",
+        ));
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = fs::File::open(path)?;
+
+    let mut bytes =
+        Vec::with_capacity(metadata.len().min((MAX_STORAGE_VALUE_BYTES + 1) as u64) as usize);
+    file.take((MAX_STORAGE_VALUE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_STORAGE_VALUE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "storage value too large",
+        ));
+    }
+    Ok(bytes)
+}
 
 struct StorageView {
     namespace: String,
     files: MemoryFiles,
+    roots: Option<Arc<FileRoots>>,
 }
 
 impl StorageView {
@@ -231,6 +404,7 @@ impl StorageView {
             namespace: self.namespace.clone(),
             kind,
             files: self.files.clone(),
+            roots: self.roots.clone(),
         }
     }
 }
@@ -257,9 +431,23 @@ struct KindHandle {
     namespace: String,
     kind: HandleKind,
     files: MemoryFiles,
+    roots: Option<Arc<FileRoots>>,
 }
 
 impl KindHandle {
+    fn file_path(&self, name: &str) -> mlua::Result<PathBuf> {
+        if matches!(self.kind, HandleKind::Secret) {
+            return Err(mlua::Error::runtime(
+                "unavailable: file secrets are disabled until PR C",
+            ));
+        }
+        self.roots
+            .as_ref()
+            .and_then(|roots| roots.get(self.kind.as_str()))
+            .map(|root| root.join("storage").join(&self.namespace).join(name))
+            .ok_or_else(|| mlua::Error::runtime("unavailable: storage root is unavailable"))
+    }
+
     fn key(&self, name: String) -> mlua::Result<(String, String, String)> {
         Ok((
             self.namespace.clone(),
@@ -273,11 +461,31 @@ impl KindHandle {
         lua: &Lua,
         name: String,
     ) -> mlua::Result<(Option<mlua::LuaString>, Option<String>)> {
+        let key = self.key(name)?;
+        if self.roots.is_some() {
+            if matches!(self.kind, HandleKind::Secret) {
+                return Ok((
+                    None,
+                    Some("unavailable: file secrets are disabled until PR C".into()),
+                ));
+            }
+            return match read_regular_file(&self.file_path(&key.2)?) {
+                Ok(bytes) => Ok((Some(lua.create_string(bytes)?), None)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Ok((None, Some("not_found".into())))
+                }
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok((
+                    None,
+                    Some("denied: storage path is not a regular file".into()),
+                )),
+                Err(_) => Ok((None, Some("unavailable: storage read failed".into()))),
+            };
+        }
         let value = self
             .files
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&self.key(name)?)
+            .get(&key)
             .cloned();
         match value {
             Some(bytes) => Ok((Some(lua.create_string(bytes)?), None)),
@@ -290,6 +498,36 @@ impl KindHandle {
             return Err(mlua::Error::runtime("remuda.storage write exceeds 1 MiB"));
         }
         let key = self.key(name)?;
+        if self.roots.is_some() {
+            if matches!(self.kind, HandleKind::Secret) {
+                return Err(mlua::Error::runtime(
+                    "unavailable: file secrets are disabled until PR C",
+                ));
+            }
+            let namespace_root = self.file_path("")?;
+            let mut names = Vec::new();
+            if namespace_root.is_dir() {
+                collect_files(&namespace_root, &namespace_root, "", &mut names)
+                    .map_err(|_| mlua::Error::runtime("unavailable: storage list failed"))?;
+            }
+            let folded = key.2.to_ascii_lowercase();
+            if names
+                .iter()
+                .any(|name| name != &key.2 && name.to_ascii_lowercase() == folded)
+            {
+                return Err(mlua::Error::runtime("remuda.storage name collides by case"));
+            }
+            if !names.iter().any(|name| name == &key.2) && names.len() >= 1024 {
+                return Err(mlua::Error::runtime("remuda.storage entry limit reached"));
+            }
+            let path = self.file_path(&key.2)?;
+            fs::create_dir_all(path.parent().unwrap()).map_err(|_| {
+                mlua::Error::runtime("unavailable: storage directory create failed")
+            })?;
+            crate::fs_atomic::write_atomic(&path, bytes, 0o600)
+                .map_err(|_| mlua::Error::runtime("unavailable: storage write failed"))?;
+            return Ok(());
+        }
         let mut files = self
             .files
             .lock()
@@ -317,19 +555,43 @@ impl KindHandle {
     }
 
     fn exists(&self, name: String) -> mlua::Result<bool> {
+        let key = self.key(name)?;
+        if self.roots.is_some() {
+            return Ok(if matches!(self.kind, HandleKind::Secret) {
+                false
+            } else {
+                self.file_path(&key.2)?.is_file()
+            });
+        }
         Ok(self
             .files
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&self.key(name)?))
+            .contains_key(&key))
     }
 
     fn delete(&self, name: String) -> mlua::Result<(Option<bool>, Option<String>)> {
+        let key = self.key(name)?;
+        if self.roots.is_some() {
+            if matches!(self.kind, HandleKind::Secret) {
+                return Ok((
+                    None,
+                    Some("unavailable: file secrets are disabled until PR C".into()),
+                ));
+            }
+            return match fs::remove_file(self.file_path(&key.2)?) {
+                Ok(()) => Ok((Some(true), None)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Ok((None, Some("not_found".into())))
+                }
+                Err(_) => Ok((None, Some("unavailable: storage delete failed".into()))),
+            };
+        }
         if self
             .files
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.key(name)?)
+            .remove(&key)
             .is_some()
         {
             Ok((Some(true), None))
@@ -340,6 +602,21 @@ impl KindHandle {
 
     fn list(&self, lua: &Lua, prefix: String) -> mlua::Result<Table> {
         let prefix = checked_prefix(prefix)?;
+        if self.roots.is_some() {
+            if matches!(self.kind, HandleKind::Secret) {
+                return Err(mlua::Error::runtime(
+                    "unavailable: file secrets are disabled until PR C",
+                ));
+            }
+            let root = self.file_path("")?;
+            let mut names = Vec::new();
+            if root.is_dir() {
+                collect_files(&root, &root, &prefix, &mut names)
+                    .map_err(|_| mlua::Error::runtime("unavailable: storage list failed"))?;
+            }
+            names.sort();
+            return lua.create_sequence_from(names);
+        }
         let names = self
             .files
             .lock()
@@ -386,12 +663,20 @@ impl UserData for SecretHandle {
                         "remuda.storage.secret.put secret must be 1..=2048 bytes",
                     ));
                 }
+                // File secrets stay unavailable until PR C adds the protected Windows DACL root.
+                if this.0.roots.is_some() {
+                    return Ok((
+                        None,
+                        Some("unavailable: file secrets are disabled until PR C".to_string()),
+                    ));
+                }
                 this.0.write(name, &secret.as_bytes())?;
-                Ok(true)
+                Ok((Some(true), None::<String>))
             },
         );
         methods.add_method("get", |lua, this, name: String| this.0.read(lua, name));
         methods.add_method("delete", |_, this, name: String| this.0.delete(name));
+        methods.add_method("exists", |_, this, name: String| this.0.exists(name));
     }
 }
 
@@ -410,6 +695,7 @@ fn checked_name(name: &str) -> mlua::Result<String> {
                 || part == "."
                 || part == ".."
                 || part.len() > 255
+                || part.starts_with(ATOMIC_TEMP_PREFIX)
                 || !part.bytes().all(|byte| byte.is_ascii_graphic())
                 || part
                     .bytes()
@@ -469,6 +755,30 @@ fn checked_prefix(prefix: String) -> mlua::Result<String> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+    struct TestRoot(PathBuf);
+
+    impl TestRoot {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "remuda-storage-{}-{}",
+                std::process::id(),
+                NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     fn env(values: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let values: HashMap<_, _> = values
@@ -525,6 +835,239 @@ mod tests {
         remuda.set("storage", bindings(&lua).unwrap()).unwrap();
         lua.globals().set("remuda", remuda).unwrap();
         lua
+    }
+
+    fn lua_with_xdg_root(root: &std::path::Path) -> Lua {
+        let environment = |name: &str| match name {
+            "REMUDA_STORAGE_ROOT" => Some(root.as_os_str().to_owned()),
+            _ => None,
+        };
+        lua_with_env(&environment)
+    }
+
+    fn lua_with_env(environment: Env<'_>) -> Lua {
+        let lua = Lua::new();
+        let remuda = lua.create_table().unwrap();
+        remuda
+            .set("storage", bindings_with_env(&lua, environment).unwrap())
+            .unwrap();
+        lua.globals().set("remuda", remuda).unwrap();
+        lua
+    }
+
+    const HANDLE_CONFORMANCE: &str = r#"
+        local s = remuda.storage
+        local a, b = s.get("suite"):data(), s.get("other"):data()
+        local value = string.char(0, 255, 1)
+        assert(a:write("mail/a.bin", value) and a:exists("mail/a.bin"))
+        local read, err = a:read("mail/a.bin"); assert(read == value and err == nil)
+        assert(b:read("mail/a.bin") == nil)
+        assert(a:write("mail/b.bin", "b"))
+        local names = a:list("mail/")
+        assert(#names == 2 and names[1] == "mail/a.bin" and names[2] == "mail/b.bin")
+        assert(a:delete("mail/a.bin") and not a:exists("mail/a.bin"))
+        local folded = s.get("folded"):data(); folded:write("token", "x")
+        assert(not pcall(function() folded:write("Token", "x") end))
+        local limited = s.get("limited"):data()
+        for i = 1, 1024 do limited:write("entry" .. i, "x") end
+        assert(not pcall(function() limited:write("overflow", "x") end))
+    "#;
+
+    fn select_backend(lua: &Lua, name: &str) {
+        lua.load(format!("assert(remuda.storage.set_default('{name}'))"))
+            .exec()
+            .unwrap();
+    }
+
+    #[test]
+    fn lua_relative_name_uses_forward_slashes() {
+        let path = PathBuf::from("mail").join("nested").join("a.bin");
+        assert_eq!(
+            lua_relative_name(&path).as_deref(),
+            Some("mail/nested/a.bin")
+        );
+    }
+
+    #[test]
+    fn xdg_namespaces_live_below_storage_subdirectory() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load("remuda.storage.get('cluster'):state():write('key', 'value')")
+            .exec()
+            .unwrap();
+        assert!(root.0.join("state/storage/cluster/key").is_file());
+        assert!(!root.0.join("state/cluster/key").exists());
+        let path: String = lua
+            .load("return remuda.storage.path('state', 'key')")
+            .eval()
+            .unwrap();
+        assert_eq!(
+            PathBuf::from(path),
+            root.0.join("state/storage/default/key")
+        );
+    }
+
+    #[test]
+    fn xdg_list_skips_and_reserves_atomic_temporary_names() {
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/listed");
+        fs::create_dir_all(&namespace).unwrap();
+        fs::write(namespace.join("regular"), b"file").unwrap();
+        fs::write(namespace.join(".remuda-atomic-123.tmp"), b"temporary").unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"
+            local files = remuda.storage.get("listed"):data()
+            local names = files:list()
+            assert(#names == 1 and names[1] == "regular")
+            assert(not pcall(function() files:write(".remuda-atomic-user.tmp", "x") end))
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn xdg_secret_operations_stay_unavailable_without_creating_files() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"
+            local secret = remuda.storage.get("secrets"):secret()
+            local value, reason = secret:put("token", "value")
+            assert(value == nil and reason:match("^unavailable:"))
+            value, reason = secret:get("token"); assert(value == nil and reason:match("^unavailable:"))
+            value, reason = secret:delete("token"); assert(value == nil and reason:match("^unavailable:"))
+            assert(secret:exists("token") == false)
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert!(fs::read_dir(&root.0).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_read_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/reader");
+        fs::create_dir_all(&namespace).unwrap();
+        fs::write(namespace.join("target"), b"secret").unwrap();
+        symlink(namespace.join("target"), namespace.join("linked")).unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"local value, reason = remuda.storage.get("reader"):data():read("linked"); assert(value == nil and reason)"#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn xdg_read_rejects_files_larger_than_one_mib() {
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/reader");
+        fs::create_dir_all(&namespace).unwrap();
+        fs::write(namespace.join("large"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"local value, reason = remuda.storage.get("reader"):data():read("large"); assert(value == nil and reason)"#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_read_does_not_block_on_fifo() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::time::Duration;
+
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/reader");
+        fs::create_dir_all(&namespace).unwrap();
+        let fifo = namespace.join("pipe");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let root_path = root.0.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let lua = lua_with_xdg_root(&root_path);
+            select_backend(&lua, "xdg");
+            let result = lua
+                .load(r#"local value, reason = remuda.storage.get("reader"):data():read("pipe"); assert(value == nil and reason)"#)
+                .exec();
+            let _ = send.send(result.is_ok());
+        });
+        assert!(receive.recv_timeout(Duration::from_secs(2)).unwrap());
+    }
+
+    fn run_handle_conformance(lua: &Lua, backend: &str) {
+        select_backend(lua, backend);
+        lua.load(HANDLE_CONFORMANCE).exec().unwrap();
+    }
+
+    #[test]
+    fn handle_conformance_runs_against_memory_and_xdg_file_backends() {
+        let memory = lua_with_storage();
+        run_handle_conformance(&memory, "memory");
+
+        let root = TestRoot::new();
+        let file = lua_with_xdg_root(&root.0);
+        run_handle_conformance(&file, "xdg");
+        assert_eq!(
+            fs::read(root.0.join("data/storage/suite/mail/b.bin")).unwrap(),
+            b"b"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_list_skips_directories_and_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestRoot::new();
+        let directory = root.0.join("data/storage/listed");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("regular"), b"file").unwrap();
+        fs::create_dir(directory.join("nested")).unwrap();
+        symlink(directory.join("regular"), directory.join("linked")).unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"local names = remuda.storage.get("listed"):data():list(); assert(#names == 1 and names[1] == "regular")"#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_without_root_uses_the_kind_resolver() {
+        let root = TestRoot::new();
+        let data_home = root.0.join("xdg-data");
+        let environment = |name: &str| match name {
+            "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_STATE_HOME" | "XDG_CACHE_HOME" => {
+                Some(data_home.as_os_str().to_owned())
+            }
+            _ => None,
+        };
+        let lua = lua_with_env(&environment);
+        select_backend(&lua, "xdg");
+        lua.load("remuda.storage.get('resolved'):data():write('item', 'x')")
+            .exec()
+            .unwrap();
+        assert_eq!(
+            fs::read(data_home.join("remuda/storage/resolved/item")).unwrap(),
+            b"x"
+        );
     }
 
     #[test]
