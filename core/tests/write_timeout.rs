@@ -141,6 +141,63 @@ fn interactive_send_returns_busy_only_after_the_writer_deadline() {
 }
 
 #[test]
+fn send_line_reports_pending_when_enter_is_busy_after_body_lands() {
+    let (body_tx, body_rx) = mpsc::channel();
+    let (attached_started_tx, attached_started_rx) = mpsc::channel();
+    let (attached_release_tx, attached_release_rx) = mpsc::channel();
+    let writer = Arc::new(SendLineBusyWriter {
+        body: Mutex::new(String::new()),
+        body_landed: AtomicBool::new(false),
+        attached_busy: AtomicBool::new(false),
+        body_written: Mutex::new(Some(body_tx)),
+        attached_started: Mutex::new(Some(attached_started_tx)),
+        attached_release: Mutex::new(attached_release_rx),
+    });
+    let clock = Arc::new(ManualClock::new());
+    let session = Arc::new(Session::new(
+        "send-line-enter-busy",
+        Box::new(SendLineBusyAgent {
+            writer: Arc::clone(&writer),
+        }),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    ));
+
+    let send_session = Arc::clone(&session);
+    let (result_tx, result_rx) = mpsc::channel();
+    let send = thread::spawn(move || {
+        result_tx
+            .send(send_session.send_line("draft body"))
+            .unwrap();
+    });
+    body_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("send_line body landed");
+
+    let attach_session = Arc::clone(&session);
+    let human_write = thread::spawn(move || attach_session.attach().write_raw(b"human key"));
+    attached_started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("attached writer stalled before Enter");
+    clock.advance(Duration::from_millis(300));
+
+    let result = result_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("send_line returned after Enter was refused");
+    attached_release_tx.send(()).unwrap();
+    assert!(human_write.join().unwrap().is_ok());
+    send.join().unwrap();
+
+    assert!(
+        matches!(&result, Err(AgentError::SubmitUncertain)),
+        "the body landed but the refused Enter was reported as {result:?}"
+    );
+    assert_eq!(
+        result.unwrap_err().to_string(),
+        "text may be in the pane, but submission is unconfirmed.\nNext: inspect it with `remuda capture NAME` before resending."
+    );
+}
+
+#[test]
 fn takeover_wakes_an_attached_write_without_holding_the_attach_slot() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -651,6 +708,110 @@ fn input_waiting_during_feed_pause_queues_behind_healthy_feed_write() {
         Ok(InputOutcome::Ack { duplicate: true })
     );
     assert_eq!(writer.writes.load(Ordering::Acquire), 2);
+}
+
+struct SendLineBusyWriter {
+    body: Mutex<String>,
+    body_landed: AtomicBool,
+    attached_busy: AtomicBool,
+    body_written: Mutex<Option<Sender<()>>>,
+    attached_started: Mutex<Option<Sender<()>>>,
+    attached_release: Mutex<Receiver<()>>,
+}
+
+impl AgentWriter for SendLineBusyWriter {
+    fn write_bounded(&self, bytes: &[u8]) -> Result<()> {
+        if self.body_landed.load(Ordering::Acquire) {
+            return if self.attached_busy.load(Ordering::Acquire) {
+                Err(AgentError::Busy)
+            } else {
+                Err(AgentError::Io("unexpected bounded write after body".into()))
+            };
+        }
+        *self.body.lock().unwrap() = String::from_utf8_lossy(bytes).into_owned();
+        self.body_landed.store(true, Ordering::Release);
+        if let Some(written) = self.body_written.lock().unwrap().take() {
+            written.send(()).unwrap();
+        }
+        Ok(())
+    }
+
+    fn write_to_completion_while(&self, _bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
+        self.attached_busy.store(true, Ordering::Release);
+        if let Some(started) = self.attached_started.lock().unwrap().take() {
+            started.send(()).unwrap();
+        }
+        loop {
+            if cancelled() {
+                self.attached_busy.store(false, Ordering::Release);
+                return Err(AgentError::Attached);
+            }
+            match self
+                .attached_release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_millis(5))
+            {
+                Ok(()) => {
+                    self.attached_busy.store(false, Ordering::Release);
+                    return Ok(());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.attached_busy.store(false, Ordering::Release);
+                    return Err(AgentError::Io(
+                        "attached writer released without signal".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn is_busy(&self) -> bool {
+        self.attached_busy.load(Ordering::Acquire)
+    }
+}
+
+struct SendLineBusyAgent {
+    writer: Arc<SendLineBusyWriter>,
+}
+
+impl AgentProcess for SendLineBusyAgent {
+    fn write(&mut self, _bytes: &[u8]) -> Result<()> {
+        Err(AgentError::Io("unexpected direct write".into()))
+    }
+
+    fn input_writer(&mut self) -> Option<Arc<dyn AgentWriter>> {
+        Some(Arc::clone(&self.writer) as Arc<dyn AgentWriter>)
+    }
+
+    fn screen_text(&mut self) -> Result<String> {
+        Ok(self.writer.body.lock().unwrap().clone())
+    }
+
+    fn output_version(&mut self) -> Option<u64> {
+        Some(0)
+    }
+
+    fn cursor(&mut self) -> Result<Cursor> {
+        Ok(Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        })
+    }
+
+    fn is_alive(&mut self) -> bool {
+        true
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        Err(AgentError::Io("not used".into()))
+    }
+
+    fn size(&self) -> Size {
+        Size::default()
+    }
 }
 
 struct BlockingAgent {

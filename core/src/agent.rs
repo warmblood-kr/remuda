@@ -224,6 +224,8 @@ pub enum AgentError {
     },
     /// Text is still being written; its Return will follow if it lands in time.
     SubmitPending,
+    /// The body landed, but the Enter write was refused while another write was busy.
+    SubmitUncertain,
     /// A `feed` act's `Pause`s summed past the caller's cap — refused before
     /// anything is written, not clamped, so a seconds/millis mixup errors
     /// instead of silently running a shorter pause than asked for.
@@ -258,6 +260,10 @@ impl fmt::Display for AgentError {
             AgentError::SubmitPending => write!(
                 f,
                 "text is still being written to a slow pane; Return follows when it lands or is dropped after the bound; check the pane before resending"
+            ),
+            AgentError::SubmitUncertain => write!(
+                f,
+                "text may be in the pane, but submission is unconfirmed.\nNext: inspect it with `remuda capture NAME` before resending."
             ),
             AgentError::PauseTooLong { total, cap } => {
                 write!(f, "feed's pauses total {total:?}, over the {cap:?} cap")
