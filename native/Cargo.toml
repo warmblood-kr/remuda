@@ -63,6 +63,12 @@ nix = { version = "0.28.0", features = ["socket"] }
 # the graph transitively via several other deps (mio, parking_lot_core, ...).
 libc = "0.2"
 
+# `remuda.system.credential`: the login Keychain, generic passwords. Already in
+# the graph via `rustls-platform-verifier`; every other OS answers
+# `unavailable` without it.
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "=3.7.0"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 

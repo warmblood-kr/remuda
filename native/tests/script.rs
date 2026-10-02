@@ -541,6 +541,141 @@ fn random_bytes_returns_csprng_bytes_and_rejects_invalid_lengths() {
     );
 }
 
+// None of the credential tests below reach a real OS store: every call either
+// fails validation first or runs where no backend exists. The round trip that
+// does write to the login Keychain is `#[ignore]`.
+const CREDENTIAL_PRELUDE: &str = r#"
+    assert(type(remuda.system) == "table", "remuda.system is missing")
+    local credential = remuda.system.credential
+    assert(type(credential) == "table", "remuda.system.credential is missing")
+    local MARKER = "s3cret-MARKER-do-not-leak"
+"#;
+
+#[test]
+fn credential_surface_is_exactly_put_get_delete_backend() {
+    let backend = if cfg!(target_os = "macos") {
+        r#""keychain""#
+    } else {
+        "nil"
+    };
+    run_lua(
+        "credential-surface",
+        &format!(
+            r#"{CREDENTIAL_PRELUDE}
+            local words = {{}}
+            for key in pairs(credential) do words[#words + 1] = key end
+            table.sort(words)
+            assert(table.concat(words, ",") == "backend,delete,get,put", table.concat(words, ","))
+            local system_words = {{}}
+            for key in pairs(remuda.system) do system_words[#system_words + 1] = key end
+            assert(table.concat(system_words, ",") == "credential", table.concat(system_words, ","))
+            assert(credential.backend() == {backend}, "backend is " .. tostring(credential.backend()))
+            "#
+        ),
+    );
+}
+
+#[test]
+fn credential_rejects_invalid_names_and_secret_lengths() {
+    run_lua(
+        "credential-validation",
+        &format!(
+            r#"{CREDENTIAL_PRELUDE}
+            local bad_names = {{
+              "", string.rep("a", 256), "tab\there", "line\nbreak", "nul\0byte",
+              "del\127", "caf\195\169", "has space", {{}}, true,
+            }}
+            for index, name in ipairs(bad_names) do
+              for _, word in ipairs({{ "put", "get", "delete" }}) do
+                local ok, err = pcall(credential[word], name, MARKER)
+                assert(not ok, word .. " should reject bad name #" .. index)
+                err = tostring(err)
+                assert(err:find("name", 1, true), word .. " error should mention name: " .. err)
+                assert(not err:find(MARKER, 1, true), word .. " error leaked the secret")
+              end
+            end
+            assert(not pcall(credential.get), "get needs a name")
+            assert(not pcall(credential.delete), "delete needs a name")
+
+            for _, secret in ipairs({{ "", MARKER .. string.rep("x", 2049 - #MARKER) }}) do
+              local ok, err = pcall(credential.put, "remuda-test/never-stored", secret)
+              assert(not ok, "put should reject a secret of " .. #secret .. " bytes")
+              err = tostring(err)
+              assert(err:find("secret", 1, true), "put error should mention secret: " .. err)
+              assert(not err:find(MARKER, 1, true), "put error leaked the secret")
+            end
+            for _, secret in ipairs({{ {{}}, true }}) do
+              assert(not pcall(credential.put, "remuda-test/never-stored", secret),
+                "put should reject a non-string secret")
+            end
+            assert(not pcall(credential.put, "remuda-test/never-stored"), "put needs a secret")
+            "#
+        ),
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn credential_is_unavailable_where_no_backend_exists() {
+    run_lua(
+        "credential-unavailable",
+        &format!(
+            r#"{CREDENTIAL_PRELUDE}
+            local want = "unavailable: no credential store on this OS"
+            local name = string.rep("n", 255)
+            local secret = MARKER .. string.rep("x", 2048 - #MARKER)
+            assert(credential.backend() == nil, "no backend on this OS")
+            for _, call in ipairs({{
+              function() return credential.put(name, secret) end,
+              function() return credential.put("a", "b") end,
+              function() return credential.get(name) end,
+              function() return credential.delete(name) end,
+            }}) do
+              local value, reason = call()
+              assert(value == nil, "expected nil, got " .. tostring(value))
+              assert(reason == want, "reason is " .. tostring(reason))
+            end
+            "#
+        ),
+    );
+}
+
+// Writes to the real login Keychain, so it never runs by default: run it by
+// hand with `--ignored`. It removes its own item even when an assertion fails.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "writes to the real login Keychain"]
+fn credential_round_trip_in_the_login_keychain() {
+    let pid = std::process::id();
+    run_lua(
+        "credential-round-trip",
+        &format!(
+            r#"{CREDENTIAL_PRELUDE}
+            local hex = remuda.random_bytes(8):gsub(".", function(byte)
+              return string.format("%02x", byte:byte())
+            end)
+            local name = "remuda-test/{pid}-" .. hex
+            local secret = "round\0trip\255-" .. hex
+            local ok, err = pcall(function()
+              local value, reason = credential.get(name)
+              assert(value == nil and reason == "not_found", "get before put: " .. tostring(reason))
+              assert(credential.put(name, secret) == true, "put")
+              assert(credential.get(name) == secret, "get returns the stored bytes")
+              assert(credential.put(name, "replaced") == true, "put replaces")
+              assert(credential.get(name) == "replaced", "get returns the replacement")
+              assert(credential.delete(name) == true, "delete")
+              value, reason = credential.get(name)
+              assert(value == nil and reason == "not_found", "get after delete: " .. tostring(reason))
+              value, reason = credential.delete(name)
+              assert(value == nil and reason == "not_found", "second delete: " .. tostring(reason))
+            end)
+            credential.delete(name)
+            assert(ok, err)
+            "#
+        ),
+    );
+}
+
 #[test]
 fn hostname_returns_the_os_host_name() {
     let dir = scratch("hostname");
@@ -644,6 +779,16 @@ fn registry_documentation_formats_are_live_and_structured() {
         .as_str()
         .unwrap()
         .contains("65536"));
+    let credential_get = document["runtime"]["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "system.credential.get")
+        .expect("system.credential.get is documented");
+    assert!(credential_get["description"]
+        .as_str()
+        .unwrap()
+        .contains("waits until the user answers"));
     let hostname = document["runtime"]["functions"]
         .as_array()
         .unwrap()

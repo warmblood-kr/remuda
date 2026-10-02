@@ -371,6 +371,31 @@ session.resize
 
 ``session.resize(name, cols, rows) -> true | nil, err`` — Resize a session's terminal (cols 20..1000, rows 24..500).
 
+system
+------
+
+``table`` — OS services for trusted Lua callers.
+
+system.credential.backend
+-------------------------
+
+``system.credential.backend() -> 'keychain' | nil`` — The OS credential store in use: 'keychain' (the macOS login Keychain), or nil where there is none, in which case put, get and delete return nil, 'unavailable: no credential store on this OS'.
+
+system.credential.delete
+------------------------
+
+``system.credential.delete(name) -> true | nil, reason`` — Remove a stored secret. The reason is 'not_found' when nothing is stored under name, or starts with 'unavailable: ' or 'denied: '.
+
+system.credential.get
+---------------------
+
+``system.credential.get(name) -> secret | nil, reason`` — Read a secret back, binary-safe. The reason is 'not_found' when nothing is stored under name, or starts with 'unavailable: ' or 'denied: '. On macOS the Keychain may ask the user to allow access; the call, and the whole Lua image with it, waits until the user answers.
+
+system.credential.put
+---------------------
+
+``system.credential.put(name, secret) -> true | nil, reason`` — Store a secret in the OS credential store under service 'remuda' and account name, replacing any earlier value. name is 1 to 255 printable ASCII characters without spaces; secret is 1 to 2048 bytes; anything else raises a Lua error. Returns nil and a reason starting with 'unavailable: ' or 'denied: ' when the store cannot be used. Any Lua code in this image can read what is stored here.
+
 tool
 ----
 

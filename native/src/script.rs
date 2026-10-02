@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 92] = [
+pub const BINDINGS: [&str; 93] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -116,6 +116,7 @@ pub const BINDINGS: [&str; 92] = [
     "schedules",
     "send",
     "session",
+    "system",
     "tool",
     "tools",
     "type_text",
@@ -353,6 +354,31 @@ const WORDS: &[(&str, &str, &str)] = &[
         "random_bytes(n) -> string",
     ),
     (
+        "system",
+        "OS services for trusted Lua callers.",
+        "table",
+    ),
+    (
+        "system.credential.put",
+        "Store a secret in the OS credential store under service 'remuda' and account name, replacing any earlier value. name is 1 to 255 printable ASCII characters without spaces; secret is 1 to 2048 bytes; anything else raises a Lua error. Returns nil and a reason starting with 'unavailable: ' or 'denied: ' when the store cannot be used. Any Lua code in this image can read what is stored here.",
+        "system.credential.put(name, secret) -> true | nil, reason",
+    ),
+    (
+        "system.credential.get",
+        "Read a secret back, binary-safe. The reason is 'not_found' when nothing is stored under name, or starts with 'unavailable: ' or 'denied: '. On macOS the Keychain may ask the user to allow access; the call, and the whole Lua image with it, waits until the user answers.",
+        "system.credential.get(name) -> secret | nil, reason",
+    ),
+    (
+        "system.credential.delete",
+        "Remove a stored secret. The reason is 'not_found' when nothing is stored under name, or starts with 'unavailable: ' or 'denied: '.",
+        "system.credential.delete(name) -> true | nil, reason",
+    ),
+    (
+        "system.credential.backend",
+        "The OS credential store in use: 'keychain' (the macOS login Keychain), or nil where there is none, in which case put, get and delete return nil, 'unavailable: no credential store on this OS'.",
+        "system.credential.backend() -> 'keychain' | nil",
+    ),
+    (
         "hostname",
         "The OS host name, read from the OS itself (not the environment). Returned unchanged and not sanitized for use in identifiers; callers slug it. Returns nil, error if the OS call fails or the name is empty, not UTF-8, or holds a control, line-separator (U+2028, U+2029) or bidi-control (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) character.",
         "hostname() -> string, nil | nil, error",
@@ -413,6 +439,7 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
         registry.set(*name, row)?;
     }
     table.set("json", crate::json::bindings(lua)?)?;
+    table.set("system", crate::credential::bindings(lua)?)?;
     fs_bindings(lua, table)?;
     table.set("_registry", registry)
 }
