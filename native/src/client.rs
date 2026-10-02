@@ -1919,7 +1919,7 @@ fn wrap_prompt_text(text: &str, columns: usize, indent_first: bool) -> Vec<Strin
         row_width = 2;
     }
     for character in text.chars() {
-        let width = UnicodeWidthChar::width(character).unwrap_or(0);
+        let width = UnicodeWidthChar::width_cjk(character).unwrap_or(0);
         if width > columns.saturating_sub(row_width) {
             rows.push("  ".into());
             row_width = 2;
@@ -4126,8 +4126,27 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(answer, Ok(Some(default)));
+        assert_eq!(answer, Ok(Some(default.clone())));
         let output = String::from_utf8(terminal.output()).unwrap();
+        let preface_rows = 5;
+        let visible_prompt = output
+            .split("\r\n")
+            .skip(preface_rows)
+            .filter(|row| !row.is_empty())
+            .enumerate()
+            .map(|(index, row)| {
+                if index == 0 {
+                    row
+                } else {
+                    row.strip_prefix("  ").unwrap()
+                }
+            })
+            .collect::<Vec<_>>()
+            .concat();
+        assert!(
+            visible_prompt.contains(&default),
+            "printed prompt omitted its returned default: {visible_prompt:?}"
+        );
         let rows = output.split("\r\n").filter(|row| !row.is_empty());
         for row in rows {
             assert!(
@@ -4135,6 +4154,38 @@ mod tests {
                 "wrapped row exceeded the width floor: {row:?}"
             );
         }
+    }
+
+    #[test]
+    fn prompt_line_wraps_ambiguous_width_text_for_cjk_terminals() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use unicode_width::UnicodeWidthStr;
+
+        let terminal = RecordingSecretTerminal::with_columns(80);
+        let preface_line = "─".repeat(110);
+        assert!(UnicodeWidthStr::width("─") < UnicodeWidthStr::width_cjk("─"));
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            "Continue?",
+            std::slice::from_ref(&preface_line),
+            None,
+            [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some(String::new())));
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let rows = output.split("\r\n").take_while(|row| row.starts_with("  "));
+        let mut visible_preface = String::new();
+        for row in rows {
+            assert!(row.starts_with("  "));
+            assert!(
+                UnicodeWidthStr::width_cjk(row) <= 80,
+                "wrapped row exceeded CJK terminal width: {row:?}"
+            );
+            visible_preface.push_str(row.strip_prefix("  ").unwrap());
+        }
+        assert_eq!(visible_preface, preface_line);
     }
 
     #[test]
