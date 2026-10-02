@@ -493,12 +493,23 @@ pub fn request_with_secret_prompts(path: &Path, request: &Request) -> std::io::R
                 default,
                 timeout_ms,
             } => {
-                match collect_line_from_terminal(&label, &preface, default.as_deref(), timeout_ms)?
-                {
+                match collect_line_from_terminal(
+                    &stream,
+                    &label,
+                    &preface,
+                    default.as_deref(),
+                    timeout_ms,
+                )? {
                     LinePromptCollection::Answer(line, refusal) => {
                         send_line_answer(&stream, id, line.as_deref(), refusal)?;
                     }
                     LinePromptCollection::Deadline => {}
+                    LinePromptCollection::Disconnected => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "daemon connection closed while waiting for a line prompt\nNext: restart the daemon and rerun the command.",
+                        ));
+                    }
                 }
                 continue;
             }
@@ -535,6 +546,7 @@ enum LinePromptCollection {
         Option<remuda_core::protocol::SecretAnswerRefusal>,
     ),
     Deadline,
+    Disconnected,
 }
 
 fn collect_secret_from_terminal(
@@ -597,6 +609,7 @@ fn collect_secret_from_terminal(
 }
 
 fn collect_line_from_terminal(
+    stream: &ipc::Stream,
     label: &str,
     preface: &[String],
     default: Option<&str>,
@@ -614,7 +627,12 @@ fn collect_line_from_terminal(
     #[cfg(unix)]
     let signal_guard = SecretPromptSignalGuard::install()?;
     let mut expired = false;
+    let mut disconnected = false;
     let events = std::iter::from_fn(|| loop {
+        if prompt_peer_disconnected(stream) {
+            disconnected = true;
+            return None;
+        }
         #[cfg(unix)]
         if SECRET_PROMPT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) != 0 {
             return None;
@@ -649,6 +667,9 @@ fn collect_line_from_terminal(
             ));
         }
     }
+    if disconnected || prompt_peer_disconnected(stream) {
+        return Ok(LinePromptCollection::Disconnected);
+    }
     if expired {
         Ok(LinePromptCollection::Deadline)
     } else {
@@ -661,6 +682,38 @@ fn collect_line_from_terminal(
             ),
         };
         Ok(LinePromptCollection::Answer(answer.0, answer.1))
+    }
+}
+
+fn prompt_peer_disconnected(stream: &ipc::Stream) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsFd, AsRawFd};
+
+        let ipc::Stream::UdSocket(socket) = stream;
+        let mut byte = 0u8;
+        loop {
+            let result = unsafe {
+                libc::recv(
+                    socket.as_fd().as_raw_fd(),
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if result >= 0 {
+                return result == 0;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return error.kind() != std::io::ErrorKind::WouldBlock;
+        }
+    }
+    #[cfg(windows)]
+    {
+        ipc::peer_disconnected(stream).unwrap_or(true)
     }
 }
 
