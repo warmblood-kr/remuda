@@ -396,7 +396,9 @@ fn reject_case_clash(directory: &fs::File, wanted: &str) -> io::Result<()> {
 
 #[cfg(unix)]
 fn open_directory_at(parent: &fs::File, name: &str, create: bool) -> io::Result<fs::File> {
-    reject_case_clash(parent, name)?;
+    if create {
+        reject_case_clash(parent, name)?;
+    }
     let name = c_name(name)?;
     if create {
         let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
@@ -868,7 +870,6 @@ impl KindHandle {
         #[cfg(not(unix))]
         {
             // Windows keeps the plain path implementation; no-follow directory handles are Unix-only.
-            let _ = create;
             let mut parent = root.clone();
             let name_parts = name.split('/').collect::<Vec<_>>();
             for component in ["storage", self.namespace.as_str()].into_iter().chain(
@@ -877,7 +878,9 @@ impl KindHandle {
                     .take(name_parts.len().saturating_sub(1))
                     .copied(),
             ) {
-                reject_path_case_clash(&parent, component)?;
+                if create {
+                    reject_path_case_clash(&parent, component)?;
+                }
                 parent.push(component);
             }
             Ok(FileLocation {
