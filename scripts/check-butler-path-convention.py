@@ -47,6 +47,9 @@ if not sh_fallback:
 sh_init_lua_target = re.search(r'init_lua="\$config_home(/remuda/init\.lua)"', installer)
 # Rust side: user_config_path selects Config + init.lua, and storage appends
 # the resolved per-kind directory plus that file name.
+rust_config_subdir = re.search(
+    r'fn unix_subdir\(self\)[\s\S]*?Self::Config => "([^"]+)"', storage_rs
+)
 rust_config_file = re.search(
     r'user_file_path_for\(\s*crate::storage::Kind::Config,\s*"([^"]+)"',
     daemon_rs,
@@ -72,6 +75,11 @@ if not rust_config_file:
         f"{DAEMON_RS.name}: could not find user_config_path()'s Config/init.lua "
         "resolver call -- parser or convention changed"
     )
+if not rust_config_subdir:
+    problems2.append(
+        f"{STORAGE_RS.name}: could not find the Config HOME fallback directory "
+        "-- parser or convention changed"
+    )
 if not rust_resolver or not rust_remuda_dir:
     problems2.append(
         f"{STORAGE_RS.name}: could not find the shared resolved Remuda file path "
@@ -87,6 +95,12 @@ if problems2:
         print(f"  - {p}", file=sys.stderr)
     sys.exit(1)
 
+rust_fallback_segment = f"/{rust_config_subdir.group(1)}"
+if sh_fallback.group(1) != rust_fallback_segment:
+    problems2.append(
+        f"HOME fallback diverged: install-butler.sh uses $HOME{sh_fallback.group(1)}, "
+        f"storage Config uses $HOME{rust_fallback_segment}"
+    )
 if sh_init_lua_target.group(1) != f"/remuda/{rust_config_file.group(1)}":
     problems2.append(
         f"init.lua path diverged: install-butler.sh writes $config_home"
@@ -110,6 +124,7 @@ if problems2:
     sys.exit(1)
 
 print(
-    "ok — install-butler.sh and daemon.rs agree: init.lua at "
+    f"ok — install-butler.sh and daemon.rs agree: $HOME{rust_fallback_segment} fallback, "
+    "init.lua at "
     f"$config_home/remuda/{rust_config_file.group(1)}"
 )
