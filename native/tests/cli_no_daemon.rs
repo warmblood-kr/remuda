@@ -168,6 +168,52 @@ fn session_clients_block_default_autostart_but_explicit_other_still_starts() {
     );
 }
 
+#[test]
+fn empty_or_whitespace_server_names_are_refused_before_daemon_access() {
+    for (tag, server, verb) in [
+        ("empty-autostart", "", &["-e", "return true"][..]),
+        ("empty-read-only", "", &["ls"][..]),
+        ("spaces-autostart", " ", &["-e", "return true"][..]),
+        ("spaces-read-only", " ", &["ls"][..]),
+    ] {
+        let scratch = SessionAutoStartScratch::new(tag, None);
+        let out = Command::new(env!("CARGO_BIN_EXE_remuda"))
+            .args(["-s", server])
+            .args(verb)
+            .env("REMUDA_RUNTIME_DIR", &scratch.root)
+            .env("XDG_RUNTIME_DIR", &scratch.root)
+            .env("HOME", &scratch.root)
+            .env("XDG_CONFIG_HOME", scratch.root.join("config"))
+            .env("XDG_DATA_HOME", scratch.root.join("data"))
+            .env("REMUDA_NO_UPDATE_CHECK", "1")
+            .output()
+            .expect("run remuda with an invalid server name");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let socket = scratch.socket(server);
+
+        assert!(!out.status.success(), "accepted server {server:?}: {out:?}");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "invalid server name should be a usage error: {out:?}"
+        );
+        assert_eq!(
+            stderr,
+            "remuda: session name cannot be empty or whitespace.\nNext: name the session with -s NAME, or omit -s.\n",
+            "invalid server name should have one line plus Next:"
+        );
+        assert!(!socket.exists(), "started a daemon at {socket:?}: {stderr}");
+        assert!(
+            !scratch.root.join("remuda").exists(),
+            "created a runtime socket directory: {stderr}"
+        );
+        assert!(
+            daemon_pids_for_runtime(&scratch.root).is_empty(),
+            "left a daemon running for server {server:?}: {stderr}"
+        );
+    }
+}
+
 /// Run `args` against a stand-in at the private server's socket that only
 /// records connections, hanging up at once so a connecting CLI fails fast.
 fn touches_daemon(tag: &str, args: &[&str]) -> (Output, bool) {

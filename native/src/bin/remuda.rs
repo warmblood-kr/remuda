@@ -50,10 +50,9 @@ mod codex_tui;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (server, rest) = split_server_flag(&args);
-    let (stdin_enabled, rest) = match split_stdin_flag(rest) {
+    let (server, stdin_enabled, rest) = match checked_cli_flags(&args) {
         Ok(flags) => flags,
-        Err(error) => return fail(error),
+        Err(code) => return code,
     };
     let argv: Vec<&str> = rest.iter().map(String::as_str).collect();
 
@@ -4579,6 +4578,17 @@ fn split_server_flag(args: &[String]) -> (&str, &[String]) {
     }
 }
 
+fn checked_cli_flags(args: &[String]) -> Result<(&str, bool, &[String]), ExitCode> {
+    let (server, rest) = split_server_flag(args);
+    if server.trim().is_empty() {
+        return Err(fail_invalid_server_name());
+    }
+    match split_stdin_flag(rest) {
+        Ok((stdin_enabled, rest)) => Ok((server, stdin_enabled, rest)),
+        Err(error) => Err(fail(error)),
+    }
+}
+
 /// Pull a leading caller-stdin opt-in from argv after the optional server
 /// selector. Without this flag, piped stdin remains untouched for mod commands.
 fn split_stdin_flag(args: &[String]) -> Result<(bool, &[String]), &'static str> {
@@ -6133,6 +6143,13 @@ fn fail(message: impl std::fmt::Display) -> ExitCode {
     }
     eprintln!("{}", format_failure(&message));
     ExitCode::FAILURE
+}
+
+fn fail_invalid_server_name() -> ExitCode {
+    eprintln!(
+        "remuda: session name cannot be empty or whitespace.\nNext: name the session with -s NAME, or omit -s."
+    );
+    ExitCode::from(2)
 }
 
 fn format_failure(message: &str) -> String {
