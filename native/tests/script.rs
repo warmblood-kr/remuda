@@ -541,9 +541,10 @@ fn random_bytes_returns_csprng_bytes_and_rejects_invalid_lengths() {
     );
 }
 
-// None of the credential tests below reach a real OS store: every call either
-// fails validation first or runs where no backend exists. The round trip that
-// does write to the login Keychain is `#[ignore]`.
+// Off Windows, none of the credential tests below reach a real OS store: every
+// call either fails validation first or runs where no backend exists, and the
+// round trip that writes to the login Keychain is `#[ignore]`. The Windows
+// tests do write to Credential Manager: the CI runner is their only run.
 const CREDENTIAL_PRELUDE: &str = r#"
     assert(type(remuda.system) == "table", "remuda.system is missing")
     local credential = remuda.system.credential
@@ -555,6 +556,8 @@ const CREDENTIAL_PRELUDE: &str = r#"
 fn credential_surface_is_exactly_put_get_delete_backend() {
     let backend = if cfg!(target_os = "macos") {
         r#""keychain""#
+    } else if cfg!(windows) {
+        r#""wincred""#
     } else {
         "nil"
     };
@@ -614,7 +617,7 @@ fn credential_rejects_invalid_names_and_secret_lengths() {
     );
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 #[test]
 fn credential_is_unavailable_where_no_backend_exists() {
     run_lua(
@@ -671,6 +674,81 @@ fn credential_round_trip_in_the_login_keychain() {
             end)
             credential.delete(name)
             assert(ok, err)
+            "#
+        ),
+    );
+}
+
+// Nobody here has a Windows machine, so the CI log is the evidence: a failure
+// prints its reason as a FACT line before the test fails with it.
+#[cfg(windows)]
+fn run_lua_reporting(tag: &str, source: &str) {
+    let dir = scratch(tag);
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path, &dir);
+    if let Err(reason) = script::run(&path, &write(&dir, &format!("{tag}.lua"), source)) {
+        eprintln!("FACT: {tag} failed on this runner: {reason}");
+        panic!("{tag}: {reason}");
+    }
+}
+
+// A unique item name per test run, and `expect`, which fails with the store's
+// own reason. No message here ever carries a secret.
+#[cfg(windows)]
+fn wincred_prelude() -> String {
+    let pid = std::process::id();
+    format!(
+        r#"{CREDENTIAL_PRELUDE}
+        assert(credential.backend() == "wincred", "backend is " .. tostring(credential.backend()))
+        local hex = remuda.random_bytes(8):gsub(".", function(byte)
+          return string.format("%02x", byte:byte())
+        end)
+        local name = "remuda-test/{pid}-" .. hex
+        local function expect(what, want, value, reason)
+          assert(value == want and (want ~= nil or reason == "not_found"),
+            what .. ": " .. type(value) .. ", " .. tostring(reason))
+        end
+        "#
+    )
+}
+
+// Writes to the real Credential Manager of the CI runner, which has a logon
+// session. It removes its own item even when an assertion fails.
+#[cfg(windows)]
+#[test]
+fn credential_round_trip_in_windows_credential_manager() {
+    let prelude = wincred_prelude();
+    run_lua_reporting(
+        "credential-wincred-round-trip",
+        &format!(
+            r#"{prelude}
+            local secret = "round\0trip\255-" .. hex
+            local longest = string.rep("\0\255", 1024)
+            local ok, err = pcall(function()
+              expect("put", true, credential.put(name, secret))
+              assert(credential.get(name) == secret, "get did not return the stored bytes")
+              expect("put replaces", true, credential.put(name, longest))
+              assert(credential.get(name) == longest, "get did not return the 2048-byte replacement")
+              expect("delete", true, credential.delete(name))
+              expect("get after delete", nil, credential.get(name))
+            end)
+            credential.delete(name)
+            assert(ok, err)
+            "#
+        ),
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn credential_missing_item_is_not_found_on_windows() {
+    let prelude = wincred_prelude();
+    run_lua_reporting(
+        "credential-wincred-missing",
+        &format!(
+            r#"{prelude}
+            expect("get of a missing item", nil, credential.get(name))
+            expect("delete of a missing item", nil, credential.delete(name))
             "#
         ),
     );
