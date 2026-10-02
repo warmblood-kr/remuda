@@ -6508,20 +6508,43 @@ fn history_path() -> Option<std::path::PathBuf> {
 fn simple_request(path: &Path, request: Request) -> ExitCode {
     match remuda_native::client::request(path, &request) {
         Ok(Response::Ok) => ExitCode::SUCCESS,
+        Ok(response @ (Response::Busy | Response::WriteTimeout)) => {
+            let (code, message) = input_write_failure(&response).expect("matched write failure");
+            fail_with_code(message, code)
+        }
         other => fail(describe(other)),
+    }
+}
+
+fn input_write_failure(response: &Response) -> Option<(u8, &'static str)> {
+    match response {
+        Response::Busy => Some((
+            75,
+            "session input is busy; nothing was written, retry\nNext: wait for the previous write to finish (see it with remuda capture NAME), then run the command again.",
+        )),
+        Response::WriteTimeout => Some((
+            74,
+            "session PTY write timed out; delivery may be partial or late\nNext: check whether the input was applied before retrying.",
+        )),
+        _ => None,
     }
 }
 
 fn describe(response: std::io::Result<Response>) -> String {
     match response {
         Ok(Response::Error(reason)) => reason,
-        Ok(Response::Busy) => "session input is busy; nothing was written, retry".into(),
-        Ok(Response::WriteTimeout) => {
-            "session PTY write timed out; delivery may be partial or late".into()
-        }
+        Ok(response @ (Response::Busy | Response::WriteTimeout)) => input_write_failure(&response)
+            .expect("matched write failure")
+            .1
+            .into(),
         Ok(other) => format!("unexpected response: {other:?}"),
         Err(e) => e.to_string(),
     }
+}
+
+fn fail_with_code(message: impl std::fmt::Display, code: u8) -> ExitCode {
+    eprintln!("{}", format_failure(&message.to_string()));
+    ExitCode::from(code)
 }
 
 fn fail(message: impl std::fmt::Display) -> ExitCode {
@@ -6825,11 +6848,19 @@ mod tests {
     fn write_timeout_has_a_user_facing_diagnostic() {
         assert_eq!(
             describe(Ok(Response::WriteTimeout)),
-            "session PTY write timed out; delivery may be partial or late"
+            "session PTY write timed out; delivery may be partial or late\nNext: check whether the input was applied before retrying."
         );
         assert_eq!(
             describe(Ok(Response::Busy)),
-            "session input is busy; nothing was written, retry"
+            "session input is busy; nothing was written, retry\nNext: wait for the previous write to finish (see it with remuda capture NAME), then run the command again."
+        );
+        assert_eq!(
+            input_write_failure(&Response::WriteTimeout).map(|(code, _)| code),
+            Some(74)
+        );
+        assert_eq!(
+            input_write_failure(&Response::Busy).map(|(code, _)| code),
+            Some(75)
         );
     }
 

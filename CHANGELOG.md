@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `remuda send` now exits 75 when session input is busy and 74 when the PTY
+  write times out (was 1); both messages include a `Next:` line (see #269).
 - Windows now resolves `init.lua` and REPL history through the Config and State
   directories instead of `HOME`. Git Bash users relying on existing
   `$HOME/.config/remuda/init.lua` or
