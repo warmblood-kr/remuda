@@ -8,6 +8,8 @@ The command tree is `remuda cluster init`, `remuda cluster join [FINGERPRINT] <l
 
 On the first machine, initialize a cluster of one. `remuda cluster init` creates the node key pair. Bare `remuda cluster` shows cluster status after initialization, or the init hint when no cluster exists. Initialization prints the node and public-key fingerprint, then points to the next step. Invite prints one complete command to paste on the other machine:
 
+If the cluster directory is missing but a saved fingerprint shows this machine had an identity before, `remuda cluster init` creates a new identity and warns that peers were not restored. Ask an admitted machine for a new invite, then join with it. Clusters initialized before this recovery marker was introduced do not have a saved fingerprint and cannot trigger this notice.
+
 ```text
 $ remuda cluster init
 Cluster initialized

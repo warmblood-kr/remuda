@@ -875,7 +875,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             }
         }
         ClusterCommand::Remote(target) => {
-            let node = remote_node_label(None, remuda_native::hostname::hostname);
+            let node = remote_node_label(remuda_native::hostname::hostname);
             cluster_remote(server, path, &node, target.as_deref())
         }
         ClusterCommand::ListenOff => cluster_listen_off(server, path),
@@ -1177,10 +1177,11 @@ fn cluster_init_listener_config(existing: Option<ListenerConfig>, enabled: bool)
 
 fn cluster_init(server: &str, path: &Path, no_listen: bool) -> ExitCode {
     with_daemon(server, path, |daemon_path| {
-        let (identity, created) = match remuda_native::cluster::init() {
-            Ok(initialized) => initialized,
-            Err(error) => return fail(render_cluster_init_error(&error)),
-        };
+        let (identity, created, previous_fingerprint) =
+            match remuda_native::cluster::init_with_notice() {
+                Ok(initialized) => initialized,
+                Err(error) => return fail(render_cluster_init_error(&error)),
+            };
         let existing_config = match remuda_native::cluster::listener_control::config() {
             Ok(config) => config,
             Err(error) => return fail(render_init_listener_error(&error)),
@@ -1198,6 +1199,7 @@ fn cluster_init(server: &str, path: &Path, no_listen: bool) -> ExitCode {
             Ok(status) => {
                 for line in render_cluster_init_lines(
                     created,
+                    previous_fingerprint.as_deref(),
                     &identity.node_name,
                     &identity.node_fp,
                     &status,
@@ -1217,15 +1219,30 @@ fn render_cluster_init_error(error: &std::io::Error) -> String {
 
 fn render_cluster_init_lines(
     created: bool,
+    previous_fingerprint: Option<&str>,
     node_name: &str,
     fingerprint: &str,
     status: &remuda_core::protocol::ListenerStatus,
 ) -> Vec<String> {
     let mut lines = vec![
-        cluster_init_message(created).to_owned(),
+        previous_fingerprint.map_or_else(
+            || cluster_init_message(created).to_owned(),
+            |previous| {
+                format!(
+                    "The previous cluster directory was missing. A NEW identity was created; the old fingerprint was {previous}. Its peers were not restored and must admit the new fingerprint."
+                )
+            },
+        ),
         format!("Node: {node_name}"),
         format!("Fingerprint: {fingerprint}"),
     ];
+    if previous_fingerprint.is_some() {
+        lines.insert(
+            1,
+            "Next: ask an admitted machine for a new invite, then run `remuda cluster join` with it."
+                .into(),
+        );
+    }
     lines.extend(render_init_listener_lines(status));
     lines
 }
@@ -2173,10 +2190,7 @@ fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -
     }
 }
 
-fn remote_node_label(
-    _hostname_env: Option<&str>,
-    os_hostname: impl FnOnce() -> std::io::Result<String>,
-) -> String {
+fn remote_node_label(os_hostname: impl FnOnce() -> std::io::Result<String>) -> String {
     os_hostname().unwrap_or_else(|_| "local".into())
 }
 
@@ -2848,6 +2862,7 @@ mod cluster_cli_tests {
 
         let listening = render_cluster_init_lines(
             true,
+            None,
             "node-a",
             "fingerprint-a",
             &ListenerStatus::On {
@@ -2878,6 +2893,41 @@ mod cluster_cli_tests {
         assert!(refusal.contains("address busy"));
         assert!(refusal.contains("remuda cluster listen"));
         assert!(!refusal.contains("remuda-join-v1"));
+    }
+
+    #[test]
+    fn cluster_init_warns_when_missing_cluster_directory_had_prior_identity() {
+        use remuda_core::protocol::ListenerStatus;
+
+        let previous_fingerprint = "SHA256:previous";
+        let new_fingerprint = "SHA256:new";
+        assert_ne!(previous_fingerprint, new_fingerprint);
+        let first_init = render_cluster_init_lines(
+            true,
+            None,
+            "node-before",
+            previous_fingerprint,
+            &ListenerStatus::Off,
+        );
+        assert_eq!(first_init[0], "Cluster initialized");
+
+        let reinitialized = render_cluster_init_lines(
+            true,
+            Some(previous_fingerprint),
+            "node-after",
+            new_fingerprint,
+            &ListenerStatus::Off,
+        );
+        assert_eq!(
+            reinitialized[0],
+            format!("The previous cluster directory was missing. A NEW identity was created; the old fingerprint was {previous_fingerprint}. Its peers were not restored and must admit the new fingerprint.")
+        );
+        assert!(reinitialized.iter().any(|line| {
+            line == "Next: ask an admitted machine for a new invite, then run `remuda cluster join` with it."
+        }));
+        assert!(reinitialized
+            .iter()
+            .any(|line| line == &format!("Fingerprint: {new_fingerprint}")));
     }
 
     #[test]
@@ -3807,16 +3857,15 @@ mod cluster_cli_tests {
     }
 
     #[test]
-    fn remote_node_label_uses_os_hostname_instead_of_hostname_env() {
-        let label = super::remote_node_label(Some("from-env"), || Ok("from-os".into()));
+    fn remote_node_label_uses_injected_os_hostname() {
+        let label = super::remote_node_label(|| Ok("from-os".into()));
         assert_eq!(label, "from-os");
     }
 
     #[test]
     fn remote_node_label_falls_back_to_local_when_os_lookup_fails() {
-        let label = super::remote_node_label(None, || {
-            Err(std::io::Error::other("hostname lookup failed"))
-        });
+        let label =
+            super::remote_node_label(|| Err(std::io::Error::other("hostname lookup failed")));
         assert_eq!(label, "local");
     }
 
