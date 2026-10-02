@@ -48,9 +48,13 @@ extern "C" fn record_join_interrupt(signal: libc::c_int) {
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
 
+#[allow(clippy::too_many_lines)]
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (server, rest) = split_server_flag(&args);
+    if server.trim().is_empty() {
+        return fail_invalid_server_name();
+    }
     let (stdin_enabled, rest) = match split_stdin_flag(rest) {
         Ok(flags) => flags,
         Err(error) => return fail(error),
@@ -6084,6 +6088,13 @@ fn fail(message: impl std::fmt::Display) -> ExitCode {
     }
     eprintln!("{}", format_failure(&message));
     ExitCode::FAILURE
+}
+
+fn fail_invalid_server_name() -> ExitCode {
+    eprintln!(
+        "remuda: session name cannot be empty or whitespace.\nNext: name the session with -s NAME, or omit -s."
+    );
+    ExitCode::from(2)
 }
 
 fn format_failure(message: &str) -> String {
