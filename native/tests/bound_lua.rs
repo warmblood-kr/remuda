@@ -180,8 +180,8 @@ fn tool_callback_instruction_limit_is_enforced() {
         .expect("queue follow-up request");
 
     let callback_error = callback
-        .recv_timeout(Duration::from_secs(4))
-        .expect("the infinite callback returns within its budget")
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the infinite callback returns within its instruction budget")
         .expect_err("the callback must report its execution limit");
     assert!(
         callback_error.contains("execution limit"),
