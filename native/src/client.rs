@@ -2371,6 +2371,9 @@ fn edit_secret_line(
 }
 
 trait SecretPromptTerminal {
+    fn columns(&self) -> usize {
+        crossterm::terminal::size().map_or(80, |(columns, _)| usize::from(columns))
+    }
     fn enable_raw_mode(&mut self) -> std::io::Result<()>;
     fn enable_bracketed_paste(&mut self) -> std::io::Result<()>;
     fn write_output(&mut self, bytes: &[u8]) -> std::io::Result<()>;
@@ -2576,9 +2579,17 @@ mod tests {
     struct RecordingSecretTerminal {
         operations: Arc<Mutex<Vec<&'static str>>>,
         output: Arc<Mutex<Vec<u8>>>,
+        columns: Option<usize>,
     }
 
     impl RecordingSecretTerminal {
+        fn with_columns(columns: usize) -> Self {
+            Self {
+                columns: Some(columns),
+                ..Self::default()
+            }
+        }
+
         fn operations(&self) -> Vec<&'static str> {
             self.operations.lock().unwrap().clone()
         }
@@ -2593,6 +2604,10 @@ mod tests {
     }
 
     impl SecretPromptTerminal for RecordingSecretTerminal {
+        fn columns(&self) -> usize {
+            self.columns.unwrap_or(80)
+        }
+
         fn enable_raw_mode(&mut self) -> std::io::Result<()> {
             self.record("raw:on");
             Ok(())
@@ -3624,6 +3639,28 @@ mod tests {
                 "raw:off"
             ]
         );
+    }
+
+    #[test]
+    fn secret_prompt_clips_label_to_terminal_width_without_wrapping_fake_tag() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(24);
+        let label = format!("remuda[outside] {}remuda[prod]", " ".repeat(24));
+        let key = secret_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        let _answer = super::prompt_secret_with_events(terminal.clone(), &label, [key])
+            .unwrap()
+            .unwrap();
+
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let prompt = output.split(": ").next().unwrap();
+        assert!(prompt.starts_with("remuda[outside]"));
+        assert!(
+            unicode_width::UnicodeWidthStr::width(prompt) <= 22,
+            "prompt label exceeded terminal width: {prompt:?}"
+        );
+        assert!(!prompt.contains("remuda[prod]"));
     }
 
     #[test]
