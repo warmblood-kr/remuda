@@ -639,7 +639,7 @@ impl Session {
                 }
                 Ok(InputOutcome::Ack { duplicate: false })
             }
-            Err(AgentError::Busy) => {
+            Err(AgentError::Busy | AgentError::LateSubmitAbandoned { .. }) => {
                 if let Ok(mut deduplicator) = self.input_dedup.lock() {
                     deduplicator.release(batch.client_id, batch.seq);
                 }

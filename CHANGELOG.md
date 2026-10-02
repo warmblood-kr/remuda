@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed remote input batches refused after a late-submit abandonment: callers
+  now get a retryable busy response because the bytes were not written (see
+  #428).
 - Lua: `remuda.storage.dir(kind)` returns an absolute per-user directory for
   `config`, `data`, `state` or `cache`. Absolute XDG values win on every OS;
   Windows falls back to Local AppData, and Linux/macOS use the XDG home layout.

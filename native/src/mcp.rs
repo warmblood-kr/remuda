@@ -284,7 +284,7 @@ fn input_error_message(response: &Response) -> &'static str {
         Response::Uncertain => "input outcome is uncertain; bytes may be partial or late",
         Response::WrongInstance => "session instance changed",
         Response::RateLimited => "session input rate limit exceeded",
-        Response::Busy => "session input is busy",
+        Response::Busy => "session input is busy; nothing was written, retry",
         Response::WriteTimeout => "session PTY write timed out; delivery may be partial or late",
         Response::RemoteControlDisabled => "remote control is disabled on the target node",
         _ => "input was refused",
