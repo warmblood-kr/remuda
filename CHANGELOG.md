@@ -7,6 +7,9 @@
   Windows falls back to Local AppData, and Linux/macOS use the XDG home layout.
   Relative XDG values are ignored; earlier data-home resolution accepted
   relative `XDG_DATA_HOME` values.
+- `remuda cluster remote` now labels this node with the OS host name instead of
+  reading the `HOSTNAME` environment variable; it uses `local` if the OS lookup
+  fails.
 - Lua: `remuda.fs.realpath(path)` resolves a path through every symlink, and
   `remuda.fs.is_symlink(path)` says whether the path itself is a link. Both work
   on Windows, where a junction counts as a link and a resolved path carries the

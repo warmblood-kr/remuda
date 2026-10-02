@@ -40,6 +40,7 @@ fn checked_secret(value: &Value) -> mlua::Result<mlua::BorrowedBytes> {
 #[cfg(target_os = "macos")]
 mod store {
     use security_framework::base::Error;
+    use security_framework::os::macos::keychain::SecKeychain;
     use security_framework::passwords;
     use zeroize::Zeroizing;
 
@@ -50,17 +51,34 @@ mod store {
     // errSecUserCanceled and errSecAuthFailed: the user refused the prompt.
     const DENIED: [i32; 2] = [-128, -25293];
 
-    // A locked keychain in an SSH session (errSecInteractionNotAllowed) is
-    // `unavailable`, like every failure that is not a miss or a refusal.
+    const NO_DEFAULT_KEYCHAIN: &str =
+        "unavailable: no default keychain. Fix: if macOS asks, Cancel is safe (the password goes to the private file) and Reset to Defaults creates a new login keychain; or pass --dir";
+    const KEYCHAIN_LOCKED: &str =
+        "unavailable: keychain locked or no GUI session. Fix: unlock it (or log in on the console) or pass --dir";
+
+    // errSecNotAvailable, errSecNoSuchKeychain and errSecNoDefaultKeychain:
+    // there is no keychain to store into. errSecInteractionNotAllowed (a
+    // locked keychain in an SSH session) is `unavailable` too, with its own
+    // fix, like every failure that is not a miss or a refusal.
     fn reason(error: Error) -> String {
         match error.code() {
             ITEM_NOT_FOUND => "not_found".to_string(),
+            -128 => {
+                format!("denied: {error}. Cancel is safe: the password goes to the private file")
+            }
             code if DENIED.contains(&code) => format!("denied: {error}"),
+            -25291 | -25294 | -25307 => NO_DEFAULT_KEYCHAIN.to_string(),
+            -25308 => KEYCHAIN_LOCKED.to_string(),
             _ => format!("unavailable: {error}"),
         }
     }
 
     pub(super) fn put(name: &str, secret: &[u8]) -> Result<(), String> {
+        // Without a default keychain macOS opens its own "A keychain cannot be
+        // found to store ..." dialog from inside the add; asking first fails
+        // quietly instead. INFERRED, not verified on a Mac that lacks a default
+        // keychain: the owner's Mac is the check.
+        SecKeychain::default().map_err(reason)?;
         passwords::set_generic_password(SERVICE, name, secret).map_err(reason)
     }
 
@@ -72,6 +90,44 @@ mod store {
 
     pub(super) fn delete(name: &str) -> Result<(), String> {
         passwords::delete_generic_password(SERVICE, name).map_err(reason)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{reason, Error};
+
+        // No usable default keychain: callers must still see `unavailable:`
+        // (so they fall back to a file) plus words that say how to fix it.
+        #[test]
+        fn a_missing_default_keychain_is_unavailable_with_the_fix() {
+            // errSecNoDefaultKeychain, errSecNoSuchKeychain, errSecNotAvailable.
+            for code in [-25307, -25294, -25291] {
+                let text = reason(Error::from_code(code));
+                assert!(text.starts_with("unavailable: "), "{code}: {text}");
+                assert!(text.contains("default keychain"), "{code}: {text}");
+                assert!(text.contains("Fix:"), "{code}: {text}");
+                assert!(text.contains("Cancel is safe"), "{code}: {text}");
+                assert!(text.contains("Reset to Defaults"), "{code}: {text}");
+                assert!(text.contains("new login keychain"), "{code}: {text}");
+                assert!(text.len() < 200, "{code}: {} chars: {text}", text.len());
+            }
+        }
+
+        #[test]
+        fn a_locked_keychain_is_unavailable_with_its_own_fix() {
+            let text = reason(Error::from_code(-25308));
+            assert!(text.starts_with("unavailable: keychain locked"), "{text}");
+            assert!(text.contains("Fix:"), "{text}");
+        }
+
+        #[test]
+        fn a_refused_prompt_stays_denied() {
+            for code in [-128, -25293] {
+                assert!(reason(Error::from_code(code)).starts_with("denied: "));
+            }
+            let cancelled = reason(Error::from_code(-128));
+            assert!(cancelled.contains("Cancel is safe"), "{cancelled}");
+        }
     }
 }
 

@@ -317,6 +317,45 @@ fn help_flags_write_usage_to_stdout_and_mod_commands_to_stderr() {
 }
 
 #[test]
+fn mod_verb_help_does_not_start_a_daemon_or_install_a_mod() {
+    let dir = scratch("mod-verb-help");
+    for verb in ["install", "list", "info", "test", "update", "remove"] {
+        let out = remuda(&dir, &["mod", verb, "--help"]);
+        assert!(out.status.success(), "{verb}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains(&format!("Usage: remuda mod {verb}")),
+            "{verb}: {out:?}"
+        );
+        assert!(out.stderr.is_empty(), "{verb}: {out:?}");
+        assert!(
+            !remuda_native::daemon::socket_path_in(&dir, "s").exists(),
+            "{verb} --help started a daemon"
+        );
+    }
+    assert!(!dir.join("data/remuda/mods").exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn mod_parse_errors_use_exit_two_and_include_help_and_next() {
+    let dir = scratch("mod-parse-error");
+    for args in [
+        &["mod", "list", "--formta", "json"][..],
+        &["mod", "install"][..],
+    ] {
+        let out = remuda(&dir, args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if args[1] == "list" {
+            assert!(stderr.contains("Did you mean '--format'?"), "{stderr}");
+        }
+        assert!(stderr.contains("Fix: run `remuda mod"), "{stderr}");
+        assert!(stderr.contains("Next:"), "{stderr}");
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn upgrade_help_flags_explain_channels_and_daemon_lifecycle() {
     let dir = scratch("upgrade-help-flags");
     for args in [&["upgrade", "--help"][..], &["upgrade", "-h"]] {

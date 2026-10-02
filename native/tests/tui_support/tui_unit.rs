@@ -466,6 +466,51 @@ fn enter_points_the_keyboard_at_the_selected_session() {
     assert_eq!(ui.sessions.len(), 2);
 }
 
+#[test]
+fn timed_out_input_sets_notice_and_ctrl_backslash_keeps_the_list_focus() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    ui.focus = Focus::Session;
+    let mut held = Some(());
+
+    input_write_failed(
+        &mut ui,
+        "a",
+        &std::io::Error::new(std::io::ErrorKind::TimedOut, "write deadline"),
+        &mut held,
+    );
+
+    assert_eq!(ui.focus, Focus::List);
+    assert!(held.is_none(), "a failed Hold must be released");
+    assert!(ui
+        .notice
+        .as_deref()
+        .unwrap()
+        .contains("this key batch may not have been delivered"));
+    assert!(ui
+        .notice
+        .as_deref()
+        .unwrap()
+        .contains("a large paste may be cut mid-way; check the session"));
+    assert!(!ui.notice.as_deref().unwrap().contains("dropped"));
+    ui.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+    assert_eq!(ui.focus, Focus::List, "the next Ctrl-\\ event is handled");
+}
+
+#[test]
+fn closed_input_pipe_has_a_distinct_notice_from_a_stuck_write() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    let mut held = None::<()>;
+    input_write_failed(
+        &mut ui,
+        "a",
+        &std::io::Error::new(std::io::ErrorKind::BrokenPipe, "peer closed"),
+        &mut held,
+    );
+
+    assert!(ui.notice.as_deref().unwrap().contains("input pipe closed"));
+    assert!(!ui.notice.as_deref().unwrap().contains("input stuck"));
+}
+
 fn click(col: u16, row: u16) -> MouseEvent {
     MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),

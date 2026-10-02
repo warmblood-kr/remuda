@@ -875,7 +875,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             }
         }
         ClusterCommand::Remote(target) => {
-            let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into());
+            let node = remote_node_label(None, remuda_native::hostname::hostname);
             cluster_remote(server, path, &node, target.as_deref())
         }
         ClusterCommand::ListenOff => cluster_listen_off(server, path),
@@ -2171,6 +2171,13 @@ fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -
         }),
         Err(error) => fail(format!("cluster remote: {error}")),
     }
+}
+
+fn remote_node_label(
+    _hostname_env: Option<&str>,
+    os_hostname: impl FnOnce() -> std::io::Result<String>,
+) -> String {
+    os_hostname().unwrap_or_else(|_| "local".into())
 }
 
 fn remote_control_label(enabled: bool) -> &'static str {
@@ -3800,6 +3807,20 @@ mod cluster_cli_tests {
     }
 
     #[test]
+    fn remote_node_label_uses_os_hostname_instead_of_hostname_env() {
+        let label = super::remote_node_label(Some("from-env"), || Ok("from-os".into()));
+        assert_eq!(label, "from-os");
+    }
+
+    #[test]
+    fn remote_node_label_falls_back_to_local_when_os_lookup_fails() {
+        let label = super::remote_node_label(None, || {
+            Err(std::io::Error::other("hostname lookup failed"))
+        });
+        assert_eq!(label, "local");
+    }
+
+    #[test]
     fn cluster_listener_supports_auto_and_explicit_bind_options() {
         assert_eq!(
             parse_cluster_command(&["listen", "--bind", "192.0.2.4:9443"]),
@@ -5192,30 +5213,184 @@ fn reload_mod_in_daemon(server: &str, path: &Path, name: &str) -> Result<(), Str
     }
 }
 
-fn mod_install_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
-    let Some(repository) = args.first() else {
-        return fail("usage: remuda mod install OWNER/REPO [--ref REF] [--force] [--reload]");
+fn mod_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{ArgSpec, OptionSpec, Spec, VerbSpec};
+
+    let option = |long: &str, value: Option<&str>, help: &str| OptionSpec {
+        long: long.into(),
+        short: None,
+        value: value.map(str::to_owned),
+        help: help.into(),
+        global: false,
     };
-    let mut reference = None;
-    let mut force = false;
-    let mut reload = false;
-    let mut index = 1;
-    while index < args.len() {
-        match args[index] {
-            "--force" if !force => force = true,
-            "--reload" if !reload => reload = true,
-            "--ref" if reference.is_none() && index + 1 < args.len() => {
-                index += 1;
-                reference = Some(args[index]);
-            }
-            _ => {
-                return fail(
-                    "usage: remuda mod install OWNER/REPO [--ref REF] [--force] [--reload]",
-                )
-            }
-        }
-        index += 1;
+    let arg = |name: &str, help: &str, required| ArgSpec {
+        name: name.into(),
+        help: help.into(),
+        multiple: false,
+        required,
+    };
+    let verb = |name: &str, about: &str, next: &str, args, options| VerbSpec {
+        name: name.into(),
+        about: about.into(),
+        args,
+        next: next.into(),
+        options,
+    };
+    Spec {
+        name: "remuda mod".into(),
+        options: vec![],
+        verbs: vec![
+            verb(
+                "install",
+                "Install a Lua mod from GitHub",
+                "remuda mod list",
+                vec![arg("OWNER/REPO", "GitHub repository", true)],
+                vec![
+                    option("ref", Some("REF"), "Git ref to install"),
+                    option("force", None, "Replace an installed mod"),
+                    option("reload", None, "Reload the mod in the running daemon"),
+                ],
+            ),
+            verb(
+                "list",
+                "List installed mods",
+                "remuda mod info NAME",
+                vec![],
+                vec![option(
+                    "format",
+                    Some("FORMAT"),
+                    "Output format: rst, markdown, or json",
+                )],
+            ),
+            verb(
+                "info",
+                "Show a mod manifest",
+                "remuda mod list",
+                vec![arg("NAME", "Installed mod name", true)],
+                vec![option(
+                    "format",
+                    Some("FORMAT"),
+                    "Output format: rst, markdown, or json",
+                )],
+            ),
+            verb(
+                "test",
+                "Validate a local mod checkout",
+                "remuda mod install OWNER/REPO",
+                vec![arg("PATH", "Path to a mod checkout", true)],
+                vec![],
+            ),
+            verb(
+                "update",
+                "Update installed mods",
+                "remuda mod list",
+                vec![arg("NAME", "Installed mod name", false)],
+                vec![
+                    option("all", None, "Update all installed mods"),
+                    option(
+                        "reload",
+                        None,
+                        "Reload the updated mod in the running daemon",
+                    ),
+                ],
+            ),
+            verb(
+                "remove",
+                "Remove an installed mod",
+                "remuda mod list",
+                vec![arg("NAME", "Installed mod name", true)],
+                vec![],
+            ),
+        ],
     }
+}
+
+fn mod_cli_parse(
+    verb: &str,
+    args: &[&str],
+) -> Result<serde_json::Map<String, serde_json::Value>, ExitCode> {
+    let mut words = Vec::with_capacity(args.len() + 1);
+    words.push(verb);
+    words.extend_from_slice(args);
+    let report = remuda_native::cli_parse::parse(&mod_cli_spec(), &words);
+    if !report.ok {
+        if report.kind.as_deref() == Some("help") {
+            println!("{}", report.text);
+        } else {
+            let fix = format!("\nFix: run `remuda mod {verb} --help` for supported syntax.");
+            eprintln!(
+                "{}",
+                report.text.replace("\nUsage:", &format!("{fix}\nUsage:"))
+            );
+        }
+        return Err(ExitCode::from(report.code as u8));
+    }
+    if let Some(format) = report
+        .values
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+    {
+        if !matches!(format, "rst" | "markdown" | "json") {
+            return Err(mod_cli_usage_error(
+                verb,
+                format!("invalid format '{format}'; choose rst, markdown, or json"),
+            ));
+        }
+    }
+    let has_name = report.values.get("NAME").is_some();
+    let update_all = report
+        .values
+        .get("all")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    if verb == "update" && has_name == update_all {
+        return Err(mod_cli_usage_error(
+            verb,
+            "provide exactly one mod NAME or --all",
+        ));
+    }
+    Ok(report.values)
+}
+
+fn mod_cli_usage_error(verb: &str, detail: impl std::fmt::Display) -> ExitCode {
+    let usage = match verb {
+        "install" => "remuda mod install [OPTIONS] OWNER/REPO",
+        "list" => "remuda mod list [OPTIONS]",
+        "info" => "remuda mod info [OPTIONS] NAME",
+        "test" => "remuda mod test PATH",
+        "update" => "remuda mod update [OPTIONS] [NAME]",
+        "remove" => "remuda mod remove NAME",
+        _ => "remuda mod",
+    };
+    eprintln!(
+        "remuda: mod {verb}: {detail}\nFix: run `remuda mod {verb} --help` for supported syntax.\nUsage: {usage}\nNext: remuda mod {verb} --help"
+    );
+    ExitCode::from(2)
+}
+
+fn mod_cli_string<'a>(
+    values: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> &'a str {
+    values
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+fn mod_cli_flag(values: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    values.get(key).and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+fn mod_install_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let values = match mod_cli_parse("install", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    let repository = mod_cli_string(&values, "OWNER/REPO");
+    let reference = values.get("ref").and_then(serde_json::Value::as_str);
+    let force = mod_cli_flag(&values, "force");
+    let reload = mod_cli_flag(&values, "reload");
     match remuda_native::packages::install(repository, reference, force) {
         Ok(report) => {
             println!(
@@ -5255,11 +5430,14 @@ fn mod_install_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
 }
 
 fn mod_list_command(args: &[&str]) -> ExitCode {
-    let format = match args {
-        [] => "rst",
-        ["--format", format @ ("rst" | "markdown" | "json")] => format,
-        _ => return fail("usage: remuda mod list [--format rst|markdown|json]"),
+    let values = match mod_cli_parse("list", args) {
+        Ok(values) => values,
+        Err(code) => return code,
     };
+    let format = values
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("rst");
     let manifests = match remuda_native::packages::manifests() {
         Ok(manifests) => manifests,
         Err(error) => return fail(error),
@@ -5315,14 +5493,15 @@ fn mod_list_command(args: &[&str]) -> ExitCode {
 }
 
 fn mod_info_command(args: &[&str]) -> ExitCode {
-    let Some(name) = args.first() else {
-        return fail("usage: remuda mod info NAME [--format rst|markdown|json]");
+    let values = match mod_cli_parse("info", args) {
+        Ok(values) => values,
+        Err(code) => return code,
     };
-    let format = match args.get(1..) {
-        Some([]) => "rst",
-        Some(["--format", format @ ("rst" | "markdown" | "json")]) => format,
-        _ => return fail("usage: remuda mod info NAME [--format rst|markdown|json]"),
-    };
+    let name = mod_cli_string(&values, "NAME");
+    let format = values
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("rst");
     let manifest = match remuda_native::packages::manifest(name) {
         Ok(Some(manifest)) => manifest,
         Ok(None) => return fail(format!("no such mod: {name}")),
@@ -5403,13 +5582,13 @@ fn mod_update_all() -> ExitCode {
 }
 
 fn mod_update_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
-    let (all, name, reload) = match args {
-        ["--all"] => (true, None, false),
-        ["--all", "--reload"] => (true, None, true),
-        [name] => (false, Some(*name), false),
-        [name, "--reload"] => (false, Some(*name), true),
-        _ => return fail("usage: remuda mod update NAME [--reload]|--all"),
+    let values = match mod_cli_parse("update", args) {
+        Ok(values) => values,
+        Err(code) => return code,
     };
+    let all = mod_cli_flag(&values, "all");
+    let name = values.get("NAME").and_then(serde_json::Value::as_str);
+    let reload = mod_cli_flag(&values, "reload");
     if all && reload {
         let manifests = match remuda_native::packages::manifests() {
             Ok(manifests) => manifests,
@@ -5427,7 +5606,7 @@ fn mod_update_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     if all {
         return mod_update_all();
     }
-    let name = name.expect("single mod name");
+    let name = name.expect("validated single mod name");
     let result = if reload {
         match remuda_native::packages::manifest(name) {
             Ok(Some(manifest)) if manifest.lifecycle.is_some() => {
@@ -5494,9 +5673,11 @@ fn display_names(names: &[String]) -> String {
 }
 
 fn mod_remove_command(args: &[&str]) -> ExitCode {
-    let [name] = args else {
-        return fail("usage: remuda mod remove NAME");
+    let values = match mod_cli_parse("remove", args) {
+        Ok(values) => values,
+        Err(code) => return code,
     };
+    let name = mod_cli_string(&values, "NAME");
     match remuda_native::packages::remove(name) {
         Ok(report) => {
             println!(
@@ -5677,9 +5858,11 @@ mod cluster_call_tests {
 }
 
 fn mod_test_command(args: &[&str]) -> ExitCode {
-    let [path] = args else {
-        return fail("usage: remuda mod test PATH");
+    let values = match mod_cli_parse("test", args) {
+        Ok(values) => values,
+        Err(code) => return code,
     };
+    let path = mod_cli_string(&values, "PATH");
     match remuda_native::packages::test_path(Path::new(path)) {
         Ok(spec) => {
             println!(
@@ -5691,6 +5874,117 @@ fn mod_test_command(args: &[&str]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => fail(error),
+    }
+}
+
+#[cfg(test)]
+mod mod_cli_tests {
+    use super::mod_cli_spec;
+    use remuda_native::cli_parse::{parse, Report};
+
+    fn parse_mod(words: &[&str]) -> Report {
+        parse(&mod_cli_spec(), words)
+    }
+
+    #[test]
+    fn mod_verbs_accept_current_valid_forms() {
+        let cases: &[&[&str]] = &[
+            &[
+                "install",
+                "owner/repo",
+                "--ref",
+                "main",
+                "--force",
+                "--reload",
+            ],
+            &["install", "--ref=main", "owner/repo"],
+            &["list", "--format", "json"],
+            &["list", "--format=json"],
+            &["info", "sample", "--format", "markdown"],
+            &["test", "./sample"],
+            &["update", "sample", "--reload"],
+            &["update", "--all"],
+            &["update", "--all", "--reload"],
+            &["remove", "sample"],
+        ];
+        for words in cases {
+            let report = parse_mod(words);
+            assert!(report.ok, "{words:?}: {report:?}");
+        }
+    }
+
+    #[test]
+    fn each_mod_verb_rejects_unknown_flags_with_fix_and_next() {
+        let cases: &[&[&str]] = &[
+            &["install", "owner/repo", "--bogus"],
+            &["list", "--bogus"],
+            &["info", "sample", "--bogus"],
+            &["test", "./sample", "--bogus"],
+            &["update", "sample", "--bogus"],
+            &["remove", "sample", "--bogus"],
+        ];
+        for words in cases {
+            let report = parse_mod(words);
+            assert!(!report.ok && report.code == 2, "{words:?}: {report:?}");
+            assert!(
+                report.text.contains("unknown option"),
+                "{words:?}: {}",
+                report.text
+            );
+            assert!(report.text.contains("Next:"), "{words:?}: {}", report.text);
+        }
+    }
+
+    #[test]
+    fn mod_install_ref_does_not_consume_the_next_flag_as_its_value() {
+        let report = parse_mod(&["install", "owner/repo", "--ref", "--force"]);
+        assert!(!report.ok && report.code == 2, "{report:?}");
+        assert!(report.text.contains("Next:"), "{}", report.text);
+    }
+
+    #[test]
+    fn each_mod_verb_rejects_extra_positional_arguments() {
+        let cases: &[&[&str]] = &[
+            &["install", "owner/repo", "extra"],
+            &["list", "extra"],
+            &["info", "sample", "extra"],
+            &["test", "./sample", "extra"],
+            &["update", "sample", "extra"],
+            &["remove", "sample", "extra"],
+        ];
+        for words in cases {
+            let report = parse_mod(words);
+            assert!(!report.ok && report.code == 2, "{words:?}: {report:?}");
+            assert!(report.text.contains("Next:"), "{words:?}: {}", report.text);
+        }
+    }
+
+    #[test]
+    fn required_mod_positionals_and_update_choice_reject_missing_arguments() {
+        for words in [
+            &["install"][..],
+            &["info"][..],
+            &["test"][..],
+            &["remove"][..],
+        ] {
+            let report = parse_mod(words);
+            assert!(!report.ok && report.code == 2, "{words:?}: {report:?}");
+            assert!(report.text.contains("Next:"), "{words:?}: {}", report.text);
+        }
+        assert!(super::mod_cli_parse("update", &[]).is_err());
+    }
+
+    #[test]
+    fn each_mod_verb_help_is_successful_without_running_the_command() {
+        for verb in ["install", "list", "info", "test", "update", "remove"] {
+            let report = parse_mod(&[verb, "--help"]);
+            assert!(
+                !report.ok && report.kind.as_deref() == Some("help"),
+                "{report:?}"
+            );
+            assert_eq!(report.code, 0, "{verb}: {report:?}");
+            assert!(report.text.contains("Next:"), "{verb}: {}", report.text);
+        }
     }
 }
 

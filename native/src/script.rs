@@ -528,6 +528,7 @@ fn cli_spec_from_lua(table: Table) -> mlua::Result<crate::cli_parse::Spec> {
                     name: item.get("name")?,
                     help: item.get("help")?,
                     multiple: item.get::<Option<bool>>("multiple")?.unwrap_or(false),
+                    required: true,
                 });
             }
         }
