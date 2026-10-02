@@ -219,6 +219,16 @@ const WORDS: &[(&str, &str, &str)] = &[
         "fs.mkdir_new(path) -> true | nil, 'exists' | nil, error",
     ),
     (
+        "fs.realpath",
+        "Resolve a path to the absolute path of what it names, following every symlink and removing '.' and '..'; the file or directory must exist. Pass an absolute path: a relative one is resolved against the daemon's working directory. On Windows the answer is a verbatim path: a prefix of two backslashes, a question mark and one backslash, then the drive (C:) or, for a network path, UNC and the server and share; a junction is followed like a symlink. Returns nil and a reason: 'not_found' (nothing there, or a link whose target is gone), or one starting with 'denied: ' or 'unavailable: '. An empty or non-string path raises a Lua error. The answer is true when it is made: a link changed afterwards is not seen.",
+        "fs.realpath(path) -> path | nil, reason",
+    ),
+    (
+        "fs.is_symlink",
+        "Whether the path itself is a link, without following it: true for a symlink, a dangling one included, and on Windows for a junction too (any reparse point that names another path); false for a plain file or directory. Only the last component is asked about: a link in a parent directory is followed. Returns nil and a reason: 'not_found', or one starting with 'denied: ' or 'unavailable: '. An empty or non-string path raises a Lua error.",
+        "fs.is_symlink(path) -> true | false | nil, reason",
+    ),
+    (
         "fs.lock",
         "Take an exclusive, non-blocking OS advisory lock on the file at an absolute path the caller chooses; it is held until handle:release() or until this daemon exits, and the same path returns the same handle. The lock file is created owner-only, stays empty and is not opened through a symlink. The owner's line (session, pid, since) is kept in PATH.info and returned as info when another process holds the lock: it is message text only, never decide on it. Any other failure returns nil, error. It guards against accidents, such as a second daemon of the same user; it is not a security boundary: a hostile process of that user can delete the lock file while it is held, and a second owner can then lock a new file there.",
         "fs.lock(path) -> handle | nil, 'held', info | nil, error",
@@ -1331,7 +1341,49 @@ fn fs_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
             },
         )?,
     )?;
+    fs.set(
+        "realpath",
+        lua.create_function(|_, path: String| {
+            let resolved =
+                std::fs::canonicalize(fs_path(&path)?).map_err(|error| fs_reason(&error));
+            Ok(
+                match resolved.map(|real| real.into_os_string().into_string()) {
+                    Ok(Ok(real)) => (Some(real), None),
+                    Ok(Err(_)) => (
+                        None,
+                        Some("unavailable: the resolved path is not UTF-8".into()),
+                    ),
+                    Err(reason) => (None, Some(reason)),
+                },
+            )
+        })?,
+    )?;
+    fs.set(
+        "is_symlink",
+        lua.create_function(|_, path: String| {
+            Ok(match std::fs::symlink_metadata(fs_path(&path)?) {
+                Ok(metadata) => (Some(metadata.file_type().is_symlink()), None),
+                Err(error) => (None, Some(fs_reason(&error))),
+            })
+        })?,
+    )?;
     table.set("fs", fs)
+}
+
+fn fs_path(path: &str) -> mlua::Result<&Path> {
+    if path.is_empty() {
+        return Err(mlua::Error::RuntimeError("path must not be empty".into()));
+    }
+    Ok(Path::new(path))
+}
+
+/// Why a path could not be read, in the reason form `system.credential` uses.
+fn fs_reason(error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "not_found".into(),
+        std::io::ErrorKind::PermissionDenied => format!("denied: {error}"),
+        _ => format!("unavailable: {error}"),
+    }
 }
 
 /// Where the image keeps every held `remuda.fs.lock`, path -> handle, so a

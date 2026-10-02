@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Lua: `remuda.fs.realpath(path)` resolves a path through every symlink, and
+  `remuda.fs.is_symlink(path)` says whether the path itself is a link. Both work
+  on Windows, where a junction counts as a link and a resolved path carries the
+  verbatim prefix (`\\?\C:\...`). A mod no longer needs a shell `realpath` or
+  `test -L` for this.
 - Windows: `remuda.exe` now declares UTF-8 as its code page, so a path with
   non-ASCII characters (for example a Korean user folder) is the same string in
   Lua's `os.getenv`, `io.open` and `os.rename` as in the `remuda.*` words.

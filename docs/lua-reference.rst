@@ -151,6 +151,11 @@ fs
 
 ``table`` — Atomic replacement of files for trusted Lua callers.
 
+fs.is_symlink
+-------------
+
+``fs.is_symlink(path) -> true | false | nil, reason`` — Whether the path itself is a link, without following it: true for a symlink, a dangling one included, and on Windows for a junction too (any reparse point that names another path); false for a plain file or directory. Only the last component is asked about: a link in a parent directory is followed. Returns nil and a reason: 'not_found', or one starting with 'denied: ' or 'unavailable: '. An empty or non-string path raises a Lua error.
+
 fs.lock
 -------
 
@@ -160,6 +165,11 @@ fs.mkdir_new
 ------------
 
 ``fs.mkdir_new(path) -> true | nil, 'exists' | nil, error`` — Create one new directory without creating parents or trusting an existing path.
+
+fs.realpath
+-----------
+
+``fs.realpath(path) -> path | nil, reason`` — Resolve a path to the absolute path of what it names, following every symlink and removing '.' and '..'; the file or directory must exist. Pass an absolute path: a relative one is resolved against the daemon's working directory. On Windows the answer is a verbatim path: a prefix of two backslashes, a question mark and one backslash, then the drive (C:) or, for a network path, UNC and the server and share; a junction is followed like a symlink. Returns nil and a reason: 'not_found' (nothing there, or a link whose target is gone), or one starting with 'denied: ' or 'unavailable: '. An empty or non-string path raises a Lua error. The answer is true when it is made: a link changed afterwards is not seen.
 
 fs.write_atomic
 ---------------
