@@ -519,6 +519,10 @@ fn storage_io_error(error: io::Error) -> String {
     }
 }
 
+fn case_clashes(_existing: &[String], _name: &str) -> bool {
+    false
+}
+
 #[cfg(unix)]
 fn write_at(location: &FileLocation, bytes: &[u8]) -> io::Result<()> {
     reject_case_clash(
@@ -1272,22 +1276,30 @@ mod tests {
         assert!(collect_files_if_present(&missing).unwrap().is_empty());
     }
 
+    #[test]
+    fn case_clashes_fold_ascii_but_allow_the_same_name() {
+        let existing = vec!["token".to_owned()];
+        assert!(case_clashes(&existing, "Token"));
+        assert!(!case_clashes(&existing, "token"));
+        assert!(!case_clashes(&existing, "other"));
+    }
+
     const HANDLE_CONFORMANCE: &str = r#"
         local s = remuda.storage
         local a, b = s.get("suite"):data(), s.get("other"):data()
         local value = string.char(0, 255, 1)
-        assert(a:write("mail/a.bin", value) and a:exists("mail/a.bin"))
-        local read, err = a:read("mail/a.bin"); assert(read == value and err == nil)
-        assert(b:read("mail/a.bin") == nil)
-        assert(a:write("mail/b.bin", "b"))
+        assert(a:write("mail/a.bin", value) and a:exists("mail/a.bin"), "write and exists mail/a.bin")
+        local read, err = a:read("mail/a.bin"); assert(read == value and err == nil, "read mail/a.bin")
+        assert(b:read("mail/a.bin") == nil, "namespace isolation")
+        assert(a:write("mail/b.bin", "b"), "write mail/b.bin")
         local names = a:list("mail/")
-        assert(#names == 2 and names[1] == "mail/a.bin" and names[2] == "mail/b.bin")
-        assert(a:delete("mail/a.bin") and not a:exists("mail/a.bin"))
+        assert(#names == 2 and names[1] == "mail/a.bin" and names[2] == "mail/b.bin", "list mail/")
+        assert(a:delete("mail/a.bin") and not a:exists("mail/a.bin"), "delete mail/a.bin")
         local folded = s.get("folded"):data(); folded:write("token", "x")
-        assert(not pcall(function() folded:write("Token", "x") end))
+        assert(not pcall(function() folded:write("Token", "x") end), "reject case-only name collision")
         local limited = s.get("limited"):data()
         for i = 1, 1024 do limited:write("entry" .. i, "x") end
-        assert(not pcall(function() limited:write("overflow", "x") end))
+        assert(not pcall(function() limited:write("overflow", "x") end), "reject 1025th entry")
     "#;
 
     fn select_backend(lua: &Lua, name: &str) {
