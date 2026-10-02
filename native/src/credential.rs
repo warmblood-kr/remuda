@@ -52,7 +52,7 @@ mod store {
     const DENIED: [i32; 2] = [-128, -25293];
 
     const NO_DEFAULT_KEYCHAIN: &str =
-        "unavailable: no default keychain. Fix: open Keychain Access once (File > Reset My Default Keychain) or pass --dir. If macOS asks: Cancel is safe (the password goes to the private file); Reset to Defaults creates a new login keychain";
+        "unavailable: no default keychain. Fix: if macOS asks, Cancel is safe (the password goes to the private file) and Reset to Defaults creates a new login keychain; or pass --dir";
     const KEYCHAIN_LOCKED: &str =
         "unavailable: keychain locked or no GUI session. Fix: unlock it (or log in on the console) or pass --dir";
 
@@ -76,7 +76,8 @@ mod store {
     pub(super) fn put(name: &str, secret: &[u8]) -> Result<(), String> {
         // Without a default keychain macOS opens its own "A keychain cannot be
         // found to store ..." dialog from inside the add; asking first fails
-        // quietly instead. (Not verified on a Mac that lacks one.)
+        // quietly instead. INFERRED, not verified on a Mac that lacks a default
+        // keychain: the owner's Mac is the check.
         SecKeychain::default().map_err(reason)?;
         passwords::set_generic_password(SERVICE, name, secret).map_err(reason)
     }
@@ -107,6 +108,8 @@ mod store {
                 assert!(text.contains("Fix:"), "{code}: {text}");
                 assert!(text.contains("Cancel is safe"), "{code}: {text}");
                 assert!(text.contains("Reset to Defaults"), "{code}: {text}");
+                assert!(text.contains("new login keychain"), "{code}: {text}");
+                assert!(text.len() < 200, "{code}: {} chars: {text}", text.len());
             }
         }
 
