@@ -158,7 +158,7 @@
 <h2 id="storage">storage</h2>
 <p><code>table</code> — Namespace for resolving per-user config, data, state and cache directories.</p>
 <h2 id="storage.dir">storage.dir</h2>
-<p><code>storage.dir(kind) -&gt; path | nil, 'unavailable: reason'</code> — Return the absolute user directory for config, data, state or cache. Returns nil and an unavailable reason when the path cannot be resolved; unknown kinds raise a Lua usage error.</p>
+<p><code>storage.dir(kind) -&gt; path | nil, 'unavailable: reason'</code> — Return the absolute user directory for config, data, state or cache. On Windows, an absolute <code>XDG_*_HOME</code> value takes precedence over Local AppData. Returns nil and an unavailable reason when the path cannot be resolved; unknown kinds raise a Lua usage error.</p>
 <h2 id="system">system</h2>
 <p><code>table</code> — OS services for trusted Lua callers.</p>
 <h2 id="system.credential.backend">system.credential.backend</h2>

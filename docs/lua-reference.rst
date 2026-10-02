@@ -399,7 +399,7 @@ storage
 storage.dir
 -----------
 
-``storage.dir(kind) -> path | nil, 'unavailable: reason'`` — Return the absolute user directory for config, data, state or cache. Returns nil and an unavailable reason when the path cannot be resolved; unknown kinds raise a Lua usage error.
+``storage.dir(kind) -> path | nil, 'unavailable: reason'`` — Return the absolute user directory for config, data, state or cache. On Windows, an absolute ``XDG_*_HOME`` value takes precedence over Local AppData. Returns nil and an unavailable reason when the path cannot be resolved; unknown kinds raise a Lua usage error.
 
 system
 ------
