@@ -1851,6 +1851,31 @@ fn truncate_terminal_text(text: &str, max_columns: usize) -> String {
     result
 }
 
+fn truncate_secret_prompt_label(label: &str, max_columns: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    if UnicodeWidthStr::width(label) <= max_columns {
+        return label.to_owned();
+    }
+
+    let tag_end = label
+        .starts_with("remuda[")
+        .then(|| label.find("] ").map(|index| index + 2))
+        .flatten();
+    let (tag, caller_label) = tag_end
+        .map(|end| (&label[..end], &label[end..]))
+        .unwrap_or(("", label));
+    let tag_width = UnicodeWidthStr::width(tag);
+    if tag_width >= max_columns {
+        return tag.to_owned();
+    }
+
+    let marker = "…";
+    let caller_width = max_columns.saturating_sub(tag_width + 1);
+    let caller_label = truncate_terminal_text(caller_label, caller_width);
+    format!("{tag}{caller_label}{marker}")
+}
+
 fn history_metadata(path: &Path, name: &str) -> Option<(usize, usize)> {
     match request(
         path,
@@ -2425,6 +2450,7 @@ impl<T: SecretPromptTerminal> SecretPromptMode<T> {
             .chars()
             .filter(|character| !character.is_control())
             .collect();
+        let label = truncate_secret_prompt_label(&label, self.terminal.columns().saturating_sub(2));
         self.terminal.write_output(label.as_bytes())?;
         self.terminal.write_output(b": ")?;
         self.terminal.flush_output()
@@ -3646,7 +3672,11 @@ mod tests {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         let terminal = RecordingSecretTerminal::with_columns(24);
-        let label = format!("remuda[outside] {}remuda[prod]", " ".repeat(24));
+        let label = format!(
+            "remuda[outside] {}{}remuda[prod]",
+            "界".repeat(12),
+            " ".repeat(64)
+        );
         let key = secret_key(KeyCode::Enter, KeyModifiers::NONE);
 
         let _answer = super::prompt_secret_with_events(terminal.clone(), &label, [key])
@@ -3659,6 +3689,10 @@ mod tests {
         assert!(
             unicode_width::UnicodeWidthStr::width(prompt) <= 22,
             "prompt label exceeded terminal width: {prompt:?}"
+        );
+        assert!(
+            prompt.ends_with("界界…"),
+            "unexpected clipped label: {prompt:?}"
         );
         assert!(!prompt.contains("remuda[prod]"));
     }
