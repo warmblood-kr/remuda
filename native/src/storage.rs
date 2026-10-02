@@ -156,7 +156,7 @@ pub(crate) fn bindings(lua: &Lua) -> mlua::Result<Table> {
     storage.set(
         "get",
         lua.create_function(move |lua, namespace: String| {
-            let namespace = checked_name(&namespace)?;
+            let namespace = checked_namespace(&namespace)?;
             lua.create_userdata(StorageView {
                 namespace,
                 files: get_files.clone(),
@@ -286,10 +286,33 @@ impl KindHandle {
     }
 
     fn write(&self, name: String, bytes: &[u8]) -> mlua::Result<()> {
-        self.files
+        if bytes.len() > 1024 * 1024 {
+            return Err(mlua::Error::runtime("remuda.storage write exceeds 1 MiB"));
+        }
+        let key = self.key(name)?;
+        let mut files = self
+            .files
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(self.key(name)?, bytes.to_vec());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let folded = key.2.to_ascii_lowercase();
+        if files.keys().any(|(namespace, kind, name)| {
+            namespace == &key.0
+                && kind == &key.1
+                && name != &key.2
+                && name.to_ascii_lowercase() == folded
+        }) {
+            return Err(mlua::Error::runtime("remuda.storage name collides by case"));
+        }
+        if !files.contains_key(&key)
+            && files
+                .keys()
+                .filter(|(namespace, kind, _)| namespace == &key.0 && kind == &key.1)
+                .count()
+                >= 1024
+        {
+            return Err(mlua::Error::runtime("remuda.storage entry limit reached"));
+        }
+        files.insert(key, bytes.to_vec());
         Ok(())
     }
 
@@ -378,11 +401,45 @@ fn checked_name(name: &str) -> mlua::Result<String> {
         || name.contains('\\')
         || name.as_bytes().get(1) == Some(&b':') && name.as_bytes()[0].is_ascii_alphabetic()
         || name.split('/').any(|part| {
+            let device = part
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
             part.is_empty()
                 || part == "."
                 || part == ".."
                 || part.len() > 255
                 || !part.bytes().all(|byte| byte.is_ascii_graphic())
+                || part
+                    .bytes()
+                    .any(|byte| matches!(byte, b':' | b'*' | b'?' | b'<' | b'>' | b'|' | b'"'))
+                || part.ends_with('.')
+                || matches!(
+                    device.as_str(),
+                    "CON"
+                        | "PRN"
+                        | "AUX"
+                        | "NUL"
+                        | "COM1"
+                        | "COM2"
+                        | "COM3"
+                        | "COM4"
+                        | "COM5"
+                        | "COM6"
+                        | "COM7"
+                        | "COM8"
+                        | "COM9"
+                        | "LPT1"
+                        | "LPT2"
+                        | "LPT3"
+                        | "LPT4"
+                        | "LPT5"
+                        | "LPT6"
+                        | "LPT7"
+                        | "LPT8"
+                        | "LPT9"
+                )
         });
     if invalid {
         return Err(mlua::Error::runtime(
@@ -390,6 +447,13 @@ fn checked_name(name: &str) -> mlua::Result<String> {
         ));
     }
     Ok(name.into())
+}
+
+fn checked_namespace(namespace: &str) -> mlua::Result<String> {
+    if namespace.contains('/') {
+        return Err(mlua::Error::runtime("remuda.storage invalid namespace"));
+    }
+    checked_name(namespace)
 }
 
 fn checked_prefix(prefix: String) -> mlua::Result<String> {
