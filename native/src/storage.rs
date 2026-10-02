@@ -61,10 +61,11 @@ fn env_absolute(env: Env<'_>, name: &str, windows: bool) -> Option<PathBuf> {
 }
 
 fn is_absolute_for(path: &std::path::Path, windows: bool) -> bool {
-    if !windows {
-        return path.is_absolute();
-    }
     let path = path.as_os_str().to_string_lossy();
+    if !windows {
+        // Judged by the rule of the platform being resolved, not the host's.
+        return path.starts_with('/');
+    }
     let bytes = path.as_bytes();
     (bytes.len() >= 3
         && bytes[0].is_ascii_alphabetic()
@@ -278,6 +279,16 @@ mod tests {
             .eval()
             .unwrap();
         assert!(is_absolute_for(std::path::Path::new(&path), cfg!(windows)));
+    }
+
+    #[test]
+    fn absoluteness_follows_the_target_platform_not_the_host() {
+        let abs = |path: &str, windows| is_absolute_for(std::path::Path::new(path), windows);
+        assert!(abs("/h/.local", false));
+        assert!(!abs("rel/dir", false));
+        assert!(!abs(r"C:\x", false));
+        assert!(abs(r"C:\x", true));
+        assert!(!abs("/h", true));
     }
 
     #[test]
