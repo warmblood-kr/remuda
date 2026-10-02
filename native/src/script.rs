@@ -462,17 +462,7 @@ fn cli_parse_bindings(lua: &Lua) -> mlua::Result<Table> {
         "parse",
         lua.create_function(|lua, (spec_table, argv_table): (Table, Table)| {
             let spec = cli_spec_from_lua(spec_table)?;
-            let argv = argv_table
-                .sequence_values::<mlua::Value>()
-                .enumerate()
-                .map(|(index, item)| match item? {
-                    mlua::Value::String(value) => Ok(value.to_str()?.to_owned()),
-                    _ => Err(mlua::Error::runtime(format!(
-                        "remuda.cli.parse argv[{}] must be a string",
-                        index + 1
-                    ))),
-                })
-                .collect::<mlua::Result<Vec<_>>>()?;
+            let argv = cli_argv_from_lua(argv_table)?;
             let words = argv.iter().map(String::as_str).collect::<Vec<_>>();
             let report = crate::cli_parse::parse(&spec, &words);
 
@@ -499,9 +489,12 @@ fn cli_spec_from_lua(table: Table) -> mlua::Result<crate::cli_parse::Spec> {
     let name = table.get::<String>("name")?;
     let options = cli_options_from_lua(table.get::<Option<Table>>("options")?)?;
     let verbs_table = table.get::<Table>("verbs")?;
+    let mut verb_entries = verbs_table
+        .pairs::<String, Table>()
+        .collect::<mlua::Result<Vec<_>>>()?;
+    verb_entries.sort_by(|left, right| left.0.cmp(&right.0));
     let mut verbs = Vec::new();
-    for pair in verbs_table.pairs::<String, Table>() {
-        let (name, verb) = pair?;
+    for (name, verb) in verb_entries {
         let about = verb.get::<Option<String>>("about")?.unwrap_or_default();
         let next = verb.get::<String>("next")?;
         let args_table = verb.get::<Option<Table>>("args")?;
@@ -531,6 +524,41 @@ fn cli_spec_from_lua(table: Table) -> mlua::Result<crate::cli_parse::Spec> {
     };
     validate_cli_spec(&spec)?;
     Ok(spec)
+}
+
+fn cli_argv_from_lua(table: Table) -> mlua::Result<Vec<String>> {
+    let mut indexed = std::collections::BTreeMap::new();
+    for pair in table.pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        let index = match key {
+            Value::Integer(index) if index > 0 => usize::try_from(index).ok(),
+            Value::Number(index) if index.is_finite() && index.fract() == 0.0 && index >= 1.0 => {
+                usize::try_from(index as u64).ok()
+            }
+            _ => None,
+        }
+        .ok_or_else(|| mlua::Error::runtime("remuda.cli.parse argv must be a dense array"))?;
+        let word = match value {
+            Value::String(value) => value.to_str()?.to_owned(),
+            _ => {
+                return Err(mlua::Error::runtime(format!(
+                    "remuda.cli.parse argv[{index}] must be a string"
+                )))
+            }
+        };
+        indexed.insert(index, word);
+    }
+
+    let mut argv = Vec::with_capacity(indexed.len());
+    for (expected, (index, word)) in indexed.into_iter().enumerate() {
+        if index != expected + 1 {
+            return Err(mlua::Error::runtime(
+                "remuda.cli.parse argv must be a dense array",
+            ));
+        }
+        argv.push(word);
+    }
+    Ok(argv)
 }
 
 fn cli_spec_valid_token(value: &str, allow_underscore: bool) -> bool {
@@ -2010,6 +2038,23 @@ mod binding_tests {
         lua.globals().set("remuda", remuda).unwrap();
     }
 
+    fn rejects_cli_argv(argv: &str) {
+        let lua = Lua::new();
+        install_cli_binding(&lua);
+        lua.globals()
+            .set("argv", lua.load(argv).eval::<Table>().unwrap())
+            .unwrap();
+        lua.load(
+            r#"
+            local spec = {name="remuda", verbs={go={next="remuda"}}}
+            local ok, err = pcall(remuda.cli.parse, spec, argv)
+            assert(not ok, tostring(err))
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
     #[test]
     fn cli_spec_rejects_duplicate_option_ids() {
         rejects_cli_spec(
@@ -2065,6 +2110,41 @@ mod binding_tests {
     }
 
     #[test]
+    fn cli_spec_rejects_duplicate_short_options() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="one",short="x",help="a"},{long="two",short="x",help="b"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_non_alphanumeric_short_options() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="one",short="!",help="a"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_bad_verb_tokens() {
+        rejects_cli_spec(r#"return {name="remuda", verbs={ ["bad name"]={next="remuda"} }}"#);
+    }
+
+    #[test]
+    fn cli_spec_sorts_verb_names() {
+        let lua = Lua::new();
+        let table: Table = lua
+            .load(r#"return {name="remuda", verbs={zeta={next="remuda"},alpha={next="remuda"}}}"#)
+            .eval()
+            .unwrap();
+        let spec = cli_spec_from_lua(table).unwrap();
+        let names = spec
+            .verbs
+            .iter()
+            .map(|verb| verb.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["alpha", "zeta"]);
+    }
+
+    #[test]
     fn cli_parse_accepts_nul_in_argv_values() {
         let lua = Lua::new();
         install_cli_binding(&lua);
@@ -2092,6 +2172,11 @@ mod binding_tests {
         )
         .exec()
         .unwrap();
+    }
+
+    #[test]
+    fn cli_parse_rejects_argv_tables_with_holes() {
+        rejects_cli_argv(r#"return {[1]="go", [3]="later"}"#);
     }
 
     #[cfg(unix)]
