@@ -1736,11 +1736,29 @@ fn handle_eval(
         // the same treatment `remuda run` gives a script file.
         Err(error) => {
             if name == Some("=remuda mod command") {
-                eprintln!("remuda daemon: mod command failed: {error}");
+                eprintln!(
+                    "remuda daemon: mod command failed: {}",
+                    escaped_mod_command_error(&error)
+                );
             }
             reply(&stream, &Response::error(error))
         }
     }
+}
+
+const MAX_LOGGED_MOD_COMMAND_ERROR: usize = 4096;
+
+fn escaped_mod_command_error(error: &str) -> String {
+    let mut escaped = format!("{error:?}");
+    if escaped.len() > MAX_LOGGED_MOD_COMMAND_ERROR {
+        let mut end = MAX_LOGGED_MOD_COMMAND_ERROR - 3;
+        while !escaped.is_char_boundary(end) {
+            end -= 1;
+        }
+        escaped.truncate(end);
+        escaped.push_str("...");
+    }
+    escaped
 }
 
 fn caller_context(stream: &Stream, registry: &Registry) -> crate::image::CallerContext {

@@ -5461,19 +5461,34 @@ fn eval_request(path: &Path, code: &str, name: Option<&str>, mod_command: bool) 
 }
 
 fn fail_mod_command(message: &str) -> ExitCode {
-    if remuda_native::image::typed_failure_message(message).is_some() {
-        return fail(message);
+    use remuda_native::text::strip_terminal_controls;
+
+    let clean_lines = |text: &str| {
+        text.lines()
+            .map(|line| strip_terminal_controls(line).into_owned())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    if let Some((code, text)) = remuda_native::image::typed_failure_message(message) {
+        eprintln!("{}", clean_lines(text));
+        return ExitCode::from(code);
     }
+    let traceback_start = message.rfind("\nstack traceback:");
+    let without_traceback = traceback_start.map_or(message, |offset| &message[..offset]);
     let show_traceback = std::env::var_os("REMUDA_TRACEBACK").is_some_and(|value| value == "1");
+    let has_next = without_traceback
+        .lines()
+        .any(|line| line.starts_with("Next:"));
     let detail = if show_traceback {
         message
     } else {
-        message.lines().next().unwrap_or(message)
+        without_traceback
     };
-    eprintln!(
-        "{}\nNext: rerun with REMUDA_TRACEBACK=1 to see the full Lua traceback.",
-        format_failure(detail)
-    );
+    let mut diagnostic = format_failure(&clean_lines(detail));
+    if !has_next {
+        diagnostic.push_str("\nNext: rerun with REMUDA_TRACEBACK=1 to see the full Lua traceback.");
+    }
+    eprintln!("{diagnostic}");
     ExitCode::FAILURE
 }
 
