@@ -5,6 +5,20 @@
 - Fixed remote input batches refused after a late-submit abandonment: callers
   now get a retryable busy response because the bytes were not written (see
   #428).
+- Lua: `remuda.storage.dir(kind)` returns an absolute per-user directory for
+  `config`, `data`, `state` or `cache`. Absolute XDG values win on every OS;
+  Windows falls back to Local AppData, and Linux/macOS use the XDG home layout.
+  On Unix, data-home resolution no longer falls back to `USERPROFILE`.
+  Relative XDG values are ignored; earlier data-home resolution accepted
+  relative `XDG_DATA_HOME` values.
+- Fixed secret prompt labels wrapping into rows that look like daemon tags by
+  clipping them to terminal display width; see #363.
+- Fixed: macOS credential store calls no longer show Keychain dialogs; locked or
+  unavailable keychains return an `unavailable` reason instead. See #472.
+- `install.sh`: when the install directory is not on `PATH` it now prints the
+  command that fixes it, `Next: export PATH='<dir>':"$PATH"`, instead of only
+  saying to add it to your shell profile. The directory is single-quoted, so
+  the line is safe to paste whatever the directory is named (#395).
 - `remuda cluster remote` now labels this node with the OS host name instead of
   reading the `HOSTNAME` environment variable; it uses `local` if the OS lookup
   fails.

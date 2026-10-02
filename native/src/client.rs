@@ -493,12 +493,23 @@ pub fn request_with_secret_prompts(path: &Path, request: &Request) -> std::io::R
                 default,
                 timeout_ms,
             } => {
-                match collect_line_from_terminal(&label, &preface, default.as_deref(), timeout_ms)?
-                {
+                match collect_line_from_terminal(
+                    &stream,
+                    &label,
+                    &preface,
+                    default.as_deref(),
+                    timeout_ms,
+                )? {
                     LinePromptCollection::Answer(line, refusal) => {
                         send_line_answer(&stream, id, line.as_deref(), refusal)?;
                     }
                     LinePromptCollection::Deadline => {}
+                    LinePromptCollection::Disconnected => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "daemon connection closed while waiting for a line prompt\nNext: restart the daemon and rerun the command.",
+                        ));
+                    }
                 }
                 continue;
             }
@@ -535,6 +546,7 @@ enum LinePromptCollection {
         Option<remuda_core::protocol::SecretAnswerRefusal>,
     ),
     Deadline,
+    Disconnected,
 }
 
 fn collect_secret_from_terminal(
@@ -597,6 +609,7 @@ fn collect_secret_from_terminal(
 }
 
 fn collect_line_from_terminal(
+    stream: &ipc::Stream,
     label: &str,
     preface: &[String],
     default: Option<&str>,
@@ -614,7 +627,12 @@ fn collect_line_from_terminal(
     #[cfg(unix)]
     let signal_guard = SecretPromptSignalGuard::install()?;
     let mut expired = false;
+    let mut disconnected = false;
     let events = std::iter::from_fn(|| loop {
+        if prompt_peer_disconnected(stream) {
+            disconnected = true;
+            return None;
+        }
         #[cfg(unix)]
         if SECRET_PROMPT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) != 0 {
             return None;
@@ -649,6 +667,9 @@ fn collect_line_from_terminal(
             ));
         }
     }
+    if disconnected || prompt_peer_disconnected(stream) {
+        return Ok(LinePromptCollection::Disconnected);
+    }
     if expired {
         Ok(LinePromptCollection::Deadline)
     } else {
@@ -661,6 +682,38 @@ fn collect_line_from_terminal(
             ),
         };
         Ok(LinePromptCollection::Answer(answer.0, answer.1))
+    }
+}
+
+fn prompt_peer_disconnected(stream: &ipc::Stream) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::fd::{AsFd, AsRawFd};
+
+        let ipc::Stream::UdSocket(socket) = stream;
+        let mut byte = 0u8;
+        loop {
+            let result = unsafe {
+                libc::recv(
+                    socket.as_fd().as_raw_fd(),
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if result >= 0 {
+                return result == 0;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return error.kind() != std::io::ErrorKind::WouldBlock;
+        }
+    }
+    #[cfg(windows)]
+    {
+        ipc::peer_disconnected(stream).unwrap_or(true)
     }
 }
 
@@ -1851,6 +1904,38 @@ fn truncate_terminal_text(text: &str, max_columns: usize) -> String {
     result
 }
 
+fn truncate_secret_prompt_label(label: &str, max_columns: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+
+    if UnicodeWidthStr::width(label) <= max_columns {
+        return label.to_owned();
+    }
+
+    let tag_end = label
+        .starts_with("remuda[")
+        .then(|| label.find("] ").map(|index| index + 2))
+        .flatten();
+    let (tag, caller_label) = tag_end
+        .map(|end| (&label[..end], &label[end..]))
+        .unwrap_or(("", label));
+    let tag_width = UnicodeWidthStr::width(tag);
+    if tag_width >= max_columns {
+        return tag.to_owned();
+    }
+
+    let marker = "…";
+    let caller_width = max_columns.saturating_sub(tag_width + 1);
+    let mut clipped = String::new();
+    for character in caller_label.chars() {
+        clipped.push(character);
+        if UnicodeWidthStr::width(clipped.as_str()) > caller_width {
+            clipped.pop();
+            break;
+        }
+    }
+    format!("{tag}{clipped}{marker}")
+}
+
 fn history_metadata(path: &Path, name: &str) -> Option<(usize, usize)> {
     match request(
         path,
@@ -2371,6 +2456,9 @@ fn edit_secret_line(
 }
 
 trait SecretPromptTerminal {
+    fn columns(&self) -> usize {
+        crossterm::terminal::size().map_or(80, |(columns, _)| usize::from(columns))
+    }
     fn enable_raw_mode(&mut self) -> std::io::Result<()>;
     fn enable_bracketed_paste(&mut self) -> std::io::Result<()>;
     fn write_output(&mut self, bytes: &[u8]) -> std::io::Result<()>;
@@ -2422,6 +2510,7 @@ impl<T: SecretPromptTerminal> SecretPromptMode<T> {
             .chars()
             .filter(|character| !character.is_control())
             .collect();
+        let label = truncate_secret_prompt_label(&label, self.terminal.columns().saturating_sub(2));
         self.terminal.write_output(label.as_bytes())?;
         self.terminal.write_output(b": ")?;
         self.terminal.flush_output()
@@ -2576,9 +2665,17 @@ mod tests {
     struct RecordingSecretTerminal {
         operations: Arc<Mutex<Vec<&'static str>>>,
         output: Arc<Mutex<Vec<u8>>>,
+        columns: Option<usize>,
     }
 
     impl RecordingSecretTerminal {
+        fn with_columns(columns: usize) -> Self {
+            Self {
+                columns: Some(columns),
+                ..Self::default()
+            }
+        }
+
         fn operations(&self) -> Vec<&'static str> {
             self.operations.lock().unwrap().clone()
         }
@@ -2593,6 +2690,10 @@ mod tests {
     }
 
     impl SecretPromptTerminal for RecordingSecretTerminal {
+        fn columns(&self) -> usize {
+            self.columns.unwrap_or(80)
+        }
+
         fn enable_raw_mode(&mut self) -> std::io::Result<()> {
             self.record("raw:on");
             Ok(())
@@ -3623,6 +3724,94 @@ mod tests {
                 "paste:off",
                 "raw:off"
             ]
+        );
+    }
+
+    #[test]
+    fn secret_prompt_clips_label_to_terminal_width_without_wrapping_fake_tag() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(24);
+        let label = format!(
+            "remuda[outside] {}{}remuda[prod]",
+            "界".repeat(12),
+            " ".repeat(64)
+        );
+        let key = secret_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        let _answer = super::prompt_secret_with_events(terminal.clone(), &label, [key])
+            .unwrap()
+            .unwrap();
+
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let prompt = output.split(": ").next().unwrap();
+        assert!(prompt.starts_with("remuda[outside]"));
+        assert!(
+            unicode_width::UnicodeWidthStr::width(prompt) <= 22,
+            "prompt label exceeded terminal width: {prompt:?}"
+        );
+        assert!(
+            prompt.ends_with("界界…"),
+            "unexpected clipped label: {prompt:?}"
+        );
+        assert!(!prompt.contains("remuda[prod]"));
+    }
+
+    #[test]
+    fn secret_prompt_keeps_over_budget_tag_without_caller_text() {
+        let tag = format!("remuda[session {}] ", "x".repeat(64));
+        let label = format!("{tag}deferred test secret");
+
+        let prompt = super::truncate_secret_prompt_label(&label, 78);
+
+        assert_eq!(prompt, tag);
+        assert!(!prompt.contains("deferred test secret"));
+    }
+
+    #[test]
+    fn secret_prompt_clips_vs16_label_by_display_width() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(40);
+        let label = format!("remuda[session a] {}", "\u{2764}\u{fe0f}".repeat(100));
+        let key = secret_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        let _answer = super::prompt_secret_with_events(terminal.clone(), &label, [key])
+            .unwrap()
+            .unwrap();
+
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let prompt = output.split(": ").next().unwrap();
+        assert!(
+            unicode_width::UnicodeWidthStr::width(prompt) <= 38,
+            "prompt label exceeded terminal width: {prompt:?}"
+        );
+    }
+
+    #[test]
+    fn secret_prompt_clips_vs16_forgery_before_fake_tag() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(80);
+        let label = format!(
+            "remuda[session a] {} remuda[prod] forged",
+            "\u{2764}\u{fe0f}".repeat(31)
+        );
+        let key = secret_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        let _answer = super::prompt_secret_with_events(terminal.clone(), &label, [key])
+            .unwrap()
+            .unwrap();
+
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let prompt = output.split(": ").next().unwrap();
+        assert!(
+            unicode_width::UnicodeWidthStr::width(prompt) <= 78,
+            "prompt label exceeded terminal width: {prompt:?}"
+        );
+        assert!(
+            !prompt.contains("remuda[prod]"),
+            "fake tag survived: {prompt:?}"
         );
     }
 

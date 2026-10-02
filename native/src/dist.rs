@@ -214,7 +214,9 @@ fn cache_path() -> PathBuf {
     cache_path_for(cfg!(windows), &|name| std::env::var_os(name))
 }
 
-/// The data home, parent of `remuda/`: `$XDG_DATA_HOME`, else `%LOCALAPPDATA%` on Windows or `$HOME/.local/share`; `None` if unknown.
+/// Data base directory, parent of `remuda/`: an absolute `$XDG_DATA_HOME`,
+/// else `%LOCALAPPDATA%` (or `%USERPROFILE%/AppData/Local`) on Windows or
+/// `$HOME/.local/share`; relative XDG values are ignored. `None` if unknown.
 pub(crate) fn data_home() -> Option<PathBuf> {
     data_home_for(cfg!(windows), &|name| std::env::var_os(name))
 }
@@ -229,7 +231,7 @@ fn set(env: Env, name: &str) -> Option<PathBuf> {
 
 // Platform and environment are arguments so every arm runs on any host.
 fn data_home_for(windows: bool, env: Env) -> Option<PathBuf> {
-    set(env, "XDG_DATA_HOME").or_else(|| home_dir_for(windows, env, ".local/share"))
+    crate::storage::base_dir_for(crate::storage::Kind::Data, windows, env).ok()
 }
 
 fn cache_path_for(windows: bool, env: Env) -> PathBuf {
@@ -354,22 +356,29 @@ mod tests {
     #[test]
     fn windows_xdg_wins_and_localappdata_falls_back_to_the_profile() {
         let env = env_of(&[
-            ("XDG_DATA_HOME", "/x"),
+            ("XDG_DATA_HOME", r"C:\xdg\data"),
             ("XDG_CACHE_HOME", "/c"),
-            ("LOCALAPPDATA", "L"),
+            ("LOCALAPPDATA", r"C:\Users\user\AppData\Local"),
         ]);
-        assert_eq!(data_home_for(true, &env), Some(PathBuf::from("/x")));
+        assert_eq!(
+            data_home_for(true, &env),
+            Some(PathBuf::from(r"C:\xdg\data"))
+        );
         assert_eq!(
             cache_path_for(true, &env),
             PathBuf::from("/c/remuda/update-check.json")
         );
         for env in [
-            env_of(&[("USERPROFILE", "P")]),
-            env_of(&[("LOCALAPPDATA", ""), ("USERPROFILE", "P")]),
+            env_of(&[("USERPROFILE", r"C:\Users\user")]),
+            env_of(&[("LOCALAPPDATA", ""), ("USERPROFILE", r"C:\Users\user")]),
         ] {
             assert_eq!(
                 data_home_for(true, &env),
-                Some(PathBuf::from("P").join("AppData").join("Local"))
+                Some(
+                    PathBuf::from(r"C:\Users\user")
+                        .join("AppData")
+                        .join("Local")
+                )
             );
         }
         assert_eq!(data_home_for(true, &env_of(&[("HOME", "/h")])), None);
@@ -387,13 +396,17 @@ mod tests {
             PathBuf::from("/h/.cache/remuda/update-check.json")
         );
         let env = env_of(&[("USERPROFILE", "/p")]);
-        assert_eq!(
-            data_home_for(false, &env),
-            Some(PathBuf::from("/p/.local/share"))
-        );
+        assert_eq!(data_home_for(false, &env), None);
         assert_eq!(
             data_home_for(false, &env_of(&[("XDG_DATA_HOME", "")])),
             None
+        );
+        assert_eq!(
+            data_home_for(
+                false,
+                &env_of(&[("XDG_DATA_HOME", "relative"), ("HOME", "/h")]),
+            ),
+            Some(PathBuf::from("/h/.local/share"))
         );
         assert_eq!(
             data_home_for(false, &env_of(&[("XDG_DATA_HOME", "/x")])),
