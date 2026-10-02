@@ -2907,10 +2907,12 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
                 Err(error) => ui.notice = Some(error),
             },
             Action::Type(bytes) => {
-                if let Some((name, hold)) = &held {
-                    if let Err(e) = hold.keys(&bytes) {
-                        input_write_failed(&mut ui, name, &e);
-                    }
+                let failure = held.as_ref().and_then(|(name, hold)| {
+                    hold.keys(&bytes).err().map(|error| (name.clone(), error))
+                });
+                if let Some((name, error)) = failure {
+                    input_write_failed(&mut ui, &name, &error);
+                    held = None;
                 }
             }
             Action::Start(command) => {
@@ -2928,7 +2930,11 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             }
             Action::Copy(name) => copy_screen(path, &mut ui, &name),
             Action::CopySelection(name) => copy_selection(path, &mut ui, &name),
-            Action::Paste => paste(path, &mut ui, &held),
+            Action::Paste => {
+                if paste(path, &mut ui, &held) {
+                    held = None;
+                }
+            }
         }
         // Not `painted.clear()`: the frame-vs-`painted` compare in `refresh`
         // already skips the write when a key changed nothing visible — see
@@ -3112,18 +3118,17 @@ fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCaptur
 }
 
 fn input_write_failed(ui: &mut Ui, name: &str, error: &std::io::Error) {
-    ui.notice = Some(format!(
-        "{name}: input stuck; dropped this key batch ({error})"
-    ));
+    ui.notice = Some(format!("{name}: input stuck; dropped this key batch; a partial prefix may already have been delivered ({error})"));
     ui.focus = Focus::List;
 }
 
-fn paste(path: &Path, ui: &mut Ui, held: &Option<(String, Hold)>) {
+fn paste(path: &Path, ui: &mut Ui, held: &Option<(String, Hold)>) -> bool {
     if ui.yank.is_empty() {
         ui.notice = Some("kill ring is empty".into());
     } else if let Some((name, hold)) = &held {
         if let Err(e) = hold.keys(ui.yank.as_bytes()) {
-            ui.notice = Some(format!("{name}: {e}"));
+            input_write_failed(ui, name, &e);
+            return true;
         }
     } else if let Some(name) = ui.selected().map(|session| session.name.clone()) {
         match client::request(
@@ -3138,6 +3143,7 @@ fn paste(path: &Path, ui: &mut Ui, held: &Option<(String, Hold)>) {
             other => ui.notice = Some(format!("{other:?}")),
         }
     }
+    false
 }
 
 /// [`Action::Focus`]`(name)` just fired. Already held: no-op. A different

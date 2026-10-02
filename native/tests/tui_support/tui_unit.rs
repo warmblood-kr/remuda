@@ -484,6 +484,11 @@ fn timed_out_input_sets_notice_and_ctrl_backslash_keeps_the_list_focus() {
         .as_deref()
         .unwrap()
         .contains("dropped this key batch"));
+    assert!(ui
+        .notice
+        .as_deref()
+        .unwrap()
+        .contains("partial prefix may already have been delivered"));
     ui.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
     assert_eq!(ui.focus, Focus::List, "the next Ctrl-\\ event is handled");
 }
