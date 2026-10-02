@@ -277,13 +277,20 @@ fn message_body_start(
             }
             continue;
         }
-        if let Some(short) = word.strip_prefix('-').and_then(|rest| rest.chars().next()) {
-            let option = options.clone().find(|option| option.short == Some(short));
-            if option.is_some_and(|option| option.value.is_some() && word.len() == 2) {
-                index += 2;
-            } else {
-                index += 1;
-            }
+        if word.strip_prefix('-').is_some_and(|rest| !rest.is_empty()) {
+            let cluster = word
+                .strip_prefix('-')
+                .unwrap_or_default()
+                .chars()
+                .collect::<Vec<_>>();
+            let value_option_position = cluster.iter().position(|short| {
+                options
+                    .clone()
+                    .any(|option| option.short == Some(*short) && option.value.is_some())
+            });
+            let consumes_next =
+                value_option_position.is_some_and(|position| position + 1 == cluster.len());
+            index += 1 + usize::from(consumes_next);
             continue;
         }
         if positionals_seen < positionals_before_body {
@@ -725,5 +732,25 @@ mod tests {
                 "{argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn short_cluster_value_does_not_start_the_message_body() {
+        let report = parse(
+            &reply_spec(),
+            &["reply", "-jr", "R", "e", "hello", "--help", "x"],
+        );
+        assert!(report.ok, "{report:?}");
+        assert_eq!(report.values["room"], "R");
+        assert_eq!(report.values["json"], true);
+        assert_eq!(report.values["EVENT_ID"], "e");
+        assert_eq!(
+            report.values["TEXT"],
+            Value::Array(vec![
+                Value::String("hello".into()),
+                Value::String("--help".into()),
+                Value::String("x".into()),
+            ])
+        );
     }
 }
