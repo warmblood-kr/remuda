@@ -27,7 +27,8 @@ use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(unix)]
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(unix)]
 use std::sync::mpsc;
 use std::thread;
@@ -35,6 +36,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 static JOIN_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+static UPDATE_NOTICE_EMITTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(unix)]
 static JOIN_INTERRUPT_SIGNAL: AtomicI32 = AtomicI32::new(0);
@@ -4385,10 +4388,24 @@ fn skew_notice(response: std::io::Result<Response>) -> Option<String> {
 /// is the client's only diagnostic when start-up fails — and on `mcp`, whose
 /// streams belong to whatever spawned it.
 fn announce_update(argv: &[&str]) {
-    if !matches!(argv, ["daemon"] | ["mcp"]) {
-        if let Some(notice) = dist::update_notice() {
-            eprintln!("{notice}");
-        }
+    if matches!(argv, ["daemon"] | ["mcp"]) || UPDATE_NOTICE_EMITTED.load(Ordering::Relaxed) {
+        return;
+    }
+    let now = std::time::SystemTime::now();
+    let no_update_check = std::env::var_os("REMUDA_NO_UPDATE_CHECK").is_some();
+    if !dist::should_show_update_notice(
+        std::io::stderr().is_terminal(),
+        std::env::var_os("REMUDA_BUTLER_AGENT_ID").is_some(),
+        no_update_check,
+        dist::update_notice_last_shown(),
+        now,
+    ) {
+        return;
+    }
+    if let Some(notice) = dist::update_notice() {
+        eprintln!("{notice}");
+        UPDATE_NOTICE_EMITTED.store(true, Ordering::Relaxed);
+        dist::record_update_notice_shown(now);
     }
 }
 

@@ -27,6 +27,34 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
+#[test]
+fn non_terminal_version_command_suppresses_cached_update_notice() {
+    let dir = scratch("non-tty-update-notice");
+    let cache_dir = dir.join("cache").join("remuda");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(
+        cache_dir.join("update-check.json"),
+        r#"{"stable":"999.0.0"}"#,
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_remuda"))
+        .arg("version")
+        .env("HOME", &dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .env_remove("REMUDA_NO_UPDATE_CHECK")
+        .env_remove("REMUDA_BUTLER_AGENT_ID")
+        .output()
+        .expect("run remuda without a terminal");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        !stderr.contains("is out on the stable channel"),
+        "non-terminal command printed update notice: {stderr}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 struct SessionAutoStartScratch {
     root: PathBuf,
     server: Option<String>,
