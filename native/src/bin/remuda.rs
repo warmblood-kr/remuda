@@ -4999,7 +4999,7 @@ fn extension_command(
     );
     with_daemon(server, path, |path| {
         match load_extension_command(path, command, &package) {
-            Ok(()) => eval_once(path, &code),
+            Ok(()) => eval_mod_command_once(path, &code),
             Err(failed) => failed,
         }
     })
@@ -5409,11 +5409,19 @@ fn resize_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
 /// Evaluate one chunk in the daemon's image and print what it came to. Nothing
 /// is printed when it returned nothing, so `-e "x = 1"` is silent.
 fn eval_once(path: &Path, code: &str) -> ExitCode {
+    eval_request(path, code, None, false)
+}
+
+fn eval_mod_command_once(path: &Path, code: &str) -> ExitCode {
+    eval_request(path, code, Some("=remuda mod command"), true)
+}
+
+fn eval_request(path: &Path, code: &str, name: Option<&str>, mod_command: bool) -> ExitCode {
     match remuda_native::client::request_with_secret_prompts(
         path,
         &Request::Eval {
             code: code.to_string(),
-            name: None,
+            name: name.map(str::to_string),
         },
     ) {
         Ok(Response::Value(value)) => {
@@ -5441,8 +5449,32 @@ fn eval_once(path: &Path, code: &str) -> ExitCode {
             }
             ExitCode::from(exit_code)
         }
-        other => fail(describe(other)),
+        other => {
+            let message = describe(other);
+            if mod_command {
+                fail_mod_command(&message)
+            } else {
+                fail(message)
+            }
+        }
     }
+}
+
+fn fail_mod_command(message: &str) -> ExitCode {
+    if remuda_native::image::typed_failure_message(message).is_some() {
+        return fail(message);
+    }
+    let show_traceback = std::env::var_os("REMUDA_TRACEBACK").is_some_and(|value| value == "1");
+    let detail = if show_traceback {
+        message
+    } else {
+        message.lines().next().unwrap_or(message)
+    };
+    eprintln!(
+        "{}\nNext: rerun with REMUDA_TRACEBACK=1 to see the full Lua traceback.",
+        format_failure(detail)
+    );
+    ExitCode::FAILURE
 }
 
 /// Render the live registry in the requested documentation format.

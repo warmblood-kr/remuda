@@ -1734,7 +1734,12 @@ fn handle_eval(
         },
         // Lua's own message, which already carries the line and a traceback —
         // the same treatment `remuda run` gives a script file.
-        Err(error) => reply(&stream, &Response::error(error)),
+        Err(error) => {
+            if name == Some("=remuda mod command") {
+                eprintln!("remuda daemon: mod command failed: {error}");
+            }
+            reply(&stream, &Response::error(error))
+        }
     }
 }
 
