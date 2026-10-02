@@ -478,19 +478,27 @@ fn timed_out_input_sets_notice_and_ctrl_backslash_keeps_the_list_focus() {
     );
 
     assert_eq!(ui.focus, Focus::List);
-    assert!(ui.notice.as_deref().unwrap().contains("input stuck"));
     assert!(ui
         .notice
         .as_deref()
         .unwrap()
-        .contains("dropped this key batch"));
-    assert!(ui
-        .notice
-        .as_deref()
-        .unwrap()
-        .contains("partial prefix may already have been delivered"));
+        .contains("this key batch may not have been delivered"));
+    assert!(!ui.notice.as_deref().unwrap().contains("dropped"));
     ui.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
     assert_eq!(ui.focus, Focus::List, "the next Ctrl-\\ event is handled");
+}
+
+#[test]
+fn closed_input_pipe_has_a_distinct_notice_from_a_stuck_write() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    input_write_failed(
+        &mut ui,
+        "a",
+        &std::io::Error::new(std::io::ErrorKind::BrokenPipe, "peer closed"),
+    );
+
+    assert!(ui.notice.as_deref().unwrap().contains("input pipe closed"));
+    assert!(!ui.notice.as_deref().unwrap().contains("input stuck"));
 }
 
 fn click(col: u16, row: u16) -> MouseEvent {
