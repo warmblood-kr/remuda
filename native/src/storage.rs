@@ -669,8 +669,7 @@ fn list_location(location: &FileLocation, limit: usize) -> io::Result<Vec<String
     }
     #[cfg(not(unix))]
     {
-        let mut names = Vec::new();
-        collect_files(&location.path, &location.path, "", &mut names)?;
+        let mut names = collect_files_if_present(&location.path)?;
         names.truncate(limit);
         names.sort();
         Ok(names)
@@ -706,7 +705,12 @@ fn collect_files(
     prefix: &str,
     names: &mut Vec<String>,
 ) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if dir == base && error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
         let kind = entry.file_type()?;
