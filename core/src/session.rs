@@ -358,7 +358,10 @@ impl Session {
             .filter(|pending| pending.tail == tail)
             .map(|pending| pending.baseline_occurrences)
             .unwrap_or_else(|| self.tail_occurrences(&tail).saturating_sub(1));
-        self.submit_locked(&tail, baseline)
+        match self.submit_locked(&tail, baseline) {
+            Err(AgentError::Busy) => Err(AgentError::SubmitUncertain),
+            result => result,
+        }
     }
 
     /// Deliver TEXT and submit it as one act. This is the composite used by
@@ -416,7 +419,10 @@ impl Session {
         if !settle.is_zero() {
             self.clock.sleep(settle);
         }
-        self.submit_locked(&tail, baseline)
+        match self.submit_locked(&tail, baseline) {
+            Err(AgentError::Busy) => Err(AgentError::SubmitUncertain),
+            result => result,
+        }
     }
 
     fn submit_locked(&self, tail: &str, baseline_occurrences: usize) -> Result<InputSubmitOutcome> {
