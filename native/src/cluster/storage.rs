@@ -290,7 +290,7 @@ pub(super) fn check_private_file(_file: &File, description: &str, path: &Path) -
 
 #[cfg(not(windows))]
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    crate::fs_atomic::write_atomic(path, bytes, 0o600)
+    crate::fs_atomic::write_atomic_exact_mode(path, bytes, 0o600)
 }
 
 const CLUSTER_INIT_MARKER: &str = "cluster-initialized";
