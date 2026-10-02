@@ -3,6 +3,10 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+fn ace_sid_fits(ace_size: usize, fixed_size: usize, sid_size: usize) -> bool {
+    ace_size >= fixed_size
+}
+
 #[allow(dead_code)]
 pub(crate) fn protected_storage_sddl(owner_sid: &str) -> String {
     // Protect the root from parent ACLs; let its three trusted principals inherit to children.
@@ -391,6 +395,12 @@ mod tests {
             protected_storage_sddl("S-1-5-21-42"),
             "O:S-1-5-21-42D:PAI(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
         );
+    }
+
+    #[test]
+    fn ace_size_must_contain_the_full_sid() {
+        assert!(ace_sid_fits(28, 8, 20));
+        assert!(!ace_sid_fits(27, 8, 20));
     }
 
     #[test]
