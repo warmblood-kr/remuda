@@ -359,6 +359,9 @@ impl Session {
             .map(|pending| pending.baseline_occurrences)
             .unwrap_or_else(|| self.tail_occurrences(&tail).saturating_sub(1));
         match self.submit_locked(&tail, baseline) {
+            // The first Return write was refused without writing bytes. The
+            // body came from an earlier input_text call, so keep the result
+            // cautious and report submission as unconfirmed.
             Err(AgentError::Busy) => Err(AgentError::SubmitUncertain),
             result => result,
         }
