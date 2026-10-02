@@ -23,6 +23,10 @@
 <p><code>capture_styled(name) -&gt; {rows, cursor = {row, col, visible}}</code> — Read a session's screen as rows of {text, dim} spans, plus its cursor.</p>
 <h2 id="clear_hooks">clear_hooks</h2>
 <p><code>clear_hooks(opts) -&gt; nil</code> — Remove every hook registered under a group.</p>
+<h2 id="cli">cli</h2>
+<p><code>table</code> — Declarative command-line parsing for extension handlers.</p>
+<h2 id="cli.parse">cli.parse</h2>
+<p><code>cli.parse(spec, argv) -&gt; report</code> — Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set multiple = true on the final positional argument to collect message body words.</p>
 <h2 id="click">click</h2>
 <p><code>click(name, col, row, button?) -&gt; nil</code> — Send a mouse click at a terminal cell.</p>
 <h2 id="clock">clock</h2>

@@ -55,7 +55,9 @@ When a manifest declares `command = "NAME"`, `remuda NAME` loads that
 mod explicitly and opens the regular Remuda screen when attached to a terminal.
 Use `remuda NAME --headless` to load it without opening the screen. Further
 words (`remuda NAME ...`) are dispatched to the already-loaded mod's Lua
-command handler; the core does not embed a mod-specific parser.
+command handler; the core does not embed a mod-specific parser. A mod may hand
+its declaration to `remuda.cli.parse`; the handler still receives the raw word
+list.
 
 `remuda mod update NAME` and `remuda mod update --all` reuse each installed
 mod's recorded GitHub source and ref, validate the new checkout, and replace

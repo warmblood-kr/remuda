@@ -541,6 +541,44 @@ fn random_bytes_returns_csprng_bytes_and_rejects_invalid_lengths() {
     );
 }
 
+#[test]
+fn remuda_cli_parse_handles_declared_arguments() {
+    run_lua(
+        "cli-parse",
+        r#"
+        local spec = {
+          name = "remuda butler matrix",
+          options = {
+            { long = "room", value = "ROOM", help = "Room ID", global = true },
+            { long = "json", help = "Print JSON", global = true },
+          },
+          verbs = {
+            thread = {
+              about = "Show every reply in a Matrix thread",
+              args = { { name = "EVENT_ID", help = "Event that starts the thread" } },
+              next = "remuda butler matrix reply EVENT_ID TEXT",
+            },
+          },
+        }
+        local result = remuda.cli.parse(spec, { "--room", "!r", "thread", "$abc", "--json" })
+        assert(result.ok == true, "expected parse success")
+        assert(result.verb == "thread", "expected selected verb")
+        assert(result.values.room == "!r", "expected room option")
+        assert(result.values.EVENT_ID == "$abc", "expected positional value")
+        assert(result.values.json == true, "expected boolean option")
+
+        local help = remuda.cli.parse(spec, { "thread", "--help" })
+        assert(help.ok == false and help.kind == "help" and help.code == 0, "expected help result")
+        assert(help.text:find("Usage:", 1, true), "help should include Usage")
+        assert(help.text:find("Next: remuda butler matrix reply EVENT_ID TEXT", 1, true), "help should include Next")
+
+        local error = remuda.cli.parse(spec, { "thread", "--jsno", "x" })
+        assert(error.ok == false and error.kind == "error" and error.code == 2, "expected error result")
+        assert(error.text:find("Did you mean '--json'", 1, true), "error should suggest --json")
+        "#,
+    );
+}
+
 // Off Windows, none of the credential tests below reach a real OS store: every
 // call either fails validation first or runs where no backend exists, and the
 // round trip that writes to the login Keychain is `#[ignore]`. The Windows
@@ -801,6 +839,18 @@ fn documented_function<'a>(document: &'a Value, name: &str) -> &'a Value {
     found.unwrap_or_else(|| panic!("{name} is not documented"))
 }
 
+fn assert_cli_parse_documented(document: &Value) {
+    let cli_parse = documented_function(document, "cli.parse");
+    assert!(cli_parse["signature"]
+        .as_str()
+        .unwrap()
+        .contains("cli.parse(spec, argv)"));
+    assert!(cli_parse["description"]
+        .as_str()
+        .unwrap()
+        .contains("without printing or exiting"));
+}
+
 #[test]
 fn registry_documentation_formats_are_live_and_structured() {
     let dir = scratch("registry-docs");
@@ -863,6 +913,7 @@ fn registry_documentation_formats_are_live_and_structured() {
         .as_str()
         .unwrap()
         .contains("65536"));
+    assert_cli_parse_documented(&document);
     let credential_get = document["runtime"]["functions"]
         .as_array()
         .unwrap()

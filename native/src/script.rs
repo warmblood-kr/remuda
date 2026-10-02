@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 93] = [
+pub const BINDINGS: [&str; 94] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -71,6 +71,7 @@ pub const BINDINGS: [&str; 93] = [
     "capture",
     "capture_styled",
     "clear_hooks",
+    "cli",
     "click",
     "clock",
     "close",
@@ -172,6 +173,16 @@ const WORDS: &[(&str, &str, &str)] = &[
         "clock",
         "Monotonic milliseconds since this Lua image started.",
         "clock() -> milliseconds",
+    ),
+    (
+        "cli",
+        "Declarative command-line parsing for extension handlers.",
+        "table",
+    ),
+    (
+        "cli.parse",
+        "Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set multiple = true on the final positional argument to collect message body words.",
+        "cli.parse(spec, argv) -> report",
     ),
     (
         "_pending_create",
@@ -439,9 +450,132 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
         registry.set(*name, row)?;
     }
     table.set("json", crate::json::bindings(lua)?)?;
+    table.set("cli", cli_parse_bindings(lua)?)?;
     table.set("system", crate::credential::bindings(lua)?)?;
     fs_bindings(lua, table)?;
     table.set("_registry", registry)
+}
+
+fn cli_parse_bindings(lua: &Lua) -> mlua::Result<Table> {
+    let cli = lua.create_table()?;
+    cli.set(
+        "parse",
+        lua.create_function(|lua, (spec_table, argv_table): (Table, Table)| {
+            let spec = cli_spec_from_lua(spec_table)?;
+            let argv = argv_table
+                .sequence_values::<String>()
+                .collect::<mlua::Result<Vec<_>>>()?;
+            let words = argv.iter().map(String::as_str).collect::<Vec<_>>();
+            let report = crate::cli_parse::parse(&spec, &words);
+
+            let result = lua.create_table()?;
+            result.set("ok", report.ok)?;
+            result.set("verb", report.verb)?;
+            result.set("kind", report.kind)?;
+            result.set("text", report.text)?;
+            result.set("code", report.code)?;
+            let values = lua.create_table()?;
+            for (key, value) in &report.values {
+                values.set(key.as_str(), json_value_to_lua(lua, value)?)?;
+            }
+            result.set("values", values)?;
+            Ok(result)
+        })?,
+    )?;
+    Ok(cli)
+}
+
+fn cli_spec_from_lua(table: Table) -> mlua::Result<crate::cli_parse::Spec> {
+    use crate::cli_parse::{ArgSpec, Spec, VerbSpec};
+
+    let name = table.get::<String>("name")?;
+    let options = cli_options_from_lua(table.get::<Option<Table>>("options")?)?;
+    let verbs_table = table.get::<Table>("verbs")?;
+    let mut verbs = Vec::new();
+    for pair in verbs_table.pairs::<String, Table>() {
+        let (name, verb) = pair?;
+        let about = verb.get::<Option<String>>("about")?.unwrap_or_default();
+        let next = verb.get::<String>("next")?;
+        let args_table = verb.get::<Option<Table>>("args")?;
+        let mut args = Vec::new();
+        if let Some(args_table) = args_table {
+            for item in args_table.sequence_values::<Table>() {
+                let item = item?;
+                args.push(ArgSpec {
+                    name: item.get("name")?,
+                    help: item.get("help")?,
+                    multiple: item.get::<Option<bool>>("multiple")?.unwrap_or(false),
+                });
+            }
+        }
+        verbs.push(VerbSpec {
+            name,
+            about,
+            args,
+            next,
+            options: cli_options_from_lua(verb.get::<Option<Table>>("options")?)?,
+        });
+    }
+    Ok(Spec {
+        name,
+        options,
+        verbs,
+    })
+}
+
+fn cli_options_from_lua(table: Option<Table>) -> mlua::Result<Vec<crate::cli_parse::OptionSpec>> {
+    let mut options = Vec::new();
+    if let Some(table) = table {
+        for item in table.sequence_values::<Table>() {
+            let item = item?;
+            let short = item
+                .get::<Option<String>>("short")?
+                .map(|short| {
+                    let mut chars = short.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(value), None) => Ok(value),
+                        _ => Err(mlua::Error::runtime(
+                            "remuda.cli.parse option short must be one character",
+                        )),
+                    }
+                })
+                .transpose()?;
+            options.push(crate::cli_parse::OptionSpec {
+                long: item.get("long")?,
+                short,
+                value: item.get("value")?,
+                help: item.get("help")?,
+                global: item.get::<Option<bool>>("global")?.unwrap_or(false),
+            });
+        }
+    }
+    Ok(options)
+}
+
+fn json_value_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<Value> {
+    Ok(match value {
+        serde_json::Value::Null => Value::Nil,
+        serde_json::Value::Bool(value) => Value::Boolean(*value),
+        serde_json::Value::Number(value) => match value.as_i64() {
+            Some(value) => Value::Integer(value),
+            None => Value::Number(value.as_f64().unwrap_or_default()),
+        },
+        serde_json::Value::String(value) => Value::String(lua.create_string(value)?),
+        serde_json::Value::Array(items) => {
+            let table = lua.create_table()?;
+            for (index, item) in items.iter().enumerate() {
+                table.raw_set(index + 1, json_value_to_lua(lua, item)?)?;
+            }
+            Value::Table(table)
+        }
+        serde_json::Value::Object(items) => {
+            let table = lua.create_table()?;
+            for (key, item) in items {
+                table.set(key.as_str(), json_value_to_lua(lua, item)?)?;
+            }
+            Value::Table(table)
+        }
+    })
 }
 
 /// Run source text **in the daemon's image**, the same as `run` but for a

@@ -6,6 +6,7 @@
 //! depend on this crate and cannot be made to.
 
 pub mod child_guard;
+pub mod cli_parse;
 pub mod client;
 pub mod cluster;
 pub mod cluster_remote;
