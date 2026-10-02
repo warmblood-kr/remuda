@@ -1198,6 +1198,7 @@ fn cluster_init(server: &str, path: &Path, no_listen: bool) -> ExitCode {
             Ok(status) => {
                 for line in render_cluster_init_lines(
                     created,
+                    false,
                     &identity.node_name,
                     &identity.node_fp,
                     &status,
@@ -1217,6 +1218,7 @@ fn render_cluster_init_error(error: &std::io::Error) -> String {
 
 fn render_cluster_init_lines(
     created: bool,
+    _previous_identity_marker: bool,
     node_name: &str,
     fingerprint: &str,
     status: &remuda_core::protocol::ListenerStatus,
@@ -2841,6 +2843,7 @@ mod cluster_cli_tests {
 
         let listening = render_cluster_init_lines(
             true,
+            false,
             "node-a",
             "fingerprint-a",
             &ListenerStatus::On {
@@ -2871,6 +2874,41 @@ mod cluster_cli_tests {
         assert!(refusal.contains("address busy"));
         assert!(refusal.contains("remuda cluster listen"));
         assert!(!refusal.contains("remuda-join-v1"));
+    }
+
+    #[test]
+    fn cluster_init_warns_when_missing_cluster_directory_had_prior_identity() {
+        use remuda_core::protocol::ListenerStatus;
+
+        let previous_fingerprint = "SHA256:previous";
+        let new_fingerprint = "SHA256:new";
+        assert_ne!(previous_fingerprint, new_fingerprint);
+        let first_init = render_cluster_init_lines(
+            true,
+            false,
+            "node-before",
+            previous_fingerprint,
+            &ListenerStatus::Off,
+        );
+        assert_eq!(first_init[0], "Cluster initialized");
+
+        let reinitialized = render_cluster_init_lines(
+            true,
+            true,
+            "node-after",
+            new_fingerprint,
+            &ListenerStatus::Off,
+        );
+        assert_eq!(
+            reinitialized[0],
+            "The previous cluster directory was missing. A NEW identity was created; old peers were not restored and must admit this fingerprint again."
+        );
+        assert!(reinitialized.iter().any(|line| {
+            line == "Next: ask an admitted machine for a new invite, then run `remuda cluster join` with it."
+        }));
+        assert!(reinitialized
+            .iter()
+            .any(|line| line == &format!("Fingerprint: {new_fingerprint}")));
     }
 
     #[test]
