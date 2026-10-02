@@ -3,8 +3,12 @@
 use mlua::{Lua, Table, UserData, UserDataMethods};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
+#[cfg(unix)]
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -301,6 +305,368 @@ type MemoryFiles = Arc<Mutex<BTreeMap<(String, String, String), Vec<u8>>>>;
 type FileRoots = BTreeMap<&'static str, PathBuf>;
 const ATOMIC_TEMP_PREFIX: &str = ".remuda-atomic-";
 const MAX_STORAGE_VALUE_BYTES: usize = 1024 * 1024;
+const MAX_STORAGE_FILES: usize = 1024;
+
+struct FileLocation {
+    #[cfg(unix)]
+    directory: fs::File,
+    #[cfg(unix)]
+    name: CString,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+fn io_denied() -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, "unsafe storage path")
+}
+
+#[cfg(unix)]
+fn c_name(name: &str) -> io::Result<CString> {
+    CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))
+}
+
+#[cfg(unix)]
+fn directory_names(directory: &fs::File) -> io::Result<Vec<String>> {
+    let dot = c_name(".")?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            dot.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        unsafe { libc::close(fd) };
+        return Err(io::Error::last_os_error());
+    }
+    let mut names = Vec::new();
+    loop {
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if name.to_bytes() != b"." && name.to_bytes() != b".." {
+            if let Ok(name) = name.to_str() {
+                names.push(name.to_owned());
+            }
+        }
+    }
+    unsafe { libc::closedir(stream) };
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn open_directory_at(parent: &fs::File, name: &str, create: bool) -> io::Result<fs::File> {
+    let name = c_name(name)?;
+    if create {
+        let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+    }
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW;
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let directory = unsafe { fs::File::from_raw_fd(fd) };
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_storage_root(root: &Path, create: bool) -> io::Result<fs::File> {
+    if create {
+        fs::create_dir_all(root)?;
+    }
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io_denied());
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root)?;
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn entry_stat(directory: &fs::File, name: &str) -> io::Result<Option<libc::stat>> {
+    let name = c_name(name)?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        Ok(Some(unsafe { stat.assume_init() }))
+    } else {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn collect_at(
+    directory: &fs::File,
+    prefix: &str,
+    names: &mut Vec<String>,
+    limit: usize,
+) -> io::Result<()> {
+    for name in directory_names(directory)? {
+        if names.len() >= limit {
+            break;
+        }
+        if name.starts_with(ATOMIC_TEMP_PREFIX) {
+            continue;
+        }
+        let relative = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        let Some(stat) = entry_stat(directory, &name)? else {
+            continue;
+        };
+        let kind = stat.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFDIR {
+            let child = open_directory_at(directory, &name, false)?;
+            collect_at(&child, &relative, names, limit)?;
+        } else if kind == libc::S_IFREG {
+            names.push(relative);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_at(location: &FileLocation) -> io::Result<Vec<u8>> {
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+    let fd = unsafe {
+        libc::openat(
+            location.directory.as_raw_fd(),
+            location.name.as_ptr(),
+            flags,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io_denied());
+    }
+    read_limited(file, metadata.len())
+}
+
+fn read_limited(file: fs::File, size: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(size.min((MAX_STORAGE_VALUE_BYTES + 1) as u64) as usize);
+    file.take((MAX_STORAGE_VALUE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_STORAGE_VALUE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "storage value too large",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn storage_io_error(error: io::Error) -> String {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied
+            | io::ErrorKind::AlreadyExists
+            | io::ErrorKind::InvalidInput
+    ) {
+        "denied: storage path is unsafe".into()
+    } else {
+        "unavailable: storage I/O failed".into()
+    }
+}
+
+fn case_clashes(existing: &[String], name: &str) -> bool {
+    let folded = name.to_ascii_lowercase();
+    existing
+        .iter()
+        .any(|existing| existing != name && existing.to_ascii_lowercase() == folded)
+}
+
+#[cfg(unix)]
+fn write_at(location: &FileLocation, bytes: &[u8]) -> io::Result<()> {
+    if let Some(stat) = entry_stat(
+        &location.directory,
+        location.name.to_str().map_err(|_| io_denied())?,
+    )? {
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(io_denied());
+        }
+    }
+    let mut random = [0_u8; 12];
+    getrandom::fill(&mut random).map_err(|_| io::Error::other("randomness unavailable"))?;
+    let temp_name = format!(
+        "{ATOMIC_TEMP_PREFIX}{}-{random:02x?}.tmp",
+        std::process::id()
+    );
+    let temp = c_name(&temp_name)?;
+    let fd = unsafe {
+        libc::openat(
+            location.directory.as_raw_fd(),
+            temp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut file = unsafe { fs::File::from_raw_fd(fd) };
+    let result = (|| {
+        if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        use std::io::Write;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        if unsafe {
+            libc::renameat(
+                location.directory.as_raw_fd(),
+                temp.as_ptr(),
+                location.directory.as_raw_fd(),
+                location.name.as_ptr(),
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        location.directory.sync_all()
+    })();
+    if result.is_err() {
+        unsafe { libc::unlinkat(location.directory.as_raw_fd(), temp.as_ptr(), 0) };
+    }
+    result
+}
+
+#[cfg(unix)]
+fn exists_at(location: &FileLocation) -> io::Result<bool> {
+    Ok(entry_stat(
+        &location.directory,
+        location.name.to_str().map_err(|_| io_denied())?,
+    )?
+    .is_some_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFREG))
+}
+
+#[cfg(unix)]
+fn delete_at(location: &FileLocation) -> io::Result<bool> {
+    let name = location.name.to_str().map_err(|_| io_denied())?;
+    let Some(stat) = entry_stat(&location.directory, name)? else {
+        return Ok(false);
+    };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(io_denied());
+    }
+    if unsafe { libc::unlinkat(location.directory.as_raw_fd(), location.name.as_ptr(), 0) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
+}
+
+fn read_location(location: &FileLocation) -> io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        read_at(location)
+    }
+    #[cfg(not(unix))]
+    {
+        read_regular_file(&location.path)
+    }
+}
+
+fn write_location(location: &FileLocation, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        write_at(location, bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(location.path.parent().unwrap())?;
+        crate::fs_atomic::write_atomic_lua_private(&location.path, bytes)
+    }
+}
+
+fn exists_location(location: &FileLocation) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        exists_at(location)
+    }
+    #[cfg(not(unix))]
+    {
+        match fs::symlink_metadata(&location.path) {
+            Ok(metadata) => Ok(metadata.file_type().is_file()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn delete_location(location: &FileLocation) -> io::Result<bool> {
+    #[cfg(unix)]
+    {
+        delete_at(location)
+    }
+    #[cfg(not(unix))]
+    {
+        match fs::symlink_metadata(&location.path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                fs::remove_file(&location.path)?;
+                Ok(true)
+            }
+            Ok(_) => Err(io_denied()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn list_location(location: &FileLocation, limit: usize) -> io::Result<Vec<String>> {
+    #[cfg(unix)]
+    {
+        let mut names = Vec::new();
+        collect_at(&location.directory, "", &mut names, limit)?;
+        names.sort();
+        Ok(names)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut names = collect_files_if_present(&location.path)?;
+        names.truncate(limit);
+        names.sort();
+        Ok(names)
+    }
+}
 
 fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
     let override_root = env("REMUDA_STORAGE_ROOT")
@@ -324,13 +690,19 @@ fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
         .collect()
 }
 
+#[cfg(any(not(unix), test))]
 fn collect_files(
     base: &std::path::Path,
     dir: &std::path::Path,
     prefix: &str,
     names: &mut Vec<String>,
 ) -> io::Result<()> {
-    for entry in fs::read_dir(dir)? {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if dir == base && error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
         let kind = entry.file_type()?;
@@ -352,6 +724,14 @@ fn collect_files(
     Ok(())
 }
 
+#[cfg(any(not(unix), test))]
+fn collect_files_if_present(base: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    collect_files(base, base, "", &mut names)?;
+    Ok(names)
+}
+
+#[cfg(any(not(unix), test))]
 fn lua_relative_name(path: &Path) -> Option<String> {
     path.components()
         .map(|component| component.as_os_str().to_str())
@@ -359,6 +739,7 @@ fn lua_relative_name(path: &Path) -> Option<String> {
         .map(|components| components.join("/"))
 }
 
+#[cfg(not(unix))]
 fn read_regular_file(path: &Path) -> io::Result<Vec<u8>> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() {
@@ -367,29 +748,8 @@ fn read_regular_file(path: &Path) -> io::Result<Vec<u8>> {
             "unsafe file",
         ));
     }
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut options = fs::OpenOptions::new();
-        options
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        options.open(path)?
-    };
-    #[cfg(not(unix))]
     let file = fs::File::open(path)?;
-
-    let mut bytes =
-        Vec::with_capacity(metadata.len().min((MAX_STORAGE_VALUE_BYTES + 1) as u64) as usize);
-    file.take((MAX_STORAGE_VALUE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_STORAGE_VALUE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "storage value too large",
-        ));
-    }
-    Ok(bytes)
+    read_limited(file, metadata.len())
 }
 
 struct StorageView {
@@ -435,17 +795,42 @@ struct KindHandle {
 }
 
 impl KindHandle {
-    fn file_path(&self, name: &str) -> mlua::Result<PathBuf> {
+    fn file_path(&self, name: &str, create: bool) -> io::Result<FileLocation> {
         if matches!(self.kind, HandleKind::Secret) {
-            return Err(mlua::Error::runtime(
-                "unavailable: file secrets are disabled until PR C",
-            ));
+            return Err(io_denied());
         }
-        self.roots
+        let root = self
+            .roots
             .as_ref()
             .and_then(|roots| roots.get(self.kind.as_str()))
-            .map(|root| root.join("storage").join(&self.namespace).join(name))
-            .ok_or_else(|| mlua::Error::runtime("unavailable: storage root is unavailable"))
+            .ok_or_else(|| io::Error::other("storage root unavailable"))?;
+        #[cfg(unix)]
+        {
+            let mut directory = open_storage_root(root, create)?;
+            directory = open_directory_at(&directory, "storage", create)?;
+            directory = open_directory_at(&directory, &self.namespace, create)?;
+            let mut parts = if name.is_empty() {
+                Vec::new()
+            } else {
+                name.split('/').collect::<Vec<_>>()
+            };
+            let leaf = parts.pop().unwrap_or(".");
+            for part in parts {
+                directory = open_directory_at(&directory, part, create)?;
+            }
+            Ok(FileLocation {
+                directory,
+                name: c_name(leaf)?,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            // Windows keeps the plain path implementation; no-follow directory handles are Unix-only.
+            let _ = create;
+            Ok(FileLocation {
+                path: root.join("storage").join(&self.namespace).join(name),
+            })
+        }
     }
 
     fn key(&self, name: String) -> mlua::Result<(String, String, String)> {
@@ -469,7 +854,14 @@ impl KindHandle {
                     Some("unavailable: file secrets are disabled until PR C".into()),
                 ));
             }
-            return match read_regular_file(&self.file_path(&key.2)?) {
+            let location = match self.file_path(&key.2, false) {
+                Ok(location) => location,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok((None, Some("not_found".into())))
+                }
+                Err(error) => return Ok((None, Some(storage_io_error(error)))),
+            };
+            return match read_location(&location) {
                 Ok(bytes) => Ok((Some(lua.create_string(bytes)?), None)),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     Ok((None, Some("not_found".into())))
@@ -504,28 +896,24 @@ impl KindHandle {
                     "unavailable: file secrets are disabled until PR C",
                 ));
             }
-            let namespace_root = self.file_path("")?;
-            let mut names = Vec::new();
-            if namespace_root.is_dir() {
-                collect_files(&namespace_root, &namespace_root, "", &mut names)
-                    .map_err(|_| mlua::Error::runtime("unavailable: storage list failed"))?;
-            }
-            let folded = key.2.to_ascii_lowercase();
-            if names
-                .iter()
-                .any(|name| name != &key.2 && name.to_ascii_lowercase() == folded)
-            {
+            let location = self
+                .file_path(&key.2, true)
+                .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
+            let namespace = self
+                .file_path("", false)
+                .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
+            let entries = list_location(&namespace, usize::MAX)
+                .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
+            if case_clashes(&entries, &key.2) {
                 return Err(mlua::Error::runtime("remuda.storage name collides by case"));
             }
-            if !names.iter().any(|name| name == &key.2) && names.len() >= 1024 {
+            let exists = exists_location(&location)
+                .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
+            if !exists && entries.len() >= MAX_STORAGE_FILES {
                 return Err(mlua::Error::runtime("remuda.storage entry limit reached"));
             }
-            let path = self.file_path(&key.2)?;
-            fs::create_dir_all(path.parent().unwrap()).map_err(|_| {
-                mlua::Error::runtime("unavailable: storage directory create failed")
-            })?;
-            crate::fs_atomic::write_atomic(&path, bytes, 0o600)
-                .map_err(|_| mlua::Error::runtime("unavailable: storage write failed"))?;
+            write_location(&location, bytes)
+                .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
             return Ok(());
         }
         let mut files = self
@@ -557,11 +945,16 @@ impl KindHandle {
     fn exists(&self, name: String) -> mlua::Result<bool> {
         let key = self.key(name)?;
         if self.roots.is_some() {
-            return Ok(if matches!(self.kind, HandleKind::Secret) {
-                false
-            } else {
-                self.file_path(&key.2)?.is_file()
-            });
+            if matches!(self.kind, HandleKind::Secret) {
+                return Ok(false);
+            }
+            let location = match self.file_path(&key.2, false) {
+                Ok(location) => location,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(mlua::Error::runtime(storage_io_error(error))),
+            };
+            return exists_location(&location)
+                .map_err(|error| mlua::Error::runtime(storage_io_error(error)));
         }
         Ok(self
             .files
@@ -579,12 +972,17 @@ impl KindHandle {
                     Some("unavailable: file secrets are disabled until PR C".into()),
                 ));
             }
-            return match fs::remove_file(self.file_path(&key.2)?) {
-                Ok(()) => Ok((Some(true), None)),
+            let location = match self.file_path(&key.2, false) {
+                Ok(location) => location,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    Ok((None, Some("not_found".into())))
+                    return Ok((None, Some("not_found".into())))
                 }
-                Err(_) => Ok((None, Some("unavailable: storage delete failed".into()))),
+                Err(error) => return Ok((None, Some(storage_io_error(error)))),
+            };
+            return match delete_location(&location) {
+                Ok(true) => Ok((Some(true), None)),
+                Ok(false) => Ok((None, Some("not_found".into()))),
+                Err(error) => Ok((None, Some(storage_io_error(error)))),
             };
         }
         if self
@@ -608,12 +1006,16 @@ impl KindHandle {
                     "unavailable: file secrets are disabled until PR C",
                 ));
             }
-            let root = self.file_path("")?;
-            let mut names = Vec::new();
-            if root.is_dir() {
-                collect_files(&root, &root, &prefix, &mut names)
-                    .map_err(|_| mlua::Error::runtime("unavailable: storage list failed"))?;
-            }
+            let location = match self.file_path("", false) {
+                Ok(location) => location,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return lua.create_sequence_from(Vec::<String>::new())
+                }
+                Err(error) => return Err(mlua::Error::runtime(storage_io_error(error))),
+            };
+            let mut names = list_location(&location, usize::MAX)
+                .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
+            names.retain(|name| name.starts_with(&prefix));
             names.sort();
             return lua.create_sequence_from(names);
         }
@@ -855,22 +1257,37 @@ mod tests {
         lua
     }
 
+    #[test]
+    fn collect_files_if_present_treats_a_missing_root_as_empty() {
+        let root = TestRoot::new();
+        let missing = root.0.join("not-created");
+        assert!(collect_files_if_present(&missing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn case_clashes_fold_ascii_but_allow_the_same_name() {
+        let existing = vec!["token".to_owned()];
+        assert!(case_clashes(&existing, "Token"));
+        assert!(!case_clashes(&existing, "token"));
+        assert!(!case_clashes(&existing, "other"));
+    }
+
     const HANDLE_CONFORMANCE: &str = r#"
         local s = remuda.storage
         local a, b = s.get("suite"):data(), s.get("other"):data()
         local value = string.char(0, 255, 1)
-        assert(a:write("mail/a.bin", value) and a:exists("mail/a.bin"))
-        local read, err = a:read("mail/a.bin"); assert(read == value and err == nil)
-        assert(b:read("mail/a.bin") == nil)
-        assert(a:write("mail/b.bin", "b"))
+        assert(a:write("mail/a.bin", value) and a:exists("mail/a.bin"), "write and exists mail/a.bin")
+        local read, err = a:read("mail/a.bin"); assert(read == value and err == nil, "read mail/a.bin")
+        assert(b:read("mail/a.bin") == nil, "namespace isolation")
+        assert(a:write("mail/b.bin", "b"), "write mail/b.bin")
         local names = a:list("mail/")
-        assert(#names == 2 and names[1] == "mail/a.bin" and names[2] == "mail/b.bin")
-        assert(a:delete("mail/a.bin") and not a:exists("mail/a.bin"))
+        assert(#names == 2 and names[1] == "mail/a.bin" and names[2] == "mail/b.bin", "list mail/")
+        assert(a:delete("mail/a.bin") and not a:exists("mail/a.bin"), "delete mail/a.bin")
         local folded = s.get("folded"):data(); folded:write("token", "x")
-        assert(not pcall(function() folded:write("Token", "x") end))
+        assert(not pcall(function() folded:write("Token", "x") end), "reject case-only name collision")
         local limited = s.get("limited"):data()
         for i = 1, 1024 do limited:write("entry" .. i, "x") end
-        assert(not pcall(function() limited:write("overflow", "x") end))
+        assert(not pcall(function() limited:write("overflow", "x") end), "reject 1025th entry")
     "#;
 
     fn select_backend(lua: &Lua, name: &str) {
@@ -1007,6 +1424,107 @@ mod tests {
             let _ = send.send(result.is_ok());
         });
         assert!(receive.recv_timeout(Duration::from_secs(2)).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_refuses_symlinked_namespace_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestRoot::new();
+        let storage = root.0.join("data/storage");
+        let outside = root.0.join("outside");
+        fs::create_dir_all(&storage).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, storage.join("linked")).unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(r#"assert(not pcall(function() remuda.storage.get("linked"):data():write("new", "x") end))"#)
+            .exec()
+            .unwrap();
+        assert!(!outside.join("new").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_refuses_symlinked_files_for_all_handle_operations() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/linked");
+        fs::create_dir_all(&namespace).unwrap();
+        fs::write(namespace.join("target"), b"keep").unwrap();
+        symlink(namespace.join("target"), namespace.join("link")).unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"
+            local f = remuda.storage.get("linked"):data()
+            local ok, exists = pcall(function() return f:exists("link") end)
+            assert(not ok or exists == false)
+            local value, reason = f:read("link"); assert(value == nil and reason)
+            assert(not pcall(function() f:write("link", "replace") end))
+            local deleted, reason = f:delete("link"); assert(deleted == nil and reason)
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(fs::read(namespace.join("target")).unwrap(), b"keep");
+        assert!(namespace.join("link").is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_refuses_directory_symlink_swapped_between_operations() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/race");
+        let outside = root.0.join("outside");
+        fs::create_dir_all(namespace.join("part")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(namespace.join("part/item"), b"inside").unwrap();
+        fs::write(outside.join("item"), b"outside").unwrap();
+        fs::remove_file(namespace.join("part/item")).unwrap();
+        fs::remove_dir(namespace.join("part")).unwrap();
+        symlink(&outside, namespace.join("part")).unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"local value, reason = remuda.storage.get("race"):data():read("part/item"); assert(value == nil and reason)"#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(fs::read(outside.join("item")).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_directories_and_existing_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(r#"remuda.storage.get("mode"):data():write("item", "first")"#)
+            .exec()
+            .unwrap();
+        let namespace = root.0.join("data/storage/mode");
+        let file = namespace.join("item");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        lua.load(r#"remuda.storage.get("mode"):data():write("item", "second")"#)
+            .exec()
+            .unwrap();
+        for dir in [root.0.join("data"), root.0.join("data/storage"), namespace] {
+            assert_eq!(
+                fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(
+            fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     fn run_handle_conformance(lua: &Lua, backend: &str) {
