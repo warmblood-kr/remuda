@@ -875,7 +875,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             }
         }
         ClusterCommand::Remote(target) => {
-            let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into());
+            let node = remote_node_label(None, remuda_native::hostname::hostname);
             cluster_remote(server, path, &node, target.as_deref())
         }
         ClusterCommand::ListenOff => cluster_listen_off(server, path),
@@ -2174,12 +2174,10 @@ fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -
 }
 
 fn remote_node_label(
-    hostname_env: Option<&str>,
+    _hostname_env: Option<&str>,
     os_hostname: impl FnOnce() -> std::io::Result<String>,
 ) -> String {
-    hostname_env
-        .map(str::to_owned)
-        .unwrap_or_else(|| os_hostname().unwrap_or_else(|_| "local".into()))
+    os_hostname().unwrap_or_else(|_| "local".into())
 }
 
 fn remote_control_label(enabled: bool) -> &'static str {
