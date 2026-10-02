@@ -48,16 +48,11 @@ extern "C" fn record_join_interrupt(signal: libc::c_int) {
 #[path = "remuda/codex_tui.rs"]
 mod codex_tui;
 
-#[allow(clippy::too_many_lines)]
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (server, rest) = split_server_flag(&args);
-    if server.trim().is_empty() {
-        return fail_invalid_server_name();
-    }
-    let (stdin_enabled, rest) = match split_stdin_flag(rest) {
+    let (server, stdin_enabled, rest) = match checked_cli_flags(&args) {
         Ok(flags) => flags,
-        Err(error) => return fail(error),
+        Err(code) => return code,
     };
     let argv: Vec<&str> = rest.iter().map(String::as_str).collect();
 
@@ -4531,6 +4526,17 @@ fn split_server_flag(args: &[String]) -> (&str, &[String]) {
     match args {
         [flag, server, rest @ ..] if flag == "-s" => (server.as_str(), rest),
         _ => ("default", args),
+    }
+}
+
+fn checked_cli_flags(args: &[String]) -> Result<(&str, bool, &[String]), ExitCode> {
+    let (server, rest) = split_server_flag(args);
+    if server.trim().is_empty() {
+        return Err(fail_invalid_server_name());
+    }
+    match split_stdin_flag(rest) {
+        Ok((stdin_enabled, rest)) => Ok((server, stdin_enabled, rest)),
+        Err(error) => Err(fail(error)),
     }
 }
 
