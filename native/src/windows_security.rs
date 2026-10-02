@@ -5,8 +5,8 @@ use std::path::PathBuf;
 
 #[allow(dead_code)]
 pub(crate) fn protected_storage_sddl(owner_sid: &str) -> String {
-    // RED baseline: this mirrors the current cluster owner-only policy.
-    format!("O:{owner_sid}D:PAI(A;OICI;FA;;;OW)")
+    // Protect the root from parent ACLs; let its three trusted principals inherit to children.
+    format!("O:{owner_sid}D:PAI(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
 }
 
 #[allow(dead_code)]
