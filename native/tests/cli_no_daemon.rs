@@ -401,6 +401,58 @@ fn mod_parse_errors_use_exit_two_and_include_help_and_next() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn assert_invalid_mod_command_has_no_side_effects(tag: &str, args: &[&str]) {
+    let dir = scratch(tag);
+    let out = remuda(&dir, args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+    assert!(
+        stderr.contains("Usage:") && stderr.contains("Fix:") && stderr.contains("Next:"),
+        "{args:?}: {stderr}"
+    );
+    assert!(
+        !dir.join("data/remuda/mods").exists(),
+        "{args:?} created the mods directory: {out:?}"
+    );
+    assert!(
+        !remuda_native::daemon::socket_path_in(&dir, "s").exists(),
+        "{args:?} created a daemon socket: {out:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn invalid_mod_install_flags_do_not_touch_the_filesystem_or_daemon() {
+    assert_invalid_mod_command_has_no_side_effects(
+        "mod-install-bogus-flag",
+        &["mod", "install", "owner/repo", "--bogus"],
+    );
+}
+
+#[test]
+fn update_all_with_a_name_does_not_touch_the_filesystem_or_daemon() {
+    assert_invalid_mod_command_has_no_side_effects(
+        "mod-update-all-name",
+        &["mod", "update", "--all", "sample"],
+    );
+}
+
+#[test]
+fn remove_extra_argument_does_not_touch_the_filesystem_or_daemon() {
+    assert_invalid_mod_command_has_no_side_effects(
+        "mod-remove-extra-argument",
+        &["mod", "remove", "sample", "extra"],
+    );
+}
+
+#[test]
+fn invalid_mod_list_format_does_not_touch_the_filesystem_or_daemon() {
+    assert_invalid_mod_command_has_no_side_effects(
+        "mod-list-bad-format",
+        &["mod", "list", "--format", "bad"],
+    );
+}
+
 #[test]
 fn upgrade_help_flags_explain_channels_and_daemon_lifecycle() {
     let dir = scratch("upgrade-help-flags");
