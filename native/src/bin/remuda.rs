@@ -5843,6 +5843,60 @@ where
     Ok(lines())
 }
 
+fn install_reload_lines<R>(
+    report: &remuda_native::packages::InstallReport,
+    reload: R,
+) -> Result<Vec<String>, String>
+where
+    R: FnOnce() -> Result<(), String>,
+{
+    reload_then_lines(reload, || {
+        vec![
+            format!(
+                "installed mod {} {} from {} at {}",
+                report.manifest.name, report.manifest.version, report.repository, report.commit
+            ),
+            format!(
+                "reloaded mod {} in the running daemon",
+                report.manifest.name
+            ),
+        ]
+    })
+    .map_err(|error| {
+        format!(
+            "installed mod {} {} from {} at {}, but its running copy was not replaced: {error}",
+            report.manifest.name, report.manifest.version, report.repository, report.commit
+        )
+    })
+}
+
+fn update_reload_lines<R>(
+    report: &remuda_native::packages::InstallReport,
+    reload: R,
+) -> Result<Vec<String>, String>
+where
+    R: FnOnce() -> Result<(), String>,
+{
+    reload_then_lines(reload, || {
+        vec![
+            format!(
+                "updated mod {} {} from {} at {}",
+                report.manifest.name, report.manifest.version, report.repository, report.commit
+            ),
+            format!(
+                "update outcomes: updated [{}]; reloaded [{}]; failed none; not attempted none",
+                report.manifest.name, report.manifest.name
+            ),
+        ]
+    })
+    .map_err(|error| {
+        format!(
+            "update outcomes: updated [{}]; reloaded none; failed {}: {}; not attempted none",
+            report.manifest.name, report.manifest.name, error
+        )
+    })
+}
+
 fn mod_install_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     let values = match mod_cli_parse("install", args) {
         Ok(values) => values,
@@ -5855,35 +5909,15 @@ fn mod_install_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     match remuda_native::packages::install(repository, reference, force) {
         Ok(report) => {
             if reload {
-                match reload_then_lines(
-                    || reload_mod_in_daemon(server, path, &report.manifest.name),
-                    || {
-                        vec![
-                            format!(
-                                "installed mod {} {} from {} at {}",
-                                report.manifest.name,
-                                report.manifest.version,
-                                report.repository,
-                                report.commit
-                            ),
-                            format!(
-                                "reloaded mod {} in the running daemon",
-                                report.manifest.name
-                            ),
-                        ]
-                    },
-                ) {
+                match install_reload_lines(&report, || {
+                    reload_mod_in_daemon(server, path, &report.manifest.name)
+                }) {
                     Ok(lines) => {
                         for line in lines {
                             println!("{line}");
                         }
                     }
-                    Err(error) => {
-                        return fail(format!(
-                            "installed mod {}, but its running copy was not replaced: {error}",
-                            report.manifest.name
-                        ));
-                    }
+                    Err(error) => return fail(error),
                 }
             } else {
                 println!(
@@ -6106,20 +6140,9 @@ fn mod_update_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     match result {
         Ok(report) => {
             if reload {
-                match reload_then_lines(
+                match update_reload_lines(
+                    &report,
                     || reload_mod_in_daemon(server, path, &report.manifest.name),
-                    || {
-                        vec![
-                            format!(
-                                "updated mod {} {} from {} at {}",
-                                report.manifest.name,
-                                report.manifest.version,
-                                report.repository,
-                                report.commit
-                            ),
-                            format!("update outcomes: updated [{}]; reloaded [{}]; failed none; not attempted none", report.manifest.name, report.manifest.name),
-                        ]
-                    },
                 ) {
                     Ok(lines) => {
                         for line in lines {
@@ -6127,12 +6150,7 @@ fn mod_update_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
                         }
                         ExitCode::SUCCESS
                     }
-                    Err(error) => {
-                        fail(format!(
-                            "update outcomes: updated [{}]; reloaded none; failed {}: {}; not attempted none",
-                            report.manifest.name, report.manifest.name, error
-                        ))
-                    }
+                    Err(error) => fail(error),
                 }
             } else {
                 println!(
@@ -6406,6 +6424,38 @@ mod mod_cli_tests {
         );
         assert_eq!(successful_lines_built, 1);
         assert_eq!(succeeded, Ok(vec!["updated mod sample".to_string()]));
+    }
+
+    #[test]
+    fn install_reload_failure_names_commit_and_update_failure_wording_is_unchanged() {
+        let report = remuda_native::packages::InstallReport {
+            manifest: remuda_native::packages::Manifest {
+                name: "sample".into(),
+                version: "1.2.3".into(),
+                api: "remuda-lua-v1".into(),
+                entry: "packages/sample/init.lua".into(),
+                command: None,
+                lifecycle: Some("remuda-module-v1".into()),
+                source: "disk".into(),
+                status: "installed".into(),
+            },
+            path: std::path::PathBuf::from("/mods/sample"),
+            repository: "owner/repo".into(),
+            reference: Some("main".into()),
+            commit: "0123456789abcdef".into(),
+        };
+
+        let installed = super::install_reload_lines(&report, || Err("stub reload failure".into()));
+        assert_eq!(
+            installed,
+            Err("installed mod sample 1.2.3 from owner/repo at 0123456789abcdef, but its running copy was not replaced: stub reload failure".into())
+        );
+
+        let updated = super::update_reload_lines(&report, || Err("stub reload failure".into()));
+        assert_eq!(
+            updated,
+            Err("update outcomes: updated [sample]; reloaded none; failed sample: stub reload failure; not attempted none".into())
+        );
     }
 
     #[test]
