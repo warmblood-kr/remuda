@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 94] = [
+pub const BINDINGS: [&str; 95] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -117,6 +117,7 @@ pub const BINDINGS: [&str; 94] = [
     "schedules",
     "send",
     "session",
+    "storage",
     "system",
     "tool",
     "tools",
@@ -375,6 +376,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "random_bytes(n) -> string",
     ),
     (
+        "storage",
+        "Namespace for resolving per-user config, data, state and cache directories.",
+        "table",
+    ),
+    (
         "system",
         "OS services for trusted Lua callers.",
         "table",
@@ -398,6 +404,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "system.credential.backend",
         "The OS credential store in use: 'keychain' (the macOS login Keychain), 'wincred' (Windows Credential Manager), or nil where there is none, in which case put, get and delete return nil, 'unavailable: no credential store on this OS'.",
         "system.credential.backend() -> 'keychain' | 'wincred' | nil",
+    ),
+    (
+        "storage.dir",
+        "Return the absolute user directory for config, data, state or cache. On Windows, an absolute ``XDG_*_HOME`` value takes precedence over Local AppData. Returns nil and an unavailable reason when the path cannot be resolved; unknown kinds raise a Lua usage error.",
+        "storage.dir(kind) -> path | nil, 'unavailable: reason'",
     ),
     (
         "hostname",
@@ -462,6 +473,7 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
     table.set("json", crate::json::bindings(lua)?)?;
     table.set("cli", cli_parse_bindings(lua)?)?;
     table.set("system", crate::credential::bindings(lua)?)?;
+    table.set("storage", crate::storage::bindings(lua)?)?;
     fs_bindings(lua, table)?;
     table.set("_registry", registry)
 }

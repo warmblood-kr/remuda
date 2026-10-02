@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Lua: `remuda.storage.dir(kind)` returns an absolute per-user directory for
+  `config`, `data`, `state` or `cache`. Absolute XDG values win on every OS;
+  Windows falls back to Local AppData, and Linux/macOS use the XDG home layout.
+  On Unix, data-home resolution no longer falls back to `USERPROFILE`.
+  Relative XDG values are ignored; earlier data-home resolution accepted
+  relative `XDG_DATA_HOME` values.
 - Fixed secret prompt labels wrapping into rows that look like daemon tags by
   clipping them to terminal display width; see #363.
 - Fixed: macOS credential store calls no longer show Keychain dialogs; locked or
