@@ -385,6 +385,57 @@ fn batch_rejected_before_submit_is_busy_and_refunds_rate_for_retry() {
 }
 
 #[test]
+fn abandoned_late_submit_batch_is_busy_and_can_be_retried() {
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let writer = Arc::new(BlockingWriter {
+        started: Mutex::new(Some(started_tx)),
+        release: Mutex::new(release_rx),
+        busy: AtomicBool::new(false),
+        timed_out: AtomicBool::new(false),
+        fail: false,
+        refusal_once: AtomicUsize::new(4),
+        writes: AtomicUsize::new(0),
+    });
+    let session = Arc::new(Session::new(
+        "abandoned-late-submit-batch",
+        Box::new(BlockingAgent {
+            writer: Arc::clone(&writer),
+        }),
+        Arc::new(ManualClock::new()),
+    ));
+    let instance_id = session.instance_id().to_owned();
+    let batch = InputBatch {
+        instance_id: &instance_id,
+        client_id: [17; 16],
+        seq: 1,
+        bytes: b"never written",
+    };
+
+    assert_eq!(session.apply_input_batch(batch), Err(InputError::Busy));
+
+    let retry_session = Arc::clone(&session);
+    let retry_instance_id = instance_id.clone();
+    let retry = thread::spawn(move || {
+        retry_session.apply_input_batch(InputBatch {
+            instance_id: &retry_instance_id,
+            client_id: [17; 16],
+            seq: 1,
+            bytes: b"never written",
+        })
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("retry write started");
+    release_tx.send(()).unwrap();
+    assert_eq!(
+        retry.join().unwrap(),
+        Ok(InputOutcome::Ack { duplicate: false })
+    );
+    assert_eq!(writer.writes.load(Ordering::Acquire), 1);
+}
+
+#[test]
 fn late_success_after_timeout_does_not_turn_a_batch_retry_into_an_ack() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
@@ -611,7 +662,8 @@ struct BlockingWriter {
     timed_out: AtomicBool,
     fail: bool,
     /// Test-only refusals returned before a write is accepted: 1 = Busy,
-    /// 2 = Exited, 3 = an in-flight write timed out during submission.
+    /// 2 = Exited, 3 = an in-flight write timed out during submission,
+    /// 4 = an abandoned late submit (the bytes were not written).
     refusal_once: AtomicUsize,
     writes: AtomicUsize,
 }
@@ -624,6 +676,11 @@ impl AgentWriter for BlockingWriter {
             3 if self.busy.load(Ordering::Acquire) => {
                 self.timed_out.store(true, Ordering::Release);
                 return Err(AgentError::Busy);
+            }
+            4 => {
+                return Err(AgentError::LateSubmitAbandoned {
+                    bound: Duration::from_secs(30),
+                });
             }
             _ => {}
         }
