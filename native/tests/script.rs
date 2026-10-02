@@ -779,6 +779,16 @@ fn registry_documentation_formats_are_live_and_structured() {
         .as_str()
         .unwrap()
         .contains("65536"));
+    let credential_get = document["runtime"]["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "system.credential.get")
+        .expect("system.credential.get is documented");
+    assert!(credential_get["description"]
+        .as_str()
+        .unwrap()
+        .contains("waits until the user answers"));
     let hostname = document["runtime"]["functions"]
         .as_array()
         .unwrap()

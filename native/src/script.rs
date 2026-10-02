@@ -365,7 +365,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "system.credential.get",
-        "Read a secret back, binary-safe. The reason is 'not_found' when nothing is stored under name, or starts with 'unavailable: ' or 'denied: '.",
+        "Read a secret back, binary-safe. The reason is 'not_found' when nothing is stored under name, or starts with 'unavailable: ' or 'denied: '. On macOS the Keychain may ask the user to allow access; the call, and the whole Lua image with it, waits until the user answers.",
         "system.credential.get(name) -> secret | nil, reason",
     ),
     (
