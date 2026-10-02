@@ -1,12 +1,20 @@
 use remuda_core::Registry;
 use remuda_native::{image::Image, tick::Counters};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+static NEXT_IMAGE_SOCKET: AtomicU64 = AtomicU64::new(0);
+
 fn image() -> Image {
+    let socket = format!(
+        "/tmp/bl-{}-{}.sock",
+        std::process::id(),
+        NEXT_IMAGE_SOCKET.fetch_add(1, Ordering::Relaxed)
+    );
     Image::spawn(
-        Path::new("/tmp/remuda-bound-lua-test.sock"),
+        Path::new(&socket),
         Arc::new(Registry::new()),
         Arc::new(Counters::default()),
     )
