@@ -699,7 +699,7 @@ fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
         .collect()
 }
 
-#[cfg(not(unix))]
+#[cfg(any(not(unix), test))]
 fn collect_files(
     base: &std::path::Path,
     dir: &std::path::Path,
@@ -726,6 +726,13 @@ fn collect_files(
         }
     }
     Ok(())
+}
+
+#[cfg(any(not(unix), test))]
+fn collect_files_if_present(base: &Path) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    collect_files(base, base, "", &mut names)?;
+    Ok(names)
 }
 
 #[cfg(any(not(unix), test))]
@@ -1252,6 +1259,13 @@ mod tests {
             .unwrap();
         lua.globals().set("remuda", remuda).unwrap();
         lua
+    }
+
+    #[test]
+    fn collect_files_if_present_treats_a_missing_root_as_empty() {
+        let root = TestRoot::new();
+        let missing = root.0.join("not-created");
+        assert!(collect_files_if_present(&missing).unwrap().is_empty());
     }
 
     const HANDLE_CONFORMANCE: &str = r#"
