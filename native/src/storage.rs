@@ -811,6 +811,11 @@ mod tests {
         local names = a:list("mail/")
         assert(#names == 2 and names[1] == "mail/a.bin" and names[2] == "mail/b.bin")
         assert(a:delete("mail/a.bin") and not a:exists("mail/a.bin"))
+        local folded = s.get("folded"):data(); folded:write("token", "x")
+        assert(not pcall(function() folded:write("Token", "x") end))
+        local limited = s.get("limited"):data()
+        for i = 1, 1024 do limited:write("entry" .. i, "x") end
+        assert(not pcall(function() limited:write("overflow", "x") end))
     "#;
 
     fn select_backend(lua: &Lua, name: &str) {
@@ -867,6 +872,86 @@ mod tests {
         )
         .exec()
         .unwrap();
+    }
+
+    #[test]
+    fn xdg_secret_operations_stay_unavailable_without_creating_files() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"
+            local secret = remuda.storage.get("secrets"):secret()
+            local value, reason = secret:put("token", "value")
+            assert(value == nil and reason:match("^unavailable:"))
+            value, reason = secret:get("token"); assert(value == nil and reason:match("^unavailable:"))
+            value, reason = secret:delete("token"); assert(value == nil and reason:match("^unavailable:"))
+            assert(secret:exists("token") == false)
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert!(fs::read_dir(&root.0).unwrap().next().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_read_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/reader");
+        fs::create_dir_all(&namespace).unwrap();
+        fs::write(namespace.join("target"), b"secret").unwrap();
+        symlink(namespace.join("target"), namespace.join("linked")).unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"local value, reason = remuda.storage.get("reader"):data():read("linked"); assert(value == nil and reason)"#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn xdg_read_rejects_files_larger_than_one_mib() {
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/reader");
+        fs::create_dir_all(&namespace).unwrap();
+        fs::write(namespace.join("large"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"local value, reason = remuda.storage.get("reader"):data():read("large"); assert(value == nil and reason)"#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_read_does_not_block_on_fifo() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::time::Duration;
+
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/reader");
+        fs::create_dir_all(&namespace).unwrap();
+        let fifo = namespace.join("pipe");
+        let fifo_c = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        let root_path = root.0.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let lua = lua_with_xdg_root(&root_path);
+            select_backend(&lua, "xdg");
+            let result = lua
+                .load(r#"local value, reason = remuda.storage.get("reader"):data():read("pipe"); assert(value == nil and reason)"#)
+                .exec();
+            let _ = send.send(result.is_ok());
+        });
+        assert!(receive.recv_timeout(Duration::from_secs(2)).unwrap());
     }
 
     fn run_handle_conformance(lua: &Lua, backend: &str) {
