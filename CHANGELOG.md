@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Lua: `remuda.storage.dir(kind)` returns an absolute per-user directory for
+  `config`, `data`, `state` or `cache`. Absolute XDG values win on every OS;
+  Windows falls back to Local AppData, and Linux/macOS use the XDG home layout.
+  Relative XDG values are ignored; earlier data-home resolution accepted
+  relative `XDG_DATA_HOME` values.
 - Lua: `remuda.fs.realpath(path)` resolves a path through every symlink, and
   `remuda.fs.is_symlink(path)` says whether the path itself is a link. Both work
   on Windows, where a junction counts as a link and a resolved path carries the

@@ -376,6 +376,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "random_bytes(n) -> string",
     ),
     (
+        "storage",
+        "Namespace for resolving per-user config, data, state and cache directories.",
+        "table",
+    ),
+    (
         "system",
         "OS services for trusted Lua callers.",
         "table",
@@ -402,7 +407,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "storage.dir",
-        "Return the absolute user directory for a storage kind, or nil and an unavailable reason.",
+        "Return the absolute user directory for config, data, state or cache. Returns nil and an unavailable reason when the path cannot be resolved; unknown kinds raise a Lua usage error.",
         "storage.dir(kind) -> path | nil, 'unavailable: reason'",
     ),
     (

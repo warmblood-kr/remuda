@@ -391,6 +391,16 @@ session.resize
 
 ``session.resize(name, cols, rows) -> true | nil, err`` — Resize a session's terminal (cols 20..1000, rows 24..500).
 
+storage
+-------
+
+``table`` — Namespace for resolving per-user config, data, state and cache directories.
+
+storage.dir
+-----------
+
+``storage.dir(kind) -> path | nil, 'unavailable: reason'`` — Return the absolute user directory for config, data, state or cache. Returns nil and an unavailable reason when the path cannot be resolved; unknown kinds raise a Lua usage error.
+
 system
 ------
 
