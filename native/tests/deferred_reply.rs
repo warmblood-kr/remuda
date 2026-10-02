@@ -1400,6 +1400,7 @@ fn session_prompt_line_shows_tagged_label_and_sanitized_default() {
         Response::Value(session_name.into())
     );
 
+    let expected_prompt = "remuda[session prompt-line-session] wizard label [default]:";
     let deadline = Instant::now() + Duration::from_secs(8);
     let prompt_screen = loop {
         let screen = match client::request(
@@ -1411,12 +1412,12 @@ fn session_prompt_line_shows_tagged_label_and_sanitized_default() {
             Ok(Response::Screen(screen)) => screen,
             other => panic!("capture failed: {other:?}"),
         };
-        if screen.contains("wizard label") {
+        if screen.contains(expected_prompt) {
             break screen;
         }
         assert!(
             Instant::now() < deadline,
-            "prompt-line prompt did not appear:\n{screen}"
+            "prompt-line prompt did not show the full label/default {expected_prompt:?}:\n{screen}"
         );
         std::thread::sleep(Duration::from_millis(25));
     };
@@ -1453,7 +1454,7 @@ fn session_prompt_line_shows_tagged_label_and_sanitized_default() {
     let _ = fs::remove_dir_all(&dir);
 
     assert!(
-        prompt_screen.contains("remuda[session prompt-line-session] wizard label [default]:"),
+        prompt_screen.contains(expected_prompt),
         "session label/default was not tagged or sanitized:\n{prompt_screen}"
     );
     assert!(
