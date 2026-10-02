@@ -316,14 +316,15 @@ impl SessionOutputNotifier {
         }
     }
 
+    /// Bounded: ConPTY can hold a dead session's output pipe open, and the
+    /// caller may be the image thread itself (`remuda.ls()` reaps there).
     fn wait_monitor(&self) {
-        if let Ok(mut finished) = self.state.monitor_finished.lock() {
-            while !*finished {
-                let Ok(next) = self.state.monitor_finished_cv.wait(finished) else {
-                    return;
-                };
-                finished = next;
-            }
+        if let Ok(finished) = self.state.monitor_finished.lock() {
+            let _ = self.state.monitor_finished_cv.wait_timeout_while(
+                finished,
+                crate::pty::PTY_WRITE_TIMEOUT,
+                |finished| !*finished,
+            );
         }
     }
 
@@ -1686,6 +1687,12 @@ mod tests {
         );
         // Registered, and never finished: no monitor thread is behind it.
         let _monitor = image.session_output_notifier("stuck", session.id());
+        image
+            .eval(
+                "remuda.on('session_exited', function(name) remuda._exited = name end)",
+                None,
+            )
+            .unwrap();
 
         let listed = image
             .submit("return #remuda.ls()", None)
@@ -1695,6 +1702,8 @@ mod tests {
                 "remuda.ls() parked the image thread behind an output monitor that never finished",
             );
         assert_eq!(listed.unwrap(), "0", "the dead session is reaped");
+        // The exit is still announced once the bound passes.
+        assert_eq!(image.eval("return remuda._exited", None).unwrap(), "stuck");
         image.stop_for_test();
     }
 }
