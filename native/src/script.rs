@@ -516,11 +516,124 @@ fn cli_spec_from_lua(table: Table) -> mlua::Result<crate::cli_parse::Spec> {
             options: cli_options_from_lua(verb.get::<Option<Table>>("options")?)?,
         });
     }
-    Ok(Spec {
+    let spec = Spec {
         name,
         options,
         verbs,
-    })
+    };
+    validate_cli_spec(&spec)?;
+    Ok(spec)
+}
+
+fn validate_cli_spec(spec: &crate::cli_parse::Spec) -> mlua::Result<()> {
+    use std::collections::HashSet;
+
+    fn valid_token(value: &str, allow_underscore: bool) -> bool {
+        let mut chars = value.chars();
+        chars
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric())
+            && chars.all(|ch| {
+                ch.is_ascii_alphanumeric() || ch == '-' || (allow_underscore && ch == '_')
+            })
+    }
+
+    fn validate_options(
+        options: &[crate::cli_parse::OptionSpec],
+        ids: &mut HashSet<String>,
+        shorts: &mut HashSet<char>,
+    ) -> mlua::Result<()> {
+        for option in options {
+            if !valid_token(&option.long, false) {
+                return Err(mlua::Error::runtime(format!(
+                    "remuda.cli.parse option long must be a non-empty alphanumeric/hyphen name: {:?}",
+                    option.long
+                )));
+            }
+            if option.long == "help" {
+                return Err(mlua::Error::runtime(
+                    "remuda.cli.parse option long 'help' is reserved",
+                ));
+            }
+            if option.long == "__help" {
+                return Err(mlua::Error::runtime(
+                    "remuda.cli.parse argument id '__help' is reserved",
+                ));
+            }
+            if !ids.insert(option.long.clone()) {
+                return Err(mlua::Error::runtime(format!(
+                    "remuda.cli.parse argument id '{}' is duplicated",
+                    option.long
+                )));
+            }
+            if let Some(short) = option.short {
+                if !short.is_ascii_alphanumeric() || short == 'h' {
+                    return Err(mlua::Error::runtime(format!(
+                        "remuda.cli.parse option short '{}' is invalid or reserved",
+                        short
+                    )));
+                }
+                if !shorts.insert(short) {
+                    return Err(mlua::Error::runtime(format!(
+                        "remuda.cli.parse option short '{}' is duplicated",
+                        short
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    let mut verb_names = HashSet::new();
+    for verb in &spec.verbs {
+        if !valid_token(&verb.name, false) || !verb_names.insert(verb.name.as_str()) {
+            return Err(mlua::Error::runtime(format!(
+                "remuda.cli.parse verb name is invalid or duplicated: {:?}",
+                verb.name
+            )));
+        }
+    }
+
+    let mut global_ids = HashSet::new();
+    let mut global_shorts = HashSet::new();
+    validate_options(&spec.options, &mut global_ids, &mut global_shorts)?;
+
+    for verb in &spec.verbs {
+        if verb
+            .args
+            .iter()
+            .enumerate()
+            .any(|(index, arg)| arg.multiple && index + 1 != verb.args.len())
+        {
+            return Err(mlua::Error::runtime(format!(
+                "remuda.cli.parse multiple positional argument must be last for verb '{}'",
+                verb.name
+            )));
+        }
+        let mut ids = global_ids.clone();
+        let mut shorts = global_shorts.clone();
+        validate_options(&verb.options, &mut ids, &mut shorts)?;
+        for arg in &verb.args {
+            if !valid_token(&arg.name, true) {
+                return Err(mlua::Error::runtime(format!(
+                    "remuda.cli.parse positional name is invalid: {:?}",
+                    arg.name
+                )));
+            }
+            if arg.name == "__help" {
+                return Err(mlua::Error::runtime(
+                    "remuda.cli.parse argument id '__help' is reserved",
+                ));
+            }
+            if !ids.insert(arg.name.clone()) {
+                return Err(mlua::Error::runtime(format!(
+                    "remuda.cli.parse argument id '{}' is duplicated",
+                    arg.name
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cli_options_from_lua(table: Option<Table>) -> mlua::Result<Vec<crate::cli_parse::OptionSpec>> {
@@ -1863,13 +1976,69 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
 
 #[cfg(test)]
 mod binding_tests {
-    use super::{fs_bindings, lua_steps_to_wire, BINDINGS};
-    use mlua::Lua;
+    use super::{cli_spec_from_lua, fs_bindings, lua_steps_to_wire, BINDINGS};
+    use mlua::{Lua, Table};
     use remuda_core::protocol::Step;
 
     #[test]
     fn binding_names_are_sorted_and_unique() {
         assert!(BINDINGS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    fn rejects_cli_spec(spec: &str) {
+        let lua = Lua::new();
+        let table = lua.load(spec).eval::<Table>().unwrap();
+        let error = cli_spec_from_lua(table).unwrap_err();
+        assert!(error.to_string().contains("remuda.cli.parse"), "{error}");
+    }
+
+    #[test]
+    fn cli_spec_rejects_duplicate_option_ids() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="json",help="a"},{long="json",help="b"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_reserved_help_long() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="help",help="a"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_reserved_help_short() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="json",short="h",help="a"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_option_positional_id_collision() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="event-id",help="a"}}, verbs={go={next="remuda",args={{name="event-id",help="b"}}}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_empty_option_long() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="",help="a"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_equals_in_option_long() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="bad=name",help="a"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_non_last_multiple_positional() {
+        rejects_cli_spec(
+            r#"return {name="remuda", verbs={go={next="remuda",args={{name="BODY",help="a",multiple=true},{name="END",help="b"}}}}}"#,
+        );
     }
 
     #[cfg(unix)]
