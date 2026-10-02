@@ -42,6 +42,7 @@ mod store {
     use security_framework::base::Error;
     use security_framework::os::macos::keychain::SecKeychain;
     use security_framework::passwords;
+    use std::sync::Mutex;
     use zeroize::Zeroizing;
 
     pub(super) const BACKEND: Option<&str> = Some("keychain");
@@ -55,6 +56,11 @@ mod store {
         "unavailable: no default keychain. Fix: if macOS asks, Cancel is safe (the password goes to the private file) and Reset to Defaults creates a new login keychain; or pass --dir";
     const KEYCHAIN_LOCKED: &str =
         "unavailable: keychain locked or no GUI session. Fix: unlock it (or log in on the console) or pass --dir";
+
+    // SecKeychainSetUserInteractionAllowed is process-global. Serialize all
+    // credential calls while it is disabled so another credential operation
+    // cannot observe a state changed by its neighbor.
+    static USER_INTERACTION_MUTEX: Mutex<()> = Mutex::new(());
 
     // errSecNotAvailable, errSecNoSuchKeychain and errSecNoDefaultKeychain:
     // there is no keychain to store into. errSecInteractionNotAllowed (a
@@ -73,28 +79,42 @@ mod store {
         }
     }
 
+    fn with_user_interaction_disabled<T>(
+        call: impl FnOnce() -> Result<T, Error>,
+    ) -> Result<T, String> {
+        let _serial = USER_INTERACTION_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // KeychainUserInteractionLock restores interaction in Drop, including
+        // when the operation returns an error or unwinds with a panic.
+        let _interaction = SecKeychain::disable_user_interaction().map_err(reason)?;
+        call().map_err(reason)
+    }
+
     pub(super) fn put(name: &str, secret: &[u8]) -> Result<(), String> {
         // Without a default keychain macOS opens its own "A keychain cannot be
         // found to store ..." dialog from inside the add; asking first fails
         // quietly instead. INFERRED, not verified on a Mac that lacks a default
         // keychain: the owner's Mac is the check.
-        SecKeychain::default().map_err(reason)?;
-        passwords::set_generic_password(SERVICE, name, secret).map_err(reason)
+        with_user_interaction_disabled(|| {
+            SecKeychain::default()?;
+            passwords::set_generic_password(SERVICE, name, secret)
+        })
     }
 
     pub(super) fn get(name: &str) -> Result<Zeroizing<Vec<u8>>, String> {
-        passwords::get_generic_password(SERVICE, name)
-            .map(Zeroizing::new)
-            .map_err(reason)
+        with_user_interaction_disabled(|| {
+            passwords::get_generic_password(SERVICE, name).map(Zeroizing::new)
+        })
     }
 
     pub(super) fn delete(name: &str) -> Result<(), String> {
-        passwords::delete_generic_password(SERVICE, name).map_err(reason)
+        with_user_interaction_disabled(|| passwords::delete_generic_password(SERVICE, name))
     }
 
     #[cfg(test)]
     mod tests {
-        use super::{reason, Error};
+        use super::{reason, with_user_interaction_disabled, Error};
 
         // No usable default keychain: callers must still see `unavailable:`
         // (so they fall back to a file) plus words that say how to fix it.
@@ -118,6 +138,14 @@ mod store {
             let text = reason(Error::from_code(-25308));
             assert!(text.starts_with("unavailable: keychain locked"), "{text}");
             assert!(text.contains("Fix:"), "{text}");
+        }
+
+        #[test]
+        fn a_noninteractive_store_call_maps_a_locked_status() {
+            let result = with_user_interaction_disabled(|| -> Result<(), Error> {
+                Err(Error::from_code(-25308))
+            });
+            assert_eq!(result.unwrap_err(), super::KEYCHAIN_LOCKED);
         }
 
         #[test]

@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io::{BufRead, Read, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -480,6 +480,103 @@ fn cluster_cli_output_matches_goldens() {
     golden_invite_join_cases(&scratch);
     golden_revoke_cancel_case(&scratch);
     golden_remaining_verb_errors(&scratch);
+}
+
+#[test]
+fn cluster_help_discloses_default_listener_and_opt_out() {
+    let scratch = Scratch::new();
+    let mut failures = Vec::new();
+    for args in [
+        &(["--help"][..]),
+        &(["cluster", "--help"][..]),
+        &(["cluster", "init", "--help"][..]),
+    ] {
+        let output = scratch.run(args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success()
+            || !stdout.contains("private LAN")
+            || !stdout.contains("listener")
+            || !stdout.contains("--no-listen")
+            || stderr.contains("no command or mod with that name")
+        {
+            failures.push(format!(
+                "{args:?}: exit={:?}\nstdout: {stdout}\nstderr: {stderr}",
+                output.status.code()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn cluster_init_discloses_listener_before_it_binds() {
+    use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = Scratch::new();
+    let _daemon = start_daemon(&scratch);
+    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port");
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let cluster_dir = scratch.root.join("state/remuda/cluster");
+    fs::create_dir_all(&cluster_dir).unwrap();
+    fs::set_permissions(&cluster_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    listener_config::write_at(
+        &cluster_dir,
+        &ListenerConfig {
+            enabled: false,
+            bind: ListenerBind::Explicit(address),
+            allow_public: false,
+        },
+    )
+    .unwrap();
+    assert!(!cluster_dir.join("identity.key").exists());
+
+    let mut child = scratch
+        .command(&["cluster", "init"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start init command");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout pipe"));
+    let mut first_line = String::new();
+    stdout.read_line(&mut first_line).expect("read init notice");
+    assert_eq!(
+        first_line.trim_end(),
+        "Starting the cluster listener (private LAN address, port 7441 by default). Only admitted machines can connect. To skip it: remuda cluster init --no-listen"
+    );
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err(),
+        "listener bound before the disclosure was printed"
+    );
+    let mut remaining_stdout = String::new();
+    stdout
+        .read_to_string(&mut remaining_stdout)
+        .expect("read remaining init output");
+    let output = child.wait_with_output().expect("wait for init command");
+    assert!(
+        output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(remaining_stdout.contains(&format!("Listening on {address}")));
+}
+
+#[test]
+fn already_initialized_no_listen_does_not_say_listener_is_starting() {
+    let scratch = Scratch::new();
+    let _daemon = start_daemon(&scratch);
+    let first = scratch.run(&["cluster", "init", "--no-listen"]);
+    assert!(first.status.success(), "init failed: {first:?}");
+    let rerun = scratch.run(&["cluster", "init", "--no-listen"]);
+    let stdout = String::from_utf8_lossy(&rerun.stdout);
+    assert!(rerun.status.success(), "init rerun failed: {rerun:?}");
+    assert!(stdout.contains("Already initialized"), "{stdout}");
+    assert!(
+        !stdout.contains("Starting the cluster listener"),
+        "no-listen rerun does not start a listener: {stdout}"
+    );
 }
 
 #[test]

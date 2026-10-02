@@ -1,5 +1,7 @@
 usage: remuda cluster <command>
   init
+    creates identity; starts listener on private LAN port 7441 by default
+    --no-listen skips the listener
   invite
   join
   nodes

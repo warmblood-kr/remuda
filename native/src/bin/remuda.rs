@@ -50,14 +50,13 @@ mod codex_tui;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (server, rest) = split_server_flag(&args);
-    let (stdin_enabled, rest) = match split_stdin_flag(rest) {
+    let (server, stdin_enabled, rest) = match checked_cli_flags(&args) {
         Ok(flags) => flags,
-        Err(error) => return fail(error),
+        Err(code) => return code,
     };
     let argv: Vec<&str> = rest.iter().map(String::as_str).collect();
 
-    if let Some(exit) = run_internal_command(&argv) {
+    if let Some(exit) = preflight_command(&argv) {
         return exit;
     }
 
@@ -160,7 +159,7 @@ fn main() -> ExitCode {
         ["mod", "update", rest @ ..] => mod_update_command(server, &path, rest),
         ["mod", "remove", rest @ ..] => mod_remove_command(rest),
 
-        ["doc", rest @ ..] => with_existing_daemon(server, &path, |path| doc_command(path, rest)),
+        ["doc", rest @ ..] => doc_command(server, &path, rest),
 
         ["repl"] => with_daemon(server, &path, repl),
 
@@ -324,7 +323,8 @@ remuda — terminal orchestration for coding agents
   remuda mod update NAME|--all   update a mod
   remuda mod remove NAME         remove a mod
   remuda cluster                 show cluster status
-  remuda cluster init            create this node's cluster identity
+  remuda cluster init            create identity; starts listener on private LAN port 7441 by default
+                                  use --no-listen to skip the listener
   remuda cluster init --new-identity [--yes]
                                  leave the cluster and create a new identity
   remuda cluster invite           invite another node
@@ -826,7 +826,7 @@ fn parse_addr_default_port(value: &str) -> Result<std::net::SocketAddr, String> 
 
 pub fn cluster_usage(verb: &str) -> String {
     match verb {
-        "init" => "usage: remuda cluster init [--no-listen | --new-identity [--yes]]\nexample: remuda cluster init --no-listen\n".into(),
+        "init" => format!("usage: remuda cluster init [--no-listen | --new-identity [--yes]]\nCreates this node's cluster identity and starts a listener on a private LAN address (port {CLUSTER_DEFAULT_PORT}) by default. Use --no-listen to skip the listener.\nexample: remuda cluster init --no-listen\n"),
         "invite" => format!("usage: remuda cluster invite [--bind IP[:PORT]] [--addr IP[:PORT]] (default port {CLUSTER_DEFAULT_PORT})\nexample: remuda cluster invite\n"),
         "join" => format!("usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})]\nexample: remuda cluster join 'remuda-join-v1 …'\n"),
         "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n".into(),
@@ -835,7 +835,7 @@ pub fn cluster_usage(verb: &str) -> String {
         "remote" => "usage: remuda cluster remote [NODE/SESSION]\nexample: remuda cluster remote\n".into(),
         "listen" => format!("usage: remuda cluster listen [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})] [--allow-public] [--foreground]\nusage: remuda cluster listen --off\nexample: remuda cluster listen\n"),
         "call" => format!("usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--json]\nexample: remuda cluster call node-abcd1234 list --addr 192.0.2.1\n"),
-        _ => "usage: remuda cluster <command>\n  init\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n".into(),
+        _ => "usage: remuda cluster <command>\n  init\n    creates identity; starts listener on private LAN port 7441 by default\n    --no-listen skips the listener\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n".into(),
     }
 }
 
@@ -1193,6 +1193,9 @@ fn cluster_init(server: &str, path: &Path, no_listen: bool) -> ExitCode {
             }
             remuda_native::cluster::listener_control::stop(daemon_path)
         } else {
+            if let Err(error) = write_cluster_init_listener_starting_notice() {
+                return fail(render_init_listener_error(&error));
+            }
             remuda_native::cluster::listener_control::start(daemon_path, Some(config))
         };
         match listener_status {
@@ -1211,6 +1214,14 @@ fn cluster_init(server: &str, path: &Path, no_listen: bool) -> ExitCode {
             Err(error) => fail(render_init_listener_error(&error)),
         }
     })
+}
+
+const CLUSTER_INIT_LISTENER_START_NOTICE: &str = "Starting the cluster listener (private LAN address, port 7441 by default). Only admitted machines can connect. To skip it: remuda cluster init --no-listen";
+
+fn write_cluster_init_listener_starting_notice() -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    writeln!(stdout, "{CLUSTER_INIT_LISTENER_START_NOTICE}")?;
+    stdout.flush()
 }
 
 fn render_cluster_init_error(error: &std::io::Error) -> String {
@@ -4269,17 +4280,13 @@ fn fate(path: &Path, name: &str) -> String {
 /// binary but cannot touch a daemon already running — this is the verb that
 /// closes that gap.
 fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
-    let mut force = false;
-    let mut yes = false;
-    let mut inside_override = false;
-    for arg in args {
-        match *arg {
-            "-f" | "--force" if !force => force = true,
-            "--yes" if !yes => yes = true,
-            "--i-am-inside" if !inside_override => inside_override = true,
-            _ => return fail("usage: remuda stop [-f] [--yes]"),
-        }
-    }
+    let values = match parse_top_level_cli(&stop_cli_spec(), "stop", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    let force = cli_flag(&values, "force");
+    let yes = cli_flag(&values, "yes");
+    let inside_override = cli_flag(&values, "i-am-inside");
     if remuda_native::ipc::connect(path).is_err() {
         eprintln!("remuda: no daemon running for {server:?} — a state-creating command starts one");
         return ExitCode::SUCCESS;
@@ -4304,6 +4311,80 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         }
         Err(e) => fail(e),
     }
+}
+
+fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{OptionSpec, Spec, VerbSpec};
+    Spec {
+        name: "remuda".into(),
+        options: vec![],
+        verbs: vec![VerbSpec {
+            name: "stop".into(),
+            about: "Stop the daemon".into(),
+            args: vec![],
+            next: "remuda stop --help".into(),
+            options: vec![
+                OptionSpec {
+                    long: "force".into(),
+                    short: Some('f'),
+                    value: None,
+                    help: "Stop without asking for confirmation".into(),
+                    global: false,
+                },
+                OptionSpec {
+                    long: "yes".into(),
+                    short: None,
+                    value: None,
+                    help: "Confirm stopping all sessions".into(),
+                    global: false,
+                },
+                OptionSpec {
+                    long: "i-am-inside".into(),
+                    short: None,
+                    value: None,
+                    help: "Allow a hosted session to stop its daemon".into(),
+                    global: false,
+                },
+            ],
+        }],
+    }
+}
+
+fn stop_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
+    let ["stop", args @ ..] = argv else {
+        return None;
+    };
+    parse_top_level_cli(&stop_cli_spec(), "stop", args).err()
+}
+
+fn parse_top_level_cli(
+    spec: &remuda_native::cli_parse::Spec,
+    verb: &str,
+    args: &[&str],
+) -> Result<serde_json::Map<String, serde_json::Value>, ExitCode> {
+    let words = std::iter::once(verb)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>();
+    let report = remuda_native::cli_parse::parse(spec, &words);
+    if report.ok {
+        return Ok(report.values);
+    }
+    if report.kind.as_deref() == Some("help") {
+        println!("{}", report.text);
+    } else {
+        eprintln!(
+            "{}",
+            report.text.replace(
+                "\nUsage:",
+                &format!("\nFix: run `remuda {verb} --help` for supported syntax.\nUsage:"),
+            )
+        );
+    }
+    Err(ExitCode::from(report.code as u8))
+}
+
+fn cli_flag(values: &serde_json::Map<String, serde_json::Value>, name: &str) -> bool {
+    values.get(name).and_then(serde_json::Value::as_bool) == Some(true)
 }
 
 fn has_sessions(path: &Path) -> bool {
@@ -4492,6 +4573,20 @@ fn run_internal_command(argv: &[&str]) -> Option<ExitCode> {
     }
 }
 
+fn preflight_command(argv: &[&str]) -> Option<ExitCode> {
+    run_internal_command(argv)
+        .or_else(|| stop_cli_preflight(argv))
+        .or_else(|| doc_cli_preflight(argv))
+        .or_else(|| resize_cli_preflight(argv))
+}
+
+fn doc_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
+    let ["doc", args @ ..] = argv else {
+        return None;
+    };
+    doc_cli_parse(args).err()
+}
+
 /// Internal release-workflow command. Reuse dist::is_newer so publication and
 /// update notices order channel versions identically.
 fn run_latest_index(args: &[&str]) -> ExitCode {
@@ -4576,6 +4671,17 @@ fn split_server_flag(args: &[String]) -> (&str, &[String]) {
     match args {
         [flag, server, rest @ ..] if flag == "-s" => (server.as_str(), rest),
         _ => ("default", args),
+    }
+}
+
+fn checked_cli_flags(args: &[String]) -> Result<(&str, bool, &[String]), ExitCode> {
+    let (server, rest) = split_server_flag(args);
+    if server.trim().is_empty() {
+        return Err(fail_invalid_server_name());
+    }
+    match split_stdin_flag(rest) {
+        Ok((stdin_enabled, rest)) => Ok((server, stdin_enabled, rest)),
+        Err(error) => Err(fail(error)),
     }
 }
 
@@ -5173,11 +5279,84 @@ fn resize_session(path: &Path, name: &str, cols: &str, rows: &str) -> ExitCode {
 }
 
 fn resize_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
-    let [name, cols, rows] = args else {
-        eprintln!("usage: remuda resize NAME COLS ROWS (cols 20..1000, rows 24..500)");
-        return ExitCode::from(2);
+    let values = match resize_cli_parse(args) {
+        Ok(values) => values,
+        Err(code) => return code,
     };
+    let name = values
+        .get("NAME")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let cols = values
+        .get("COLS")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let rows = values
+        .get("ROWS")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
     with_existing_daemon(server, path, |path| resize_session(path, name, cols, rows))
+}
+
+fn resize_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{ArgSpec, Spec, VerbSpec};
+    Spec {
+        name: "remuda".into(),
+        options: vec![],
+        verbs: vec![VerbSpec {
+            name: "resize".into(),
+            about: "Resize one session".into(),
+            args: ["NAME", "COLS", "ROWS"]
+                .into_iter()
+                .map(|name| ArgSpec {
+                    name: name.into(),
+                    help: format!("Session {name}"),
+                    multiple: false,
+                    required: true,
+                })
+                .collect(),
+            next: "remuda resize NAME 80 24".into(),
+            options: vec![],
+        }],
+    }
+}
+
+fn resize_cli_parse(args: &[&str]) -> Result<serde_json::Map<String, serde_json::Value>, ExitCode> {
+    use remuda_core::Size;
+    let values = parse_top_level_cli(&resize_cli_spec(), "resize", args)?;
+    let cols = values
+        .get("COLS")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<u16>().ok());
+    let rows = values
+        .get("ROWS")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<u16>().ok());
+    if !cols.is_some_and(|cols| (Size::MIN_RESIZE_COLS..=Size::MAX_RESIZE_COLS).contains(&cols))
+        || !rows.is_some_and(|rows| (Size::MIN_ROWS..=Size::MAX_RESIZE_ROWS).contains(&rows))
+    {
+        return Err(resize_dimensions_usage_error());
+    }
+    Ok(values)
+}
+
+fn resize_dimensions_usage_error() -> ExitCode {
+    use remuda_core::Size;
+    eprintln!(
+        "resize dimensions must be integers: cols {}..{}, rows {}..{}\nFix: use integer dimensions within those ranges.\nUsage: remuda resize NAME COLS ROWS\nNext: remuda resize NAME 80 24",
+        Size::MIN_RESIZE_COLS,
+        Size::MAX_RESIZE_COLS,
+        Size::MIN_ROWS,
+        Size::MAX_RESIZE_ROWS
+    );
+    ExitCode::from(2)
+}
+
+fn resize_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
+    let ["resize", args @ ..] = argv else {
+        return None;
+    };
+    resize_cli_parse(args).err()
 }
 
 /// Evaluate one chunk in the daemon's image and print what it came to. Nothing
@@ -5220,26 +5399,79 @@ fn eval_once(path: &Path, code: &str) -> ExitCode {
 }
 
 /// Render the live registry in the requested documentation format.
-fn doc_command(path: &Path, args: &[&str]) -> ExitCode {
-    let format = match args {
-        [] => "rst",
-        ["--format", format @ ("rst" | "markdown" | "json")] => format,
-        _ => return fail("usage: remuda doc [--format rst|markdown|json]"),
+fn doc_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let values = match doc_cli_parse(args) {
+        Ok(values) => values,
+        Err(code) => return code,
     };
+    let format = values
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("rst");
     let encoded = serde_json::to_string(format).expect("format names are valid strings");
-    match remuda_native::client::request(
-        path,
-        &Request::Eval {
-            code: format!("return remuda._registry_dump({encoded})"),
-            name: None,
-        },
-    ) {
-        Ok(Response::Value(value)) => {
-            println!("{value}");
-            ExitCode::SUCCESS
+    with_existing_daemon(server, path, |path| {
+        match remuda_native::client::request(
+            path,
+            &Request::Eval {
+                code: format!("return remuda._registry_dump({encoded})"),
+                name: None,
+            },
+        ) {
+            Ok(Response::Value(value)) => {
+                println!("{value}");
+                ExitCode::SUCCESS
+            }
+            other => fail(describe(other)),
         }
-        other => fail(describe(other)),
+    })
+}
+
+fn doc_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{OptionSpec, Spec, VerbSpec};
+    Spec {
+        name: "remuda".into(),
+        options: vec![],
+        verbs: vec![VerbSpec {
+            name: "doc".into(),
+            about: "Print live Lua documentation".into(),
+            args: vec![],
+            next: "remuda doc --help".into(),
+            options: vec![OptionSpec {
+                long: "format".into(),
+                short: None,
+                value: Some("FORMAT".into()),
+                help: "Output format: rst, markdown, or json".into(),
+                global: false,
+            }],
+        }],
     }
+}
+
+fn doc_cli_parse(args: &[&str]) -> Result<serde_json::Map<String, serde_json::Value>, ExitCode> {
+    let values = parse_top_level_cli(&doc_cli_spec(), "doc", args)?;
+    if let Some(format) = values.get("format").and_then(serde_json::Value::as_str) {
+        if !matches!(format, "rst" | "markdown" | "json") {
+            return Err(cli_usage_error(
+                "doc",
+                format!("invalid format '{format}'; choose rst, markdown, or json"),
+                "remuda doc [OPTIONS]",
+                "remuda doc --help",
+            ));
+        }
+    }
+    Ok(values)
+}
+
+fn cli_usage_error(
+    verb: &str,
+    detail: impl std::fmt::Display,
+    usage: &str,
+    next: &str,
+) -> ExitCode {
+    eprintln!(
+        "remuda: {verb}: {detail}\nFix: run `remuda {verb} --help` for supported syntax.\nUsage: {usage}\nNext: {next}"
+    );
+    ExitCode::from(2)
 }
 
 fn reload_mod_in_daemon(server: &str, path: &Path, name: &str) -> Result<(), String> {
@@ -6133,6 +6365,13 @@ fn fail(message: impl std::fmt::Display) -> ExitCode {
     }
     eprintln!("{}", format_failure(&message));
     ExitCode::FAILURE
+}
+
+fn fail_invalid_server_name() -> ExitCode {
+    eprintln!(
+        "remuda: session name cannot be empty or whitespace.\nNext: name the session with -s NAME, or omit -s."
+    );
+    ExitCode::from(2)
 }
 
 fn format_failure(message: &str) -> String {
