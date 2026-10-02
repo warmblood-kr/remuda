@@ -164,6 +164,20 @@ assert(handle.name == name, "calling remuda.session must still return a handle")
 assert(type(handle.is_busy) == "boolean", "the callable table must preserve session handle properties")
 assert(session.close(name) == nil, "session.close must preserve close's return value")
 
+-- Styled capture exposes the cursor and dim spans needed by caller-owned
+-- prompt interpretation without adding agent-specific policy to core.
+local capture_name = "api-v5-capture-" .. tostring(os.time())
+session.new(capture_name, { "sh" })
+local screen = remuda.capture_styled(capture_name)
+assert(type(screen) == "table" and type(screen.rows) == "table",
+  "capture_styled must return rows")
+local cursor = screen.cursor
+assert(type(cursor) == "table", "capture_styled must return cursor metadata")
+assert(type(cursor.row) == "number" and type(cursor.col) == "number",
+  "cursor row and column must be numbers")
+assert(type(cursor.visible) == "boolean", "cursor visibility must be boolean")
+session.close(capture_name)
+
 -- Flat spellings remain usable through API v5 while emitting suppressible
 -- deprecation notices for callers that have not migrated yet.
 local legacy_name = "api-v5-legacy-" .. tostring(os.time())
