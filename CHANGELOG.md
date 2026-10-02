@@ -5,7 +5,7 @@
 - The storage file backend opens files through no-follow directory handles, refuses symlinked namespace and file components, and writes directories 0700 and files 0600 on Unix.
 - Storage listings cap results at 1,024 valid names and eight path parts, filter names through API validation, and reject case-folded directory-part collisions.
 - `remuda.storage.set_default("xdg")` selects a file backend for config, data, state and cache blobs under `REMUDA_STORAGE_ROOT` or the platform storage directories; secrets stay unavailable there.
-- Windows file storage creates each resolver-based kind root with a protected owner, SYSTEM and Administrators DACL (including `%LOCALAPPDATA%\remuda\storage` for data), verifies roots on selection, and keeps secrets unavailable until reparse-safe file opens land.
+- Windows file storage creates each resolver-based kind root with a protected owner, SYSTEM and Administrators DACL (including `%LOCALAPPDATA%\remuda\storage` for data) and verifies it once at selection. The verified handle is dropped and later I/O is path-based; `create_dir_all` ancestors are not verified, and `REMUDA_STORAGE_ROOT` selects the parent. File secrets stay unavailable until reparse-safe file handles land (slice D).
 - Memory storage rejects unsafe names, case-fold collisions and writes over 1 MiB or 1024 entries per namespace and kind.
 - `remuda send` now exits 75 when session input is busy and 74 when the PTY
   write times out (was 1); both messages include a `Next:` line (see #269).

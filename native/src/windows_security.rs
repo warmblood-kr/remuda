@@ -3,8 +3,11 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+#[cfg(any(windows, test))]
 fn ace_sid_fits(ace_size: usize, fixed_size: usize, sid_size: usize) -> bool {
-    ace_size >= fixed_size
+    fixed_size
+        .checked_add(sid_size)
+        .is_some_and(|required| ace_size >= required)
 }
 
 #[allow(dead_code)]
@@ -46,7 +49,7 @@ pub(crate) fn storage_root_for(env: &dyn Fn(&str) -> Option<OsString>) -> Result
 
 #[cfg(windows)]
 mod platform {
-    use super::protected_storage_sddl;
+    use super::{ace_sid_fits, protected_storage_sddl};
     use std::ffi::{c_void, OsStr};
     use std::fs;
     use std::io;
@@ -63,8 +66,9 @@ mod platform {
     };
     use windows_sys::Win32::Security::{
         GetAce, GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-        GetTokenInformation, TokenUser, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
-        OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+        GetTokenInformation, TokenUser, ACE_HEADER, ACL_SIZE_INFORMATION,
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED, TOKEN_QUERY,
+        TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateDirectoryW, CreateFileW, GetFileInformationByHandleEx, FILE_ALL_ACCESS,
@@ -77,6 +81,7 @@ mod platform {
     struct Handle(HANDLE);
     impl Drop for Handle {
         fn drop(&mut self) {
+            // SAFETY: This wrapper exclusively owns a valid handle from OpenProcessToken/CreateFileW.
             unsafe { CloseHandle(self.0) };
         }
     }
@@ -85,6 +90,7 @@ mod platform {
     impl Drop for LocalMemory {
         fn drop(&mut self) {
             if !self.0.is_null() {
+                // SAFETY: The pointer is an allocation returned by a Win32 LocalAlloc API.
                 unsafe { LocalFree(self.0) };
             }
         }
@@ -99,11 +105,13 @@ mod platform {
     impl UserSid {
         fn current() -> io::Result<Self> {
             let mut token = ptr::null_mut();
+            // SAFETY: GetCurrentProcess is a pseudo-handle and token is a valid output pointer.
             if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
                 return Err(last_error());
             }
             let token = Handle(token);
             let mut needed = 0;
+            // SAFETY: This sizing call intentionally supplies no buffer and a valid length pointer.
             unsafe { GetTokenInformation(token.0, TokenUser, ptr::null_mut(), 0, &mut needed) };
             if needed == 0 {
                 return Err(last_error());
@@ -111,6 +119,7 @@ mod platform {
             let words =
                 (needed as usize + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
             let mut buffer = vec![0usize; words];
+            // SAFETY: buffer is aligned and at least `needed` bytes; token remains live.
             if unsafe {
                 GetTokenInformation(
                     token.0,
@@ -123,6 +132,7 @@ mod platform {
             {
                 return Err(last_error());
             }
+            // SAFETY: Successful TokenUser query initialized a TOKEN_USER in the sized buffer.
             let user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
             let sid = user.User.Sid;
             let text = sid_text(sid)?;
@@ -135,6 +145,7 @@ mod platform {
     }
 
     fn last_error() -> io::Error {
+        // SAFETY: GetLastError has no pointer or handle preconditions.
         io::Error::from_raw_os_error(unsafe { GetLastError() } as i32)
     }
 
@@ -147,6 +158,7 @@ mod platform {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "missing SID"));
         }
         let mut text = ptr::null_mut();
+        // SAFETY: sid is non-null and points to a SID retained by its owning buffer/descriptor.
         if unsafe { ConvertSidToStringSidW(sid, &mut text) } == 0 {
             return Err(last_error());
         }
@@ -158,11 +170,13 @@ mod platform {
         }
         let memory = LocalMemory(text.cast());
         let mut len = 0;
+        // SAFETY: ConvertSidToStringSidW returned a NUL-terminated UTF-16 allocation.
         unsafe {
             while *text.add(len) != 0 {
                 len += 1;
             }
         }
+        // SAFETY: The preceding scan found the terminator within the returned allocation.
         let value = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
         drop(memory);
         Ok(value)
@@ -174,6 +188,7 @@ mod platform {
             .chain(Some(0))
             .collect();
         let mut descriptor = ptr::null_mut();
+        // SAFETY: sddl is NUL-terminated and descriptor is a valid output pointer.
         if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 sddl.as_ptr(),
@@ -210,6 +225,7 @@ mod platform {
             bInheritHandle: 0,
         };
         let path_wide = wide(path.as_os_str());
+        // SAFETY: path_wide and attributes remain valid for this synchronous Win32 call.
         let created = unsafe { CreateDirectoryW(path_wide.as_ptr(), &attributes) };
         if created == 0 {
             let error = last_error();
@@ -222,6 +238,7 @@ mod platform {
 
     pub(crate) fn verify_storage_root(path: &Path) -> io::Result<()> {
         let path_wide = wide(path.as_os_str());
+        // SAFETY: path_wide is NUL-terminated; null optional pointers are permitted by CreateFileW.
         let handle = unsafe {
             CreateFileW(
                 path_wide.as_ptr(),
@@ -236,8 +253,10 @@ mod platform {
         if handle == INVALID_HANDLE_VALUE || handle.is_null() {
             return Err(last_error());
         }
+        // SAFETY: This call takes ownership of the valid handle returned by CreateFileW.
         let file = unsafe { std::fs::File::from_raw_handle(handle) };
         let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+        // SAFETY: tag is a writable buffer of the exact requested size; file owns the handle.
         if unsafe {
             GetFileInformationByHandleEx(
                 file.as_raw_handle(),
@@ -261,6 +280,7 @@ mod platform {
         let mut owner = ptr::null_mut();
         let mut dacl = ptr::null_mut();
         let mut raw_descriptor = ptr::null_mut();
+        // SAFETY: file is a live handle and all output pointers are valid for this call.
         let result = unsafe {
             GetSecurityInfo(
                 file.as_raw_handle(),
@@ -284,13 +304,16 @@ mod platform {
         }
         let descriptor = LocalMemory(raw_descriptor.cast());
         let user = UserSid::current()?;
-        if owner.is_null()
-            || unsafe { windows_sys::Win32::Security::EqualSid(owner, user.sid) } == 0
-        {
+        if owner.is_null() {
+            return Err(policy_error("storage root owner mismatch"));
+        }
+        // SAFETY: Both SID pointers are valid for comparison and remain live for this call.
+        if unsafe { windows_sys::Win32::Security::EqualSid(owner, user.sid) } == 0 {
             return Err(policy_error("storage root owner mismatch"));
         }
         let mut control = 0;
         let mut revision = 0;
+        // SAFETY: descriptor owns a valid security descriptor and outputs are writable.
         if unsafe { GetSecurityDescriptorControl(descriptor.0.cast(), &mut control, &mut revision) }
             == 0
         {
@@ -302,6 +325,7 @@ mod platform {
         let mut present = 0;
         let mut actual_dacl = ptr::null_mut();
         let mut defaulted = 0;
+        // SAFETY: descriptor is valid and the DACL fields are output pointers.
         if unsafe {
             GetSecurityDescriptorDacl(
                 descriptor.0.cast(),
@@ -317,6 +341,7 @@ mod platform {
             return Err(policy_error("storage root DACL missing"));
         }
         let mut info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: actual_dacl is the descriptor's live DACL; info is a writable sized buffer.
         if unsafe {
             GetAclInformation(
                 actual_dacl,
@@ -334,6 +359,7 @@ mod platform {
         let mut principals = Vec::with_capacity(3);
         for index in 0..info.AceCount {
             let mut raw_ace = ptr::null_mut();
+            // SAFETY: actual_dacl is valid and raw_ace is a writable output pointer.
             if unsafe { GetAce(actual_dacl, index, &mut raw_ace) } == 0 {
                 return Err(last_error());
             }
@@ -343,13 +369,33 @@ mod platform {
                     "storage root ACE is missing",
                 ));
             }
+            // SAFETY: GetAce returned an ACE pointer owned by the live DACL.
+            let header = unsafe { &*(raw_ace.cast::<ACE_HEADER>()) };
+            let fixed_size = std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>();
+            if (header.AceSize as usize) < fixed_size + 8 {
+                return Err(policy_error("storage root ACE is truncated"));
+            }
+            if header.AceType != 0 || header.AceFlags != 0x03 {
+                return Err(policy_error("storage root ACE policy mismatch"));
+            }
+            // SAFETY: AceSize covers the fixed ACCESS_ALLOWED_ACE prefix checked above.
             let ace =
                 unsafe { &*(raw_ace.cast::<windows_sys::Win32::Security::ACCESS_ALLOWED_ACE>()) };
-            if ace.Header.AceType != 0 || ace.Header.AceFlags != 0x03 || ace.Mask != FILE_ALL_ACCESS
-            {
+            if ace.Mask != FILE_ALL_ACCESS {
                 return Err(policy_error("storage root ACE policy mismatch"));
             }
             let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
+            // SAFETY: The ACE's fixed prefix and minimum eight-byte SID header are in bounds.
+            let sid_bytes = sid.cast::<u8>();
+            let (revision, sub_authority_count) = unsafe { (*sid_bytes, *sid_bytes.add(1)) };
+            if revision != 1 || sub_authority_count > 15 {
+                return Err(policy_error("storage root ACE SID is invalid"));
+            }
+            let sub_authority_count = sub_authority_count as usize;
+            let sid_size = 8usize + sub_authority_count * std::mem::size_of::<u32>();
+            if !ace_sid_fits(header.AceSize as usize, fixed_size, sid_size) {
+                return Err(policy_error("storage root ACE SID is truncated"));
+            }
             principals.push(sid_text(sid)?);
         }
         principals.sort();
