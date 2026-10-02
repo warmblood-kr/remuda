@@ -4,6 +4,9 @@
 
 - Fixed: macOS credential store calls no longer show Keychain dialogs; locked or
   unavailable keychains return an `unavailable` reason instead. See #472.
+- `install.sh`: when the install directory is not on `PATH` it now prints the
+  command that fixes it, `Next: export PATH="<dir>:$PATH"`, instead of only
+  saying to add it to your shell profile (#395).
 - `remuda cluster remote` now labels this node with the OS host name instead of
   reading the `HOSTNAME` environment variable; it uses `local` if the OS lookup
   fails.

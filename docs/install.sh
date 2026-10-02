@@ -168,7 +168,10 @@ echo "$channel" >"$channel_file"
 echo "install.sh: remuda $version -> $install_dir/remuda ($channel channel)" >&2
 case ":$PATH:" in
 *":$install_dir:"*) ;;
-*) echo "install.sh: $install_dir is not on your PATH — add it to your shell profile" >&2 ;;
+*)
+	echo "install.sh: $install_dir is not on your PATH — add it to your shell profile" >&2
+	echo "Next: export PATH=\"$install_dir:\$PATH\"  (add this line to your shell profile to keep it)" >&2
+	;;
 esac
 
 if [ "${REMUDA_INSTALL_BUTLER:-}" = 1 ]; then
