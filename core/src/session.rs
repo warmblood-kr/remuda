@@ -136,6 +136,17 @@ pub struct Session {
     input_rate: Mutex<InputRateLimiter>,
 }
 
+fn configure_writer_clock(
+    agent: &mut dyn AgentProcess,
+    clock: &Arc<dyn Clock>,
+) -> (Duration, Arc<Mutex<Duration>>) {
+    if let Some(writer) = agent.input_writer() {
+        writer.set_clock(Arc::clone(clock));
+    }
+    let started = clock.now();
+    (started, Arc::new(Mutex::new(started)))
+}
+
 /// Generate a unique session-start identity from host entropy and a process counter.
 pub fn generate_instance_id(seed: u128) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -181,9 +192,8 @@ impl Session {
         clock: Arc<dyn Clock>,
     ) -> Self {
         let instance_id = generate_instance_id(clock.instance_id_seed());
+        let (started, last_output_at) = configure_writer_clock(agent.as_mut(), &clock);
         let size = agent.size();
-        let started = clock.now();
-        let last_output_at = Arc::new(Mutex::new(started));
         let output_changed = Arc::new((Mutex::new(0_u64), Condvar::new()));
         if let Some(output) = agent.subscribe_output_wakeup() {
             let last_output_at = Arc::clone(&last_output_at);

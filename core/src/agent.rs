@@ -9,6 +9,7 @@
 //! Drill the hole once and both are satisfied: a scripted double for tests,
 //! and a second vendor later, are the same substitution.
 
+use crate::clock::Clock;
 use core::fmt;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -284,6 +285,9 @@ pub enum ChainOutcome {
 
 /// A backend writer that can wait independently of the locked process object.
 pub trait AgentWriter: Send + Sync {
+    /// Give the writer the session's clock for policy deadlines. Backends that
+    /// do not keep time-based writer state can ignore it.
+    fn set_clock(&self, _clock: Arc<dyn Clock>) {}
     fn write_bounded(&self, bytes: &[u8]) -> Result<()>;
     /// Ask the write that timed out to be followed by FOLLOW_UP once it lands.
     /// `Landed` means the timed-out write is no longer the active write; `Unsupported` means it cannot chain.

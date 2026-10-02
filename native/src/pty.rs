@@ -60,7 +60,7 @@ struct WriterState {
     active_since: Option<Instant>,
     follow_up: Option<(Vec<u8>, Duration)>,
     follow_up_open: bool,
-    late_submit_abandoned: bool,
+    late_submit_abandoned_at: Option<Duration>,
 }
 
 /// One bounded worker owns blocking PTY writes. It accepts only one task at a
@@ -68,6 +68,7 @@ struct WriterState {
 struct PtyInputWriter {
     sender: SyncSender<WriteTask>,
     state: Arc<Mutex<WriterState>>,
+    clock: Arc<Mutex<Arc<dyn remuda_core::Clock>>>,
     timeout: Duration,
     late_submit_bound: Duration,
 }
@@ -80,13 +81,25 @@ impl PtyInputWriter {
     ) -> std::io::Result<Self> {
         let (sender, receiver) = sync_channel::<WriteTask>(1);
         let state = Arc::new(Mutex::new(WriterState::default()));
+        let clock: Arc<Mutex<Arc<dyn remuda_core::Clock>>> =
+            Arc::new(Mutex::new(Arc::new(crate::SystemClock::new())));
         let worker_state = Arc::clone(&state);
+        let worker_clock = Arc::clone(&clock);
         std::thread::Builder::new()
             .name("remuda-pty-writer".into())
-            .spawn(move || run_writer(receiver, writer, worker_state, late_submit_bound))?;
+            .spawn(move || {
+                run_writer(
+                    receiver,
+                    writer,
+                    worker_state,
+                    worker_clock,
+                    late_submit_bound,
+                )
+            })?;
         Ok(Self {
             sender,
             state,
+            clock,
             timeout,
             late_submit_bound,
         })
@@ -110,11 +123,18 @@ impl PtyInputWriter {
             if state.active_since.is_some() {
                 return Err(AgentError::Busy);
             }
-            if report_completed_abandonment && state.late_submit_abandoned {
-                state.late_submit_abandoned = false;
-                return Err(AgentError::LateSubmitAbandoned {
-                    bound: self.late_submit_bound,
+            if report_completed_abandonment {
+                let expired = state.late_submit_abandoned_at.is_some_and(|abandoned_at| {
+                    self.clock_now().saturating_sub(abandoned_at) >= self.late_submit_bound
                 });
+                if expired {
+                    state.late_submit_abandoned_at = None;
+                }
+                if state.late_submit_abandoned_at.take().is_some() {
+                    return Err(AgentError::LateSubmitAbandoned {
+                        bound: self.late_submit_bound,
+                    });
+                }
             }
             state.next_sequence = state.next_sequence.wrapping_add(1);
             let sequence = state.next_sequence;
@@ -164,9 +184,23 @@ impl PtyInputWriter {
         if past_bound && state.follow_up.is_some() {
             state.follow_up = None;
             state.follow_up_open = false;
-            state.late_submit_abandoned = true;
+            state.late_submit_abandoned_at = Some(self.clock_now());
         }
-        state.active_since.is_some() && state.late_submit_abandoned
+        state.active_since.is_some() && state.late_submit_abandoned_at.is_some()
+    }
+
+    fn clock_now(&self) -> Duration {
+        self.clock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .now()
+    }
+
+    fn clear_late_submit_abandoned(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .late_submit_abandoned_at = None;
     }
 }
 
@@ -174,6 +208,7 @@ fn run_writer(
     receiver: Receiver<WriteTask>,
     writer: SharedWriter,
     state: Arc<Mutex<WriterState>>,
+    clock: Arc<Mutex<Arc<dyn remuda_core::Clock>>>,
     late_submit_bound: Duration,
 ) {
     while let Ok(task) = receiver.recv() {
@@ -198,9 +233,14 @@ fn run_writer(
                     if result.is_ok()
                         && state.active_sequence == Some(task.sequence)
                         && too_late
-                        && state.follow_up.is_some()
+                        && (state.follow_up.is_some() || state.late_submit_abandoned_at.is_some())
                     {
-                        state.late_submit_abandoned = true;
+                        state.late_submit_abandoned_at = Some(
+                            clock
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .now(),
+                        );
                     }
                     state.follow_up = None;
                     None
@@ -240,6 +280,13 @@ impl Drop for BusyReset<'_> {
 }
 
 impl AgentWriter for PtyInputWriter {
+    fn set_clock(&self, clock: Arc<dyn remuda_core::Clock>) {
+        *self
+            .clock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = clock;
+    }
+
     fn chain_after_stalled(&self, follow_up: &[u8], settle: Duration) -> ChainOutcome {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let Some(active_sequence) = state.active_sequence else {
@@ -254,7 +301,7 @@ impl AgentWriter for PtyInputWriter {
         if too_late {
             state.follow_up = None;
             state.follow_up_open = false;
-            state.late_submit_abandoned = true;
+            state.late_submit_abandoned_at = Some(self.clock_now());
             return ChainOutcome::Unsupported;
         }
         state.follow_up = Some((follow_up.to_vec(), settle));
@@ -309,7 +356,12 @@ impl AgentWriter for PtyInputWriter {
                         return Err(AgentError::Attached);
                     }
                     match receiver.recv_timeout(Duration::from_millis(10)) {
-                        Ok(result) => return result,
+                        Ok(result) => {
+                            if result.is_ok() {
+                                self.clear_late_submit_abandoned();
+                            }
+                            return result;
+                        }
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                             return Err(AgentError::Io("pty writer worker stopped".into()));
@@ -806,6 +858,7 @@ impl AgentProcess for PtyAgent {
 #[cfg(test)]
 mod input_writer_tests {
     use super::*;
+    use remuda_core::Clock;
     use std::sync::atomic::AtomicBool;
 
     struct StalledWrite {
@@ -845,6 +898,54 @@ mod input_writer_tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    fn capture_writer(
+        captured: &Arc<Mutex<Vec<u8>>>,
+        clock: Arc<remuda_core::ManualClock>,
+        late_submit_bound: Duration,
+    ) -> Arc<PtyInputWriter> {
+        let shared: SharedWriter =
+            Arc::new(Mutex::new(Box::new(CaptureWrites(Arc::clone(captured)))));
+        let writer = Arc::new(
+            PtyInputWriter::spawn(shared, Duration::from_secs(1), late_submit_bound).unwrap(),
+        );
+        writer.set_clock(clock);
+        writer
+    }
+
+    fn mark_late_submit_abandoned(writer: &PtyInputWriter, clock: &remuda_core::ManualClock) {
+        writer.state.lock().unwrap().late_submit_abandoned_at = Some(clock.now());
+    }
+
+    #[test]
+    fn expired_abandonment_flag_does_not_refuse_a_bounded_write() {
+        let late_submit_bound = Duration::from_secs(30);
+        let clock = Arc::new(remuda_core::ManualClock::new());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = capture_writer(&captured, Arc::clone(&clock), late_submit_bound);
+        mark_late_submit_abandoned(&writer, &clock);
+        clock.advance(late_submit_bound);
+
+        writer.write_bounded(b"fresh input").unwrap();
+
+        assert_eq!(*captured.lock().unwrap(), b"fresh input");
+    }
+
+    #[test]
+    fn attached_human_write_clears_the_abandonment_flag() {
+        let late_submit_bound = Duration::from_secs(30);
+        let clock = Arc::new(remuda_core::ManualClock::new());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = capture_writer(&captured, Arc::clone(&clock), late_submit_bound);
+        mark_late_submit_abandoned(&writer, &clock);
+
+        writer
+            .write_to_completion_while(b"human cleanup", &|| false)
+            .unwrap();
+        writer.write_bounded(b"automated input").unwrap();
+
+        assert_eq!(*captured.lock().unwrap(), b"human cleanupautomated input");
     }
 
     impl Write for StalledWrite {
