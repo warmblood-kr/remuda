@@ -61,6 +61,16 @@ clear_hooks
 
 ``clear_hooks(opts) -> nil`` — Remove every hook registered under a group.
 
+cli
+---
+
+``table`` — Declarative command-line parsing for extension handlers.
+
+cli.parse
+---------
+
+``cli.parse(spec, argv) -> report`` — Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set multiple = true on the final positional argument to collect message body words.
+
 click
 -----
 

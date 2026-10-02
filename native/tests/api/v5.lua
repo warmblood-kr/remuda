@@ -388,4 +388,34 @@ end
 local failed, file_error = fs.write_atomic(write_path .. ".missing/child", "unwritable")
 assert(failed == nil and type(file_error) == "string", "write errors must return nil, error")
 
+local cli_spec = {
+  name = "remuda test",
+  options = { { long = "json", help = "Print JSON", global = true } },
+  verbs = {
+    thread = {
+      about = "Read a thread",
+      args = { { name = "EVENT_ID", help = "Starting event" } },
+      next = "remuda test reply EVENT_ID TEXT",
+    },
+  },
+}
+assert(type(remuda.cli) == "table" and type(remuda.cli.parse) == "function",
+  "remuda.cli.parse is missing")
+assert(remuda._registry["cli.parse"] ~= nil, "remuda.cli.parse needs a registry entry")
+local cli_success = remuda.cli.parse(cli_spec, { "thread", "$v5", "--json" })
+assert(cli_success.ok and cli_success.verb == "thread", "cli.parse should return parsed success")
+assert(cli_success.values.EVENT_ID == "$v5" and cli_success.values.json == true,
+  "cli.parse success should expose parsed values")
+local cli_help = remuda.cli.parse(cli_spec, { "thread", "--help" })
+assert(not cli_help.ok and cli_help.kind == "help" and cli_help.code == 0,
+  "cli.parse help result shape changed")
+assert(cli_help.text:find("Usage:", 1, true), "cli.parse help should include Usage")
+assert(cli_help.text:find("Next: remuda test reply EVENT_ID TEXT", 1, true),
+  "cli.parse help should include Next")
+local cli_error = remuda.cli.parse(cli_spec, { "thread", "--jsno", "$v5" })
+assert(not cli_error.ok and cli_error.kind == "error" and cli_error.code == 2,
+  "cli.parse error result shape changed")
+assert(cli_error.text:find("Did you mean '--json'", 1, true),
+  "cli.parse error should use clap's option suggestion")
+
 print("v5 ok")

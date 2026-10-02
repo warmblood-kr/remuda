@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 93] = [
+pub const BINDINGS: [&str; 94] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -71,6 +71,7 @@ pub const BINDINGS: [&str; 93] = [
     "capture",
     "capture_styled",
     "clear_hooks",
+    "cli",
     "click",
     "clock",
     "close",
@@ -172,6 +173,16 @@ const WORDS: &[(&str, &str, &str)] = &[
         "clock",
         "Monotonic milliseconds since this Lua image started.",
         "clock() -> milliseconds",
+    ),
+    (
+        "cli",
+        "Declarative command-line parsing for extension handlers.",
+        "table",
+    ),
+    (
+        "cli.parse",
+        "Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set multiple = true on the final positional argument to collect message body words.",
+        "cli.parse(spec, argv) -> report",
     ),
     (
         "_pending_create",
@@ -439,9 +450,285 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
         registry.set(*name, row)?;
     }
     table.set("json", crate::json::bindings(lua)?)?;
+    table.set("cli", cli_parse_bindings(lua)?)?;
     table.set("system", crate::credential::bindings(lua)?)?;
     fs_bindings(lua, table)?;
     table.set("_registry", registry)
+}
+
+fn cli_parse_bindings(lua: &Lua) -> mlua::Result<Table> {
+    let cli = lua.create_table()?;
+    cli.set(
+        "parse",
+        lua.create_function(|lua, (spec_table, argv_table): (Table, Table)| {
+            let spec = cli_spec_from_lua(spec_table)?;
+            let argv = cli_argv_from_lua(argv_table)?;
+            let words = argv.iter().map(String::as_str).collect::<Vec<_>>();
+            let report = crate::cli_parse::parse(&spec, &words);
+
+            let result = lua.create_table()?;
+            result.set("ok", report.ok)?;
+            result.set("verb", report.verb)?;
+            result.set("kind", report.kind)?;
+            result.set("text", report.text)?;
+            result.set("code", report.code)?;
+            let values = lua.create_table()?;
+            for (key, value) in &report.values {
+                values.set(key.as_str(), json_value_to_lua(lua, value)?)?;
+            }
+            result.set("values", values)?;
+            Ok(result)
+        })?,
+    )?;
+    Ok(cli)
+}
+
+fn cli_spec_from_lua(table: Table) -> mlua::Result<crate::cli_parse::Spec> {
+    use crate::cli_parse::{ArgSpec, Spec, VerbSpec};
+
+    let name = table.get::<String>("name")?;
+    let options = cli_options_from_lua(table.get::<Option<Table>>("options")?)?;
+    let verbs_table = table.get::<Table>("verbs")?;
+    let mut verb_entries = verbs_table
+        .pairs::<String, Table>()
+        .collect::<mlua::Result<Vec<_>>>()?;
+    verb_entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut verbs = Vec::new();
+    for (name, verb) in verb_entries {
+        let about = verb.get::<Option<String>>("about")?.unwrap_or_default();
+        let next = verb.get::<String>("next")?;
+        let args_table = verb.get::<Option<Table>>("args")?;
+        let mut args = Vec::new();
+        if let Some(args_table) = args_table {
+            for item in args_table.sequence_values::<Table>() {
+                let item = item?;
+                args.push(ArgSpec {
+                    name: item.get("name")?,
+                    help: item.get("help")?,
+                    multiple: item.get::<Option<bool>>("multiple")?.unwrap_or(false),
+                });
+            }
+        }
+        verbs.push(VerbSpec {
+            name,
+            about,
+            args,
+            next,
+            options: cli_options_from_lua(verb.get::<Option<Table>>("options")?)?,
+        });
+    }
+    let spec = Spec {
+        name,
+        options,
+        verbs,
+    };
+    validate_cli_spec(&spec)?;
+    Ok(spec)
+}
+
+fn cli_argv_from_lua(table: Table) -> mlua::Result<Vec<String>> {
+    let mut indexed = std::collections::BTreeMap::new();
+    for pair in table.pairs::<Value, Value>() {
+        let (key, value) = pair?;
+        let index = match key {
+            Value::Integer(index) if index > 0 => usize::try_from(index).ok(),
+            Value::Number(index) if index.is_finite() && index.fract() == 0.0 && index >= 1.0 => {
+                usize::try_from(index as u64).ok()
+            }
+            _ => None,
+        }
+        .ok_or_else(|| mlua::Error::runtime("remuda.cli.parse argv must be a dense array"))?;
+        let word = match value {
+            Value::String(value) => value.to_str()?.to_owned(),
+            _ => {
+                return Err(mlua::Error::runtime(format!(
+                    "remuda.cli.parse argv[{index}] must be a string"
+                )))
+            }
+        };
+        indexed.insert(index, word);
+    }
+
+    let mut argv = Vec::with_capacity(indexed.len());
+    for (expected, (index, word)) in indexed.into_iter().enumerate() {
+        if index != expected + 1 {
+            return Err(mlua::Error::runtime(
+                "remuda.cli.parse argv must be a dense array",
+            ));
+        }
+        argv.push(word);
+    }
+    Ok(argv)
+}
+
+fn cli_spec_valid_token(value: &str, allow_underscore: bool) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && chars
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || (allow_underscore && ch == '_'))
+}
+
+fn validate_cli_options(
+    options: &[crate::cli_parse::OptionSpec],
+    ids: &mut std::collections::HashSet<String>,
+    shorts: &mut std::collections::HashSet<char>,
+) -> mlua::Result<()> {
+    for option in options {
+        if !cli_spec_valid_token(&option.long, false) {
+            return Err(mlua::Error::runtime(format!(
+                "remuda.cli.parse option long must be a non-empty alphanumeric/hyphen name: {:?}",
+                option.long
+            )));
+        }
+        if option.long == "help" {
+            return Err(mlua::Error::runtime(
+                "remuda.cli.parse option long 'help' is reserved",
+            ));
+        }
+        if option.long == "__help" {
+            return Err(mlua::Error::runtime(
+                "remuda.cli.parse argument id '__help' is reserved",
+            ));
+        }
+        if !ids.insert(option.long.clone()) {
+            return Err(mlua::Error::runtime(format!(
+                "remuda.cli.parse argument id '{}' is duplicated",
+                option.long
+            )));
+        }
+        if let Some(short) = option.short {
+            if !short.is_ascii_alphanumeric() || short == 'h' {
+                return Err(mlua::Error::runtime(format!(
+                    "remuda.cli.parse option short '{}' is invalid or reserved",
+                    short
+                )));
+            }
+            if !shorts.insert(short) {
+                return Err(mlua::Error::runtime(format!(
+                    "remuda.cli.parse option short '{}' is duplicated",
+                    short
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_cli_spec(spec: &crate::cli_parse::Spec) -> mlua::Result<()> {
+    use std::collections::HashSet;
+
+    let mut verb_names = HashSet::new();
+    for verb in &spec.verbs {
+        if verb.name == "help" {
+            return Err(mlua::Error::runtime(
+                "remuda.cli.parse verb name 'help' is reserved",
+            ));
+        }
+        if !cli_spec_valid_token(&verb.name, false) || !verb_names.insert(verb.name.as_str()) {
+            return Err(mlua::Error::runtime(format!(
+                "remuda.cli.parse verb name is invalid or duplicated: {:?}",
+                verb.name
+            )));
+        }
+    }
+
+    let mut global_ids = HashSet::new();
+    let mut global_shorts = HashSet::new();
+    validate_cli_options(&spec.options, &mut global_ids, &mut global_shorts)?;
+
+    for verb in &spec.verbs {
+        if verb
+            .args
+            .iter()
+            .enumerate()
+            .any(|(index, arg)| arg.multiple && index + 1 != verb.args.len())
+        {
+            return Err(mlua::Error::runtime(format!(
+                "remuda.cli.parse multiple positional argument must be last for verb '{}'",
+                verb.name
+            )));
+        }
+        let mut ids = global_ids.clone();
+        let mut shorts = global_shorts.clone();
+        validate_cli_options(&verb.options, &mut ids, &mut shorts)?;
+        for arg in &verb.args {
+            if !cli_spec_valid_token(&arg.name, true) {
+                return Err(mlua::Error::runtime(format!(
+                    "remuda.cli.parse positional name is invalid: {:?}",
+                    arg.name
+                )));
+            }
+            if arg.name == "__help" {
+                return Err(mlua::Error::runtime(
+                    "remuda.cli.parse argument id '__help' is reserved",
+                ));
+            }
+            if !ids.insert(arg.name.clone()) {
+                return Err(mlua::Error::runtime(format!(
+                    "remuda.cli.parse argument id '{}' is duplicated",
+                    arg.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cli_options_from_lua(table: Option<Table>) -> mlua::Result<Vec<crate::cli_parse::OptionSpec>> {
+    let mut options = Vec::new();
+    if let Some(table) = table {
+        for item in table.sequence_values::<Table>() {
+            let item = item?;
+            let short = item
+                .get::<Option<String>>("short")?
+                .map(|short| {
+                    let mut chars = short.chars();
+                    match (chars.next(), chars.next()) {
+                        (Some(value), None) => Ok(value),
+                        _ => Err(mlua::Error::runtime(
+                            "remuda.cli.parse option short must be one character",
+                        )),
+                    }
+                })
+                .transpose()?;
+            options.push(crate::cli_parse::OptionSpec {
+                long: item.get("long")?,
+                short,
+                value: item.get("value")?,
+                help: item.get("help")?,
+                global: item.get::<Option<bool>>("global")?.unwrap_or(false),
+            });
+        }
+    }
+    Ok(options)
+}
+
+fn json_value_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<Value> {
+    Ok(match value {
+        serde_json::Value::Null => Value::Nil,
+        serde_json::Value::Bool(value) => Value::Boolean(*value),
+        serde_json::Value::Number(value) => match value.as_i64() {
+            Some(value) => Value::Integer(value),
+            None => Value::Number(value.as_f64().unwrap_or_default()),
+        },
+        serde_json::Value::String(value) => Value::String(lua.create_string(value)?),
+        serde_json::Value::Array(items) => {
+            let table = lua.create_table()?;
+            for (index, item) in items.iter().enumerate() {
+                table.raw_set(index + 1, json_value_to_lua(lua, item)?)?;
+            }
+            Value::Table(table)
+        }
+        serde_json::Value::Object(items) => {
+            let table = lua.create_table()?;
+            for (key, item) in items {
+                table.set(key.as_str(), json_value_to_lua(lua, item)?)?;
+            }
+            Value::Table(table)
+        }
+    })
 }
 
 /// Run source text **in the daemon's image**, the same as `run` but for a
@@ -1729,13 +2016,167 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
 
 #[cfg(test)]
 mod binding_tests {
-    use super::{fs_bindings, lua_steps_to_wire, BINDINGS};
-    use mlua::Lua;
+    use super::{cli_parse_bindings, cli_spec_from_lua, fs_bindings, lua_steps_to_wire, BINDINGS};
+    use mlua::{Lua, Table};
     use remuda_core::protocol::Step;
 
     #[test]
     fn binding_names_are_sorted_and_unique() {
         assert!(BINDINGS.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    fn rejects_cli_spec(spec: &str) {
+        let lua = Lua::new();
+        let table = lua.load(spec).eval::<Table>().unwrap();
+        let error = cli_spec_from_lua(table).unwrap_err();
+        assert!(error.to_string().contains("remuda.cli.parse"), "{error}");
+    }
+
+    fn install_cli_binding(lua: &Lua) {
+        let remuda = lua.create_table().unwrap();
+        remuda.set("cli", cli_parse_bindings(lua).unwrap()).unwrap();
+        lua.globals().set("remuda", remuda).unwrap();
+    }
+
+    fn rejects_cli_argv(argv: &str) {
+        let lua = Lua::new();
+        install_cli_binding(&lua);
+        lua.globals()
+            .set("argv", lua.load(argv).eval::<Table>().unwrap())
+            .unwrap();
+        lua.load(
+            r#"
+            local spec = {name="remuda", verbs={go={next="remuda"}}}
+            local ok, err = pcall(remuda.cli.parse, spec, argv)
+            assert(not ok, tostring(err))
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn cli_spec_rejects_duplicate_option_ids() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="json",help="a"},{long="json",help="b"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_reserved_help_long() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="help",help="a"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_reserved_help_verb() {
+        rejects_cli_spec(r#"return {name="remuda", verbs={help={next="remuda"}}}"#);
+    }
+
+    #[test]
+    fn cli_spec_rejects_reserved_help_short() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="json",short="h",help="a"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_option_positional_id_collision() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="event-id",help="a"}}, verbs={go={next="remuda",args={{name="event-id",help="b"}}}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_empty_option_long() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="",help="a"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_equals_in_option_long() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="bad=name",help="a"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_non_last_multiple_positional() {
+        rejects_cli_spec(
+            r#"return {name="remuda", verbs={go={next="remuda",args={{name="BODY",help="a",multiple=true},{name="END",help="b"}}}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_duplicate_short_options() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="one",short="x",help="a"},{long="two",short="x",help="b"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_non_alphanumeric_short_options() {
+        rejects_cli_spec(
+            r#"return {name="remuda", options={{long="one",short="!",help="a"}}, verbs={go={next="remuda"}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_spec_rejects_bad_verb_tokens() {
+        rejects_cli_spec(r#"return {name="remuda", verbs={ ["bad name"]={next="remuda"} }}"#);
+    }
+
+    #[test]
+    fn cli_spec_sorts_verb_names() {
+        let lua = Lua::new();
+        let table: Table = lua
+            .load(r#"return {name="remuda", verbs={zeta={next="remuda"},alpha={next="remuda"}}}"#)
+            .eval()
+            .unwrap();
+        let spec = cli_spec_from_lua(table).unwrap();
+        let names = spec
+            .verbs
+            .iter()
+            .map(|verb| verb.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn cli_parse_accepts_nul_in_argv_values() {
+        let lua = Lua::new();
+        install_cli_binding(&lua);
+        lua.load(
+            r#"
+            local spec = {name="remuda", verbs={send={next="remuda",args={{name="TEXT",help="text"}}}}}
+            local result = remuda.cli.parse(spec, {"send", "left\0right"})
+            assert(result.ok and result.values.TEXT == "left\0right")
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn cli_parse_rejects_non_string_argv_entries() {
+        let lua = Lua::new();
+        install_cli_binding(&lua);
+        lua.load(
+            r#"
+            local spec = {name="remuda", verbs={go={next="remuda"}}}
+            local ok, err = pcall(remuda.cli.parse, spec, {"go", 7})
+            assert(not ok, tostring(err))
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn cli_parse_rejects_argv_tables_with_holes() {
+        rejects_cli_argv(r#"return {[1]="go", [3]="later"}"#);
     }
 
     #[cfg(unix)]
