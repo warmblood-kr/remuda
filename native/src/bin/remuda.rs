@@ -156,6 +156,7 @@ fn run_cli(args: Vec<String>) -> ExitCode {
         // Not part of the user-facing set: this is what the auto-start spawns.
         ["daemon"] => match daemon::serve_with_runtime(&path, &daemon::runtime_dir()) {
             Ok(()) => ExitCode::SUCCESS,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => fail(e),
             Err(e) => fail(format!("daemon: {e}")),
         },
 
@@ -1145,6 +1146,7 @@ fn cluster_listen_off(server: &str, path: &Path) -> ExitCode {
             println!("Next: run `remuda cluster invite` when you are ready to admit a peer.");
             ExitCode::SUCCESS
         }
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => fail(error),
         Err(error) => fail(format!(
             "cannot connect to remuda daemon at {}: {error}; refusing to start a second daemon\nNext: check `remuda cluster` and try `remuda cluster listen --off` again.",
             path.display()
@@ -4344,9 +4346,15 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     let force = cli_flag(&values, "force");
     let yes = cli_flag(&values, "yes");
     let inside_override = cli_flag(&values, "i-am-inside");
-    if remuda_native::ipc::connect(path).is_err() {
-        eprintln!("remuda: no daemon running for {server:?} — a state-creating command starts one");
-        return ExitCode::SUCCESS;
+    match remuda_native::ipc::connect(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => return fail(error),
+        Err(_) => {
+            eprintln!(
+                "remuda: no daemon running for {server:?} — a state-creating command starts one"
+            );
+            return ExitCode::SUCCESS;
+        }
     }
     if !yes && !force && has_sessions(path) {
         if let Err(refusal) = confirm_losses(path) {
@@ -4845,7 +4853,7 @@ fn with_existing_daemon(server: &str, path: &Path, f: impl Fn(&Path) -> ExitCode
     match remuda_native::ipc::connect(path) {
         Ok(_) => f(path),
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-            fail(format!("cannot use {}: {error}", path.display()))
+            fail(error)
         }
         Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => fail(format!(
             "no daemon running for {server:?} (socket {}); start one with remuda run ... or remuda -e ...",
@@ -4876,9 +4884,7 @@ fn ensure_daemon(server: &str, path: &Path) -> Result<(), String> {
             start_daemon(server, path)
         }
         // A path the transport cannot even name proves nothing about a daemon.
-        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
-            Err(format!("cannot use {}: {error}", path.display()))
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Err(error.to_string()),
         Err(error) => Err(format!(
             "cannot connect to remuda daemon at {}: {error}; refusing to start a second daemon",
             path.display()
