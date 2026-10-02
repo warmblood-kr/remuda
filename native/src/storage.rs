@@ -306,6 +306,8 @@ type FileRoots = BTreeMap<&'static str, PathBuf>;
 const ATOMIC_TEMP_PREFIX: &str = ".remuda-atomic-";
 const MAX_STORAGE_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_STORAGE_FILES: usize = 1024;
+const MAX_STORAGE_ENTRIES: usize = 1024;
+const MAX_STORAGE_PARTS: usize = 8;
 
 struct FileLocation {
     #[cfg(unix)]
@@ -320,6 +322,23 @@ fn io_denied() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "unsafe storage path")
 }
 
+#[cfg(not(unix))]
+fn reject_path_case_clash(parent: &Path, wanted: &str) -> io::Result<()> {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name();
+        name.to_str()
+            .is_some_and(|name| name != wanted && name.eq_ignore_ascii_case(wanted))
+    }) {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "case clash"));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn c_name(name: &str) -> io::Result<CString> {
     CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))
@@ -327,6 +346,8 @@ fn c_name(name: &str) -> io::Result<CString> {
 
 #[cfg(unix)]
 fn directory_names(directory: &fs::File) -> io::Result<Vec<String>> {
+    #[cfg(test)]
+    DIRECTORY_ENUMERATIONS.with(|count| count.set(count.get() + 1));
     let dot = c_name(".")?;
     let fd = unsafe {
         libc::openat(
@@ -360,8 +381,24 @@ fn directory_names(directory: &fs::File) -> io::Result<Vec<String>> {
     Ok(names)
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    static DIRECTORY_ENUMERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(unix)]
+fn reject_case_clash(directory: &fs::File, wanted: &str) -> io::Result<()> {
+    if case_clashes(&directory_names(directory)?, wanted) {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "case clash"));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn open_directory_at(parent: &fs::File, name: &str, create: bool) -> io::Result<fs::File> {
+    if create {
+        reject_case_clash(parent, name)?;
+    }
     let name = c_name(name)?;
     if create {
         let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
@@ -432,6 +469,8 @@ fn entry_stat(directory: &fs::File, name: &str) -> io::Result<Option<libc::stat>
 fn collect_at(
     directory: &fs::File,
     prefix: &str,
+    wanted_prefix: &str,
+    parts: usize,
     names: &mut Vec<String>,
     limit: usize,
 ) -> io::Result<()> {
@@ -447,14 +486,19 @@ fn collect_at(
         } else {
             format!("{prefix}/{name}")
         };
+        if checked_name(&relative).is_err() {
+            continue;
+        }
         let Some(stat) = entry_stat(directory, &name)? else {
             continue;
         };
         let kind = stat.st_mode & libc::S_IFMT;
-        if kind == libc::S_IFDIR {
+        let may_match = relative.starts_with(wanted_prefix)
+            || wanted_prefix.starts_with(&format!("{relative}/"));
+        if kind == libc::S_IFDIR && parts < MAX_STORAGE_PARTS && may_match {
             let child = open_directory_at(directory, &name, false)?;
-            collect_at(&child, &relative, names, limit)?;
-        } else if kind == libc::S_IFREG {
+            collect_at(&child, &relative, wanted_prefix, parts + 1, names, limit)?;
+        } else if kind == libc::S_IFREG && relative.starts_with(wanted_prefix) {
             names.push(relative);
         }
     }
@@ -651,21 +695,27 @@ fn delete_location(location: &FileLocation) -> io::Result<bool> {
     }
 }
 
-fn list_location(location: &FileLocation, limit: usize) -> io::Result<Vec<String>> {
+fn list_location(location: &FileLocation, prefix: &str, limit: usize) -> io::Result<Vec<String>> {
     #[cfg(unix)]
     {
         let mut names = Vec::new();
-        collect_at(&location.directory, "", &mut names, limit)?;
+        collect_at(&location.directory, "", prefix, 0, &mut names, limit)?;
         names.sort();
         Ok(names)
     }
     #[cfg(not(unix))]
     {
-        let mut names = collect_files_if_present(&location.path)?;
-        names.truncate(limit);
+        let mut names = collect_files_matching(&location.path, prefix, limit)?;
         names.sort();
         Ok(names)
     }
+}
+
+fn select_list_names(mut names: Vec<String>, prefix: &str, limit: usize) -> Vec<String> {
+    names.retain(|name| name.starts_with(prefix));
+    names.truncate(limit);
+    names.sort();
+    names
 }
 
 fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
@@ -696,6 +746,7 @@ fn collect_files(
     dir: &std::path::Path,
     prefix: &str,
     names: &mut Vec<String>,
+    limit: usize,
 ) -> io::Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -707,7 +758,7 @@ fn collect_files(
         let path = entry.path();
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            collect_files(base, &path, prefix, names)?;
+            collect_files(base, &path, prefix, names, limit)?;
         } else if kind.is_file()
             && !path
                 .file_name()
@@ -715,7 +766,7 @@ fn collect_files(
                 .is_some_and(|name| name.starts_with(ATOMIC_TEMP_PREFIX))
         {
             if let Some(name) = path.strip_prefix(base).ok().and_then(lua_relative_name) {
-                if name.starts_with(prefix) {
+                if name.starts_with(prefix) && checked_name(&name).is_ok() && names.len() < limit {
                     names.push(name);
                 }
             }
@@ -726,8 +777,13 @@ fn collect_files(
 
 #[cfg(any(not(unix), test))]
 fn collect_files_if_present(base: &Path) -> io::Result<Vec<String>> {
+    collect_files_matching(base, "", MAX_STORAGE_ENTRIES)
+}
+
+#[cfg(any(not(unix), test))]
+fn collect_files_matching(base: &Path, prefix: &str, limit: usize) -> io::Result<Vec<String>> {
     let mut names = Vec::new();
-    collect_files(base, base, "", &mut names)?;
+    collect_files(base, base, prefix, &mut names, limit)?;
     Ok(names)
 }
 
@@ -826,7 +882,19 @@ impl KindHandle {
         #[cfg(not(unix))]
         {
             // Windows keeps the plain path implementation; no-follow directory handles are Unix-only.
-            let _ = create;
+            let mut parent = root.clone();
+            let name_parts = name.split('/').collect::<Vec<_>>();
+            for component in ["storage", self.namespace.as_str()].into_iter().chain(
+                name_parts
+                    .iter()
+                    .take(name_parts.len().saturating_sub(1))
+                    .copied(),
+            ) {
+                if create {
+                    reject_path_case_clash(&parent, component)?;
+                }
+                parent.push(component);
+            }
             Ok(FileLocation {
                 path: root.join("storage").join(&self.namespace).join(name),
             })
@@ -902,7 +970,7 @@ impl KindHandle {
             let namespace = self
                 .file_path("", false)
                 .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
-            let entries = list_location(&namespace, usize::MAX)
+            let entries = list_location(&namespace, "", usize::MAX)
                 .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
             if case_clashes(&entries, &key.2) {
                 return Err(mlua::Error::runtime("remuda.storage name collides by case"));
@@ -1013,11 +1081,13 @@ impl KindHandle {
                 }
                 Err(error) => return Err(mlua::Error::runtime(storage_io_error(error))),
             };
-            let mut names = list_location(&location, usize::MAX)
+            let names = list_location(&location, &prefix, MAX_STORAGE_ENTRIES)
                 .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
-            names.retain(|name| name.starts_with(&prefix));
-            names.sort();
-            return lua.create_sequence_from(names);
+            return lua.create_sequence_from(select_list_names(
+                names,
+                &prefix,
+                MAX_STORAGE_ENTRIES,
+            ));
         }
         let names = self
             .files
@@ -1030,6 +1100,7 @@ impl KindHandle {
                     && name.starts_with(&prefix)
             })
             .map(|(_, _, name)| name.clone())
+            .take(MAX_STORAGE_ENTRIES)
             .collect::<Vec<_>>();
         lua.create_sequence_from(names)
     }
@@ -1084,6 +1155,7 @@ impl UserData for SecretHandle {
 
 fn checked_name(name: &str) -> mlua::Result<String> {
     let invalid = name.is_empty()
+        || name.split('/').count() > MAX_STORAGE_PARTS
         || name.starts_with('/')
         || name.contains('\\')
         || name.as_bytes().get(1) == Some(&b':') && name.as_bytes()[0].is_ascii_alphabetic()
@@ -1346,6 +1418,32 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn xdg_noncreating_operations_only_enumerate_list_contents() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load("remuda.storage.get('enumeration'):data():write('key', 'value')")
+            .exec()
+            .unwrap();
+        DIRECTORY_ENUMERATIONS.with(|count| count.set(0));
+
+        lua.load(
+            r#"
+            local files = remuda.storage.get('enumeration'):data()
+            assert(files:read('key') == 'value')
+            assert(files:exists('key'))
+            assert(files:delete('key'))
+            assert(#files:list() == 0)
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        DIRECTORY_ENUMERATIONS.with(|count| assert_eq!(count.get(), 1));
+    }
+
     #[test]
     fn xdg_secret_operations_stay_unavailable_without_creating_files() {
         let root = TestRoot::new();
@@ -1525,6 +1623,80 @@ mod tests {
             fs::metadata(file).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn xdg_rejects_case_clashes_in_directory_components() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"
+            local files = remuda.storage.get("case"):data()
+            files:write("Mail/a", "a")
+            assert(not pcall(function() files:write("mail/b", "b") end))
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn xdg_rejects_more_than_eight_name_parts() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"assert(not pcall(function() remuda.storage.get("parts"):data():write("a/b/c/d/e/f/g/h/i", "x") end))"#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_list_caps_entries_at_1024() {
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/listed");
+        fs::create_dir_all(&namespace).unwrap();
+        for index in 0..1025 {
+            fs::write(namespace.join(format!("entry{index}")), b"x").unwrap();
+        }
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        let count: usize = lua
+            .load(r#"return #remuda.storage.get("listed"):data():list()"#)
+            .eval()
+            .unwrap();
+        assert!(count <= 1024);
+    }
+
+    #[test]
+    fn list_prefix_matches_are_not_hidden_by_unrelated_entries() {
+        let names = (0..MAX_STORAGE_ENTRIES)
+            .map(|index| format!("elsewhere{index}"))
+            .chain(std::iter::once("wanted/item".to_owned()))
+            .collect();
+        assert_eq!(
+            select_list_names(names, "wanted/", MAX_STORAGE_ENTRIES),
+            ["wanted/item"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_list_never_returns_names_rejected_by_the_api() {
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/listed");
+        fs::create_dir_all(&namespace).unwrap();
+        fs::write(namespace.join("CON"), b"x").unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        let names: Vec<String> = lua
+            .load(r#"return remuda.storage.get("listed"):data():list()"#)
+            .eval()
+            .unwrap();
+        assert!(names.iter().all(|name| checked_name(name).is_ok()));
     }
 
     fn run_handle_conformance(lua: &Lua, backend: &str) {
