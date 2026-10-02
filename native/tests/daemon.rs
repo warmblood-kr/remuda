@@ -24,6 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PATIENCE: Duration = Duration::from_secs(10);
+const EMPTY_SCREEN_STARTUP_PATIENCE: Duration = Duration::from_secs(30);
 #[cfg(unix)]
 const STALL_FLOOD_CHUNK_BYTES: usize = 4 * 1024;
 #[cfg(unix)]
@@ -3097,11 +3098,16 @@ fn capture_styled_snapshot(path: &Path, name: &str, scrollback: usize) -> (Strin
 }
 
 fn wait_for(path: &Path, name: &str, needle: &str) -> String {
-    let deadline = Instant::now() + PATIENCE;
+    let mut deadline = Instant::now() + EMPTY_SCREEN_STARTUP_PATIENCE;
+    let mut saw_output = false;
     loop {
         let screen = capture(path, name);
         if screen.contains(needle) {
             return screen;
+        }
+        if !saw_output && !screen.trim().is_empty() {
+            saw_output = true;
+            deadline = Instant::now() + PATIENCE;
         }
         assert!(
             Instant::now() < deadline,
