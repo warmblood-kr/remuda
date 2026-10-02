@@ -1658,4 +1658,43 @@ mod tests {
         assert_eq!(lua.globals().get::<i64>("calls").unwrap(), 1);
         assert_eq!(super::eval(&lua, "x = 1", None).unwrap(), "");
     }
+
+    // ConPTY can hold a dead session's output pipe open, so its monitor never
+    // reports the end. `remuda.ls()` reaps on the image thread itself, and a
+    // wait there with no bound parks every later Eval — the TUI's included.
+    #[test]
+    fn ls_returns_when_a_dead_sessions_output_monitor_never_finishes() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let registry = Arc::new(remuda_core::Registry::new());
+        let mut agent = remuda_core::ScriptedAgent::new(Vec::new());
+        agent.kill();
+        let session = registry
+            .register(remuda_core::Session::new(
+                "stuck",
+                Box::new(agent),
+                Arc::new(remuda_core::ManualClock::default()),
+            ))
+            .unwrap_or_else(|_| panic!("the name is free"));
+        let socket =
+            std::env::temp_dir().join(format!("unused-ls-monitor-image-{}", std::process::id()));
+        let image = super::Image::spawn(
+            &socket,
+            Arc::clone(&registry),
+            Arc::new(crate::tick::Counters::default()),
+        );
+        // Registered, and never finished: no monitor thread is behind it.
+        let _monitor = image.session_output_notifier("stuck", session.id());
+
+        let listed = image
+            .submit("return #remuda.ls()", None)
+            .unwrap()
+            .recv_timeout(Duration::from_secs(5))
+            .expect(
+                "remuda.ls() parked the image thread behind an output monitor that never finished",
+            );
+        assert_eq!(listed.unwrap(), "0", "the dead session is reaped");
+        image.stop_for_test();
+    }
 }
