@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `remuda.storage.set_default("xdg")` selects a file backend for config, data, state and cache blobs under `REMUDA_STORAGE_ROOT` or the platform storage directories; secrets stay unavailable there.
 - Memory storage rejects unsafe names, case-fold collisions and writes over 1 MiB or 1024 entries per namespace and kind.
 - `remuda send` now exits 75 when session input is busy and 74 when the PTY
   write times out (was 1); both messages include a `Next:` line (see #269).
