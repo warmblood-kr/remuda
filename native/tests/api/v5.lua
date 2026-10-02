@@ -166,17 +166,23 @@ assert(session.close(name) == nil, "session.close must preserve close's return v
 
 -- Styled capture exposes the cursor and dim spans needed by caller-owned
 -- prompt interpretation without adding agent-specific policy to core.
-local capture_name = "api-v5-capture-" .. tostring(os.time())
+assert(type(remuda._api_v5_test_pid) == "number",
+  "the v5 test must provide a unique session-name suffix")
+local capture_name = "api-v5-capture-" .. tostring(remuda._api_v5_test_pid)
 session.new(capture_name, { "sh" })
-local screen = remuda.capture_styled(capture_name)
-assert(type(screen) == "table" and type(screen.rows) == "table",
-  "capture_styled must return rows")
-local cursor = screen.cursor
-assert(type(cursor) == "table", "capture_styled must return cursor metadata")
-assert(type(cursor.row) == "number" and type(cursor.col) == "number",
-  "cursor row and column must be numbers")
-assert(type(cursor.visible) == "boolean", "cursor visibility must be boolean")
-session.close(capture_name)
+local capture_ok, capture_error = pcall(function()
+  local screen = remuda.capture_styled(capture_name)
+  assert(type(screen) == "table" and type(screen.rows) == "table",
+    "capture_styled must return rows")
+  local cursor = screen.cursor
+  assert(type(cursor) == "table", "capture_styled must return cursor metadata")
+  assert(type(cursor.row) == "number" and type(cursor.col) == "number",
+    "cursor row and column must be numbers")
+  assert(type(cursor.visible) == "boolean", "cursor visibility must be boolean")
+end)
+local close_ok, close_error = pcall(session.close, capture_name)
+if not capture_ok then error(capture_error, 0) end
+assert(close_ok, "session.close must not raise: " .. tostring(close_error))
 
 -- Flat spellings remain usable through API v5 while emitting suppressible
 -- deprecation notices for callers that have not migrated yet.

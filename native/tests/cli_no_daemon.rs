@@ -798,6 +798,11 @@ fn a_socket_path_over_sun_path_names_the_length_not_a_second_daemon() {
 
 #[test]
 fn stop_reports_a_blocked_socket_connect_error() {
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skip: directory permissions do not block root from connecting to the socket");
+        return;
+    }
+
     let dir = scratch("stop-blocked-socket");
     let socket = remuda_native::daemon::socket_path_in(&dir, "s");
     std::fs::create_dir_all(socket.parent().unwrap()).expect("create socket parent");
