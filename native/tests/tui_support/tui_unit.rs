@@ -3022,6 +3022,30 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
         ui.consecutive_transport_failures, 0,
         "busy refusal must not count"
     );
+
+    // Exercise the refresh path too. The endpoint is a regular file, so the
+    // real connect fails deterministically as a non-socket error (ENOTSOCK on
+    // macOS); after the synthetic busy refusal reset the counter, this single
+    // transport failure cannot mark the daemon gone.
+    let mut held = None;
+    let mut painted = String::new();
+    let mut shown = None;
+    refresh(
+        &socket,
+        "test",
+        &mut ui,
+        &mut held,
+        &mut painted,
+        &mut shown,
+        false,
+        false,
+    )
+    .expect("refresh handles a non-socket endpoint");
+    assert!(ui.daemon_gone.is_none());
+    assert!(
+        ui.consecutive_transport_failures <= 1,
+        "one non-socket transport error must not mark the daemon gone"
+    );
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
     assert!(socket_lock_is_free(&socket));
     assert!(
