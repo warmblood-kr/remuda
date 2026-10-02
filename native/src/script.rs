@@ -463,7 +463,15 @@ fn cli_parse_bindings(lua: &Lua) -> mlua::Result<Table> {
         lua.create_function(|lua, (spec_table, argv_table): (Table, Table)| {
             let spec = cli_spec_from_lua(spec_table)?;
             let argv = argv_table
-                .sequence_values::<String>()
+                .sequence_values::<mlua::Value>()
+                .enumerate()
+                .map(|(index, item)| match item? {
+                    mlua::Value::String(value) => Ok(value.to_str()?.to_owned()),
+                    _ => Err(mlua::Error::runtime(format!(
+                        "remuda.cli.parse argv[{}] must be a string",
+                        index + 1
+                    ))),
+                })
                 .collect::<mlua::Result<Vec<_>>>()?;
             let words = argv.iter().map(String::as_str).collect::<Vec<_>>();
             let report = crate::cli_parse::parse(&spec, &words);
@@ -1976,7 +1984,7 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
 
 #[cfg(test)]
 mod binding_tests {
-    use super::{cli_spec_from_lua, fs_bindings, lua_steps_to_wire, BINDINGS};
+    use super::{cli_parse_bindings, cli_spec_from_lua, fs_bindings, lua_steps_to_wire, BINDINGS};
     use mlua::{Lua, Table};
     use remuda_core::protocol::Step;
 
@@ -1990,6 +1998,12 @@ mod binding_tests {
         let table = lua.load(spec).eval::<Table>().unwrap();
         let error = cli_spec_from_lua(table).unwrap_err();
         assert!(error.to_string().contains("remuda.cli.parse"), "{error}");
+    }
+
+    fn install_cli_binding(lua: &Lua) {
+        let remuda = lua.create_table().unwrap();
+        remuda.set("cli", cli_parse_bindings(lua).unwrap()).unwrap();
+        lua.globals().set("remuda", remuda).unwrap();
     }
 
     #[test]
@@ -2039,6 +2053,36 @@ mod binding_tests {
         rejects_cli_spec(
             r#"return {name="remuda", verbs={go={next="remuda",args={{name="BODY",help="a",multiple=true},{name="END",help="b"}}}}}"#,
         );
+    }
+
+    #[test]
+    fn cli_parse_accepts_nul_in_argv_values() {
+        let lua = Lua::new();
+        install_cli_binding(&lua);
+        lua.load(
+            r#"
+            local spec = {name="remuda", verbs={send={next="remuda",args={{name="TEXT",help="text"}}}}}
+            local result = remuda.cli.parse(spec, {"send", "left\0right"})
+            assert(result.ok and result.values.TEXT == "left\0right")
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn cli_parse_rejects_non_string_argv_entries() {
+        let lua = Lua::new();
+        install_cli_binding(&lua);
+        lua.load(
+            r#"
+            local spec = {name="remuda", verbs={go={next="remuda"}}}
+            local ok, err = pcall(remuda.cli.parse, spec, {"go", 7})
+            assert(not ok, tostring(err))
+            "#,
+        )
+        .exec()
+        .unwrap();
     }
 
     #[cfg(unix)]
