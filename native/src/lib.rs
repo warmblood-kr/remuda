@@ -10,6 +10,7 @@ pub mod client;
 pub mod cluster;
 pub mod cluster_remote;
 pub mod cluster_tui;
+pub mod cmd_arguments;
 pub(crate) mod credential;
 pub mod daemon;
 pub mod dist;
