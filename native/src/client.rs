@@ -523,11 +523,17 @@ pub fn request_with_secret_prompts(path: &Path, request: &Request) -> std::io::R
         else {
             return Ok(response);
         };
-        match collect_secret_from_terminal(&label, timeout_ms)? {
+        match collect_secret_from_terminal(&stream, &label, timeout_ms)? {
             SecretPromptCollection::Answer(secret, refusal) => {
                 send_secret_answer(&stream, id, secret.as_ref(), refusal)?;
             }
             SecretPromptCollection::Deadline => {}
+            SecretPromptCollection::Disconnected => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "daemon connection closed while waiting for a secret prompt\nNext: restart the daemon and rerun the command.",
+                ));
+            }
         }
     }
 }
@@ -538,6 +544,7 @@ enum SecretPromptCollection {
         Option<remuda_core::protocol::SecretAnswerRefusal>,
     ),
     Deadline,
+    Disconnected,
 }
 
 enum LinePromptCollection {
@@ -550,6 +557,7 @@ enum LinePromptCollection {
 }
 
 fn collect_secret_from_terminal(
+    stream: &ipc::Stream,
     label: &str,
     timeout_ms: u64,
 ) -> std::io::Result<SecretPromptCollection> {
@@ -565,7 +573,12 @@ fn collect_secret_from_terminal(
     #[cfg(unix)]
     let signal_guard = SecretPromptSignalGuard::install()?;
     let mut expired = false;
+    let mut disconnected = false;
     let events = std::iter::from_fn(|| loop {
+        if prompt_peer_disconnected(stream) {
+            disconnected = true;
+            return None;
+        }
         #[cfg(unix)]
         if SECRET_PROMPT_SIGNAL.load(std::sync::atomic::Ordering::SeqCst) != 0 {
             return None;
@@ -599,6 +612,9 @@ fn collect_secret_from_terminal(
                 "secret prompt interrupted by signal",
             ));
         }
+    }
+    if disconnected || prompt_peer_disconnected(stream) {
+        return Ok(SecretPromptCollection::Disconnected);
     }
     if expired {
         Ok(SecretPromptCollection::Deadline)

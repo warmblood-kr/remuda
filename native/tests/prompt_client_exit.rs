@@ -51,12 +51,19 @@ fn prepare(dir: &Path) {
     fs::write(
         package.join("packages/prompt_exit/init.lua"),
         r#"remuda.extension_command("prompt_exit", function(args)
-  assert(args[1] == "wait")
+  assert(args[1] == "wait" or args[1] == "secret")
   local reply = remuda.pending { timeout = 30 }
-  reply:prompt_line { label = "wizard prompt", callback = function(value, err)
-    if err then reply:reject(tostring(err) .. "\nNext: rerun remuda prompt_exit")
-    else reply:resolve(0, "answer: " .. (value or ""), "") end
-  end }
+  if args[1] == "secret" then
+    reply:prompt_secret { label = "wizard prompt", callback = function(value, err)
+      if err then reply:reject(tostring(err) .. "\nNext: rerun remuda prompt_exit")
+      else reply:resolve(0, "answer: " .. (value or ""), "") end
+    end }
+  else
+    reply:prompt_line { label = "wizard prompt", callback = function(value, err)
+      if err then reply:reject(tostring(err) .. "\nNext: rerun remuda prompt_exit")
+      else reply:resolve(0, "answer: " .. (value or ""), "") end
+    end }
+  end
   return reply
 end)"#,
     )
@@ -132,9 +139,15 @@ struct PromptClient {
 }
 
 impl PromptClient {
-    fn spawn(dir: &Path) -> Self {
+    fn spawn(dir: &Path, prompt_kind: &str) -> Self {
         let mut master_fd = -1;
         let mut slave_fd = -1;
+        let mut window_size = libc::winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
         assert_eq!(
             unsafe {
                 libc::openpty(
@@ -142,7 +155,7 @@ impl PromptClient {
                     &mut slave_fd,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    std::ptr::null_mut(),
+                    &mut window_size,
                 )
             },
             0,
@@ -152,7 +165,7 @@ impl PromptClient {
         let slave_file = unsafe { fs::File::from_raw_fd(slave_fd) };
         let mut command = Command::new(env!("CARGO_BIN_EXE_remuda"));
         command
-            .args(["-s", "s", "prompt_exit", "wait"])
+            .args(["-s", "s", "prompt_exit", prompt_kind])
             .env("REMUDA_RUNTIME_DIR", dir.join("runtime"))
             .env("XDG_DATA_HOME", dir.join("data"))
             .env("XDG_CACHE_HOME", dir.join("cache"))
@@ -182,11 +195,17 @@ impl PromptClient {
         std::thread::spawn(move || {
             let mut buffer = [0; 1024];
             loop {
-                // Let terminal writers acquire the master mutex between polls.
-                std::thread::sleep(Duration::from_millis(1));
-                let mut guard = reader_master.lock().unwrap();
-                let Some(reader) = guard.as_mut() else {
-                    break;
+                // Clone while locked, then release the mutex before poll/read
+                // so terminal writers cannot be starved while the pty is quiet.
+                let mut reader = {
+                    let guard = reader_master.lock().unwrap();
+                    let Some(master) = guard.as_ref() else {
+                        break;
+                    };
+                    match master.try_clone() {
+                        Ok(reader) => reader,
+                        Err(_) => break,
+                    }
                 };
                 let mut poll_fd = libc::pollfd {
                     fd: reader.as_raw_fd(),
@@ -292,8 +311,8 @@ struct ClientResult {
     output: String,
 }
 
-fn waiting_prompt(dir: &Path) -> PromptClient {
-    let client = PromptClient::spawn(dir);
+fn waiting_prompt(dir: &Path, prompt_kind: &str) -> PromptClient {
+    let client = PromptClient::spawn(dir, prompt_kind);
     assert!(
         client.wait_for_prompt(),
         "prompt did not appear; client output: {}",
@@ -304,7 +323,7 @@ fn waiting_prompt(dir: &Path) -> PromptClient {
 
 fn answer_prompt(dir: &Path) -> ClientResult {
     let mut daemon = start_daemon(dir);
-    let mut client = waiting_prompt(dir);
+    let mut client = waiting_prompt(dir, "wait");
     client.write_terminal(b"answer\r");
     let result = ClientResult {
         status: client.wait(),
@@ -317,7 +336,21 @@ fn answer_prompt(dir: &Path) -> ClientResult {
 
 fn stop_daemon_with_prompt(dir: &Path) -> ClientResult {
     let mut daemon = start_daemon(dir);
-    let mut client = waiting_prompt(dir);
+    let mut client = waiting_prompt(dir, "wait");
+    daemon.stop(dir);
+    let result = ClientResult {
+        status: client.wait(),
+        output: client.captured_output(),
+    };
+    client.cleanup();
+    result
+}
+
+fn stop_daemon_with_secret_prompt(dir: &Path) -> ClientResult {
+    let mut daemon = start_daemon(dir);
+    let mut client = waiting_prompt(dir, "secret");
+    // SEC note: queued response data can make a disconnect peek look live
+    // until that data is read; the secret-prompt loop must check again after it.
     daemon.stop(dir);
     let result = ClientResult {
         status: client.wait(),
@@ -329,7 +362,7 @@ fn stop_daemon_with_prompt(dir: &Path) -> ClientResult {
 
 fn sigterm_with_prompt(dir: &Path) -> ClientResult {
     let mut daemon = start_daemon(dir);
-    let mut client = waiting_prompt(dir);
+    let mut client = waiting_prompt(dir, "wait");
     client.signal(libc::SIGTERM);
     let result = ClientResult {
         status: client.wait(),
@@ -342,7 +375,7 @@ fn sigterm_with_prompt(dir: &Path) -> ClientResult {
 
 fn close_terminal_with_daemon_stop(dir: &Path) -> ClientResult {
     let mut daemon = start_daemon(dir);
-    let mut client = waiting_prompt(dir);
+    let mut client = waiting_prompt(dir, "wait");
     client.close_terminal();
     daemon.stop(dir);
     let result = ClientResult {
@@ -355,7 +388,7 @@ fn close_terminal_with_daemon_stop(dir: &Path) -> ClientResult {
 
 fn close_terminal_with_sigterm(dir: &Path) -> ClientResult {
     let mut daemon = start_daemon(dir);
-    let mut client = waiting_prompt(dir);
+    let mut client = waiting_prompt(dir, "wait");
     client.close_terminal();
     client.signal(libc::SIGTERM);
     let result = ClientResult {
@@ -428,5 +461,37 @@ fn prompt_client_exits_when_daemon_or_terminal_disappears_and_on_sigterm() {
             .is_some_and(|status| !status.success()),
         "closed pty master plus SIGTERM left client alive past {WAIT:?}; client output: {}",
         terminal_gone_sigterm.output
+    );
+}
+
+#[test]
+fn secret_prompt_client_exits_when_daemon_stops() {
+    let dir = scratch_dir();
+    prepare(&dir);
+    let daemon_stop = stop_daemon_with_secret_prompt(&dir);
+
+    assert!(
+        daemon_stop.status.is_some_and(|status| !status.success()),
+        "daemon stop did not end the secret-prompt client with a non-zero status: {:?}; client output: {}",
+        daemon_stop.status,
+        daemon_stop.output
+    );
+    assert_eq!(
+        daemon_stop
+            .output
+            .matches("daemon connection closed while waiting for a secret prompt")
+            .count(),
+        1,
+        "expected one secret-prompt disconnect line; client output: {}",
+        daemon_stop.output
+    );
+    assert_eq!(
+        daemon_stop
+            .output
+            .matches("Next: restart the daemon")
+            .count(),
+        1,
+        "expected one Next: line; client output: {}",
+        daemon_stop.output
     );
 }
