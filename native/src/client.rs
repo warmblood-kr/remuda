@@ -1872,8 +1872,15 @@ fn truncate_secret_prompt_label(label: &str, max_columns: usize) -> String {
 
     let marker = "…";
     let caller_width = max_columns.saturating_sub(tag_width + 1);
-    let caller_label = truncate_terminal_text(caller_label, caller_width);
-    format!("{tag}{caller_label}{marker}")
+    let mut clipped = String::new();
+    for character in caller_label.chars() {
+        clipped.push(character);
+        if UnicodeWidthStr::width(clipped.as_str()) > caller_width {
+            clipped.pop();
+            break;
+        }
+    }
+    format!("{tag}{clipped}{marker}")
 }
 
 fn history_metadata(path: &Path, name: &str) -> Option<(usize, usize)> {
