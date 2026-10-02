@@ -156,7 +156,7 @@ pub(crate) fn bindings(lua: &Lua) -> mlua::Result<Table> {
     storage.set(
         "get",
         lua.create_function(move |lua, namespace: String| {
-            let namespace = checked_name(&namespace)?;
+            let namespace = checked_namespace(&namespace)?;
             lua.create_userdata(StorageView {
                 namespace,
                 files: get_files.clone(),
@@ -286,10 +286,33 @@ impl KindHandle {
     }
 
     fn write(&self, name: String, bytes: &[u8]) -> mlua::Result<()> {
-        self.files
+        if bytes.len() > 1024 * 1024 {
+            return Err(mlua::Error::runtime("remuda.storage write exceeds 1 MiB"));
+        }
+        let key = self.key(name)?;
+        let mut files = self
+            .files
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(self.key(name)?, bytes.to_vec());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let folded = key.2.to_ascii_lowercase();
+        if files.keys().any(|(namespace, kind, name)| {
+            namespace == &key.0
+                && kind == &key.1
+                && name != &key.2
+                && name.to_ascii_lowercase() == folded
+        }) {
+            return Err(mlua::Error::runtime("remuda.storage name collides by case"));
+        }
+        if !files.contains_key(&key)
+            && files
+                .keys()
+                .filter(|(namespace, kind, _)| namespace == &key.0 && kind == &key.1)
+                .count()
+                >= 1024
+        {
+            return Err(mlua::Error::runtime("remuda.storage entry limit reached"));
+        }
+        files.insert(key, bytes.to_vec());
         Ok(())
     }
 
@@ -378,11 +401,45 @@ fn checked_name(name: &str) -> mlua::Result<String> {
         || name.contains('\\')
         || name.as_bytes().get(1) == Some(&b':') && name.as_bytes()[0].is_ascii_alphabetic()
         || name.split('/').any(|part| {
+            let device = part
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_uppercase();
             part.is_empty()
                 || part == "."
                 || part == ".."
                 || part.len() > 255
                 || !part.bytes().all(|byte| byte.is_ascii_graphic())
+                || part
+                    .bytes()
+                    .any(|byte| matches!(byte, b':' | b'*' | b'?' | b'<' | b'>' | b'|' | b'"'))
+                || part.ends_with('.')
+                || matches!(
+                    device.as_str(),
+                    "CON"
+                        | "PRN"
+                        | "AUX"
+                        | "NUL"
+                        | "COM1"
+                        | "COM2"
+                        | "COM3"
+                        | "COM4"
+                        | "COM5"
+                        | "COM6"
+                        | "COM7"
+                        | "COM8"
+                        | "COM9"
+                        | "LPT1"
+                        | "LPT2"
+                        | "LPT3"
+                        | "LPT4"
+                        | "LPT5"
+                        | "LPT6"
+                        | "LPT7"
+                        | "LPT8"
+                        | "LPT9"
+                )
         });
     if invalid {
         return Err(mlua::Error::runtime(
@@ -390,6 +447,13 @@ fn checked_name(name: &str) -> mlua::Result<String> {
         ));
     }
     Ok(name.into())
+}
+
+fn checked_namespace(namespace: &str) -> mlua::Result<String> {
+    if namespace.contains('/') {
+        return Err(mlua::Error::runtime("remuda.storage invalid namespace"));
+    }
+    checked_name(namespace)
 }
 
 fn checked_prefix(prefix: String) -> mlua::Result<String> {
@@ -474,6 +538,47 @@ mod tests {
             assert(b:read("mail/a.bin") == nil and state:read("mail/a.bin") == nil); local missing, reason = a:read("missing"); assert(missing == nil and reason == "not_found")
             a:write("mail/b.bin", "b"); local names = a:list("mail/"); assert(#names == 2 and names[1] == "mail/a.bin" and names[2] == "mail/b.bin")
             assert(a:delete("mail/a.bin") and not a:exists("mail/a.bin"))
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn memory_handles_reject_unsafe_names_and_namespace_aliases() {
+        let lua = lua_with_storage();
+        lua.load(
+            r#"
+            local s = remuda.storage
+            for _, namespace in ipairs({"", ".", "..", "a/b", "a\\b"}) do
+                assert(not pcall(function() s.get(namespace) end))
+            end
+            local files = s.get("safe"):data()
+            for _, name in ipairs({"colon:name", "star*name", "question?name", "less<name", "greater>name", "pipe|name", 'quote"name', "trail.", "trail ", "CON", "prn", "AUX.txt", "nul.txt", "COM1", "com9.log", "LPT1", "lpt9.log"}) do
+                assert(not pcall(function() files:write(name, "x") end), name)
+            end
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn memory_writes_enforce_folded_names_and_size_limits_without_echoing_input() {
+        let lua = lua_with_storage();
+        lua.load(
+            r#"
+            local files = remuda.storage.get("safe"):data()
+            files:write("token", "x")
+            local ok, err = pcall(function() files:write("Token", "x") end)
+            assert(not ok and not tostring(err):find("Token", 1, true))
+            local payload = string.rep("s", 1024 * 1024 + 1)
+            ok, err = pcall(function() files:write("large", payload) end)
+            assert(not ok and not tostring(err):find(payload, 1, true) and not tostring(err):find("large", 1, true))
+            local limited = remuda.storage.get("limit"):data()
+            for i = 1, 1024 do limited:write("entry" .. i, "x") end
+            ok, err = pcall(function() limited:write("overflow", "secret-bytes") end)
+            assert(not ok and not tostring(err):find("overflow", 1, true) and not tostring(err):find("secret-bytes", 1, true))
             "#,
         )
         .exec()
