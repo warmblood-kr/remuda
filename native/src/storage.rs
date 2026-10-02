@@ -306,6 +306,8 @@ type FileRoots = BTreeMap<&'static str, PathBuf>;
 const ATOMIC_TEMP_PREFIX: &str = ".remuda-atomic-";
 const MAX_STORAGE_VALUE_BYTES: usize = 1024 * 1024;
 const MAX_STORAGE_FILES: usize = 1024;
+const MAX_STORAGE_ENTRIES: usize = 1024;
+const MAX_STORAGE_PARTS: usize = 8;
 
 struct FileLocation {
     #[cfg(unix)]
@@ -318,6 +320,23 @@ struct FileLocation {
 
 fn io_denied() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "unsafe storage path")
+}
+
+#[cfg(not(unix))]
+fn reject_path_case_clash(parent: &Path, wanted: &str) -> io::Result<()> {
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if entries.filter_map(Result::ok).any(|entry| {
+        let name = entry.file_name();
+        name.to_str()
+            .is_some_and(|name| name != wanted && name.eq_ignore_ascii_case(wanted))
+    }) {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "case clash"));
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -362,6 +381,7 @@ fn directory_names(directory: &fs::File) -> io::Result<Vec<String>> {
 
 #[cfg(unix)]
 fn open_directory_at(parent: &fs::File, name: &str, create: bool) -> io::Result<fs::File> {
+    reject_case_clash(parent, name)?;
     let name = c_name(name)?;
     if create {
         let result = unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) };
@@ -432,6 +452,7 @@ fn entry_stat(directory: &fs::File, name: &str) -> io::Result<Option<libc::stat>
 fn collect_at(
     directory: &fs::File,
     prefix: &str,
+    parts: usize,
     names: &mut Vec<String>,
     limit: usize,
 ) -> io::Result<()> {
@@ -447,13 +468,16 @@ fn collect_at(
         } else {
             format!("{prefix}/{name}")
         };
+        if checked_name(&relative).is_err() {
+            continue;
+        }
         let Some(stat) = entry_stat(directory, &name)? else {
             continue;
         };
         let kind = stat.st_mode & libc::S_IFMT;
-        if kind == libc::S_IFDIR {
+        if kind == libc::S_IFDIR && parts < MAX_STORAGE_PARTS {
             let child = open_directory_at(directory, &name, false)?;
-            collect_at(&child, &relative, names, limit)?;
+            collect_at(&child, &relative, parts + 1, names, limit)?;
         } else if kind == libc::S_IFREG {
             names.push(relative);
         }
@@ -655,7 +679,7 @@ fn list_location(location: &FileLocation, limit: usize) -> io::Result<Vec<String
     #[cfg(unix)]
     {
         let mut names = Vec::new();
-        collect_at(&location.directory, "", &mut names, limit)?;
+        collect_at(&location.directory, "", 0, &mut names, limit)?;
         names.sort();
         Ok(names)
     }
@@ -715,7 +739,10 @@ fn collect_files(
                 .is_some_and(|name| name.starts_with(ATOMIC_TEMP_PREFIX))
         {
             if let Some(name) = path.strip_prefix(base).ok().and_then(lua_relative_name) {
-                if name.starts_with(prefix) {
+                if name.starts_with(prefix)
+                    && checked_name(&name).is_ok()
+                    && names.len() < MAX_STORAGE_ENTRIES
+                {
                     names.push(name);
                 }
             }
@@ -827,6 +854,17 @@ impl KindHandle {
         {
             // Windows keeps the plain path implementation; no-follow directory handles are Unix-only.
             let _ = create;
+            let mut parent = root.clone();
+            let name_parts = name.split('/').collect::<Vec<_>>();
+            for component in ["storage", self.namespace.as_str()].into_iter().chain(
+                name_parts
+                    .iter()
+                    .take(name_parts.len().saturating_sub(1))
+                    .copied(),
+            ) {
+                reject_path_case_clash(&parent, component)?;
+                parent.push(component);
+            }
             Ok(FileLocation {
                 path: root.join("storage").join(&self.namespace).join(name),
             })
@@ -1013,7 +1051,7 @@ impl KindHandle {
                 }
                 Err(error) => return Err(mlua::Error::runtime(storage_io_error(error))),
             };
-            let mut names = list_location(&location, usize::MAX)
+            let mut names = list_location(&location, MAX_STORAGE_ENTRIES)
                 .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
             names.retain(|name| name.starts_with(&prefix));
             names.sort();
@@ -1030,6 +1068,7 @@ impl KindHandle {
                     && name.starts_with(&prefix)
             })
             .map(|(_, _, name)| name.clone())
+            .take(MAX_STORAGE_ENTRIES)
             .collect::<Vec<_>>();
         lua.create_sequence_from(names)
     }
@@ -1084,6 +1123,7 @@ impl UserData for SecretHandle {
 
 fn checked_name(name: &str) -> mlua::Result<String> {
     let invalid = name.is_empty()
+        || name.split('/').count() > MAX_STORAGE_PARTS
         || name.starts_with('/')
         || name.contains('\\')
         || name.as_bytes().get(1) == Some(&b':') && name.as_bytes()[0].is_ascii_alphabetic()
