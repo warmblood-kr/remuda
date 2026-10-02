@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Windows now resolves `init.lua` and REPL history through the Config and State
+  directories instead of `HOME`. Git Bash users relying on existing
+  `$HOME/.config/remuda/init.lua` or
+  `$HOME/.local/state/remuda/repl-history` files must move them to
+  `%LOCALAPPDATA%\remuda\config\init.lua` and
+  `%LOCALAPPDATA%\remuda\state\repl-history`, or set absolute XDG paths; the
+  old files are not migrated.
 - Fixed remote input batches refused after a late-submit abandonment: callers
   now get a retryable busy response because the bytes were not written (see
   #428).

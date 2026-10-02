@@ -117,6 +117,18 @@ pub(crate) fn resolve_dir_for(kind: &str, windows: bool, env: Env<'_>) -> Result
     Ok(dir)
 }
 
+/// Resolve a named Remuda user file below its per-kind storage directory.
+pub(crate) fn user_file_path_for(
+    kind: Kind,
+    file: &str,
+    windows: bool,
+    env: Env<'_>,
+) -> Option<PathBuf> {
+    resolve_dir_for(kind.as_str(), windows, env)
+        .ok()
+        .map(|directory| directory.join(file))
+}
+
 pub(crate) fn bindings(lua: &Lua) -> mlua::Result<Table> {
     let storage = lua.create_table()?;
     storage.set(
@@ -192,6 +204,64 @@ mod tests {
             let subdir = Kind::parse(kind).unwrap().unix_subdir();
             PathBuf::from("/home/test").join(subdir).join("remuda")
         }
+    }
+
+    #[test]
+    fn init_lua_path_uses_windows_user_profile_without_home() {
+        let environment = env(&[("USERPROFILE", r"C:\Users\user")]);
+        let expected = PathBuf::from(r"C:\Users\user")
+            .join("AppData")
+            .join("Local")
+            .join("remuda")
+            .join("config")
+            .join("init.lua");
+        assert_eq!(
+            user_file_path_for(Kind::Config, "init.lua", true, &environment),
+            Some(expected)
+        );
+
+        let xdg_environment = env(&[
+            ("XDG_CONFIG_HOME", r"D:\config"),
+            ("USERPROFILE", r"C:\Users\user"),
+        ]);
+        assert_eq!(
+            user_file_path_for(Kind::Config, "init.lua", true, &xdg_environment),
+            Some(
+                PathBuf::from(r"D:\config")
+                    .join("remuda")
+                    .join("config")
+                    .join("init.lua")
+            )
+        );
+    }
+
+    #[test]
+    fn repl_history_path_uses_windows_user_profile_without_home() {
+        let environment = env(&[("USERPROFILE", r"C:\Users\user")]);
+        let expected = PathBuf::from(r"C:\Users\user")
+            .join("AppData")
+            .join("Local")
+            .join("remuda")
+            .join("state")
+            .join("repl-history");
+        assert_eq!(
+            user_file_path_for(Kind::State, "repl-history", true, &environment),
+            Some(expected)
+        );
+
+        let xdg_environment = env(&[
+            ("XDG_STATE_HOME", r"D:\state"),
+            ("USERPROFILE", r"C:\Users\user"),
+        ]);
+        assert_eq!(
+            user_file_path_for(Kind::State, "repl-history", true, &xdg_environment),
+            Some(
+                PathBuf::from(r"D:\state")
+                    .join("remuda")
+                    .join("state")
+                    .join("repl-history")
+            )
+        );
     }
 
     #[test]

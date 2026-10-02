@@ -6419,14 +6419,10 @@ fn eval_line(path: &Path, code: &str) {
     }
 }
 
-/// Where REPL history lives, by the XDG state convention. `None` when `$HOME`
-/// is unset too — nowhere to put it is not a reason to refuse to start.
+/// Where REPL history lives by the XDG state convention. `None` when no
+/// platform storage directory is available; that is not a reason to refuse to start.
 fn history_path() -> Option<std::path::PathBuf> {
-    let state = match std::env::var_os("XDG_STATE_HOME") {
-        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
-        _ => std::path::PathBuf::from(std::env::var_os("HOME")?).join(".local/state"),
-    };
-    Some(state.join("remuda").join("repl-history"))
+    remuda_native::repl_history_path()
 }
 
 /// The shape every request that answers with a bare `Ok` shares: `new`,
