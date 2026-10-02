@@ -85,7 +85,15 @@ fn init_at(state_dir: &Path) -> io::Result<(NodeIdentity, bool, Option<String>)>
     let previous_fingerprint = match fs::symlink_metadata(&cluster_dir) {
         Ok(_) => None,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            storage::read_cluster_init_marker(state_dir)?
+            storage::read_cluster_init_marker(state_dir).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "cluster initialization marker {} could not be used: {error}; it can be deleted to continue (only the new-identity notice will be lost)",
+                        state_dir.join("cluster-initialized").display()
+                    ),
+                )
+            })?
         }
         Err(error) => return Err(error),
     };
@@ -649,6 +657,29 @@ mod init_marker_tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn corrupt_marker_without_cluster_explains_recovery() {
+        let state_dir = TempStateDir::new();
+        fs::create_dir_all(&state_dir.0).unwrap();
+        let marker = state_dir.0.join("cluster-initialized");
+        fs::write(&marker, b"corrupt").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let error = match init_at(&state_dir.0) {
+            Ok(_) => panic!("corrupt initialization marker should fail closed"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+
+        assert!(message.contains(&marker.display().to_string()), "{message}");
+        assert!(message.contains("delete"), "{message}");
+        assert!(message.contains("new-identity notice"), "{message}");
     }
 
     #[test]
