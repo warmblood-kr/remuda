@@ -948,6 +948,49 @@ mod input_writer_tests {
         assert_eq!(*captured.lock().unwrap(), b"human cleanupautomated input");
     }
 
+    #[test]
+    fn too_late_chain_is_unsupported_and_marks_the_abandonment() {
+        let late_submit_bound = Duration::from_secs(30);
+        let clock = Arc::new(remuda_core::ManualClock::new());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = capture_writer(&captured, Arc::clone(&clock), late_submit_bound);
+        {
+            let mut state = writer.state.lock().unwrap();
+            state.active_sequence = Some(1);
+            state.stalled_sequence = Some(1);
+            state.active_since =
+                Some(Instant::now() - late_submit_bound - Duration::from_millis(1));
+            state.follow_up_open = true;
+        }
+
+        assert_eq!(
+            writer.chain_after_stalled(b"\r", Duration::ZERO),
+            ChainOutcome::Unsupported
+        );
+
+        let state = writer.state.lock().unwrap();
+        assert!(state.follow_up.is_none());
+        assert_eq!(state.late_submit_abandoned_at, Some(clock.now()));
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn idle_abandonment_is_reported_once_before_a_retry() {
+        let late_submit_bound = Duration::from_secs(30);
+        let clock = Arc::new(remuda_core::ManualClock::new());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = capture_writer(&captured, Arc::clone(&clock), late_submit_bound);
+        mark_late_submit_abandoned(&writer, &clock);
+
+        assert!(matches!(
+            writer.write_bounded(b"first retry"),
+            Err(AgentError::LateSubmitAbandoned { bound }) if bound == late_submit_bound
+        ));
+        assert!(captured.lock().unwrap().is_empty());
+        writer.write_bounded(b"second retry").unwrap();
+        assert_eq!(*captured.lock().unwrap(), b"second retry");
+    }
+
     impl Write for StalledWrite {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             if !self.first.swap(true, Ordering::AcqRel) {
