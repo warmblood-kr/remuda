@@ -2613,7 +2613,10 @@ where
         Err(error) => return Ok(Err(error)),
     };
     let mut mode = SecretPromptMode::enable(terminal)?;
-    let columns = mode.terminal.columns().max(20);
+    let columns = match mode.terminal.columns() {
+        0 => 80,
+        columns => columns.max(20),
+    };
     // The mod's own text: indented and untagged, so a line can never pass for
     // the daemon-tagged prompt line below it.
     for line in &preface {
@@ -4154,6 +4157,30 @@ mod tests {
                 "wrapped row exceeded the width floor: {row:?}"
             );
         }
+    }
+
+    #[test]
+    fn prompt_line_uses_default_width_when_terminal_width_is_unknown() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(0);
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            "remuda[outside] wizard prompt",
+            &[],
+            None,
+            [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some(String::new())));
+        let output = terminal.output();
+        assert!(
+            output
+                .windows(b"wizard prompt".len())
+                .any(|window| window == b"wizard prompt"),
+            "label was split across rows: {output:?}"
+        );
     }
 
     #[test]
