@@ -141,7 +141,7 @@ fn interactive_send_returns_busy_only_after_the_writer_deadline() {
 }
 
 #[test]
-fn send_line_reports_pending_when_enter_is_busy_after_body_lands() {
+fn send_line_reports_uncertain_when_enter_is_busy_after_body_lands() {
     let (body_tx, body_rx) = mpsc::channel();
     let (attached_started_tx, attached_started_rx) = mpsc::channel();
     let (attached_release_tx, attached_release_rx) = mpsc::channel();
@@ -158,6 +158,7 @@ fn send_line_reports_pending_when_enter_is_busy_after_body_lands() {
         "send-line-enter-busy",
         Box::new(SendLineBusyAgent {
             writer: Arc::clone(&writer),
+            output_version: Some(0),
         }),
         Arc::clone(&clock) as Arc<dyn Clock>,
     ));
@@ -195,6 +196,36 @@ fn send_line_reports_pending_when_enter_is_busy_after_body_lands() {
         result.unwrap_err().to_string(),
         "text may be in the pane, but submission is unconfirmed.\nNext: inspect it with `remuda capture NAME` before resending."
     );
+}
+
+#[test]
+fn submit_reports_uncertain_when_enter_is_busy_after_input_text_lands() {
+    let (_attached_release_tx, attached_release_rx) = mpsc::channel();
+    let writer = Arc::new(SendLineBusyWriter {
+        body: Mutex::new(String::new()),
+        body_landed: AtomicBool::new(false),
+        attached_busy: AtomicBool::new(false),
+        body_written: Mutex::new(None),
+        attached_started: Mutex::new(None),
+        attached_release: Mutex::new(attached_release_rx),
+    });
+    let session = Session::new(
+        "submit-enter-busy",
+        Box::new(SendLineBusyAgent {
+            writer: Arc::clone(&writer),
+            output_version: None,
+        }),
+        Arc::new(ManualClock::new()),
+    );
+
+    session.input_text("draft body").unwrap();
+    assert_eq!(writer.body.lock().unwrap().as_str(), "draft body");
+    writer.attached_busy.store(true, Ordering::Release);
+
+    assert!(matches!(
+        session.submit("draft body"),
+        Err(AgentError::SubmitUncertain)
+    ));
 }
 
 #[test]
@@ -774,6 +805,7 @@ impl AgentWriter for SendLineBusyWriter {
 
 struct SendLineBusyAgent {
     writer: Arc<SendLineBusyWriter>,
+    output_version: Option<u64>,
 }
 
 impl AgentProcess for SendLineBusyAgent {
@@ -790,7 +822,7 @@ impl AgentProcess for SendLineBusyAgent {
     }
 
     fn output_version(&mut self) -> Option<u64> {
-        Some(0)
+        self.output_version
     }
 
     fn cursor(&mut self) -> Result<Cursor> {

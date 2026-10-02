@@ -224,7 +224,8 @@ pub enum AgentError {
     },
     /// Text is still being written; its Return will follow if it lands in time.
     SubmitPending,
-    /// The body landed, but the Enter write was refused while another write was busy.
+    /// The body landed, but a Return write was refused while busy, whether
+    /// that Return was meant to submit or add a composer newline.
     SubmitUncertain,
     /// A `feed` act's `Pause`s summed past the caller's cap — refused before
     /// anything is written, not clamped, so a seconds/millis mixup errors
