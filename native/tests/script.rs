@@ -1258,3 +1258,132 @@ fn capture_styled_marks_dim_spans_and_reports_the_cursor() {
     let got = script::eval_source(&path, "=styled-capture", code).expect("capture styled screen");
     assert_eq!(got, "ghost=true -plain=false cursor=number,number,boolean");
 }
+
+/// A Lua long string: a Windows path keeps its backslashes.
+fn lua_path(path: &Path) -> String {
+    format!("[==[{}]==]", path.display())
+}
+
+const FS_PRELUDE: &str = r#"
+    assert(type(remuda.fs.realpath) == "function", "remuda.fs.realpath is missing")
+    assert(type(remuda.fs.is_symlink) == "function", "remuda.fs.is_symlink is missing")
+    local function expect(what, want, got, reason)
+      assert(got == want, what .. ": want " .. tostring(want) .. ", got " .. tostring(got) .. " (" .. tostring(reason) .. ")")
+    end
+"#;
+
+#[test]
+fn fs_realpath_resolves_dot_dot_and_reports_a_missing_path() {
+    let dir = scratch("fs-realpath");
+    std::fs::create_dir_all(dir.join("sub")).expect("make sub");
+    std::fs::write(dir.join("file.txt"), "x").expect("write file");
+    let real = std::fs::canonicalize(dir.join("file.txt")).expect("canonical file");
+    let manifest = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+        .expect("canonical manifest");
+    run_lua(
+        "fs-realpath",
+        &format!(
+            r#"{FS_PRELUDE}
+            expect("an absolute path with '..'", {real}, remuda.fs.realpath({dotted}))
+            -- A relative path is resolved against the daemon's working directory.
+            expect("a relative path with '..'", {manifest}, remuda.fs.realpath("src/../Cargo.toml"))
+            local got, reason = remuda.fs.realpath({missing})
+            expect("a missing path", nil, got)
+            expect("a missing path's reason", "not_found", reason)
+            got, reason = remuda.fs.is_symlink({missing})
+            expect("is_symlink of a missing path", nil, got)
+            expect("is_symlink of a missing path's reason", "not_found", reason)
+            expect("a plain file is not a link", false, remuda.fs.is_symlink({file}))
+            expect("a directory is not a link", false, remuda.fs.is_symlink({sub}))
+            for _, bad in ipairs({{ "", {{}}, true }}) do
+              assert(not pcall(remuda.fs.realpath, bad), "realpath should raise for " .. tostring(bad))
+              assert(not pcall(remuda.fs.is_symlink, bad), "is_symlink should raise for " .. tostring(bad))
+            end
+            assert(not pcall(remuda.fs.realpath), "realpath with no argument should raise")
+            "#,
+            real = lua_path(&real),
+            manifest = lua_path(&manifest),
+            dotted = lua_path(&dir.join("sub").join("..").join("file.txt")),
+            missing = lua_path(&dir.join("missing.txt")),
+            file = lua_path(&dir.join("file.txt")),
+            sub = lua_path(&dir.join("sub")),
+        ),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn fs_realpath_follows_a_symlink_and_is_symlink_does_not() {
+    let dir = scratch("fs-symlink");
+    std::fs::write(dir.join("target.txt"), "x").expect("write target");
+    let _ = std::fs::remove_file(dir.join("link"));
+    let _ = std::fs::remove_file(dir.join("dangling"));
+    std::os::unix::fs::symlink(dir.join("target.txt"), dir.join("link")).expect("make link");
+    std::os::unix::fs::symlink(dir.join("gone"), dir.join("dangling")).expect("make dangling link");
+    let real = std::fs::canonicalize(dir.join("target.txt")).expect("canonical target");
+    run_lua(
+        "fs-symlink",
+        &format!(
+            r#"{FS_PRELUDE}
+            expect("realpath of a link is its target", {real}, remuda.fs.realpath({link}))
+            expect("a link is a link", true, remuda.fs.is_symlink({link}))
+            expect("its target is not", false, remuda.fs.is_symlink({target}))
+            -- The link itself is asked about, so a dangling one is still a link.
+            expect("a dangling link is a link", true, remuda.fs.is_symlink({dangling}))
+            local got, reason = remuda.fs.realpath({dangling})
+            expect("realpath of a dangling link", nil, got)
+            expect("realpath of a dangling link's reason", "not_found", reason)
+            "#,
+            real = lua_path(&real),
+            link = lua_path(&dir.join("link")),
+            target = lua_path(&dir.join("target.txt")),
+            dangling = lua_path(&dir.join("dangling")),
+        ),
+    );
+}
+
+// The CI log is the evidence for Windows: the FACT lines say what a resolved
+// path looks like there and whether a junction counts as a link.
+#[cfg(windows)]
+#[test]
+fn fs_realpath_and_is_symlink_on_windows() {
+    let dir = scratch("fs-windows");
+    std::fs::create_dir_all(dir.join("target")).expect("make target");
+    std::fs::write(dir.join("target").join("file.txt"), "x").expect("write file");
+    let junction = dir.join("junction");
+    let _ = std::fs::remove_dir(&junction);
+    let made = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(dir.join("target"))
+        .output()
+        .expect("run mklink");
+    assert!(made.status.success(), "mklink /J failed: {made:?}");
+    let real = std::fs::canonicalize(dir.join("target").join("file.txt")).expect("canonical file");
+    eprintln!("FACT: std canonicalize returns {}", real.display());
+    eprintln!(
+        "FACT: std is_symlink of a junction is {}",
+        std::fs::symlink_metadata(&junction)
+            .expect("junction metadata")
+            .file_type()
+            .is_symlink()
+    );
+    run_lua_reporting(
+        "fs-windows",
+        &format!(
+            r#"{FS_PRELUDE}
+            local real = remuda.fs.realpath({through})
+            expect("realpath through a junction", {real}, real)
+            expect("the resolved path keeps the verbatim prefix", [[\\?\]], real:sub(1, 4))
+            local slashed = ({through}):gsub("\\", "/")
+            expect("a forward-slash path resolves the same", {real}, remuda.fs.realpath(slashed))
+            expect("a junction is a link", true, remuda.fs.is_symlink({junction}))
+            expect("its target is not", false, remuda.fs.is_symlink({target}))
+            "#,
+            real = lua_path(&real),
+            through = lua_path(&junction.join("file.txt")),
+            junction = lua_path(&junction),
+            target = lua_path(&dir.join("target")),
+        ),
+    );
+}
