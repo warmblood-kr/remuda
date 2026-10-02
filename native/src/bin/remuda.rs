@@ -6514,7 +6514,7 @@ fn input_write_failure(response: &Response) -> Option<(u8, &'static str)> {
     match response {
         Response::Busy => Some((
             75,
-            "session input is busy; nothing was written, retry\nNext: wait for the previous write to finish, then run the command again.",
+            "session input is busy; nothing was written, retry\nNext: wait for the previous write to finish (see it with remuda capture NAME), then run the command again.",
         )),
         Response::WriteTimeout => Some((
             74,
@@ -6846,7 +6846,7 @@ mod tests {
         );
         assert_eq!(
             describe(Ok(Response::Busy)),
-            "session input is busy; nothing was written, retry\nNext: wait for the previous write to finish, then run the command again."
+            "session input is busy; nothing was written, retry\nNext: wait for the previous write to finish (see it with remuda capture NAME), then run the command again."
         );
         assert_eq!(
             input_write_failure(&Response::WriteTimeout).map(|(code, _)| code),
