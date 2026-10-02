@@ -24,7 +24,7 @@ impl Scratch {
             .expect("run remuda")
     }
 
-    fn pipeline(&self, args: &[&str], repetitions: usize) -> Output {
+    fn pipeline(&self, args: &[&str], repetitions: usize, expected_status: u8) -> Output {
         let mut command = vec![env!("CARGO_BIN_EXE_remuda")];
         command.extend_from_slice(args);
         let command = command
@@ -37,16 +37,17 @@ impl Scratch {
         } else {
             format!("for ((i=0; i<{repetitions}; i++)); do {command}; done")
         };
-        let script =
-            format!("set -o pipefail; {producer} | {{ IFS= read -r line && [[ -n \"$line\" ]]; }}");
+        let script = format!(
+            "{producer} | head -n 1\nproducer_status=${{PIPESTATUS[0]}}\n[[ $producer_status -eq {expected_status} ]]"
+        );
         Command::new("bash")
-            .args(["-o", "pipefail", "-c", &script])
+            .args(["-c", &script])
             .env("REMUDA_RUNTIME_DIR", &self.0)
             .env("XDG_DATA_HOME", self.0.join("data"))
             .env("HOME", &self.0)
             .env("REMUDA_NO_UPDATE_CHECK", "1")
             .output()
-            .expect("run one-line reader pipeline")
+            .expect("run head reader pipeline")
     }
 }
 
@@ -67,15 +68,15 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-fn assert_reader_pipeline_succeeded(command: &str, output: Output) {
+fn assert_reader_pipeline_status(command: &str, output: Output) {
     let stderr = stderr(&output);
     assert!(
         output.status.success(),
-        "the one-line reader accepted input, but remuda {command} failed: {stderr}"
+        "remuda {command} did not return 141 after its reader stopped: {stderr}"
     );
     assert!(
-        !stderr.contains("failed printing to stdout"),
-        "remuda {command} leaked a broken pipe panic: {stderr}"
+        stderr.is_empty(),
+        "remuda {command} wrote to stderr after its reader stopped: {stderr}"
     );
 }
 
@@ -124,8 +125,25 @@ fn listing_commands_allow_the_reader_to_stop_after_one_line() {
             "remuda {command} produced {} bytes, not more than a pipe buffer",
             full_output.stdout.len() * repetitions
         );
-        assert_reader_pipeline_succeeded(command, scratch.pipeline(&args, repetitions));
+        assert_reader_pipeline_status(command, scratch.pipeline(&args, repetitions, 141));
     }
+
+    let empty_home = Scratch::new();
+    let failed_batch = empty_home.pipeline(&["mod", "update", "--all", "--reload"], 1, 1);
+    assert!(
+        failed_batch.status.success(),
+        "the failing offline batch was reported as success: {}",
+        stderr(&failed_batch)
+    );
+    assert!(
+        String::from_utf8_lossy(&failed_batch.stdout).contains("batch reload preflight"),
+        "the test did not observe the batch preflight line"
+    );
+    assert!(
+        stderr(&failed_batch).contains("update --all --reload` is disabled"),
+        "the batch's real failure was not reported: {}",
+        stderr(&failed_batch)
+    );
 
     let _ = scratch.remuda(&["-s", "s", "stop", "-f"]);
 }
