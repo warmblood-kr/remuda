@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed secret prompt labels wrapping into rows that look like daemon tags by
+  clipping them to terminal display width; see #363.
 - Fixed: macOS credential store calls no longer show Keychain dialogs; locked or
   unavailable keychains return an `unavailable` reason instead. See #472.
 - `install.sh`: when the install directory is not on `PATH` it now prints the

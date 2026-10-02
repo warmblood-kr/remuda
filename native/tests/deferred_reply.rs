@@ -728,7 +728,12 @@ fn secret_answer_frame_round_trips_at_four_kib_and_reports_too_long() {
 }
 
 #[cfg(unix)]
-fn secret_prompt_in_session(socket: &std::path::Path, session_name: &str, binary: &str) -> String {
+fn secret_prompt_in_session(
+    socket: &std::path::Path,
+    session_name: &str,
+    binary: &str,
+    columns: u16,
+) -> String {
     use remuda_core::protocol::{Request, Response, Step};
     use remuda_core::Size;
     use remuda_native::client;
@@ -741,7 +746,7 @@ fn secret_prompt_in_session(socket: &std::path::Path, session_name: &str, binary
             &Request::New {
                 name: Some(session_name.into()),
                 command: vec!["sh".into(), "-c".into(), command],
-                size: Size::new(80, 24),
+                size: Size::new(columns, 24),
                 cwd: None,
                 env: None,
             },
@@ -818,7 +823,7 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
     let socket = daemon::socket_path_in(&dir, "s");
     let session_name = "secret-label-session";
     let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
-    let prompt_screen = secret_prompt_in_session(&socket, session_name, &binary);
+    let prompt_screen = secret_prompt_in_session(&socket, session_name, &binary, 80);
     let _ = remuda(&["stop", "-f"]);
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -847,7 +852,7 @@ fn session_secret_prompt_tag_replaces_brackets_in_the_session_name() {
 
     let socket = daemon::socket_path_in(&dir, "s");
     let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
-    let prompt_screen = secret_prompt_in_session(&socket, "x] remuda[outside", &binary);
+    let prompt_screen = secret_prompt_in_session(&socket, "x] remuda[outside", &binary, 80);
     let _ = remuda(&["stop", "-f"]);
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -873,7 +878,7 @@ fn session_secret_prompt_tag_caps_the_session_name_at_64_chars() {
     let socket = daemon::socket_path_in(&dir, "s");
     let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
     let session_name = "x".repeat(70);
-    let prompt_screen = secret_prompt_in_session(&socket, &session_name, &binary);
+    let prompt_screen = secret_prompt_in_session(&socket, &session_name, &binary, 110);
     let _ = remuda(&["stop", "-f"]);
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -899,7 +904,7 @@ fn session_secret_prompt_tag_preserves_non_ascii_session_names() {
     let socket = daemon::socket_path_in(&dir, "s");
     let binary = env!("CARGO_BIN_EXE_remuda").replace('\\', "/");
     let session_name = "東京🦀";
-    let prompt_screen = secret_prompt_in_session(&socket, session_name, &binary);
+    let prompt_screen = secret_prompt_in_session(&socket, session_name, &binary, 80);
     let _ = remuda(&["stop", "-f"]);
     let _ = std::fs::remove_dir_all(&dir);
 
