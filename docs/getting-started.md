@@ -20,8 +20,10 @@ $env:REMUDA_CHANNEL='nightly'; $env:REMUDA_INSTALL_BUTLER='1'; irm https://warmb
 
 You should see, as the last line, `Next: remuda butler doctor`.
 If not: nightly has no Intel Mac or ARM Linux binary; build from source
-there. Remuda lands in `~/.local/bin`; make sure that directory is on `PATH`.
-If it is not, on macOS or Debian run:
+there. On macOS or Debian, Remuda lands in `~/.local/bin`. If the installer
+says the install directory is not on `PATH`, run the `export PATH=...` command
+it prints after `Next:`. Add that same line to your shell profile to keep it
+for later terminals. With the default install directory, the command is:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
