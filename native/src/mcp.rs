@@ -284,7 +284,7 @@ fn input_error_message(response: &Response) -> &'static str {
         Response::Uncertain => "input outcome is uncertain; bytes may be partial or late",
         Response::WrongInstance => "session instance changed",
         Response::RateLimited => "session input rate limit exceeded",
-        Response::Busy => "session input is busy; nothing was written, retry",
+        Response::Busy => crate::BUSY_RETRY_MESSAGE,
         Response::WriteTimeout => "session PTY write timed out; delivery may be partial or late",
         Response::RemoteControlDisabled => "remote control is disabled on the target node",
         _ => "input was refused",
@@ -463,7 +463,8 @@ fn error_reply(id: Value, code: i32, message: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{lua_literal, lua_string};
+    use super::{input_error_message, lua_literal, lua_string};
+    use remuda_core::protocol::Response;
     use serde_json::json;
 
     #[test]
@@ -496,5 +497,13 @@ mod tests {
         // string still parses and carries a different byte.
         assert_eq!(lua_string("a\nb\tc"), r#""a\nb\009c""#);
         assert_eq!(lua_string("한"), r#""한""#);
+    }
+
+    #[test]
+    fn busy_error_has_the_shared_retry_guidance() {
+        assert_eq!(
+            input_error_message(&Response::Busy),
+            "session input is busy; nothing was written, retry\nNext: wait for the previous write to finish (see it with remuda capture NAME), then run the command again."
+        );
     }
 }

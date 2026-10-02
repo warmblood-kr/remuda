@@ -1988,7 +1988,7 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
         Response::WrongInstance => Err(mlua::Error::runtime("session instance changed")),
         Response::RateLimited => Err(mlua::Error::runtime("session input rate limit exceeded")),
         Response::SyncAtCapacity => Err(mlua::Error::runtime("Sync is at capacity; retry shortly")),
-        Response::Busy => Err(mlua::Error::runtime("session input is busy")),
+        Response::Busy => Err(mlua::Error::runtime(crate::BUSY_RETRY_MESSAGE)),
         Response::WriteTimeout => Err(mlua::Error::runtime(
             "session PTY write timed out; delivery may be partial or late",
         )),
@@ -2081,9 +2081,23 @@ fn value(lua: &Lua, response: Response) -> mlua::Result<Value> {
 
 #[cfg(test)]
 mod binding_tests {
-    use super::{cli_parse_bindings, cli_spec_from_lua, fs_bindings, lua_steps_to_wire, BINDINGS};
+    use super::{
+        cli_parse_bindings, cli_spec_from_lua, fs_bindings, lua_steps_to_wire, value, BINDINGS,
+    };
     use mlua::{Lua, Table};
-    use remuda_core::protocol::Step;
+    use remuda_core::protocol::{Response, Step};
+
+    #[test]
+    fn lua_busy_error_has_the_cli_retry_guidance() {
+        let error = value(&Lua::new(), Response::Busy).unwrap_err().to_string();
+
+        assert!(
+            error.contains(
+                "session input is busy; nothing was written, retry\nNext: wait for the previous write to finish (see it with remuda capture NAME), then run the command again."
+            ),
+            "Lua Busy error did not include retry guidance: {error}"
+        );
+    }
 
     #[test]
     fn binding_names_are_sorted_and_unique() {

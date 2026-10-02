@@ -21,7 +21,7 @@ use remuda_core::protocol::{Request, Response};
 use remuda_native::client::Left;
 use remuda_native::cluster::listener_config::{ListenerBind, ListenerConfig};
 use remuda_native::net::advertise_addr::CLUSTER_DEFAULT_PORT;
-use remuda_native::{daemon, dist, terminal_size};
+use remuda_native::{daemon, dist, terminal_size, BUSY_RETRY_MESSAGE};
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -6649,10 +6649,7 @@ fn simple_request(path: &Path, request: Request) -> ExitCode {
 
 fn input_write_failure(response: &Response) -> Option<(u8, &'static str)> {
     match response {
-        Response::Busy => Some((
-            75,
-            "session input is busy; nothing was written, retry\nNext: wait for the previous write to finish (see it with remuda capture NAME), then run the command again.",
-        )),
+        Response::Busy => Some((75, BUSY_RETRY_MESSAGE)),
         Response::WriteTimeout => Some((
             74,
             "session PTY write timed out; delivery may be partial or late\nNext: check whether the input was applied before retrying.",
