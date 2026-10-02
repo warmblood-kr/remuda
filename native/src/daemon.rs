@@ -2380,6 +2380,9 @@ fn handle_new(
         )),
     };
     let mut session_env = env.unwrap_or_default();
+    session_env
+        .entry("REMUDA_RUNTIME_DIR".into())
+        .or_insert_with(|| runtime_dir().to_string_lossy().into_owned());
     let session_id = Session::new_id();
     session_env.insert("REMUDA_DAEMON_ID".into(), std::process::id().to_string());
     session_env.insert("REMUDA_SESSION_ID".into(), session_id.clone());

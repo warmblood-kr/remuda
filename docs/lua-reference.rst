@@ -289,7 +289,7 @@ process
 process.run
 -----------
 
-``process.run{argv, stdin?, timeout?, cwd?} -> {code, stdout, stderr, timed_out, signal?}`` — Run argv directly without a shell; inherits the daemon's environment and, unless `cwd` is given, its working directory. `cwd` is an absolute path to an existing directory where the child starts; with it argv[1] must be an absolute path or a bare command name, and a bare name is searched on the absolute entries of PATH only (never in cwd). Blocks the Lua image until exit or timeout (default 5s, max 30s; longer commands use remuda.process), captures each stream up to 1 MiB. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.
+``process.run{argv, stdin?, timeout?, cwd?, stdin_hold_until_lines?} -> {code, stdout, stderr, timed_out, signal?}`` — Run argv directly without a shell; inherits the daemon's environment and, unless `cwd` is given, its working directory. `cwd` is an absolute path to an existing directory where the child starts; with it argv[1] must be an absolute path or a bare command name, and a bare name is searched on the absolute entries of PATH only (never in cwd). Blocks the Lua image until exit or timeout (default 5s, max 30s; longer commands use remuda.process), captures each stream up to 1 MiB. `stdin_hold_until_lines`, when set to an integer from 1 through 1000, keeps stdin open until stdout has that many newlines, the child exits, or timeout. Surviving descendants can keep pipes open; at most 16 background output readers are allowed.
 
 processes
 ---------
@@ -370,6 +370,31 @@ session.resize
 --------------
 
 ``session.resize(name, cols, rows) -> true | nil, err`` — Resize a session's terminal (cols 20..1000, rows 24..500).
+
+system
+------
+
+``table`` — OS services for trusted Lua callers.
+
+system.credential.backend
+-------------------------
+
+``system.credential.backend() -> 'keychain' | 'wincred' | nil`` — The OS credential store in use: 'keychain' (the macOS login Keychain), 'wincred' (Windows Credential Manager), or nil where there is none, in which case put, get and delete return nil, 'unavailable: no credential store on this OS'.
+
+system.credential.delete
+------------------------
+
+``system.credential.delete(name) -> true | nil, reason`` — Remove a stored secret. The reason is 'not_found' when nothing is stored under name, or starts with 'unavailable: ' or 'denied: '.
+
+system.credential.get
+---------------------
+
+``system.credential.get(name) -> secret | nil, reason`` — Read a secret back, binary-safe. The reason is 'not_found' when nothing is stored under name, or starts with 'unavailable: ' or 'denied: '. On macOS the Keychain may ask the user to allow access; the call, and the whole Lua image with it, waits until the user answers.
+
+system.credential.put
+---------------------
+
+``system.credential.put(name, secret) -> true | nil, reason`` — Store a secret in the OS credential store under service 'remuda' and account name, replacing any earlier value. name is 1 to 255 printable ASCII characters without spaces; secret is 1 to 2048 bytes; anything else raises a Lua error. Returns nil and a reason starting with 'unavailable: ' or 'denied: ' when the store cannot be used. The store is not a sandbox: any Lua code in this image, MCP run_script included, can read, replace or delete what is stored here.
 
 tool
 ----

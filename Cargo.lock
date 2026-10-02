@@ -921,6 +921,7 @@ dependencies = [
  "rustls",
  "rustls-platform-verifier",
  "rustyline",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2",

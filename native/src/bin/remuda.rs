@@ -4570,6 +4570,15 @@ fn ensure_daemon(server: &str, path: &Path) -> Result<(), String> {
     match remuda_native::ipc::connect(path) {
         Ok(_) => Ok(()),
         Err(error) if remuda_native::ipc::may_start_daemon(path, &error) => {
+            if server == "default"
+                && (std::env::var_os("REMUDA_SESSION_ID").is_some()
+                    || std::env::var_os("REMUDA_SESSION_CAPABILITY").is_some())
+            {
+                return Err(format!(
+                    "refusing to start the default daemon from inside a session (socket {})\nNext: run remuda from a terminal outside the session, or pass -s NAME for a private daemon",
+                    path.display(),
+                ));
+            }
             start_daemon(server, path)
         }
         // A path the transport cannot even name proves nothing about a daemon.

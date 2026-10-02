@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 92] = [
+pub const BINDINGS: [&str; 93] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -116,6 +116,7 @@ pub const BINDINGS: [&str; 92] = [
     "schedules",
     "send",
     "session",
+    "system",
     "tool",
     "tools",
     "type_text",
@@ -353,6 +354,31 @@ const WORDS: &[(&str, &str, &str)] = &[
         "random_bytes(n) -> string",
     ),
     (
+        "system",
+        "OS services for trusted Lua callers.",
+        "table",
+    ),
+    (
+        "system.credential.put",
+        "Store a secret in the OS credential store under service 'remuda' and account name, replacing any earlier value. name is 1 to 255 printable ASCII characters without spaces; secret is 1 to 2048 bytes; anything else raises a Lua error. Returns nil and a reason starting with 'unavailable: ' or 'denied: ' when the store cannot be used. The store is not a sandbox: any Lua code in this image, MCP run_script included, can read, replace or delete what is stored here.",
+        "system.credential.put(name, secret) -> true | nil, reason",
+    ),
+    (
+        "system.credential.get",
+        "Read a secret back, binary-safe. The reason is 'not_found' when nothing is stored under name, or starts with 'unavailable: ' or 'denied: '. On macOS the Keychain may ask the user to allow access; the call, and the whole Lua image with it, waits until the user answers.",
+        "system.credential.get(name) -> secret | nil, reason",
+    ),
+    (
+        "system.credential.delete",
+        "Remove a stored secret. The reason is 'not_found' when nothing is stored under name, or starts with 'unavailable: ' or 'denied: '.",
+        "system.credential.delete(name) -> true | nil, reason",
+    ),
+    (
+        "system.credential.backend",
+        "The OS credential store in use: 'keychain' (the macOS login Keychain), 'wincred' (Windows Credential Manager), or nil where there is none, in which case put, get and delete return nil, 'unavailable: no credential store on this OS'.",
+        "system.credential.backend() -> 'keychain' | 'wincred' | nil",
+    ),
+    (
         "hostname",
         "The OS host name, read from the OS itself (not the environment). Returned unchanged and not sanitized for use in identifiers; callers slug it. Returns nil, error if the OS call fails or the name is empty, not UTF-8, or holds a control, line-separator (U+2028, U+2029) or bidi-control (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) character.",
         "hostname() -> string, nil | nil, error",
@@ -364,8 +390,8 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "_process_run",
-        "Run an argv process synchronously with a bounded timeout and captured output; internal, called by `remuda.process.run`.",
-        "_process_run(argv, stdin?, timeout, cwd?) -> result | nil, refusal",
+        "Run an argv process synchronously with a bounded timeout and captured output; internal, called by `remuda.process.run`. Its optional stdin_hold_until_lines keeps stdin open until stdout has that many newlines, the child exits, or timeout.",
+        "_process_run(argv, stdin?, timeout, cwd?, stdin_hold_until_lines?) -> result | nil, refusal",
     ),
     (
         "_process_spawn",
@@ -413,6 +439,7 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
         registry.set(*name, row)?;
     }
     table.set("json", crate::json::bindings(lua)?)?;
+    table.set("system", crate::credential::bindings(lua)?)?;
     fs_bindings(lua, table)?;
     table.set("_registry", registry)
 }
@@ -1448,6 +1475,19 @@ fn request_count_bindings(
     )
 }
 
+fn parse_stdin_hold_until_lines(value: Value) -> Result<Option<usize>, String> {
+    match value {
+        Value::Nil => Ok(None),
+        Value::Integer(lines) if (1..=1000).contains(&lines) => Ok(Some(lines as usize)),
+        Value::Number(lines)
+            if lines.is_finite() && lines.fract() == 0.0 && (1.0..=1000.0).contains(&lines) =>
+        {
+            Ok(Some(lines as usize))
+        }
+        _ => Err("process.run stdin_hold_until_lines must be an integer from 1 through 1000. Next: pass a whole number in that range.".to_string()),
+    }
+}
+
 /// `remuda.process`'s Rust half — split out of `bindings` to stay under its
 /// line cap.
 // `remuda.process` itself (the validated, Lua-facing spec-table word) lives
@@ -1484,12 +1524,18 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
         "_process_run",
         lua.create_function(
             |lua,
-             (mut argv, stdin, timeout, cwd): (
+             (mut argv, stdin, timeout, cwd, stdin_hold_until_lines): (
                 Vec<String>,
                 Option<mlua::LuaString>,
                 f64,
                 Option<String>,
+                Value,
             )| {
+                let stdin_hold_until_lines =
+                    match parse_stdin_hold_until_lines(stdin_hold_until_lines) {
+                        Ok(lines) => lines,
+                        Err(refused) => return Ok((Value::Nil, Some(refused))),
+                    };
                 let cwd =
                     match crate::process::checked_cwd("process.run", cwd.as_deref(), &mut argv) {
                         Ok(cwd) => cwd,
@@ -1500,6 +1546,7 @@ fn process_bindings(lua: &Lua, table: &Table, image: crate::image::Image) -> mlu
                     stdin.map(|value| value.as_bytes().to_vec()),
                     timeout,
                     cwd,
+                    stdin_hold_until_lines,
                 )
                 .map_err(mlua::Error::runtime)?;
                 let result = lua.create_table()?;

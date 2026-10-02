@@ -541,6 +541,219 @@ fn random_bytes_returns_csprng_bytes_and_rejects_invalid_lengths() {
     );
 }
 
+// Off Windows, none of the credential tests below reach a real OS store: every
+// call either fails validation first or runs where no backend exists, and the
+// round trip that writes to the login Keychain is `#[ignore]`. The Windows
+// tests do write to Credential Manager: the CI runner is their only run.
+const CREDENTIAL_PRELUDE: &str = r#"
+    assert(type(remuda.system) == "table", "remuda.system is missing")
+    local credential = remuda.system.credential
+    assert(type(credential) == "table", "remuda.system.credential is missing")
+    local MARKER = "s3cret-MARKER-do-not-leak"
+"#;
+
+#[test]
+fn credential_surface_is_exactly_put_get_delete_backend() {
+    let backend = if cfg!(target_os = "macos") {
+        r#""keychain""#
+    } else if cfg!(windows) {
+        r#""wincred""#
+    } else {
+        "nil"
+    };
+    run_lua(
+        "credential-surface",
+        &format!(
+            r#"{CREDENTIAL_PRELUDE}
+            local words = {{}}
+            for key in pairs(credential) do words[#words + 1] = key end
+            table.sort(words)
+            assert(table.concat(words, ",") == "backend,delete,get,put", table.concat(words, ","))
+            local system_words = {{}}
+            for key in pairs(remuda.system) do system_words[#system_words + 1] = key end
+            assert(table.concat(system_words, ",") == "credential", table.concat(system_words, ","))
+            assert(credential.backend() == {backend}, "backend is " .. tostring(credential.backend()))
+            "#
+        ),
+    );
+}
+
+#[test]
+fn credential_rejects_invalid_names_and_secret_lengths() {
+    run_lua(
+        "credential-validation",
+        &format!(
+            r#"{CREDENTIAL_PRELUDE}
+            local bad_names = {{
+              "", string.rep("a", 256), "tab\there", "line\nbreak", "nul\0byte",
+              "del\127", "caf\195\169", "has space", {{}}, true,
+            }}
+            for index, name in ipairs(bad_names) do
+              for _, word in ipairs({{ "put", "get", "delete" }}) do
+                local ok, err = pcall(credential[word], name, MARKER)
+                assert(not ok, word .. " should reject bad name #" .. index)
+                err = tostring(err)
+                assert(err:find("name", 1, true), word .. " error should mention name: " .. err)
+                assert(not err:find(MARKER, 1, true), word .. " error leaked the secret")
+              end
+            end
+            assert(not pcall(credential.get), "get needs a name")
+            assert(not pcall(credential.delete), "delete needs a name")
+
+            for _, secret in ipairs({{ "", MARKER .. string.rep("x", 2049 - #MARKER) }}) do
+              local ok, err = pcall(credential.put, "remuda-test/never-stored", secret)
+              assert(not ok, "put should reject a secret of " .. #secret .. " bytes")
+              err = tostring(err)
+              assert(err:find("secret", 1, true), "put error should mention secret: " .. err)
+              assert(not err:find(MARKER, 1, true), "put error leaked the secret")
+            end
+            for _, secret in ipairs({{ {{}}, true }}) do
+              assert(not pcall(credential.put, "remuda-test/never-stored", secret),
+                "put should reject a non-string secret")
+            end
+            assert(not pcall(credential.put, "remuda-test/never-stored"), "put needs a secret")
+            "#
+        ),
+    );
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+#[test]
+fn credential_is_unavailable_where_no_backend_exists() {
+    run_lua(
+        "credential-unavailable",
+        &format!(
+            r#"{CREDENTIAL_PRELUDE}
+            local want = "unavailable: no credential store on this OS"
+            local name = string.rep("n", 255)
+            local secret = MARKER .. string.rep("x", 2048 - #MARKER)
+            assert(credential.backend() == nil, "no backend on this OS")
+            for _, call in ipairs({{
+              function() return credential.put(name, secret) end,
+              function() return credential.put("a", "b") end,
+              function() return credential.get(name) end,
+              function() return credential.delete(name) end,
+            }}) do
+              local value, reason = call()
+              assert(value == nil, "expected nil, got " .. tostring(value))
+              assert(reason == want, "reason is " .. tostring(reason))
+            end
+            "#
+        ),
+    );
+}
+
+// Writes to the real login Keychain, so it never runs by default: run it by
+// hand with `--ignored`. It removes its own item even when an assertion fails.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "writes to the real login Keychain"]
+fn credential_round_trip_in_the_login_keychain() {
+    let pid = std::process::id();
+    run_lua(
+        "credential-round-trip",
+        &format!(
+            r#"{CREDENTIAL_PRELUDE}
+            local hex = remuda.random_bytes(8):gsub(".", function(byte)
+              return string.format("%02x", byte:byte())
+            end)
+            local name = "remuda-test/{pid}-" .. hex
+            local secret = "round\0trip\255-" .. hex
+            local ok, err = pcall(function()
+              local value, reason = credential.get(name)
+              assert(value == nil and reason == "not_found", "get before put: " .. tostring(reason))
+              assert(credential.put(name, secret) == true, "put")
+              assert(credential.get(name) == secret, "get returns the stored bytes")
+              assert(credential.put(name, "replaced") == true, "put replaces")
+              assert(credential.get(name) == "replaced", "get returns the replacement")
+              assert(credential.delete(name) == true, "delete")
+              value, reason = credential.get(name)
+              assert(value == nil and reason == "not_found", "get after delete: " .. tostring(reason))
+              value, reason = credential.delete(name)
+              assert(value == nil and reason == "not_found", "second delete: " .. tostring(reason))
+            end)
+            credential.delete(name)
+            assert(ok, err)
+            "#
+        ),
+    );
+}
+
+// Nobody here has a Windows machine, so the CI log is the evidence: a failure
+// prints its reason as a FACT line before the test fails with it.
+#[cfg(windows)]
+fn run_lua_reporting(tag: &str, source: &str) {
+    let dir = scratch(tag);
+    let path = daemon::socket_path_in(&dir, "s");
+    let _daemon = daemon_at(&path, &dir);
+    if let Err(reason) = script::run(&path, &write(&dir, &format!("{tag}.lua"), source)) {
+        eprintln!("FACT: {tag} failed on this runner: {reason}");
+        panic!("{tag}: {reason}");
+    }
+}
+
+// A unique item name per test run, and `expect`, which fails with the store's
+// own reason. No message here ever carries a secret.
+#[cfg(windows)]
+fn wincred_prelude() -> String {
+    let pid = std::process::id();
+    format!(
+        r#"{CREDENTIAL_PRELUDE}
+        assert(credential.backend() == "wincred", "backend is " .. tostring(credential.backend()))
+        local hex = remuda.random_bytes(8):gsub(".", function(byte)
+          return string.format("%02x", byte:byte())
+        end)
+        local name = "remuda-test/{pid}-" .. hex
+        local function expect(what, want, value, reason)
+          assert(value == want and (want ~= nil or reason == "not_found"),
+            what .. ": " .. type(value) .. ", " .. tostring(reason))
+        end
+        "#
+    )
+}
+
+// Writes to the real Credential Manager of the CI runner, which has a logon
+// session. It removes its own item even when an assertion fails.
+#[cfg(windows)]
+#[test]
+fn credential_round_trip_in_windows_credential_manager() {
+    let prelude = wincred_prelude();
+    run_lua_reporting(
+        "credential-wincred-round-trip",
+        &format!(
+            r#"{prelude}
+            local secret = "round\0trip\255-" .. hex
+            local longest = string.rep("\0\255", 1024)
+            local ok, err = pcall(function()
+              expect("put", true, credential.put(name, secret))
+              assert(credential.get(name) == secret, "get did not return the stored bytes")
+              expect("put replaces", true, credential.put(name, longest))
+              assert(credential.get(name) == longest, "get did not return the 2048-byte replacement")
+              expect("delete", true, credential.delete(name))
+              expect("get after delete", nil, credential.get(name))
+            end)
+            credential.delete(name)
+            assert(ok, err)
+            "#
+        ),
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn credential_missing_item_is_not_found_on_windows() {
+    let prelude = wincred_prelude();
+    run_lua_reporting(
+        "credential-wincred-missing",
+        &format!(
+            r#"{prelude}
+            expect("get of a missing item", nil, credential.get(name))
+            expect("delete of a missing item", nil, credential.delete(name))
+            "#
+        ),
+    );
+}
+
 #[test]
 fn hostname_returns_the_os_host_name() {
     let dir = scratch("hostname");
@@ -580,6 +793,12 @@ fn hostname_returns_the_os_host_name() {
         let end = buffer.iter().position(|byte| *byte == 0).unwrap();
         assert_eq!(name.as_bytes(), &buffer[..end]);
     }
+}
+
+fn documented_function<'a>(document: &'a Value, name: &str) -> &'a Value {
+    let functions = document["runtime"]["functions"].as_array().unwrap();
+    let found = functions.iter().find(|entry| entry["name"] == name);
+    found.unwrap_or_else(|| panic!("{name} is not documented"))
 }
 
 #[test]
@@ -644,6 +863,20 @@ fn registry_documentation_formats_are_live_and_structured() {
         .as_str()
         .unwrap()
         .contains("65536"));
+    let credential_get = document["runtime"]["functions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "system.credential.get")
+        .expect("system.credential.get is documented");
+    assert!(credential_get["description"]
+        .as_str()
+        .unwrap()
+        .contains("waits until the user answers"));
+    let backend = documented_function(&document, "system.credential.backend");
+    for field in ["description", "signature"] {
+        assert!(backend[field].as_str().unwrap().contains("'wincred'"));
+    }
     let hostname = document["runtime"]["functions"]
         .as_array()
         .unwrap()
