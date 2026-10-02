@@ -875,7 +875,7 @@ fn cluster_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
             }
         }
         ClusterCommand::Remote(target) => {
-            let node = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".into());
+            let node = remote_node_label(None, remuda_native::hostname::hostname);
             cluster_remote(server, path, &node, target.as_deref())
         }
         ClusterCommand::ListenOff => cluster_listen_off(server, path),
@@ -2171,6 +2171,13 @@ fn cluster_remote(server: &str, path: &Path, node: &str, target: Option<&str>) -
         }),
         Err(error) => fail(format!("cluster remote: {error}")),
     }
+}
+
+fn remote_node_label(
+    _hostname_env: Option<&str>,
+    os_hostname: impl FnOnce() -> std::io::Result<String>,
+) -> String {
+    os_hostname().unwrap_or_else(|_| "local".into())
 }
 
 fn remote_control_label(enabled: bool) -> &'static str {
@@ -3797,6 +3804,20 @@ mod cluster_cli_tests {
             parse_cluster_command(&["remote", "studio/dev"]),
             ClusterCommand::Remote(Some("studio/dev".into()))
         );
+    }
+
+    #[test]
+    fn remote_node_label_uses_os_hostname_instead_of_hostname_env() {
+        let label = super::remote_node_label(Some("from-env"), || Ok("from-os".into()));
+        assert_eq!(label, "from-os");
+    }
+
+    #[test]
+    fn remote_node_label_falls_back_to_local_when_os_lookup_fails() {
+        let label = super::remote_node_label(None, || {
+            Err(std::io::Error::other("hostname lookup failed"))
+        });
+        assert_eq!(label, "local");
     }
 
     #[test]
