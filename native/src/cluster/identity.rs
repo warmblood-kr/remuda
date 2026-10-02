@@ -20,8 +20,8 @@ pub struct NodeIdentity {
     pub static_pubkey: Vec<u8>,
 }
 
-pub(super) fn prepare_cluster_dir() -> io::Result<std::path::PathBuf> {
-    let dir = storage::cluster_state_dir()?.join("cluster");
+pub(super) fn prepare_cluster_dir_at(state_dir: &Path) -> io::Result<std::path::PathBuf> {
+    let dir = state_dir.join("cluster");
     match fs::symlink_metadata(&dir) {
         Ok(_) => {
             check_identity_path(&dir)?;
