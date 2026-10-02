@@ -1,4 +1,6 @@
-use remuda_core::agent::{AgentError, AgentProcess, AgentWriter, Cursor, Result, Size};
+use remuda_core::agent::{
+    AgentError, AgentProcess, AgentWriter, ChainOutcome, Cursor, Result, Size,
+};
 use remuda_core::input::{InputBatch, InputError, InputOutcome};
 use remuda_core::{Clock, ManualClock, Session};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -785,6 +787,93 @@ impl AgentProcess for LateCompletionAgent {
 
     fn screen_text(&mut self) -> Result<String> {
         Ok(String::new())
+    }
+
+    fn cursor(&mut self) -> Result<Cursor> {
+        Ok(Cursor {
+            row: 0,
+            col: 0,
+            visible: true,
+        })
+    }
+
+    fn is_alive(&mut self) -> bool {
+        true
+    }
+
+    fn terminate(&mut self) -> Result<()> {
+        Err(AgentError::Io("not used".into()))
+    }
+
+    fn size(&self) -> Size {
+        Size::default()
+    }
+}
+
+#[test]
+fn type_text_preserves_write_timeout_when_return_chaining_is_unsupported() {
+    let writer = Arc::new(UnsupportedChainWriter {
+        writes: Mutex::new(Vec::new()),
+        timeout: Duration::from_millis(17),
+    });
+    let session = Session::new(
+        "unsupported-return-chain",
+        Box::new(UnsupportedChainAgent {
+            writer: Arc::clone(&writer),
+        }),
+        Arc::new(ManualClock::new()),
+    );
+
+    let result = session.type_text("text", Duration::ZERO);
+
+    assert!(matches!(
+        result,
+        Err(AgentError::WriteTimeout { timeout }) if timeout == Duration::from_millis(17)
+    ));
+    assert_eq!(*writer.writes.lock().unwrap(), [b"text".to_vec()]);
+}
+
+struct UnsupportedChainWriter {
+    writes: Mutex<Vec<Vec<u8>>>,
+    timeout: Duration,
+}
+
+impl AgentWriter for UnsupportedChainWriter {
+    fn write_bounded(&self, bytes: &[u8]) -> Result<()> {
+        self.writes.lock().unwrap().push(bytes.to_vec());
+        Err(AgentError::WriteTimeout {
+            timeout: self.timeout,
+        })
+    }
+
+    fn chain_after_stalled(&self, _follow_up: &[u8], _settle: Duration) -> ChainOutcome {
+        ChainOutcome::Unsupported
+    }
+
+    fn is_busy(&self) -> bool {
+        true
+    }
+}
+
+struct UnsupportedChainAgent {
+    writer: Arc<UnsupportedChainWriter>,
+}
+
+impl AgentProcess for UnsupportedChainAgent {
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.writer.write_bounded(bytes)
+    }
+
+    fn input_writer(&mut self) -> Option<Arc<dyn AgentWriter>> {
+        Some(Arc::clone(&self.writer) as Arc<dyn AgentWriter>)
+    }
+
+    fn screen_text(&mut self) -> Result<String> {
+        Ok("ready".into())
+    }
+
+    fn output_version(&mut self) -> Option<u64> {
+        Some(0)
     }
 
     fn cursor(&mut self) -> Result<Cursor> {
