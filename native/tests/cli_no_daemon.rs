@@ -401,6 +401,184 @@ fn mod_parse_errors_use_exit_two_and_include_help_and_next() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn assert_invalid_mod_command_has_no_side_effects(tag: &str, args: &[&str]) {
+    let dir = scratch(tag);
+    let out = remuda(&dir, args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+    assert!(
+        stderr.contains("Usage:") && stderr.contains("Fix:") && stderr.contains("Next:"),
+        "{args:?}: {stderr}"
+    );
+    assert!(
+        !dir.join("data/remuda/mods").exists(),
+        "{args:?} created the mods directory: {out:?}"
+    );
+    assert!(
+        !remuda_native::daemon::socket_path_in(&dir, "s").exists(),
+        "{args:?} created a daemon socket: {out:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn invalid_mod_install_flags_do_not_touch_the_filesystem_or_daemon() {
+    assert_invalid_mod_command_has_no_side_effects(
+        "mod-install-bogus-flag",
+        &["mod", "install", "owner/repo", "--bogus"],
+    );
+}
+
+#[test]
+fn update_all_with_a_name_does_not_touch_the_filesystem_or_daemon() {
+    assert_invalid_mod_command_has_no_side_effects(
+        "mod-update-all-name",
+        &["mod", "update", "--all", "sample"],
+    );
+}
+
+#[test]
+fn remove_extra_argument_does_not_touch_the_filesystem_or_daemon() {
+    assert_invalid_mod_command_has_no_side_effects(
+        "mod-remove-extra-argument",
+        &["mod", "remove", "sample", "extra"],
+    );
+}
+
+#[test]
+fn invalid_mod_list_format_does_not_touch_the_filesystem_or_daemon() {
+    assert_invalid_mod_command_has_no_side_effects(
+        "mod-list-bad-format",
+        &["mod", "list", "--format", "bad"],
+    );
+}
+
+#[test]
+fn stop_parser_handles_valid_flags_help_and_errors_before_connecting() {
+    for args in [
+        &["stop"][..],
+        &["stop", "-f"],
+        &["stop", "--force"],
+        &["stop", "--yes"],
+        &["stop", "--i-am-inside"],
+        &["stop", "-f", "--yes", "--i-am-inside"],
+    ] {
+        let dir = scratch("stop-valid");
+        let out = remuda(&dir, args);
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        assert!(
+            !remuda_native::daemon::socket_path_in(&dir, "s").exists(),
+            "{args:?} created a daemon socket"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    for (tag, args, code) in [
+        ("stop-bogus-flag", &["stop", "--bogus"][..], Some(2)),
+        ("stop-extra-arg", &["stop", "stray"], Some(2)),
+        ("stop-help", &["stop", "--help"], Some(0)),
+    ] {
+        let (out, touched) = touches_daemon(tag, args);
+        assert!(!touched, "{args:?} connected to the daemon socket");
+        assert_eq!(out.status.code(), code, "{args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if args[1] == "--help" {
+            assert!(stdout.contains("Usage: remuda stop"), "{stdout}");
+            assert!(stderr.is_empty(), "{stderr}");
+        } else {
+            assert!(stderr.contains("Usage: remuda stop"), "{stderr}");
+            assert!(stderr.contains("Fix:"), "{stderr}");
+            assert!(stderr.contains("Next:"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn doc_parser_handles_formats_help_and_errors_before_connecting() {
+    for args in [
+        &["doc"][..],
+        &["doc", "--format", "rst"],
+        &["doc", "--format", "markdown"],
+        &["doc", "--format", "json"],
+    ] {
+        let (out, touched) = touches_daemon("doc-valid", args);
+        assert!(touched, "valid {args:?} did not reach the daemon");
+        assert_ne!(out.status.code(), Some(2), "{args:?}: {out:?}");
+    }
+
+    for (tag, args, code) in [
+        ("doc-bogus-flag", &["doc", "--bogus"][..], Some(2)),
+        ("doc-missing-format", &["doc", "--format"], Some(2)),
+        ("doc-bad-format", &["doc", "--format", "bad"], Some(2)),
+        ("doc-help-cold", &["doc", "--help"], Some(0)),
+    ] {
+        let (out, touched) = touches_daemon(tag, args);
+        assert!(!touched, "{args:?} connected to the daemon socket");
+        assert_eq!(out.status.code(), code, "{args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if args[1] == "--help" {
+            assert!(stdout.contains("Usage: remuda doc"), "{stdout}");
+            assert!(stderr.is_empty(), "{stderr}");
+        } else {
+            assert!(stderr.contains("Usage: remuda doc"), "{stderr}");
+            assert!(stderr.contains("Fix:"), "{stderr}");
+            assert!(stderr.contains("Next:"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn resize_parser_handles_arity_help_and_range_errors_before_connecting() {
+    let (valid, touched) = touches_daemon("resize-valid", &["resize", "session", "80", "24"]);
+    assert!(touched, "valid resize did not reach the daemon");
+    assert_ne!(valid.status.code(), Some(2), "{valid:?}");
+
+    for (tag, args, code) in [
+        (
+            "resize-bogus-flag",
+            &["resize", "session", "80", "24", "--bogus"][..],
+            Some(2),
+        ),
+        ("resize-wrong-arity", &["resize", "session", "80"], Some(2)),
+        (
+            "resize-out-of-range",
+            &["resize", "session", "19", "24"],
+            Some(2),
+        ),
+        ("resize-help-cold", &["resize", "--help"], Some(0)),
+    ] {
+        let (out, touched) = touches_daemon(tag, args);
+        assert!(!touched, "{args:?} connected to the daemon socket");
+        assert_eq!(out.status.code(), code, "{args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if args[1] == "--help" {
+            assert!(
+                stdout.contains("Usage: remuda resize NAME COLS ROWS"),
+                "{stdout}"
+            );
+            assert!(stderr.is_empty(), "{stderr}");
+        } else {
+            assert!(
+                stderr.contains("Usage: remuda resize NAME COLS ROWS"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("Fix:"), "{stderr}");
+            assert!(stderr.contains("Next:"), "{stderr}");
+            if tag == "resize-out-of-range" {
+                assert!(
+                    stderr.starts_with(
+                        "resize dimensions must be integers: cols 20..1000, rows 24..500\n"
+                    ),
+                    "range error wording changed: {stderr}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn upgrade_help_flags_explain_channels_and_daemon_lifecycle() {
     let dir = scratch("upgrade-help-flags");
