@@ -1924,6 +1924,143 @@ pub struct Hold {
     stream: Stream,
     drain: Option<std::thread::JoinHandle<()>>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    writer: HoldInputWriter,
+}
+
+struct HoldInputTask {
+    bytes: Vec<u8>,
+    reply: std::sync::mpsc::SyncSender<std::io::Result<()>>,
+}
+
+struct HoldInputWriter {
+    sender: Option<std::sync::mpsc::SyncSender<HoldInputTask>>,
+    poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wake: std::sync::Arc<std::sync::Mutex<Option<ipc::WakeHandle>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HoldInputWriter {
+    fn new(mut stream: Stream) -> std::io::Result<Self> {
+        let wake = ipc::wake_handle(&stream);
+        let shared_wake = std::sync::Arc::new(std::sync::Mutex::new(Some(wake)));
+        let worker_wake = std::sync::Arc::clone(&shared_wake);
+        let poisoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_poisoned = std::sync::Arc::clone(&poisoned);
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<HoldInputTask>(1);
+        let worker = std::thread::Builder::new()
+            .name("remuda-hold-input".into())
+            .spawn(move || {
+                while let Ok(task) = receiver.recv() {
+                    if worker_poisoned.load(std::sync::atomic::Ordering::SeqCst) {
+                        let _ = task.reply.send(Err(std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "focused input pipe is closed",
+                        )));
+                        break;
+                    }
+                    let result = stream.write_all(&task.bytes).and_then(|()| stream.flush());
+                    if result.is_err() {
+                        worker_poisoned.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    let failed = result.is_err();
+                    let _ = task.reply.send(result);
+                    if failed {
+                        break;
+                    }
+                }
+                // wake_captured uses a raw descriptor/handle. Keep stream close
+                // and invalidating that handle under the same lock as wakeups.
+                let mut wake = worker_wake.lock().unwrap_or_else(|p| p.into_inner());
+                drop(stream);
+                *wake = None;
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            poisoned,
+            wake: shared_wake,
+            worker: Some(worker),
+        })
+    }
+
+    fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
+        if self.poisoned.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "focused input pipe is closed",
+            ));
+        }
+        let (reply, result) = std::sync::mpsc::sync_channel(1);
+        let task = HoldInputTask {
+            bytes: bytes.to_vec(),
+            reply,
+        };
+        let Some(sender) = self.sender.as_ref() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "focused input pipe is closed",
+            ));
+        };
+        if sender.try_send(task).is_err() {
+            self.poison();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "focused input writer is stalled; key batch dropped",
+            ));
+        }
+        match result.recv_timeout(crate::pty::PTY_WRITE_TIMEOUT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                self.poison();
+                Err(error)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.poison();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "focused input write timed out; key batch delivery is uncertain",
+                ))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.poison();
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "focused input writer stopped; key batch dropped",
+                ))
+            }
+        }
+    }
+
+    fn poison(&self) {
+        if !self
+            .poisoned
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let wake = self.wake.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(handle) = *wake {
+                ipc::wake_captured(handle);
+            }
+        }
+    }
+}
+
+impl Drop for HoldInputWriter {
+    fn drop(&mut self) {
+        let was_poisoned = self
+            .poisoned
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
+        if !was_poisoned {
+            let wake = self.wake.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(handle) = *wake {
+                ipc::wake_captured(handle);
+            }
+        }
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            if !was_poisoned || worker.is_finished() {
+                let _ = worker.join();
+            }
+        }
+    }
 }
 
 /// Take a session for the TUI's focused pane. The output is *not* handed back:
@@ -1960,6 +2097,7 @@ fn hold_inner(path: &Path, name: &str, drain_delay: std::time::Duration) -> std:
         Response::Error(reason) => return Err(std::io::Error::other(reason)),
         _ => return Err(std::io::Error::other("daemon did not acknowledge attach")),
     }
+    let writer = HoldInputWriter::new(stream.try_clone()?)?;
     // Drained rather than ignored: the daemon repaints and then streams, and an
     // unread socket fills and parks its output pump.
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1980,6 +2118,7 @@ fn hold_inner(path: &Path, name: &str, drain_delay: std::time::Duration) -> std:
         stream,
         drain: Some(drain),
         stop,
+        writer,
     })
 }
 
@@ -1987,9 +2126,7 @@ impl Hold {
     /// Type exactly these bytes: one `write_all`, nothing appended — the terms
     /// `Attached::write_raw` sets one layer down.
     pub fn keys(&self, bytes: &[u8]) -> std::io::Result<()> {
-        let mut stream = &self.stream;
-        stream.write_all(bytes)?;
-        stream.flush()
+        self.writer.write(bytes)
     }
 }
 
@@ -2412,8 +2549,9 @@ mod tests {
     use super::trace_input_read;
     use super::{
         detach_offset, interpret, report_attach_input_dropped, reset_input_modes, route_tokens,
-        truncate_terminal_text, write_input_trace, AttachInputQueue, AttachRoute, SecretPromptMode,
-        SecretPromptTerminal, ATTACH_INPUT_STALL, DETACH, RESET_INPUT_MODES,
+        truncate_terminal_text, write_input_trace, AttachInputQueue, AttachRoute, Hold,
+        HoldInputWriter, SecretPromptMode, SecretPromptTerminal, ATTACH_INPUT_STALL, DETACH,
+        RESET_INPUT_MODES,
     };
     #[cfg(unix)]
     use super::{read_response_with_timeout, request_with_timeout};
@@ -2727,6 +2865,84 @@ mod tests {
             seq: 1,
             bytes: vec![b'x'; 64 * 1024],
         });
+    }
+
+    #[test]
+    fn hold_keys_returns_by_pty_write_timeout_when_peer_never_drains() {
+        use crate::ipc::TryClone as _;
+        use interprocess::local_socket::traits::Listener as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        const TEST_DEADLINE: Duration = Duration::from_secs(5);
+        static NEXT_PIPE: AtomicU64 = AtomicU64::new(0);
+        let suffix = NEXT_PIPE.fetch_add(1, Ordering::Relaxed);
+        #[cfg(unix)]
+        let path = std::env::temp_dir().join(format!(
+            "remuda-hold-write-{}-{suffix}.sock",
+            std::process::id()
+        ));
+        #[cfg(windows)]
+        let path = Path::new(&format!(
+            r"\\.\pipe\remuda-hold-write-{}-{suffix}",
+            std::process::id()
+        ))
+        .to_path_buf();
+
+        let listener = crate::ipc::listen(&path).expect("listen on a local pipe");
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let peer = std::thread::spawn(move || {
+            let stream = listener.accept().expect("accept Hold");
+            accepted_tx.send(()).expect("report accepted Hold");
+            release_rx.recv().expect("release the undrained peer");
+            drop(stream);
+        });
+        let stream = crate::ipc::connect(&path).expect("connect Hold");
+        accepted_rx
+            .recv_timeout(TEST_DEADLINE)
+            .expect("pipe peer did not accept Hold");
+        let hold = Hold {
+            writer: HoldInputWriter::new(stream.try_clone().expect("clone Hold writer"))
+                .expect("start Hold writer"),
+            stream,
+            drain: None,
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = hold.keys(&vec![b'x'; 64 * 1024 * 1024]);
+            result_tx
+                .send((started.elapsed(), result.map_err(|error| error.kind())))
+                .expect("report Hold write");
+        });
+
+        let bounded =
+            result_rx.recv_timeout(crate::pty::PTY_WRITE_TIMEOUT + Duration::from_millis(500));
+        // A broken implementation must not strand a test thread forever.
+        if bounded.is_err() {
+            release_tx.send(()).expect("release the stuck pipe writer");
+        } else {
+            release_tx.send(()).expect("release the pipe peer");
+        }
+        peer.join().expect("peer thread");
+        let completed = bounded.or_else(|_| result_rx.recv_timeout(TEST_DEADLINE));
+        writer.join().expect("writer thread");
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&path);
+
+        let (elapsed, result) = completed.expect("Hold::keys did not return before test cleanup");
+        assert!(
+            elapsed <= crate::pty::PTY_WRITE_TIMEOUT + Duration::from_millis(500),
+            "Hold::keys exceeded the bounded-write test deadline: {elapsed:?}"
+        );
+        assert_eq!(
+            result,
+            Err(std::io::ErrorKind::TimedOut),
+            "a timed-out batch must be reported as dropped"
+        );
     }
 
     #[cfg(unix)]
