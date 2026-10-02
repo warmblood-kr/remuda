@@ -293,6 +293,106 @@ struct ClientResult {
     status: Option<std::process::ExitStatus>,
     output: String,
     writes: usize,
+    diagnostics: String,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_client_diagnostics(client: &PromptClient) -> String {
+    let pid = client.child.id();
+    let mut lines = Vec::new();
+
+    let master = client.master.lock().unwrap();
+    let termios = master.as_ref().and_then(|master| {
+        let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+        let result = unsafe { libc::tcgetattr(master.as_raw_fd(), &mut termios) };
+        (result == 0).then_some(termios)
+    });
+    if let Some(termios) = termios {
+        lines.push(format!(
+            "pty master flags: ICANON={} ECHO={} ICRNL={} ISIG={}",
+            termios.c_lflag & libc::ICANON != 0,
+            termios.c_lflag & libc::ECHO != 0,
+            termios.c_iflag & libc::ICRNL != 0,
+            termios.c_lflag & libc::ISIG != 0
+        ));
+    } else {
+        lines.push(format!(
+            "pty master tcgetattr failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    drop(master);
+
+    let fd_dir = PathBuf::from(format!("/proc/{pid}/fd"));
+    let mut descriptors = Vec::new();
+    match fs::read_dir(&fd_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let target = fs::read_link(entry.path())
+                    .map(|target| target.display().to_string())
+                    .unwrap_or_else(|error| format!("<readlink failed: {error}>"));
+                descriptors.push(format!("{name} -> {target}"));
+            }
+            descriptors.sort();
+            lines.push(format!("/proc/{pid}/fd: {}", descriptors.join("; ")));
+        }
+        Err(error) => lines.push(format!("/proc/{pid}/fd failed: {error}")),
+    }
+
+    let task_dir = PathBuf::from(format!("/proc/{pid}/task"));
+    match fs::read_dir(&task_dir) {
+        Ok(entries) => {
+            let mut threads = Vec::new();
+            for entry in entries.flatten() {
+                let task_id = entry.file_name().to_string_lossy().into_owned();
+                let task_path = entry.path();
+                let comm = fs::read_to_string(task_path.join("comm"))
+                    .map(|value| value.trim().to_owned())
+                    .unwrap_or_else(|error| format!("<read failed: {error}>"));
+                let wchan = fs::read_to_string(task_path.join("wchan"))
+                    .map(|value| value.trim().to_owned())
+                    .unwrap_or_else(|error| format!("<read failed: {error}>"));
+                let state = fs::read_to_string(task_path.join("status"))
+                    .ok()
+                    .and_then(|status| {
+                        status
+                            .lines()
+                            .find(|line| line.starts_with("State:"))
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "State: <unavailable>".to_owned());
+                threads.push(format!("{task_id}: comm={comm} wchan={wchan} {state}"));
+            }
+            threads.sort();
+            lines.push(format!("/proc/{pid}/task: {}", threads.join("; ")));
+        }
+        Err(error) => lines.push(format!("/proc/{pid}/task failed: {error}")),
+    }
+
+    let stat_path = format!("/proc/{pid}/stat");
+    match fs::read_to_string(&stat_path) {
+        Ok(stat) => {
+            let fields = stat
+                .rsplit_once(')')
+                .map(|(_, fields)| fields.split_whitespace().collect::<Vec<_>>());
+            match fields {
+                Some(fields) if fields.len() > 5 => lines.push(format!(
+                    "/proc/{pid}/stat: tty_nr={} tpgid={}",
+                    fields[4], fields[5]
+                )),
+                _ => lines.push(format!("/proc/{pid}/stat: could not parse {stat:?}")),
+            }
+        }
+        Err(error) => lines.push(format!("/proc/{pid}/stat failed: {error}")),
+    }
+
+    lines.join("\n")
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_client_diagnostics(_client: &PromptClient) -> String {
+    "Linux /proc diagnostics unavailable on this platform".to_owned()
 }
 
 fn waiting_prompt(dir: &Path) -> PromptClient {
@@ -311,6 +411,7 @@ fn answer_prompt(dir: &Path) -> ClientResult {
     std::thread::sleep(Duration::from_millis(500));
     let mut writes = 0;
     let mut status = None;
+    let mut diagnostics = String::new();
     for _ in 0..=5 {
         client.write_terminal(b"answer\r");
         writes += 1;
@@ -318,11 +419,16 @@ fn answer_prompt(dir: &Path) -> ClientResult {
         if status.is_some() {
             break;
         }
+        if diagnostics.is_empty() {
+            diagnostics = linux_client_diagnostics(&client);
+            eprintln!("client diagnostics after write {writes}:\n{diagnostics}");
+        }
     }
     let result = ClientResult {
         status,
         output: client.captured_output(),
         writes,
+        diagnostics,
     };
     client.cleanup();
     daemon.stop(dir);
@@ -337,6 +443,7 @@ fn stop_daemon_with_prompt(dir: &Path) -> ClientResult {
         status: client.wait(),
         output: client.captured_output(),
         writes: 0,
+        diagnostics: String::new(),
     };
     client.cleanup();
     result
@@ -350,6 +457,7 @@ fn sigterm_with_prompt(dir: &Path) -> ClientResult {
         status: client.wait(),
         output: client.captured_output(),
         writes: 0,
+        diagnostics: String::new(),
     };
     client.cleanup();
     daemon.stop(dir);
@@ -365,6 +473,7 @@ fn close_terminal_with_daemon_stop(dir: &Path) -> ClientResult {
         status: client.wait(),
         output: client.captured_output(),
         writes: 0,
+        diagnostics: String::new(),
     };
     client.cleanup();
     result
@@ -379,6 +488,7 @@ fn close_terminal_with_sigterm(dir: &Path) -> ClientResult {
         status: client.wait(),
         output: client.captured_output(),
         writes: 0,
+        diagnostics: String::new(),
     };
     client.cleanup();
     daemon.stop(dir);
@@ -398,10 +508,11 @@ fn prompt_client_exits_when_daemon_or_terminal_disappears_and_on_sigterm() {
     eprintln!("normal answer writes needed: {}", normal_answer.writes);
     assert!(
         normal_answer.status.is_some_and(|status| status.success()),
-        "answering a normal prompt did not succeed after {} writes: {:?}; client output: {}",
+        "answering a normal prompt did not succeed after {} writes: {:?}; client output: {}; diagnostics: {}",
         normal_answer.writes,
         normal_answer.status,
-        normal_answer.output
+        normal_answer.output,
+        normal_answer.diagnostics
     );
     assert!(
         normal_answer.output.contains("answer: answer"),
