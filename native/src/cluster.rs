@@ -19,8 +19,10 @@ pub use replication::{
     push_now, push_now_excluding, push_now_with_revoked_target, registry_changed, PeerPushResult,
 };
 
+use std::fs;
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 
 /// Take the per-user cluster-listener host lock without waiting. The returned
 /// file keeps the OS lock alive until the hosting listener drops it.
@@ -68,34 +70,57 @@ pub enum RevokeOutcome {
 
 /// Initialize the local identity and cluster-of-one registry.
 pub fn init() -> io::Result<(NodeIdentity, bool)> {
-    {
-        let dir = identity::prepare_cluster_dir()?;
-        let _guard = storage::StateLock::acquire(&dir)?;
-        let (node, created) = identity::init_identity_locked(&dir)?;
-        let mut registry = registry::load_registry_at(&dir)?;
-        registry.merge(&Registry {
-            authorized_nodes: vec![AuthorizedNode {
-                node_fp: node.node_fp.clone(),
-                static_pubkey: encoding::encode_base64(&node.static_pubkey),
-                delivered_by: None,
-                format_major: 1,
-                format_minor: 0,
-                optional_fields: std::collections::BTreeMap::new(),
-                endpoint: None,
-                state: NodeState::Admitted,
-                version: 1,
-                by: node.node_fp.clone(),
-            }],
-        })?;
-        registry::save_registry_at(&dir, &registry)?;
-        Ok((node, created))
-    }
+    let (identity, created, _) = init_with_notice()?;
+    Ok((identity, created))
+}
+
+/// Initialize the local identity and return a fingerprint recovered from a
+/// prior cluster directory that was missing, if one was recorded.
+pub fn init_with_notice() -> io::Result<(NodeIdentity, bool, Option<String>)> {
+    init_at(&storage::cluster_state_dir()?)
+}
+
+fn init_at(state_dir: &Path) -> io::Result<(NodeIdentity, bool, Option<String>)> {
+    let cluster_dir = state_dir.join("cluster");
+    let previous_fingerprint = match fs::symlink_metadata(&cluster_dir) {
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            storage::read_cluster_init_marker(state_dir)?
+        }
+        Err(error) => return Err(error),
+    };
+    let dir = identity::prepare_cluster_dir_at(state_dir)?;
+    let _guard = storage::StateLock::acquire(&dir)?;
+    let (node, created) = identity::init_identity_locked(&dir)?;
+    let mut registry = registry::load_registry_at(&dir)?;
+    registry.merge(&Registry {
+        authorized_nodes: vec![AuthorizedNode {
+            node_fp: node.node_fp.clone(),
+            static_pubkey: encoding::encode_base64(&node.static_pubkey),
+            delivered_by: None,
+            format_major: 1,
+            format_minor: 0,
+            optional_fields: std::collections::BTreeMap::new(),
+            endpoint: None,
+            state: NodeState::Admitted,
+            version: 1,
+            by: node.node_fp.clone(),
+        }],
+    })?;
+    registry::save_registry_at(&dir, &registry)?;
+    storage::write_cluster_init_marker(state_dir, &node.node_fp)?;
+    Ok((
+        node,
+        created,
+        if created { previous_fingerprint } else { None },
+    ))
 }
 
 /// Replace the local identity and reset membership to the new local node only.
 /// The caller must confirm this disruptive operation in the CLI.
 pub fn init_new_identity() -> io::Result<NodeIdentity> {
-    let dir = identity::prepare_cluster_dir()?;
+    let state_dir = storage::cluster_state_dir()?;
+    let dir = identity::prepare_cluster_dir_at(&state_dir)?;
     let _guard = storage::StateLock::acquire(&dir)?;
     identity::load_identity_at(&dir)?;
     join_token::clear_at(&dir)?;
@@ -119,6 +144,7 @@ pub fn init_new_identity() -> io::Result<NodeIdentity> {
         },
     )?;
     control::clear_revoked_notice_at(&dir)?;
+    storage::write_cluster_init_marker(&state_dir, &node.node_fp)?;
     Ok(node)
 }
 
@@ -595,6 +621,92 @@ fn cluster_not_initialized_error() -> io::Error {
 
 pub fn node_label(fingerprint: &str) -> String {
     identity::node_name(fingerprint)
+}
+
+#[cfg(test)]
+mod init_marker_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct TempStateDir(PathBuf);
+
+    impl TempStateDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "remuda-cluster-init-marker-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&path);
+            Self(path)
+        }
+    }
+
+    impl Drop for TempStateDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn missing_cluster_uses_marker_and_records_the_replacement_fingerprint() {
+        let state_dir = TempStateDir::new();
+        let (first, first_created, first_prior) = init_at(&state_dir.0).unwrap();
+        assert!(first_created);
+        assert!(first_prior.is_none());
+        assert_eq!(
+            storage::read_cluster_init_marker(&state_dir.0)
+                .unwrap()
+                .as_deref(),
+            Some(first.node_fp.as_str())
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(state_dir.0.join("cluster-initialized"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let (same, same_created, same_prior) = init_at(&state_dir.0).unwrap();
+        assert_eq!(same.node_fp, first.node_fp);
+        assert!(!same_created);
+        assert!(same_prior.is_none());
+
+        fs::remove_dir_all(state_dir.0.join("cluster")).unwrap();
+        let (replacement, replacement_created, previous) = init_at(&state_dir.0).unwrap();
+        assert!(replacement_created);
+        assert_ne!(replacement.node_fp, first.node_fp);
+        assert_eq!(previous.as_deref(), Some(first.node_fp.as_str()));
+        assert_eq!(
+            storage::read_cluster_init_marker(&state_dir.0)
+                .unwrap()
+                .as_deref(),
+            Some(replacement.node_fp.as_str())
+        );
+    }
+
+    #[test]
+    fn existing_cluster_without_marker_does_not_report_a_previous_fingerprint() {
+        let state_dir = TempStateDir::new();
+        let (first, created, previous) = init_at(&state_dir.0).unwrap();
+        assert!(created);
+        assert!(previous.is_none());
+        fs::remove_file(state_dir.0.join("cluster-initialized")).unwrap();
+
+        let (same, created, previous) = init_at(&state_dir.0).unwrap();
+        assert_eq!(same.node_fp, first.node_fp);
+        assert!(!created);
+        assert!(previous.is_none());
+    }
 }
 
 #[cfg(all(test, unix))]
