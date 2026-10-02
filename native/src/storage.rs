@@ -469,6 +469,7 @@ fn entry_stat(directory: &fs::File, name: &str) -> io::Result<Option<libc::stat>
 fn collect_at(
     directory: &fs::File,
     prefix: &str,
+    wanted_prefix: &str,
     parts: usize,
     names: &mut Vec<String>,
     limit: usize,
@@ -492,10 +493,12 @@ fn collect_at(
             continue;
         };
         let kind = stat.st_mode & libc::S_IFMT;
-        if kind == libc::S_IFDIR && parts < MAX_STORAGE_PARTS {
+        let may_match = relative.starts_with(wanted_prefix)
+            || wanted_prefix.starts_with(&format!("{relative}/"));
+        if kind == libc::S_IFDIR && parts < MAX_STORAGE_PARTS && may_match {
             let child = open_directory_at(directory, &name, false)?;
-            collect_at(&child, &relative, parts + 1, names, limit)?;
-        } else if kind == libc::S_IFREG {
+            collect_at(&child, &relative, wanted_prefix, parts + 1, names, limit)?;
+        } else if kind == libc::S_IFREG && relative.starts_with(wanted_prefix) {
             names.push(relative);
         }
     }
@@ -692,26 +695,25 @@ fn delete_location(location: &FileLocation) -> io::Result<bool> {
     }
 }
 
-fn list_location(location: &FileLocation, limit: usize) -> io::Result<Vec<String>> {
+fn list_location(location: &FileLocation, prefix: &str, limit: usize) -> io::Result<Vec<String>> {
     #[cfg(unix)]
     {
         let mut names = Vec::new();
-        collect_at(&location.directory, "", 0, &mut names, limit)?;
+        collect_at(&location.directory, "", prefix, 0, &mut names, limit)?;
         names.sort();
         Ok(names)
     }
     #[cfg(not(unix))]
     {
-        let mut names = collect_files_if_present(&location.path)?;
-        names.truncate(limit);
+        let mut names = collect_files_matching(&location.path, prefix, limit)?;
         names.sort();
         Ok(names)
     }
 }
 
 fn select_list_names(mut names: Vec<String>, prefix: &str, limit: usize) -> Vec<String> {
-    names.truncate(limit);
     names.retain(|name| name.starts_with(prefix));
+    names.truncate(limit);
     names.sort();
     names
 }
@@ -744,6 +746,7 @@ fn collect_files(
     dir: &std::path::Path,
     prefix: &str,
     names: &mut Vec<String>,
+    limit: usize,
 ) -> io::Result<()> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -755,7 +758,7 @@ fn collect_files(
         let path = entry.path();
         let kind = entry.file_type()?;
         if kind.is_dir() {
-            collect_files(base, &path, prefix, names)?;
+            collect_files(base, &path, prefix, names, limit)?;
         } else if kind.is_file()
             && !path
                 .file_name()
@@ -763,10 +766,7 @@ fn collect_files(
                 .is_some_and(|name| name.starts_with(ATOMIC_TEMP_PREFIX))
         {
             if let Some(name) = path.strip_prefix(base).ok().and_then(lua_relative_name) {
-                if name.starts_with(prefix)
-                    && checked_name(&name).is_ok()
-                    && names.len() < MAX_STORAGE_ENTRIES
-                {
+                if name.starts_with(prefix) && checked_name(&name).is_ok() && names.len() < limit {
                     names.push(name);
                 }
             }
@@ -777,8 +777,13 @@ fn collect_files(
 
 #[cfg(any(not(unix), test))]
 fn collect_files_if_present(base: &Path) -> io::Result<Vec<String>> {
+    collect_files_matching(base, "", MAX_STORAGE_ENTRIES)
+}
+
+#[cfg(any(not(unix), test))]
+fn collect_files_matching(base: &Path, prefix: &str, limit: usize) -> io::Result<Vec<String>> {
     let mut names = Vec::new();
-    collect_files(base, base, "", &mut names)?;
+    collect_files(base, base, prefix, &mut names, limit)?;
     Ok(names)
 }
 
@@ -965,7 +970,7 @@ impl KindHandle {
             let namespace = self
                 .file_path("", false)
                 .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
-            let entries = list_location(&namespace, usize::MAX)
+            let entries = list_location(&namespace, "", usize::MAX)
                 .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
             if case_clashes(&entries, &key.2) {
                 return Err(mlua::Error::runtime("remuda.storage name collides by case"));
@@ -1076,7 +1081,7 @@ impl KindHandle {
                 }
                 Err(error) => return Err(mlua::Error::runtime(storage_io_error(error))),
             };
-            let names = list_location(&location, MAX_STORAGE_ENTRIES)
+            let names = list_location(&location, &prefix, MAX_STORAGE_ENTRIES)
                 .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
             return lua.create_sequence_from(select_list_names(
                 names,
