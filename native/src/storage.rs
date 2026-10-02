@@ -805,6 +805,56 @@ mod tests {
             .unwrap();
     }
 
+    #[test]
+    fn lua_relative_name_uses_forward_slashes() {
+        let path = PathBuf::from("mail").join("nested").join("a.bin");
+        assert_eq!(
+            lua_relative_name(&path).as_deref(),
+            Some("mail/nested/a.bin")
+        );
+    }
+
+    #[test]
+    fn xdg_namespaces_live_below_storage_subdirectory() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load("remuda.storage.get('cluster'):state():write('key', 'value')")
+            .exec()
+            .unwrap();
+        assert!(root.0.join("state/storage/cluster/key").is_file());
+        assert!(!root.0.join("state/cluster/key").exists());
+        let path: String = lua
+            .load("return remuda.storage.path('state', 'key')")
+            .eval()
+            .unwrap();
+        assert_eq!(
+            PathBuf::from(path),
+            root.0.join("state/storage/default/key")
+        );
+    }
+
+    #[test]
+    fn xdg_list_skips_and_reserves_atomic_temporary_names() {
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/listed");
+        fs::create_dir_all(&namespace).unwrap();
+        fs::write(namespace.join("regular"), b"file").unwrap();
+        fs::write(namespace.join(".remuda-atomic-123.tmp"), b"temporary").unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"
+            local files = remuda.storage.get("listed"):data()
+            local names = files:list()
+            assert(#names == 1 and names[1] == "regular")
+            assert(not pcall(function() files:write(".remuda-atomic-user.tmp", "x") end))
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
     fn run_handle_conformance(lua: &Lua, backend: &str) {
         select_backend(lua, backend);
         lua.load(HANDLE_CONFORMANCE).exec().unwrap();
