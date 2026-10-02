@@ -583,7 +583,7 @@ fn credential_rejects_invalid_names_and_secret_lengths() {
             r#"{CREDENTIAL_PRELUDE}
             local bad_names = {{
               "", string.rep("a", 256), "tab\there", "line\nbreak", "nul\0byte",
-              "del\127", "caf\195\169", {{}}, true,
+              "del\127", "caf\195\169", "has space", {{}}, true,
             }}
             for index, name in ipairs(bad_names) do
               for _, word in ipairs({{ "put", "get", "delete" }}) do
@@ -635,6 +635,42 @@ fn credential_is_unavailable_where_no_backend_exists() {
               assert(value == nil, "expected nil, got " .. tostring(value))
               assert(reason == want, "reason is " .. tostring(reason))
             end
+            "#
+        ),
+    );
+}
+
+// Writes to the real login Keychain, so it never runs by default: run it by
+// hand with `--ignored`. It removes its own item even when an assertion fails.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "writes to the real login Keychain"]
+fn credential_round_trip_in_the_login_keychain() {
+    let pid = std::process::id();
+    run_lua(
+        "credential-round-trip",
+        &format!(
+            r#"{CREDENTIAL_PRELUDE}
+            local hex = remuda.random_bytes(8):gsub(".", function(byte)
+              return string.format("%02x", byte:byte())
+            end)
+            local name = "remuda-test/{pid}-" .. hex
+            local secret = "round\0trip\255-" .. hex
+            local ok, err = pcall(function()
+              local value, reason = credential.get(name)
+              assert(value == nil and reason == "not_found", "get before put: " .. tostring(reason))
+              assert(credential.put(name, secret) == true, "put")
+              assert(credential.get(name) == secret, "get returns the stored bytes")
+              assert(credential.put(name, "replaced") == true, "put replaces")
+              assert(credential.get(name) == "replaced", "get returns the replacement")
+              assert(credential.delete(name) == true, "delete")
+              value, reason = credential.get(name)
+              assert(value == nil and reason == "not_found", "get after delete: " .. tostring(reason))
+              value, reason = credential.delete(name)
+              assert(value == nil and reason == "not_found", "second delete: " .. tostring(reason))
+            end)
+            credential.delete(name)
+            assert(ok, err)
             "#
         ),
     );

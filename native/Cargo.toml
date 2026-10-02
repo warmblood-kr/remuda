@@ -63,6 +63,14 @@ nix = { version = "0.28.0", features = ["socket"] }
 # the graph transitively via several other deps (mio, parking_lot_core, ...).
 libc = "0.2"
 
+# `remuda.system.credential`: the login Keychain, generic passwords. Only the
+# Apple store is compiled; every other OS answers `unavailable` without it.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "=3.6.3", default-features = false, features = ["apple-native"] }
+# Already in the graph via `keyring`, pinned to the version it uses: named here
+# only to read the OSStatus that tells a refused prompt from a locked keychain.
+security-framework = "=2.11.1"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_SystemInformation", "Win32_System_Threading"] }
 
