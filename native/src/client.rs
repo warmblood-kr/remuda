@@ -1935,13 +1935,15 @@ struct HoldInputTask {
 struct HoldInputWriter {
     sender: Option<std::sync::mpsc::SyncSender<HoldInputTask>>,
     poisoned: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    wake: ipc::WakeHandle,
+    wake: std::sync::Arc<std::sync::Mutex<Option<ipc::WakeHandle>>>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HoldInputWriter {
     fn new(mut stream: Stream) -> std::io::Result<Self> {
         let wake = ipc::wake_handle(&stream);
+        let shared_wake = std::sync::Arc::new(std::sync::Mutex::new(Some(wake)));
+        let worker_wake = std::sync::Arc::clone(&shared_wake);
         let poisoned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let worker_poisoned = std::sync::Arc::clone(&poisoned);
         let (sender, receiver) = std::sync::mpsc::sync_channel::<HoldInputTask>(1);
@@ -1966,11 +1968,16 @@ impl HoldInputWriter {
                         break;
                     }
                 }
+                // wake_captured uses a raw descriptor/handle. Keep stream close
+                // and invalidating that handle under the same lock as wakeups.
+                let mut wake = worker_wake.lock().unwrap_or_else(|p| p.into_inner());
+                drop(stream);
+                *wake = None;
             })?;
         Ok(Self {
             sender: Some(sender),
             poisoned,
-            wake,
+            wake: shared_wake,
             worker: Some(worker),
         })
     }
@@ -2010,7 +2017,7 @@ impl HoldInputWriter {
                 self.poison();
                 Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "focused input write timed out; key batch dropped",
+                    "focused input write timed out; key batch delivery is uncertain",
                 ))
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -2028,7 +2035,10 @@ impl HoldInputWriter {
             .poisoned
             .swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            ipc::wake_captured(self.wake);
+            let wake = self.wake.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(handle) = *wake {
+                ipc::wake_captured(handle);
+            }
         }
     }
 }
@@ -2039,7 +2049,10 @@ impl Drop for HoldInputWriter {
             .poisoned
             .swap(true, std::sync::atomic::Ordering::SeqCst);
         if !was_poisoned {
-            ipc::wake_captured(self.wake);
+            let wake = self.wake.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(handle) = *wake {
+                ipc::wake_captured(handle);
+            }
         }
         self.sender.take();
         if let Some(worker) = self.worker.take() {
