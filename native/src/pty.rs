@@ -265,6 +265,17 @@ fn run_writer(
             result
         }))
         .unwrap_or_else(|_| Err(io("pty writer panicked")));
+        if result.is_err() {
+            let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.stalled_sequence == Some(task.sequence) {
+                state.late_submit_abandoned_at = Some(
+                    clock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .now(),
+                );
+            }
+        }
         drop(reset_busy);
         let _ = task.result.send(result);
     }
@@ -862,7 +873,7 @@ impl AgentProcess for PtyAgent {
 mod input_writer_tests {
     use super::*;
     use remuda_core::Clock;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     struct StalledWrite {
         started: Mutex<Option<Sender<()>>>,
@@ -874,6 +885,14 @@ mod input_writer_tests {
 
     struct SequentialStallWrite {
         started: Sender<Vec<u8>>,
+        release: Mutex<Receiver<()>>,
+        captured: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct DelayedFailureWrite {
+        fail_on_write: usize,
+        write_count: AtomicUsize,
+        started: Sender<usize>,
         release: Mutex<Receiver<()>>,
         captured: Arc<Mutex<Vec<u8>>>,
     }
@@ -1034,6 +1053,25 @@ mod input_writer_tests {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.started.send(bytes.to_vec()).unwrap();
             self.release.lock().unwrap().recv().unwrap();
+            self.captured.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Write for DelayedFailureWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let write_number = self.write_count.fetch_add(1, Ordering::AcqRel) + 1;
+            if write_number <= self.fail_on_write {
+                self.started.send(write_number).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                if write_number == self.fail_on_write {
+                    return Err(std::io::Error::other("injected late PTY write failure"));
+                }
+            }
             self.captured.lock().unwrap().extend_from_slice(bytes);
             Ok(bytes.len())
         }
@@ -1302,6 +1340,74 @@ mod input_writer_tests {
             *captured.lock().unwrap(),
             b"textsecond after late completion"
         );
+    }
+
+    fn assert_late_write_error_is_reported(fail_on_write: usize, captured_before_retry: &[u8]) {
+        let (started_tx, started_rx) = channel();
+        let (release_tx, release_rx) = channel();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer: SharedWriter = Arc::new(Mutex::new(Box::new(DelayedFailureWrite {
+            fail_on_write,
+            write_count: AtomicUsize::new(0),
+            started: started_tx,
+            release: Mutex::new(release_rx),
+            captured: Arc::clone(&captured),
+        })));
+        let clock = Arc::new(remuda_core::ManualClock::new());
+        let writer = Arc::new(
+            PtyInputWriter::spawn(writer, Duration::from_millis(50), PTY_LATE_SUBMIT_BOUND)
+                .unwrap(),
+        );
+        writer.set_clock(clock.clone());
+
+        let first_writer = Arc::clone(&writer);
+        let first = std::thread::spawn(move || first_writer.write_bounded(b"text"));
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        assert!(matches!(
+            first.join().unwrap(),
+            Err(AgentError::WriteTimeout { .. })
+        ));
+        assert_eq!(
+            writer.chain_after_stalled(b"\r", Duration::ZERO),
+            ChainOutcome::Chained
+        );
+        let expected_abandonment_at = clock.now();
+
+        release_tx.send(()).unwrap();
+        if fail_on_write == 2 {
+            assert_eq!(started_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 2);
+            release_tx.send(()).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while writer.is_busy() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!writer.is_busy());
+        assert_eq!(*captured.lock().unwrap(), captured_before_retry);
+        assert_eq!(
+            writer.state.lock().unwrap().late_submit_abandoned_at,
+            Some(expected_abandonment_at)
+        );
+
+        clock.advance(PTY_LATE_SUBMIT_BOUND + Duration::from_millis(1));
+        assert!(matches!(
+            writer.write_bounded(b"later input"),
+            Err(AgentError::LateSubmitAbandoned { bound }) if bound == PTY_LATE_SUBMIT_BOUND
+        ));
+        writer.write_bounded(b"later input").unwrap();
+        let mut expected = captured_before_retry.to_vec();
+        expected.extend_from_slice(b"later input");
+        assert_eq!(*captured.lock().unwrap(), expected);
+    }
+
+    #[test]
+    fn late_text_write_error_is_reported_to_the_next_sender() {
+        assert_late_write_error_is_reported(1, b"");
+    }
+
+    #[test]
+    fn late_chained_return_error_is_reported_to_the_next_sender() {
+        assert_late_write_error_is_reported(2, b"text");
     }
 
     #[test]
