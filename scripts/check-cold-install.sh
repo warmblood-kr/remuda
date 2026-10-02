@@ -62,7 +62,7 @@ check_nightly_succeeds() {
 		exit 1
 	fi
 	case "$out" in
-	*"Next: export PATH=\"$REMUDA_INSTALL_DIR:\$PATH\""*) ;;
+	*"Next: export PATH='$REMUDA_INSTALL_DIR':\"\$PATH\""*) ;;
 	*)
 		rm -rf "$tmp"
 		echo "check-cold-install: an install dir that is not on PATH got no 'Next: export PATH=...' line: $out" >&2

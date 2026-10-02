@@ -170,7 +170,17 @@ case ":$PATH:" in
 *":$install_dir:"*) ;;
 *)
 	echo "install.sh: $install_dir is not on your PATH — add it to your shell profile" >&2
-	echo "Next: export PATH=\"$install_dir:\$PATH\"  (add this line to your shell profile to keep it)" >&2
+	# The dir is the person's own input and the line is made to be pasted:
+	# single quotes keep `$(...)`, backticks and `"` in it inert. A newline
+	# cannot be one line at all, so that dir gets no command.
+	case "$install_dir" in
+	*"
+"*) ;;
+	*)
+		printf "Next: export PATH='%s':\"\$PATH\"\n" "$(printf '%s' "$install_dir" | sed "s/'/'\\\\''/g")" >&2
+		echo "Add that line to your shell profile to keep it." >&2
+		;;
+	esac
 	;;
 esac
 
