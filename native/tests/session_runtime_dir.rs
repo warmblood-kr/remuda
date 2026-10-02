@@ -52,7 +52,7 @@ mod unix {
 
     impl Daemon {
         fn start(runtime: &Path, home: &Path, server: &str) -> Self {
-            let mut child = Command::new(env!("CARGO_BIN_EXE_remuda"))
+            let child = Command::new(env!("CARGO_BIN_EXE_remuda"))
                 .args(["-s", server, "daemon"])
                 .env("HOME", home)
                 .env("XDG_RUNTIME_DIR", runtime)
@@ -64,9 +64,10 @@ mod unix {
                 .spawn()
                 .expect("start isolated daemon");
             let socket = daemon::socket_path_in(runtime, server);
+            let mut daemon = Self(child);
             let deadline = Instant::now() + Duration::from_secs(10);
             while ipc::connect(&socket).is_err() {
-                if let Ok(Some(status)) = child.try_wait() {
+                if let Ok(Some(status)) = daemon.0.try_wait() {
                     panic!("isolated daemon exited before binding {socket:?}: {status}");
                 }
                 assert!(
@@ -75,7 +76,7 @@ mod unix {
                 );
                 thread::sleep(Duration::from_millis(10));
             }
-            Self(child)
+            daemon
         }
     }
 
