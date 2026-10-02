@@ -6,10 +6,12 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const WAIT: Duration = Duration::from_secs(10);
+static NEXT_SCRATCH_DIR: AtomicU64 = AtomicU64::new(0);
 
 struct ScratchDir(PathBuf);
 
@@ -37,7 +39,8 @@ fn scratch_dir() -> ScratchDir {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    ScratchDir(root.join(format!("remuda-prompt-exit-{}-{stamp}", std::process::id())))
+    let serial = NEXT_SCRATCH_DIR.fetch_add(1, Ordering::Relaxed);
+    ScratchDir(root.join(format!("rpe-{}-{stamp}-{serial}", std::process::id())))
 }
 
 fn prepare(dir: &Path) {
