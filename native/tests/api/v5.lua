@@ -166,9 +166,11 @@ assert(session.close(name) == nil, "session.close must preserve close's return v
 
 -- Styled capture exposes the cursor and dim spans needed by caller-owned
 -- prompt interpretation without adding agent-specific policy to core.
-assert(type(remuda._api_v5_test_pid) == "number",
-  "the v5 test must provide a unique session-name suffix")
-local capture_name = "api-v5-capture-" .. tostring(remuda._api_v5_test_pid)
+local capture_suffix = remuda._api_v5_test_pid
+if capture_suffix == nil then
+  capture_suffix = tostring(os.time()) .. "-" .. tostring(math.random(1, 1e9))
+end
+local capture_name = "api-v5-capture-" .. tostring(capture_suffix)
 session.new(capture_name, { "sh" })
 local capture_ok, capture_error = pcall(function()
   local screen = remuda.capture_styled(capture_name)
