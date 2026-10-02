@@ -795,6 +795,12 @@ fn hostname_returns_the_os_host_name() {
     }
 }
 
+fn documented_function<'a>(document: &'a Value, name: &str) -> &'a Value {
+    let functions = document["runtime"]["functions"].as_array().unwrap();
+    let found = functions.iter().find(|entry| entry["name"] == name);
+    found.unwrap_or_else(|| panic!("{name} is not documented"))
+}
+
 #[test]
 fn registry_documentation_formats_are_live_and_structured() {
     let dir = scratch("registry-docs");
@@ -867,6 +873,10 @@ fn registry_documentation_formats_are_live_and_structured() {
         .as_str()
         .unwrap()
         .contains("waits until the user answers"));
+    let backend = documented_function(&document, "system.credential.backend");
+    for field in ["description", "signature"] {
+        assert!(backend[field].as_str().unwrap().contains("'wincred'"));
+    }
     let hostname = document["runtime"]["functions"]
         .as_array()
         .unwrap()

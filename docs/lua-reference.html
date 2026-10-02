@@ -150,13 +150,13 @@
 <h2 id="system">system</h2>
 <p><code>table</code> — OS services for trusted Lua callers.</p>
 <h2 id="system.credential.backend">system.credential.backend</h2>
-<p><code>system.credential.backend() -&gt; 'keychain' | nil</code> — The OS credential store in use: 'keychain' (the macOS login Keychain), or nil where there is none, in which case put, get and delete return nil, 'unavailable: no credential store on this OS'.</p>
+<p><code>system.credential.backend() -&gt; 'keychain' | 'wincred' | nil</code> — The OS credential store in use: 'keychain' (the macOS login Keychain), 'wincred' (Windows Credential Manager), or nil where there is none, in which case put, get and delete return nil, 'unavailable: no credential store on this OS'.</p>
 <h2 id="system.credential.delete">system.credential.delete</h2>
 <p><code>system.credential.delete(name) -&gt; true | nil, reason</code> — Remove a stored secret. The reason is 'not_found' when nothing is stored under name, or starts with 'unavailable: ' or 'denied: '.</p>
 <h2 id="system.credential.get">system.credential.get</h2>
 <p><code>system.credential.get(name) -&gt; secret | nil, reason</code> — Read a secret back, binary-safe. The reason is 'not_found' when nothing is stored under name, or starts with 'unavailable: ' or 'denied: '. On macOS the Keychain may ask the user to allow access; the call, and the whole Lua image with it, waits until the user answers.</p>
 <h2 id="system.credential.put">system.credential.put</h2>
-<p><code>system.credential.put(name, secret) -&gt; true | nil, reason</code> — Store a secret in the OS credential store under service 'remuda' and account name, replacing any earlier value. name is 1 to 255 printable ASCII characters without spaces; secret is 1 to 2048 bytes; anything else raises a Lua error. Returns nil and a reason starting with 'unavailable: ' or 'denied: ' when the store cannot be used. Any Lua code in this image can read what is stored here.</p>
+<p><code>system.credential.put(name, secret) -&gt; true | nil, reason</code> — Store a secret in the OS credential store under service 'remuda' and account name, replacing any earlier value. name is 1 to 255 printable ASCII characters without spaces; secret is 1 to 2048 bytes; anything else raises a Lua error. Returns nil and a reason starting with 'unavailable: ' or 'denied: ' when the store cannot be used. The store is not a sandbox: any Lua code in this image, MCP run_script included, can read, replace or delete what is stored here.</p>
 <h2 id="tool">tool</h2>
 <p><code>tool(spec) -&gt; word</code> — Define a word and export it as an MCP tool.</p>
 <h2 id="tools">tools</h2>

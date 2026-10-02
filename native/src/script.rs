@@ -360,7 +360,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "system.credential.put",
-        "Store a secret in the OS credential store under service 'remuda' and account name, replacing any earlier value. name is 1 to 255 printable ASCII characters without spaces; secret is 1 to 2048 bytes; anything else raises a Lua error. Returns nil and a reason starting with 'unavailable: ' or 'denied: ' when the store cannot be used. Any Lua code in this image can read what is stored here.",
+        "Store a secret in the OS credential store under service 'remuda' and account name, replacing any earlier value. name is 1 to 255 printable ASCII characters without spaces; secret is 1 to 2048 bytes; anything else raises a Lua error. Returns nil and a reason starting with 'unavailable: ' or 'denied: ' when the store cannot be used. The store is not a sandbox: any Lua code in this image, MCP run_script included, can read, replace or delete what is stored here.",
         "system.credential.put(name, secret) -> true | nil, reason",
     ),
     (
@@ -375,8 +375,8 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "system.credential.backend",
-        "The OS credential store in use: 'keychain' (the macOS login Keychain), or nil where there is none, in which case put, get and delete return nil, 'unavailable: no credential store on this OS'.",
-        "system.credential.backend() -> 'keychain' | nil",
+        "The OS credential store in use: 'keychain' (the macOS login Keychain), 'wincred' (Windows Credential Manager), or nil where there is none, in which case put, get and delete return nil, 'unavailable: no credential store on this OS'.",
+        "system.credential.backend() -> 'keychain' | 'wincred' | nil",
     ),
     (
         "hostname",
