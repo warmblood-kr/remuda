@@ -45,6 +45,7 @@ type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
 pub const PTY_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const PTY_LATE_SUBMIT_BOUND: Duration = Duration::from_secs(30);
+const PTY_ABANDONED_FLAG_EXPIRY: Duration = Duration::from_secs(10 * 60);
 
 struct WriteTask {
     sequence: u64,
@@ -124,9 +125,10 @@ impl PtyInputWriter {
                 return Err(AgentError::Busy);
             }
             if report_completed_abandonment {
-                // The 30-second window is intentional: after it, abandoned state stops blocking sends.
+                // Keep this at 10 minutes so a manual caller still gets one refusal while
+                // old text may sit in the composer.
                 let expired = state.late_submit_abandoned_at.is_some_and(|abandoned_at| {
-                    self.clock_now().saturating_sub(abandoned_at) >= self.late_submit_bound
+                    self.clock_now().saturating_sub(abandoned_at) >= PTY_ABANDONED_FLAG_EXPIRY
                 });
                 if expired {
                     state.late_submit_abandoned_at = None;
@@ -921,12 +923,11 @@ mod input_writer_tests {
 
     #[test]
     fn expired_abandonment_flag_does_not_refuse_a_bounded_write() {
-        let late_submit_bound = Duration::from_secs(30);
         let clock = Arc::new(remuda_core::ManualClock::new());
         let captured = Arc::new(Mutex::new(Vec::new()));
-        let writer = capture_writer(&captured, Arc::clone(&clock), late_submit_bound);
+        let writer = capture_writer(&captured, Arc::clone(&clock), PTY_LATE_SUBMIT_BOUND);
         mark_late_submit_abandoned(&writer, &clock);
-        clock.advance(late_submit_bound);
+        clock.advance(PTY_ABANDONED_FLAG_EXPIRY);
 
         writer.write_bounded(b"fresh input").unwrap();
 
@@ -935,16 +936,15 @@ mod input_writer_tests {
 
     #[test]
     fn abandonment_flag_still_refuses_a_write_one_millisecond_before_expiry() {
-        let late_submit_bound = Duration::from_secs(30);
         let clock = Arc::new(remuda_core::ManualClock::new());
         let captured = Arc::new(Mutex::new(Vec::new()));
-        let writer = capture_writer(&captured, Arc::clone(&clock), late_submit_bound);
+        let writer = capture_writer(&captured, Arc::clone(&clock), PTY_LATE_SUBMIT_BOUND);
         mark_late_submit_abandoned(&writer, &clock);
-        clock.advance(late_submit_bound - Duration::from_millis(1));
+        clock.advance(PTY_ABANDONED_FLAG_EXPIRY - Duration::from_millis(1));
 
         assert!(matches!(
             writer.write_bounded(b"too early"),
-            Err(AgentError::LateSubmitAbandoned { bound }) if bound == late_submit_bound
+            Err(AgentError::LateSubmitAbandoned { bound }) if bound == PTY_LATE_SUBMIT_BOUND
         ));
         assert!(captured.lock().unwrap().is_empty());
     }
@@ -1282,7 +1282,7 @@ mod input_writer_tests {
             writer.chain_after_stalled(b"\r", Duration::ZERO),
             ChainOutcome::Unsupported
         );
-        clock.advance(late_submit_bound + Duration::from_millis(1));
+        clock.advance(PTY_ABANDONED_FLAG_EXPIRY + Duration::from_millis(1));
 
         release_tx.send(()).unwrap();
         finished_rx.recv_timeout(Duration::from_secs(1)).unwrap();
