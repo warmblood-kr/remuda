@@ -63,10 +63,14 @@
 <p><code>feed(name, steps) -&gt; nil</code> — Deliver a sequence of bursts and pauses as one indivisible act.</p>
 <h2 id="fs">fs</h2>
 <p><code>table</code> — Atomic replacement of files for trusted Lua callers.</p>
+<h2 id="fs.is_symlink">fs.is_symlink</h2>
+<p><code>fs.is_symlink(path) -&gt; true | false | nil, reason</code> — Whether the path itself is a link, without following it: true for a symlink, a dangling one included, and on Windows for a junction too (any reparse point that names another path); false for a plain file or directory. Only the last component is asked about: a link in a parent directory is followed. Returns nil and a reason: 'not_found', or one starting with 'denied: ' or 'unavailable: '. An empty or non-string path raises a Lua error.</p>
 <h2 id="fs.lock">fs.lock</h2>
 <p><code>fs.lock(path) -&gt; handle | nil, 'held', info | nil, error</code> — Take an exclusive, non-blocking OS advisory lock on the file at an absolute path the caller chooses; it is held until handle:release() or until this daemon exits, and the same path returns the same handle. The lock file is created owner-only, stays empty and is not opened through a symlink. The owner's line (session, pid, since) is kept in PATH.info and returned as info when another process holds the lock: it is message text only, never decide on it. Any other failure returns nil, error. It guards against accidents, such as a second daemon of the same user; it is not a security boundary: a hostile process of that user can delete the lock file while it is held, and a second owner can then lock a new file there.</p>
 <h2 id="fs.mkdir_new">fs.mkdir_new</h2>
 <p><code>fs.mkdir_new(path) -&gt; true | nil, 'exists' | nil, error</code> — Create one new directory without creating parents or trusting an existing path.</p>
+<h2 id="fs.realpath">fs.realpath</h2>
+<p><code>fs.realpath(path) -&gt; path | nil, reason</code> — Resolve a path to the absolute path of what it names, following every symlink and removing '.' and '..'; the file or directory must exist. Pass an absolute path: a relative one is resolved against the daemon's working directory. On Windows the answer is a verbatim path: a prefix of two backslashes, a question mark and one backslash, then the drive (C:) or, for a network path, UNC and the server and share; a junction is followed like a symlink. Returns nil and a reason: 'not_found' (nothing there, or a link whose target is gone), or one starting with 'denied: ' or 'unavailable: '. An empty or non-string path raises a Lua error. The answer is true when it is made: a link changed afterwards is not seen.</p>
 <h2 id="fs.write_atomic">fs.write_atomic</h2>
 <p><code>fs.write_atomic(path, bytes, options?) -&gt; true, nil | nil, error</code> — Write bytes through a same-directory temporary file and atomically replace the target; private mode uses owner-only permissions on Unix.</p>
 <h2 id="hook_list">hook_list</h2>
