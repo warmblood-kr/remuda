@@ -6067,7 +6067,7 @@ fn simple_request(path: &Path, request: Request) -> ExitCode {
 fn describe(response: std::io::Result<Response>) -> String {
     match response {
         Ok(Response::Error(reason)) => reason,
-        Ok(Response::Busy) => "session input is busy".into(),
+        Ok(Response::Busy) => "session input is busy; nothing was written, retry".into(),
         Ok(Response::WriteTimeout) => {
             "session PTY write timed out; delivery may be partial or late".into()
         }
@@ -6337,7 +6337,10 @@ mod tests {
             describe(Ok(Response::WriteTimeout)),
             "session PTY write timed out; delivery may be partial or late"
         );
-        assert_eq!(describe(Ok(Response::Busy)), "session input is busy");
+        assert_eq!(
+            describe(Ok(Response::Busy)),
+            "session input is busy; nothing was written, retry"
+        );
     }
 
     #[test]

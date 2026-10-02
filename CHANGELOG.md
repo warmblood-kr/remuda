@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Fixed remote input batches refused after a late-submit abandonment: callers
+  now get a retryable busy response because the bytes were not written (see
+  #428).
 - `remuda cluster remote` now labels this node with the OS host name instead of
   reading the `HOSTNAME` environment variable; it uses `local` if the OS lookup
   fails.
