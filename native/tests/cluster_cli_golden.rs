@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io::{BufRead, Read, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -480,6 +480,87 @@ fn cluster_cli_output_matches_goldens() {
     golden_invite_join_cases(&scratch);
     golden_revoke_cancel_case(&scratch);
     golden_remaining_verb_errors(&scratch);
+}
+
+#[test]
+fn cluster_help_discloses_default_listener_and_opt_out() {
+    let scratch = Scratch::new();
+    let mut failures = Vec::new();
+    for args in [
+        &(["cluster", "--help"][..]),
+        &(["cluster", "init", "--help"][..]),
+    ] {
+        let output = scratch.run(args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success()
+            || !stdout.contains("private LAN listener")
+            || !stdout.contains("--no-listen")
+            || stderr.contains("no command or mod with that name")
+        {
+            failures.push(format!(
+                "{args:?}: exit={:?}\nstdout: {stdout}\nstderr: {stderr}",
+                output.status.code()
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn cluster_init_discloses_listener_before_it_binds() {
+    use remuda_native::cluster::listener_config::{self, ListenerBind, ListenerConfig};
+
+    let scratch = Scratch::new();
+    let _daemon = start_daemon(&scratch);
+    let initialized = scratch.run(&["cluster", "init", "--no-listen"]);
+    assert!(
+        initialized.status.success(),
+        "no-listen init failed: {initialized:?}"
+    );
+
+    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve a loopback port");
+    let address = reservation.local_addr().unwrap();
+    drop(reservation);
+    let cluster_dir = scratch.root.join("state/remuda/cluster");
+    listener_config::write_at(
+        &cluster_dir,
+        &ListenerConfig {
+            enabled: false,
+            bind: ListenerBind::Explicit(address),
+            allow_public: false,
+        },
+    )
+    .unwrap();
+
+    let mut child = scratch
+        .command(&["cluster", "init"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start init command");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout pipe"));
+    let mut first_line = String::new();
+    stdout.read_line(&mut first_line).expect("read init notice");
+    assert_eq!(
+        first_line.trim_end(),
+        "Starting a private LAN listener on port 7441; only admitted machines can connect. Use `remuda cluster init --no-listen` to skip it."
+    );
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err(),
+        "listener bound before the disclosure was printed"
+    );
+    let mut remaining_stdout = String::new();
+    stdout
+        .read_to_string(&mut remaining_stdout)
+        .expect("read remaining init output");
+    let output = child.wait_with_output().expect("wait for init command");
+    assert!(
+        output.status.success(),
+        "init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(remaining_stdout.contains(&format!("Listening on {address}")));
 }
 
 #[test]
