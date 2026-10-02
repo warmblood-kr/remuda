@@ -124,6 +124,7 @@ impl PtyInputWriter {
                 return Err(AgentError::Busy);
             }
             if report_completed_abandonment {
+                // The 30-second window is intentional: after it, abandoned state stops blocking sends.
                 let expired = state.late_submit_abandoned_at.is_some_and(|abandoned_at| {
                     self.clock_now().saturating_sub(abandoned_at) >= self.late_submit_bound
                 });
@@ -933,6 +934,22 @@ mod input_writer_tests {
     }
 
     #[test]
+    fn abandonment_flag_still_refuses_a_write_one_millisecond_before_expiry() {
+        let late_submit_bound = Duration::from_secs(30);
+        let clock = Arc::new(remuda_core::ManualClock::new());
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = capture_writer(&captured, Arc::clone(&clock), late_submit_bound);
+        mark_late_submit_abandoned(&writer, &clock);
+        clock.advance(late_submit_bound - Duration::from_millis(1));
+
+        assert!(matches!(
+            writer.write_bounded(b"too early"),
+            Err(AgentError::LateSubmitAbandoned { bound }) if bound == late_submit_bound
+        ));
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn attached_human_write_clears_the_abandonment_flag() {
         let late_submit_bound = Duration::from_secs(30);
         let clock = Arc::new(remuda_core::ManualClock::new());
@@ -959,7 +976,7 @@ mod input_writer_tests {
             state.active_sequence = Some(1);
             state.stalled_sequence = Some(1);
             state.active_since =
-                Some(Instant::now() - late_submit_bound - Duration::from_millis(1));
+                Instant::now().checked_sub(late_submit_bound + Duration::from_millis(1));
             state.follow_up_open = true;
         }
 
@@ -1259,7 +1276,7 @@ mod input_writer_tests {
         {
             let mut state = writer.state.lock().unwrap();
             state.active_since =
-                Some(Instant::now() - late_submit_bound - Duration::from_millis(1));
+                Instant::now().checked_sub(late_submit_bound + Duration::from_millis(1));
         }
         assert_eq!(
             writer.chain_after_stalled(b"\r", Duration::ZERO),
