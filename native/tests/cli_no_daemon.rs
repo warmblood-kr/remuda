@@ -530,6 +530,56 @@ fn doc_parser_handles_formats_help_and_errors_before_connecting() {
 }
 
 #[test]
+fn resize_parser_handles_arity_help_and_range_errors_before_connecting() {
+    let (valid, touched) = touches_daemon("resize-valid", &["resize", "session", "80", "24"]);
+    assert!(touched, "valid resize did not reach the daemon");
+    assert_ne!(valid.status.code(), Some(2), "{valid:?}");
+
+    for (tag, args, code) in [
+        (
+            "resize-bogus-flag",
+            &["resize", "session", "80", "24", "--bogus"][..],
+            Some(2),
+        ),
+        ("resize-wrong-arity", &["resize", "session", "80"], Some(2)),
+        (
+            "resize-out-of-range",
+            &["resize", "session", "19", "24"],
+            Some(2),
+        ),
+        ("resize-help-cold", &["resize", "--help"], Some(0)),
+    ] {
+        let (out, touched) = touches_daemon(tag, args);
+        assert!(!touched, "{args:?} connected to the daemon socket");
+        assert_eq!(out.status.code(), code, "{args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if args[1] == "--help" {
+            assert!(
+                stdout.contains("Usage: remuda resize NAME COLS ROWS"),
+                "{stdout}"
+            );
+            assert!(stderr.is_empty(), "{stderr}");
+        } else {
+            assert!(
+                stderr.contains("Usage: remuda resize NAME COLS ROWS"),
+                "{stderr}"
+            );
+            assert!(stderr.contains("Fix:"), "{stderr}");
+            assert!(stderr.contains("Next:"), "{stderr}");
+            if tag == "resize-out-of-range" {
+                assert!(
+                    stderr.starts_with(
+                        "resize dimensions must be integers: cols 20..1000, rows 24..500\n"
+                    ),
+                    "range error wording changed: {stderr}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn upgrade_help_flags_explain_channels_and_daemon_lifecycle() {
     let dir = scratch("upgrade-help-flags");
     for args in [&["upgrade", "--help"][..], &["upgrade", "-h"]] {

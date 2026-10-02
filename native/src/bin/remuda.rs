@@ -4565,6 +4565,7 @@ fn preflight_command(argv: &[&str]) -> Option<ExitCode> {
     run_internal_command(argv)
         .or_else(|| stop_cli_preflight(argv))
         .or_else(|| doc_cli_preflight(argv))
+        .or_else(|| resize_cli_preflight(argv))
 }
 
 fn doc_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
@@ -5266,11 +5267,84 @@ fn resize_session(path: &Path, name: &str, cols: &str, rows: &str) -> ExitCode {
 }
 
 fn resize_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
-    let [name, cols, rows] = args else {
-        eprintln!("usage: remuda resize NAME COLS ROWS (cols 20..1000, rows 24..500)");
-        return ExitCode::from(2);
+    let values = match resize_cli_parse(args) {
+        Ok(values) => values,
+        Err(code) => return code,
     };
+    let name = values
+        .get("NAME")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let cols = values
+        .get("COLS")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let rows = values
+        .get("ROWS")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
     with_existing_daemon(server, path, |path| resize_session(path, name, cols, rows))
+}
+
+fn resize_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{ArgSpec, Spec, VerbSpec};
+    Spec {
+        name: "remuda".into(),
+        options: vec![],
+        verbs: vec![VerbSpec {
+            name: "resize".into(),
+            about: "Resize one session".into(),
+            args: ["NAME", "COLS", "ROWS"]
+                .into_iter()
+                .map(|name| ArgSpec {
+                    name: name.into(),
+                    help: format!("Session {name}"),
+                    multiple: false,
+                    required: true,
+                })
+                .collect(),
+            next: "remuda resize NAME 80 24".into(),
+            options: vec![],
+        }],
+    }
+}
+
+fn resize_cli_parse(args: &[&str]) -> Result<serde_json::Map<String, serde_json::Value>, ExitCode> {
+    use remuda_core::Size;
+    let values = parse_top_level_cli(&resize_cli_spec(), "resize", args)?;
+    let cols = values
+        .get("COLS")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<u16>().ok());
+    let rows = values
+        .get("ROWS")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<u16>().ok());
+    if !cols.is_some_and(|cols| (Size::MIN_RESIZE_COLS..=Size::MAX_RESIZE_COLS).contains(&cols))
+        || !rows.is_some_and(|rows| (Size::MIN_ROWS..=Size::MAX_RESIZE_ROWS).contains(&rows))
+    {
+        return Err(resize_dimensions_usage_error());
+    }
+    Ok(values)
+}
+
+fn resize_dimensions_usage_error() -> ExitCode {
+    use remuda_core::Size;
+    eprintln!(
+        "resize dimensions must be integers: cols {}..{}, rows {}..{}\nFix: use integer dimensions within those ranges.\nUsage: remuda resize NAME COLS ROWS\nNext: remuda resize NAME 80 24",
+        Size::MIN_RESIZE_COLS,
+        Size::MAX_RESIZE_COLS,
+        Size::MIN_ROWS,
+        Size::MAX_RESIZE_ROWS
+    );
+    ExitCode::from(2)
+}
+
+fn resize_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
+    let ["resize", args @ ..] = argv else {
+        return None;
+    };
+    resize_cli_parse(args).err()
 }
 
 /// Evaluate one chunk in the daemon's image and print what it came to. Nothing
