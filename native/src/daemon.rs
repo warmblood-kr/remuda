@@ -217,17 +217,17 @@ pub(crate) fn keep_exited() -> bool {
 }
 
 /// Where a user's own auto-loaded config lives (XDG `$XDG_CONFIG_HOME`,
-/// else `$HOME/.config`) — mirrors `remuda.rs`'s `history_path` shape, not
-/// `dist.rs`'s `base_dir` (see steps/035 for why).
+/// else the platform's config directory).
 fn user_config_path() -> Option<PathBuf> {
-    let config_home = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
-    };
-    Some(config_home.join("remuda").join("init.lua"))
+    crate::storage::user_file_path_for(
+        crate::storage::Kind::Config,
+        "init.lua",
+        cfg!(windows),
+        &|name| std::env::var_os(name),
+    )
 }
 
-/// Evaluate the user's `~/.config/remuda/init.lua`, once, at daemon boot.
+/// Evaluate the user's config `init.lua`, once, at daemon boot.
 /// Absence is silent; a broken file is reported but never poisons the
 /// image the way an `Err` in `Image::spawn`'s `ready` chain would (steps/035).
 fn load_user_config(image: &Image) {

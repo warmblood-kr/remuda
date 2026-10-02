@@ -38,6 +38,17 @@ pub mod text;
 pub mod tick;
 pub mod tui;
 
+/// Path used to persist command history for the REPL binary.
+#[doc(hidden)]
+pub fn repl_history_path() -> Option<std::path::PathBuf> {
+    storage::user_file_path_for(
+        storage::Kind::State,
+        "repl-history",
+        cfg!(windows),
+        &|name| std::env::var_os(name),
+    )
+}
+
 pub use portable_pty::CommandBuilder;
 pub use pty::PtyAgent;
 
