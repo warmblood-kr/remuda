@@ -201,7 +201,11 @@ fn preserve_help_in_body(verb: &VerbSpec, argv: &[&str], mut input: Vec<String>)
     let Some(help_index) = argv.iter().position(|arg| *arg == "--help") else {
         return input;
     };
-    let has_body_before_help = argv[1..help_index].iter().any(|arg| !arg.starts_with('-'));
+    let has_body_before_help = argv
+        .get(1..help_index)
+        .unwrap_or(&[])
+        .iter()
+        .any(|arg| !arg.starts_with('-'));
     if has_body_before_help {
         input.insert(help_index + 1, "--".into());
     }
@@ -445,6 +449,7 @@ mod tests {
                 true,
                 "",
             ),
+            ("help before verb", &["--help", "send-to-leader"], false, ""),
             (
                 "verb name in message body",
                 &["send-to-leader", "thread"],
