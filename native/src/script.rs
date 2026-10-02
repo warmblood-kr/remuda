@@ -533,68 +533,67 @@ fn cli_spec_from_lua(table: Table) -> mlua::Result<crate::cli_parse::Spec> {
     Ok(spec)
 }
 
+fn cli_spec_valid_token(value: &str, allow_underscore: bool) -> bool {
+    let mut chars = value.chars();
+    chars
+        .next()
+        .is_some_and(|first| first.is_ascii_alphanumeric())
+        && chars
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || (allow_underscore && ch == '_'))
+}
+
+fn validate_cli_options(
+    options: &[crate::cli_parse::OptionSpec],
+    ids: &mut std::collections::HashSet<String>,
+    shorts: &mut std::collections::HashSet<char>,
+) -> mlua::Result<()> {
+    for option in options {
+        if !cli_spec_valid_token(&option.long, false) {
+            return Err(mlua::Error::runtime(format!(
+                "remuda.cli.parse option long must be a non-empty alphanumeric/hyphen name: {:?}",
+                option.long
+            )));
+        }
+        if option.long == "help" {
+            return Err(mlua::Error::runtime(
+                "remuda.cli.parse option long 'help' is reserved",
+            ));
+        }
+        if option.long == "__help" {
+            return Err(mlua::Error::runtime(
+                "remuda.cli.parse argument id '__help' is reserved",
+            ));
+        }
+        if !ids.insert(option.long.clone()) {
+            return Err(mlua::Error::runtime(format!(
+                "remuda.cli.parse argument id '{}' is duplicated",
+                option.long
+            )));
+        }
+        if let Some(short) = option.short {
+            if !short.is_ascii_alphanumeric() || short == 'h' {
+                return Err(mlua::Error::runtime(format!(
+                    "remuda.cli.parse option short '{}' is invalid or reserved",
+                    short
+                )));
+            }
+            if !shorts.insert(short) {
+                return Err(mlua::Error::runtime(format!(
+                    "remuda.cli.parse option short '{}' is duplicated",
+                    short
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_cli_spec(spec: &crate::cli_parse::Spec) -> mlua::Result<()> {
     use std::collections::HashSet;
 
-    fn valid_token(value: &str, allow_underscore: bool) -> bool {
-        let mut chars = value.chars();
-        chars
-            .next()
-            .is_some_and(|first| first.is_ascii_alphanumeric())
-            && chars.all(|ch| {
-                ch.is_ascii_alphanumeric() || ch == '-' || (allow_underscore && ch == '_')
-            })
-    }
-
-    fn validate_options(
-        options: &[crate::cli_parse::OptionSpec],
-        ids: &mut HashSet<String>,
-        shorts: &mut HashSet<char>,
-    ) -> mlua::Result<()> {
-        for option in options {
-            if !valid_token(&option.long, false) {
-                return Err(mlua::Error::runtime(format!(
-                    "remuda.cli.parse option long must be a non-empty alphanumeric/hyphen name: {:?}",
-                    option.long
-                )));
-            }
-            if option.long == "help" {
-                return Err(mlua::Error::runtime(
-                    "remuda.cli.parse option long 'help' is reserved",
-                ));
-            }
-            if option.long == "__help" {
-                return Err(mlua::Error::runtime(
-                    "remuda.cli.parse argument id '__help' is reserved",
-                ));
-            }
-            if !ids.insert(option.long.clone()) {
-                return Err(mlua::Error::runtime(format!(
-                    "remuda.cli.parse argument id '{}' is duplicated",
-                    option.long
-                )));
-            }
-            if let Some(short) = option.short {
-                if !short.is_ascii_alphanumeric() || short == 'h' {
-                    return Err(mlua::Error::runtime(format!(
-                        "remuda.cli.parse option short '{}' is invalid or reserved",
-                        short
-                    )));
-                }
-                if !shorts.insert(short) {
-                    return Err(mlua::Error::runtime(format!(
-                        "remuda.cli.parse option short '{}' is duplicated",
-                        short
-                    )));
-                }
-            }
-        }
-        Ok(())
-    }
-
     let mut verb_names = HashSet::new();
     for verb in &spec.verbs {
-        if !valid_token(&verb.name, false) || !verb_names.insert(verb.name.as_str()) {
+        if !cli_spec_valid_token(&verb.name, false) || !verb_names.insert(verb.name.as_str()) {
             return Err(mlua::Error::runtime(format!(
                 "remuda.cli.parse verb name is invalid or duplicated: {:?}",
                 verb.name
@@ -604,7 +603,7 @@ fn validate_cli_spec(spec: &crate::cli_parse::Spec) -> mlua::Result<()> {
 
     let mut global_ids = HashSet::new();
     let mut global_shorts = HashSet::new();
-    validate_options(&spec.options, &mut global_ids, &mut global_shorts)?;
+    validate_cli_options(&spec.options, &mut global_ids, &mut global_shorts)?;
 
     for verb in &spec.verbs {
         if verb
@@ -620,9 +619,9 @@ fn validate_cli_spec(spec: &crate::cli_parse::Spec) -> mlua::Result<()> {
         }
         let mut ids = global_ids.clone();
         let mut shorts = global_shorts.clone();
-        validate_options(&verb.options, &mut ids, &mut shorts)?;
+        validate_cli_options(&verb.options, &mut ids, &mut shorts)?;
         for arg in &verb.args {
-            if !valid_token(&arg.name, true) {
+            if !cli_spec_valid_token(&arg.name, true) {
                 return Err(mlua::Error::runtime(format!(
                     "remuda.cli.parse positional name is invalid: {:?}",
                     arg.name
