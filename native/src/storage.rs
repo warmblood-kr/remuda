@@ -1,8 +1,10 @@
 //! Per-kind user directory resolution and Lua bindings.
 
-use mlua::{Lua, Table};
+use mlua::{Lua, Table, UserData, UserDataMethods};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 pub(crate) type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;
 
@@ -137,7 +139,254 @@ pub(crate) fn bindings(lua: &Lua) -> mlua::Result<Table> {
             }
         })?,
     )?;
+    let files = Arc::new(Mutex::new(BTreeMap::new()));
+    let get_files = files.clone();
+    storage.set(
+        "get",
+        lua.create_function(move |lua, namespace: String| {
+            let namespace = checked_name(&namespace)?;
+            lua.create_userdata(StorageView {
+                namespace,
+                files: get_files.clone(),
+            })
+        })?,
+    )?;
+    storage.set(
+        "default",
+        lua.create_function(move |lua, ()| {
+            lua.create_userdata(StorageView {
+                namespace: "default".into(),
+                files: files.clone(),
+            })
+        })?,
+    )?;
+    storage.set(
+        "set_default",
+        lua.create_function(|_, backend: String| {
+            (backend == "memory")
+                .then_some(true)
+                .ok_or_else(|| mlua::Error::runtime("only the memory backend is available"))
+        })?,
+    )?;
+    storage.set("backend", lua.create_function(|_, ()| Ok("memory"))?)?;
+    storage.set(
+        "path",
+        lua.create_function(|_, (kind, name): (String, String)| {
+            if !matches!(
+                kind.as_str(),
+                "config" | "data" | "state" | "cache" | "secret"
+            ) {
+                return Err(mlua::Error::runtime("remuda.storage.path: unknown kind"));
+            }
+            checked_name(&name)?;
+            Ok(None::<String>)
+        })?,
+    )?;
     Ok(storage)
+}
+
+#[derive(Clone, Copy)]
+enum HandleKind {
+    Config,
+    Data,
+    State,
+    Cache,
+    Secret,
+}
+
+impl HandleKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Config => "config",
+            Self::Data => "data",
+            Self::State => "state",
+            Self::Cache => "cache",
+            Self::Secret => "secret",
+        }
+    }
+}
+
+type MemoryFiles = Arc<Mutex<BTreeMap<(String, String, String), Vec<u8>>>>;
+
+struct StorageView {
+    namespace: String,
+    files: MemoryFiles,
+}
+
+impl StorageView {
+    fn handle(&self, kind: HandleKind) -> KindHandle {
+        KindHandle {
+            namespace: self.namespace.clone(),
+            kind,
+            files: self.files.clone(),
+        }
+    }
+}
+
+impl UserData for StorageView {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        for (name, kind) in [
+            ("config", HandleKind::Config),
+            ("data", HandleKind::Data),
+            ("state", HandleKind::State),
+            ("cache", HandleKind::Cache),
+        ] {
+            methods.add_method(name, move |lua, this, ()| {
+                lua.create_userdata(this.handle(kind))
+            });
+        }
+        methods.add_method("secret", |lua, this, ()| {
+            lua.create_userdata(SecretHandle(this.handle(HandleKind::Secret)))
+        });
+    }
+}
+
+struct KindHandle {
+    namespace: String,
+    kind: HandleKind,
+    files: MemoryFiles,
+}
+
+impl KindHandle {
+    fn key(&self, name: String) -> mlua::Result<(String, String, String)> {
+        Ok((
+            self.namespace.clone(),
+            self.kind.as_str().into(),
+            checked_name(&name)?,
+        ))
+    }
+
+    fn read(
+        &self,
+        lua: &Lua,
+        name: String,
+    ) -> mlua::Result<(Option<mlua::LuaString>, Option<String>)> {
+        let value = self
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&self.key(name)?)
+            .cloned();
+        match value {
+            Some(bytes) => Ok((Some(lua.create_string(bytes)?), None)),
+            None => Ok((None, Some("not_found".into()))),
+        }
+    }
+
+    fn write(&self, name: String, bytes: &[u8]) -> mlua::Result<()> {
+        self.files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(self.key(name)?, bytes.to_vec());
+        Ok(())
+    }
+
+    fn exists(&self, name: String) -> mlua::Result<bool> {
+        Ok(self
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&self.key(name)?))
+    }
+
+    fn delete(&self, name: String) -> mlua::Result<(Option<bool>, Option<String>)> {
+        if self
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.key(name)?)
+            .is_some()
+        {
+            Ok((Some(true), None))
+        } else {
+            Ok((None, Some("not_found".into())))
+        }
+    }
+
+    fn list(&self, lua: &Lua, prefix: String) -> mlua::Result<Table> {
+        let prefix = checked_prefix(prefix)?;
+        let names = self
+            .files
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .filter(|(namespace, kind, name)| {
+                namespace == &self.namespace
+                    && kind == self.kind.as_str()
+                    && name.starts_with(&prefix)
+            })
+            .map(|(_, _, name)| name.clone())
+            .collect::<Vec<_>>();
+        lua.create_sequence_from(names)
+    }
+}
+
+impl UserData for KindHandle {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("read", |lua, this, name: String| this.read(lua, name));
+        methods.add_method(
+            "write",
+            |_, this, (name, value): (String, mlua::LuaString)| {
+                this.write(name, &value.as_bytes())?;
+                Ok((true, None::<String>))
+            },
+        );
+        methods.add_method("exists", |_, this, name: String| this.exists(name));
+        methods.add_method("delete", |_, this, name: String| this.delete(name));
+        methods.add_method("list", |lua, this, prefix: Option<String>| {
+            this.list(lua, prefix.unwrap_or_default())
+        });
+    }
+}
+
+struct SecretHandle(KindHandle);
+
+impl UserData for SecretHandle {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method(
+            "put",
+            |_, this, (name, secret): (String, mlua::LuaString)| {
+                if !(1..=2048).contains(&secret.as_bytes().len()) {
+                    return Err(mlua::Error::runtime(
+                        "remuda.storage.secret.put secret must be 1..=2048 bytes",
+                    ));
+                }
+                this.0.write(name, &secret.as_bytes())?;
+                Ok(true)
+            },
+        );
+        methods.add_method("get", |lua, this, name: String| this.0.read(lua, name));
+        methods.add_method("delete", |_, this, name: String| this.0.delete(name));
+    }
+}
+
+fn checked_name(name: &str) -> mlua::Result<String> {
+    let invalid = name.is_empty()
+        || name.starts_with('/')
+        || name.contains('\\')
+        || name.as_bytes().get(1) == Some(&b':') && name.as_bytes()[0].is_ascii_alphabetic()
+        || name.split('/').any(|part| {
+            part.is_empty()
+                || part == "."
+                || part == ".."
+                || part.len() > 255
+                || !part.bytes().all(|byte| byte.is_ascii_graphic())
+        });
+    if invalid {
+        return Err(mlua::Error::runtime(
+            "remuda.storage name must be relative, traversal-free printable ASCII, with components up to 255 bytes",
+        ));
+    }
+    Ok(name.into())
+}
+
+fn checked_prefix(prefix: String) -> mlua::Result<String> {
+    if prefix.is_empty() {
+        return Ok(prefix);
+    }
+    let checked = prefix.strip_suffix('/').unwrap_or(&prefix);
+    checked_name(checked)?;
+    Ok(prefix)
 }
 
 #[cfg(test)]
@@ -207,25 +456,12 @@ mod tests {
         let lua = lua_with_storage();
         lua.load(
             r#"
-            local storage = remuda.storage
-            storage.set_default("memory")
-            local first = storage.get("first"):config()
-            local second = storage.get("second"):config()
-            local state = storage.get("first"):state()
-            local bytes = string.char(0, 255, 1)
-            assert(first:write("mail/a.bin", bytes))
-            assert(first:exists("mail/a.bin"))
-            local value, err = first:read("mail/a.bin")
-            assert(value == bytes and err == nil)
-            assert(second:read("mail/a.bin") == nil)
-            assert(state:read("mail/a.bin") == nil)
-            local missing, reason = first:read("missing")
-            assert(missing == nil and reason == "not_found")
-            first:write("mail/b.bin", "b")
-            local names = first:list("mail/")
-            assert(#names == 2 and names[1] == "mail/a.bin" and names[2] == "mail/b.bin")
-            assert(first:delete("mail/a.bin"))
-            assert(not first:exists("mail/a.bin"))
+            local s = remuda.storage
+            local a, b = s.get("first"):config(), s.get("second"):config(); local state = s.get("first"):state()
+            local bytes = string.char(0, 255, 1); assert(a:write("mail/a.bin", bytes) and a:exists("mail/a.bin")); local value, err = a:read("mail/a.bin"); assert(value == bytes and err == nil)
+            assert(b:read("mail/a.bin") == nil and state:read("mail/a.bin") == nil); local missing, reason = a:read("missing"); assert(missing == nil and reason == "not_found")
+            a:write("mail/b.bin", "b"); local names = a:list("mail/"); assert(#names == 2 and names[1] == "mail/a.bin" and names[2] == "mail/b.bin")
+            assert(a:delete("mail/a.bin") and not a:exists("mail/a.bin"))
             "#,
         )
         .exec()
@@ -237,17 +473,11 @@ mod tests {
         let lua = lua_with_storage();
         lua.load(
             r#"
-            local storage = remuda.storage
-            storage.set_default("memory")
+            local storage = remuda.storage; storage.set_default("memory")
             local secret = storage.default():secret()
-            assert(secret:put("matrix_token", "bytes") == true)
-            local value, err = secret:get("matrix_token")
-            assert(value == "bytes" and err == nil)
-            local other, reason = storage.get("other"):secret():get("matrix_token")
-            assert(other == nil and reason == "not_found")
-            assert(secret:delete("matrix_token") == true)
-            assert(storage.backend() == "memory")
-            assert(storage.path("secret", "matrix_token") == nil)
+            assert(secret:put("matrix_token", "bytes") == true); local value, err = secret:get("matrix_token"); assert(value == "bytes" and err == nil)
+            local other, reason = storage.get("other"):secret():get("matrix_token"); assert(other == nil and reason == "not_found")
+            assert(secret:delete("matrix_token") == true); assert(storage.backend() == "memory" and storage.path("secret", "matrix_token") == nil)
             for _, name in ipairs({"../escape", "a/../b", "/absolute", "C:/drive", string.rep("x", 256)}) do
                 assert(not pcall(function() secret:put(name, "x") end), name)
             end
