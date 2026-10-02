@@ -52,6 +52,9 @@ pub fn repl_history_path() -> Option<std::path::PathBuf> {
 pub use portable_pty::CommandBuilder;
 pub use pty::PtyAgent;
 
+/// Shared guidance for input writes refused because the session is busy.
+pub const BUSY_RETRY_MESSAGE: &str = "session input is busy; nothing was written, retry\nNext: wait for the previous write to finish (see it with remuda capture NAME), then run the command again.";
+
 use remuda_core::{Clock, Size, WallClock};
 use std::time::{Duration, Instant};
 
