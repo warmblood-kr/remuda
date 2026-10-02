@@ -1023,6 +1023,15 @@ pub fn prepare_socket_path(_socket: &Path, _runtime: Option<&Path>) -> std::io::
     Ok(())
 }
 
+/// Give a daemon about to be spawned a console of its own, with no window.
+/// Left on the caller's console it is ended when that window is closed, and
+/// every session with it. A console it keeps, so its children open no windows.
+#[cfg(windows)]
+pub fn own_console(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+}
+
 #[cfg(unix)]
 fn socket_lock_holder(lock_path: &Path) -> Option<u32> {
     std::fs::read_to_string(lock_path).ok()?.trim().parse().ok()

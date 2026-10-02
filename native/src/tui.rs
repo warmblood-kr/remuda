@@ -3002,6 +3002,8 @@ fn restart_daemon(path: &Path, server: &str) -> Result<(), String> {
             });
         }
     }
+    #[cfg(windows)]
+    crate::daemon::own_console(&mut command);
     let mut child = command
         .spawn()
         .map_err(|error| format!("cannot restart daemon: {error}"))?;

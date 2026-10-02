@@ -4970,6 +4970,8 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
             });
         }
     }
+    #[cfg(windows)]
+    daemon::own_console(&mut command);
     let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start daemon: {e}"))?;
@@ -4998,7 +5000,9 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
         if remuda_native::ipc::connect(path).is_ok() {
             // "remuda should always come up in daemon mode" — it already did.
             // What was missing was the line saying so.
-            eprintln!("remuda: started a daemon for {server:?}");
+            eprintln!(
+                "remuda: started a daemon for {server:?}: none was running (sessions of an earlier daemon, if any, are gone)"
+            );
             return Ok(());
         }
         // If it has already exited, waiting out the deadline only delays the
