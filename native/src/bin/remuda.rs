@@ -4349,11 +4349,22 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
     match remuda_native::ipc::connect(path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => return fail(error),
-        Err(_) => {
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
             eprintln!(
                 "remuda: no daemon running for {server:?} — a state-creating command starts one"
             );
             return ExitCode::SUCCESS;
+        }
+        Err(error) => {
+            return fail(format!(
+                "cannot connect to daemon for {server:?} at {}: {error}\nNext: check socket permissions and daemon status, then run `remuda stop` again.",
+                path.display(),
+            ));
         }
     }
     if !yes && !force && has_sessions(path) {

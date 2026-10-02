@@ -797,6 +797,37 @@ fn a_socket_path_over_sun_path_names_the_length_not_a_second_daemon() {
 }
 
 #[test]
+fn stop_reports_a_blocked_socket_connect_error() {
+    let dir = scratch("stop-blocked-socket");
+    let socket = remuda_native::daemon::socket_path_in(&dir, "s");
+    std::fs::create_dir_all(socket.parent().unwrap()).expect("create socket parent");
+    let _listener = UnixListener::bind(&socket).expect("bind a live socket");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000))
+        .expect("make the socket path inaccessible");
+
+    let out = remuda(&dir, &["stop", "-f"]);
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore runtime directory access");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        !out.status.success(),
+        "blocked socket stop succeeded: {out:?}"
+    );
+    assert!(
+        stderr.contains("cannot connect to daemon for \"s\""),
+        "missing connect error: {stderr:?}"
+    );
+    assert!(stderr.contains("Next:"), "missing next step: {stderr:?}");
+    assert!(
+        !stderr.contains("no daemon running"),
+        "blocked socket was reported as absent: {stderr:?}"
+    );
+}
+
+#[test]
 fn long_socket_path_errors_are_clear_for_each_cli_entry_point() {
     let dir = scratch("long-entry-points").join("x".repeat(120));
     std::fs::create_dir_all(&dir).unwrap();
