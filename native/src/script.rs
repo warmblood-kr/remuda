@@ -29,7 +29,7 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 94] = [
+pub const BINDINGS: [&str; 95] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
@@ -117,6 +117,7 @@ pub const BINDINGS: [&str; 94] = [
     "schedules",
     "send",
     "session",
+    "storage",
     "system",
     "tool",
     "tools",
@@ -400,6 +401,11 @@ const WORDS: &[(&str, &str, &str)] = &[
         "system.credential.backend() -> 'keychain' | 'wincred' | nil",
     ),
     (
+        "storage.dir",
+        "Return the absolute user directory for a storage kind, or nil and an unavailable reason.",
+        "storage.dir(kind) -> path | nil, 'unavailable: reason'",
+    ),
+    (
         "hostname",
         "The OS host name, read from the OS itself (not the environment). Returned unchanged and not sanitized for use in identifiers; callers slug it. Returns nil, error if the OS call fails or the name is empty, not UTF-8, or holds a control, line-separator (U+2028, U+2029) or bidi-control (U+061C, U+200E, U+200F, U+202A-U+202E, U+2066-U+2069) character.",
         "hostname() -> string, nil | nil, error",
@@ -462,6 +468,7 @@ fn registry_bindings(lua: &Lua, table: &Table) -> mlua::Result<()> {
     table.set("json", crate::json::bindings(lua)?)?;
     table.set("cli", cli_parse_bindings(lua)?)?;
     table.set("system", crate::credential::bindings(lua)?)?;
+    table.set("storage", crate::storage::bindings(lua)?)?;
     fs_bindings(lua, table)?;
     table.set("_registry", registry)
 }
