@@ -4,7 +4,7 @@ use mlua::{Lua, Table, UserData, UserDataMethods};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -300,6 +300,7 @@ impl HandleKind {
 type MemoryFiles = Arc<Mutex<BTreeMap<(String, String, String), Vec<u8>>>>;
 type FileRoots = BTreeMap<&'static str, PathBuf>;
 const ATOMIC_TEMP_PREFIX: &str = ".remuda-atomic-";
+const MAX_STORAGE_VALUE_BYTES: usize = 1024 * 1024;
 
 fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
     let override_root = env("REMUDA_STORAGE_ROOT")
@@ -356,6 +357,39 @@ fn lua_relative_name(path: &Path) -> Option<String> {
         .map(|component| component.as_os_str().to_str())
         .collect::<Option<Vec<_>>>()
         .map(|components| components.join("/"))
+}
+
+fn read_regular_file(path: &Path) -> io::Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe file",
+        ));
+    }
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut options = fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = fs::File::open(path)?;
+
+    let mut bytes =
+        Vec::with_capacity(metadata.len().min((MAX_STORAGE_VALUE_BYTES + 1) as u64) as usize);
+    file.take((MAX_STORAGE_VALUE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_STORAGE_VALUE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "storage value too large",
+        ));
+    }
+    Ok(bytes)
 }
 
 struct StorageView {
@@ -435,11 +469,15 @@ impl KindHandle {
                     Some("unavailable: file secrets are disabled until PR C".into()),
                 ));
             }
-            return match fs::read(self.file_path(&key.2)?) {
+            return match read_regular_file(&self.file_path(&key.2)?) {
                 Ok(bytes) => Ok((Some(lua.create_string(bytes)?), None)),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     Ok((None, Some("not_found".into())))
                 }
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok((
+                    None,
+                    Some("denied: storage path is not a regular file".into()),
+                )),
                 Err(_) => Ok((None, Some("unavailable: storage read failed".into()))),
             };
         }
@@ -465,6 +503,22 @@ impl KindHandle {
                 return Err(mlua::Error::runtime(
                     "unavailable: file secrets are disabled until PR C",
                 ));
+            }
+            let namespace_root = self.file_path("")?;
+            let mut names = Vec::new();
+            if namespace_root.is_dir() {
+                collect_files(&namespace_root, &namespace_root, "", &mut names)
+                    .map_err(|_| mlua::Error::runtime("unavailable: storage list failed"))?;
+            }
+            let folded = key.2.to_ascii_lowercase();
+            if names
+                .iter()
+                .any(|name| name != &key.2 && name.to_ascii_lowercase() == folded)
+            {
+                return Err(mlua::Error::runtime("remuda.storage name collides by case"));
+            }
+            if !names.iter().any(|name| name == &key.2) && names.len() >= 1024 {
+                return Err(mlua::Error::runtime("remuda.storage entry limit reached"));
             }
             let path = self.file_path(&key.2)?;
             fs::create_dir_all(path.parent().unwrap()).map_err(|_| {
@@ -622,6 +676,7 @@ impl UserData for SecretHandle {
         );
         methods.add_method("get", |lua, this, name: String| this.0.read(lua, name));
         methods.add_method("delete", |_, this, name: String| this.0.delete(name));
+        methods.add_method("exists", |_, this, name: String| this.0.exists(name));
     }
 }
 
