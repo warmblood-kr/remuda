@@ -581,9 +581,9 @@ fn resize_parser_handles_arity_help_and_range_errors_before_connecting() {
 
 #[test]
 fn upgrade_help_flags_explain_channels_and_daemon_lifecycle() {
-    let dir = scratch("upgrade-help-flags");
     for args in [&["upgrade", "--help"][..], &["upgrade", "-h"]] {
-        let out = remuda(&dir, args);
+        let (out, touched) = touches_daemon("upgrade-help-flags", args);
+        assert!(!touched, "{args:?} connected to the daemon socket");
         assert!(out.status.success(), "{args:?}: {out:?}");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("--channel stable|nightly"), "{stdout}");
@@ -600,7 +600,6 @@ fn upgrade_help_flags_explain_channels_and_daemon_lifecycle() {
             "{stdout}"
         );
     }
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -610,9 +609,7 @@ fn invalid_upgrade_channel_suggests_supported_channels_and_next_step() {
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains(
-            "use --channel stable or --channel nightly, e.g. remuda upgrade --channel nightly"
-        ),
+        stderr.contains("choose --channel stable or --channel nightly"),
         "missing supported channel suggestion: {stderr}"
     );
     assert!(
@@ -623,6 +620,8 @@ fn invalid_upgrade_channel_suggests_supported_channels_and_next_step() {
             .starts_with("Next:"),
         "{stderr}"
     );
+    assert!(stderr.contains("Fix:"), "{stderr}");
+    assert!(stderr.contains("Usage: remuda upgrade"), "{stderr}");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -714,12 +713,36 @@ fn upgrade_explains_daemon_and_session_lifecycle() {
 /// A bad channel fails before any download, after the handshake would have run.
 #[test]
 fn upgrade_never_connects_to_a_daemon() {
-    let (out, touched) = touches_daemon("upgrade", &["upgrade", "--channel", "bogus"]);
-    assert!(
-        !out.status.success(),
-        "a bogus channel was accepted: {out:?}"
-    );
-    assert!(!touched, "upgrade connected to the daemon socket");
+    for args in [
+        &["upgrade", "--channel", "bogus"][..],
+        &["upgrade", "--bogus"][..],
+        &["upgrade", "--channel"][..],
+        &["upgrade", "unexpected"][..],
+    ] {
+        let (out, touched) = touches_daemon("upgrade", args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        assert!(!touched, "{args:?} connected to the daemon socket");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("Fix:"), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("Usage: remuda upgrade"),
+            "{args:?}: {stderr}"
+        );
+        assert!(stderr.contains("Next:"), "{args:?}: {stderr}");
+        if args.get(1) == Some(&"--bogus") {
+            assert!(
+                stderr.contains("remuda: upgrade: unknown option"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("remuda: upgrade: remuda:"), "{stderr}");
+        }
+        if args.get(1) == Some(&"--channel") && args.get(2) == Some(&"bogus") {
+            assert!(
+                stderr.contains("--channel stable or --channel nightly"),
+                "{stderr}"
+            );
+        }
+    }
 }
 
 #[test]

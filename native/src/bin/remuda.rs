@@ -4536,11 +4536,11 @@ fn prepare_command(argv: &[&str], path: &Path) -> Result<Option<String>, String>
 /// Split out of `main` for the same reason `list_sessions` was: clippy's line
 /// budget. This one talks to no daemon — it replaces this very binary.
 fn run_upgrade(args: &[&str]) -> ExitCode {
-    if matches!(args, ["--help"] | ["-h"]) {
-        print!("{UPGRADE_HELP}");
-        return ExitCode::SUCCESS;
-    }
-    match upgrade_channel(args).and_then(dist::upgrade) {
+    let channel = match upgrade_cli_parse(args) {
+        Ok(channel) => channel,
+        Err(code) => return code,
+    };
+    match dist::upgrade(channel.as_deref()) {
         Ok(()) => {
             eprintln!(
                 "The running daemon and its sessions keep using the old version until you run `remuda stop` (that ends those sessions); the next remuda command starts the new version."
@@ -4552,6 +4552,68 @@ fn run_upgrade(args: &[&str]) -> ExitCode {
         }
         Err(e) => fail(e),
     }
+}
+
+fn upgrade_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{OptionSpec, Spec, VerbSpec};
+    Spec {
+        name: "remuda".into(),
+        options: vec![],
+        verbs: vec![VerbSpec {
+            name: "upgrade".into(),
+            about: "Install the latest stable or nightly CLI release".into(),
+            args: vec![],
+            next: "run `remuda upgrade --channel stable` (or choose nightly)".into(),
+            options: vec![OptionSpec {
+                long: "channel".into(),
+                short: None,
+                value: Some("CHANNEL".into()),
+                help: "Release channel: stable or nightly".into(),
+                global: false,
+            }],
+        }],
+    }
+}
+
+fn upgrade_cli_parse(args: &[&str]) -> Result<Option<String>, ExitCode> {
+    let words = std::iter::once("upgrade")
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>();
+    let report = remuda_native::cli_parse::parse(&upgrade_cli_spec(), &words);
+    if !report.ok {
+        if report.kind.as_deref() == Some("help") {
+            print!("{UPGRADE_HELP}");
+            return Err(ExitCode::SUCCESS);
+        }
+        let detail = report.text.lines().next().unwrap_or("invalid arguments");
+        let detail = detail
+            .strip_prefix("remuda: remuda upgrade: ")
+            .unwrap_or(detail);
+        eprintln!(
+            "remuda: upgrade: {detail}\nFix: choose --channel stable or --channel nightly, or omit --channel to keep the installed channel.\nUsage: remuda upgrade [--channel stable|nightly]\nNext: run `remuda upgrade --channel stable` (or choose nightly)."
+        );
+        return Err(ExitCode::FAILURE);
+    }
+    let channel = report
+        .values
+        .get("channel")
+        .and_then(serde_json::Value::as_str);
+    if let Some(channel) = channel {
+        if !dist::is_channel(channel) {
+            eprintln!(
+                "remuda: upgrade: unknown channel {channel:?}; choose --channel stable or --channel nightly.\nFix: choose stable or nightly, or omit --channel to keep the installed channel.\nUsage: remuda upgrade [--channel stable|nightly]\nNext: run `remuda upgrade --channel stable` (or choose nightly)."
+            );
+            return Err(ExitCode::FAILURE);
+        }
+    }
+    Ok(channel.map(str::to_owned))
+}
+
+fn upgrade_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
+    let ["upgrade", args @ ..] = argv else {
+        return None;
+    };
+    upgrade_cli_parse(args).err()
 }
 
 fn send_command(server: &str, path: &Path, name: &str, text: &[&str]) -> ExitCode {
@@ -4578,6 +4640,7 @@ fn preflight_command(argv: &[&str]) -> Option<ExitCode> {
         .or_else(|| stop_cli_preflight(argv))
         .or_else(|| doc_cli_preflight(argv))
         .or_else(|| resize_cli_preflight(argv))
+        .or_else(|| upgrade_cli_preflight(argv))
 }
 
 fn doc_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
@@ -4645,22 +4708,6 @@ fn run_latest_index(args: &[&str]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => fail(error),
-    }
-}
-
-/// `--channel <name>` or nothing, in which case the installed channel file
-/// decides. An unknown flag is refused rather than ignored.
-fn upgrade_channel<'a>(args: &[&'a str]) -> Result<Option<&'a str>, String> {
-    match args {
-        [] => Ok(None),
-        ["--channel", name] if dist::is_channel(name) => Ok(Some(name)),
-        ["--channel", name] => Err(format!(
-            "unknown channel {name:?}; use --channel stable or --channel nightly, e.g. remuda upgrade --channel nightly.\nNext: run `remuda upgrade --channel stable` or `remuda upgrade --channel nightly`."
-        )),
-        _ => Err(
-            "usage: remuda upgrade [--channel stable|nightly]\nNext: run `remuda upgrade --channel stable` or `remuda upgrade --channel nightly`."
-                .into(),
-        ),
     }
 }
 
@@ -6692,5 +6739,25 @@ mod tests {
             caller_env(vars.into_iter()),
             r#"["REMUDA_BUTLER_AGENT_ID"] = "dev \"lead\"""#
         );
+    }
+}
+
+#[cfg(test)]
+mod upgrade_cli_tests {
+    use super::upgrade_cli_parse;
+
+    #[test]
+    fn upgrade_parser_accepts_the_default_and_both_release_channels() {
+        for (args, expected) in [
+            (&[][..], None),
+            (&["--channel", "stable"][..], Some("stable")),
+            (&["--channel", "nightly"][..], Some("nightly")),
+        ] {
+            assert_eq!(
+                upgrade_cli_parse(args).unwrap().as_deref(),
+                expected,
+                "{args:?}"
+            );
+        }
     }
 }
