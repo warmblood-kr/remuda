@@ -361,17 +361,6 @@ fn directory_names(directory: &fs::File) -> io::Result<Vec<String>> {
 }
 
 #[cfg(unix)]
-fn reject_case_clash(directory: &fs::File, wanted: &str) -> io::Result<()> {
-    if directory_names(directory)?
-        .iter()
-        .any(|name| name != wanted && name.eq_ignore_ascii_case(wanted))
-    {
-        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "case clash"));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
 fn open_directory_at(parent: &fs::File, name: &str, create: bool) -> io::Result<fs::File> {
     let name = c_name(name)?;
     if create {
@@ -519,16 +508,15 @@ fn storage_io_error(error: io::Error) -> String {
     }
 }
 
-fn case_clashes(_existing: &[String], _name: &str) -> bool {
-    false
+fn case_clashes(existing: &[String], name: &str) -> bool {
+    let folded = name.to_ascii_lowercase();
+    existing
+        .iter()
+        .any(|existing| existing != name && existing.to_ascii_lowercase() == folded)
 }
 
 #[cfg(unix)]
 fn write_at(location: &FileLocation, bytes: &[u8]) -> io::Result<()> {
-    reject_case_clash(
-        &location.directory,
-        location.name.to_str().map_err(|_| io_denied())?,
-    )?;
     if let Some(stat) = entry_stat(
         &location.directory,
         location.name.to_str().map_err(|_| io_denied())?,
@@ -914,14 +902,14 @@ impl KindHandle {
             let namespace = self
                 .file_path("", false)
                 .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
+            let entries = list_location(&namespace, usize::MAX)
+                .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
+            if case_clashes(&entries, &key.2) {
+                return Err(mlua::Error::runtime("remuda.storage name collides by case"));
+            }
             let exists = exists_location(&location)
                 .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
-            if !exists
-                && list_location(&namespace, usize::MAX)
-                    .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?
-                    .len()
-                    >= MAX_STORAGE_FILES
-            {
+            if !exists && entries.len() >= MAX_STORAGE_FILES {
                 return Err(mlua::Error::runtime("remuda.storage entry limit reached"));
             }
             write_location(&location, bytes)
