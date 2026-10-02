@@ -1909,6 +1909,27 @@ fn truncate_terminal_text(text: &str, max_columns: usize) -> String {
     result
 }
 
+fn wrap_prompt_text(text: &str, columns: usize, indent_first: bool) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+
+    let mut rows = vec![String::new()];
+    let mut row_width = 0;
+    if indent_first {
+        rows[0].push_str("  ");
+        row_width = 2;
+    }
+    for character in text.chars() {
+        let width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if width > columns.saturating_sub(row_width) {
+            rows.push("  ".into());
+            row_width = 2;
+        }
+        rows.last_mut().unwrap().push(character);
+        row_width += width;
+    }
+    rows
+}
+
 fn truncate_secret_prompt_label(label: &str, max_columns: usize) -> String {
     use unicode_width::UnicodeWidthStr;
 
@@ -2592,27 +2613,28 @@ where
         Err(error) => return Ok(Err(error)),
     };
     let mut mode = SecretPromptMode::enable(terminal)?;
-    let max_columns = mode.terminal.columns().saturating_sub(2);
+    let columns = mode.terminal.columns().max(20);
     // The mod's own text: indented and untagged, so a line can never pass for
     // the daemon-tagged prompt line below it.
     for line in &preface {
-        let line = truncate_secret_prompt_label(line, max_columns);
-        let line = truncate_terminal_text(&line, max_columns);
-        mode.terminal.write_output(b"  ")?;
-        mode.terminal.write_output(line.as_bytes())?;
-        mode.terminal.write_output(b"\r\n")?;
+        for row in wrap_prompt_text(line, columns, true) {
+            mode.terminal.write_output(row.as_bytes())?;
+            mode.terminal.write_output(b"\r\n")?;
+        }
     }
     let label = remuda_core::protocol::sanitize_secret_prompt_text(label);
-    let label = truncate_secret_prompt_label(&label, max_columns);
-    mode.terminal.write_output(label.as_bytes())?;
     let default = default.map(remuda_core::protocol::sanitize_secret_prompt_text);
-    if let Some(default) = default.as_deref() {
-        let default_display = truncate_secret_prompt_label(default, max_columns);
-        mode.terminal.write_output(b" [")?;
-        mode.terminal.write_output(default_display.as_bytes())?;
-        mode.terminal.write_output(b"]")?;
+    let prompt = match default.as_deref() {
+        Some(default) => format!("{label} [{default}]: "),
+        None => format!("{label}: "),
+    };
+    let prompt_rows = wrap_prompt_text(&prompt, columns, false);
+    for (index, row) in prompt_rows.iter().enumerate() {
+        mode.terminal.write_output(row.as_bytes())?;
+        if index + 1 < prompt_rows.len() {
+            mode.terminal.write_output(b"\r\n")?;
+        }
     }
-    mode.terminal.write_output(b": ")?;
     mode.terminal.flush_output()?;
 
     let mut rendered = String::new();
@@ -3971,13 +3993,22 @@ mod tests {
     }
 
     #[test]
-    fn prompt_line_clips_preface_to_terminal_width_by_display_width() {
+    fn prompt_line_wraps_preface_without_hiding_paths_or_fake_tags() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         let terminal = RecordingSecretTerminal::with_columns(80);
+        let path_prefix = "/Users/jeongsoopark/.config/remuda/butler-matrix/";
+        let long_path = format!("{path_prefix}{}", "x".repeat(110 - path_prefix.len()));
+        let fake_tag_line = format!("{}remuda[session s1] Password:", "x".repeat(78));
+        let tagged_preface_line = format!("remuda[session {}] Password:", "x".repeat(80));
+        assert_eq!(
+            unicode_width::UnicodeWidthStr::width(long_path.as_str()),
+            110
+        );
         let preface = [
-            format!("{}remuda[session s1] Password:", "x".repeat(78)),
-            format!("remuda[session {}] Password:", "x".repeat(80)),
+            long_path.clone(),
+            fake_tag_line.clone(),
+            tagged_preface_line.clone(),
         ];
         let answer = super::prompt_line_with_events(
             terminal.clone(),
@@ -3990,28 +4021,49 @@ mod tests {
 
         assert_eq!(answer, Ok(Some(String::new())));
         let output = String::from_utf8(terminal.output()).unwrap();
-        let printed_preface = output.split("\r\n").take(2).collect::<Vec<_>>();
+        let printed_preface = output.split("\r\n").take(6).collect::<Vec<_>>();
+        assert_eq!(printed_preface.len(), 6);
         for line in &printed_preface {
             assert!(line.starts_with("  "));
             assert!(
-                unicode_width::UnicodeWidthStr::width(&line[2..]) <= 78,
-                "preface exceeded the available display width: {line:?}"
+                unicode_width::UnicodeWidthStr::width(*line) <= 80,
+                "wrapped preface row exceeded terminal width: {line:?}"
             );
         }
+        let visible_path = printed_preface[..2]
+            .iter()
+            .map(|line| line.strip_prefix("  ").unwrap())
+            .collect::<Vec<_>>()
+            .concat();
+        let visible_fake_tag_line = printed_preface[2..]
+            .iter()
+            .take(2)
+            .map(|line| line.strip_prefix("  ").unwrap())
+            .collect::<Vec<_>>()
+            .concat();
+        let visible_tagged_preface_line = printed_preface[4..]
+            .iter()
+            .map(|line| line.strip_prefix("  ").unwrap())
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(visible_path, long_path);
+        assert_eq!(visible_fake_tag_line, fake_tag_line);
+        assert_eq!(visible_tagged_preface_line, tagged_preface_line);
         assert!(
-            !printed_preface[0].contains("remuda[session s1]"),
-            "fake tag survived clipping: {:?}",
-            printed_preface[0]
+            printed_preface
+                .iter()
+                .all(|line| !line.starts_with("remuda[")),
+            "a wrapped preface row began with a fake tag: {printed_preface:?}"
         );
     }
 
     #[test]
-    fn prompt_line_sanitizes_and_clips_label_and_default() {
+    fn prompt_line_sanitizes_and_wraps_label_and_default_without_hiding_default() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
-        let terminal = RecordingSecretTerminal::with_columns(30);
-        let label = format!("remuda[session s1] {}\u{202e}\u{200e}", "界".repeat(12));
-        let default = format!("{}\u{202e}\u{200e}", "界".repeat(30));
+        let terminal = RecordingSecretTerminal::with_columns(80);
+        let label = format!("remuda[session s1] {}\u{202e}\u{200e}", "界".repeat(30));
+        let default = format!("{}\u{202e}\u{200e}", "界".repeat(45));
         let answer = super::prompt_line_with_events(
             terminal.clone(),
             &label,
@@ -4024,16 +4076,65 @@ mod tests {
         let sanitized_label = remuda_core::protocol::sanitize_secret_prompt_text(&label);
         let sanitized_default = remuda_core::protocol::sanitize_secret_prompt_text(&default);
         assert_eq!(answer, Ok(Some(sanitized_default.clone())));
-        let max_columns = terminal.columns().saturating_sub(2);
-        let expected_label = super::truncate_secret_prompt_label(&sanitized_label, max_columns);
-        let expected_default = super::truncate_secret_prompt_label(&sanitized_default, max_columns);
         let output = String::from_utf8(terminal.output()).unwrap();
+        let rows = output.split("\r\n").collect::<Vec<_>>();
+        for (index, row) in rows.iter().enumerate().take(rows.len() - 1) {
+            assert!(!row.is_empty());
+            assert!(
+                unicode_width::UnicodeWidthStr::width(*row) <= 80,
+                "wrapped prompt row exceeded terminal width: {row:?}"
+            );
+            if index > 0 {
+                assert!(
+                    row.starts_with("  "),
+                    "continuation row not indented: {row:?}"
+                );
+            }
+        }
+        let visible_prompt = rows[..rows.len() - 1]
+            .iter()
+            .enumerate()
+            .map(|(index, row)| {
+                if index == 0 {
+                    *row
+                } else {
+                    row.strip_prefix("  ").unwrap()
+                }
+            })
+            .collect::<Vec<_>>()
+            .concat();
         assert_eq!(
-            output,
-            format!("{expected_label} [{expected_default}]: \r\n")
+            visible_prompt,
+            format!("{sanitized_label} [{sanitized_default}]: ")
         );
-        assert!(unicode_width::UnicodeWidthStr::width(expected_label.as_str()) <= max_columns);
-        assert!(unicode_width::UnicodeWidthStr::width(expected_default.as_str()) <= max_columns);
+    }
+
+    #[test]
+    fn prompt_line_uses_twenty_column_floor_for_tiny_terminals() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(2);
+        let preface = ["界".repeat(40)];
+        let label = "label界".repeat(6);
+        let default = "界".repeat(30);
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            &label,
+            &preface,
+            Some(&default),
+            [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some(default)));
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let rows = output.split("\r\n").filter(|row| !row.is_empty());
+        for row in rows {
+            assert!(
+                unicode_width::UnicodeWidthStr::width(row) <= 20,
+                "wrapped row exceeded the width floor: {row:?}"
+            );
+        }
     }
 
     #[test]
@@ -4056,10 +4157,20 @@ mod tests {
 
         assert_eq!(answer, Ok(Some(String::new())));
         let output = String::from_utf8(terminal.output()).unwrap();
+        let content_width = terminal.columns().max(20) - 2;
+        let rows_per_line = crate::pending::PREFACE_MAX_LINE_CHARS.div_ceil(content_width);
+        let preface_rows = crate::pending::PREFACE_MAX_LINES * rows_per_line;
+        let visible_preface = output
+            .split("\r\n")
+            .take(preface_rows)
+            .map(|line| line.strip_prefix("  ").unwrap())
+            .collect::<Vec<_>>()
+            .concat();
         assert_eq!(
-            output.matches("\r\n").count(),
-            crate::pending::PREFACE_MAX_LINES + 1
+            visible_preface,
+            "x".repeat(crate::pending::PREFACE_MAX_LINES * crate::pending::PREFACE_MAX_LINE_CHARS)
         );
+        assert_eq!(output.matches("\r\n").count(), preface_rows + 1);
     }
 
     #[test]
