@@ -1407,6 +1407,8 @@ mod tests {
     fn xdg_list_skips_and_reserves_atomic_temporary_names() {
         let root = TestRoot::new();
         let namespace = root.0.join("data/storage/listed");
+        #[cfg(windows)]
+        crate::windows_security::ensure_storage_root(&root.0.join("data/storage")).unwrap();
         fs::create_dir_all(&namespace).unwrap();
         fs::write(namespace.join("regular"), b"file").unwrap();
         fs::write(namespace.join(".remuda-atomic-123.tmp"), b"temporary").unwrap();
@@ -1467,7 +1469,22 @@ mod tests {
         )
         .exec()
         .unwrap();
+        #[cfg(windows)]
+        assert!(!contains_regular_file(&root.0).unwrap());
+        #[cfg(unix)]
         assert!(fs::read_dir(&root.0).unwrap().next().is_none());
+    }
+
+    #[cfg(windows)]
+    fn contains_regular_file(path: &Path) -> io::Result<bool> {
+        for entry in fs::read_dir(path)? {
+            let child = entry?.path();
+            let file_type = fs::symlink_metadata(&child)?.file_type();
+            if file_type.is_file() || (file_type.is_dir() && contains_regular_file(&child)?) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     #[cfg(unix)]
@@ -1493,6 +1510,8 @@ mod tests {
     fn xdg_read_rejects_files_larger_than_one_mib() {
         let root = TestRoot::new();
         let namespace = root.0.join("data/storage/reader");
+        #[cfg(windows)]
+        crate::windows_security::ensure_storage_root(&root.0.join("data/storage")).unwrap();
         fs::create_dir_all(&namespace).unwrap();
         fs::write(namespace.join("large"), vec![b'x'; 1024 * 1024 + 1]).unwrap();
         let lua = lua_with_xdg_root(&root.0);
