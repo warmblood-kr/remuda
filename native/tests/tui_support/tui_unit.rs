@@ -2967,7 +2967,6 @@ fn refused_socket_is_definitive_only_when_its_lifetime_lock_is_free() {
 #[test]
 fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
     use std::os::fd::AsRawFd;
-    use std::os::unix::net::UnixListener;
 
     struct TestDir(std::path::PathBuf);
 
@@ -2984,12 +2983,7 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
     let dir = TestDir(std::env::temp_dir().join(format!("r{:x}-{nonce:x}", std::process::id())));
     std::fs::create_dir(&dir.0).expect("create unique busy daemon directory");
     let socket = dir.0.join("s.sock");
-    assert!(
-        socket.as_os_str().len() < 104,
-        "private socket path must fit the macOS sun_path limit: {} bytes",
-        socket.as_os_str().len()
-    );
-    drop(UnixListener::bind(&socket).expect("bind private endpoint"));
+    std::fs::write(&socket, b"stale endpoint").expect("make endpoint exist");
     let lock_path = dir.0.join("s.sock.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -3002,30 +2996,24 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
     );
-    let connect_error = crate::ipc::connect(&socket).expect_err("placeholder is not a socket");
-    assert_eq!(
-        connect_error.kind(),
-        std::io::ErrorKind::ConnectionRefused,
-        "{connect_error:?}"
+    let refused = std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+    assert!(
+        !socket_lock_is_free(&socket),
+        "the fixture must hold the daemon lifetime lock"
     );
-    assert!(!daemon_is_definitively_gone(&socket, &connect_error));
+    assert!(
+        !daemon_is_definitively_gone(&socket, &refused),
+        "the held flock is why this refusal is not definitive"
+    );
 
     let mut ui = make_ui(vec![row("remembered", true, false)]);
     ui.consecutive_transport_failures = 2;
-    let mut held = None;
-    let mut painted = String::new();
-    let mut shown = None;
-    refresh(
+    record_daemon_probe_failure(
         &socket,
-        "test",
         &mut ui,
-        &mut held,
-        &mut painted,
-        &mut shown,
-        false,
-        false,
-    )
-    .expect("refresh handles refused private endpoint");
+        "synthetic connection refusal".into(),
+        refused,
+    );
     assert!(
         ui.daemon_gone.is_none(),
         "held lifetime lock means the daemon may be busy"
@@ -3035,6 +3023,14 @@ fn held_lock_refused_connection_does_not_accumulate_gone_failures() {
         "busy refusal must not count"
     );
     assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    assert!(socket_lock_is_free(&socket));
+    assert!(
+        daemon_is_definitively_gone(
+            &socket,
+            &std::io::Error::from_raw_os_error(libc::ECONNREFUSED)
+        ),
+        "after releasing the flock, the same refusal is definitive"
+    );
     drop(lock);
 }
 
