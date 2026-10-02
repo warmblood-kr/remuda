@@ -616,6 +616,8 @@ fn collect_line_from_terminal(
     timeout_ms: u64,
 ) -> std::io::Result<LinePromptCollection> {
     use std::io::IsTerminal as _;
+    let preface =
+        sanitize_prompt_line_preface(preface).map_err(|_| invalid_prompt_preface_error())?;
     if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
         return Ok(LinePromptCollection::Answer(
             None,
@@ -654,7 +656,7 @@ fn collect_line_from_terminal(
             Err(_) => return None,
         }
     });
-    let answer = prompt_line_with_events(std::io::stderr(), label, preface, default, events)?;
+    let answer = prompt_line_with_events(std::io::stderr(), label, &preface, default, events)?;
     #[cfg(unix)]
     {
         drop(signal_guard);
@@ -680,6 +682,9 @@ fn collect_line_from_terminal(
                 None,
                 Some(remuda_core::protocol::SecretAnswerRefusal::TooLong),
             ),
+            Err(PromptLineError::InvalidPreface) => {
+                return Err(invalid_prompt_preface_error());
+            }
         };
         Ok(LinePromptCollection::Answer(answer.0, answer.1))
     }
@@ -2279,6 +2284,31 @@ enum PromptLineEcho {
 #[derive(Debug, Eq, PartialEq)]
 enum PromptLineError {
     TooLong,
+    InvalidPreface,
+}
+
+fn sanitize_prompt_line_preface(preface: &[String]) -> Result<Vec<String>, PromptLineError> {
+    if preface.len() > crate::pending::PREFACE_MAX_LINES {
+        return Err(PromptLineError::InvalidPreface);
+    }
+    let safe: Vec<String> = preface
+        .iter()
+        .map(|line| remuda_core::protocol::sanitize_secret_prompt_text(line))
+        .collect();
+    if safe
+        .iter()
+        .any(|line| line.chars().count() > crate::pending::PREFACE_MAX_LINE_CHARS)
+    {
+        return Err(PromptLineError::InvalidPreface);
+    }
+    Ok(safe)
+}
+
+fn invalid_prompt_preface_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "daemon sent an invalid line prompt preface\nNext: update remuda and retry the command.",
+    )
 }
 
 fn edit_prompt_line(
@@ -2557,14 +2587,14 @@ where
     T: SecretPromptTerminal,
     I: IntoIterator<Item = crossterm::event::Event>,
 {
+    let preface = match sanitize_prompt_line_preface(preface) {
+        Ok(preface) => preface,
+        Err(error) => return Ok(Err(error)),
+    };
     let mut mode = SecretPromptMode::enable(terminal)?;
     // The mod's own text: indented and untagged, so a line can never pass for
     // the daemon-tagged prompt line below it.
-    for line in preface {
-        let line: String = line
-            .chars()
-            .filter(|character| !character.is_control())
-            .collect();
+    for line in &preface {
         mode.terminal.write_output(b"  ")?;
         mode.terminal.write_output(line.as_bytes())?;
         mode.terminal.write_output(b"\r\n")?;
@@ -3874,6 +3904,70 @@ mod tests {
         assert_eq!(
             terminal.output(),
             b"  Will join[2K the room\r\n  \r\nContinue? [N]: \r\n"
+        );
+    }
+
+    #[test]
+    fn prompt_line_preface_from_response_is_capped_and_sanitized() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let run_frame = |preface: Vec<String>| {
+            let frame = Response::PromptLine {
+                id: 1,
+                label: "Continue?".into(),
+                preface,
+                default: None,
+                timeout_ms: 1000,
+            };
+            let wire = serde_json::to_vec(&frame).unwrap();
+            let decoded: Response = serde_json::from_slice(&wire).unwrap();
+            let Response::PromptLine {
+                label,
+                preface,
+                default,
+                ..
+            } = decoded
+            else {
+                unreachable!("serialized prompt line changed variant")
+            };
+            let terminal = RecordingSecretTerminal::default();
+            let answer = super::prompt_line_with_events(
+                terminal.clone(),
+                &label,
+                &preface,
+                default.as_deref(),
+                [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
+            )
+            .unwrap();
+            (answer, terminal.output())
+        };
+
+        let mut too_many_lines = vec!["safe\u{202e}".to_string()];
+        too_many_lines.extend((1..=crate::pending::PREFACE_MAX_LINES).map(|n| n.to_string()));
+        let (answer, output) = run_frame(too_many_lines);
+        assert_eq!(answer, Err(super::PromptLineError::InvalidPreface));
+        assert!(
+            output.is_empty(),
+            "over-cap frame reached terminal: {output:?}"
+        );
+
+        let too_long_line = format!(
+            "safe\u{202e}{}",
+            "x".repeat(crate::pending::PREFACE_MAX_LINE_CHARS)
+        );
+        let (answer, output) = run_frame(vec![too_long_line]);
+        assert_eq!(answer, Err(super::PromptLineError::InvalidPreface));
+        assert!(
+            output.is_empty(),
+            "over-cap frame reached terminal: {output:?}"
+        );
+
+        let (answer, output) = run_frame(vec!["Will\u{202e} join".into(), "Plain line".into()]);
+        assert_eq!(answer, Ok(Some(String::new())));
+        assert_eq!(output, b"  Will join\r\n  Plain line\r\nContinue?: \r\n");
+        assert_eq!(
+            super::invalid_prompt_preface_error().to_string(),
+            "daemon sent an invalid line prompt preface\nNext: update remuda and retry the command."
         );
     }
 
