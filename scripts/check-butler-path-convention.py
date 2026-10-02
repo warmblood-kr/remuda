@@ -34,8 +34,13 @@ installer = INSTALLER.read_text(encoding="utf-8")
 daemon_rs = DAEMON_RS.read_text(encoding="utf-8")
 storage_rs = STORAGE_RS.read_text(encoding="utf-8")
 
-# Shell side: config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
-sh_fallback = re.search(r'config_home="\$\{XDG_CONFIG_HOME:-\$HOME(/[^}]*)\}"', installer)
+# Shell side: read XDG_CONFIG_HOME only after requiring an absolute path, else
+# use the HOME fallback that storage's Config kind defines.
+sh_fallback = re.search(
+    r'config_home="\$\{XDG_CONFIG_HOME:-\$HOME(/[^}]*)\}"'
+    r'|config_home="\$HOME(/[^\"]+)"',
+    installer,
+)
 if not sh_fallback:
     print(
         f"{INSTALLER.name}: could not find the XDG_CONFIG_HOME:-$HOME fallback "
@@ -43,6 +48,15 @@ if not sh_fallback:
         file=sys.stderr,
     )
     sys.exit(1)
+sh_fallback_segment = sh_fallback.group(1) or sh_fallback.group(2)
+sh_absolute_xdg_guard = re.search(
+    r'config_home="\$\{XDG_CONFIG_HOME:-\}"\s*\n'
+    r'case "\$config_home" in\s*\n'
+    r'\s*/\*\)\s*;;\s*\n'
+    r'\s*\*\)\s*config_home="\$HOME/[^\"]+"\s*;;\s*\n'
+    r'esac',
+    installer,
+)
 
 sh_init_lua_target = re.search(r'init_lua="\$config_home(/remuda/init\.lua)"', installer)
 # Rust side: user_config_path selects Config + init.lua, and storage appends
@@ -75,6 +89,11 @@ if not rust_config_file:
         f"{DAEMON_RS.name}: could not find user_config_path()'s Config/init.lua "
         "resolver call -- parser or convention changed"
     )
+if not sh_absolute_xdg_guard:
+    problems2.append(
+        f"{INSTALLER.name}: relative XDG_CONFIG_HOME must fall back to HOME "
+        "instead of being used as an init.lua base"
+    )
 if not rust_config_subdir:
     problems2.append(
         f"{STORAGE_RS.name}: could not find the Config HOME fallback directory "
@@ -96,9 +115,9 @@ if problems2:
     sys.exit(1)
 
 rust_fallback_segment = f"/{rust_config_subdir.group(1)}"
-if sh_fallback.group(1) != rust_fallback_segment:
+if sh_fallback_segment != rust_fallback_segment:
     problems2.append(
-        f"HOME fallback diverged: install-butler.sh uses $HOME{sh_fallback.group(1)}, "
+        f"HOME fallback diverged: install-butler.sh uses $HOME{sh_fallback_segment}, "
         f"storage Config uses $HOME{rust_fallback_segment}"
     )
 if sh_init_lua_target.group(1) != f"/remuda/{rust_config_file.group(1)}":
