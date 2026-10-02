@@ -108,7 +108,12 @@ fn init_at(state_dir: &Path) -> io::Result<(NodeIdentity, bool, Option<String>)>
         }],
     })?;
     registry::save_registry_at(&dir, &registry)?;
-    storage::write_cluster_init_marker(state_dir, &node.node_fp)?;
+    if let Err(error) = storage::write_cluster_init_marker(state_dir, &node.node_fp) {
+        eprintln!(
+            "warning: cluster identity initialized, but marker {} could not be written: {error}",
+            state_dir.join("cluster-initialized").display()
+        );
+    }
     Ok((
         node,
         created,
@@ -706,6 +711,45 @@ mod init_marker_tests {
         assert_eq!(same.node_fp, first.node_fp);
         assert!(!created);
         assert!(previous.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_succeeds_when_marker_write_fails_after_identity_save() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_dir = TempStateDir::new();
+        let cluster_dir = state_dir.0.join("cluster");
+        fs::create_dir_all(&cluster_dir).unwrap();
+        fs::set_permissions(&cluster_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&state_dir.0, fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = init_at(&state_dir.0);
+
+        fs::set_permissions(&state_dir.0, fs::Permissions::from_mode(0o700)).unwrap();
+        let (_, created, previous) = result.expect("marker write failure must not fail init");
+        assert!(created);
+        assert!(previous.is_none());
+        assert!(cluster_dir.join("identity.key").exists());
+        assert!(!state_dir.0.join("cluster-initialized").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_rewrites_existing_marker_with_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let state_dir = TempStateDir::new();
+        init_at(&state_dir.0).unwrap();
+        let marker = state_dir.0.join("cluster-initialized");
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o644)).unwrap();
+
+        init_at(&state_dir.0).unwrap();
+
+        assert_eq!(
+            fs::metadata(marker).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }
 

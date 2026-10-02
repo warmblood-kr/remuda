@@ -11,6 +11,13 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<(
     write_atomic_inner(path, bytes, mode, true)
 }
 
+/// Atomically replace a file with the requested mode instead of preserving an
+/// existing regular file's mode.
+#[cfg(not(windows))]
+pub(crate) fn write_atomic_exact_mode(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    write_atomic_inner(path, bytes, mode, false)
+}
+
 /// Write an owner-only Lua state file on Unix. Windows uses its normal
 /// inherited ACL for this public Lua option.
 pub(crate) fn write_atomic_lua_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -83,6 +90,9 @@ fn write_atomic_inner(
                 use std::os::unix::fs::PermissionsExt;
                 file.set_permissions(fs::Permissions::from_mode(existing_mode))?;
             }
+        } else {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(mode))?;
         }
         file.sync_all()
     });
