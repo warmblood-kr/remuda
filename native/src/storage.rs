@@ -1,8 +1,10 @@
 //! Per-kind user directory resolution and Lua bindings.
 
 use mlua::{Lua, Table, UserData, UserDataMethods};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
+use std::fs;
+use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -132,27 +134,31 @@ pub(crate) fn user_file_path_for(
 }
 
 pub(crate) fn bindings(lua: &Lua) -> mlua::Result<Table> {
+    bindings_with_env(lua, &|name| std::env::var_os(name))
+}
+
+fn bindings_with_env(lua: &Lua, env: Env<'_>) -> mlua::Result<Table> {
+    let environment = Arc::new(
+        [
+            "REMUDA_STORAGE_ROOT",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_CACHE_HOME",
+            "HOME",
+            "LOCALAPPDATA",
+            "USERPROFILE",
+        ]
+        .into_iter()
+        .filter_map(|name| env(name).map(|value| (name.to_string(), value)))
+        .collect::<HashMap<_, _>>(),
+    );
     let storage = lua.create_table()?;
-    storage.set(
-        "dir",
-        lua.create_function(|_, kind: String| {
-            match resolve_dir_for(&kind, cfg!(windows), &|name| std::env::var_os(name)) {
-                Ok(path) => match path.into_os_string().into_string() {
-                    Ok(path) => Ok((Some(path), None::<String>)),
-                    Err(_) => Ok((
-                        None::<String>,
-                        Some("unavailable: resolved path is not valid UTF-8".to_string()),
-                    )),
-                },
-                Err(error) if error.starts_with("unavailable: ") => {
-                    Ok((None::<String>, Some(error)))
-                }
-                Err(error) => Err(mlua::Error::runtime(error)),
-            }
-        })?,
-    )?;
+    register_dir_binding(lua, &storage)?;
     let files = Arc::new(Mutex::new(BTreeMap::new()));
+    let roots = Arc::new(Mutex::new(None::<Arc<FileRoots>>));
     let get_files = files.clone();
+    let get_roots = roots.clone();
     storage.set(
         "get",
         lua.create_function(move |lua, namespace: String| {
@@ -160,46 +166,114 @@ pub(crate) fn bindings(lua: &Lua) -> mlua::Result<Table> {
             lua.create_userdata(StorageView {
                 namespace,
                 files: get_files.clone(),
+                roots: get_roots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
             })
         })?,
     )?;
+    let default_files = files.clone();
+    let default_roots = roots.clone();
     storage.set(
         "default",
         lua.create_function(move |lua, ()| {
             lua.create_userdata(StorageView {
                 namespace: "default".into(),
-                files: files.clone(),
+                files: default_files.clone(),
+                roots: default_roots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
             })
         })?,
     )?;
+    let set_roots = roots.clone();
+    let memory_roots = roots.clone();
+    let backend_env = environment.clone();
     storage.set(
         "set_default",
-        lua.create_function(|_, backend: String| {
-            (backend == "memory")
-                .then_some(true)
-                .ok_or_else(|| mlua::Error::runtime("only the memory backend is available"))
+        lua.create_function(move |_, backend: String| {
+            let selected = match backend.as_str() {
+                "memory" => None,
+                "xdg" => Some(Arc::new(
+                    file_roots(&|name| backend_env.get(name).cloned())
+                        .map_err(mlua::Error::runtime)?,
+                )),
+                _ => return Err(mlua::Error::runtime("unknown storage backend")),
+            };
+            *set_roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = selected;
+            Ok(true)
         })?,
     )?;
-    storage.set("backend", lua.create_function(|_, ()| Ok("memory"))?)?;
     storage.set(
-        "path",
-        lua.create_function(|_, (kind, name): (String, String)| {
-            if !matches!(
-                kind.as_str(),
-                "config" | "data" | "state" | "cache" | "secret"
-            ) {
-                return Err(mlua::Error::runtime("remuda.storage.path: unknown kind"));
-            }
-            checked_name(&name)?;
-            Ok(None::<String>)
+        "backend",
+        lua.create_function(move |_, ()| {
+            Ok(
+                if memory_roots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_some()
+                {
+                    "xdg"
+                } else {
+                    "memory"
+                },
+            )
         })?,
     )?;
+    register_path_binding(lua, &storage, roots)?;
     Ok(storage)
 }
 
-#[cfg(test)]
-fn bindings_with_env(lua: &Lua, _env: Env<'_>) -> mlua::Result<Table> {
-    bindings(lua)
+fn register_dir_binding(lua: &Lua, storage: &Table) -> mlua::Result<()> {
+    storage.set(
+        "dir",
+        lua.create_function(|_, kind: String| {
+            match resolve_dir_for(&kind, cfg!(windows), &|name| std::env::var_os(name)) {
+                Ok(path) => match path.into_os_string().into_string() {
+                    Ok(path) => Ok((Some(path), None::<String>)),
+                    Err(_) => Ok((
+                        None,
+                        Some("unavailable: resolved path is not valid UTF-8".to_string()),
+                    )),
+                },
+                Err(error) if error.starts_with("unavailable: ") => Ok((None, Some(error))),
+                Err(error) => Err(mlua::Error::runtime(error)),
+            }
+        })?,
+    )?;
+    Ok(())
+}
+
+fn register_path_binding(
+    lua: &Lua,
+    storage: &Table,
+    path_roots: Arc<Mutex<Option<Arc<FileRoots>>>>,
+) -> mlua::Result<()> {
+    storage.set(
+        "path",
+        lua.create_function(move |_, (kind, name): (String, String)| {
+            if kind == "secret" {
+                checked_name(&name)?;
+                return Ok(None::<String>);
+            }
+            let Some(kind) = Kind::parse(&kind) else {
+                return Err(mlua::Error::runtime("remuda.storage.path: unknown kind"));
+            };
+            checked_name(&name)?;
+            Ok(path_roots
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .and_then(|roots| roots.get(kind.as_str()))
+                .map(|root| root.join("default").join(name))
+                .and_then(|path| path.into_os_string().into_string().ok()))
+        })?,
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -224,10 +298,57 @@ impl HandleKind {
 }
 
 type MemoryFiles = Arc<Mutex<BTreeMap<(String, String, String), Vec<u8>>>>;
+type FileRoots = BTreeMap<&'static str, PathBuf>;
+
+fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
+    let override_root = env("REMUDA_STORAGE_ROOT")
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from);
+    if override_root
+        .as_ref()
+        .is_some_and(|root| !root.is_absolute())
+    {
+        return Err("REMUDA_STORAGE_ROOT must be an absolute path".into());
+    }
+    [Kind::Config, Kind::Data, Kind::State, Kind::Cache]
+        .into_iter()
+        .map(|kind| {
+            let root = match &override_root {
+                Some(root) => root.join(kind.as_str()),
+                None => resolve_dir_for(kind.as_str(), cfg!(windows), env)?,
+            };
+            Ok((kind.as_str(), root))
+        })
+        .collect()
+}
+
+fn collect_files(
+    base: &std::path::Path,
+    dir: &std::path::Path,
+    prefix: &str,
+    names: &mut Vec<String>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            collect_files(base, &path, prefix, names)?;
+        } else if kind.is_file() {
+            if let Some(name) = path.strip_prefix(base).ok().and_then(|path| path.to_str()) {
+                if name.starts_with(prefix) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 struct StorageView {
     namespace: String,
     files: MemoryFiles,
+    roots: Option<Arc<FileRoots>>,
 }
 
 impl StorageView {
@@ -236,6 +357,7 @@ impl StorageView {
             namespace: self.namespace.clone(),
             kind,
             files: self.files.clone(),
+            roots: self.roots.clone(),
         }
     }
 }
@@ -262,9 +384,23 @@ struct KindHandle {
     namespace: String,
     kind: HandleKind,
     files: MemoryFiles,
+    roots: Option<Arc<FileRoots>>,
 }
 
 impl KindHandle {
+    fn file_path(&self, name: &str) -> mlua::Result<PathBuf> {
+        if matches!(self.kind, HandleKind::Secret) {
+            return Err(mlua::Error::runtime(
+                "unavailable: file secrets are disabled until PR C",
+            ));
+        }
+        self.roots
+            .as_ref()
+            .and_then(|roots| roots.get(self.kind.as_str()))
+            .map(|root| root.join(&self.namespace).join(name))
+            .ok_or_else(|| mlua::Error::runtime("unavailable: storage root is unavailable"))
+    }
+
     fn key(&self, name: String) -> mlua::Result<(String, String, String)> {
         Ok((
             self.namespace.clone(),
@@ -278,11 +414,27 @@ impl KindHandle {
         lua: &Lua,
         name: String,
     ) -> mlua::Result<(Option<mlua::LuaString>, Option<String>)> {
+        let key = self.key(name)?;
+        if self.roots.is_some() {
+            if matches!(self.kind, HandleKind::Secret) {
+                return Ok((
+                    None,
+                    Some("unavailable: file secrets are disabled until PR C".into()),
+                ));
+            }
+            return match fs::read(self.file_path(&key.2)?) {
+                Ok(bytes) => Ok((Some(lua.create_string(bytes)?), None)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Ok((None, Some("not_found".into())))
+                }
+                Err(_) => Ok((None, Some("unavailable: storage read failed".into()))),
+            };
+        }
         let value = self
             .files
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&self.key(name)?)
+            .get(&key)
             .cloned();
         match value {
             Some(bytes) => Ok((Some(lua.create_string(bytes)?), None)),
@@ -295,6 +447,20 @@ impl KindHandle {
             return Err(mlua::Error::runtime("remuda.storage write exceeds 1 MiB"));
         }
         let key = self.key(name)?;
+        if self.roots.is_some() {
+            if matches!(self.kind, HandleKind::Secret) {
+                return Err(mlua::Error::runtime(
+                    "unavailable: file secrets are disabled until PR C",
+                ));
+            }
+            let path = self.file_path(&key.2)?;
+            fs::create_dir_all(path.parent().unwrap()).map_err(|_| {
+                mlua::Error::runtime("unavailable: storage directory create failed")
+            })?;
+            crate::fs_atomic::write_atomic(&path, bytes, 0o600)
+                .map_err(|_| mlua::Error::runtime("unavailable: storage write failed"))?;
+            return Ok(());
+        }
         let mut files = self
             .files
             .lock()
@@ -322,19 +488,43 @@ impl KindHandle {
     }
 
     fn exists(&self, name: String) -> mlua::Result<bool> {
+        let key = self.key(name)?;
+        if self.roots.is_some() {
+            return Ok(if matches!(self.kind, HandleKind::Secret) {
+                false
+            } else {
+                self.file_path(&key.2)?.is_file()
+            });
+        }
         Ok(self
             .files
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(&self.key(name)?))
+            .contains_key(&key))
     }
 
     fn delete(&self, name: String) -> mlua::Result<(Option<bool>, Option<String>)> {
+        let key = self.key(name)?;
+        if self.roots.is_some() {
+            if matches!(self.kind, HandleKind::Secret) {
+                return Ok((
+                    None,
+                    Some("unavailable: file secrets are disabled until PR C".into()),
+                ));
+            }
+            return match fs::remove_file(self.file_path(&key.2)?) {
+                Ok(()) => Ok((Some(true), None)),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    Ok((None, Some("not_found".into())))
+                }
+                Err(_) => Ok((None, Some("unavailable: storage delete failed".into()))),
+            };
+        }
         if self
             .files
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&self.key(name)?)
+            .remove(&key)
             .is_some()
         {
             Ok((Some(true), None))
@@ -345,6 +535,21 @@ impl KindHandle {
 
     fn list(&self, lua: &Lua, prefix: String) -> mlua::Result<Table> {
         let prefix = checked_prefix(prefix)?;
+        if self.roots.is_some() {
+            if matches!(self.kind, HandleKind::Secret) {
+                return Err(mlua::Error::runtime(
+                    "unavailable: file secrets are disabled until PR C",
+                ));
+            }
+            let root = self.file_path("")?;
+            let mut names = Vec::new();
+            if root.is_dir() {
+                collect_files(&root, &root, &prefix, &mut names)
+                    .map_err(|_| mlua::Error::runtime("unavailable: storage list failed"))?;
+            }
+            names.sort();
+            return lua.create_sequence_from(names);
+        }
         let names = self
             .files
             .lock()
@@ -391,8 +596,15 @@ impl UserData for SecretHandle {
                         "remuda.storage.secret.put secret must be 1..=2048 bytes",
                     ));
                 }
+                // File secrets stay unavailable until PR C adds the protected Windows DACL root.
+                if this.0.roots.is_some() {
+                    return Ok((
+                        None,
+                        Some("unavailable: file secrets are disabled until PR C".to_string()),
+                    ));
+                }
                 this.0.write(name, &secret.as_bytes())?;
-                Ok(true)
+                Ok((Some(true), None::<String>))
             },
         );
         methods.add_method("get", |lua, this, name: String| this.0.read(lua, name));
@@ -638,7 +850,9 @@ mod tests {
         let root = TestRoot::new();
         let data_home = root.0.join("xdg-data");
         let environment = |name: &str| match name {
-            "XDG_DATA_HOME" => Some(data_home.as_os_str().to_owned()),
+            "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_STATE_HOME" | "XDG_CACHE_HOME" => {
+                Some(data_home.as_os_str().to_owned())
+            }
             _ => None,
         };
         let lua = lua_with_env(&environment);
