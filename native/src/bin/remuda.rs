@@ -159,7 +159,7 @@ fn main() -> ExitCode {
         ["mod", "update", rest @ ..] => mod_update_command(server, &path, rest),
         ["mod", "remove", rest @ ..] => mod_remove_command(rest),
 
-        ["doc", rest @ ..] => with_existing_daemon(server, &path, |path| doc_command(path, rest)),
+        ["doc", rest @ ..] => doc_command(server, &path, rest),
 
         ["repl"] => with_daemon(server, &path, repl),
 
@@ -4562,7 +4562,16 @@ fn run_internal_command(argv: &[&str]) -> Option<ExitCode> {
 }
 
 fn preflight_command(argv: &[&str]) -> Option<ExitCode> {
-    run_internal_command(argv).or_else(|| stop_cli_preflight(argv))
+    run_internal_command(argv)
+        .or_else(|| stop_cli_preflight(argv))
+        .or_else(|| doc_cli_preflight(argv))
+}
+
+fn doc_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
+    let ["doc", args @ ..] = argv else {
+        return None;
+    };
+    doc_cli_parse(args).err()
 }
 
 /// Internal release-workflow command. Reuse dist::is_newer so publication and
@@ -5304,26 +5313,79 @@ fn eval_once(path: &Path, code: &str) -> ExitCode {
 }
 
 /// Render the live registry in the requested documentation format.
-fn doc_command(path: &Path, args: &[&str]) -> ExitCode {
-    let format = match args {
-        [] => "rst",
-        ["--format", format @ ("rst" | "markdown" | "json")] => format,
-        _ => return fail("usage: remuda doc [--format rst|markdown|json]"),
+fn doc_command(server: &str, path: &Path, args: &[&str]) -> ExitCode {
+    let values = match doc_cli_parse(args) {
+        Ok(values) => values,
+        Err(code) => return code,
     };
+    let format = values
+        .get("format")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("rst");
     let encoded = serde_json::to_string(format).expect("format names are valid strings");
-    match remuda_native::client::request(
-        path,
-        &Request::Eval {
-            code: format!("return remuda._registry_dump({encoded})"),
-            name: None,
-        },
-    ) {
-        Ok(Response::Value(value)) => {
-            println!("{value}");
-            ExitCode::SUCCESS
+    with_existing_daemon(server, path, |path| {
+        match remuda_native::client::request(
+            path,
+            &Request::Eval {
+                code: format!("return remuda._registry_dump({encoded})"),
+                name: None,
+            },
+        ) {
+            Ok(Response::Value(value)) => {
+                println!("{value}");
+                ExitCode::SUCCESS
+            }
+            other => fail(describe(other)),
         }
-        other => fail(describe(other)),
+    })
+}
+
+fn doc_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{OptionSpec, Spec, VerbSpec};
+    Spec {
+        name: "remuda".into(),
+        options: vec![],
+        verbs: vec![VerbSpec {
+            name: "doc".into(),
+            about: "Print live Lua documentation".into(),
+            args: vec![],
+            next: "remuda doc --help".into(),
+            options: vec![OptionSpec {
+                long: "format".into(),
+                short: None,
+                value: Some("FORMAT".into()),
+                help: "Output format: rst, markdown, or json".into(),
+                global: false,
+            }],
+        }],
     }
+}
+
+fn doc_cli_parse(args: &[&str]) -> Result<serde_json::Map<String, serde_json::Value>, ExitCode> {
+    let values = parse_top_level_cli(&doc_cli_spec(), "doc", args)?;
+    if let Some(format) = values.get("format").and_then(serde_json::Value::as_str) {
+        if !matches!(format, "rst" | "markdown" | "json") {
+            return Err(cli_usage_error(
+                "doc",
+                format!("invalid format '{format}'; choose rst, markdown, or json"),
+                "remuda doc [OPTIONS]",
+                "remuda doc --help",
+            ));
+        }
+    }
+    Ok(values)
+}
+
+fn cli_usage_error(
+    verb: &str,
+    detail: impl std::fmt::Display,
+    usage: &str,
+    next: &str,
+) -> ExitCode {
+    eprintln!(
+        "remuda: {verb}: {detail}\nFix: run `remuda {verb} --help` for supported syntax.\nUsage: {usage}\nNext: {next}"
+    );
+    ExitCode::from(2)
 }
 
 fn reload_mod_in_daemon(server: &str, path: &Path, name: &str) -> Result<(), String> {

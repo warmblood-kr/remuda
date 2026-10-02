@@ -495,6 +495,41 @@ fn stop_parser_handles_valid_flags_help_and_errors_before_connecting() {
 }
 
 #[test]
+fn doc_parser_handles_formats_help_and_errors_before_connecting() {
+    for args in [
+        &["doc"][..],
+        &["doc", "--format", "rst"],
+        &["doc", "--format", "markdown"],
+        &["doc", "--format", "json"],
+    ] {
+        let (out, touched) = touches_daemon("doc-valid", args);
+        assert!(touched, "valid {args:?} did not reach the daemon");
+        assert_ne!(out.status.code(), Some(2), "{args:?}: {out:?}");
+    }
+
+    for (tag, args, code) in [
+        ("doc-bogus-flag", &["doc", "--bogus"][..], Some(2)),
+        ("doc-missing-format", &["doc", "--format"], Some(2)),
+        ("doc-bad-format", &["doc", "--format", "bad"], Some(2)),
+        ("doc-help-cold", &["doc", "--help"], Some(0)),
+    ] {
+        let (out, touched) = touches_daemon(tag, args);
+        assert!(!touched, "{args:?} connected to the daemon socket");
+        assert_eq!(out.status.code(), code, "{args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if args[1] == "--help" {
+            assert!(stdout.contains("Usage: remuda doc"), "{stdout}");
+            assert!(stderr.is_empty(), "{stderr}");
+        } else {
+            assert!(stderr.contains("Usage: remuda doc"), "{stderr}");
+            assert!(stderr.contains("Fix:"), "{stderr}");
+            assert!(stderr.contains("Next:"), "{stderr}");
+        }
+    }
+}
+
+#[test]
 fn upgrade_help_flags_explain_channels_and_daemon_lifecycle() {
     let dir = scratch("upgrade-help-flags");
     for args in [&["upgrade", "--help"][..], &["upgrade", "-h"]] {
