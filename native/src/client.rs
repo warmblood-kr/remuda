@@ -3705,6 +3705,17 @@ mod tests {
     }
 
     #[test]
+    fn secret_prompt_keeps_over_budget_tag_without_caller_text() {
+        let tag = format!("remuda[session {}] ", "x".repeat(64));
+        let label = format!("{tag}deferred test secret");
+
+        let prompt = super::truncate_secret_prompt_label(&label, 78);
+
+        assert_eq!(prompt, tag);
+        assert!(!prompt.contains("deferred test secret"));
+    }
+
+    #[test]
     fn secret_prompt_clips_vs16_label_by_display_width() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
