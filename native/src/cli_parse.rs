@@ -25,6 +25,7 @@ pub struct ArgSpec {
     pub name: String,
     pub help: String,
     pub multiple: bool,
+    pub required: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -145,7 +146,7 @@ fn command_for(spec: &Spec, verb: &VerbSpec) -> Command {
     for arg in &verb.args {
         let mut positional = Arg::new(arg.name.clone())
             .help(arg.help.clone())
-            .required(true);
+            .required(arg.required);
         if arg.multiple {
             positional = positional.num_args(1..).trailing_var_arg(true);
         }
@@ -192,7 +193,13 @@ fn usage_tail(spec: &Spec, verb: &VerbSpec) -> String {
     if !spec.options.is_empty() || !verb.options.is_empty() {
         parts.push("[OPTIONS]".into());
     }
-    parts.extend(verb.args.iter().map(|arg| arg.name.clone()));
+    parts.extend(verb.args.iter().map(|arg| {
+        if arg.required {
+            arg.name.clone()
+        } else {
+            format!("[{}]", arg.name)
+        }
+    }));
     parts.join(" ")
 }
 
@@ -480,6 +487,7 @@ mod tests {
                         name: "EVENT_ID".into(),
                         help: "Event that starts the thread".into(),
                         multiple: false,
+                        required: true,
                     }],
                     next: "remuda butler matrix reply EVENT_ID TEXT".into(),
                     options: vec![],
@@ -491,6 +499,7 @@ mod tests {
                         name: "TEXT".into(),
                         help: "Message text".into(),
                         multiple: true,
+                        required: true,
                     }],
                     next: "remuda butler inbox".into(),
                     options: vec![],
@@ -533,11 +542,13 @@ mod tests {
                         name: "EVENT_ID".into(),
                         help: "Event to reply to".into(),
                         multiple: false,
+                        required: true,
                     },
                     ArgSpec {
                         name: "TEXT".into(),
                         help: "Message text".into(),
                         multiple: true,
+                        required: true,
                     },
                 ],
                 next: "remuda butler matrix inbox".into(),
