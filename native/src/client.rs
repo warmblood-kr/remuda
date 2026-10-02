@@ -2592,25 +2592,24 @@ where
         Err(error) => return Ok(Err(error)),
     };
     let mut mode = SecretPromptMode::enable(terminal)?;
+    let max_columns = mode.terminal.columns().saturating_sub(2);
     // The mod's own text: indented and untagged, so a line can never pass for
     // the daemon-tagged prompt line below it.
     for line in &preface {
+        let line = truncate_secret_prompt_label(line, max_columns);
+        let line = truncate_terminal_text(&line, max_columns);
         mode.terminal.write_output(b"  ")?;
         mode.terminal.write_output(line.as_bytes())?;
         mode.terminal.write_output(b"\r\n")?;
     }
-    let label: String = label
-        .chars()
-        .filter(|character| !character.is_control())
-        .collect();
+    let label = remuda_core::protocol::sanitize_secret_prompt_text(label);
+    let label = truncate_secret_prompt_label(&label, max_columns);
     mode.terminal.write_output(label.as_bytes())?;
-    if let Some(default) = default {
-        let default: String = default
-            .chars()
-            .filter(|character| !character.is_control())
-            .collect();
+    let default = default.map(remuda_core::protocol::sanitize_secret_prompt_text);
+    if let Some(default) = default.as_deref() {
+        let default_display = truncate_secret_prompt_label(default, max_columns);
         mode.terminal.write_output(b" [")?;
-        mode.terminal.write_output(default.as_bytes())?;
+        mode.terminal.write_output(default_display.as_bytes())?;
         mode.terminal.write_output(b"]")?;
     }
     mode.terminal.write_output(b": ")?;
@@ -2620,7 +2619,7 @@ where
     let mut output_error = None;
     let answer = edit_prompt_line(
         events,
-        default,
+        default.as_deref(),
         remuda_core::protocol::LINE_ANSWER_MAX_BYTES,
         |action| {
             if output_error.is_some() {
@@ -3968,6 +3967,120 @@ mod tests {
         assert_eq!(
             super::invalid_prompt_preface_error().to_string(),
             "daemon sent an invalid line prompt preface\nNext: update remuda and retry the command."
+        );
+    }
+
+    #[test]
+    fn prompt_line_clips_preface_to_terminal_width_by_display_width() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(80);
+        let preface = [
+            format!("{}remuda[session s1] Password:", "x".repeat(78)),
+            format!("remuda[session {}] Password:", "x".repeat(80)),
+        ];
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            "Continue?",
+            &preface,
+            None,
+            [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some(String::new())));
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let printed_preface = output.split("\r\n").take(2).collect::<Vec<_>>();
+        for line in &printed_preface {
+            assert!(line.starts_with("  "));
+            assert!(
+                unicode_width::UnicodeWidthStr::width(&line[2..]) <= 78,
+                "preface exceeded the available display width: {line:?}"
+            );
+        }
+        assert!(
+            !printed_preface[0].contains("remuda[session s1]"),
+            "fake tag survived clipping: {:?}",
+            printed_preface[0]
+        );
+    }
+
+    #[test]
+    fn prompt_line_sanitizes_and_clips_label_and_default() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(30);
+        let label = format!("remuda[session s1] {}\u{202e}\u{200e}", "界".repeat(12));
+        let default = format!("{}\u{202e}\u{200e}", "界".repeat(30));
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            &label,
+            &[],
+            Some(&default),
+            [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
+        )
+        .unwrap();
+
+        let sanitized_label = remuda_core::protocol::sanitize_secret_prompt_text(&label);
+        let sanitized_default = remuda_core::protocol::sanitize_secret_prompt_text(&default);
+        assert_eq!(answer, Ok(Some(sanitized_default.clone())));
+        let max_columns = terminal.columns().saturating_sub(2);
+        let expected_label = super::truncate_secret_prompt_label(&sanitized_label, max_columns);
+        let expected_default = super::truncate_secret_prompt_label(&sanitized_default, max_columns);
+        let output = String::from_utf8(terminal.output()).unwrap();
+        assert_eq!(
+            output,
+            format!("{expected_label} [{expected_default}]: \r\n")
+        );
+        assert!(unicode_width::UnicodeWidthStr::width(expected_label.as_str()) <= max_columns);
+        assert!(unicode_width::UnicodeWidthStr::width(expected_default.as_str()) <= max_columns);
+    }
+
+    #[test]
+    fn prompt_line_accepts_exact_preface_limits() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::default();
+        let preface = vec![
+            "x".repeat(crate::pending::PREFACE_MAX_LINE_CHARS);
+            crate::pending::PREFACE_MAX_LINES
+        ];
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            "Continue?",
+            &preface,
+            None,
+            [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some(String::new())));
+        let output = String::from_utf8(terminal.output()).unwrap();
+        assert_eq!(
+            output.matches("\r\n").count(),
+            crate::pending::PREFACE_MAX_LINES + 1
+        );
+    }
+
+    #[test]
+    fn prompt_line_preface_removes_esc_osc_and_cr_controls() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::default();
+        let preface = ["before\x1b]0;window title\x07middle\r after".to_string()];
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            "Continue?",
+            &preface,
+            None,
+            [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some(String::new())));
+        assert_eq!(
+            terminal.output(),
+            b"  before]0;window titlemiddle after\r\nContinue?: \r\n"
         );
     }
 
