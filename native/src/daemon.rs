@@ -1484,6 +1484,8 @@ fn handle(
     anti_entropy: Arc<AntiEntropyTask>,
     listener_task: Arc<DaemonListenerControl>,
 ) -> std::io::Result<()> {
+    // Before the request is read: a caller must be older than this moment.
+    let accepted = std::time::SystemTime::now();
     let mut reader = BufReader::new(stream.try_clone()?);
     let Some(request) = read_request(&stream, &mut reader)? else {
         return Ok(());
@@ -1499,6 +1501,7 @@ fn handle(
         anti_entropy,
         listener_task,
         request,
+        accepted,
     )
 }
 
@@ -1512,6 +1515,7 @@ fn handle_request(
     anti_entropy: Arc<AntiEntropyTask>,
     listener_task: Arc<DaemonListenerControl>,
     request: Request,
+    accepted: std::time::SystemTime,
 ) -> std::io::Result<()> {
     match request {
         Request::List => {
@@ -1636,7 +1640,7 @@ fn handle_request(
         Request::RemoveDirAll { path: dir } => reply(&stream, &remove_dir_all(&dir)),
 
         Request::Eval { code, name } => {
-            let caller = caller_context(&stream, registry);
+            let caller = caller_context(&stream, registry, accepted);
             handle_eval(stream, reader, image, &code, name.as_deref(), caller)
         }
 
@@ -1729,7 +1733,28 @@ fn handle_eval(
     }
 }
 
-fn caller_context(stream: &Stream, registry: &Registry) -> crate::image::CallerContext {
+fn caller_context(
+    stream: &Stream,
+    registry: &Registry,
+    accepted: std::time::SystemTime,
+) -> crate::image::CallerContext {
+    // Windows: a session's job decides first. It still holds a process whose
+    // parent has exited, which the parent walk below cannot see. A session
+    // child's own PID stays sound there: the daemon holds that process open.
+    #[cfg(windows)]
+    {
+        let Some((pid, _held)) = process_ancestry::current_peer(stream, accepted) else {
+            return crate::image::CallerContext::default();
+        };
+        if let Some(name) = registry.session_owning(pid) {
+            return crate::image::CallerContext {
+                kind: crate::image::CallerKind::Session,
+                session: Some(name),
+            };
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = accepted;
     match process_ancestry::resolve_caller(
         process_ancestry::peer_pid(stream),
         &registry.live_processes(),
@@ -2625,7 +2650,7 @@ fn spawn(
         }
     }
 
-    let agent = PtyAgent::spawn(builder, size).map_err(|e| e.to_string())?;
+    let agent = PtyAgent::spawn(builder, size).map_err(crate::session_job::spawn_error_line)?;
     Ok(Session::new_with_id(
         name,
         session_id,

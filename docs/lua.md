@@ -16,6 +16,13 @@ notices, set `REMUDA_SUPPRESS_DEPRECATIONS=1` in the daemon's environment when
 the daemon starts; setting it only on a CLI process cannot change the
 environment of a running daemon.
 
+On Windows a session ends when its own program exits (the daemon reaps it),
+when it is closed, or when the daemon stops, and everything the session
+started ends with it, including a background server an agent started. A
+process that must outlive the session has to be started outside remuda. While
+a session is listed, every process it started is a `session` caller for
+`remuda.caller()`, also one whose parent has exited.
+
 ## Generate the reference
 
 ```sh

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Windows: everything a session started now ends with the session or the
+  daemon, including a background server an agent started. A session ends when
+  its own program exits, when it is closed, or when the daemon stops. A process
+  that must outlive the session has to be started outside remuda. Each session
+  is held in a Windows job object; a session that cannot be put in one is not
+  started. While a session is listed, every process it started is a `session`
+  caller for `remuda.caller()`, also one whose parent has exited.
 - Windows: `remuda.exe` now declares UTF-8 as its code page, so a path with
   non-ASCII characters (for example a Korean user folder) is the same string in
   Lua's `os.getenv`, `io.open` and `os.rename` as in the `remuda.*` words.

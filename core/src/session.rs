@@ -974,6 +974,12 @@ impl Session {
         agent.is_alive().then(|| agent.process_id()).flatten()
     }
 
+    /// Whether the backend holds `pid` as this session's own; it can be true
+    /// after the session's child has exited.
+    pub fn owns_process(&self, pid: u32) -> bool {
+        self.agent.lock().is_ok_and(|agent| agent.owns_process(pid))
+    }
+
     /// End the child. Refused while attached, and idempotent on an
     /// already-dead agent. Does not remove the session from a registry — the
     /// last screen survives; [`crate::Registry::close`] does both.
