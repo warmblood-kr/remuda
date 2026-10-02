@@ -56,7 +56,7 @@ fn main() -> ExitCode {
     };
     let argv: Vec<&str> = rest.iter().map(String::as_str).collect();
 
-    if let Some(exit) = run_internal_command(&argv) {
+    if let Some(exit) = preflight_command(&argv) {
         return exit;
     }
 
@@ -4268,17 +4268,13 @@ fn fate(path: &Path, name: &str) -> String {
 /// binary but cannot touch a daemon already running — this is the verb that
 /// closes that gap.
 fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
-    let mut force = false;
-    let mut yes = false;
-    let mut inside_override = false;
-    for arg in args {
-        match *arg {
-            "-f" | "--force" if !force => force = true,
-            "--yes" if !yes => yes = true,
-            "--i-am-inside" if !inside_override => inside_override = true,
-            _ => return fail("usage: remuda stop [-f] [--yes]"),
-        }
-    }
+    let values = match parse_top_level_cli(&stop_cli_spec(), "stop", args) {
+        Ok(values) => values,
+        Err(code) => return code,
+    };
+    let force = cli_flag(&values, "force");
+    let yes = cli_flag(&values, "yes");
+    let inside_override = cli_flag(&values, "i-am-inside");
     if remuda_native::ipc::connect(path).is_err() {
         eprintln!("remuda: no daemon running for {server:?} — a state-creating command starts one");
         return ExitCode::SUCCESS;
@@ -4303,6 +4299,80 @@ fn stop(server: &str, path: &Path, args: &[&str]) -> ExitCode {
         }
         Err(e) => fail(e),
     }
+}
+
+fn stop_cli_spec() -> remuda_native::cli_parse::Spec {
+    use remuda_native::cli_parse::{OptionSpec, Spec, VerbSpec};
+    Spec {
+        name: "remuda".into(),
+        options: vec![],
+        verbs: vec![VerbSpec {
+            name: "stop".into(),
+            about: "Stop the daemon".into(),
+            args: vec![],
+            next: "remuda stop --help".into(),
+            options: vec![
+                OptionSpec {
+                    long: "force".into(),
+                    short: Some('f'),
+                    value: None,
+                    help: "Stop without asking for confirmation".into(),
+                    global: false,
+                },
+                OptionSpec {
+                    long: "yes".into(),
+                    short: None,
+                    value: None,
+                    help: "Confirm stopping all sessions".into(),
+                    global: false,
+                },
+                OptionSpec {
+                    long: "i-am-inside".into(),
+                    short: None,
+                    value: None,
+                    help: "Allow a hosted session to stop its daemon".into(),
+                    global: false,
+                },
+            ],
+        }],
+    }
+}
+
+fn stop_cli_preflight(argv: &[&str]) -> Option<ExitCode> {
+    let ["stop", args @ ..] = argv else {
+        return None;
+    };
+    parse_top_level_cli(&stop_cli_spec(), "stop", args).err()
+}
+
+fn parse_top_level_cli(
+    spec: &remuda_native::cli_parse::Spec,
+    verb: &str,
+    args: &[&str],
+) -> Result<serde_json::Map<String, serde_json::Value>, ExitCode> {
+    let words = std::iter::once(verb)
+        .chain(args.iter().copied())
+        .collect::<Vec<_>>();
+    let report = remuda_native::cli_parse::parse(spec, &words);
+    if report.ok {
+        return Ok(report.values);
+    }
+    if report.kind.as_deref() == Some("help") {
+        println!("{}", report.text);
+    } else {
+        eprintln!(
+            "{}",
+            report.text.replace(
+                "\nUsage:",
+                &format!("\nFix: run `remuda {verb} --help` for supported syntax.\nUsage:"),
+            )
+        );
+    }
+    Err(ExitCode::from(report.code as u8))
+}
+
+fn cli_flag(values: &serde_json::Map<String, serde_json::Value>, name: &str) -> bool {
+    values.get(name).and_then(serde_json::Value::as_bool) == Some(true)
 }
 
 fn has_sessions(path: &Path) -> bool {
@@ -4489,6 +4559,10 @@ fn run_internal_command(argv: &[&str]) -> Option<ExitCode> {
         ["_latest-index", args @ ..] => Some(run_latest_index(args)),
         _ => None,
     }
+}
+
+fn preflight_command(argv: &[&str]) -> Option<ExitCode> {
+    run_internal_command(argv).or_else(|| stop_cli_preflight(argv))
 }
 
 /// Internal release-workflow command. Reuse dist::is_newer so publication and

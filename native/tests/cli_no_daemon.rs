@@ -454,6 +454,47 @@ fn invalid_mod_list_format_does_not_touch_the_filesystem_or_daemon() {
 }
 
 #[test]
+fn stop_parser_handles_valid_flags_help_and_errors_before_connecting() {
+    for args in [
+        &["stop"][..],
+        &["stop", "-f"],
+        &["stop", "--force"],
+        &["stop", "--yes"],
+        &["stop", "--i-am-inside"],
+        &["stop", "-f", "--yes", "--i-am-inside"],
+    ] {
+        let dir = scratch("stop-valid");
+        let out = remuda(&dir, args);
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        assert!(
+            !remuda_native::daemon::socket_path_in(&dir, "s").exists(),
+            "{args:?} created a daemon socket"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    for (tag, args, code) in [
+        ("stop-bogus-flag", &["stop", "--bogus"][..], Some(2)),
+        ("stop-extra-arg", &["stop", "stray"], Some(2)),
+        ("stop-help", &["stop", "--help"], Some(0)),
+    ] {
+        let (out, touched) = touches_daemon(tag, args);
+        assert!(!touched, "{args:?} connected to the daemon socket");
+        assert_eq!(out.status.code(), code, "{args:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if args[1] == "--help" {
+            assert!(stdout.contains("Usage: remuda stop"), "{stdout}");
+            assert!(stderr.is_empty(), "{stderr}");
+        } else {
+            assert!(stderr.contains("Usage: remuda stop"), "{stderr}");
+            assert!(stderr.contains("Fix:"), "{stderr}");
+            assert!(stderr.contains("Next:"), "{stderr}");
+        }
+    }
+}
+
+#[test]
 fn upgrade_help_flags_explain_channels_and_daemon_lifecycle() {
     let dir = scratch("upgrade-help-flags");
     for args in [&["upgrade", "--help"][..], &["upgrade", "-h"]] {
