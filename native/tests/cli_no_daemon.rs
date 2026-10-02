@@ -9,8 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn remuda(dir: &Path, args: &[&str]) -> Output {
+    remuda_command(dir, ["-s", "s"].into_iter().chain(args.iter().copied()))
+}
+
+fn remuda_command<'a>(dir: &Path, args: impl IntoIterator<Item = &'a str>) -> Output {
     Command::new(env!("CARGO_BIN_EXE_remuda"))
-        .args(["-s", "s"])
         .args(args)
         .env("REMUDA_RUNTIME_DIR", dir)
         .env("XDG_DATA_HOME", dir.join("data"))
@@ -791,6 +794,49 @@ fn a_socket_path_over_sun_path_names_the_length_not_a_second_daemon() {
         "blamed a second daemon: {said}"
     );
     assert!(said.contains("REMUDA_RUNTIME_DIR"), "no cure named: {said}");
+}
+
+#[test]
+fn long_socket_path_errors_are_clear_for_each_cli_entry_point() {
+    let dir = scratch("long-entry-points").join("x".repeat(120));
+    std::fs::create_dir_all(&dir).unwrap();
+    let limit = if cfg!(any(target_os = "linux", target_os = "android")) {
+        107
+    } else {
+        103
+    };
+    let cases: [(&str, &[&str], &str); 4] = [
+        ("ls", &["ls"], "default"),
+        ("exec", &["-s", "x", "-e", "1"], "x"),
+        ("daemon", &["daemon"], "default"),
+        ("stop", &["stop"], "default"),
+    ];
+
+    for (label, args, server) in cases {
+        let socket = remuda_native::daemon::socket_path_in(&dir, server);
+        let out = remuda_command(&dir, args.iter().copied());
+        let expected = format!(
+            "remuda: socket path too long ({} bytes, limit {limit})\nNext: set a shorter REMUDA_RUNTIME_DIR\n",
+            socket.as_os_str().len()
+        );
+        assert_eq!(out.status.code(), Some(1), "{label} exit code");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            expected,
+            "{label} stderr"
+        );
+        assert!(
+            !socket.exists(),
+            "{label} left a socket behind at {}",
+            socket.display()
+        );
+        assert!(
+            daemon_pids_for_runtime(&dir).is_empty(),
+            "{label} left a daemon running"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(dir.parent().unwrap());
 }
 
 /// `mod install --reload` reaches the daemon through its own connect path; a
