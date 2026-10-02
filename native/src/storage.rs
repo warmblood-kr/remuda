@@ -194,6 +194,70 @@ mod tests {
         }
     }
 
+    fn lua_with_storage() -> Lua {
+        let lua = Lua::new();
+        let remuda = lua.create_table().unwrap();
+        remuda.set("storage", bindings(&lua).unwrap()).unwrap();
+        lua.globals().set("remuda", remuda).unwrap();
+        lua
+    }
+
+    #[test]
+    fn memory_handles_isolate_namespaces_and_support_blob_operations() {
+        let lua = lua_with_storage();
+        lua.load(
+            r#"
+            local storage = remuda.storage
+            storage.set_default("memory")
+            local first = storage.get("first"):config()
+            local second = storage.get("second"):config()
+            local state = storage.get("first"):state()
+            local bytes = string.char(0, 255, 1)
+            assert(first:write("mail/a.bin", bytes))
+            assert(first:exists("mail/a.bin"))
+            local value, err = first:read("mail/a.bin")
+            assert(value == bytes and err == nil)
+            assert(second:read("mail/a.bin") == nil)
+            assert(state:read("mail/a.bin") == nil)
+            local missing, reason = first:read("missing")
+            assert(missing == nil and reason == "not_found")
+            first:write("mail/b.bin", "b")
+            local names = first:list("mail/")
+            assert(#names == 2 and names[1] == "mail/a.bin" and names[2] == "mail/b.bin")
+            assert(first:delete("mail/a.bin"))
+            assert(not first:exists("mail/a.bin"))
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn memory_secret_handles_validate_names_and_have_no_path() {
+        let lua = lua_with_storage();
+        lua.load(
+            r#"
+            local storage = remuda.storage
+            storage.set_default("memory")
+            local secret = storage.default():secret()
+            assert(secret:put("matrix_token", "bytes") == true)
+            local value, err = secret:get("matrix_token")
+            assert(value == "bytes" and err == nil)
+            local other, reason = storage.get("other"):secret():get("matrix_token")
+            assert(other == nil and reason == "not_found")
+            assert(secret:delete("matrix_token") == true)
+            assert(storage.backend() == "memory")
+            assert(storage.path("secret", "matrix_token") == nil)
+            for _, name in ipairs({"../escape", "a/../b", "/absolute", "C:/drive", string.rep("x", 256)}) do
+                assert(not pcall(function() secret:put(name, "x") end), name)
+            end
+            assert(not pcall(function() secret:put("too_large", string.rep("x", 2049)) end))
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
     #[test]
     fn resolver_table_covers_platforms_kinds_and_environment_rules() {
         let kinds = ["config", "data", "state", "cache"];
