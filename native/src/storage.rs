@@ -1527,6 +1527,68 @@ mod tests {
         );
     }
 
+    #[test]
+    fn xdg_rejects_case_clashes_in_directory_components() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"
+            local files = remuda.storage.get("case"):data()
+            files:write("Mail/a", "a")
+            assert(not pcall(function() files:write("mail/b", "b") end))
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[test]
+    fn xdg_rejects_more_than_eight_name_parts() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"assert(not pcall(function() remuda.storage.get("parts"):data():write("a/b/c/d/e/f/g/h/i", "x") end))"#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_list_caps_entries_at_1024() {
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/listed");
+        fs::create_dir_all(&namespace).unwrap();
+        for index in 0..1025 {
+            fs::write(namespace.join(format!("entry{index}")), b"x").unwrap();
+        }
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        let count: usize = lua
+            .load(r#"return #remuda.storage.get("listed"):data():list()"#)
+            .eval()
+            .unwrap();
+        assert!(count <= 1024);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_list_never_returns_names_rejected_by_the_api() {
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/listed");
+        fs::create_dir_all(&namespace).unwrap();
+        fs::write(namespace.join("CON"), b"x").unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        let names: Vec<String> = lua
+            .load(r#"return remuda.storage.get("listed"):data():list()"#)
+            .eval()
+            .unwrap();
+        assert!(names.iter().all(|name| checked_name(name).is_ok()));
+    }
+
     fn run_handle_conformance(lua: &Lua, backend: &str) {
         select_backend(lua, backend);
         lua.load(HANDLE_CONFORMANCE).exec().unwrap();
