@@ -2412,8 +2412,8 @@ mod tests {
     use super::trace_input_read;
     use super::{
         detach_offset, interpret, report_attach_input_dropped, reset_input_modes, route_tokens,
-        truncate_terminal_text, write_input_trace, AttachInputQueue, AttachRoute, SecretPromptMode,
-        SecretPromptTerminal, ATTACH_INPUT_STALL, DETACH, RESET_INPUT_MODES,
+        truncate_terminal_text, write_input_trace, AttachInputQueue, AttachRoute, Hold,
+        SecretPromptMode, SecretPromptTerminal, ATTACH_INPUT_STALL, DETACH, RESET_INPUT_MODES,
     };
     #[cfg(unix)]
     use super::{read_response_with_timeout, request_with_timeout};
@@ -2727,6 +2727,81 @@ mod tests {
             seq: 1,
             bytes: vec![b'x'; 64 * 1024],
         });
+    }
+
+    #[test]
+    fn hold_keys_returns_by_pty_write_timeout_when_peer_never_drains() {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        const TEST_DEADLINE: Duration = Duration::from_secs(5);
+        static NEXT_PIPE: AtomicU64 = AtomicU64::new(0);
+        let suffix = NEXT_PIPE.fetch_add(1, Ordering::Relaxed);
+        #[cfg(unix)]
+        let path = std::env::temp_dir().join(format!(
+            "remuda-hold-write-{}-{suffix}.sock",
+            std::process::id()
+        ));
+        #[cfg(windows)]
+        let path = Path::new(&format!(
+            r"\\.\pipe\remuda-hold-write-{}-{suffix}",
+            std::process::id()
+        ))
+        .to_path_buf();
+
+        let listener = crate::ipc::listen(&path).expect("listen on a local pipe");
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let peer = std::thread::spawn(move || {
+            let stream = listener.accept().expect("accept Hold");
+            accepted_tx.send(()).expect("report accepted Hold");
+            release_rx.recv().expect("release the undrained peer");
+            drop(stream);
+        });
+        let stream = crate::ipc::connect(&path).expect("connect Hold");
+        accepted_rx
+            .recv_timeout(TEST_DEADLINE)
+            .expect("pipe peer did not accept Hold");
+        let hold = Hold {
+            stream,
+            drain: None,
+            stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            let started = Instant::now();
+            let result = hold.keys(&vec![b'x'; 64 * 1024 * 1024]);
+            result_tx
+                .send((started.elapsed(), result.map_err(|error| error.kind())))
+                .expect("report Hold write");
+        });
+
+        let bounded =
+            result_rx.recv_timeout(crate::pty::PTY_WRITE_TIMEOUT + Duration::from_millis(500));
+        // A broken implementation must not strand a test thread forever.
+        if bounded.is_err() {
+            release_tx.send(()).expect("release the stuck pipe writer");
+        } else {
+            release_tx.send(()).expect("release the pipe peer");
+        }
+        peer.join().expect("peer thread");
+        let completed = bounded.or_else(|_| result_rx.recv_timeout(TEST_DEADLINE));
+        writer.join().expect("writer thread");
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&path);
+
+        let (elapsed, result) = completed.expect("Hold::keys did not return before test cleanup");
+        assert!(
+            elapsed <= crate::pty::PTY_WRITE_TIMEOUT,
+            "Hold::keys exceeded PTY_WRITE_TIMEOUT: {elapsed:?}"
+        );
+        assert_eq!(
+            result,
+            Err(std::io::ErrorKind::TimedOut),
+            "a timed-out batch must be reported as dropped"
+        );
     }
 
     #[cfg(unix)]

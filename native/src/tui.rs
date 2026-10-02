@@ -2909,8 +2909,7 @@ pub fn run(path: &Path, server: &str, notice: Option<String>) -> std::io::Result
             Action::Type(bytes) => {
                 if let Some((name, hold)) = &held {
                     if let Err(e) = hold.keys(&bytes) {
-                        ui.notice = Some(format!("{name}: {e}"));
-                        ui.focus = Focus::List;
+                        input_write_failed(&mut ui, name, &e);
                     }
                 }
             }
@@ -3110,6 +3109,13 @@ fn capture_preview(path: &Path, ui: &mut Ui, name: &str) -> Result<PreviewCaptur
     state.history_total = history_total;
     state.anchor_total = anchor_total;
     Ok((cells, wrapped, cursor))
+}
+
+fn input_write_failed(ui: &mut Ui, name: &str, error: &std::io::Error) {
+    ui.notice = Some(format!(
+        "{name}: input stuck; dropped this key batch ({error})"
+    ));
+    ui.focus = Focus::List;
 }
 
 fn paste(path: &Path, ui: &mut Ui, held: &Option<(String, Hold)>) {

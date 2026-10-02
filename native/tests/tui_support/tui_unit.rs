@@ -466,6 +466,28 @@ fn enter_points_the_keyboard_at_the_selected_session() {
     assert_eq!(ui.sessions.len(), 2);
 }
 
+#[test]
+fn timed_out_input_sets_notice_and_ctrl_backslash_keeps_the_list_focus() {
+    let mut ui = make_ui(vec![row("a", true, false)]);
+    ui.focus = Focus::Session;
+
+    input_write_failed(
+        &mut ui,
+        "a",
+        &std::io::Error::new(std::io::ErrorKind::TimedOut, "write deadline"),
+    );
+
+    assert_eq!(ui.focus, Focus::List);
+    assert!(ui.notice.as_deref().unwrap().contains("input stuck"));
+    assert!(ui
+        .notice
+        .as_deref()
+        .unwrap()
+        .contains("dropped this key batch"));
+    ui.on_key(KeyEvent::new(KeyCode::Char('\\'), KeyModifiers::CONTROL));
+    assert_eq!(ui.focus, Focus::List, "the next Ctrl-\\ event is handled");
+}
+
 fn click(col: u16, row: u16) -> MouseEvent {
     MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
