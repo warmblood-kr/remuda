@@ -4970,6 +4970,8 @@ fn start_daemon(server: &str, path: &Path) -> Result<(), String> {
             });
         }
     }
+    #[cfg(windows)]
+    daemon::own_console(&mut command);
     let mut child = command
         .spawn()
         .map_err(|e| format!("cannot start daemon: {e}"))?;
