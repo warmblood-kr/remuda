@@ -60,6 +60,32 @@ mod store {
         }
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::{reason, Error};
+
+        // No usable default keychain: callers must still see `unavailable:`
+        // (so they fall back to a file) plus words that say how to fix it.
+        #[test]
+        fn a_missing_default_keychain_is_unavailable_with_the_fix() {
+            // errSecNoDefaultKeychain, errSecNoSuchKeychain, errSecNotAvailable,
+            // errSecInteractionNotAllowed.
+            for code in [-25307, -25294, -25291, -25308] {
+                let text = reason(Error::from_code(code));
+                assert!(text.starts_with("unavailable: "), "{code}: {text}");
+                assert!(text.contains("default keychain"), "{code}: {text}");
+                assert!(text.contains("Fix:"), "{code}: {text}");
+            }
+        }
+
+        #[test]
+        fn a_refused_prompt_stays_denied() {
+            for code in [-128, -25293] {
+                assert!(reason(Error::from_code(code)).starts_with("denied: "));
+            }
+        }
+    }
+
     pub(super) fn put(name: &str, secret: &[u8]) -> Result<(), String> {
         passwords::set_generic_password(SERVICE, name, secret).map_err(reason)
     }
