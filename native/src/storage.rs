@@ -380,6 +380,14 @@ fn directory_names(directory: &fs::File) -> io::Result<Vec<String>> {
 }
 
 #[cfg(unix)]
+fn reject_case_clash(directory: &fs::File, wanted: &str) -> io::Result<()> {
+    if case_clashes(&directory_names(directory)?, wanted) {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "case clash"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn open_directory_at(parent: &fs::File, name: &str, create: bool) -> io::Result<fs::File> {
     reject_case_clash(parent, name)?;
     let name = c_name(name)?;
