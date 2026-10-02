@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fixed secret prompt labels wrapping into rows that look like daemon tags by
+  clipping them to terminal display width; see #363.
 - `remuda cluster remote` now labels this node with the OS host name instead of
   reading the `HOSTNAME` environment variable; it uses `local` if the OS lookup
   fails.
