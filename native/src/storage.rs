@@ -346,6 +346,8 @@ fn c_name(name: &str) -> io::Result<CString> {
 
 #[cfg(unix)]
 fn directory_names(directory: &fs::File) -> io::Result<Vec<String>> {
+    #[cfg(test)]
+    DIRECTORY_ENUMERATIONS.with(|count| count.set(count.get() + 1));
     let dot = c_name(".")?;
     let fd = unsafe {
         libc::openat(
@@ -377,6 +379,11 @@ fn directory_names(directory: &fs::File) -> io::Result<Vec<String>> {
     }
     unsafe { libc::closedir(stream) };
     Ok(names)
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static DIRECTORY_ENUMERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(unix)]
@@ -1392,6 +1399,32 @@ mod tests {
         )
         .exec()
         .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_noncreating_operations_only_enumerate_list_contents() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load("remuda.storage.get('enumeration'):data():write('key', 'value')")
+            .exec()
+            .unwrap();
+        DIRECTORY_ENUMERATIONS.with(|count| count.set(0));
+
+        lua.load(
+            r#"
+            local files = remuda.storage.get('enumeration'):data()
+            assert(files:read('key') == 'value')
+            assert(files:exists('key'))
+            assert(files:delete('key'))
+            assert(#files:list() == 0)
+            "#,
+        )
+        .exec()
+        .unwrap();
+
+        DIRECTORY_ENUMERATIONS.with(|count| assert_eq!(count.get(), 1));
     }
 
     #[test]
