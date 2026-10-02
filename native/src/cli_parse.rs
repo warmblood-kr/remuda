@@ -85,7 +85,7 @@ pub fn parse(spec: &Spec, argv: &[&str]) -> Report {
     match command.try_get_matches_from(input) {
         Ok(matches) => {
             let submatches = matches.subcommand().map(|(_, matches)| matches);
-            Report::success(verb_name, collect_values(spec, verb, submatches))
+            Report::success(verb_name, collect_values(spec, verb, &matches, submatches))
         }
         Err(error) if error.kind() == ErrorKind::DisplayHelp => {
             let mut text = error.to_string();
@@ -215,6 +215,7 @@ fn preserve_help_in_body(verb: &VerbSpec, argv: &[&str], mut input: Vec<String>)
 fn collect_values(
     spec: &Spec,
     verb: &VerbSpec,
+    root_matches: &clap::ArgMatches,
     matches: Option<&clap::ArgMatches>,
 ) -> Map<String, Value> {
     let mut values = Map::new();
@@ -231,7 +232,10 @@ fn collect_values(
             );
         }
     }
-    for option in spec.options.iter().chain(verb.options.iter()) {
+    for option in &spec.options {
+        collect_option(&mut values, option, Some(root_matches));
+    }
+    for option in &verb.options {
         collect_option(&mut values, option, matches);
     }
     values
@@ -493,5 +497,19 @@ mod tests {
         assert_eq!(report.code, 0);
         assert!(report.kind.is_none());
         assert!(report.text.is_empty());
+    }
+
+    #[test]
+    fn non_global_root_options_are_read_from_root_matches() {
+        let mut spec = spec();
+        spec.options[1].global = false;
+        for (argv, expected_json) in [
+            (&["thread", "$abc"][..], false),
+            (&["--json", "thread", "$abc"][..], true),
+        ] {
+            let report = parse(&spec, argv);
+            assert!(report.ok, "{argv:?}: {report:?}");
+            assert_eq!(report.values["json"], expected_json, "{argv:?}");
+        }
     }
 }
