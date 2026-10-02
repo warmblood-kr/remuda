@@ -798,6 +798,43 @@ mod tests {
     }
 
     #[test]
+    fn remote_busy_retries_then_fails_without_uncertainty() {
+        let (mut sender, mut queue, now) = remote_queued(b"line\r".to_vec());
+        let mut first_request = None;
+
+        for attempt in 0..=3_u64 {
+            let at = now + Duration::from_secs(attempt);
+            assert!(queue.begin_due(at).is_some());
+            let result = sender.send_remote_started(&mut queue, at, |node, request| {
+                assert_eq!(node, "laptop");
+                if let Some(first) = &first_request {
+                    assert_eq!(first, request);
+                } else {
+                    first_request = Some(request.clone());
+                }
+                Ok(Response::Busy)
+            });
+
+            if attempt < 3 {
+                assert!(matches!(
+                    result,
+                    Some(QueueEvent::RetryScheduled { seq: 1, .. })
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Some(QueueEvent::RemoteTargetFailed { seq: 1, .. })
+                ));
+            }
+        }
+
+        let batch = queue.items().next().unwrap();
+        assert_eq!(batch.state, QueueState::Failed);
+        assert!(batch.status.contains("busy"));
+        assert!(batch.status.contains("not written"));
+    }
+
+    #[test]
     fn remote_control_disabled_marks_batch_and_stops_waiting_target() {
         let (mut sender, mut queue, now) = remote_queued(b"first\r".to_vec());
         let client_id = queue.items().next().unwrap().client_id.clone();
