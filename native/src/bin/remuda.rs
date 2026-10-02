@@ -50,6 +50,60 @@ mod codex_tui;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let (_, rest) = split_server_flag(&args);
+    if starts_interactive_client(rest) {
+        return run_cli(args);
+    }
+
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !should_suppress_stdout_broken_pipe_panic(std::thread::current().name(), info.payload())
+        {
+            previous_hook(info);
+        }
+    }));
+    match std::panic::catch_unwind(|| run_cli(args)) {
+        Ok(code) => code,
+        Err(payload)
+            if should_suppress_stdout_broken_pipe_panic(
+                std::thread::current().name(),
+                payload.as_ref(),
+            ) =>
+        {
+            ExitCode::from(141)
+        }
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn starts_interactive_client(args: &[String]) -> bool {
+    match args {
+        [] => true,
+        [command, ..] if ["daemon", "run", "attach"].contains(&command.as_str()) => true,
+        [command, ..] if command == "_codex_tui" => true,
+        [command, verb, ..] if command == "cluster" && verb == "remote" => true,
+        _ => false,
+    }
+}
+
+fn is_stdout_broken_pipe_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+    message.is_some_and(|message| {
+        message.starts_with("failed printing to stdout:") && message.contains("Broken pipe")
+    })
+}
+
+fn should_suppress_stdout_broken_pipe_panic(
+    thread_name: Option<&str>,
+    payload: &(dyn std::any::Any + Send),
+) -> bool {
+    thread_name == Some("main") && is_stdout_broken_pipe_panic(payload)
+}
+
+fn run_cli(args: Vec<String>) -> ExitCode {
     let (server, stdin_enabled, rest) = match checked_cli_flags(&args) {
         Ok(flags) => flags,
         Err(code) => return code,
@@ -6493,6 +6547,41 @@ fn print_lines(n: &str, delay_ms: &str) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stdout_broken_pipe_panic_match_is_narrow() {
+        let broken_pipe = Box::new("failed printing to stdout: Broken pipe (os error 32)")
+            as Box<dyn std::any::Any + Send>;
+        assert!(is_stdout_broken_pipe_panic(broken_pipe.as_ref()));
+
+        for payload in [
+            Box::new("failed printing to stdout: Permission denied")
+                as Box<dyn std::any::Any + Send>,
+            Box::new("a different panic") as Box<dyn std::any::Any + Send>,
+            Box::new(141_u8) as Box<dyn std::any::Any + Send>,
+        ] {
+            assert!(!is_stdout_broken_pipe_panic(payload.as_ref()));
+        }
+    }
+
+    #[test]
+    fn stdout_broken_pipe_panic_is_suppressed_only_on_main_thread() {
+        let broken_pipe = Box::new(String::from(
+            "failed printing to stdout: Broken pipe (os error 32)",
+        )) as Box<dyn std::any::Any + Send>;
+        assert!(should_suppress_stdout_broken_pipe_panic(
+            Some("main"),
+            broken_pipe.as_ref()
+        ));
+        assert!(!should_suppress_stdout_broken_pipe_panic(
+            Some("worker"),
+            broken_pipe.as_ref()
+        ));
+        assert!(!should_suppress_stdout_broken_pipe_panic(
+            None,
+            broken_pipe.as_ref()
+        ));
+    }
 
     #[derive(Debug)]
     struct TestErrorMessage(String);
