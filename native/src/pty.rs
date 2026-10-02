@@ -1371,6 +1371,7 @@ mod input_writer_tests {
             writer.chain_after_stalled(b"\r", Duration::ZERO),
             ChainOutcome::Chained
         );
+        let expected_abandonment_at = clock.now();
 
         release_tx.send(()).unwrap();
         if fail_on_write == 2 {
@@ -1385,7 +1386,7 @@ mod input_writer_tests {
         assert_eq!(*captured.lock().unwrap(), captured_before_retry);
         assert_eq!(
             writer.state.lock().unwrap().late_submit_abandoned_at,
-            Some(clock.now())
+            Some(expected_abandonment_at)
         );
 
         clock.advance(PTY_LATE_SUBMIT_BOUND + Duration::from_millis(1));
