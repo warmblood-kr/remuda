@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub(crate) type Env<'a> = &'a dyn Fn(&str) -> Option<OsString>;
@@ -269,7 +269,7 @@ fn register_path_binding(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .and_then(|roots| roots.get(kind.as_str()))
-                .map(|root| root.join("default").join(name))
+                .map(|root| root.join("storage").join("default").join(name))
                 .and_then(|path| path.into_os_string().into_string().ok()))
         })?,
     )?;
@@ -299,6 +299,7 @@ impl HandleKind {
 
 type MemoryFiles = Arc<Mutex<BTreeMap<(String, String, String), Vec<u8>>>>;
 type FileRoots = BTreeMap<&'static str, PathBuf>;
+const ATOMIC_TEMP_PREFIX: &str = ".remuda-atomic-";
 
 fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
     let override_root = env("REMUDA_STORAGE_ROOT")
@@ -334,15 +335,27 @@ fn collect_files(
         let kind = entry.file_type()?;
         if kind.is_dir() {
             collect_files(base, &path, prefix, names)?;
-        } else if kind.is_file() {
-            if let Some(name) = path.strip_prefix(base).ok().and_then(|path| path.to_str()) {
+        } else if kind.is_file()
+            && !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(ATOMIC_TEMP_PREFIX))
+        {
+            if let Some(name) = path.strip_prefix(base).ok().and_then(lua_relative_name) {
                 if name.starts_with(prefix) {
-                    names.push(name.to_string());
+                    names.push(name);
                 }
             }
         }
     }
     Ok(())
+}
+
+fn lua_relative_name(path: &Path) -> Option<String> {
+    path.components()
+        .map(|component| component.as_os_str().to_str())
+        .collect::<Option<Vec<_>>>()
+        .map(|components| components.join("/"))
 }
 
 struct StorageView {
@@ -397,7 +410,7 @@ impl KindHandle {
         self.roots
             .as_ref()
             .and_then(|roots| roots.get(self.kind.as_str()))
-            .map(|root| root.join(&self.namespace).join(name))
+            .map(|root| root.join("storage").join(&self.namespace).join(name))
             .ok_or_else(|| mlua::Error::runtime("unavailable: storage root is unavailable"))
     }
 
@@ -627,6 +640,7 @@ fn checked_name(name: &str) -> mlua::Result<String> {
                 || part == "."
                 || part == ".."
                 || part.len() > 255
+                || part.starts_with(ATOMIC_TEMP_PREFIX)
                 || !part.bytes().all(|byte| byte.is_ascii_graphic())
                 || part
                     .bytes()
@@ -869,7 +883,7 @@ mod tests {
         let file = lua_with_xdg_root(&root.0);
         run_handle_conformance(&file, "xdg");
         assert_eq!(
-            fs::read(root.0.join("data/suite/mail/b.bin")).unwrap(),
+            fs::read(root.0.join("data/storage/suite/mail/b.bin")).unwrap(),
             b"b"
         );
     }
@@ -880,7 +894,7 @@ mod tests {
         use std::os::unix::fs::symlink;
 
         let root = TestRoot::new();
-        let directory = root.0.join("data/listed");
+        let directory = root.0.join("data/storage/listed");
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("regular"), b"file").unwrap();
         fs::create_dir(directory.join("nested")).unwrap();
@@ -911,7 +925,7 @@ mod tests {
             .exec()
             .unwrap();
         assert_eq!(
-            fs::read(data_home.join("remuda/resolved/item")).unwrap(),
+            fs::read(data_home.join("remuda/storage/resolved/item")).unwrap(),
             b"x"
         );
     }
