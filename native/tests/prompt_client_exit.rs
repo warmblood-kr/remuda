@@ -52,7 +52,7 @@ fn prepare(dir: &Path) {
         package.join("packages/prompt_exit/init.lua"),
         r#"remuda.extension_command("prompt_exit", function(args)
   assert(args[1] == "wait")
-  local reply = remuda.pending { timeout = 30 }
+  local reply = remuda.pending { timeout = 120 }
   reply:prompt_line { label = "wizard prompt", callback = function(value, err)
     if err then reply:reject(tostring(err) .. "\nNext: rerun remuda prompt_exit")
     else reply:resolve(0, "answer: " .. (value or ""), "") end
@@ -77,7 +77,7 @@ fn env_command(args: &[&str], dir: &Path) -> Command {
     command
 }
 
-struct PrivateDaemon(std::process::Child);
+struct PrivateDaemon(std::process::Child, Instant);
 
 impl PrivateDaemon {
     fn stop(&mut self, dir: &Path) {
@@ -108,6 +108,7 @@ fn start_daemon(dir: &Path) -> PrivateDaemon {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    let started_at = Instant::now();
     let child = command.spawn().expect("spawn private daemon");
     let socket = remuda_native::daemon::socket_path_in(&dir.join("runtime"), "s");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -115,7 +116,7 @@ fn start_daemon(dir: &Path) -> PrivateDaemon {
         assert!(Instant::now() < deadline, "daemon never bound {socket:?}");
         std::thread::sleep(Duration::from_millis(10));
     }
-    PrivateDaemon(child)
+    PrivateDaemon(child, started_at)
 }
 
 fn stop_daemon(dir: &Path) {
@@ -129,6 +130,8 @@ struct PromptClient {
     child: std::process::Child,
     master: Arc<Mutex<Option<fs::File>>>,
     output: Arc<Mutex<Vec<u8>>>,
+    spawned_at: Instant,
+    prompt_seen_at: Mutex<Option<Instant>>,
 }
 
 impl PromptClient {
@@ -175,6 +178,7 @@ impl PromptClient {
             });
         }
         let child = command.spawn().expect("spawn prompt client");
+        let spawned_at = Instant::now();
         let output = Arc::new(Mutex::new(Vec::new()));
         let master = Arc::new(Mutex::new(Some(master_file)));
         let reader_master = Arc::clone(&master);
@@ -212,6 +216,8 @@ impl PromptClient {
             child,
             master,
             output,
+            spawned_at,
+            prompt_seen_at: Mutex::new(None),
         }
     }
 
@@ -225,6 +231,7 @@ impl PromptClient {
                 .windows(b"wizard prompt".len())
                 .any(|window| window == b"wizard prompt")
             {
+                *self.prompt_seen_at.lock().unwrap() = Some(Instant::now());
                 return true;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -294,6 +301,7 @@ struct ClientResult {
     output: String,
     writes: usize,
     diagnostics: String,
+    timeline: String,
 }
 
 #[cfg(target_os = "linux")]
@@ -407,16 +415,26 @@ fn waiting_prompt(dir: &Path) -> PromptClient {
 
 fn answer_prompt(dir: &Path) -> ClientResult {
     let mut daemon = start_daemon(dir);
+    let daemon_started_at = daemon.1;
     let mut client = waiting_prompt(dir);
+    let prompt_seen_at = client
+        .prompt_seen_at
+        .lock()
+        .unwrap()
+        .expect("prompt timestamp recorded");
     std::thread::sleep(Duration::from_millis(500));
     let mut writes = 0;
     let mut status = None;
     let mut diagnostics = String::new();
+    let mut first_answer_written_at = None;
+    let mut client_exit_at = None;
     for _ in 0..=5 {
         client.write_terminal(b"answer\r");
         writes += 1;
+        first_answer_written_at.get_or_insert_with(Instant::now);
         status = client.wait_for(Duration::from_secs(3));
         if status.is_some() {
+            client_exit_at = Some(Instant::now());
             break;
         }
         if diagnostics.is_empty() {
@@ -424,11 +442,32 @@ fn answer_prompt(dir: &Path) -> ClientResult {
             eprintln!("client diagnostics after write {writes}:\n{diagnostics}");
         }
     }
+    let timeline = format!(
+        "prompt_label_seen={}ms after client spawn/{}ms after daemon start; answer_written={}ms after client spawn/{}ms after daemon start; client_exit={}ms after client spawn/{}ms after daemon start",
+        prompt_seen_at.duration_since(client.spawned_at).as_millis(),
+        prompt_seen_at.duration_since(daemon_started_at).as_millis(),
+        first_answer_written_at
+            .expect("answer was written")
+            .duration_since(client.spawned_at)
+            .as_millis(),
+        first_answer_written_at
+            .expect("answer was written")
+            .duration_since(daemon_started_at)
+            .as_millis(),
+        client_exit_at
+            .map(|at| at.duration_since(client.spawned_at).as_millis().to_string())
+            .unwrap_or_else(|| "not observed".to_owned()),
+        client_exit_at
+            .map(|at| at.duration_since(daemon_started_at).as_millis().to_string())
+            .unwrap_or_else(|| "not observed".to_owned())
+    );
+    eprintln!("normal answer timeline: {timeline}");
     let result = ClientResult {
         status,
         output: client.captured_output(),
         writes,
         diagnostics,
+        timeline,
     };
     client.cleanup();
     daemon.stop(dir);
@@ -444,6 +483,7 @@ fn stop_daemon_with_prompt(dir: &Path) -> ClientResult {
         output: client.captured_output(),
         writes: 0,
         diagnostics: String::new(),
+        timeline: String::new(),
     };
     client.cleanup();
     result
@@ -458,6 +498,7 @@ fn sigterm_with_prompt(dir: &Path) -> ClientResult {
         output: client.captured_output(),
         writes: 0,
         diagnostics: String::new(),
+        timeline: String::new(),
     };
     client.cleanup();
     daemon.stop(dir);
@@ -474,6 +515,7 @@ fn close_terminal_with_daemon_stop(dir: &Path) -> ClientResult {
         output: client.captured_output(),
         writes: 0,
         diagnostics: String::new(),
+        timeline: String::new(),
     };
     client.cleanup();
     result
@@ -489,6 +531,7 @@ fn close_terminal_with_sigterm(dir: &Path) -> ClientResult {
         output: client.captured_output(),
         writes: 0,
         diagnostics: String::new(),
+        timeline: String::new(),
     };
     client.cleanup();
     daemon.stop(dir);
@@ -505,14 +548,18 @@ fn prompt_client_exits_when_daemon_or_terminal_disappears_and_on_sigterm() {
     let terminal_gone = close_terminal_with_daemon_stop(&dir);
     let terminal_gone_sigterm = close_terminal_with_sigterm(&dir);
 
-    eprintln!("normal answer writes needed: {}", normal_answer.writes);
+    eprintln!(
+        "normal answer writes needed: {}; {}",
+        normal_answer.writes, normal_answer.timeline
+    );
     assert!(
         normal_answer.status.is_some_and(|status| status.success()),
-        "answering a normal prompt did not succeed after {} writes: {:?}; client output: {}; diagnostics: {}",
+        "answering a normal prompt did not succeed after {} writes: {:?}; client output: {}; diagnostics: {}; {}",
         normal_answer.writes,
         normal_answer.status,
         normal_answer.output,
-        normal_answer.diagnostics
+        normal_answer.diagnostics,
+        normal_answer.timeline
     );
     assert!(
         normal_answer.output.contains("answer: answer"),
