@@ -52,7 +52,7 @@ mod store {
     const DENIED: [i32; 2] = [-128, -25293];
 
     const NO_DEFAULT_KEYCHAIN: &str =
-        "unavailable: no default keychain. Fix: open Keychain Access once (File > Reset My Default Keychain) or pass --dir";
+        "unavailable: no default keychain. Fix: open Keychain Access once (File > Reset My Default Keychain) or pass --dir. If macOS asks: Cancel is safe (the password goes to the private file); Reset to Defaults creates a new login keychain";
     const KEYCHAIN_LOCKED: &str =
         "unavailable: keychain locked or no GUI session. Fix: unlock it (or log in on the console) or pass --dir";
 
@@ -63,6 +63,9 @@ mod store {
     fn reason(error: Error) -> String {
         match error.code() {
             ITEM_NOT_FOUND => "not_found".to_string(),
+            -128 => {
+                format!("denied: {error}. Cancel is safe: the password goes to the private file")
+            }
             code if DENIED.contains(&code) => format!("denied: {error}"),
             -25291 | -25294 | -25307 => NO_DEFAULT_KEYCHAIN.to_string(),
             -25308 => KEYCHAIN_LOCKED.to_string(),
@@ -102,6 +105,8 @@ mod store {
                 assert!(text.starts_with("unavailable: "), "{code}: {text}");
                 assert!(text.contains("default keychain"), "{code}: {text}");
                 assert!(text.contains("Fix:"), "{code}: {text}");
+                assert!(text.contains("Cancel is safe"), "{code}: {text}");
+                assert!(text.contains("Reset to Defaults"), "{code}: {text}");
             }
         }
 
@@ -117,6 +122,8 @@ mod store {
             for code in [-128, -25293] {
                 assert!(reason(Error::from_code(code)).starts_with("denied: "));
             }
+            let cancelled = reason(Error::from_code(-128));
+            assert!(cancelled.contains("Cancel is safe"), "{cancelled}");
         }
     }
 }
