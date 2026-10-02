@@ -1009,6 +1009,107 @@ mod tests {
         assert!(receive.recv_timeout(Duration::from_secs(2)).unwrap());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn xdg_refuses_symlinked_namespace_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestRoot::new();
+        let storage = root.0.join("data/storage");
+        let outside = root.0.join("outside");
+        fs::create_dir_all(&storage).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, storage.join("linked")).unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(r#"assert(not pcall(function() remuda.storage.get("linked"):data():write("new", "x") end))"#)
+            .exec()
+            .unwrap();
+        assert!(!outside.join("new").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_refuses_symlinked_files_for_all_handle_operations() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/linked");
+        fs::create_dir_all(&namespace).unwrap();
+        fs::write(namespace.join("target"), b"keep").unwrap();
+        symlink(namespace.join("target"), namespace.join("link")).unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"
+            local f = remuda.storage.get("linked"):data()
+            local ok, exists = pcall(function() return f:exists("link") end)
+            assert(not ok or exists == false)
+            local value, reason = f:read("link"); assert(value == nil and reason)
+            assert(not pcall(function() f:write("link", "replace") end))
+            local deleted, reason = f:delete("link"); assert(deleted == nil and reason)
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(fs::read(namespace.join("target")).unwrap(), b"keep");
+        assert!(namespace.join("link").is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_refuses_directory_symlink_swapped_between_operations() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestRoot::new();
+        let namespace = root.0.join("data/storage/race");
+        let outside = root.0.join("outside");
+        fs::create_dir_all(namespace.join("part")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(namespace.join("part/item"), b"inside").unwrap();
+        fs::write(outside.join("item"), b"outside").unwrap();
+        fs::remove_file(namespace.join("part/item")).unwrap();
+        fs::remove_dir(namespace.join("part")).unwrap();
+        symlink(&outside, namespace.join("part")).unwrap();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"local value, reason = remuda.storage.get("race"):data():read("part/item"); assert(value == nil and reason)"#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(fs::read(outside.join("item")).unwrap(), b"outside");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xdg_directories_and_existing_files_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(r#"remuda.storage.get("mode"):data():write("item", "first")"#)
+            .exec()
+            .unwrap();
+        let namespace = root.0.join("data/storage/mode");
+        let file = namespace.join("item");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        lua.load(r#"remuda.storage.get("mode"):data():write("item", "second")"#)
+            .exec()
+            .unwrap();
+        for dir in [root.0.join("data"), root.0.join("data/storage"), namespace] {
+            assert_eq!(
+                fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(
+            fs::metadata(file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     fn run_handle_conformance(lua: &Lua, backend: &str) {
         select_backend(lua, backend);
         lua.load(HANDLE_CONFORMANCE).exec().unwrap();
