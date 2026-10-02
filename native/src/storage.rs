@@ -709,6 +709,13 @@ fn list_location(location: &FileLocation, limit: usize) -> io::Result<Vec<String
     }
 }
 
+fn select_list_names(mut names: Vec<String>, prefix: &str, limit: usize) -> Vec<String> {
+    names.truncate(limit);
+    names.retain(|name| name.starts_with(prefix));
+    names.sort();
+    names
+}
+
 fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
     let override_root = env("REMUDA_STORAGE_ROOT")
         .filter(|root| !root.is_empty())
@@ -1069,11 +1076,13 @@ impl KindHandle {
                 }
                 Err(error) => return Err(mlua::Error::runtime(storage_io_error(error))),
             };
-            let mut names = list_location(&location, MAX_STORAGE_ENTRIES)
+            let names = list_location(&location, MAX_STORAGE_ENTRIES)
                 .map_err(|error| mlua::Error::runtime(storage_io_error(error)))?;
-            names.retain(|name| name.starts_with(&prefix));
-            names.sort();
-            return lua.create_sequence_from(names);
+            return lua.create_sequence_from(select_list_names(
+                names,
+                &prefix,
+                MAX_STORAGE_ENTRIES,
+            ));
         }
         let names = self
             .files
@@ -1655,6 +1664,18 @@ mod tests {
             .eval()
             .unwrap();
         assert!(count <= 1024);
+    }
+
+    #[test]
+    fn list_prefix_matches_are_not_hidden_by_unrelated_entries() {
+        let names = (0..MAX_STORAGE_ENTRIES)
+            .map(|index| format!("elsewhere{index}"))
+            .chain(std::iter::once("wanted/item".to_owned()))
+            .collect();
+        assert_eq!(
+            select_list_names(names, "wanted/", MAX_STORAGE_ENTRIES),
+            ["wanted/item"]
+        );
     }
 
     #[cfg(unix)]
