@@ -257,6 +257,8 @@ fn message_body_start(
     end: usize,
 ) -> Option<usize> {
     let options = spec.options.iter().chain(verb.options.iter());
+    let positionals_before_body = verb.args.len().saturating_sub(1);
+    let mut positionals_seen = 0;
     let mut index = start;
     while index < end {
         let word = argv[index];
@@ -284,7 +286,12 @@ fn message_body_start(
             }
             continue;
         }
-        return Some(index);
+        if positionals_seen < positionals_before_body {
+            positionals_seen += 1;
+            index += 1;
+        } else {
+            return Some(index);
+        }
     }
     None
 }
@@ -485,6 +492,53 @@ mod tests {
         }
     }
 
+    fn reply_spec() -> Spec {
+        Spec {
+            name: "remuda butler matrix".into(),
+            options: vec![
+                OptionSpec {
+                    long: "room".into(),
+                    short: Some('r'),
+                    value: Some("ROOM".into()),
+                    help: "Room ID".into(),
+                    global: true,
+                },
+                OptionSpec {
+                    long: "verbose".into(),
+                    short: Some('v'),
+                    value: Some("LEVEL".into()),
+                    help: "Verbosity".into(),
+                    global: true,
+                },
+                OptionSpec {
+                    long: "json".into(),
+                    short: Some('j'),
+                    value: None,
+                    help: "Print JSON".into(),
+                    global: true,
+                },
+            ],
+            verbs: vec![VerbSpec {
+                name: "reply".into(),
+                about: "Reply to an event".into(),
+                args: vec![
+                    ArgSpec {
+                        name: "EVENT_ID".into(),
+                        help: "Event to reply to".into(),
+                        multiple: false,
+                    },
+                    ArgSpec {
+                        name: "TEXT".into(),
+                        help: "Message text".into(),
+                        multiple: true,
+                    },
+                ],
+                next: "remuda butler matrix inbox".into(),
+                options: vec![],
+            }],
+        }
+    }
+
     #[test]
     fn proven_cli_behaviors_are_table_driven() {
         let cases: &[(&str, &[&str], bool, &str)] = &[
@@ -630,5 +684,46 @@ mod tests {
                 Value::String("there".into()),
             ])
         );
+    }
+
+    #[test]
+    fn help_in_reply_body_keeps_options_after_leading_positional() {
+        let spec = reply_spec();
+        let cases: &[(&[&str], &str, &str)] = &[
+            (
+                &["reply", "e", "--room", "R", "hello", "--help", "there"],
+                "room",
+                "R",
+            ),
+            (
+                &["reply", "e", "-v", "q", "hello", "--help", "there"],
+                "verbose",
+                "q",
+            ),
+            (
+                &["reply", "e", "--json", "hello", "--help", "there"],
+                "json",
+                "true",
+            ),
+        ];
+        for (argv, option, expected) in cases {
+            let report = parse(&spec, argv);
+            assert!(report.ok, "{argv:?}: {report:?}");
+            assert_eq!(report.values["EVENT_ID"], "e", "{argv:?}");
+            assert_eq!(
+                report.values[*option].to_string().trim_matches('"'),
+                *expected,
+                "{argv:?}"
+            );
+            assert_eq!(
+                report.values["TEXT"],
+                Value::Array(vec![
+                    Value::String("hello".into()),
+                    Value::String("--help".into()),
+                    Value::String("there".into()),
+                ]),
+                "{argv:?}"
+            );
+        }
     }
 }
