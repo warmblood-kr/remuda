@@ -1,23 +1,86 @@
 use remuda_core::Registry;
 use remuda_native::{image::Image, tick::Counters};
-use std::path::Path;
+use std::fs;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 static NEXT_IMAGE_SOCKET: AtomicU64 = AtomicU64::new(0);
 
-fn image() -> Image {
-    let socket = format!(
-        "/tmp/bl-{}-{}.sock",
+struct ScratchDir(PathBuf);
+
+impl Deref for ScratchDir {
+    type Target = Path;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+struct TestImage {
+    image: Image,
+    // Image does not bind or unlink this path, so keep the private directory
+    // alive with the handle and remove it after the handle is dropped.
+    _scratch: ScratchDir,
+}
+
+impl Deref for TestImage {
+    type Target = Image;
+
+    fn deref(&self) -> &Self::Target {
+        &self.image
+    }
+}
+
+fn scratch_dir() -> ScratchDir {
+    let root = if cfg!(target_os = "macos") {
+        PathBuf::from("/private/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    let dir = root.join(format!(
+        "bl-{}-{}",
         std::process::id(),
         NEXT_IMAGE_SOCKET.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&dir)
+        .expect("create private image scratch dir");
+    ScratchDir(dir)
+}
+
+fn image() -> TestImage {
+    let scratch = scratch_dir();
+    let socket = scratch.join("s.sock");
+    #[cfg(unix)]
+    assert!(
+        socket.as_os_str().len() < 104,
+        "image socket path must fit the Unix sun_path limit: {} bytes",
+        socket.as_os_str().len()
     );
-    Image::spawn(
-        Path::new(&socket),
+    let image = Image::spawn(
+        &socket,
         Arc::new(Registry::new()),
         Arc::new(Counters::default()),
-    )
+    );
+    TestImage {
+        image,
+        _scratch: scratch,
+    }
 }
 
 fn expect_bounded_error(code: &str) {
