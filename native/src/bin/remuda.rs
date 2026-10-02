@@ -50,6 +50,45 @@ mod codex_tui;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let (_, rest) = split_server_flag(&args);
+    if starts_interactive_client(rest) {
+        return run_cli(args);
+    }
+
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if !is_stdout_broken_pipe_panic(info.payload()) {
+            previous_hook(info);
+        }
+    }));
+    match std::panic::catch_unwind(|| run_cli(args)) {
+        Ok(code) => code,
+        Err(payload) if is_stdout_broken_pipe_panic(payload.as_ref()) => ExitCode::SUCCESS,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
+fn starts_interactive_client(args: &[String]) -> bool {
+    match args {
+        [] => true,
+        [command, ..] if ["daemon", "run", "attach"].contains(&command.as_str()) => true,
+        [command, ..] if command == "_codex_tui" => true,
+        [command, verb, ..] if command == "cluster" && verb == "remote" => true,
+        _ => false,
+    }
+}
+
+fn is_stdout_broken_pipe_panic(payload: &(dyn std::any::Any + Send)) -> bool {
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+    message.is_some_and(|message| {
+        message.starts_with("failed printing to stdout:") && message.contains("Broken pipe")
+    })
+}
+
+fn run_cli(args: Vec<String>) -> ExitCode {
     let (server, stdin_enabled, rest) = match checked_cli_flags(&args) {
         Ok(flags) => flags,
         Err(code) => return code,
