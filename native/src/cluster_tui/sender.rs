@@ -198,6 +198,7 @@ impl InputSender {
         let outcome = match send(&request) {
             Ok(Response::Ack { duplicate }) => SendOutcome::Ack { duplicate },
             Ok(Response::Uncertain) => SendOutcome::Uncertain,
+            Ok(Response::Busy) => SendOutcome::Busy,
             Ok(Response::WrongInstance) => SendOutcome::WrongInstance,
             Ok(Response::RateLimited) => SendOutcome::RateLimited,
             Ok(Response::Error(reason)) if reason == crate::client::EMPTY_REPLY_ERROR => {
@@ -234,6 +235,7 @@ impl InputSender {
         let outcome = match send(node, &request) {
             Ok(Response::Ack { duplicate }) => SendOutcome::Ack { duplicate },
             Ok(Response::Uncertain) => SendOutcome::Uncertain,
+            Ok(Response::Busy) => SendOutcome::Busy,
             Ok(Response::WrongInstance) => SendOutcome::WrongInstance,
             Ok(Response::RateLimited) => SendOutcome::RateLimited,
             Ok(Response::RemoteControlDisabled) => SendOutcome::RemoteControlDisabled,
@@ -831,7 +833,7 @@ mod tests {
         let batch = queue.items().next().unwrap();
         assert_eq!(batch.state, QueueState::Failed);
         assert!(batch.status.contains("busy"));
-        assert!(batch.status.contains("not written"));
+        assert!(batch.status.contains("no bytes were written"));
     }
 
     #[test]
