@@ -265,6 +265,17 @@ fn run_writer(
             result
         }))
         .unwrap_or_else(|_| Err(io("pty writer panicked")));
+        if result.is_err() {
+            let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.stalled_sequence == Some(task.sequence) {
+                state.late_submit_abandoned_at = Some(
+                    clock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .now(),
+                );
+            }
+        }
         drop(reset_busy);
         let _ = task.result.send(result);
     }
