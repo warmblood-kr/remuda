@@ -129,10 +129,11 @@ fn listing_commands_allow_the_reader_to_stop_after_one_line() {
     }
 
     let empty_home = Scratch::new();
-    let failed_batch = empty_home.pipeline(&["mod", "update", "--all", "--reload"], 1, 1);
-    assert!(
-        failed_batch.status.success(),
-        "the failing offline batch was reported as success: {}",
+    let failed_batch = empty_home.remuda(&["mod", "update", "--all", "--reload"]);
+    assert_eq!(
+        failed_batch.status.code(),
+        Some(1),
+        "the failing offline batch returned the wrong status: {}",
         stderr(&failed_batch)
     );
     assert!(
