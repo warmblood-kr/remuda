@@ -116,13 +116,14 @@ fn start_daemon(dir: &Path) -> PrivateDaemon {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let child = command.spawn().expect("spawn private daemon");
+    let daemon = PrivateDaemon(child);
     let socket = remuda_native::daemon::socket_path_in(&dir.join("runtime"), "s");
     let deadline = Instant::now() + Duration::from_secs(10);
     while remuda_native::ipc::connect(&socket).is_err() {
         assert!(Instant::now() < deadline, "daemon never bound {socket:?}");
         std::thread::sleep(Duration::from_millis(10));
     }
-    PrivateDaemon(child)
+    daemon
 }
 
 fn stop_daemon(dir: &Path) {

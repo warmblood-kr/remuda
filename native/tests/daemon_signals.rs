@@ -50,12 +50,17 @@ impl Daemon {
             .spawn()
             .expect("spawn daemon");
         let socket = daemon::socket_path_in(&dir, "s");
+        let daemon = Self { child, socket, log };
         let deadline = Instant::now() + Duration::from_secs(10);
-        while remuda_native::ipc::connect(&socket).is_err() {
-            assert!(Instant::now() < deadline, "daemon never bound {socket:?}");
+        while remuda_native::ipc::connect(&daemon.socket).is_err() {
+            assert!(
+                Instant::now() < deadline,
+                "daemon never bound {:?}",
+                daemon.socket
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
-        Self { child, socket, log }
+        daemon
     }
 
     fn signal(&self, signal: libc::c_int) {
