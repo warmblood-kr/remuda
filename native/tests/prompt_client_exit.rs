@@ -142,7 +142,7 @@ impl PromptClient {
     fn spawn(dir: &Path, prompt_kind: &str) -> Self {
         let mut master_fd = -1;
         let mut slave_fd = -1;
-        let mut window_size = libc::winsize {
+        let window_size = libc::winsize {
             ws_row: 24,
             ws_col: 80,
             ws_xpixel: 0,
@@ -155,7 +155,7 @@ impl PromptClient {
                     &mut slave_fd,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut window_size,
+                    std::ptr::addr_of!(window_size).cast_mut(),
                 )
             },
             0,
@@ -349,8 +349,7 @@ fn stop_daemon_with_prompt(dir: &Path) -> ClientResult {
 fn stop_daemon_with_secret_prompt(dir: &Path) -> ClientResult {
     let mut daemon = start_daemon(dir);
     let mut client = waiting_prompt(dir, "secret");
-    // SEC note: queued response data can make a disconnect peek look live
-    // until that data is read; the secret-prompt loop must check again after it.
+    // The collector probes the peer again after each terminal poll while it waits.
     daemon.stop(dir);
     let result = ClientResult {
         status: client.wait(),
