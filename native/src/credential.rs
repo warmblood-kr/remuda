@@ -38,50 +38,39 @@ fn checked_secret(value: &Value) -> mlua::Result<mlua::BorrowedBytes> {
 
 #[cfg(target_os = "macos")]
 mod store {
+    use security_framework::base::Error;
+    use security_framework::passwords;
     use zeroize::Zeroizing;
 
     pub(super) const BACKEND: Option<&str> = Some("keychain");
 
+    const SERVICE: &str = "remuda";
+    const ITEM_NOT_FOUND: i32 = -25300;
     // errSecUserCanceled and errSecAuthFailed: the user refused the prompt.
     const DENIED: [i32; 2] = [-128, -25293];
 
-    fn reason(error: keyring::Error) -> String {
-        match error {
-            keyring::Error::NoEntry => "not_found".to_string(),
-            keyring::Error::PlatformFailure(error)
-                if error
-                    .downcast_ref::<security_framework::base::Error>()
-                    .is_some_and(|error| DENIED.contains(&error.code())) =>
-            {
-                format!("denied: {error}")
-            }
-            // A locked keychain in an SSH session lands here
-            // (errSecInteractionNotAllowed), and so does every other failure.
-            keyring::Error::PlatformFailure(error) | keyring::Error::NoStorageAccess(error) => {
-                format!("unavailable: {error}")
-            }
-            // Display only: these variants' Debug output could hold stored bytes.
-            other => format!("unavailable: {other}"),
+    // A locked keychain in an SSH session (errSecInteractionNotAllowed) is
+    // `unavailable`, like every failure that is not a miss or a refusal.
+    fn reason(error: Error) -> String {
+        match error.code() {
+            ITEM_NOT_FOUND => "not_found".to_string(),
+            code if DENIED.contains(&code) => format!("denied: {error}"),
+            _ => format!("unavailable: {error}"),
         }
     }
 
-    fn entry(name: &str) -> Result<keyring::Entry, String> {
-        keyring::Entry::new("remuda", name).map_err(reason)
-    }
-
     pub(super) fn put(name: &str, secret: &[u8]) -> Result<(), String> {
-        entry(name)?.set_secret(secret).map_err(reason)
+        passwords::set_generic_password(SERVICE, name, secret).map_err(reason)
     }
 
     pub(super) fn get(name: &str) -> Result<Zeroizing<Vec<u8>>, String> {
-        entry(name)?
-            .get_secret()
+        passwords::get_generic_password(SERVICE, name)
             .map(Zeroizing::new)
             .map_err(reason)
     }
 
     pub(super) fn delete(name: &str) -> Result<(), String> {
-        entry(name)?.delete_credential().map_err(reason)
+        passwords::delete_generic_password(SERVICE, name).map_err(reason)
     }
 }
 
