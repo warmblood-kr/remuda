@@ -285,119 +285,146 @@ impl Drop for PromptClient {
     }
 }
 
+struct ClientResult {
+    status: Option<std::process::ExitStatus>,
+    output: String,
+}
+
+fn waiting_prompt(dir: &Path) -> PromptClient {
+    let client = PromptClient::spawn(dir);
+    assert!(
+        client.wait_for_prompt(),
+        "prompt did not appear; client output: {}",
+        client.captured_output()
+    );
+    client
+}
+
+fn answer_prompt(dir: &Path) -> ClientResult {
+    let mut daemon = start_daemon(dir);
+    let mut client = waiting_prompt(dir);
+    client.write_terminal(b"answer\r");
+    let result = ClientResult {
+        status: client.wait(),
+        output: client.captured_output(),
+    };
+    client.cleanup();
+    daemon.stop(dir);
+    result
+}
+
+fn stop_daemon_with_prompt(dir: &Path) -> ClientResult {
+    let mut daemon = start_daemon(dir);
+    let mut client = waiting_prompt(dir);
+    daemon.stop(dir);
+    let result = ClientResult {
+        status: client.wait(),
+        output: client.captured_output(),
+    };
+    client.cleanup();
+    result
+}
+
+fn sigterm_with_prompt(dir: &Path) -> ClientResult {
+    let mut daemon = start_daemon(dir);
+    let mut client = waiting_prompt(dir);
+    client.signal(libc::SIGTERM);
+    let result = ClientResult {
+        status: client.wait(),
+        output: client.captured_output(),
+    };
+    client.cleanup();
+    daemon.stop(dir);
+    result
+}
+
+fn close_terminal_with_daemon_stop(dir: &Path) -> ClientResult {
+    let mut daemon = start_daemon(dir);
+    let mut client = waiting_prompt(dir);
+    client.close_terminal();
+    daemon.stop(dir);
+    let result = ClientResult {
+        status: client.wait(),
+        output: client.captured_output(),
+    };
+    client.cleanup();
+    result
+}
+
+fn close_terminal_with_sigterm(dir: &Path) -> ClientResult {
+    let mut daemon = start_daemon(dir);
+    let mut client = waiting_prompt(dir);
+    client.close_terminal();
+    client.signal(libc::SIGTERM);
+    let result = ClientResult {
+        status: client.wait(),
+        output: client.captured_output(),
+    };
+    client.cleanup();
+    daemon.stop(dir);
+    result
+}
+
 #[test]
 fn prompt_client_exits_when_daemon_or_terminal_disappears_and_on_sigterm() {
     let dir = scratch_dir();
     prepare(&dir);
+    let normal_answer = answer_prompt(&dir);
+    let daemon_stop = stop_daemon_with_prompt(&dir);
+    let live_sigterm = sigterm_with_prompt(&dir);
+    let terminal_gone = close_terminal_with_daemon_stop(&dir);
+    let terminal_gone_sigterm = close_terminal_with_sigterm(&dir);
 
-    let mut daemon = start_daemon(&dir);
-    let mut normal_answer = PromptClient::spawn(&dir);
     assert!(
-        normal_answer.wait_for_prompt(),
-        "prompt did not appear; client output: {}",
-        normal_answer.captured_output()
-    );
-    normal_answer.write_terminal(b"answer\r");
-    let normal_answer_exited = normal_answer.wait();
-    let normal_answer_output = normal_answer.captured_output();
-    normal_answer.cleanup();
-    daemon.stop(&dir);
-
-    let mut daemon = start_daemon(&dir);
-    let mut live_daemon_stop = PromptClient::spawn(&dir);
-    assert!(
-        live_daemon_stop.wait_for_prompt(),
-        "prompt did not appear from {}; client output: {}",
-        env!("CARGO_BIN_EXE_remuda"),
-        live_daemon_stop.captured_output(),
-    );
-    daemon.stop(&dir);
-    let daemon_stop_exited = live_daemon_stop.wait();
-    live_daemon_stop.cleanup();
-
-    let mut daemon = start_daemon(&dir);
-    let mut live_sigterm = PromptClient::spawn(&dir);
-    assert!(
-        live_sigterm.wait_for_prompt(),
-        "prompt did not appear; client output: {}",
-        live_sigterm.captured_output()
-    );
-    live_sigterm.signal(libc::SIGTERM);
-    let live_sigterm_exited = live_sigterm.wait();
-    live_sigterm.cleanup();
-    daemon.stop(&dir);
-
-    let mut daemon = start_daemon(&dir);
-    let mut gone_terminal = PromptClient::spawn(&dir);
-    assert!(
-        gone_terminal.wait_for_prompt(),
-        "prompt did not appear; client output: {}",
-        gone_terminal.captured_output()
-    );
-    gone_terminal.close_terminal();
-    daemon.stop(&dir);
-    let terminal_gone_exited = gone_terminal.wait();
-    gone_terminal.cleanup();
-
-    let mut daemon = start_daemon(&dir);
-    let mut gone_terminal_sigterm = PromptClient::spawn(&dir);
-    assert!(
-        gone_terminal_sigterm.wait_for_prompt(),
-        "prompt did not appear; client output: {}",
-        gone_terminal_sigterm.captured_output()
-    );
-    gone_terminal_sigterm.close_terminal();
-    gone_terminal_sigterm.signal(libc::SIGTERM);
-    let terminal_gone_sigterm_exited = gone_terminal_sigterm.wait();
-    gone_terminal_sigterm.cleanup();
-    daemon.stop(&dir);
-
-    eprintln!(
-        "prompt exit observations: normal answer={normal_answer_exited:?}, daemon stop={daemon_stop_exited:?}, live SIGTERM={live_sigterm_exited:?}, closed terminal + daemon stop={terminal_gone_exited:?}, closed terminal + SIGTERM={terminal_gone_sigterm_exited:?}"
+        normal_answer.status.is_some_and(|status| status.success()),
+        "answering a normal prompt did not succeed: {:?}; client output: {}",
+        normal_answer.status,
+        normal_answer.output
     );
     assert!(
-        normal_answer_exited.is_some_and(|status| status.success()),
-        "answering a normal prompt did not succeed: {normal_answer_exited:?}; client output: {normal_answer_output}"
-    );
-    assert!(
-        normal_answer_output.contains("answer: answer"),
+        normal_answer.output.contains("answer: answer"),
         "normal prompt answer was not returned: {}",
-        normal_answer_output
+        normal_answer.output
     );
     assert!(
-        daemon_stop_exited.is_some_and(|status| !status.success()),
-        "daemon stop did not end the client with a non-zero status: {daemon_stop_exited:?}; client output: {}",
-        live_daemon_stop.captured_output()
+        daemon_stop.status.is_some_and(|status| !status.success()),
+        "daemon stop did not end the client with a non-zero status: {:?}; client output: {}",
+        daemon_stop.status,
+        daemon_stop.output
     );
-    let daemon_stop_output_bytes = live_daemon_stop.output.lock().unwrap().clone();
-    let daemon_stop_output = String::from_utf8_lossy(&daemon_stop_output_bytes);
     assert_eq!(
-        daemon_stop_output
+        daemon_stop
+            .output
             .matches("daemon connection closed while waiting for a line prompt")
             .count(),
         1,
-        "expected one disconnect line, got {daemon_stop_output:?}; client output: {daemon_stop_output}"
+        "expected one disconnect line; client output: {}",
+        daemon_stop.output
     );
     assert_eq!(
-        daemon_stop_output
+        daemon_stop
+            .output
             .matches("Next: restart the daemon")
             .count(),
         1,
-        "expected one Next: line, got {daemon_stop_output:?}; client output: {daemon_stop_output}"
+        "expected one Next: line; client output: {}",
+        daemon_stop.output
     );
     assert!(
-        live_sigterm_exited.is_some_and(|status| !status.success()),
+        live_sigterm.status.is_some_and(|status| !status.success()),
         "SIGTERM left client alive past {WAIT:?}; terminal stayed open; client output: {}",
-        live_sigterm.captured_output()
+        live_sigterm.output
     );
     assert!(
-        terminal_gone_exited.is_some_and(|status| !status.success()),
+        terminal_gone.status.is_some_and(|status| !status.success()),
         "closed pty master left client alive past {WAIT:?}; client output: {}",
-        gone_terminal.captured_output()
+        terminal_gone.output
     );
     assert!(
-        terminal_gone_sigterm_exited.is_some_and(|status| !status.success()),
+        terminal_gone_sigterm
+            .status
+            .is_some_and(|status| !status.success()),
         "closed pty master plus SIGTERM left client alive past {WAIT:?}; client output: {}",
-        gone_terminal_sigterm.captured_output()
+        terminal_gone_sigterm.output
     );
 }
