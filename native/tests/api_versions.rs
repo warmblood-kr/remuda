@@ -313,6 +313,10 @@ fn frozen_api_fixtures_v1_through_v4_and_new_v5_surface_run() {
         let mut private_daemon = spawn::Daemon::spawn(&dir);
         let fixture = dir.join(format!("{version}.lua"));
         if version == "v5" {
+            eval(
+                &path,
+                &format!("remuda._api_v5_test_pid = {}", std::process::id()),
+            );
             let private_path = dir.join("private-atomic-write");
             std::fs::write(&private_path, b"old contents").unwrap();
             #[cfg(unix)]
