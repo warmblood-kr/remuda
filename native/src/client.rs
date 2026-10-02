@@ -3698,6 +3698,53 @@ mod tests {
     }
 
     #[test]
+    fn secret_prompt_clips_vs16_label_by_display_width() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(40);
+        let label = format!("remuda[session a] {}", "\u{2764}\u{fe0f}".repeat(100));
+        let key = secret_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        let _answer = super::prompt_secret_with_events(terminal.clone(), &label, [key])
+            .unwrap()
+            .unwrap();
+
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let prompt = output.split(": ").next().unwrap();
+        assert!(
+            unicode_width::UnicodeWidthStr::width(prompt) <= 38,
+            "prompt label exceeded terminal width: {prompt:?}"
+        );
+    }
+
+    #[test]
+    fn secret_prompt_clips_vs16_forgery_before_fake_tag() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(80);
+        let label = format!(
+            "remuda[session a] {} remuda[prod] forged",
+            "\u{2764}\u{fe0f}".repeat(31)
+        );
+        let key = secret_key(KeyCode::Enter, KeyModifiers::NONE);
+
+        let _answer = super::prompt_secret_with_events(terminal.clone(), &label, [key])
+            .unwrap()
+            .unwrap();
+
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let prompt = output.split(": ").next().unwrap();
+        assert!(
+            unicode_width::UnicodeWidthStr::width(prompt) <= 78,
+            "prompt label exceeded terminal width: {prompt:?}"
+        );
+        assert!(
+            !prompt.contains("remuda[prod]"),
+            "fake tag survived: {prompt:?}"
+        );
+    }
+
+    #[test]
     fn prompt_line_prints_default_and_echoes_visible_input() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
