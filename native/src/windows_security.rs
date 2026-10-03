@@ -3,23 +3,44 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct NtOpenPolicy {
     pub(crate) object_attributes: u32,
     pub(crate) create_options: u32,
 }
 
-#[cfg(any(windows, test))]
+#[cfg(test)]
 pub(crate) fn relative_component_utf16(component: &str) -> Option<Vec<u16>> {
-    Some(component.encode_utf16().collect())
+    if component.is_empty()
+        || component == "."
+        || component == ".."
+        || !component.bytes().all(|byte| byte.is_ascii_graphic())
+        || component
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'\\' | b':' | b'\0'))
+    {
+        return None;
+    }
+    Some(component.encode_utf16().chain(Some(0)).collect())
 }
 
-#[cfg(any(windows, test))]
-pub(crate) fn nt_open_policy(_directory: bool) -> NtOpenPolicy {
+#[cfg(test)]
+pub(crate) fn nt_open_policy(directory: bool) -> NtOpenPolicy {
+    const OBJ_DONT_REPARSE: u32 = 0x0000_1000;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
+    const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+    const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
     NtOpenPolicy {
-        object_attributes: 0,
-        create_options: 0,
+        object_attributes: OBJ_DONT_REPARSE,
+        create_options: FILE_OPEN_REPARSE_POINT
+            | FILE_SYNCHRONOUS_IO_NONALERT
+            | if directory {
+                FILE_DIRECTORY_FILE
+            } else {
+                FILE_NON_DIRECTORY_FILE
+            },
     }
 }
 
