@@ -130,6 +130,11 @@ pub(crate) fn protected_storage_sddl(owner_sid: &str) -> String {
     format!("O:{owner_sid}D:PAI(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
 }
 
+#[cfg(any(windows, test))]
+fn trusted_storage_owner(actual_sid: &str, current_user_sid: &str) -> bool {
+    actual_sid == current_user_sid || matches!(actual_sid, "S-1-5-18" | "S-1-5-32-544")
+}
+
 #[allow(dead_code)]
 pub(crate) fn local_appdata_for(env: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
     let absolute_windows_path = |name| {
@@ -167,7 +172,7 @@ mod platform {
     use super::FAIL_NEXT_STORAGE_RENAME;
     use super::{
         ace_sid_fits, build_file_rename_info, nt_open_policy, protected_storage_sddl,
-        relative_component_utf16,
+        relative_component_utf16, trusted_storage_owner,
     };
     use std::ffi::{c_void, OsStr};
     use std::fs;
@@ -664,10 +669,11 @@ mod platform {
         }
         let descriptor = LocalMemory(raw_descriptor.cast());
         let user = UserSid::current()?;
-        if owner.is_null()
-            // SAFETY: Both owner and current-user SIDs remain live for this comparison.
-            || unsafe { windows_sys::Win32::Security::EqualSid(owner, user.sid) } == 0
-        {
+        if owner.is_null() {
+            return Err(policy_error("storage child owner mismatch"));
+        }
+        // Elevated setup can create children as Administrators or SYSTEM; trust those SIDs only.
+        if !trusted_storage_owner(&sid_text(owner)?, &user.text) {
             return Err(policy_error("storage child owner mismatch"));
         }
         let mut control = 0;
