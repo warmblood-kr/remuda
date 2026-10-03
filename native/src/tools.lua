@@ -1173,7 +1173,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
   if reactivate == false and modules[name] ~= nil then
     local active = modules[name]
     if not commands_only and not active.started and active.start then
-      return false, active.state, nil, active.start, nil
+      return false, active.state, active.start, nil, nil
     end
     return false
   end
@@ -1604,7 +1604,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
   end
   local launch_start = start
   if commands_only and commands then launch_start = nil end
-  return true, state, commands, launch_start, rollback
+  return true, state, launch_start, rollback, commands
 end
 
 -- Called by the daemon's clean shutdown path. A snapshot avoids mutation
