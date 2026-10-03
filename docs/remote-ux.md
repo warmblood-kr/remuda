@@ -12,12 +12,12 @@ If the cluster directory is missing but a saved fingerprint shows this machine h
 
 ```text
 $ remuda cluster init
-Starting the listener for cluster nodes on the private LAN (port 7441 by default). Only admitted machines can connect. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (127.0.0.1:7441 for local-only).
+Starting the listener for cluster nodes (port 7441 by default). Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (127.0.0.1:7441 for local-only).
 Cluster initialized
 Node: studio
 Fingerprint: SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=
 Listening for cluster nodes on 192.168.1.20:7441 (reachable from your LAN)
-Only admitted machines can connect.
+Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key.
 To skip opening a port on init, use `remuda cluster init --no-listen`; to stop it later, run `remuda cluster listen --off`; to limit the address, run `remuda cluster listen --bind IP[:PORT]` (use `127.0.0.1:7441` for local-only).
 Next: run `remuda cluster invite` here, then run its printed `remuda cluster join ...` command on the other node.
 
@@ -223,7 +223,7 @@ the bounded input path.
 ### Security and implementation constraints
 
 - The allowlisted request front comes first, initially on a local socket. It exposes only the operations required by this UX; never forward the general daemon protocol or arbitrary Lua remotely. The network listener is a later layer over that restricted front.
-- If the listener needs TCP, allow exactly one scoped clippy TCP-ban exception in its module (`#[allow]` at that module), with a `clippy.toml` and documentation note that names #191. Auto mode detects the default-route RFC 1918 address and binds only that address; it re-detects every five seconds and on listener reload. Never default to `0.0.0.0`; require `remuda cluster listen --bind 0.0.0.0 --allow-public` for a wildcard. Start the listener only after `remuda cluster init`.
+- If the listener needs TCP, allow exactly one scoped clippy TCP-ban exception in its module (`#[allow]` at that module), with a `clippy.toml` and documentation note that names #191. Auto mode detects the default-route RFC 1918 address and binds only that address; it re-detects every five seconds and on listener reload. Never default to `0.0.0.0`; require `remuda cluster listen --bind 0.0.0.0 --allow-public` for a wildcard. Start the listener only after `remuda cluster init`. Peers may reach its port, but unadmitted nodes need a valid invitation to join; admitted nodes authenticate by registered key.
 - The invite output carries a one-time, expiring token and prints the first node’s fingerprint separately for comparison with `remuda cluster` on the inviting machine. The copied fingerprint in the join command is not an independent trust check. Subsequent requests authenticate with registered node keys. Revoking a node key immediately rejects its later requests.
 
 ## Prior art

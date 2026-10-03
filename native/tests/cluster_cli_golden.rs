@@ -549,7 +549,7 @@ fn cluster_init_discloses_listener_before_it_binds() {
     stdout.read_line(&mut first_line).expect("read init notice");
     assert_eq!(
         first_line.trim_end(),
-        "Starting the listener for cluster nodes on the private LAN (port 7441 by default). Only admitted machines can connect. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (127.0.0.1:7441 for local-only)."
+        "Starting the listener for cluster nodes (port 7441 by default). Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (127.0.0.1:7441 for local-only)."
     );
     assert!(
         TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_err(),
@@ -568,12 +568,26 @@ fn cluster_init_discloses_listener_before_it_binds() {
     assert!(remaining_stdout.contains(&format!(
         "Listening for cluster nodes on {address} (loopback only)"
     )));
+    assert!(remaining_stdout.contains(
+        "Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key."
+    ));
     assert!(remaining_stdout.contains("remuda cluster init --no-listen"));
     assert!(remaining_stdout.contains("remuda cluster listen --off"));
     assert!(remaining_stdout.contains("remuda cluster listen --bind IP[:PORT]"));
     assert!(remaining_stdout.contains("127.0.0.1:7441` for local-only"));
     assert!(remaining_stdout.contains("Next: run `remuda cluster invite` here"));
     assert!(remaining_stdout.contains("`remuda cluster join ...` command on the other node."));
+    let mut init_stdout = first_line.into_bytes();
+    init_stdout.extend_from_slice(remaining_stdout.as_bytes());
+    golden(
+        "init_listener",
+        &Output {
+            status: output.status,
+            stdout: init_stdout,
+            stderr: output.stderr,
+        },
+        &scratch.root,
+    );
 }
 
 #[test]
