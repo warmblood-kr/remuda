@@ -27,7 +27,7 @@ use remuda_core::agent::{
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 /// Live viewers of one pty's output. Shared with the reader thread, which is
@@ -410,6 +410,8 @@ impl AgentWriter for PtyInputWriter {
 /// BEFORE emitting anything and waits: unanswered, the child is alive and the
 /// screen is blank forever. Measured on a windows-latest runner; see steps/010.
 const DSR_CURSOR: &[u8] = b"\x1b[6n";
+const DSR_REPLY_RETRY_LIMIT: usize = 250;
+const DSR_REPLY_RETRY_DELAY: Duration = Duration::from_millis(10);
 const SCROLLBACK_ROWS: usize = 10_000;
 const SCROLLBACK_PROBE_CHUNK: usize = 512;
 
@@ -502,6 +504,8 @@ impl PtyAgent {
         )));
         let watchers: Watchers = Arc::new(Mutex::new(Vec::new()));
         let reader_closed = Arc::new(AtomicBool::new(false));
+        let pending_cursor_replies =
+            spawn_cursor_reply_worker(Arc::clone(&writer), Arc::clone(&reader_closed));
         let scrollback_total = Arc::new(AtomicUsize::new(0));
         let output_version = Arc::new(AtomicU64::new(0));
         spawn_reader(
@@ -509,9 +513,9 @@ impl PtyAgent {
             Arc::clone(&screen),
             Arc::clone(&watchers),
             Arc::clone(&reader_closed),
-            Arc::clone(&writer),
             Arc::clone(&scrollback_total),
             Arc::clone(&output_version),
+            pending_cursor_replies,
         );
 
         Ok(Self {
@@ -537,9 +541,9 @@ fn spawn_reader(
     screen: Arc<Mutex<vt100::Parser>>,
     watchers: Watchers,
     reader_closed: Arc<AtomicBool>,
-    writer: SharedWriter,
     scrollback_total: Arc<AtomicUsize>,
     output_version: Arc<AtomicU64>,
+    pending_cursor_replies: SyncSender<Vec<u8>>,
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
@@ -554,7 +558,7 @@ fn spawn_reader(
                 &screen,
                 &scrollback_total,
                 &output_version,
-                &writer,
+                &pending_cursor_replies,
             ) {
                 break;
             }
@@ -576,7 +580,7 @@ fn spawn_reader(
     });
 }
 
-/// Process one read from the pty and answer a cursor query found in that read.
+/// Process one PTY read and answer a cursor query found there or in its carry-over.
 /// Query matching is deliberately kept at this seam so reader chunk behavior
 /// can be exercised without a platform pty.
 fn process_reader_chunk(
@@ -585,7 +589,7 @@ fn process_reader_chunk(
     screen: &Arc<Mutex<vt100::Parser>>,
     scrollback_total: &AtomicUsize,
     output_version: &AtomicU64,
-    writer: &SharedWriter,
+    pending_cursor_replies: &SyncSender<Vec<u8>>,
 ) -> bool {
     let mut query_window = Vec::with_capacity(dsr_carry.len() + bytes.len());
     query_window.extend_from_slice(dsr_carry);
@@ -606,7 +610,7 @@ fn process_reader_chunk(
         Err(_) => return false,
     };
     if asked {
-        answer_cursor_query(writer, at);
+        answer_cursor_query(pending_cursor_replies, at);
     }
     true
 }
@@ -647,15 +651,64 @@ fn process_output(
     (row + 1, col + 1)
 }
 
-/// Reply to a cursor-position query when the writer is free. The reader never
-/// waits behind a stalled input write; a busy child can ask again later.
-// ponytail: matched within one read. ConPTY writes the query as a single
-// four-byte message; a split one would be missed until the next ask.
-fn answer_cursor_query(writer: &SharedWriter, (row, col): (u16, u16)) {
-    let reply = format!("\x1b[{row};{col}R");
-    if let Ok(mut writer) = writer.try_lock() {
-        let _ = writer.write_all(reply.as_bytes());
-        let _ = writer.flush();
+/// Start the bounded worker that writes cursor replies away from the reader.
+/// The one-item channel is the pending slot; retrying never blocks PTY output.
+fn spawn_cursor_reply_worker(
+    writer: SharedWriter,
+    reader_closed: Arc<AtomicBool>,
+) -> SyncSender<Vec<u8>> {
+    let (pending, replies) = sync_channel::<Vec<u8>>(1);
+    std::thread::spawn(move || {
+        while let Ok(reply) = replies.recv() {
+            let mut sent = false;
+            for _ in 0..DSR_REPLY_RETRY_LIMIT {
+                if reader_closed.load(Ordering::Acquire) {
+                    eprintln!(
+                        "remuda pty: dropping pending cursor reply because the session closed"
+                    );
+                    break;
+                }
+                match writer.try_lock() {
+                    Ok(mut writer) => {
+                        sent = writer
+                            .write_all(&reply)
+                            .and_then(|()| writer.flush())
+                            .is_ok();
+                        if !sent {
+                            eprintln!("remuda pty: cursor reply write failed");
+                        }
+                        break;
+                    }
+                    Err(TryLockError::WouldBlock) => {
+                        std::thread::sleep(DSR_REPLY_RETRY_DELAY);
+                    }
+                    Err(TryLockError::Poisoned(_)) => {
+                        eprintln!(
+                            "remuda pty: dropping cursor reply because the writer lock is poisoned"
+                        );
+                        break;
+                    }
+                }
+            }
+            if !sent && !reader_closed.load(Ordering::Acquire) {
+                eprintln!("remuda pty: dropping cursor reply after the retry limit");
+            }
+        }
+    });
+    pending
+}
+
+/// Enqueue one cursor reply without blocking the PTY reader thread.
+fn answer_cursor_query(pending: &SyncSender<Vec<u8>>, (row, col): (u16, u16)) {
+    let reply = format!("\x1b[{row};{col}R").into_bytes();
+    match pending.try_send(reply) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => {
+            eprintln!("remuda pty: dropping cursor reply because the pending slot is full");
+        }
+        Err(TrySendError::Disconnected(_)) => {
+            eprintln!("remuda pty: dropping cursor reply because the session is closed");
+        }
     }
 }
 
@@ -1463,16 +1516,39 @@ mod input_writer_tests {
     }
 
     #[test]
-    fn cursor_query_does_not_block_behind_a_stalled_input_write() {
+    fn cursor_reply_does_not_block_reader_and_retries_when_writer_is_busy() {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let writer: SharedWriter =
             Arc::new(Mutex::new(Box::new(CaptureWrites(Arc::clone(&captured)))));
+        let reader_closed = Arc::new(AtomicBool::new(false));
+        let pending = spawn_cursor_reply_worker(Arc::clone(&writer), reader_closed);
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 80, SCROLLBACK_ROWS)));
+        let scrollback_total = AtomicUsize::new(0);
+        let output_version = AtomicU64::new(0);
+        let mut dsr_carry = Vec::new();
         let guard = writer.lock().unwrap();
         let started = std::time::Instant::now();
-        answer_cursor_query(&writer, (1, 2));
+        assert!(process_reader_chunk(
+            DSR_CURSOR,
+            &mut dsr_carry,
+            &screen,
+            &scrollback_total,
+            &output_version,
+            &pending,
+        ));
         assert!(started.elapsed() < Duration::from_millis(100));
-        drop(guard);
         assert!(captured.lock().unwrap().is_empty());
+        assert!(process_reader_chunk(
+            b"x",
+            &mut dsr_carry,
+            &screen,
+            &scrollback_total,
+            &output_version,
+            &pending,
+        ));
+        assert_eq!(output_version.load(Ordering::SeqCst), 2);
+        drop(guard);
+        wait_for_captured(&captured, b"\x1b[1;1R");
     }
 
     #[test]
@@ -1484,6 +1560,8 @@ mod input_writer_tests {
         let scrollback_total = AtomicUsize::new(0);
         let output_version = AtomicU64::new(0);
         let mut dsr_carry = Vec::new();
+        let reader_closed = Arc::new(AtomicBool::new(false));
+        let pending = spawn_cursor_reply_worker(Arc::clone(&writer), reader_closed);
 
         for chunk in [b"\x1b[".as_slice(), b"6n"] {
             assert!(process_reader_chunk(
@@ -1492,10 +1570,22 @@ mod input_writer_tests {
                 &screen,
                 &scrollback_total,
                 &output_version,
-                &writer,
+                &pending,
             ));
         }
-        assert_eq!(*captured.lock().unwrap(), b"\x1b[1;1R");
+        wait_for_captured(&captured, b"\x1b[1;1R");
+    }
+
+    fn wait_for_captured(captured: &Arc<Mutex<Vec<u8>>>, expected: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let current = captured.lock().unwrap().clone();
+            if current == expected {
+                return;
+            }
+            assert!(Instant::now() < deadline, "captured reply: {current:?}");
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
