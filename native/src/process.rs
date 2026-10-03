@@ -40,6 +40,38 @@ pub const RUN_DEFAULT_TIMEOUT: f64 = 5.0;
 pub const RUN_MAX_TIMEOUT: f64 = 30.0;
 pub const RUN_TIMEOUT_EXIT_CODE: i32 = 124;
 
+/// Environment policy applied to a process child. With `clear` false, the
+/// child inherits the daemon's environment and `vars` overrides entries.
+#[derive(Clone, Default)]
+pub struct ChildEnvironment {
+    clear: bool,
+    vars: Vec<(String, String)>,
+}
+
+impl ChildEnvironment {
+    pub fn new(word: &str, clear: bool, vars: Vec<(String, String)>) -> Result<Self, String> {
+        for (name, value) in &vars {
+            if name.is_empty() {
+                return Err(format!("{word} env names must not be empty"));
+            }
+            if name.contains('=') || name.contains('\0') {
+                return Err(format!("{word} env names must not contain '=' or NUL"));
+            }
+            if value.contains('\0') {
+                return Err(format!("{word} env values must not contain NUL"));
+            }
+        }
+        Ok(Self { clear, vars })
+    }
+
+    fn apply(&self, command: &mut Command) {
+        if self.clear {
+            command.env_clear();
+        }
+        command.envs(self.vars.iter().map(|(name, value)| (name, value)));
+    }
+}
+
 /// Result from the bounded synchronous `remuda.process.run` word. Output is
 /// raw bytes (Lua strings are byte strings); each stream is capped separately.
 pub struct RunOutput {
@@ -60,6 +92,24 @@ pub fn run_sync(
     cwd: Option<PathBuf>,
     stdin_hold_until_lines: Option<usize>,
 ) -> Result<RunOutput, String> {
+    run_sync_with_env(
+        argv,
+        stdin,
+        timeout_seconds,
+        cwd,
+        stdin_hold_until_lines,
+        ChildEnvironment::default(),
+    )
+}
+
+pub fn run_sync_with_env(
+    argv: Vec<String>,
+    stdin: Option<Vec<u8>>,
+    timeout_seconds: f64,
+    cwd: Option<PathBuf>,
+    stdin_hold_until_lines: Option<usize>,
+    child_environment: ChildEnvironment,
+) -> Result<RunOutput, String> {
     validate_run(&argv, timeout_seconds)?;
     let (stdout_permit, stderr_permit) = reserve_run_reader_workers()?;
     let process_tree = ProcessTree::new().map_err(|error| error.to_string())?;
@@ -75,6 +125,7 @@ pub fn run_sync(
     if let Some(dir) = &cwd {
         command.current_dir(dir);
     }
+    child_environment.apply(&mut command);
     child_guard::harden(&mut command);
 
     #[cfg(windows)]
@@ -1129,6 +1180,25 @@ impl Processes {
         on_exit: Option<String>,
         cwd: Option<PathBuf>,
     ) -> Result<u64, String> {
+        self.spawn_with_env(
+            image,
+            argv,
+            on_line,
+            on_exit,
+            cwd,
+            ChildEnvironment::default(),
+        )
+    }
+
+    pub fn spawn_with_env(
+        &self,
+        image: Image,
+        argv: Vec<String>,
+        on_line: Option<String>,
+        on_exit: Option<String>,
+        cwd: Option<PathBuf>,
+        child_environment: ChildEnvironment,
+    ) -> Result<u64, String> {
         let (program, args) = argv
             .split_first()
             .ok_or_else(|| "a process needs a non-empty argv".to_string())?;
@@ -1141,6 +1211,7 @@ impl Processes {
         if let Some(dir) = &cwd {
             command.current_dir(dir);
         }
+        child_environment.apply(&mut command);
         // Every plain-pipe child funnels through the one seam that keeps it
         // from outliving this daemon — see child_guard.rs.
         child_guard::harden(&mut command);
