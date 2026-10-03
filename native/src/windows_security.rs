@@ -149,6 +149,48 @@ fn trusted_storage_owner(actual_sid: &str, current_user_sid: &str) -> bool {
     actual_sid == current_user_sid || matches!(actual_sid, "S-1-5-18" | "S-1-5-32-544")
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn secret_owner_matches(actual_sid: &str, current_user_sid: &str) -> bool {
+    actual_sid == current_user_sid
+}
+
+#[cfg(any(windows, test))]
+fn secret_storage_sddl(owner_sid: &str, directory: bool) -> String {
+    let inheritance = if directory { "OICI" } else { "" };
+    format!(
+        "O:{owner_sid}D:P(A;{inheritance};FA;;;OW)(A;{inheritance};FA;;;SY)(A;{inheritance};FA;;;BA)"
+    )
+}
+
+#[cfg(any(windows, test))]
+fn nt_status_error_kind(status: u32) -> std::io::ErrorKind {
+    match status {
+        0xC000_0034 | 0xC000_003A => std::io::ErrorKind::NotFound,
+        0xC000_0035 => std::io::ErrorKind::AlreadyExists,
+        0xC000_0022 | 0xC000_050B => std::io::ErrorKind::PermissionDenied,
+        0xC000_00BA | 0xC000_0103 => std::io::ErrorKind::InvalidInput,
+        _ => std::io::ErrorKind::Other,
+    }
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn secret_dacl_matches(
+    is_directory: bool,
+    protected: bool,
+    aces: &[(&str, u8, u32, u8)],
+) -> bool {
+    let expected_flags = if is_directory { 0x03 } else { 0 };
+    let mut principals = Vec::with_capacity(aces.len());
+    for (sid, flags, mask, ace_type) in aces {
+        if *flags != expected_flags || *mask != 0x001F_01FF || *ace_type != 0 {
+            return false;
+        }
+        principals.push(*sid);
+    }
+    principals.sort_unstable();
+    protected && principals == ["S-1-3-4", "S-1-5-18", "S-1-5-32-544"]
+}
+
 #[allow(dead_code)]
 pub(crate) fn local_appdata_for(env: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
     let absolute_windows_path = |name| {
@@ -186,7 +228,8 @@ mod platform {
     use super::FAIL_NEXT_STORAGE_RENAME;
     use super::{
         ace_sid_fits, build_nt_file_rename_info, inherited_child_ace_matches, nt_open_policy,
-        protected_storage_sddl, relative_component_utf16, trusted_storage_owner,
+        nt_status_error_kind, protected_storage_sddl, relative_component_utf16,
+        secret_dacl_matches, secret_owner_matches, secret_storage_sddl, trusted_storage_owner,
         FILE_RENAME_INFORMATION_EX_CLASS,
     };
     use std::ffi::{c_void, OsStr};
@@ -252,6 +295,7 @@ mod platform {
     pub(crate) struct StorageDirectory {
         file: std::fs::File,
         names_lock: Mutex<()>,
+        secret: bool,
     }
 
     impl StorageDirectory {
@@ -261,6 +305,15 @@ mod platform {
         }
 
         pub(crate) fn open_directory(&self, name: &str, create: bool) -> io::Result<Self> {
+            self.open_directory_policy(name, create, self.secret)
+        }
+
+        pub(crate) fn open_directory_policy(
+            &self,
+            name: &str,
+            create: bool,
+            secret: bool,
+        ) -> io::Result<Self> {
             if create
                 && self
                     .names()?
@@ -269,15 +322,44 @@ mod platform {
             {
                 return Err(io::Error::from(io::ErrorKind::AlreadyExists));
             }
-            let file = open_relative(&self.file, name, true, create, 0x0012_0087)?;
-            verify_inherited_acl(&file, "storage child directory", true)?;
+            let security = if secret {
+                Some(
+                    secret_descriptor(&UserSid::current()?.text, true)
+                        .map_err(|_| policy_error("secret owner/DACL setup failed"))?,
+                )
+            } else {
+                None
+            };
+            let file = open_relative_with_security(
+                &self.file,
+                name,
+                true,
+                create,
+                0x0012_0087,
+                security
+                    .as_ref()
+                    .map_or(ptr::null_mut(), |descriptor| descriptor.0),
+            )
+            .map_err(|error| {
+                if secret && error.kind() == io::ErrorKind::PermissionDenied {
+                    policy_error("secret owner assignment failed")
+                } else {
+                    error
+                }
+            })?;
+            if secret {
+                verify_secret_security(&file, true)?;
+            } else {
+                verify_inherited_acl(&file, "storage child directory", true)?;
+            }
             Ok(Self {
                 file,
                 names_lock: Mutex::new(()),
+                secret,
             })
         }
 
-        pub(crate) fn open_file(&self, name: &str, write: bool) -> io::Result<std::fs::File> {
+        fn open_file_policy(&self, name: &str, write: bool) -> io::Result<std::fs::File> {
             let file = open_relative(
                 &self.file,
                 name,
@@ -285,20 +367,53 @@ mod platform {
                 write,
                 if write { 0x0012_0082 } else { 0x0012_0081 },
             )?;
-            verify_inherited_acl(&file, "storage child file", false)?;
+            if self.secret {
+                verify_secret_security(&file, false)?;
+            } else {
+                verify_inherited_acl(&file, "storage child file", false)?;
+            }
             Ok(file)
         }
 
+        pub(crate) fn open_file(&self, name: &str, write: bool) -> io::Result<std::fs::File> {
+            self.open_file_policy(name, write)
+        }
+
         pub(crate) fn write_atomic(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
-            match self.open_file(name, false) {
+            self.write_atomic_policy(name, bytes)
+        }
+
+        fn write_atomic_policy(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+            let secret = self.secret;
+            let existing = if secret {
+                self.open_file_policy(name, false)
+            } else {
+                self.open_file(name, false)
+            };
+            match existing {
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
+            let security = if secret {
+                Some(
+                    secret_descriptor(&UserSid::current()?.text, false)
+                        .map_err(|_| policy_error("secret owner/DACL setup failed"))?,
+                )
+            } else {
+                None
+            };
+            let security_descriptor = security
+                .as_ref()
+                .map_or(ptr::null_mut(), |descriptor| descriptor.0);
             let mut temporary = None;
             for _ in 0..8 {
-                let name = random_temporary_name()?;
-                match create_relative_file(&self.file, &name) {
+                let temporary_name = random_temporary_name()?;
+                match create_relative_file_with_security(
+                    &self.file,
+                    &temporary_name,
+                    security_descriptor,
+                ) {
                     Ok(file) => {
                         temporary = Some(TempFileGuard {
                             file,
@@ -307,17 +422,24 @@ mod platform {
                         break;
                     }
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) if secret && error.kind() == io::ErrorKind::PermissionDenied => {
+                        return Err(policy_error("secret owner assignment failed"))
+                    }
                     Err(error) => return Err(error),
                 }
             }
             let mut temporary =
                 temporary.ok_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists))?;
-            verify_inherited_acl(&temporary.file, "storage temporary file", false)?;
+            if secret {
+                verify_secret_security(&temporary.file, false)?;
+            } else {
+                verify_inherited_acl(&temporary.file, "storage temporary file", false)?;
+            }
             temporary.file.write_all(bytes)?;
             temporary.file.sync_all()?;
 
             #[cfg(test)]
-            if FAIL_NEXT_STORAGE_RENAME.with(|fail| fail.replace(false)) {
+            if !secret && FAIL_NEXT_STORAGE_RENAME.with(|fail| fail.replace(false)) {
                 return Err(io::Error::from(io::ErrorKind::PermissionDenied));
             }
 
@@ -342,18 +464,26 @@ mod platform {
                 return Err(nt_error(status));
             }
             temporary.delete_on_drop = false;
+            if secret {
+                self.open_file_policy(name, false)?;
+            }
             Ok(())
         }
 
         pub(crate) fn delete_file(&self, name: &str) -> io::Result<bool> {
+            let secret = self.secret;
             let file = match open_relative(&self.file, name, false, false, 0x0013_0080) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error),
             };
-            verify_inherited_acl(&file, "storage child file", false)?;
+            if secret {
+                verify_secret_security(&file, false)?;
+            } else {
+                verify_inherited_acl(&file, "storage child file", false)?;
+            }
             let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
-            // SAFETY: file is a no-follow regular-file handle with DELETE access.
+            // SAFETY: file is a no-follow regular file opened with DELETE access.
             if unsafe {
                 SetFileInformationByHandle(
                     file.as_raw_handle(),
@@ -499,7 +629,11 @@ mod platform {
         Ok(name)
     }
 
-    fn create_relative_file(parent: &std::fs::File, component: &str) -> io::Result<std::fs::File> {
+    fn create_relative_file_with_security(
+        parent: &std::fs::File,
+        component: &str,
+        security_descriptor: *mut c_void,
+    ) -> io::Result<std::fs::File> {
         let name = relative_component_utf16(component)
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
         let length = ((name.len() - 1) * std::mem::size_of::<u16>()) as u16;
@@ -514,7 +648,7 @@ mod platform {
             RootDirectory: parent.as_raw_handle(),
             ObjectName: &mut unicode,
             Attributes: policy.object_attributes,
-            SecurityDescriptor: ptr::null_mut(),
+            SecurityDescriptor: security_descriptor.cast(),
             SecurityQualityOfService: ptr::null_mut(),
         };
         // SAFETY: A zeroed IO_STATUS_BLOCK is the required initialized output structure.
@@ -557,12 +691,11 @@ mod platform {
     }
 
     fn nt_error(status: i32) -> io::Error {
-        match status as u32 {
-            0xC000_0034 | 0xC000_003A => io::Error::from(io::ErrorKind::NotFound),
-            0xC000_0035 => io::Error::from(io::ErrorKind::AlreadyExists),
-            0xC000_050B => io::Error::from(io::ErrorKind::PermissionDenied),
-            0xC000_00BA | 0xC000_0103 => io::Error::from(io::ErrorKind::InvalidInput),
-            _ => io::Error::other("storage I/O failed"),
+        let kind = nt_status_error_kind(status as u32);
+        if kind == io::ErrorKind::Other {
+            io::Error::other("storage I/O failed")
+        } else {
+            io::Error::new(kind, "storage I/O failed")
         }
     }
 
@@ -572,6 +705,24 @@ mod platform {
         directory: bool,
         create: bool,
         access: u32,
+    ) -> io::Result<std::fs::File> {
+        open_relative_with_security(
+            parent,
+            component,
+            directory,
+            create,
+            access,
+            ptr::null_mut(),
+        )
+    }
+
+    fn open_relative_with_security(
+        parent: &std::fs::File,
+        component: &str,
+        directory: bool,
+        create: bool,
+        access: u32,
+        security_descriptor: *mut c_void,
     ) -> io::Result<std::fs::File> {
         let name = relative_component_utf16(component)
             .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
@@ -589,7 +740,7 @@ mod platform {
             // NTFS lookup is case-insensitive by default; create-time folded checks keep
             // this API consistent while preserving the backing filesystem's lookup mode.
             Attributes: policy.object_attributes,
-            SecurityDescriptor: ptr::null_mut(),
+            SecurityDescriptor: security_descriptor.cast(),
             SecurityQualityOfService: ptr::null_mut(),
         };
         // SAFETY: The initialized object/name/status structures outlive the synchronous NT call.
@@ -668,6 +819,19 @@ mod platform {
         subject: &str,
         is_directory: bool,
     ) -> io::Result<()> {
+        verify_storage_acl(file, subject, is_directory, false)
+    }
+
+    fn verify_secret_security(file: &std::fs::File, is_directory: bool) -> io::Result<()> {
+        verify_storage_acl(file, "secret storage", is_directory, true)
+    }
+
+    fn verify_storage_acl(
+        file: &std::fs::File,
+        subject: &str,
+        is_directory: bool,
+        secret: bool,
+    ) -> io::Result<()> {
         let mut owner = ptr::null_mut();
         let mut dacl = ptr::null_mut();
         let mut raw_descriptor = ptr::null_mut();
@@ -695,8 +859,14 @@ mod platform {
         if owner.is_null() {
             return Err(policy_error(&format!("{subject} owner is missing")));
         }
-        // Elevated setup can create children as Administrators or SYSTEM; trust those SIDs only.
-        if !trusted_storage_owner(&sid_text(owner)?, &user.text) {
+        let owner_sid = sid_text(owner)?;
+        let trusted_owner = if secret {
+            secret_owner_matches(&owner_sid, &user.text)
+        } else {
+            // Elevated setup can create children as Administrators or SYSTEM; trust those SIDs only.
+            trusted_storage_owner(&owner_sid, &user.text)
+        };
+        if !trusted_owner {
             return Err(policy_error(&format!("{subject} owner is untrusted")));
         }
         let mut control = 0;
@@ -707,7 +877,7 @@ mod platform {
         {
             return Err(last_error());
         }
-        if control & SE_DACL_PROTECTED != 0 {
+        if (control & SE_DACL_PROTECTED != 0) != secret {
             return Err(policy_error(&format!("{subject} DACL is protected")));
         }
         let mut present = 0;
@@ -745,6 +915,7 @@ mod platform {
             return Err(policy_error(&format!("{subject} ACE count mismatch")));
         }
         let mut principals = Vec::with_capacity(3);
+        let mut secret_aces = Vec::with_capacity(3);
         for index in 0..info.AceCount {
             let mut raw_ace = ptr::null_mut();
             // SAFETY: actual_dacl is valid and raw_ace is a writable output pointer.
@@ -764,7 +935,7 @@ mod platform {
             }
             // SAFETY: AceSize covers the ACCESS_ALLOWED_ACE prefix checked above.
             let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
-            if !inherited_child_ace_matches(is_directory, header.AceFlags, ace.Mask) {
+            if !secret && !inherited_child_ace_matches(is_directory, header.AceFlags, ace.Mask) {
                 return Err(policy_error(&format!(
                     "{subject} ACE flags or mask mismatch"
                 )));
@@ -780,7 +951,19 @@ mod platform {
             if !ace_sid_fits(header.AceSize as usize, fixed_size, sid_size) {
                 return Err(policy_error(&format!("{subject} ACE SID is truncated")));
             }
-            principals.push(sid_text(sid)?);
+            let principal = sid_text(sid)?;
+            principals.push(principal.clone());
+            secret_aces.push((principal, header.AceFlags, ace.Mask, header.AceType));
+        }
+        if secret {
+            let borrowed = secret_aces
+                .iter()
+                .map(|(sid, flags, mask, ace_type)| (sid.as_str(), *flags, *mask, *ace_type))
+                .collect::<Vec<_>>();
+            if !secret_dacl_matches(is_directory, true, &borrowed) {
+                return Err(policy_error(&format!("{subject} DACL policy mismatch")));
+            }
+            return Ok(());
         }
         principals.sort();
         let mut expected = vec![
@@ -900,6 +1083,28 @@ mod platform {
             ));
         }
         Ok(descriptor)
+    }
+
+    fn secret_descriptor(owner_sid: &str, directory: bool) -> io::Result<LocalMemory> {
+        let sddl = secret_storage_sddl(owner_sid, directory);
+        let encoded: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
+        let mut descriptor = ptr::null_mut();
+        // SAFETY: encoded is NUL-terminated and descriptor is a valid output pointer.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                encoded.as_ptr(),
+                1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(policy_error("secret owner/DACL setup failed"));
+        }
+        if descriptor.is_null() {
+            return Err(policy_error("secret owner/DACL setup failed"));
+        }
+        Ok(LocalMemory(descriptor.cast()))
     }
 
     pub(crate) fn ensure_storage_root(path: &Path) -> io::Result<StorageDirectory> {
@@ -1107,6 +1312,7 @@ mod platform {
         Ok(StorageDirectory {
             file,
             names_lock: Mutex::new(()),
+            secret: false,
         })
     }
 
@@ -1228,6 +1434,71 @@ mod tests {
             );
         }
         assert!(!trusted_storage_owner("S-1-5-21-99", current));
+    }
+
+    #[test]
+    fn secret_policy_requires_exact_current_owner_and_protected_aces() {
+        const ALL: u32 = 0x001F_01FF;
+        let file_aces = [
+            ("S-1-3-4", 0, ALL, 0),
+            ("S-1-5-18", 0, ALL, 0),
+            ("S-1-5-32-544", 0, ALL, 0),
+        ];
+        let directory_aces = [
+            ("S-1-3-4", 0x03, ALL, 0),
+            ("S-1-5-18", 0x03, ALL, 0),
+            ("S-1-5-32-544", 0x03, ALL, 0),
+        ];
+        let current = "S-1-5-21-42";
+
+        assert!(secret_owner_matches(current, current));
+        for near_miss in ["S-1-5-32-5440", "S-1-5-18x", "s-1-5-18"] {
+            assert!(!secret_owner_matches(near_miss, current), "{near_miss}");
+        }
+        assert!(secret_dacl_matches(false, true, &file_aces));
+        assert!(secret_dacl_matches(true, true, &directory_aces));
+        assert!(!secret_dacl_matches(false, false, &file_aces));
+        assert!(!secret_dacl_matches(true, true, &file_aces));
+        assert!(!secret_dacl_matches(false, true, &directory_aces));
+
+        let widened = [file_aces[0], file_aces[1], ("S-1-1-0", 0, ALL, 0)];
+        assert!(!secret_dacl_matches(false, true, &widened));
+        let extra = [
+            file_aces[0],
+            file_aces[1],
+            file_aces[2],
+            ("S-1-1-0", 0, ALL, 0),
+        ];
+        assert!(!secret_dacl_matches(false, true, &extra));
+        let wrong_mask = [
+            file_aces[0],
+            file_aces[1],
+            ("S-1-5-32-544", 0, 0x001F_01FE, 0),
+        ];
+        assert!(!secret_dacl_matches(false, true, &wrong_mask));
+        let deny_ace = [file_aces[0], file_aces[1], ("S-1-5-32-544", 0, ALL, 1)];
+        assert!(!secret_dacl_matches(false, true, &deny_ace));
+    }
+
+    #[test]
+    fn secret_sddl_protects_exact_file_and_directory_aces() {
+        let owner = "S-1-5-21-42";
+        assert_eq!(
+            secret_storage_sddl(owner, false),
+            "O:S-1-5-21-42D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
+        );
+        assert_eq!(
+            secret_storage_sddl(owner, true),
+            "O:S-1-5-21-42D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+        );
+    }
+
+    #[test]
+    fn access_denied_ntstatus_maps_to_permission_denied() {
+        assert_eq!(
+            nt_status_error_kind(0xC000_0022),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]

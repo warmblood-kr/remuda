@@ -836,25 +836,45 @@ fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
         return Err("REMUDA_STORAGE_ROOT must be an absolute path".into());
     }
     #[cfg(windows)]
-    return [Kind::Config, Kind::Data, Kind::State, Kind::Cache]
-        .into_iter()
-        .map(|kind| {
-            let root = match &override_root {
-                Some(root) => root.join(kind.as_str()),
-                None => resolve_dir_for(kind.as_str(), true, env)?,
-            };
-            let storage_path = root.join("storage");
-            let directory = crate::windows_security::ensure_storage_root(&storage_path)
-                .map_err(|_| "unavailable: storage root security check failed".to_owned())?;
-            Ok((
-                kind.as_str(),
-                WindowsFileRoot {
-                    path: storage_path,
-                    directory,
-                },
-            ))
-        })
-        .collect();
+    {
+        let mut roots: FileRoots = [Kind::Config, Kind::Data, Kind::State, Kind::Cache]
+            .into_iter()
+            .map(|kind| {
+                let root = match &override_root {
+                    Some(root) => root.join(kind.as_str()),
+                    None => resolve_dir_for(kind.as_str(), true, env)?,
+                };
+                let storage_path = root.join("storage");
+                let directory = crate::windows_security::ensure_storage_root(&storage_path)
+                    .map_err(|_| "unavailable: storage root security check failed".to_owned())?;
+                Ok((
+                    kind.as_str(),
+                    WindowsFileRoot {
+                        path: storage_path,
+                        directory,
+                    },
+                ))
+            })
+            .collect::<Result<_, String>>()?;
+        let secret_path = match &override_root {
+            Some(root) => root.join("secret").join("storage"),
+            None => crate::windows_security::local_appdata_for(env)
+                .map_err(|_| "unavailable: storage root could not be resolved".to_owned())?
+                .join("remuda")
+                .join("secret")
+                .join("storage"),
+        };
+        let directory = crate::windows_security::ensure_storage_root(&secret_path)
+            .map_err(|_| "unavailable: storage root security check failed".to_owned())?;
+        roots.insert(
+            "secret",
+            WindowsFileRoot {
+                path: secret_path,
+                directory,
+            },
+        );
+        return Ok(roots);
+    }
     #[cfg(not(windows))]
     [Kind::Config, Kind::Data, Kind::State, Kind::Cache]
         .into_iter()
@@ -980,7 +1000,7 @@ struct KindHandle {
 
 impl KindHandle {
     fn file_path(&self, name: &str, create: bool) -> io::Result<FileLocation> {
-        if matches!(self.kind, HandleKind::Secret) {
+        if matches!(self.kind, HandleKind::Secret) && !cfg!(windows) {
             return Err(io_denied());
         }
         let root = self
@@ -1009,7 +1029,10 @@ impl KindHandle {
         }
         #[cfg(windows)]
         {
-            let mut directory = root.directory.open_directory(&self.namespace, create)?;
+            let secret = matches!(self.kind, HandleKind::Secret);
+            let mut directory =
+                root.directory
+                    .open_directory_policy(&self.namespace, create, secret)?;
             let mut parts = if name.is_empty() {
                 Vec::new()
             } else {
@@ -1060,7 +1083,7 @@ impl KindHandle {
     ) -> mlua::Result<(Option<mlua::LuaString>, Option<String>)> {
         let key = self.key(name)?;
         if self.roots.is_some() {
-            if matches!(self.kind, HandleKind::Secret) {
+            if matches!(self.kind, HandleKind::Secret) && !cfg!(windows) {
                 return Ok((
                     None,
                     Some("unavailable: file secrets require a dedicated protected root".into()),
@@ -1078,10 +1101,18 @@ impl KindHandle {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     Ok((None, Some("not_found".into())))
                 }
-                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok((
-                    None,
-                    Some("denied: storage path is not a regular file".into()),
-                )),
+                Err(error)
+                    if error.kind() == io::ErrorKind::PermissionDenied
+                        && !matches!(self.kind, HandleKind::Secret) =>
+                {
+                    Ok((
+                        None,
+                        Some("denied: storage path is not a regular file".into()),
+                    ))
+                }
+                Err(error) if matches!(self.kind, HandleKind::Secret) => {
+                    Ok((None, Some(storage_io_error(error))))
+                }
                 Err(_) => Ok((None, Some("unavailable: storage read failed".into()))),
             };
         }
@@ -1103,7 +1134,7 @@ impl KindHandle {
         }
         let key = self.key(name)?;
         if self.roots.is_some() {
-            if matches!(self.kind, HandleKind::Secret) {
+            if matches!(self.kind, HandleKind::Secret) && !cfg!(windows) {
                 return Err(mlua::Error::runtime(
                     "unavailable: file secrets require a dedicated protected root",
                 ));
@@ -1157,7 +1188,7 @@ impl KindHandle {
     fn exists(&self, name: String) -> mlua::Result<bool> {
         let key = self.key(name)?;
         if self.roots.is_some() {
-            if matches!(self.kind, HandleKind::Secret) {
+            if matches!(self.kind, HandleKind::Secret) && !cfg!(windows) {
                 return Ok(false);
             }
             let location = match self.file_path(&key.2, false) {
@@ -1178,7 +1209,7 @@ impl KindHandle {
     fn delete(&self, name: String) -> mlua::Result<(Option<bool>, Option<String>)> {
         let key = self.key(name)?;
         if self.roots.is_some() {
-            if matches!(self.kind, HandleKind::Secret) {
+            if matches!(self.kind, HandleKind::Secret) && !cfg!(windows) {
                 return Ok((
                     None,
                     Some("unavailable: file secrets require a dedicated protected root".into()),
@@ -1280,8 +1311,8 @@ impl UserData for SecretHandle {
                         "remuda.storage.secret.put secret must be 1..=2048 bytes",
                     ));
                 }
-                // File secrets stay unavailable until Windows has a dedicated protected root.
-                if this.0.roots.is_some() {
+                // Non-Windows file secrets stay unavailable until a protected backend exists.
+                if this.0.roots.is_some() && !cfg!(windows) {
                     return Ok((
                         None,
                         Some(
@@ -1731,6 +1762,7 @@ mod tests {
         DIRECTORY_ENUMERATIONS.with(|count| assert_eq!(count.get(), 1));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn xdg_secret_operations_stay_unavailable_without_creating_files() {
         let root = TestRoot::new();
@@ -1752,6 +1784,51 @@ mod tests {
         assert!(!contains_regular_file(&root.0).unwrap());
         #[cfg(unix)]
         assert!(fs::read_dir(&root.0).unwrap().next().is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_secrets_support_put_get_exists_and_delete() {
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        lua.load(
+            r#"
+            local storage = remuda.storage
+            local secret = storage.get("d3-secrets"):secret()
+            assert(storage.path("secret", "token") == nil)
+            assert(secret:exists("token") == false)
+            assert(secret:put("token", "secret-bytes") == true)
+            assert(secret:exists("token") == true)
+            local value, reason = secret:get("token")
+            assert(value == "secret-bytes" and reason == nil)
+            assert(secret:delete("token") == true)
+            assert(secret:exists("token") == false)
+            assert(not pcall(function() secret:list() end))
+            "#,
+        )
+        .exec()
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_secret_policy_refuses_wrong_owner_and_widened_acl() {
+        const ALL: u32 = 0x001F_01FF;
+        let current = "S-1-5-21-42";
+        let widened = [
+            ("S-1-3-4", 0, ALL, 0),
+            ("S-1-5-18", 0, ALL, 0),
+            ("S-1-5-32-544", 0, ALL, 0),
+            ("S-1-1-0", 0, ALL, 0),
+        ];
+        assert!(!crate::windows_security::secret_owner_matches(
+            "S-1-5-32-544",
+            current
+        ));
+        assert!(!crate::windows_security::secret_dacl_matches(
+            false, true, &widened
+        ));
     }
 
     #[cfg(windows)]
