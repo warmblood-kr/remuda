@@ -1374,6 +1374,7 @@ fn input_line_empty_uses_styled_prompt_snapshots_and_returns_unknown_safely() {
         local footer_draft, footer_reason = answer({ kind = "codex" })
         assert(footer_draft == nil and footer_reason:find("visible text", 1, true))
         current = screen({ row("> "), row("gpt 5 · 40%") })
+        -- known limit, see docs: rows below the cursor do not affect the result.
         assert(answer() == true)
         assert(answer({ kind = "codex" }) == true)
         assert(answer({ kind = "shell" }) == true)
@@ -1412,6 +1413,7 @@ fn input_line_empty_uses_styled_prompt_snapshots_and_returns_unknown_safely() {
         local word = remuda._registry.input_line_empty
         assert(word and word.signature == "input_line_empty(session, opts?) -> true | nil, reason")
         assert(word.about:find("opts.kind", 1, true) and word.about:find("contiguous composer block", 1, true))
+        assert(word.about:find("true means only that the cursor row matches the empty-prompt shape; callers must add per-kind checks", 1, true))
         assert(word.about:find("'? for shortcuts' for every kind", 1, true))
         assert(word.about:find("Unlike Butler's helper", 1, true))
         assert(word.about:find("continuation prompt after a blank row", 1, true))
@@ -1447,9 +1449,36 @@ fn input_line_empty_rejects_draft_content_above_the_cursor() {
         local after_glyph = screen({ row("❯ ") }, 1)
         after_glyph.cursor.col = 2 -- the valid position before its optional space
         expect_empty(after_glyph, "shell")
+        local plain_col_four = screen({ row("❯ ") }, 1)
+        plain_col_four.cursor.col = 4
+        expect_unknown(plain_col_four, "shell")
         local wrong_col = screen({ row("❯ ") }, 1)
         wrong_col.cursor.col = 1
         expect_unknown(wrong_col, "shell")
+
+        local framed_col_four = screen({ row("│ ❯ │") }, 1)
+        framed_col_four.cursor.col = 4
+        expect_empty(framed_col_four, "claude")
+        local framed_col_six = screen({ row("│ ❯ │") }, 1)
+        framed_col_six.cursor.col = 6
+        expect_unknown(framed_col_six, "claude")
+
+        -- Column math uses text after dim spans are discarded, so an earlier
+        -- dim prefix shifts the physical cursor beyond the accepted prompt columns.
+        local dim_prefix = { rows = {{
+          { text = "ghost ", dim = true }, { text = "❯ ", dim = false }
+        }}, cursor = { row = 1, col = 9, visible = true } }
+        expect_unknown(dim_prefix, "shell")
+        -- Tabs are not stripped as prompt indentation; only ASCII spaces are.
+        expect_unknown(screen({ row("\t❯ ") }, 1), "shell")
+        -- A CJK glyph is not treated as whitespace before a supported prompt.
+        expect_unknown(screen({ row("界❯ ") }, 1), "shell")
+        -- NBSP is folded to one ASCII space before prompt and column checks.
+        local nbsp_prefix = screen({ row(" ❯ ") }, 1)
+        nbsp_prefix.cursor.col = 4
+        expect_empty(nbsp_prefix, "shell")
+        -- Frame recognition requires │ in the first screen column.
+        expect_unknown(screen({ row("  │ ❯ ") }, 1), "claude")
 
         current = screen({ row("│ transcript"), row("╭ unrelated history"), row("❯ ") }, 3)
         local generic, generic_reason = remuda.input_line_empty("fixture")
@@ -1460,7 +1489,7 @@ fn input_line_empty_rejects_draft_content_above_the_cursor() {
           row("history"), row(""), row("╭──────╮"), row("│ ❯  │"), row("╰──────╯"), row("? for shortcuts")
         }, 4), "claude")
         expect_empty(screen({ row("transcript line"), row(""), row("> Ask Codex to do anything"), row("gpt 5 · 40%") }, 3), "codex")
-        -- Known limit: a blank row inside a composer block hides prior draft text,
+        -- known limit, see docs: a blank row inside a composer block hides prior draft text,
         -- so a later continuation prompt can still be reported as empty.
         expect_empty(screen({ row("text"), row(""), row("> ") }, 3), "codex")
 

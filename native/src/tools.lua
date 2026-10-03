@@ -1987,8 +1987,12 @@ local function input_line_row_text(row, ignore_dim)
   return table.concat(parts)
 end
 
--- The conservative allow-list: only a known, visibly empty prompt on the
--- cursor row with no draft rows in its contiguous composer block can prove it.
+-- true means only that the cursor row matches the empty-prompt shape; callers
+-- must add per-kind checks. Require a visible cursor and no draft rows in its
+-- contiguous composer block. Dim spans are dropped before cursor-column math,
+-- and Claude frame bars must start in column one (indented frames return nil).
+-- A continuation prompt after a blank row can still read as empty; rows below
+-- the cursor are not checked, and the Codex placeholder is empty regardless.
 local function input_line_empty_from_snapshot(kind, screen)
   if kind ~= nil and kind ~= "shell" and kind ~= "claude" and kind ~= "codex" then
     return nil, "opts.kind must be shell, claude, or codex"
@@ -2094,7 +2098,7 @@ end
 
 register(
   "input_line_empty",
-  "Return true only when the cursor is immediately after a recognized prompt glyph (or one optional space) on the visible cursor row and its contiguous composer block above contains no non-blank rows; a blank row ends the block, and a Claude top frame border ends its frame. Other ambiguous screens return nil and a reason. Dim ghost text on the cursor row is ignored; visible paste placeholders count as content. The exact Codex placeholder counts as empty for codex or generic mode. Pass opts.kind = 'shell', 'claude', or 'codex' for that policy; kind is optional, but agent-specific layouts can be ambiguous without it. Limit: a continuation prompt after a blank row inside the composer can still read as empty; rows below the cursor are not inspected (including '? for shortcuts' for every kind), and the Codex placeholder counts as empty regardless of rows below. Use stricter agent-specific recognizers in Butler Lua per kind. Unlike Butler's helper, this word requires a visible cursor, rejects unknown kinds, and recognizes only the built-in Codex placeholder.",
+  "true means only that the cursor row matches the empty-prompt shape; callers must add per-kind checks. Return true only when the cursor is immediately after a recognized prompt glyph (or one optional space) and its contiguous composer block above contains no non-blank rows; a blank row ends the block, and a Claude top frame border ends its frame. Other ambiguous screens return nil and a reason. Dim ghost spans are dropped before cursor-column math; dim ghost text is ignored, and visible paste placeholders count as content. Claude frame bars must start in column one; an indented frame returns nil. The exact Codex placeholder counts as empty for codex or generic mode. Pass opts.kind = 'shell', 'claude', or 'codex' for that policy; kind is optional, but agent-specific layouts can be ambiguous without it. Limit: a continuation prompt after a blank row inside the composer can still read as empty; rows below the cursor are not inspected (including '? for shortcuts' for every kind), and the Codex placeholder counts as empty regardless of rows below. Use stricter agent-specific recognizers in Butler Lua per kind. Unlike Butler's helper, this word requires a visible cursor, rejects unknown kinds, and recognizes only the built-in Codex placeholder.",
   "input_line_empty(session, opts?) -> true | nil, reason"
 )
 
