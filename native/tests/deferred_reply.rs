@@ -3,7 +3,7 @@
 use std::fs;
 use std::process::{Command, Output};
 
-#[path = "autostart_daemon_guard.rs"]
+#[path = "daemon_support/autostart_guard.rs"]
 mod autostart_daemon_guard;
 use autostart_daemon_guard::AutostartDaemonGuard;
 

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[path = "autostart_daemon_guard.rs"]
+#[path = "daemon_support/autostart_guard.rs"]
 mod autostart_daemon_guard;
 use autostart_daemon_guard::AutostartDaemonGuard;
 
