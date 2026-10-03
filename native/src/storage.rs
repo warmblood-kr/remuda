@@ -1849,16 +1849,20 @@ mod tests {
             0,
             "query worker token groups"
         );
-        let groups = unsafe { &*(buffer.as_ptr().cast::<TOKEN_GROUPS>()) };
-        let entries = unsafe {
-            std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
-        };
+        let groups = buffer.as_ptr().cast::<TOKEN_GROUPS>();
+        let group_count = unsafe { std::ptr::addr_of!((*groups).GroupCount).read() as usize };
+        let group_entries =
+            unsafe { std::ptr::addr_of!((*groups).Groups).cast::<SID_AND_ATTRIBUTES>() };
+        let entries = unsafe { std::slice::from_raw_parts(group_entries, group_count) };
         assert!(
-            entries
-                .iter()
-                .any(|SID_AND_ATTRIBUTES { Sid, Attributes }| {
-                    (unsafe { EqualSid(*Sid, admin_sid) }) != 0 && *Attributes & 0x0000_0010 != 0
-                }),
+            entries.iter().any(
+                |SID_AND_ATTRIBUTES {
+                     Sid: sid,
+                     Attributes: attributes,
+                 }| {
+                    (unsafe { EqualSid(*sid, admin_sid) }) != 0 && *attributes & 0x0000_0010 != 0
+                }
+            ),
             "Administrators SID must be deny-only"
         );
     }
@@ -1946,11 +1950,34 @@ mod tests {
             let guest_sid = guests.as_ptr().cast_mut().cast();
             // This retains the current TokenUser; it is a restricted-token negative case,
             // not a different-user test. Guests is absent from the secret DACL.
-            let token = restricted_admin_token(admin_sid, Some(guest_sid));
+            {
+                let token = restricted_admin_token(admin_sid, Some(guest_sid));
+                assert_ne!(
+                    unsafe { ImpersonateLoggedOnUser(token.0) },
+                    0,
+                    "impersonate token with unmatched restricting SID"
+                );
+                let _revert = RevertImpersonation;
+                assert_worker_admin_is_deny_only(admin_sid);
+                // This denial does not distinguish the namespace-directory ACL from the file ACL.
+                reader
+                    .load(
+                        r#"
+                        local secret = remuda.storage.get("restricted-negative"):secret()
+                        local value, reason = secret:get("token")
+                        assert(value == nil and reason and reason:match("^denied:"),
+                            "unmatched restricting SID must deny read")
+                        "#,
+                    )
+                    .exec()
+                    .unwrap();
+            }
+
+            let control_token = restricted_admin_token(admin_sid, Some(admin_sid));
             assert_ne!(
-                unsafe { ImpersonateLoggedOnUser(token.0) },
+                unsafe { ImpersonateLoggedOnUser(control_token.0) },
                 0,
-                "impersonate token with unmatched restricting SID"
+                "impersonate token with Administrators restricting SID"
             );
             let _revert = RevertImpersonation;
             assert_worker_admin_is_deny_only(admin_sid);
@@ -1959,8 +1986,7 @@ mod tests {
                     r#"
                     local secret = remuda.storage.get("restricted-negative"):secret()
                     local value, reason = secret:get("token")
-                    assert(value == nil and reason and reason:match("^denied:"),
-                        "restricted SID absent from DACL must deny read")
+                    assert(value == "elevated secret", "Administrators restricting SID should allow get: " .. tostring(reason))
                     "#,
                 )
                 .exec()
