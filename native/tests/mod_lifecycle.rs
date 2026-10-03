@@ -608,6 +608,193 @@ fn mod_command_handler_receives_caller_env() {
     );
 }
 
+#[test]
+fn mod_command_loads_commands_without_start_then_bare_exec_starts_once() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return { starts = 0, commands = 0 } end,
+          commands = function(state)
+            state.commands = state.commands + 1
+            remuda.extension_command("sample-cmd", function()
+              return state.commands .. ":" .. state.starts
+            end)
+          end,
+          start = function(state)
+            assert(state.commands == 1, "commands must run before start")
+            state.starts = state.starts + 1
+          end,
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-commands-only.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+
+    assert_eq!(
+        read_value(
+            &image,
+            "return tostring(remuda._load_extension_command('sample-cmd', 'sample'))",
+        ),
+        "true"
+    );
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "1:0"
+    );
+
+    read_value(&image, "remuda.exec('sample')");
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "1:1"
+    );
+    read_value(&image, "remuda.exec('sample')");
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "1:1"
+    );
+}
+
+#[test]
+fn legacy_start_only_mod_still_starts_when_command_is_loaded() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return { starts = 0 } end,
+          start = function(state)
+            state.starts = state.starts + 1
+            remuda.extension_command("sample-cmd", function() return tostring(state.starts) end)
+          end,
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-legacy-command.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+
+    assert_eq!(
+        read_value(
+            &image,
+            "return tostring(remuda._load_extension_command('sample-cmd', 'sample'))",
+        ),
+        "true"
+    );
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "1"
+    );
+}
+
+#[test]
+fn command_hook_reload_replaces_handler_and_failed_reload_restores_it() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    let entry = home.entry();
+    let source = |version: &str, fails: bool| {
+        format!(
+            r#"return {{
+              api = "remuda-module-v1", state_version = 1,
+              initialize = function() return {{}} end,
+              commands = function()
+                remuda.extension_command("sample-cmd", function() return "{version}" end)
+                {failure}
+              end,
+            }}"#,
+            failure = if fails {
+                "error('commands failed')"
+            } else {
+                ""
+            }
+        )
+    };
+    write_entry(&entry, &source("v1", false));
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-commands-reload.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(
+        &image,
+        "remuda._load_extension_command('sample-cmd', 'sample')",
+    );
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "v1"
+    );
+
+    write_entry(&entry, &source("v2", false));
+    read_value(&image, "remuda.reload('sample')");
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "v2"
+    );
+    assert_eq!(
+        read_value(&image, "local n = 0 for _ in pairs(remuda._extension_commands) do n = n + 1 end return tostring(n)"),
+        "1"
+    );
+
+    write_entry(&entry, &source("v3", true));
+    assert!(image.eval("remuda.reload('sample')", None).is_err());
+    assert_eq!(
+        read_value(
+            &image,
+            "return remuda._dispatch_extension_command('sample-cmd')"
+        ),
+        "v2"
+    );
+    assert_eq!(
+        read_value(&image, "local n = 0 for _ in pairs(remuda._extension_commands) do n = n + 1 end return tostring(n)"),
+        "1"
+    );
+}
+
 // #116: a reload must leave the image in the shape of one activation, and
 // `exec` on an already-active mod (a no-args mod command) must not restart it.
 #[test]

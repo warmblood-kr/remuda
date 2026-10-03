@@ -254,9 +254,18 @@ mod's own no-argument command) on an already-active mod does nothing, so
 opening a mod's screen does not restart it. The mod owns its declared hooks,
 tools and schedules, and also every `remuda.on` hook and
 `remuda.extension_command` registered while its own code runs (`initialize`,
-`start`, or one of its declared hooks, tools or schedules). `hook_list` shows
-that `owner`. A mod may also create new top-level `remuda.*` fields (for
-example `function remuda._sample_notify(...) end` in `start`); they are its own.
+`commands`, `start`, or one of its declared hooks, tools or schedules).
+`hook_list` shows the owner of event hooks.
+
+An optional `commands(state)` hook lets a lifecycle mod register its CLI
+handlers without launching its background work. When Remuda loads a mod to
+serve one of its subcommands, it runs `commands` and skips `start`; running
+`remuda MOD` with no subcommand runs `commands` and then `start` once. A later
+bare invocation starts a mod that was previously loaded only for commands.
+Mods without `commands` keep the old behavior: loading their subcommand runs
+`start` as before. Keep `commands` limited to registration; put launch work in
+`start`. A mod may also create new top-level `remuda.*` fields (for example
+`function remuda._sample_notify(...) end` in `start`); they are its own.
 Assigning a field core defines, or one another mod owns, is an error. A field
 left by a legacy script is taken over only in the mod's own namespace,
 `remuda._NAME_*` or `remuda.NAME_*`; any other existing field is an error. Reload replaces everything the mod owns,
