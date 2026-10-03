@@ -1329,7 +1329,12 @@ fn input_line_empty_uses_styled_prompt_snapshots_and_returns_unknown_safely() {
           return spans
         end
         local function screen(rows, cursor_row)
-          return { rows = rows, cursor = { row = cursor_row or 1, col = 1, visible = true } }
+          cursor_row = cursor_row or 1
+          local parts = {}
+          for _, span in ipairs(rows[cursor_row] or {}) do parts[#parts + 1] = span.text or "" end
+          local raw = table.concat(parts):gsub("\194\160", " ")
+          local col = raw:sub(1, 3) == "│" and 5 or 3
+          return { rows = rows, cursor = { row = cursor_row, col = col, visible = true } }
         end
         local function answer(opts)
           return remuda.input_line_empty("fixture", opts)
@@ -1409,6 +1414,8 @@ fn input_line_empty_uses_styled_prompt_snapshots_and_returns_unknown_safely() {
         assert(word.about:find("opts.kind", 1, true) and word.about:find("contiguous composer block", 1, true))
         assert(word.about:find("'? for shortcuts' for every kind", 1, true))
         assert(word.about:find("Unlike Butler's helper", 1, true))
+        assert(word.about:find("continuation prompt after a blank row", 1, true))
+        assert(word.about:find("rows below the cursor are not inspected", 1, true))
         "#,
     );
 }
@@ -1422,7 +1429,9 @@ fn input_line_empty_rejects_draft_content_above_the_cursor() {
         remuda.capture_styled = function() return current end
         local function row(text) return { { text = text, dim = false } } end
         local function screen(rows, cursor_row)
-          return { rows = rows, cursor = { row = cursor_row, col = 1, visible = true } }
+          local raw = rows[cursor_row][1].text:gsub("\194\160", " ")
+          local col = raw:sub(1, 3) == "│" and 5 or 3
+          return { rows = rows, cursor = { row = cursor_row, col = col, visible = true } }
         end
         local function expect_unknown(snapshot, kind)
           current = snapshot
@@ -1435,11 +1444,25 @@ fn input_line_empty_rejects_draft_content_above_the_cursor() {
           assert(answer == true, tostring(answer) .. " / " .. tostring(reason))
         end
 
+        local after_glyph = screen({ row("❯ ") }, 1)
+        after_glyph.cursor.col = 2 -- the valid position before its optional space
+        expect_empty(after_glyph, "shell")
+        local wrong_col = screen({ row("❯ ") }, 1)
+        wrong_col.cursor.col = 1
+        expect_unknown(wrong_col, "shell")
+
+        current = screen({ row("│ transcript"), row("╭ unrelated history"), row("❯ ") }, 3)
+        local generic, generic_reason = remuda.input_line_empty("fixture")
+        assert(generic == nil and generic_reason:find("non-blank rows", 1, true), "a stray │ must not enable Claude frame mode")
+
         expect_empty(screen({ row("ls output"), row(""), row("❯ ") }, 3), "shell")
         expect_empty(screen({
           row("history"), row(""), row("╭──────╮"), row("│ ❯  │"), row("╰──────╯"), row("? for shortcuts")
         }, 4), "claude")
         expect_empty(screen({ row("transcript line"), row(""), row("> Ask Codex to do anything"), row("gpt 5 · 40%") }, 3), "codex")
+        -- Known limit: a blank row inside a composer block hides prior draft text,
+        -- so a later continuation prompt can still be reported as empty.
+        expect_empty(screen({ row("text"), row(""), row("> ") }, 3), "codex")
 
         expect_unknown(screen({ row("❯ draft"), row("❯ ") }, 2), "shell")
         expect_unknown(screen({ row("❯ draft"), row("> "), row("❯ ") }, 3), "shell")
