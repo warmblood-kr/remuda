@@ -1410,6 +1410,16 @@ mod tests {
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    #[cfg(windows)]
+    struct TestToken(windows_sys::Win32::Foundation::HANDLE);
+
+    #[cfg(windows)]
+    impl Drop for TestToken {
+        fn drop(&mut self) {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+
     static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 
     struct TestRoot(PathBuf);
@@ -1682,6 +1692,228 @@ mod tests {
         lua.load(format!("assert(remuda.storage.set_default('{name}'))"))
             .exec()
             .unwrap();
+    }
+
+    #[cfg(windows)]
+    fn assert_process_is_elevated() {
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let mut raw_token = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) },
+            0,
+            "open process token for elevation check"
+        );
+        let token = TestToken(raw_token);
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0;
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.0,
+                    TokenElevation,
+                    (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                    std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                    &mut returned,
+                )
+            },
+            0,
+            "query process token elevation"
+        );
+        assert_ne!(elevation.TokenIsElevated, 0, "test must write as elevated");
+    }
+
+    #[cfg(windows)]
+    fn well_known_sid(kind: windows_sys::Win32::Security::WELL_KNOWN_SID_TYPE) -> Vec<usize> {
+        use windows_sys::Win32::Security::CreateWellKnownSid;
+
+        let mut storage = vec![0usize; 16];
+        let mut size = std::mem::size_of_val(storage.as_slice()) as u32;
+        assert_ne!(
+            unsafe {
+                CreateWellKnownSid(
+                    kind,
+                    std::ptr::null_mut(),
+                    storage.as_mut_ptr().cast(),
+                    &mut size,
+                )
+            },
+            0,
+            "build well-known SID"
+        );
+        storage
+    }
+
+    #[cfg(windows)]
+    fn restricted_admin_token(admin_sid: *mut std::ffi::c_void) -> TestToken {
+        use windows_sys::Win32::Security::{
+            CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE,
+            TOKEN_IMPERSONATE, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let mut raw_process_token = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_IMPERSONATE,
+                    &mut raw_process_token,
+                )
+            },
+            0,
+            "open process token for restricted-token creation"
+        );
+        let process_token = TestToken(raw_process_token);
+        let disabled_admin = SID_AND_ATTRIBUTES {
+            Sid: admin_sid,
+            Attributes: 0x0000_0010, // SE_GROUP_USE_FOR_DENY_ONLY
+        };
+        let mut restricted = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                CreateRestrictedToken(
+                    process_token.0,
+                    DISABLE_MAX_PRIVILEGE,
+                    1,
+                    &disabled_admin,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    &mut restricted,
+                )
+            },
+            0,
+            "create token with Administrators disabled"
+        );
+        TestToken(restricted)
+    }
+
+    #[cfg(windows)]
+    fn assert_worker_admin_is_deny_only(admin_sid: *mut std::ffi::c_void) {
+        use windows_sys::Win32::Security::{
+            CheckTokenMembership, EqualSid, GetTokenInformation, TokenGroups, SID_AND_ATTRIBUTES,
+            TOKEN_GROUPS, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+        let mut is_member = 1;
+        assert_ne!(
+            unsafe { CheckTokenMembership(std::ptr::null_mut(), admin_sid, &mut is_member) },
+            0,
+            "check impersonated Administrators membership"
+        );
+        assert_eq!(
+            is_member, 0,
+            "Administrators must not be enabled in worker token"
+        );
+
+        let mut raw_token = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut raw_token) },
+            0,
+            "open impersonation token for deny-only check"
+        );
+        let token = TestToken(raw_token);
+        let mut needed = 0;
+        unsafe {
+            GetTokenInformation(token.0, TokenGroups, std::ptr::null_mut(), 0, &mut needed);
+        }
+        assert_ne!(needed, 0, "size worker token group buffer");
+        let mut buffer = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.0,
+                    TokenGroups,
+                    buffer.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed,
+                )
+            },
+            0,
+            "query worker token groups"
+        );
+        let groups = buffer.as_ptr().cast::<TOKEN_GROUPS>();
+        let group_count = unsafe { std::ptr::addr_of!((*groups).GroupCount).read() as usize };
+        let group_entries =
+            unsafe { std::ptr::addr_of!((*groups).Groups).cast::<SID_AND_ATTRIBUTES>() };
+        let entries = unsafe { std::slice::from_raw_parts(group_entries, group_count) };
+        assert!(
+            entries.iter().any(
+                |SID_AND_ATTRIBUTES {
+                     Sid: sid,
+                     Attributes: attributes,
+                 }| {
+                    (unsafe { EqualSid(*sid, admin_sid) }) != 0 && *attributes & 0x0000_0010 != 0
+                }
+            ),
+            "Administrators SID must be deny-only"
+        );
+    }
+
+    #[cfg(windows)]
+    struct RevertImpersonation;
+
+    #[cfg(windows)]
+    impl Drop for RevertImpersonation {
+        fn drop(&mut self) {
+            unsafe { windows_sys::Win32::Security::RevertToSelf() };
+        }
+    }
+
+    #[cfg(all(test, windows))]
+    #[test]
+    // Proves an Administrators-deny-only token (same user) reads, checks and deletes an
+    // elevated-written secret via the current-user owner + Owner Rights ACEs. Not a different-user
+    // test; a negative case would need a second logon and is not covered.
+    fn windows_secret_survives_admin_deny_only_impersonation() {
+        use windows_sys::Win32::Security::ImpersonateLoggedOnUser;
+
+        assert_process_is_elevated();
+        let root = TestRoot::new();
+        let writer = lua_with_xdg_root(&root.0);
+        select_backend(&writer, "xdg");
+        writer
+            .load(r#"assert(remuda.storage.get("elevated-writer"):secret():put("token", "elevated secret"))"#)
+            .exec()
+            .unwrap();
+
+        let worker_root = root.0.clone();
+        std::thread::spawn(move || {
+            let sid = well_known_sid(windows_sys::Win32::Security::WinBuiltinAdministratorsSid);
+            let admin_sid = sid.as_ptr().cast_mut().cast();
+            let token = restricted_admin_token(admin_sid);
+            assert_ne!(
+                unsafe { ImpersonateLoggedOnUser(token.0) },
+                0,
+                "impersonate restricted worker token"
+            );
+            let _revert = RevertImpersonation;
+            assert_worker_admin_is_deny_only(admin_sid);
+
+            let reader = lua_with_xdg_root(&worker_root);
+            select_backend(&reader, "xdg");
+            reader
+                .load(
+                    r#"
+                    local secret = remuda.storage.get("elevated-writer"):secret()
+                    local value, reason = secret:get("token")
+                    assert(value == "elevated secret", "Owner Rights read failed: " .. tostring(reason))
+                    assert(secret:exists("token"), "Owner Rights exists failed")
+                    assert(secret:delete("token"), "Owner Rights delete failed")
+                    assert(not secret:exists("token"), "deleted secret still exists")
+                    "#,
+                )
+                .exec()
+                .unwrap();
+        })
+        .join()
+        .expect("restricted-token worker panicked");
     }
 
     #[test]
