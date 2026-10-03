@@ -125,19 +125,27 @@ for example over your VPN.
 The next command sets up the cluster on this machine. It also opens a
 network listener on this machine's local network (LAN) address, port 7441.
 Only admitted machines can connect to it. Use `--no-listen` on machines
-that do not need to accept connections. On every machine:
+that do not need to accept connections. To limit the bind address, run
+`remuda cluster listen --bind IP[:PORT]` (use `127.0.0.1:7441` for local-only).
+On every machine:
 
 ```sh
 remuda cluster init
 ```
 
-You should see `Cluster initialized`, then this machine's `Node:` and
-`Fingerprint:`. You should also see the listener lines, where `IP` is this
-machine's LAN address:
+You should see the listener start notice, `Cluster initialized`, then this
+machine's `Node:` and `Fingerprint:`. The listener lines show the actual
+address, where `IP` is this machine's LAN address:
 
 ```text
-Listening on IP:7441
-Only admitted machines can connect; turn off: remuda cluster listen --off
+Starting the listener for cluster nodes on the private LAN (port 7441 by default). Only admitted machines can connect. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (127.0.0.1:7441 for local-only).
+Cluster initialized
+Node: studio
+Fingerprint: SHA256:...
+Listening for cluster nodes on IP:7441 (reachable from your LAN)
+Only admitted machines can connect.
+To skip opening a port on init, use `remuda cluster init --no-listen`; to stop it later, run `remuda cluster listen --off`; to limit the address, run `remuda cluster listen --bind IP[:PORT]` (use `127.0.0.1:7441` for local-only).
+Next: run `remuda cluster invite` here, then run its printed `remuda cluster join ...` command on the other node.
 ```
 
 Then go on to the invitation.

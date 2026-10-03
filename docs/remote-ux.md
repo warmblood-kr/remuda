@@ -12,10 +12,14 @@ If the cluster directory is missing but a saved fingerprint shows this machine h
 
 ```text
 $ remuda cluster init
+Starting the listener for cluster nodes on the private LAN (port 7441 by default). Only admitted machines can connect. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (127.0.0.1:7441 for local-only).
 Cluster initialized
 Node: studio
 Fingerprint: SHA256:QmFzZTY0LWZpbmdlcnByaW50LWV4YW1wbGU=
-Next: remuda cluster invite (on this machine), or join an existing cluster with the command another machine's invite prints.
+Listening for cluster nodes on 192.168.1.20:7441 (reachable from your LAN)
+Only admitted machines can connect.
+To skip opening a port on init, use `remuda cluster init --no-listen`; to stop it later, run `remuda cluster listen --off`; to limit the address, run `remuda cluster listen --bind IP[:PORT]` (use `127.0.0.1:7441` for local-only).
+Next: run `remuda cluster invite` here, then run its printed `remuda cluster join ...` command on the other node.
 
 $ remuda cluster invite --bind 100.80.0.12:7443
 Invitation for one machine, valid 10 minutes. Run this on the other machine:
