@@ -149,6 +149,29 @@ fn trusted_storage_owner(actual_sid: &str, current_user_sid: &str) -> bool {
     actual_sid == current_user_sid || matches!(actual_sid, "S-1-5-18" | "S-1-5-32-544")
 }
 
+#[cfg(any(windows, test))]
+pub(crate) fn secret_owner_matches(actual_sid: &str, current_user_sid: &str) -> bool {
+    actual_sid == current_user_sid
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn secret_dacl_matches(
+    is_directory: bool,
+    protected: bool,
+    aces: &[(&str, u8, u32, u8)],
+) -> bool {
+    let expected_flags = if is_directory { 0x03 } else { 0 };
+    let mut principals = Vec::with_capacity(aces.len());
+    for (sid, flags, mask, ace_type) in aces {
+        if *flags != expected_flags || *mask != 0x001F_01FF || *ace_type != 0 {
+            return false;
+        }
+        principals.push(*sid);
+    }
+    principals.sort_unstable();
+    protected && principals == ["S-1-3-4", "S-1-5-18", "S-1-5-32-544"]
+}
+
 #[allow(dead_code)]
 pub(crate) fn local_appdata_for(env: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
     let absolute_windows_path = |name| {

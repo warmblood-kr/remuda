@@ -836,25 +836,45 @@ fn file_roots(env: Env<'_>) -> Result<FileRoots, String> {
         return Err("REMUDA_STORAGE_ROOT must be an absolute path".into());
     }
     #[cfg(windows)]
-    return [Kind::Config, Kind::Data, Kind::State, Kind::Cache]
-        .into_iter()
-        .map(|kind| {
-            let root = match &override_root {
-                Some(root) => root.join(kind.as_str()),
-                None => resolve_dir_for(kind.as_str(), true, env)?,
-            };
-            let storage_path = root.join("storage");
-            let directory = crate::windows_security::ensure_storage_root(&storage_path)
-                .map_err(|_| "unavailable: storage root security check failed".to_owned())?;
-            Ok((
-                kind.as_str(),
-                WindowsFileRoot {
-                    path: storage_path,
-                    directory,
-                },
-            ))
-        })
-        .collect();
+    {
+        let mut roots: FileRoots = [Kind::Config, Kind::Data, Kind::State, Kind::Cache]
+            .into_iter()
+            .map(|kind| {
+                let root = match &override_root {
+                    Some(root) => root.join(kind.as_str()),
+                    None => resolve_dir_for(kind.as_str(), true, env)?,
+                };
+                let storage_path = root.join("storage");
+                let directory = crate::windows_security::ensure_storage_root(&storage_path)
+                    .map_err(|_| "unavailable: storage root security check failed".to_owned())?;
+                Ok((
+                    kind.as_str(),
+                    WindowsFileRoot {
+                        path: storage_path,
+                        directory,
+                    },
+                ))
+            })
+            .collect::<Result<_, String>>()?;
+        let secret_path = match &override_root {
+            Some(root) => root.join("secret").join("storage"),
+            None => crate::windows_security::local_appdata_for(env)
+                .map_err(|_| "unavailable: storage root could not be resolved".to_owned())?
+                .join("remuda")
+                .join("secret")
+                .join("storage"),
+        };
+        let directory = crate::windows_security::ensure_storage_root(&secret_path)
+            .map_err(|_| "unavailable: storage root security check failed".to_owned())?;
+        roots.insert(
+            "secret",
+            WindowsFileRoot {
+                path: secret_path,
+                directory,
+            },
+        );
+        return Ok(roots);
+    }
     #[cfg(not(windows))]
     [Kind::Config, Kind::Data, Kind::State, Kind::Cache]
         .into_iter()
