@@ -128,9 +128,11 @@ question at a time: `reply:prompt_secret { label, callback }` or
   `remuda[session NAME]`, and the CLI appends ` [default]` and `: `. The CLI
   keeps the prompt on one terminal row and clips its displayed text to the
   terminal's display width, marking clipped text with `…`. The label is clipped
-  before a default that fits the row. If the default itself cannot fit, empty
-  Enter asks the caller to type a value or widen the terminal. Once the default
-  is fully visible, Enter returns the full sanitized default.
+  before a default that fits the row. If the default itself cannot fit, or
+  display sanitizing removes any of its characters, empty Enter asks the caller
+  to type a value. For a default that does not fit, the notice also suggests
+  widening the terminal. Once the default is fully visible, Enter returns the
+  full sanitized default.
 - `preface` is optional text shown above the prompt, for example a summary
   before `Continue?`. Lines are separated by `\n`; one trailing newline is
   ignored. Each line goes through the same sanitizer as the label and is
