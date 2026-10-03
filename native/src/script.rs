@@ -184,7 +184,7 @@ const WORDS: &[(&str, &str, &str)] = &[
     ),
     (
         "cli.parse",
-        "Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set multiple = true on the final positional argument to collect message body words.",
+        "Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set required = false on an optional positional (positionals are required by default), and set multiple = true on the final positional argument to collect message body words.",
         "cli.parse(spec, argv) -> report",
     ),
     (
@@ -530,7 +530,7 @@ fn cli_spec_from_lua(table: Table) -> mlua::Result<crate::cli_parse::Spec> {
                     name: item.get("name")?,
                     help: item.get("help")?,
                     multiple: item.get::<Option<bool>>("multiple")?.unwrap_or(false),
-                    required: true,
+                    required: item.get::<Option<bool>>("required")?.unwrap_or(true),
                 });
             }
         }
@@ -674,6 +674,16 @@ fn validate_cli_spec(spec: &crate::cli_parse::Spec) -> mlua::Result<()> {
                 "remuda.cli.parse multiple positional argument must be last for verb '{}'",
                 verb.name
             )));
+        }
+        let mut saw_optional = false;
+        for arg in &verb.args {
+            if saw_optional && arg.required {
+                return Err(mlua::Error::runtime(format!(
+                    "remuda.cli.parse required positional argument must not follow an optional positional argument for verb '{}'",
+                    verb.name
+                )));
+            }
+            saw_optional |= !arg.required;
         }
         let mut ids = global_ids.clone();
         let mut shorts = global_shorts.clone();
@@ -2286,6 +2296,45 @@ mod binding_tests {
         rejects_cli_spec(
             r#"return {name="remuda", verbs={go={next="remuda",args={{name="BODY",help="a",multiple=true},{name="END",help="b"}}}}}"#,
         );
+    }
+
+    #[test]
+    fn cli_spec_rejects_required_positional_after_optional() {
+        rejects_cli_spec(
+            r#"return {name="remuda", verbs={go={next="remuda",args={{name="OPTIONAL",help="a",required=false},{name="REQUIRED",help="b"}}}}}"#,
+        );
+    }
+
+    #[test]
+    fn cli_parse_accepts_optional_positionals() {
+        let lua = Lua::new();
+        install_cli_binding(&lua);
+        lua.load(
+            r#"
+            local spec = {
+                name="remuda",
+                verbs={
+                    go={next="remuda",args={
+                        {name="KIND",help="kind"},
+                        {name="NAME",help="name",required=false},
+                    }},
+                    body={next="remuda",args={
+                        {name="WORDS",help="words",multiple=true,required=false},
+                    }},
+                },
+            }
+            local absent = remuda.cli.parse(spec, {"go", "claude"})
+            assert(absent.ok and absent.values.KIND == "claude" and absent.values.NAME == nil, "optional trailing positional should be absent")
+            local present = remuda.cli.parse(spec, {"go", "claude", "x"})
+            assert(present.ok and present.values.KIND == "claude" and present.values.NAME == "x", "optional trailing positional should be captured")
+            local missing = remuda.cli.parse(spec, {"go"})
+            assert(not missing.ok and missing.kind == "error" and missing.text:find("Usage: remuda go KIND [NAME]", 1, true), "required first positional should still produce a usage error")
+            local empty_body = remuda.cli.parse(spec, {"body"})
+            assert(empty_body.ok and empty_body.values.WORDS == nil, "empty optional multiple positional should parse with no value")
+            "#,
+        )
+        .exec()
+        .unwrap();
     }
 
     #[test]
