@@ -1452,6 +1452,27 @@ mod tests {
     }
 
     #[test]
+    fn secret_sddl_protects_exact_file_and_directory_aces() {
+        let owner = "S-1-5-21-42";
+        assert_eq!(
+            secret_storage_sddl(owner, false),
+            "O:S-1-5-21-42D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)"
+        );
+        assert_eq!(
+            secret_storage_sddl(owner, true),
+            "O:S-1-5-21-42D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
+        );
+    }
+
+    #[test]
+    fn access_denied_ntstatus_maps_to_permission_denied() {
+        assert_eq!(
+            nt_status_error_kind(0xC000_0022),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
     fn ace_size_must_contain_the_full_sid() {
         assert!(ace_sid_fits(28, 8, 20));
         assert!(!ace_sid_fits(27, 8, 20));
