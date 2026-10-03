@@ -1342,6 +1342,20 @@ mod tests {
         assert!(collect_files_if_present(&missing).unwrap().is_empty());
     }
 
+    #[cfg(windows)]
+    fn symlink_result(result: io::Result<()>) -> bool {
+        match result {
+            Ok(()) => true,
+            Err(error)
+                if error.kind() == io::ErrorKind::Unsupported
+                    || error.raw_os_error() == Some(1314) =>
+            {
+                false
+            }
+            Err(error) => panic!("create symlink fixture: {error}"),
+        }
+    }
+
     #[test]
     fn case_clashes_fold_ascii_but_allow_the_same_name() {
         let existing = vec!["token".to_owned()];
@@ -1727,6 +1741,72 @@ mod tests {
     fn run_handle_conformance(lua: &Lua, backend: &str) {
         select_backend(lua, backend);
         lua.load(HANDLE_CONFORMANCE).exec().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn xdg_handle_walk_refuses_reparse_components_for_all_operations() {
+        use std::os::windows::fs::{symlink_dir, symlink_file};
+
+        let root = TestRoot::new();
+        let lua = lua_with_xdg_root(&root.0);
+        select_backend(&lua, "xdg");
+        let storage = root.0.join("data/storage");
+        let namespace_target = root.0.join("outside-namespace");
+        fs::create_dir(&namespace_target).unwrap();
+        fs::write(namespace_target.join("item"), b"outside").unwrap();
+        if !symlink_result(symlink_dir(
+            &namespace_target,
+            storage.join("linked-namespace"),
+        )) {
+            return;
+        }
+
+        let intermediate = storage.join("real-namespace/intermediate");
+        let intermediate_target = root.0.join("outside-intermediate");
+        fs::create_dir_all(storage.join("real-namespace")).unwrap();
+        fs::create_dir(&intermediate_target).unwrap();
+        fs::write(intermediate_target.join("item"), b"outside").unwrap();
+        if !symlink_result(symlink_dir(&intermediate_target, &intermediate)) {
+            return;
+        }
+
+        let leaf_namespace = storage.join("leaf-namespace");
+        let leaf_target = root.0.join("outside-leaf");
+        fs::create_dir(&leaf_namespace).unwrap();
+        fs::write(&leaf_target, b"outside").unwrap();
+        if !symlink_result(symlink_file(&leaf_target, leaf_namespace.join("item"))) {
+            return;
+        }
+
+        lua.load(
+            r#"
+            local function denied(namespace, name)
+                local files = remuda.storage.get(namespace):data()
+                local ok, value, reason = pcall(function() return files:read(name) end)
+                assert(not ok or value == nil, "read " .. namespace .. "/" .. name)
+                ok, value = pcall(function() return files:exists(name) end)
+                assert(not ok or value == false, "exists " .. namespace .. "/" .. name)
+                ok, value = pcall(function() return files:list() end)
+                assert(not ok or #value == 0, "list " .. namespace)
+                ok, value = pcall(function() return files:delete(name) end)
+                assert(not ok or value ~= true, "delete " .. namespace .. "/" .. name)
+                ok = pcall(function() files:write(name, "replacement") end)
+                assert(not ok, "write " .. namespace .. "/" .. name)
+            end
+            denied("linked-namespace", "item")
+            denied("real-namespace", "intermediate/item")
+            denied("leaf-namespace", "item")
+            "#,
+        )
+        .exec()
+        .unwrap();
+        assert_eq!(fs::read(namespace_target.join("item")).unwrap(), b"outside");
+        assert_eq!(
+            fs::read(intermediate_target.join("item")).unwrap(),
+            b"outside"
+        );
+        assert_eq!(fs::read(&leaf_target).unwrap(), b"outside");
     }
 
     #[cfg(windows)]
