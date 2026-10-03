@@ -314,6 +314,20 @@ pub trait AgentWriter: Send + Sync {
         }
         self.write_to_completion(bytes)
     }
+    /// As `write_to_completion_while`, notifying when the backend begins its
+    /// actual write attempt.
+    fn write_to_completion_while_started(
+        &self,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+        on_start: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<()> {
+        if cancelled() {
+            return Err(AgentError::Attached);
+        }
+        on_start();
+        self.write_to_completion_while(bytes, cancelled)
+    }
     fn is_busy(&self) -> bool;
     /// Whether an active write has exceeded its backend's bounded-write deadline.
     /// Healthy writes remain busy but callers may wait for them to finish.

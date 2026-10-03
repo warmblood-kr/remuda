@@ -50,6 +50,7 @@ const PTY_ABANDONED_FLAG_EXPIRY: Duration = Duration::from_secs(10 * 60);
 struct WriteTask {
     sequence: u64,
     bytes: Vec<u8>,
+    on_start: Arc<dyn Fn() + Send + Sync>,
     result: Sender<Result<()>>,
 }
 
@@ -106,18 +107,15 @@ impl PtyInputWriter {
         })
     }
 
-    fn submit(&self, bytes: &[u8]) -> Result<(u64, Receiver<Result<()>>)> {
-        self.submit_inner(bytes, false)
-    }
-
     fn submit_bounded(&self, bytes: &[u8]) -> Result<(u64, Receiver<Result<()>>)> {
-        self.submit_inner(bytes, true)
+        self.submit_inner(bytes, true, Arc::new(|| {}))
     }
 
     fn submit_inner(
         &self,
         bytes: &[u8],
         report_completed_abandonment: bool,
+        on_start: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<(u64, Receiver<Result<()>>)> {
         let sequence = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -151,6 +149,7 @@ impl PtyInputWriter {
         let task = WriteTask {
             sequence,
             bytes: bytes.to_vec(),
+            on_start,
             result,
         };
         match self.sender.try_send(task) {
@@ -218,10 +217,13 @@ fn run_writer(
         let reset_busy = BusyReset(&state);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let result = match writer.lock() {
-                Ok(mut writer) => writer
-                    .write_all(&task.bytes)
-                    .and_then(|()| writer.flush())
-                    .map_err(io),
+                Ok(mut writer) => {
+                    (task.on_start)();
+                    writer
+                        .write_all(&task.bytes)
+                        .and_then(|()| writer.flush())
+                        .map_err(io)
+                }
                 Err(_) => Err(io("pty writer lock poisoned")),
             };
             let follow_up = {
@@ -360,11 +362,20 @@ impl AgentWriter for PtyInputWriter {
     }
 
     fn write_to_completion_while(&self, bytes: &[u8], cancelled: &dyn Fn() -> bool) -> Result<()> {
+        self.write_to_completion_while_started(bytes, cancelled, Arc::new(|| {}))
+    }
+
+    fn write_to_completion_while_started(
+        &self,
+        bytes: &[u8],
+        cancelled: &dyn Fn() -> bool,
+        on_start: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<()> {
         loop {
             if cancelled() {
                 return Err(AgentError::Attached);
             }
-            match self.submit(bytes) {
+            match self.submit_inner(bytes, false, Arc::clone(&on_start)) {
                 Ok((_, receiver)) => loop {
                     if cancelled() {
                         return Err(AgentError::Attached);
@@ -999,9 +1010,22 @@ mod input_writer_tests {
 
     struct CaptureWrites(Arc<Mutex<Vec<u8>>>);
 
+    struct StartCheckedWrite(Arc<AtomicBool>);
+
     impl Write for CaptureWrites {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Write for StartCheckedWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            assert!(self.0.load(Ordering::SeqCst));
             Ok(bytes.len())
         }
 
@@ -1026,6 +1050,25 @@ mod input_writer_tests {
 
     fn mark_late_submit_abandoned(writer: &PtyInputWriter, clock: &remuda_core::ManualClock) {
         writer.state.lock().unwrap().late_submit_abandoned_at = Some(clock.now());
+    }
+
+    #[test]
+    fn write_start_callback_runs_before_the_pty_write_attempt() {
+        let started = Arc::new(AtomicBool::new(false));
+        let shared: SharedWriter = Arc::new(Mutex::new(Box::new(StartCheckedWrite(Arc::clone(
+            &started,
+        )))));
+        let writer =
+            PtyInputWriter::spawn(shared, Duration::from_secs(1), PTY_LATE_SUBMIT_BOUND).unwrap();
+        let callback_started = Arc::clone(&started);
+        let on_start: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            callback_started.store(true, Ordering::SeqCst);
+        });
+
+        writer
+            .write_to_completion_while_started(b"input", &|| false, on_start)
+            .unwrap();
+        assert!(started.load(Ordering::SeqCst));
     }
 
     #[test]
