@@ -1358,12 +1358,32 @@ fn input_line_empty_uses_styled_prompt_snapshots_and_returns_unknown_safely() {
         current = screen({ row("❯ previous command"), row("❯ ", span("suggested text", true)) }, 2)
         assert(answer({ kind = "shell" }) == true)
 
+        -- A different prompt marker on the cursor row can be a wrapped
+        -- continuation of a non-empty draft, so do not call it empty.
+        current = screen({ row("❯ rm -rf x"), row("> ") }, 2)
+        local continuation, continuation_reason = answer({ kind = "shell" })
+        assert(continuation == nil and continuation_reason:find("continuation", 1, true))
+
+        current = screen({ row("❯ "), row("continued draft"), row("ordinary row") }, 3)
+        continuation, continuation_reason = answer({ kind = "shell" })
+        assert(continuation == nil and continuation_reason:find("non-blank rows", 1, true))
+
+        -- Claude's visible frame makes wrapped continuation rows recognizable.
+        current = screen({ row("│ ❯ draft│"), row("│ continuation│"), row("╰ footer") }, 2)
+        local claude_continuation, claude_reason = answer({ kind = "claude" })
+        assert(claude_continuation == false, tostring(claude_reason))
+
         -- The visible Codex empty placeholder is recognized without opts.kind
         -- for any caller; explicit non-Codex policy retains Butler's behavior.
         current = screen({ row("> Ask Codex to do anything") })
         assert(answer() == true)
         assert(answer({ kind = "codex" }) == true)
         assert(answer({ kind = "shell" }) == false)
+
+        -- The exact placeholder is only empty when continuation parsing finds
+        -- no additional composer text.
+        current = screen({ row("> Ask Codex to do anything"), row("continued draft") })
+        assert(answer() == false)
 
         -- Generic mode applies Codex's specific footer and trace cues when
         -- visible, while a paste placeholder in the composer is real content.
@@ -1385,6 +1405,10 @@ fn input_line_empty_uses_styled_prompt_snapshots_and_returns_unknown_safely() {
         assert(unknown == nil and type(reason) == "string" and reason:find("hidden", 1, true))
 
         current = screen({ row("❯ ") })
+        unknown, reason = answer({ kind = "gemini" })
+        assert(unknown == nil and type(reason) == "string" and reason:find("opts.kind", 1, true))
+
+        current = screen({ row("❯ ") })
         current.cursor.row = 2
         unknown, reason = answer()
         assert(unknown == nil and type(reason) == "string" and reason:find("outside", 1, true))
@@ -1400,6 +1424,8 @@ fn input_line_empty_uses_styled_prompt_snapshots_and_returns_unknown_safely() {
         local word = remuda._registry.input_line_empty
         assert(word and word.signature == "input_line_empty(session, opts?) -> true | false | nil, reason")
         assert(word.about:find("opts.kind", 1, true) and word.about:find("ambiguous", 1, true))
+        assert(word.about:find("regardless of agent kind", 1, true))
+        assert(word.about:find("Unlike Butler's helper", 1, true))
         "#,
     );
 }

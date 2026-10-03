@@ -1968,7 +1968,13 @@ local input_line_prompt_glyphs = { "❯", ">", "›" }
 local input_line_codex_placeholder = "Ask Codex to do anything"
 
 local function input_line_trim(text)
-  return (text:gsub("^%s+", ""):gsub("%s+$", ""))
+  local first = text:find("%S")
+  if not first then return "" end
+  local last = #text
+  while last >= first and text:sub(last, last):match("%s") do
+    last = last - 1
+  end
+  return text:sub(first, last)
 end
 
 local function input_line_row_text(row, ignore_dim)
@@ -2014,7 +2020,7 @@ local function input_line_empty_from_snapshot(kind, screen)
     lines[index] = input_line_row_text(row, index == cursor.row):gsub("\194\160", " ")
   end
 
-  local text, prompt_at
+  local text, prompt_at, prompt_glyph, ambiguous_continuation
   for index, line in ipairs(lines) do
     if index > cursor.row then break end
     local rest = line:gsub("^%s+", "")
@@ -2023,12 +2029,30 @@ local function input_line_empty_from_snapshot(kind, screen)
     end
     for _, glyph in ipairs(input_line_prompt_glyphs) do
       if rest:sub(1, #glyph) == glyph then
+        -- A different prompt marker at the cursor can be a wrapped
+        -- continuation of the earlier draft, not a fresh empty composer.
+        if index == cursor.row and prompt_at and prompt_glyph ~= glyph
+            and input_line_trim(text or "") ~= "" then
+          ambiguous_continuation = true
+        end
         text, prompt_at = rest:sub(#glyph + 1), index
+        prompt_glyph = glyph
         break
       end
     end
   end
   if not text then return nil, "no supported prompt glyph is visible" end
+  if ambiguous_continuation then
+    return nil, "cursor prompt may be a wrapped continuation of earlier draft text"
+  end
+
+  if prompt_at < cursor.row and not has_claude_frame then
+    for index = prompt_at + 1, cursor.row - 1 do
+      if input_line_trim(lines[index] or "") ~= "" then
+        return nil, "non-blank rows separate the prompt from the cursor"
+      end
+    end
+  end
 
   local raw_prompt = raw_lines[prompt_at]:gsub("^%s+", "")
   if has_claude_frame and raw_prompt:sub(1, 3) == "│" then
@@ -2040,10 +2064,6 @@ local function input_line_empty_from_snapshot(kind, screen)
   end
   local raw_text = raw_glyph and raw_prompt:sub(#raw_glyph + 1) or ""
   raw_text = input_line_trim(raw_text:gsub("│%s*$", ""))
-  if kind == nil and raw_text == input_line_codex_placeholder then
-    return true
-  end
-
   text = input_line_trim(text:gsub("│%s*$", ""))
   local parts = { text }
   for index = prompt_at + 1, #lines do
@@ -2070,7 +2090,7 @@ local function input_line_empty_from_snapshot(kind, screen)
     text = input_line_trim(table.concat(remaining, "\n"))
   end
   if kind == "codex" and raw_text == input_line_codex_placeholder then return true end
-  if kind == "codex" and text == input_line_codex_placeholder then return true end
+  if (kind == "codex" or kind == nil) and text == input_line_codex_placeholder then return true end
   if text == "" then return true end
   return false
 end
@@ -2093,7 +2113,7 @@ end
 
 register(
   "input_line_empty",
-  "Report whether a session has a visibly empty input line. Returns nil and a reason unless the cursor and prompt are visible. Dim ghost text on the cursor row is ignored; visible paste placeholders count as content. Pass opts.kind = 'shell', 'claude', or 'codex' for that exact policy. Kind is optional; without it, shared prompt glyphs, the visible Claude frame, the exact Codex placeholder, and specific Codex footer/trace cues are used. Other agent-specific layouts remain ambiguous, and an unfamiliar footer may be mistaken for composer text.",
+  "Report whether a session has a visibly empty input line. Returns nil and a reason unless the cursor and prompt are visible. Dim ghost text on the cursor row is ignored; visible paste placeholders count as content. Pass opts.kind = 'shell', 'claude', or 'codex' for that exact policy. Kind is optional; without it, shared prompt glyphs, the visible Claude frame, and the exact Codex placeholder are recognized. In generic mode, visible Codex footer and trace cues are applied regardless of agent kind; other agent-specific layouts remain ambiguous, and an unfamiliar footer may be mistaken for composer text. Unlike Butler's helper, this word requires a visible cursor, rejects unknown kinds, and recognizes only the built-in Codex placeholder.",
   "input_line_empty(session, opts?) -> true | false | nil, reason"
 )
 
