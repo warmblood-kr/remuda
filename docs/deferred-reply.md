@@ -125,7 +125,10 @@ question at a time: `reply:prompt_secret { label, callback }` or
 - The label is one short line. Control characters (newlines included) and
   invisible formatting characters are removed, and the caller's text is cut at
   256 characters. The daemon prefixes it with its own tag, `remuda[outside]` or
-  `remuda[session NAME]`, and the CLI appends ` [default]` and `: `.
+  `remuda[session NAME]`, and the CLI appends ` [default]` and `: `. The CLI
+  keeps the prompt on one terminal row and clips its displayed text to the
+  terminal's display width, marking a clipped prompt with `…`. Pressing Enter
+  still returns the full sanitized default.
 - `preface` is optional text shown above the prompt, for example a summary
   before `Continue?`. Lines are separated by `\n`; one trailing newline is
   ignored. Each line goes through the same sanitizer as the label and is
