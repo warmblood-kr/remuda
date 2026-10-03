@@ -3098,6 +3098,7 @@ fn capture_styled_snapshot(path: &Path, name: &str, scrollback: usize) -> (Strin
 }
 
 fn wait_for(path: &Path, name: &str, needle: &str) -> String {
+    let started_at = Instant::now();
     let mut deadline = Instant::now() + EMPTY_SCREEN_STARTUP_PATIENCE;
     let mut saw_output = false;
     loop {
@@ -3111,10 +3112,56 @@ fn wait_for(path: &Path, name: &str, needle: &str) -> String {
         }
         assert!(
             Instant::now() < deadline,
-            "{needle:?} never appeared in {name}. screen:\n{screen}"
+            "{needle:?} never appeared in {name}. screen:\n{screen}\n{}",
+            wait_for_diagnostics(path, name, started_at.elapsed())
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn wait_for_diagnostics(path: &Path, name: &str, elapsed: Duration) -> String {
+    let sessions = match client::request(path, &Request::List) {
+        Ok(Response::Sessions(sessions)) => format!(
+            "List sessions (name, alive, output_version, output_idle, size): {:?}",
+            sessions
+                .into_iter()
+                .map(|session| (
+                    session.name,
+                    session.alive,
+                    session.output_version,
+                    session.output_idle,
+                    session.size,
+                ))
+                .collect::<Vec<_>>()
+        ),
+        other => format!("List request failed: {other:?}"),
+    };
+    let capture = match client::request(
+        path,
+        &Request::CaptureStyled {
+            name: name.to_string(),
+            scrollback: 0,
+        },
+    ) {
+        Ok(Response::StyledScreen {
+            rows,
+            scrollback_len,
+            scrollback_total,
+            cursor,
+            ..
+        }) => {
+            let viewport = rows
+                .into_iter()
+                .map(|row| row.into_iter().map(|run| run.text).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!(
+                "CaptureStyled viewport (scrollback_len/total={scrollback_len}/{scrollback_total}, cursor={cursor:?}):\n{viewport}"
+            )
+        }
+        other => format!("CaptureStyled request failed: {other:?}"),
+    };
+    format!("elapsed since wait_for start: {elapsed:?}\n{sessions}\n{capture}")
 }
 
 fn wait_for_session_screen(session: &Session, needle: &str) {
@@ -3260,14 +3307,17 @@ fn sessions_are_listed_and_kept_apart() {
 
     // Instructions must land in the session they name and nowhere else — the
     // property a shared pty would break.
-    client::request(
+    let send = client::request(
         &path,
         &Request::SendLine {
             name: "alpha".into(),
             text: "echo $((6*7))-alpha".into(),
         },
-    )
-    .expect("send");
+    );
+    assert!(
+        matches!(&send, Ok(Response::Ok)),
+        "SendLine response: {send:?}"
+    );
 
     wait_for(&path, "alpha", "42-alpha");
     let bravo = capture(&path, "bravo");
