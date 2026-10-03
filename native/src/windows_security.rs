@@ -1163,17 +1163,18 @@ mod tests {
     }
 
     #[test]
-    fn rename_info_builder_is_handle_relative_utf16_and_nul_terminated() {
+    fn nt_rename_info_builder_is_handle_relative_utf16_and_nul_terminated() {
         let root = 0x1234usize;
         let name = "résumé.tmp";
-        let info = build_file_rename_info(root, name, true).unwrap();
+        let info = build_nt_file_rename_info(root, name, true).unwrap();
         let root_offset = 4usize.next_multiple_of(std::mem::size_of::<usize>());
         let length_offset = root_offset + std::mem::size_of::<usize>();
         let name_offset = length_offset + std::mem::size_of::<u32>();
         let encoded = name.encode_utf16().collect::<Vec<_>>();
 
+        assert_eq!(FILE_RENAME_INFORMATION_EX_CLASS, 65);
         assert_eq!(u32::from_le_bytes(info[0..4].try_into().unwrap()), 0x3);
-        let no_replace = build_file_rename_info(root, name, false).unwrap();
+        let no_replace = build_nt_file_rename_info(root, name, false).unwrap();
         assert_eq!(
             u32::from_le_bytes(no_replace[0..4].try_into().unwrap()),
             0x2
@@ -1196,9 +1197,9 @@ mod tests {
 
     #[test]
     fn rename_info_builder_rejects_empty_or_nul_containing_leaf_names() {
-        assert!(build_file_rename_info(1, "", true).is_err());
-        assert!(build_file_rename_info(1, "bad\0name", true).is_err());
-        assert!(build_file_rename_info(1, "nested/name", true).is_err());
+        assert!(build_nt_file_rename_info(1, "", true).is_err());
+        assert!(build_nt_file_rename_info(1, "bad\0name", true).is_err());
+        assert!(build_nt_file_rename_info(1, "nested/name", true).is_err());
     }
 
     #[test]
