@@ -226,6 +226,11 @@ input.type_text
 
 ``input.type_text(session, text, settle?) -> status`` — Type text, honor the settle pause, then return 'submitted', 'unverified' or 'late'. 'late': the text is still being written to a slow pane and its Return follows when it lands (dropped after 30 s); do not resend, check the pane.
 
+input_line_empty
+----------------
+
+``input_line_empty(session, opts?) -> true | false | nil, reason`` — Report whether a session has a visibly empty input line. Returns nil and a reason unless the cursor and prompt are visible. Dim ghost text on the cursor row is ignored; visible paste placeholders count as content. Pass opts.kind = 'shell', 'claude', or 'codex' for that exact policy. Kind is optional; without it, shared prompt glyphs, the visible Claude frame, the exact Codex placeholder, and specific Codex footer/trace cues are used. Other agent-specific layouts remain ambiguous, and an unfamiliar footer may be mistaken for composer text.
+
 insert
 ------
 

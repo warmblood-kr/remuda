@@ -1964,6 +1964,139 @@ register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments
 -- separately-timed submit key after the composer shows the text.
 remuda.input = {}
 
+local input_line_prompt_glyphs = { "❯", ">", "›" }
+local input_line_codex_placeholder = "Ask Codex to do anything"
+
+local function input_line_trim(text)
+  return (text:gsub("^%s+", ""):gsub("%s+$", ""))
+end
+
+local function input_line_row_text(row, ignore_dim)
+  local parts = {}
+  for _, span in ipairs(row or {}) do
+    if not (ignore_dim and span.dim) then
+      parts[#parts + 1] = span.text or ""
+    end
+  end
+  return table.concat(parts)
+end
+
+local function input_line_codex_trace_row(text)
+  return tostring(text or ""):match(
+    "^%d%d%d%d%-%d%d%-%d%dT%d%d:%d%d:%d%d[%.,]?%d*Z?%s+%u+%s+[%w_%.:]+:.*$") ~= nil
+end
+
+-- Returns true/false only when the cursor and a known prompt are visible.
+-- Generic mode accepts the shared prompt forms, recognizes the exact Codex
+-- placeholder and ignores Codex-only footer/trace rows when those cues appear.
+local function input_line_empty_from_snapshot(kind, screen)
+  if kind ~= nil and kind ~= "shell" and kind ~= "claude" and kind ~= "codex" then
+    return nil, "opts.kind must be shell, claude, or codex"
+  end
+  if type(screen) ~= "table" or type(screen.rows) ~= "table" or type(screen.cursor) ~= "table" then
+    return nil, "capture_styled did not return rows and cursor metadata"
+  end
+  local cursor = screen.cursor
+  if cursor.visible ~= true then return nil, "session cursor is hidden" end
+  if type(cursor.row) ~= "number" or cursor.row % 1 ~= 0
+      or cursor.row < 1 or cursor.row > #screen.rows then
+    return nil, "session cursor row is outside the captured screen"
+  end
+
+  local raw_lines, lines = {}, {}
+  local has_claude_frame = kind == "claude"
+  for index, row in ipairs(screen.rows) do
+    local raw = input_line_row_text(row, false):gsub("\194\160", " ")
+    raw_lines[index] = raw
+    if kind == nil and raw:match("^%s*│") then has_claude_frame = true end
+    -- Butler's notify policy discards dim spans on the cursor row before
+    -- checking it: dim ghost suggestions are not unsent user input.
+    lines[index] = input_line_row_text(row, index == cursor.row):gsub("\194\160", " ")
+  end
+
+  local text, prompt_at
+  for index, line in ipairs(lines) do
+    if index > cursor.row then break end
+    local rest = line:gsub("^%s+", "")
+    if has_claude_frame and rest:sub(1, 3) == "│" then
+      rest = rest:sub(4):gsub("^%s+", "")
+    end
+    for _, glyph in ipairs(input_line_prompt_glyphs) do
+      if rest:sub(1, #glyph) == glyph then
+        text, prompt_at = rest:sub(#glyph + 1), index
+        break
+      end
+    end
+  end
+  if not text then return nil, "no supported prompt glyph is visible" end
+
+  local raw_prompt = raw_lines[prompt_at]:gsub("^%s+", "")
+  if has_claude_frame and raw_prompt:sub(1, 3) == "│" then
+    raw_prompt = raw_prompt:sub(4):gsub("^%s+", "")
+  end
+  local raw_glyph
+  for _, glyph in ipairs(input_line_prompt_glyphs) do
+    if raw_prompt:sub(1, #glyph) == glyph then raw_glyph = glyph; break end
+  end
+  local raw_text = raw_glyph and raw_prompt:sub(#raw_glyph + 1) or ""
+  raw_text = input_line_trim(raw_text:gsub("│%s*$", ""))
+  if kind == nil and raw_text == input_line_codex_placeholder then
+    return true
+  end
+
+  text = input_line_trim(text:gsub("│%s*$", ""))
+  local parts = { text }
+  for index = prompt_at + 1, #lines do
+    local rest = lines[index]:gsub("^%s+", "")
+    if rest:sub(1, 3) == "╰" or rest:sub(1, 3) == "└" or rest:sub(1, 3) == "─" then break end
+    if rest:match("^%? for shortcuts")
+        or ((kind == "codex" or kind == nil)
+          and (rest:lower():find("context left", 1, true)
+            or rest:match("^[^%s]+%s+[^%s]+%s+·"))) then
+      break
+    end
+    if has_claude_frame and rest:sub(1, 3) == "│" then
+      rest = rest:sub(4):gsub("│%s*$", "")
+    end
+    parts[#parts + 1] = rest
+  end
+  text = input_line_trim(table.concat(parts, "\n"))
+
+  if kind == "codex" or kind == nil then
+    local remaining = {}
+    for row in (text .. "\n"):gmatch("(.-)\n") do
+      if not input_line_codex_trace_row(row) then remaining[#remaining + 1] = row end
+    end
+    text = input_line_trim(table.concat(remaining, "\n"))
+  end
+  if kind == "codex" and raw_text == input_line_codex_placeholder then return true end
+  if kind == "codex" and text == input_line_codex_placeholder then return true end
+  if text == "" then return true end
+  return false
+end
+
+function remuda.input_line_empty(session, opts)
+  if type(session) ~= "string" or session == "" then
+    return nil, "session must be a non-empty name"
+  end
+  if opts ~= nil and type(opts) ~= "table" then
+    return nil, "opts must be a table"
+  end
+  local kind = opts and opts.kind
+  if kind ~= nil and kind ~= "shell" and kind ~= "claude" and kind ~= "codex" then
+    return nil, "opts.kind must be shell, claude, or codex"
+  end
+  local ok, screen = pcall(remuda.capture_styled, session)
+  if not ok then return nil, tostring(screen) end
+  return input_line_empty_from_snapshot(kind, screen)
+end
+
+register(
+  "input_line_empty",
+  "Report whether a session has a visibly empty input line. Returns nil and a reason unless the cursor and prompt are visible. Dim ghost text on the cursor row is ignored; visible paste placeholders count as content. Pass opts.kind = 'shell', 'claude', or 'codex' for that exact policy. Kind is optional; without it, shared prompt glyphs, the visible Claude frame, the exact Codex placeholder, and specific Codex footer/trace cues are used. Other agent-specific layouts remain ambiguous, and an unfamiliar footer may be mistaken for composer text.",
+  "input_line_empty(session, opts?) -> true | false | nil, reason"
+)
+
 function remuda.input.text(session, text)
   remuda._input_text(session, tostring(text))
 end

@@ -1310,6 +1310,100 @@ fn capture_styled_marks_dim_spans_and_reports_the_cursor() {
     assert_eq!(got, "ghost=true -plain=false cursor=number,number,boolean");
 }
 
+#[test]
+fn input_line_empty_uses_styled_prompt_snapshots_and_returns_unknown_safely() {
+    run_lua(
+        "input-line-empty",
+        r#"
+        local original_capture = remuda.capture_styled
+        local current
+        remuda.capture_styled = function(name)
+          assert(name == "fixture")
+          if current == "capture-error" then error("capture failed") end
+          return current
+        end
+        local function span(text, dim) return { text = text, dim = dim or false } end
+        local function row(...)
+          local spans = {}
+          for _, text in ipairs({...}) do spans[#spans + 1] = type(text) == "table" and text or span(text) end
+          return spans
+        end
+        local function screen(rows, cursor_row)
+          return { rows = rows, cursor = { row = cursor_row or 1, col = 1, visible = true } }
+        end
+        local function answer(opts)
+          return remuda.input_line_empty("fixture", opts)
+        end
+        local function both(snapshot, kind, expected)
+          current = snapshot
+          local generic, generic_reason = answer()
+          assert(generic == expected, "generic result: " .. tostring(generic) .. " / " .. tostring(generic_reason))
+          local specific, specific_reason = answer({ kind = kind })
+          assert(specific == expected, kind .. " result: " .. tostring(specific) .. " / " .. tostring(specific_reason))
+        end
+
+        -- Empty prompt forms for each kind are checked both with an explicit
+        -- kind and through the generic parser on the exact same snapshot.
+        both(screen({ row("❯ ") }), "shell", true)
+        both(screen({ row("│ ❯ │") }), "claude", true) -- U+00A0 is Claude's empty prompt.
+        both(screen({ row("> ") }), "codex", true)
+
+        both(screen({ row("❯ typed command") }), "shell", false)
+        both(screen({ row("│ ❯ draft│"), row("│ continuation│"), row("╰ footer") }), "claude", false)
+        both(screen({ row("> draft"), row("3.2k tokens · context left") }), "codex", false)
+
+        -- Cursor row selects the active prompt when the screen also contains
+        -- an older shell prompt. Butler's notify policy removes dim spans from
+        -- that row first, so a dim ghost suggestion does not count as input.
+        current = screen({ row("❯ previous command"), row("❯ ", span("suggested text", true)) }, 2)
+        assert(answer({ kind = "shell" }) == true)
+
+        -- The visible Codex empty placeholder is recognized without opts.kind
+        -- for any caller; explicit non-Codex policy retains Butler's behavior.
+        current = screen({ row("> Ask Codex to do anything") })
+        assert(answer() == true)
+        assert(answer({ kind = "codex" }) == true)
+        assert(answer({ kind = "shell" }) == false)
+
+        -- Generic mode applies Codex's specific footer and trace cues when
+        -- visible, while a paste placeholder in the composer is real content.
+        both(screen({ row("> "), row("3.2k tokens · context left") }), "codex", true)
+        current = screen({ row("> "), row("gpt 5 · 40%") })
+        assert(answer() == true)
+        assert(answer({ kind = "codex" }) == true)
+        assert(answer({ kind = "shell" }) == false)
+        both(screen({ row("> "), row("2026-10-03T12:00:00Z INFO codex: startup trace") }), "codex", true)
+        both(screen({ row("❯ [Pasted text #1 +5 lines]") }), "shell", false)
+
+        current = screen({ row("ordinary terminal output") })
+        local unknown, reason = answer()
+        assert(unknown == nil and type(reason) == "string" and reason:find("prompt glyph", 1, true))
+
+        current = screen({ row("❯ ") })
+        current.cursor.visible = false
+        unknown, reason = answer()
+        assert(unknown == nil and type(reason) == "string" and reason:find("hidden", 1, true))
+
+        current = screen({ row("❯ ") })
+        current.cursor.row = 2
+        unknown, reason = answer()
+        assert(unknown == nil and type(reason) == "string" and reason:find("outside", 1, true))
+
+        current = "capture-error"
+        unknown, reason = answer()
+        assert(unknown == nil and type(reason) == "string" and reason:find("capture failed", 1, true))
+
+        remuda.capture_styled = original_capture
+        unknown, reason = remuda.input_line_empty("missing-session")
+        assert(unknown == nil and type(reason) == "string" and reason:find("no such session", 1, true))
+
+        local word = remuda._registry.input_line_empty
+        assert(word and word.signature == "input_line_empty(session, opts?) -> true | false | nil, reason")
+        assert(word.about:find("opts.kind", 1, true) and word.about:find("ambiguous", 1, true))
+        "#,
+    );
+}
+
 /// A Lua long string: a Windows path keeps its backslashes.
 fn lua_path(path: &Path) -> String {
     format!("[==[{}]==]", path.display())
