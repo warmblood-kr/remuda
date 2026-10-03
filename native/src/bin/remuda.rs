@@ -381,8 +381,8 @@ remuda — terminal orchestration for coding agents
   remuda mod update NAME|--all   update a mod
   remuda mod remove NAME         remove a mod
   remuda cluster                 show cluster status
-  remuda cluster init            create identity; starts listener on private LAN port 7441 by default
-                                  use --no-listen to skip the listener
+  remuda cluster init            create identity; opens a private-LAN listener on port 7441 by default
+                                  use --no-listen to skip it; listen --off stops it; listen --bind IP[:PORT] limits its address
   remuda cluster init --new-identity [--yes]
                                  leave the cluster and create a new identity
   remuda cluster invite           invite another node
@@ -884,7 +884,7 @@ fn parse_addr_default_port(value: &str) -> Result<std::net::SocketAddr, String> 
 
 pub fn cluster_usage(verb: &str) -> String {
     match verb {
-        "init" => format!("usage: remuda cluster init [--no-listen | --new-identity [--yes]]\nCreates this node's cluster identity and starts a listener on a private LAN address (port {CLUSTER_DEFAULT_PORT}) by default. Use --no-listen to skip the listener.\nexample: remuda cluster init --no-listen\n"),
+        "init" => format!("usage: remuda cluster init [--no-listen | --new-identity [--yes]]\nCreates this node's identity and opens a listener for cluster nodes on a private LAN address (port {CLUSTER_DEFAULT_PORT}) by default.\nUse --no-listen to skip opening a port; run `remuda cluster listen --off` to stop it later; use `remuda cluster listen --bind IP[:PORT]` to limit the address (127.0.0.1:7441 for local-only).\nexample: remuda cluster init --no-listen\n"),
         "invite" => format!("usage: remuda cluster invite [--bind IP[:PORT]] [--addr IP[:PORT]] (default port {CLUSTER_DEFAULT_PORT})\nexample: remuda cluster invite\n"),
         "join" => format!("usage: remuda cluster join [FINGERPRINT] 'JOIN_LINE' (FINGERPRINT required when not on a terminal) [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})]\nexample: remuda cluster join 'remuda-join-v1 …'\n"),
         "nodes" => "usage: remuda cluster nodes\nexample: remuda cluster nodes\n".into(),
@@ -893,7 +893,7 @@ pub fn cluster_usage(verb: &str) -> String {
         "remote" => "usage: remuda cluster remote [NODE/SESSION]\nexample: remuda cluster remote\n".into(),
         "listen" => format!("usage: remuda cluster listen [--bind IP[:PORT] (default port {CLUSTER_DEFAULT_PORT})] [--allow-public] [--foreground]\nusage: remuda cluster listen --off\nexample: remuda cluster listen\n"),
         "call" => format!("usage: remuda cluster call NODE (list|capture SESSION) --addr IP[:PORT] (default port {CLUSTER_DEFAULT_PORT}) [--json]\nexample: remuda cluster call node-abcd1234 list --addr 192.0.2.1\n"),
-        _ => "usage: remuda cluster <command>\n  init\n    creates identity; starts listener on private LAN port 7441 by default\n    --no-listen skips the listener\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n".into(),
+        _ => "usage: remuda cluster <command>\n  init\n    creates identity; opens listener for cluster nodes on private LAN port 7441 by default\n    --no-listen skips opening it; listen --off stops it; listen --bind IP[:PORT] limits its address\n  invite\n  join\n  nodes\n  revoke\n  control\n  remote\n  listen\n  call\n  help\n".into(),
     }
 }
 
@@ -1275,7 +1275,7 @@ fn cluster_init(server: &str, path: &Path, no_listen: bool) -> ExitCode {
     })
 }
 
-const CLUSTER_INIT_LISTENER_START_NOTICE: &str = "Starting the cluster listener (private LAN address, port 7441 by default). Only admitted machines can connect. To skip it: remuda cluster init --no-listen";
+const CLUSTER_INIT_LISTENER_START_NOTICE: &str = "Starting the listener for cluster nodes on the private LAN (port 7441 by default). Only admitted machines can connect. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (127.0.0.1:7441 for local-only).";
 
 fn write_cluster_init_listener_starting_notice() -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
@@ -1331,14 +1331,35 @@ fn render_init_listener_lines(status: &remuda_core::protocol::ListenerStatus) ->
     match status {
         ListenerStatus::On {
             addr,
-            auto,
             advertise_addr,
             listen_addrs,
+            ..
         } => {
-            let mut lines = render_listener_addresses(*addr, *auto, *advertise_addr, listen_addrs);
-            lines.push(
-                "Only admitted machines can connect; turn off: remuda cluster listen --off".into(),
-            );
+            let addresses = if listen_addrs.is_empty() {
+                vec![*addr]
+            } else {
+                listen_addrs.to_vec()
+            };
+            let rendered_addresses = addresses
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let reachability = if addresses.iter().all(|address| address.ip().is_loopback()) {
+                "loopback only"
+            } else {
+                "reachable from your LAN"
+            };
+            let mut lines = vec![format!(
+                "Listening for cluster nodes on {rendered_addresses} ({reachability})"
+            )];
+            if let Some(advertise_addr) =
+                advertise_addr.filter(|advertised| !addresses.contains(advertised))
+            {
+                lines.push(format!("Invites use {advertise_addr}"));
+            }
+            lines.push("Only admitted machines can connect.".into());
+            lines.push("To skip opening a port on init, use `remuda cluster init --no-listen`; to stop it later, run `remuda cluster listen --off`; to limit the address, run `remuda cluster listen --bind IP[:PORT]` (use `127.0.0.1:7441` for local-only).".into());
             lines.push(next_step_init().into());
             lines
         }
@@ -2738,7 +2759,7 @@ fn invite_message(line: &remuda_native::cluster::join_line::JoinLine) -> std::io
 }
 
 fn next_step_init() -> &'static str {
-    "Next: remuda cluster invite (on this machine), or join an existing cluster with the command another machine's invite prints."
+    "Next: run `remuda cluster invite` here, then run its printed `remuda cluster join ...` command on the other node."
 }
 
 fn next_step_join() -> &'static str {
@@ -2942,11 +2963,16 @@ mod cluster_cli_tests {
                 listen_addrs: vec!["192.0.2.4:7441".parse().unwrap()],
             },
         );
+        assert!(listening.iter().any(|line| {
+            line == "Listening for cluster nodes on 192.0.2.4:7441 (reachable from your LAN)"
+        }));
         assert!(listening
             .iter()
-            .any(|line| { line == "Listening on 192.0.2.4:7441" }));
+            .any(|line| line == "Only admitted machines can connect."));
         assert!(listening.iter().any(|line| {
-            line == "Only admitted machines can connect; turn off: remuda cluster listen --off"
+            line.contains("remuda cluster init --no-listen")
+                && line.contains("remuda cluster listen --off")
+                && line.contains("remuda cluster listen --bind IP[:PORT]")
         }));
         assert!(listening.iter().any(|line| line.starts_with("Next:")));
 
@@ -3773,7 +3799,7 @@ mod cluster_cli_tests {
     fn next_steps_cover_init_join_and_single_member_status() {
         assert_eq!(
             next_step_init(),
-            "Next: remuda cluster invite (on this machine), or join an existing cluster with the command another machine's invite prints."
+            "Next: run `remuda cluster invite` here, then run its printed `remuda cluster join ...` command on the other node."
         );
         assert_eq!(next_step_join(), "Next: remuda cluster remote");
         assert_eq!(
@@ -4075,7 +4101,9 @@ mod cluster_cli_tests {
         };
         let lines = render_init_listener_lines(&status).join("\n");
         assert!(
-            lines.contains("Listening on 192.168.1.20:7441"),
+            lines.contains(
+                "Listening for cluster nodes on 192.168.1.20:7441 (reachable from your LAN)"
+            ),
             "init output must show the detected bind address: {lines}"
         );
     }
