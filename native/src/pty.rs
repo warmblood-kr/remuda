@@ -410,7 +410,9 @@ impl AgentWriter for PtyInputWriter {
 /// BEFORE emitting anything and waits: unanswered, the child is alive and the
 /// screen is blank forever. Measured on a windows-latest runner; see steps/010.
 const DSR_CURSOR: &[u8] = b"\x1b[6n";
-const DSR_REPLY_RETRY_LIMIT: usize = 250;
+// A 500 ms cap covers ConPTY's startup query before user input while avoiding
+// a cursor reply arriving late between a user's write body and follow-up.
+const DSR_REPLY_RETRY_LIMIT: usize = 50;
 const DSR_REPLY_RETRY_DELAY: Duration = Duration::from_millis(10);
 const SCROLLBACK_ROWS: usize = 10_000;
 const SCROLLBACK_PROBE_CHUNK: usize = 512;
