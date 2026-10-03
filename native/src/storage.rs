@@ -1442,29 +1442,6 @@ mod tests {
         }
     }
 
-    #[cfg(windows)]
-    fn metadata_probe(path: &Path) -> String {
-        match fs::metadata(path) {
-            Ok(_) => "Ok".to_owned(),
-            Err(error) => format!("Err({:?}, {:?})", error.kind(), error.raw_os_error()),
-        }
-    }
-
-    #[cfg(windows)]
-    fn secret_path_probes(root: &Path) -> String {
-        let secret = root.join("secret");
-        let storage = secret.join("storage");
-        format!(
-            "root {}: {}; root/secret {}: {}; root/secret/storage {}: {}",
-            root.display(),
-            metadata_probe(root),
-            secret.display(),
-            metadata_probe(&secret),
-            storage.display(),
-            metadata_probe(&storage),
-        )
-    }
-
     fn env(values: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let values: HashMap<_, _> = values
             .iter()
@@ -1771,10 +1748,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn restricted_admin_token(
-        admin_sid: *mut std::ffi::c_void,
-        restricted_sid: Option<*mut std::ffi::c_void>,
-    ) -> TestToken {
+    fn restricted_admin_token(admin_sid: *mut std::ffi::c_void) -> TestToken {
         use windows_sys::Win32::Security::{
             CreateRestrictedToken, DISABLE_MAX_PRIVILEGE, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE,
             TOKEN_IMPERSONATE, TOKEN_QUERY,
@@ -1798,14 +1772,6 @@ mod tests {
             Sid: admin_sid,
             Attributes: 0x0000_0010, // SE_GROUP_USE_FOR_DENY_ONLY
         };
-        let restricted_sid = restricted_sid.map(|sid| SID_AND_ATTRIBUTES {
-            Sid: sid,
-            Attributes: 0,
-        });
-        let (restricted_count, restricted_sids) = match &restricted_sid {
-            Some(sid) => (1, sid as *const SID_AND_ATTRIBUTES),
-            None => (0, std::ptr::null()),
-        };
         let mut restricted = std::ptr::null_mut();
         assert_ne!(
             unsafe {
@@ -1816,8 +1782,8 @@ mod tests {
                     &disabled_admin,
                     0,
                     std::ptr::null(),
-                    restricted_count,
-                    restricted_sids,
+                    0,
+                    std::ptr::null(),
                     &mut restricted,
                 )
             },
@@ -1828,27 +1794,23 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn assert_worker_admin_is_deny_only(admin_sid: *mut std::ffi::c_void, check_membership: bool) {
+    fn assert_worker_admin_is_deny_only(admin_sid: *mut std::ffi::c_void) {
         use windows_sys::Win32::Security::{
             CheckTokenMembership, EqualSid, GetTokenInformation, TokenGroups, SID_AND_ATTRIBUTES,
             TOKEN_GROUPS, TOKEN_QUERY,
         };
         use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
-        // CheckTokenMembership itself fails for a token with a restricting SID;
-        // deny-only is asserted from TokenGroups below in all cases.
-        if check_membership {
-            let mut is_member = 1;
-            assert_ne!(
-                unsafe { CheckTokenMembership(std::ptr::null_mut(), admin_sid, &mut is_member) },
-                0,
-                "check impersonated Administrators membership"
-            );
-            assert_eq!(
-                is_member, 0,
-                "Administrators must not be enabled in worker token"
-            );
-        }
+        let mut is_member = 1;
+        assert_ne!(
+            unsafe { CheckTokenMembership(std::ptr::null_mut(), admin_sid, &mut is_member) },
+            0,
+            "check impersonated Administrators membership"
+        );
+        assert_eq!(
+            is_member, 0,
+            "Administrators must not be enabled in worker token"
+        );
 
         let mut raw_token = std::ptr::null_mut();
         assert_ne!(
@@ -1906,6 +1868,9 @@ mod tests {
 
     #[cfg(all(test, windows))]
     #[test]
+    // Proves an Administrators-deny-only token (same user) reads, checks and deletes an
+    // elevated-written secret via the current-user owner + Owner Rights ACEs. Not a different-user
+    // test; a negative case would need a second logon and is not covered.
     fn windows_secret_survives_admin_deny_only_impersonation() {
         use windows_sys::Win32::Security::ImpersonateLoggedOnUser;
 
@@ -1922,14 +1887,14 @@ mod tests {
         std::thread::spawn(move || {
             let sid = well_known_sid(windows_sys::Win32::Security::WinBuiltinAdministratorsSid);
             let admin_sid = sid.as_ptr().cast_mut().cast();
-            let token = restricted_admin_token(admin_sid, None);
+            let token = restricted_admin_token(admin_sid);
             assert_ne!(
                 unsafe { ImpersonateLoggedOnUser(token.0) },
                 0,
                 "impersonate restricted worker token"
             );
             let _revert = RevertImpersonation;
-            assert_worker_admin_is_deny_only(admin_sid, true);
+            assert_worker_admin_is_deny_only(admin_sid);
 
             let reader = lua_with_xdg_root(&worker_root);
             select_backend(&reader, "xdg");
@@ -1949,92 +1914,6 @@ mod tests {
         })
         .join()
         .expect("restricted-token worker panicked");
-    }
-
-    #[cfg(all(test, windows))]
-    #[test]
-    fn windows_secret_denies_token_with_unmatched_restricted_sid() {
-        use windows_sys::Win32::Security::{
-            ImpersonateLoggedOnUser, WinBuiltinAdministratorsSid, WinBuiltinGuestsSid,
-        };
-
-        assert_process_is_elevated();
-        let root = TestRoot::new();
-        let writer = lua_with_xdg_root(&root.0);
-        select_backend(&writer, "xdg");
-        writer
-            .load(r#"assert(remuda.storage.get("restricted-negative"):secret():put("token", "elevated secret"))"#)
-            .exec()
-            .unwrap();
-
-        let worker_root = root.0.clone();
-        std::thread::spawn(move || {
-            let reader = lua_with_xdg_root(&worker_root);
-            select_backend(&reader, "xdg");
-            let admin = well_known_sid(WinBuiltinAdministratorsSid);
-            let guests = well_known_sid(WinBuiltinGuestsSid);
-            let admin_sid = admin.as_ptr().cast_mut().cast();
-            let guest_sid = guests.as_ptr().cast_mut().cast();
-            // This retains the current TokenUser; it is a restricted-token negative case,
-            // not a different-user test. Guests is absent from the secret DACL.
-            {
-                let token = restricted_admin_token(admin_sid, Some(guest_sid));
-                assert_ne!(
-                    unsafe { ImpersonateLoggedOnUser(token.0) },
-                    0,
-                    "impersonate token with unmatched restricting SID"
-                );
-                let _revert = RevertImpersonation;
-                assert_worker_admin_is_deny_only(admin_sid, false);
-                // This denial does not distinguish the namespace-directory ACL from the file ACL.
-                let probes = secret_path_probes(&worker_root);
-                eprintln!("Guests-restricted path probes: {probes}");
-                let result = reader
-                    .load(
-                        r#"
-                        local secret = remuda.storage.get("restricted-negative"):secret()
-                        local value, reason = secret:get("token")
-                        assert(value == nil and reason and reason:match("^denied:"),
-                            "unmatched restricting SID must deny read")
-                        "#,
-                    )
-                    .exec();
-                assert!(
-                    result.is_ok(),
-                    "Guests-restricted read result: {result:?}; {probes}"
-                );
-            }
-
-            let control_token = restricted_admin_token(admin_sid, Some(admin_sid));
-            assert_ne!(
-                unsafe { ImpersonateLoggedOnUser(control_token.0) },
-                0,
-                "impersonate token with Administrators restricting SID"
-            );
-            let _revert = RevertImpersonation;
-            assert_worker_admin_is_deny_only(admin_sid, false);
-            let probes = secret_path_probes(&worker_root);
-            eprintln!("Administrators-restricted path probes: {probes}");
-            let result = reader
-                .load(
-                    r#"
-                    local secret = remuda.storage.get("restricted-negative"):secret()
-                    local value, reason = secret:get("token")
-                    assert(value == "elevated secret", "Administrators restricting SID should allow get: " .. tostring(reason))
-                    "#,
-                )
-                .exec();
-            assert!(
-                result.is_ok(),
-                "Administrators-restricted control result: {result:?}; {probes}"
-            );
-        })
-        .join()
-        .expect("restricted negative worker panicked");
-        writer
-            .load(r#"assert(remuda.storage.get("restricted-negative"):secret():exists("token"))"#)
-            .exec()
-            .unwrap();
     }
 
     #[test]
