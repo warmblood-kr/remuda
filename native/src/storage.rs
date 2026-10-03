@@ -1000,7 +1000,7 @@ struct KindHandle {
 
 impl KindHandle {
     fn file_path(&self, name: &str, create: bool) -> io::Result<FileLocation> {
-        if matches!(self.kind, HandleKind::Secret) {
+        if matches!(self.kind, HandleKind::Secret) && !cfg!(windows) {
             return Err(io_denied());
         }
         let root = self
@@ -1029,7 +1029,10 @@ impl KindHandle {
         }
         #[cfg(windows)]
         {
-            let mut directory = root.directory.open_directory(&self.namespace, create)?;
+            let secret = matches!(self.kind, HandleKind::Secret);
+            let mut directory =
+                root.directory
+                    .open_directory_policy(&self.namespace, create, secret)?;
             let mut parts = if name.is_empty() {
                 Vec::new()
             } else {
@@ -1080,7 +1083,7 @@ impl KindHandle {
     ) -> mlua::Result<(Option<mlua::LuaString>, Option<String>)> {
         let key = self.key(name)?;
         if self.roots.is_some() {
-            if matches!(self.kind, HandleKind::Secret) {
+            if matches!(self.kind, HandleKind::Secret) && !cfg!(windows) {
                 return Ok((
                     None,
                     Some("unavailable: file secrets require a dedicated protected root".into()),
@@ -1123,7 +1126,7 @@ impl KindHandle {
         }
         let key = self.key(name)?;
         if self.roots.is_some() {
-            if matches!(self.kind, HandleKind::Secret) {
+            if matches!(self.kind, HandleKind::Secret) && !cfg!(windows) {
                 return Err(mlua::Error::runtime(
                     "unavailable: file secrets require a dedicated protected root",
                 ));
@@ -1177,7 +1180,7 @@ impl KindHandle {
     fn exists(&self, name: String) -> mlua::Result<bool> {
         let key = self.key(name)?;
         if self.roots.is_some() {
-            if matches!(self.kind, HandleKind::Secret) {
+            if matches!(self.kind, HandleKind::Secret) && !cfg!(windows) {
                 return Ok(false);
             }
             let location = match self.file_path(&key.2, false) {
@@ -1198,7 +1201,7 @@ impl KindHandle {
     fn delete(&self, name: String) -> mlua::Result<(Option<bool>, Option<String>)> {
         let key = self.key(name)?;
         if self.roots.is_some() {
-            if matches!(self.kind, HandleKind::Secret) {
+            if matches!(self.kind, HandleKind::Secret) && !cfg!(windows) {
                 return Ok((
                     None,
                     Some("unavailable: file secrets require a dedicated protected root".into()),
@@ -1300,8 +1303,8 @@ impl UserData for SecretHandle {
                         "remuda.storage.secret.put secret must be 1..=2048 bytes",
                     ));
                 }
-                // File secrets stay unavailable until Windows has a dedicated protected root.
-                if this.0.roots.is_some() {
+                // Non-Windows file secrets stay unavailable until a protected backend exists.
+                if this.0.roots.is_some() && !cfg!(windows) {
                     return Ok((
                         None,
                         Some(
