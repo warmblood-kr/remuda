@@ -37,6 +37,11 @@ const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 #[cfg(any(windows, test))]
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 
+#[cfg(all(test, windows))]
+thread_local! {
+    static FAIL_NEXT_STORAGE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(any(windows, test))]
 pub(crate) fn nt_open_policy(directory: bool) -> NtOpenPolicy {
     NtOpenPolicy {
@@ -158,6 +163,8 @@ pub(crate) fn storage_root_for(env: &dyn Fn(&str) -> Option<OsString>) -> Result
 
 #[cfg(windows)]
 mod platform {
+    #[cfg(test)]
+    use super::FAIL_NEXT_STORAGE_RENAME;
     use super::{
         ace_sid_fits, build_file_rename_info, nt_open_policy, protected_storage_sddl,
         relative_component_utf16,
@@ -261,14 +268,12 @@ mod platform {
             Ok(file)
         }
 
-        #[allow(dead_code)] // Wired into storage::write_location in the next D2 commit.
         pub(crate) fn write_atomic(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
             match self.open_file(name, false) {
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-
             let mut temporary = None;
             for _ in 0..8 {
                 let name = random_temporary_name()?;
@@ -290,11 +295,17 @@ mod platform {
             temporary.file.write_all(bytes)?;
             temporary.file.sync_all()?;
 
+            #[cfg(test)]
+            if FAIL_NEXT_STORAGE_RENAME.with(|fail| fail.replace(false)) {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+
             let mut rename_info =
                 build_file_rename_info(self.file.as_raw_handle() as usize, name, true)?;
             let length = u32::try_from(rename_info.len())
                 .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            // FileRenameInfoEx = 22; POSIX semantics and replace-if-exists are both required.
+            // FileRenameInfoEx = 22; POSIX semantics and replace-if-exists are required.
+            // SAFETY: the aligned buffer and owned file handle remain live through the call.
             if unsafe {
                 SetFileInformationByHandle(
                     temporary.file.as_raw_handle(),
@@ -482,9 +493,11 @@ mod platform {
             SecurityDescriptor: ptr::null_mut(),
             SecurityQualityOfService: ptr::null_mut(),
         };
+        // SAFETY: A zeroed IO_STATUS_BLOCK is the required initialized output structure.
         let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
         let mut raw = ptr::null_mut();
         // FILE_CREATE makes collisions fail instead of opening an existing sibling.
+        // SAFETY: all NT structures and the component buffer remain live through the call.
         let status = unsafe {
             NtCreateFile(
                 &mut raw,
@@ -643,8 +656,11 @@ mod platform {
                 &mut raw_descriptor,
             )
         };
-        if result != 0 {
-            return Err(io::Error::from_raw_os_error(result as i32));
+            if result != 0 {
+                return Err(io::Error::from_raw_os_error(result as i32));
+            }
+        if raw_descriptor.is_null() {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         let descriptor = LocalMemory(raw_descriptor.cast());
         let user = UserSid::current()?;
@@ -708,7 +724,10 @@ mod platform {
             }
             // SAFETY: GetAce returned an ACE pointer owned by the live DACL.
             let header = unsafe { &*(raw_ace.cast::<ACE_HEADER>()) };
-            if header.AceType != 0 || header.AceFlags & 0x10 == 0 {
+            if header.AceSize as usize > info.AclBytesInUse as usize
+                || header.AceType != 0
+                || header.AceFlags & 0x10 == 0
+            {
                 return Err(policy_error("storage child ACE policy mismatch"));
             }
             let fixed_size = std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>();
@@ -721,6 +740,16 @@ mod platform {
                 return Err(policy_error("storage child ACE mask mismatch"));
             }
             let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
+            let sid_bytes = sid.cast::<u8>();
+            // SAFETY: the checked ACE prefix includes the initial eight-byte SID header.
+            let (revision, sub_authority_count) = unsafe { (*sid_bytes, *sid_bytes.add(1)) };
+            if revision != 1 || sub_authority_count > 15 {
+                return Err(policy_error("storage child ACE SID is invalid"));
+            }
+            let sid_size = 8 + usize::from(sub_authority_count) * std::mem::size_of::<u32>();
+            if !ace_sid_fits(header.AceSize as usize, fixed_size, sid_size) {
+                return Err(policy_error("storage child ACE SID is truncated"));
+            }
             principals.push(sid_text(sid)?);
         }
         principals.sort();
@@ -1122,6 +1151,11 @@ mod tests {
         let encoded = name.encode_utf16().collect::<Vec<_>>();
 
         assert_eq!(u32::from_le_bytes(info[0..4].try_into().unwrap()), 0x3);
+        let no_replace = build_file_rename_info(root, name, false).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(no_replace[0..4].try_into().unwrap()),
+            0x2
+        );
         assert_eq!(
             usize::from_le_bytes(info[root_offset..length_offset].try_into().unwrap()),
             root
@@ -1234,5 +1268,22 @@ mod windows_tests {
         assert!(status.success(), "could not create junction for test");
         assert!(ensure_storage_root(&link).is_err());
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn failed_handle_relative_rename_leaves_no_target_or_temporary_sibling() {
+        let root = test_root();
+        let storage = ensure_storage_root(&root).unwrap();
+        let namespace = storage.open_directory("atomic-failure", true).unwrap();
+        FAIL_NEXT_STORAGE_RENAME.with(|fail| fail.set(true));
+        let result = namespace.write_atomic("target", b"value");
+        FAIL_NEXT_STORAGE_RENAME.with(|fail| fail.set(false));
+        let error = result.unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(namespace.names().unwrap(), Vec::<String>::new());
+        drop(namespace);
+        drop(storage);
+        fs::remove_dir_all(root).unwrap();
     }
 }

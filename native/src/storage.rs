@@ -329,8 +329,6 @@ struct FileLocation {
     directory: crate::windows_security::StorageDirectory,
     #[cfg(windows)]
     name: String,
-    #[cfg(windows)]
-    path: PathBuf,
     #[cfg(not(any(unix, windows)))]
     path: PathBuf,
 }
@@ -679,9 +677,7 @@ fn write_location(location: &FileLocation, bytes: &[u8]) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        location.directory.open_file(&location.name, true)?;
-        // The handle walk validated the leaf and every parent; D2 makes this handle-relative.
-        crate::fs_atomic::write_atomic_lua_private(&location.path, bytes)
+        location.directory.write_atomic(&location.name, bytes)
     }
     #[cfg(all(not(unix), not(windows)))]
     {
@@ -1026,7 +1022,6 @@ impl KindHandle {
             Ok(FileLocation {
                 directory,
                 name: leaf.to_owned(),
-                path: root.path.join(&self.namespace).join(name),
             })
         }
         #[cfg(all(not(unix), not(windows)))]
@@ -1534,6 +1529,7 @@ mod tests {
 
         let mut dacl = std::ptr::null_mut();
         let mut descriptor = std::ptr::null_mut();
+        // SAFETY: file is an open handle and all output pointers remain live for the call.
         let result = unsafe {
             GetSecurityInfo(
                 file.as_raw_handle(),
@@ -1547,9 +1543,14 @@ mod tests {
             )
         };
         assert_eq!(result, 0, "query opened storage handle ACL");
+        assert!(
+            !descriptor.is_null(),
+            "opened handle has a security descriptor"
+        );
         assert!(!dacl.is_null(), "opened storage handle has a DACL");
         let mut info = ACL_SIZE_INFORMATION::default();
         assert_ne!(
+            // SAFETY: dacl is owned by descriptor; info is a correctly sized output buffer.
             unsafe {
                 GetAclInformation(
                     dacl,
@@ -1566,13 +1567,18 @@ mod tests {
         for index in 0..info.AceCount {
             let mut raw_ace = std::ptr::null_mut();
             assert_ne!(
+                // SAFETY: dacl is valid and raw_ace is a writable output pointer.
                 unsafe { GetAce(dacl, index, &mut raw_ace) },
                 0,
                 "read storage ACE"
             );
+            assert!(!raw_ace.is_null(), "storage ACL ACE is present");
+            // SAFETY: GetAce returned an ACE pointer owned by the live DACL.
             let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
             assert_eq!(header.AceType, 0, "storage ACL contains only allow ACEs");
             assert_ne!(header.AceFlags & 0x10, 0, "storage ACE is inherited");
+            assert!(header.AceSize as usize >= std::mem::size_of::<ACCESS_ALLOWED_ACE>());
+            // SAFETY: AceSize covers the ACCESS_ALLOWED_ACE prefix checked above.
             let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
             assert_eq!(
                 ace.Mask,
@@ -1581,14 +1587,19 @@ mod tests {
             );
             let sid = (&ace.SidStart as *const u32).cast_mut().cast();
             let mut sid_text = std::ptr::null_mut();
+            // SAFETY: sid points into a live, size-checked allow ACE.
             assert_ne!(unsafe { ConvertSidToStringSidW(sid, &mut sid_text) }, 0);
+            assert!(!sid_text.is_null(), "storage ACE SID converted");
             let mut length = 0;
+            // SAFETY: ConvertSidToStringSidW returns a NUL-terminated allocation.
             while unsafe { *sid_text.add(length) } != 0 {
                 length += 1;
             }
+            // SAFETY: the scan found the NUL terminator within the returned allocation.
             principals.push(String::from_utf16_lossy(unsafe {
                 std::slice::from_raw_parts(sid_text, length)
             }));
+            // SAFETY: sid_text is the allocation returned by ConvertSidToStringSidW.
             unsafe { windows_sys::Win32::Foundation::LocalFree(sid_text.cast()) };
         }
         principals.sort();
@@ -1597,6 +1608,7 @@ mod tests {
             ["S-1-3-4", "S-1-5-18", "S-1-5-32-544"],
             "opened storage handle ACL principals"
         );
+        // SAFETY: descriptor is the allocation returned by GetSecurityInfo.
         unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor.cast()) };
     }
 
@@ -2062,10 +2074,9 @@ mod tests {
         let handle = xdg_data_handle(&root.0, "inherited-acl");
         let location = handle.file_path("nested/item", true).unwrap();
         write_location(&location, b"protected").unwrap();
-        let nested = location.directory.open_directory("nested", false).unwrap();
-        let file = nested.open_file("item", false).unwrap();
+        let file = location.directory.open_file("item", false).unwrap();
 
-        assert_inherited_storage_acl(nested.as_file_for_test());
+        assert_inherited_storage_acl(location.directory.as_file_for_test());
         assert_inherited_storage_acl(&file);
     }
 
@@ -2083,7 +2094,7 @@ mod tests {
         write_location(&location, &first).unwrap();
         let done = Arc::new(AtomicBool::new(false));
         let reader_done = Arc::clone(&done);
-        let path = location.path.clone();
+        let path = root.0.join("data/storage/atomic-overwrite/item");
         let reader_first = first.clone();
         let reader_second = second.clone();
         let reader = thread::spawn(move || {
