@@ -29,7 +29,7 @@ impl Drop for AutostartDaemonGuard {
             .output();
 
         for pid in &pids {
-            if process_matches_runtime(*pid, &self.runtime) {
+            if can_signal_pid(*pid) && process_matches_runtime(*pid, &self.runtime) {
                 let _ = Command::new("kill")
                     .args(["-TERM", &pid.to_string()])
                     .status();
@@ -45,7 +45,7 @@ impl Drop for AutostartDaemonGuard {
             std::thread::sleep(Duration::from_millis(20));
         }
         for pid in pids {
-            if process_matches_runtime(pid, &self.runtime) {
+            if can_signal_pid(pid) && process_matches_runtime(pid, &self.runtime) {
                 let _ = Command::new("kill")
                     .args(["-KILL", &pid.to_string()])
                     .status();
@@ -124,6 +124,16 @@ fn process_matches_runtime(pid: u32, runtime: &Path) -> bool {
         )
 }
 
+#[cfg(not(unix))]
+fn process_matches_runtime(_pid: u32, _runtime: &Path) -> bool {
+    false
+}
+
+fn can_signal_pid(pid: u32) -> bool {
+    pid > 1 && pid != std::process::id()
+}
+
+#[cfg(unix)]
 fn runtime_env_token_matches(command: &str, expected_token: &str) -> bool {
     command
         .split_whitespace()
@@ -136,7 +146,7 @@ fn daemon_pids_for_runtime(_runtime: &Path) -> Vec<u32> {
     Vec::new()
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::runtime_env_token_matches;
 
@@ -148,6 +158,14 @@ mod tests {
         ));
         assert!(!runtime_env_token_matches(
             "remuda daemon REMUDA_RUNTIME_DIR=/tmp/rcx-1234 -s s",
+            "REMUDA_RUNTIME_DIR=/tmp/rcx-123"
+        ));
+        assert!(!runtime_env_token_matches(
+            "remuda daemon X_REMUDA_RUNTIME_DIR=/tmp/rcx-123 -s s",
+            "REMUDA_RUNTIME_DIR=/tmp/rcx-123"
+        ));
+        assert!(!runtime_env_token_matches(
+            "remuda daemon REMUDA_RUNTIME_DIR=/tmp/rcx-123/sub -s s",
             "REMUDA_RUNTIME_DIR=/tmp/rcx-123"
         ));
     }
