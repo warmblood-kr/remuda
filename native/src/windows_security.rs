@@ -63,6 +63,9 @@ struct FileRenameInfoBuffer {
 }
 
 #[cfg(any(windows, test))]
+const FILE_RENAME_INFORMATION_EX_CLASS: i32 = 65;
+
+#[cfg(any(windows, test))]
 impl FileRenameInfoBuffer {
     fn as_mut_bytes(&mut self) -> &mut [u8] {
         // SAFETY: `words` is aligned storage and every allocated byte is initialized.
@@ -81,7 +84,7 @@ impl std::ops::Deref for FileRenameInfoBuffer {
 }
 
 #[cfg(any(windows, test))]
-fn build_file_rename_info(
+fn build_nt_file_rename_info(
     root_directory: usize,
     name: &str,
     replace: bool,
@@ -182,8 +185,9 @@ mod platform {
     #[cfg(test)]
     use super::FAIL_NEXT_STORAGE_RENAME;
     use super::{
-        ace_sid_fits, build_file_rename_info, inherited_child_ace_matches, nt_open_policy,
+        ace_sid_fits, build_nt_file_rename_info, inherited_child_ace_matches, nt_open_policy,
         protected_storage_sddl, relative_component_utf16, trusted_storage_owner,
+        FILE_RENAME_INFORMATION_EX_CLASS,
     };
     use std::ffi::{c_void, OsStr};
     use std::fs;
@@ -195,7 +199,8 @@ mod platform {
     use std::sync::Mutex;
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        NtCreateFile, NtOpenFile, NtQueryDirectoryFile, FILE_NAMES_INFORMATION,
+        NtCreateFile, NtOpenFile, NtQueryDirectoryFile, NtSetInformationFile,
+        FILE_NAMES_INFORMATION,
     };
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, LocalFree, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING,
@@ -317,21 +322,24 @@ mod platform {
             }
 
             let mut rename_info =
-                build_file_rename_info(self.file.as_raw_handle() as usize, name, true)?;
+                build_nt_file_rename_info(self.file.as_raw_handle() as usize, name, true)?;
             let length = u32::try_from(rename_info.len())
                 .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            // FileRenameInfoEx = 22; POSIX semantics and replace-if-exists are required.
-            // SAFETY: the aligned buffer and owned file handle remain live through the call.
-            if unsafe {
-                SetFileInformationByHandle(
+            // SAFETY: A zeroed IO_STATUS_BLOCK is a valid writable output structure.
+            let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+            // NtSetInformationFile accepts the held parent handle in the relative-name payload.
+            // SAFETY: the aligned buffer, status block, and owned file handle live through the call.
+            let status = unsafe {
+                NtSetInformationFile(
                     temporary.file.as_raw_handle(),
-                    22,
+                    &mut status_block,
                     rename_info.as_mut_bytes().as_mut_ptr().cast(),
                     length,
+                    FILE_RENAME_INFORMATION_EX_CLASS,
                 )
-            } == 0
-            {
-                return Err(last_error());
+            };
+            if status < 0 {
+                return Err(nt_error(status));
             }
             temporary.delete_on_drop = false;
             Ok(())
