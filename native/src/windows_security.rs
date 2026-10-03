@@ -163,6 +163,11 @@ mod platform {
     }
 
     impl StorageDirectory {
+        #[cfg(test)]
+        pub(crate) fn as_file_for_test(&self) -> &std::fs::File {
+            &self.file
+        }
+
         pub(crate) fn open_directory(&self, name: &str, create: bool) -> io::Result<Self> {
             if create
                 && self
