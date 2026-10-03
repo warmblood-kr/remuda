@@ -1925,6 +1925,23 @@ fn truncate_terminal_text(text: &str, max_columns: usize) -> String {
     result
 }
 
+fn prompt_columns(columns: usize) -> usize {
+    match columns {
+        0 => 80,
+        columns => columns.max(20),
+    }
+}
+
+fn sanitize_prompt_display_text(text: &str) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    text.chars()
+        .filter(|character| {
+            !character.is_control() && UnicodeWidthChar::width_cjk(*character).unwrap_or(0) > 0
+        })
+        .collect()
+}
+
 fn wrap_prompt_text(text: &str, columns: usize, indent_first: bool) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
 
@@ -1949,33 +1966,116 @@ fn wrap_prompt_text(text: &str, columns: usize, indent_first: bool) -> Vec<Strin
 fn truncate_secret_prompt_label(label: &str, max_columns: usize) -> String {
     use unicode_width::UnicodeWidthStr;
 
-    if UnicodeWidthStr::width(label) <= max_columns {
+    if UnicodeWidthStr::width_cjk(label) <= max_columns {
         return label.to_owned();
     }
 
-    let tag_end = label
-        .starts_with("remuda[")
-        .then(|| label.find("] ").map(|index| index + 2))
-        .flatten();
+    let tag_end = prompt_tag_end(label);
     let (tag, caller_label) = tag_end
         .map(|end| (&label[..end], &label[end..]))
         .unwrap_or(("", label));
-    let tag_width = UnicodeWidthStr::width(tag);
+    let tag_width = UnicodeWidthStr::width_cjk(tag);
     if tag_width >= max_columns {
-        return tag.to_owned();
+        return truncate_prompt_text(tag, max_columns);
     }
 
     let marker = "…";
-    let caller_width = max_columns.saturating_sub(tag_width + 1);
+    let marker_width = UnicodeWidthStr::width_cjk(marker);
+    let caller_width = max_columns.saturating_sub(tag_width + marker_width);
     let mut clipped = String::new();
     for character in caller_label.chars() {
         clipped.push(character);
-        if UnicodeWidthStr::width(clipped.as_str()) > caller_width {
+        if UnicodeWidthStr::width_cjk(clipped.as_str()) > caller_width {
             clipped.pop();
             break;
         }
     }
     format!("{tag}{clipped}{marker}")
+}
+
+fn prompt_tag_end(label: &str) -> Option<usize> {
+    label
+        .starts_with("remuda[")
+        .then(|| label.find("] ").map(|index| index + 2))
+        .flatten()
+}
+
+fn clip_prompt_label_and_default(
+    label: &str,
+    default: Option<&str>,
+    columns: usize,
+) -> (String, Option<String>, bool) {
+    use unicode_width::UnicodeWidthStr;
+
+    // Reserve ` [`, `]: ` and one column for the first typed character.
+    let content_width = columns.saturating_sub(5);
+    let Some(default) = default else {
+        return (
+            truncate_secret_prompt_label(label, content_width),
+            None,
+            true,
+        );
+    };
+
+    let default_width = UnicodeWidthStr::width_cjk(default);
+    let marker_width = UnicodeWidthStr::width_cjk("…");
+    let caller_label_width = UnicodeWidthStr::width_cjk(label);
+    let tag_width = prompt_tag_end(label)
+        .map(|end| UnicodeWidthStr::width_cjk(&label[..end]))
+        .unwrap_or(0);
+    let minimum_label_width = tag_width.saturating_add(if caller_label_width > tag_width {
+        marker_width
+    } else {
+        0
+    });
+    let default_fits = default_width
+        .saturating_add(2)
+        .saturating_add(minimum_label_width)
+        <= content_width;
+    if default_fits {
+        let label_width = content_width.saturating_sub(default_width.saturating_add(2));
+        return (
+            truncate_secret_prompt_label(label, label_width),
+            Some(default.to_owned()),
+            true,
+        );
+    }
+
+    let label_width = tag_width.min(content_width.saturating_sub(2));
+    let clipped_label = truncate_secret_prompt_label(label, label_width);
+    let displayed_label_width = UnicodeWidthStr::width_cjk(clipped_label.as_str());
+    let default_width = content_width.saturating_sub(displayed_label_width.saturating_add(2));
+    (
+        clipped_label,
+        Some(truncate_prompt_text(default, default_width)),
+        false,
+    )
+}
+
+fn truncate_prompt_text(text: &str, max_columns: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    if UnicodeWidthStr::width_cjk(text) <= max_columns {
+        return text.to_owned();
+    }
+
+    let marker = "…";
+    let marker_width = UnicodeWidthStr::width_cjk(marker);
+    let content_width = max_columns.saturating_sub(marker_width);
+    let mut clipped = String::new();
+    let mut clipped_width = 0;
+    for character in text.chars() {
+        let width = UnicodeWidthChar::width_cjk(character).unwrap_or(0);
+        if width > content_width.saturating_sub(clipped_width) {
+            break;
+        }
+        clipped.push(character);
+        clipped_width += width;
+    }
+    if marker_width <= max_columns {
+        clipped.push_str(marker);
+    }
+    clipped
 }
 
 fn history_metadata(path: &Path, name: &str) -> Option<(usize, usize)> {
@@ -2316,6 +2416,13 @@ enum PromptLineEcho {
     Text(char),
     Erase,
     Submit,
+    RefusedDefault(PromptLineDefaultRefusal),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PromptLineDefaultRefusal {
+    TooLongToShow,
+    ContainsUnshownCharacters,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -2352,6 +2459,7 @@ fn edit_prompt_line(
     events: impl IntoIterator<Item = crossterm::event::Event>,
     default: Option<&str>,
     max_bytes: usize,
+    refuse_empty_enter: Option<PromptLineDefaultRefusal>,
     mut echo: impl FnMut(PromptLineEcho),
 ) -> Result<Option<String>, PromptLineError> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -2389,6 +2497,12 @@ fn edit_prompt_line(
                 }
                 match key.code {
                     KeyCode::Enter => {
+                        if line.is_empty() {
+                            if let Some(reason) = refuse_empty_enter {
+                                echo(PromptLineEcho::RefusedDefault(reason));
+                                continue;
+                            }
+                        }
                         echo(PromptLineEcho::Submit);
                         if line.is_empty() {
                             return Ok(Some(default.unwrap_or_default().to_owned()));
@@ -2573,11 +2687,9 @@ impl<T: SecretPromptTerminal> SecretPromptMode<T> {
     }
 
     fn prompt(&mut self, label: &str) -> std::io::Result<()> {
-        let label: String = label
-            .chars()
-            .filter(|character| !character.is_control())
-            .collect();
-        let label = truncate_secret_prompt_label(&label, self.terminal.columns().saturating_sub(2));
+        let label = sanitize_prompt_display_text(label);
+        let columns = prompt_columns(self.terminal.columns());
+        let label = truncate_secret_prompt_label(&label, columns.saturating_sub(3));
         self.terminal.write_output(label.as_bytes())?;
         self.terminal.write_output(b": ")?;
         self.terminal.flush_output()
@@ -2629,31 +2741,38 @@ where
         Err(error) => return Ok(Err(error)),
     };
     let mut mode = SecretPromptMode::enable(terminal)?;
-    let columns = match mode.terminal.columns() {
-        0 => 80,
-        columns => columns.max(20),
-    };
+    let columns = prompt_columns(mode.terminal.columns());
     // The mod's own text: indented and untagged, so a line can never pass for
     // the daemon-tagged prompt line below it.
     for line in &preface {
-        for row in wrap_prompt_text(line, columns, true) {
+        let line = sanitize_prompt_display_text(line);
+        for row in wrap_prompt_text(&line, columns, true) {
             mode.terminal.write_output(row.as_bytes())?;
             mode.terminal.write_output(b"\r\n")?;
         }
     }
     let label = remuda_core::protocol::sanitize_secret_prompt_text(label);
+    let label = sanitize_prompt_display_text(&label);
     let default = default.map(remuda_core::protocol::sanitize_secret_prompt_text);
-    let prompt = match default.as_deref() {
-        Some(default) => format!("{label} [{default}]: "),
-        None => format!("{label}: "),
-    };
-    let prompt_rows = wrap_prompt_text(&prompt, columns, false);
-    for (index, row) in prompt_rows.iter().enumerate() {
-        mode.terminal.write_output(row.as_bytes())?;
-        if index + 1 < prompt_rows.len() {
-            mode.terminal.write_output(b"\r\n")?;
+    let default_display = default.as_deref().map(sanitize_prompt_display_text);
+    let (label, default_display, default_fits) =
+        clip_prompt_label_and_default(&label, default_display.as_deref(), columns);
+    let default_refusal = default.as_deref().and_then(|full_default| {
+        let display_default = default_display.as_deref().unwrap_or_default();
+        if sanitize_prompt_display_text(full_default) != full_default {
+            Some(PromptLineDefaultRefusal::ContainsUnshownCharacters)
+        } else if !default_fits || display_default != full_default {
+            Some(PromptLineDefaultRefusal::TooLongToShow)
+        } else {
+            None
         }
-    }
+    });
+    let prompt_body = match default_display.as_deref() {
+        Some(default) => format!("{label} [{default}]"),
+        None => label,
+    };
+    let prompt = format!("{prompt_body}: ");
+    mode.terminal.write_output(prompt.as_bytes())?;
     mode.terminal.flush_output()?;
 
     let mut rendered = String::new();
@@ -2662,6 +2781,7 @@ where
         events,
         default.as_deref(),
         remuda_core::protocol::LINE_ANSWER_MAX_BYTES,
+        default_refusal,
         |action| {
             if output_error.is_some() {
                 return;
@@ -2687,6 +2807,20 @@ where
                     }
                 }
                 PromptLineEcho::Submit => Ok(()),
+                PromptLineEcho::RefusedDefault(reason) => {
+                    let chars = default.as_deref().map_or(0, |text| text.chars().count());
+                    let notice = match reason {
+                        PromptLineDefaultRefusal::TooLongToShow => format!(
+                            "default too long to show ({chars} chars); type the value, or widen the terminal and retry"
+                        ),
+                        PromptLineDefaultRefusal::ContainsUnshownCharacters => format!(
+                            "default contains characters that cannot be shown ({chars} chars); type the value"
+                        ),
+                    };
+                    let notice = truncate_prompt_text(&notice, columns);
+                    mode.terminal
+                        .write_output(format!("\r\n{notice}\r\n{prompt}").as_bytes())
+                }
             };
             if let Err(error) = result {
                 output_error = Some(error);
@@ -3445,7 +3579,7 @@ mod tests {
         ];
         let mut echo = Vec::new();
 
-        let answer = super::edit_prompt_line(events, None, 1024, |action| echo.push(action));
+        let answer = super::edit_prompt_line(events, None, 1024, None, |action| echo.push(action));
 
         assert_eq!(answer, Ok(Some("ax".into())));
         assert_eq!(
@@ -3466,11 +3600,17 @@ mod tests {
 
         let enter = secret_key(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(
-            super::edit_prompt_line([enter.clone()], Some("https://example.test"), 1024, |_| {},),
+            super::edit_prompt_line(
+                [enter.clone()],
+                Some("https://example.test"),
+                1024,
+                None,
+                |_| {},
+            ),
             Ok(Some("https://example.test".into()))
         );
         assert_eq!(
-            super::edit_prompt_line([enter], None, 1024, |_| {}),
+            super::edit_prompt_line([enter], None, 1024, None, |_| {}),
             Ok(Some(String::new()))
         );
     }
@@ -3480,7 +3620,7 @@ mod tests {
         let events = [crossterm::event::Event::Paste("x".repeat(1025))];
 
         assert_eq!(
-            super::edit_prompt_line(events, None, 1024, |_| {}),
+            super::edit_prompt_line(events, None, 1024, None, |_| {}),
             Err(super::PromptLineError::TooLong)
         );
     }
@@ -3494,7 +3634,7 @@ mod tests {
             secret_key(KeyCode::Esc, KeyModifiers::NONE),
         ] {
             assert_eq!(
-                super::edit_prompt_line([cancel], None, 1024, |_| {}),
+                super::edit_prompt_line([cancel], None, 1024, None, |_| {}),
                 Ok(None)
             );
         }
@@ -3510,12 +3650,14 @@ mod tests {
         ];
         let mut echo = Vec::new();
 
-        let answer = super::edit_prompt_line(events, None, 1024, |action| echo.push(action));
+        let answer = super::edit_prompt_line(events, None, 1024, None, |action| echo.push(action));
 
         assert_eq!(answer, Ok(Some("ok[31m".into())));
         assert!(echo.iter().all(|action| match action {
             super::PromptLineEcho::Text(character) => !character.is_control(),
-            super::PromptLineEcho::Erase | super::PromptLineEcho::Submit => true,
+            super::PromptLineEcho::Erase
+            | super::PromptLineEcho::Submit
+            | super::PromptLineEcho::RefusedDefault(_) => true,
         }));
         assert_eq!(
             echo,
@@ -3541,7 +3683,7 @@ mod tests {
         ];
         let mut echo = Vec::new();
 
-        let answer = super::edit_prompt_line(events, None, 1024, |action| echo.push(action));
+        let answer = super::edit_prompt_line(events, None, 1024, None, |action| echo.push(action));
 
         assert_eq!(answer, Ok(Some("oktxt.exe".into())));
         assert_eq!(
@@ -3821,21 +3963,33 @@ mod tests {
             "prompt label exceeded terminal width: {prompt:?}"
         );
         assert!(
-            prompt.ends_with("界界…"),
+            prompt.ends_with("界…"),
             "unexpected clipped label: {prompt:?}"
         );
         assert!(!prompt.contains("remuda[prod]"));
     }
 
     #[test]
-    fn secret_prompt_keeps_over_budget_tag_without_caller_text() {
+    fn secret_prompt_clips_over_budget_tag_without_caller_text() {
         let tag = format!("remuda[session {}] ", "x".repeat(64));
         let label = format!("{tag}deferred test secret");
 
         let prompt = super::truncate_secret_prompt_label(&label, 78);
 
-        assert_eq!(prompt, tag);
+        assert!(unicode_width::UnicodeWidthStr::width_cjk(prompt.as_str()) <= 78);
+        assert!(prompt.ends_with('…'));
         assert!(!prompt.contains("deferred test secret"));
+    }
+
+    #[test]
+    fn secret_prompt_clip_budget_accounts_for_wide_ellipsis() {
+        let tag = "remuda[outside] ";
+        let label = format!("{tag}界界more");
+
+        let prompt = super::truncate_secret_prompt_label(&label, 21);
+
+        assert_eq!(prompt, format!("{tag}界…"));
+        assert!(unicode_width::UnicodeWidthStr::width_cjk(prompt.as_str()) <= 21);
     }
 
     #[test]
@@ -3853,7 +4007,7 @@ mod tests {
         let output = String::from_utf8(terminal.output()).unwrap();
         let prompt = output.split(": ").next().unwrap();
         assert!(
-            unicode_width::UnicodeWidthStr::width(prompt) <= 38,
+            unicode_width::UnicodeWidthStr::width_cjk(prompt) <= 37,
             "prompt label exceeded terminal width: {prompt:?}"
         );
     }
@@ -3865,7 +4019,7 @@ mod tests {
         let terminal = RecordingSecretTerminal::with_columns(80);
         let label = format!(
             "remuda[session a] {} remuda[prod] forged",
-            "\u{2764}\u{fe0f}".repeat(31)
+            "\u{2764}\u{fe0f}".repeat(50)
         );
         let key = secret_key(KeyCode::Enter, KeyModifiers::NONE);
 
@@ -3876,7 +4030,7 @@ mod tests {
         let output = String::from_utf8(terminal.output()).unwrap();
         let prompt = output.split(": ").next().unwrap();
         assert!(
-            unicode_width::UnicodeWidthStr::width(prompt) <= 78,
+            unicode_width::UnicodeWidthStr::width_cjk(prompt) <= 77,
             "prompt label exceeded terminal width: {prompt:?}"
         );
         assert!(
@@ -4077,7 +4231,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_line_sanitizes_and_wraps_label_and_default_without_hiding_default() {
+    fn prompt_line_refuses_a_default_that_is_clipped_offscreen() {
         use crossterm::event::{KeyCode, KeyModifiers};
 
         let terminal = RecordingSecretTerminal::with_columns(80);
@@ -4092,39 +4246,307 @@ mod tests {
         )
         .unwrap();
 
-        let sanitized_label = remuda_core::protocol::sanitize_secret_prompt_text(&label);
         let sanitized_default = remuda_core::protocol::sanitize_secret_prompt_text(&default);
-        assert_eq!(answer, Ok(Some(sanitized_default.clone())));
+        assert_eq!(answer, Ok(None));
         let output = String::from_utf8(terminal.output()).unwrap();
         let rows = output.split("\r\n").collect::<Vec<_>>();
-        for (index, row) in rows.iter().enumerate().take(rows.len() - 1) {
-            assert!(!row.is_empty());
-            assert!(
-                unicode_width::UnicodeWidthStr::width(*row) <= 80,
-                "wrapped prompt row exceeded terminal width: {row:?}"
-            );
-            if index > 0 {
-                assert!(
-                    row.starts_with("  "),
-                    "continuation row not indented: {row:?}"
-                );
-            }
-        }
-        let visible_prompt = rows[..rows.len() - 1]
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                if index == 0 {
-                    *row
-                } else {
-                    row.strip_prefix("  ").unwrap()
-                }
-            })
-            .collect::<Vec<_>>()
-            .concat();
+        let prompt = rows[0];
+        assert!(rows.len() >= 2, "refusal notice was not printed: {rows:?}");
+        assert!(
+            prompt.contains("remuda[session s1]"),
+            "daemon tag was not kept: {prompt:?}"
+        );
+        assert!(
+            prompt.contains('…'),
+            "truncated prompt has no marker: {prompt:?}"
+        );
+        assert!(!prompt.contains(&sanitized_default));
+        let notice = rows[1];
+        assert!(notice.starts_with("default too long to show (45 chars); type the value"));
+        assert!(notice.ends_with('…'));
+        assert!(unicode_width::UnicodeWidthStr::width_cjk(notice) <= 80);
+    }
+
+    #[test]
+    fn prompt_line_keeps_short_default_visible_when_clipping_long_label() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(80);
+        let label = format!("remuda[session s1] {}", "界".repeat(40));
+        let default = "continue";
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            &label,
+            &[],
+            Some(default),
+            [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some(default.into())));
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let prompt = output.split("\r\n").next().unwrap();
+        assert!(prompt.starts_with("remuda[session s1] "));
+        assert!(
+            prompt.contains("… [continue]: "),
+            "default was hidden: {prompt:?}"
+        );
+        assert!(unicode_width::UnicodeWidthStr::width_cjk(prompt) <= 79);
+    }
+
+    #[test]
+    fn prompt_line_does_not_wrap_a_fake_tag_after_padded_label() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(80);
+        let label = "remuda[session s1] prompt";
+        let default = format!("{}remuda[prod]", " ".repeat(64));
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            label,
+            &[],
+            Some(&default),
+            [
+                secret_key(KeyCode::Enter, KeyModifiers::NONE),
+                secret_key(KeyCode::Char('t'), KeyModifiers::NONE),
+                secret_key(KeyCode::Char('y'), KeyModifiers::NONE),
+                secret_key(KeyCode::Char('p'), KeyModifiers::NONE),
+                secret_key(KeyCode::Char('e'), KeyModifiers::NONE),
+                secret_key(KeyCode::Char('d'), KeyModifiers::NONE),
+                secret_key(KeyCode::Enter, KeyModifiers::NONE),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some("typed".into())));
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let prompt = output.split("\r\n").next().unwrap();
+        assert!(prompt.ends_with(": "));
+        assert!(unicode_width::UnicodeWidthStr::width_cjk(prompt) <= 79);
+        assert!(prompt.starts_with("remuda[session s1]"));
+        assert!(!prompt.contains("remuda[prod]"));
+        let notice = output.split("\r\n").nth(1).unwrap();
+        assert!(notice.starts_with("default too long to show (76 chars); type the value"));
+        assert!(notice.ends_with('…'));
+        assert!(unicode_width::UnicodeWidthStr::width_cjk(notice) <= 80);
+    }
+
+    #[test]
+    fn prompt_line_refuses_long_default_then_accepts_typed_value() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let default = "d".repeat(1024);
+        let terminal = RecordingSecretTerminal::with_columns(120);
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            "remuda[session s1] prompt",
+            &[],
+            Some(&default),
+            [
+                secret_key(KeyCode::Enter, KeyModifiers::NONE),
+                secret_key(KeyCode::Char('t'), KeyModifiers::NONE),
+                secret_key(KeyCode::Char('y'), KeyModifiers::NONE),
+                secret_key(KeyCode::Char('p'), KeyModifiers::NONE),
+                secret_key(KeyCode::Char('e'), KeyModifiers::NONE),
+                secret_key(KeyCode::Char('d'), KeyModifiers::NONE),
+                secret_key(KeyCode::Enter, KeyModifiers::NONE),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some("typed".into())));
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let notice = "default too long to show (1024 chars); type the value, or widen the terminal and retry";
         assert_eq!(
-            visible_prompt,
-            format!("{sanitized_label} [{sanitized_default}]: ")
+            output.matches(notice).count(),
+            1,
+            "notice mismatch: {output:?}"
+        );
+        assert!(output.contains(" [d"));
+        assert!(output.contains('…'));
+        let first_prompt = output.split("\r\n").next().unwrap();
+        assert!(unicode_width::UnicodeWidthStr::width_cjk(first_prompt) <= 119);
+    }
+
+    #[test]
+    fn secret_prompt_drops_zero_width_chars_from_displayed_label() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(40);
+        let label = "remuda[outside] e\u{301}❤️";
+        let _answer = super::prompt_secret_with_events(
+            terminal.clone(),
+            label,
+            [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
+        )
+        .unwrap()
+        .unwrap();
+
+        let output = String::from_utf8(terminal.output()).unwrap();
+        assert!(
+            !output.contains('\u{301}'),
+            "combining mark was displayed: {output:?}"
+        );
+        assert!(
+            !output.contains('\u{fe0f}'),
+            "VS16 was displayed: {output:?}"
+        );
+        assert!(output.starts_with("remuda[outside] e❤: "));
+    }
+
+    #[test]
+    fn prompt_display_drops_zero_width_chars_and_refuses_a_changed_default() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(80);
+        let default = "https://good\u{301}.test";
+        let preface = ["accent\u{301} and heart ❤️".to_owned()];
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            "label\u{301}",
+            &preface,
+            Some(default),
+            [
+                secret_key(KeyCode::Enter, KeyModifiers::NONE),
+                secret_key(KeyCode::Char('v'), KeyModifiers::NONE),
+                secret_key(KeyCode::Char('a'), KeyModifiers::NONE),
+                secret_key(KeyCode::Char('l'), KeyModifiers::NONE),
+                secret_key(KeyCode::Char('u'), KeyModifiers::NONE),
+                secret_key(KeyCode::Char('e'), KeyModifiers::NONE),
+                secret_key(KeyCode::Enter, KeyModifiers::NONE),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some("value".into())));
+        let output = String::from_utf8(terminal.output()).unwrap();
+        assert!(
+            !output.contains('\u{301}'),
+            "combining mark was displayed: {output:?}"
+        );
+        assert!(
+            !output.contains('\u{fe0f}'),
+            "VS16 was displayed: {output:?}"
+        );
+        assert!(output.contains("accent and heart ❤"));
+        assert!(output.contains("https://good.test"));
+        assert!(!output.contains(default));
+        assert!(output.contains(
+            "\r\ndefault contains characters that cannot be shown (18 chars); type the value\r\n"
+        ));
+    }
+
+    #[test]
+    fn prompt_line_refuses_a_default_made_only_of_zero_width_chars() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let terminal = RecordingSecretTerminal::with_columns(80);
+        let default = "\u{301}";
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            "Continue?",
+            &[],
+            Some(default),
+            [
+                secret_key(KeyCode::Enter, KeyModifiers::NONE),
+                secret_key(KeyCode::Char('y'), KeyModifiers::NONE),
+                secret_key(KeyCode::Enter, KeyModifiers::NONE),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some("y".into())));
+        let output = String::from_utf8(terminal.output()).unwrap();
+        assert!(
+            output.contains("[]: "),
+            "empty display expected: {output:?}"
+        );
+        assert!(output.contains(
+            "\r\ndefault contains characters that cannot be shown (1 chars); type the value\r\n"
+        ));
+    }
+
+    #[test]
+    fn prompt_line_accepts_default_at_the_display_width_boundary() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use unicode_width::UnicodeWidthStr;
+
+        let terminal = RecordingSecretTerminal::with_columns(80);
+        let label = "remuda[session s1] long label";
+        let tag_width = UnicodeWidthStr::width_cjk("remuda[session s1] ");
+        let marker_width = UnicodeWidthStr::width_cjk("…");
+        let default = "d".repeat(80 - 5 - 2 - tag_width - marker_width);
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            label,
+            &[],
+            Some(&default),
+            [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some(default.clone())));
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let prompt = output.split("\r\n").next().unwrap();
+        assert!(prompt.contains("… ["));
+        assert!(prompt.contains(&format!("[{default}]: ")));
+        assert!(UnicodeWidthStr::width_cjk(prompt) <= 79);
+    }
+
+    #[test]
+    fn prompt_line_refuses_default_one_display_column_over_the_boundary() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use unicode_width::UnicodeWidthStr;
+
+        let terminal = RecordingSecretTerminal::with_columns(2);
+        let default = "d".repeat(20 - 5 - 2 + 1);
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            "",
+            &[],
+            Some(&default),
+            [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(None));
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let notice = output.split("\r\n").nth(1).unwrap();
+        assert!(UnicodeWidthStr::width_cjk(notice) <= 20);
+        assert_eq!(notice, "default too long t…");
+    }
+
+    #[test]
+    fn prompt_line_clips_wide_korean_character_at_the_display_column_boundary() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        use unicode_width::UnicodeWidthStr;
+
+        let terminal = RecordingSecretTerminal::with_columns(80);
+        let label = format!("{}한", "x".repeat(76));
+        let answer = super::prompt_line_with_events(
+            terminal.clone(),
+            &label,
+            &[],
+            None,
+            [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
+        )
+        .unwrap();
+
+        assert_eq!(answer, Ok(Some(String::new())));
+        let output = String::from_utf8(terminal.output()).unwrap();
+        let prompt = output.split("\r\n").next().unwrap();
+        assert!(UnicodeWidthStr::width_cjk("한") == 2);
+        assert!(
+            UnicodeWidthStr::width_cjk(prompt) <= 79,
+            "row too wide: {prompt:?}"
+        );
+        assert!(
+            prompt.ends_with("…: "),
+            "wide char split or marker missing: {prompt:?}"
+        );
+        assert!(
+            !prompt.contains('한'),
+            "wide char straddling the cut was included: {prompt:?}"
         );
     }
 
@@ -4134,18 +4556,18 @@ mod tests {
 
         let terminal = RecordingSecretTerminal::with_columns(2);
         let preface = ["界".repeat(40)];
-        let label = "label界".repeat(6);
-        let default = "界".repeat(30);
+        let label = "label";
+        let default = "ok";
         let answer = super::prompt_line_with_events(
             terminal.clone(),
-            &label,
+            label,
             &preface,
-            Some(&default),
+            Some(default),
             [secret_key(KeyCode::Enter, KeyModifiers::NONE)],
         )
         .unwrap();
 
-        assert_eq!(answer, Ok(Some(default.clone())));
+        assert_eq!(answer, Ok(Some(default.into())));
         let output = String::from_utf8(terminal.output()).unwrap();
         let preface_rows = 5;
         let visible_prompt = output
@@ -4162,14 +4584,11 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .concat();
-        assert!(
-            visible_prompt.contains(&default),
-            "printed prompt omitted its returned default: {visible_prompt:?}"
-        );
+        assert!(visible_prompt.contains("label [ok]: "));
         let rows = output.split("\r\n").filter(|row| !row.is_empty());
         for row in rows {
             assert!(
-                unicode_width::UnicodeWidthStr::width(row) <= 20,
+                unicode_width::UnicodeWidthStr::width_cjk(row) <= 20,
                 "wrapped row exceeded the width floor: {row:?}"
             );
         }
@@ -4191,6 +4610,9 @@ mod tests {
 
         assert_eq!(answer, Ok(Some(String::new())));
         let output = terminal.output();
+        let prompt = String::from_utf8(output.clone()).unwrap();
+        let prompt = prompt.split("\r\n").next().unwrap();
+        assert!(unicode_width::UnicodeWidthStr::width_cjk(prompt) <= 79);
         assert!(
             output
                 .windows(b"wizard prompt".len())
