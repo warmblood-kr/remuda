@@ -1310,6 +1310,202 @@ fn capture_styled_marks_dim_spans_and_reports_the_cursor() {
     assert_eq!(got, "ghost=true -plain=false cursor=number,number,boolean");
 }
 
+#[test]
+fn input_line_empty_uses_styled_prompt_snapshots_and_returns_unknown_safely() {
+    run_lua(
+        "input-line-empty",
+        r#"
+        local original_capture = remuda.capture_styled
+        local current
+        remuda.capture_styled = function(name)
+          assert(name == "fixture")
+          if current == "capture-error" then error("capture failed") end
+          return current
+        end
+        local function span(text, dim) return { text = text, dim = dim or false } end
+        local function row(...)
+          local spans = {}
+          for _, text in ipairs({...}) do spans[#spans + 1] = type(text) == "table" and text or span(text) end
+          return spans
+        end
+        local function screen(rows, cursor_row)
+          cursor_row = cursor_row or 1
+          local parts = {}
+          for _, span in ipairs(rows[cursor_row] or {}) do parts[#parts + 1] = span.text or "" end
+          local raw = table.concat(parts):gsub("\194\160", " ")
+          local col = raw:sub(1, 3) == "│" and 5 or 3
+          return { rows = rows, cursor = { row = cursor_row, col = col, visible = true } }
+        end
+        local function answer(opts)
+          return remuda.input_line_empty("fixture", opts)
+        end
+        local function both(snapshot, kind, expected)
+          current = snapshot
+          local generic, generic_reason = answer()
+          assert(generic == expected, "generic result: " .. tostring(generic) .. " / " .. tostring(generic_reason))
+          local specific, specific_reason = answer({ kind = kind })
+          assert(specific == expected, kind .. " result: " .. tostring(specific) .. " / " .. tostring(specific_reason))
+        end
+
+        -- Empty prompt forms for each kind are checked both with an explicit
+        -- kind and through the generic parser on the exact same snapshot.
+        both(screen({ row("❯ ") }), "shell", true)
+        both(screen({ row("│ ❯ │") }), "claude", true) -- U+00A0 is Claude's empty prompt.
+        both(screen({ row("> ") }), "codex", true)
+
+        both(screen({ row("❯ typed command") }), "shell", nil)
+        both(screen({ row("│ ❯ draft│"), row("│ continuation│"), row("╰ footer") }), "claude", nil)
+        both(screen({ row("> draft"), row("3.2k tokens · context left") }), "codex", nil)
+
+        current = screen({ row("❯ ", span("suggested text", true)) })
+        assert(answer({ kind = "shell" }) == true)
+
+        -- The visible Codex empty placeholder is recognized without opts.kind
+        -- for any caller; explicit non-Codex policy retains Butler's behavior.
+        current = screen({ row("> Ask Codex to do anything") })
+        assert(answer() == true)
+        assert(answer({ kind = "codex" }) == true)
+        assert(answer({ kind = "shell" }) == nil)
+
+        -- Codex status/trace rows below the cursor are footer area. A visible
+        -- paste placeholder in the cursor composer is still content.
+        both(screen({ row("> "), row("3.2k tokens · context left") }), "codex", true)
+        current = screen({ row("> my draft · notes") })
+        local footer_draft, footer_reason = answer({ kind = "codex" })
+        assert(footer_draft == nil and footer_reason:find("visible text", 1, true))
+        current = screen({ row("> "), row("gpt 5 · 40%") })
+        -- known limit, see docs: rows below the cursor do not affect the result.
+        assert(answer() == true)
+        assert(answer({ kind = "codex" }) == true)
+        assert(answer({ kind = "shell" }) == true)
+        current = screen({ row("❯ "), row("? for shortcuts") })
+        assert(answer({ kind = "shell" }) == true)
+        assert(answer({ kind = "claude" }) == true)
+        both(screen({ row("> "), row("2026-10-03T12:00:00Z INFO codex: startup trace") }), "codex", true)
+        both(screen({ row("❯ [Pasted text #1 +5 lines]") }), "shell", nil)
+
+        current = screen({ row("ordinary terminal output") })
+        local unknown, reason = answer()
+        assert(unknown == nil and type(reason) == "string" and reason:find("prompt glyph", 1, true))
+
+        current = screen({ row("❯ ") })
+        current.cursor.visible = false
+        unknown, reason = answer()
+        assert(unknown == nil and type(reason) == "string" and reason:find("hidden", 1, true))
+
+        current = screen({ row("❯ ") })
+        unknown, reason = answer({ kind = "gemini" })
+        assert(unknown == nil and type(reason) == "string" and reason:find("opts.kind", 1, true))
+
+        current = screen({ row("❯ ") })
+        current.cursor.row = 2
+        unknown, reason = answer()
+        assert(unknown == nil and type(reason) == "string" and reason:find("outside", 1, true))
+
+        current = "capture-error"
+        unknown, reason = answer()
+        assert(unknown == nil and type(reason) == "string" and reason:find("capture failed", 1, true))
+
+        remuda.capture_styled = original_capture
+        unknown, reason = remuda.input_line_empty("missing-session")
+        assert(unknown == nil and type(reason) == "string" and reason:find("no such session", 1, true))
+
+        local word = remuda._registry.input_line_empty
+        assert(word and word.signature == "input_line_empty(session, opts?) -> true | nil, reason")
+        assert(word.about:find("opts.kind", 1, true) and word.about:find("contiguous composer block", 1, true))
+        assert(word.about:find("true means only that the cursor row matches the empty-prompt shape; callers must add per-kind checks", 1, true))
+        assert(word.about:find("'? for shortcuts' for every kind", 1, true))
+        assert(word.about:find("Unlike Butler's helper", 1, true))
+        assert(word.about:find("continuation prompt after a blank row", 1, true))
+        assert(word.about:find("rows below the cursor are not inspected", 1, true))
+        "#,
+    );
+}
+
+#[test]
+fn input_line_empty_rejects_draft_content_above_the_cursor() {
+    run_lua(
+        "input-line-empty-ambiguous-rows",
+        r#"
+        local current
+        remuda.capture_styled = function() return current end
+        local function row(text) return { { text = text, dim = false } } end
+        local function screen(rows, cursor_row)
+          local raw = rows[cursor_row][1].text:gsub("\194\160", " ")
+          local col = raw:sub(1, 3) == "│" and 5 or 3
+          return { rows = rows, cursor = { row = cursor_row, col = col, visible = true } }
+        end
+        local function expect_unknown(snapshot, kind)
+          current = snapshot
+          local answer, reason = remuda.input_line_empty("fixture", { kind = kind })
+          assert(answer == nil and type(reason) == "string", tostring(answer) .. " / " .. tostring(reason))
+        end
+        local function expect_empty(snapshot, kind)
+          current = snapshot
+          local answer, reason = remuda.input_line_empty("fixture", { kind = kind })
+          assert(answer == true, tostring(answer) .. " / " .. tostring(reason))
+        end
+
+        local after_glyph = screen({ row("❯ ") }, 1)
+        after_glyph.cursor.col = 2 -- the valid position before its optional space
+        expect_empty(after_glyph, "shell")
+        local plain_col_four = screen({ row("❯ ") }, 1)
+        plain_col_four.cursor.col = 4
+        expect_unknown(plain_col_four, "shell")
+        local wrong_col = screen({ row("❯ ") }, 1)
+        wrong_col.cursor.col = 1
+        expect_unknown(wrong_col, "shell")
+
+        local framed_col_four = screen({ row("│ ❯ │") }, 1)
+        framed_col_four.cursor.col = 4
+        expect_empty(framed_col_four, "claude")
+        local framed_col_six = screen({ row("│ ❯ │") }, 1)
+        framed_col_six.cursor.col = 6
+        expect_unknown(framed_col_six, "claude")
+
+        -- Column math uses text after dim spans are discarded, so an earlier
+        -- dim prefix shifts the physical cursor beyond the accepted prompt columns.
+        local dim_prefix = { rows = {{
+          { text = "ghost ", dim = true }, { text = "❯ ", dim = false }
+        }}, cursor = { row = 1, col = 9, visible = true } }
+        expect_unknown(dim_prefix, "shell")
+        -- Tabs are not stripped as prompt indentation; only ASCII spaces are.
+        expect_unknown(screen({ row("\t❯ ") }, 1), "shell")
+        -- A CJK glyph is not treated as whitespace before a supported prompt.
+        expect_unknown(screen({ row("界❯ ") }, 1), "shell")
+        -- NBSP is folded to one ASCII space before prompt and column checks.
+        local nbsp_prefix = screen({ row(" ❯ ") }, 1)
+        nbsp_prefix.cursor.col = 4
+        expect_empty(nbsp_prefix, "shell")
+        -- Frame recognition requires │ in the first screen column.
+        expect_unknown(screen({ row("  │ ❯ ") }, 1), "claude")
+
+        current = screen({ row("│ transcript"), row("╭ unrelated history"), row("❯ ") }, 3)
+        local generic, generic_reason = remuda.input_line_empty("fixture")
+        assert(generic == nil and generic_reason:find("non-blank rows", 1, true), "a stray │ must not enable Claude frame mode")
+
+        expect_empty(screen({ row("ls output"), row(""), row("❯ ") }, 3), "shell")
+        expect_empty(screen({
+          row("history"), row(""), row("╭──────╮"), row("│ ❯  │"), row("╰──────╯"), row("? for shortcuts")
+        }, 4), "claude")
+        expect_empty(screen({ row("transcript line"), row(""), row("> Ask Codex to do anything"), row("gpt 5 · 40%") }, 3), "codex")
+        -- known limit, see docs: a blank row inside a composer block hides prior draft text,
+        -- so a later continuation prompt can still be reported as empty.
+        expect_empty(screen({ row("text"), row(""), row("> ") }, 3), "codex")
+
+        expect_unknown(screen({ row("❯ draft"), row("❯ ") }, 2), "shell")
+        expect_unknown(screen({ row("❯ draft"), row("> "), row("❯ ") }, 3), "shell")
+        -- A glyph-less PS1 above a PS2 row is still ambiguous.
+        expect_unknown(screen({ row("user@host$ python"), row("> ") }, 2), "shell")
+        expect_unknown(screen({ row("❯ "), row("continued draft"), row("ordinary row") }, 3), "shell")
+        -- In a Claude frame the first prompt row anchors the composer.
+        expect_unknown(screen({ row("│ ❯ draft│"), row("│ ❯ │"), row("╰ footer") }, 2), "claude")
+        -- Codex's placeholder does not hide text on a later composer row.
+        expect_unknown(screen({ row("> Ask Codex to do anything"), row("continued draft") }, 2), "codex")
+        "#,
+    );
+}
+
 /// A Lua long string: a Windows path keeps its backslashes.
 fn lua_path(path: &Path) -> String {
     format!("[==[{}]==]", path.display())

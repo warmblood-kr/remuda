@@ -1964,6 +1964,144 @@ register("_call", "Dispatch one MCP tools/call by name.", "_call(name, arguments
 -- separately-timed submit key after the composer shows the text.
 remuda.input = {}
 
+local input_line_prompt_glyphs = { "❯", ">", "›" }
+local input_line_codex_placeholder = "Ask Codex to do anything"
+
+local function input_line_trim(text)
+  local first = text:find("%S")
+  if not first then return "" end
+  local last = #text
+  while last >= first and text:sub(last, last):match("%s") do
+    last = last - 1
+  end
+  return text:sub(first, last)
+end
+
+local function input_line_row_text(row, ignore_dim)
+  local parts = {}
+  for _, span in ipairs(row or {}) do
+    if not (ignore_dim and span.dim) then
+      parts[#parts + 1] = span.text or ""
+    end
+  end
+  return table.concat(parts)
+end
+
+-- true means only that the cursor row matches the empty-prompt shape; callers
+-- must add per-kind checks. Require a visible cursor and no draft rows in its
+-- contiguous composer block. Dim spans are dropped before cursor-column math,
+-- and Claude frame bars must start in column one (indented frames return nil).
+-- A continuation prompt after a blank row can still read as empty; rows below
+-- the cursor are not checked, and the Codex placeholder is empty regardless.
+local function input_line_empty_from_snapshot(kind, screen)
+  if kind ~= nil and kind ~= "shell" and kind ~= "claude" and kind ~= "codex" then
+    return nil, "opts.kind must be shell, claude, or codex"
+  end
+  if type(screen) ~= "table" or type(screen.rows) ~= "table" or type(screen.cursor) ~= "table" then
+    return nil, "capture_styled did not return rows and cursor metadata"
+  end
+  local cursor = screen.cursor
+  if cursor.visible ~= true then return nil, "session cursor is hidden" end
+  if type(cursor.row) ~= "number" or cursor.row % 1 ~= 0
+      or cursor.row < 1 or cursor.row > #screen.rows then
+    return nil, "session cursor row is outside the captured screen"
+  end
+
+  local lines = {}
+  local has_claude_frame = kind == "claude"
+  for index, row in ipairs(screen.rows) do
+    -- Butler's notify policy discards dim spans on the cursor row before
+    -- checking it: dim ghost suggestions are not unsent user input.
+    lines[index] = input_line_row_text(row, index == cursor.row):gsub("\194\160", " ")
+  end
+
+  -- In generic mode, a stray vertical box character elsewhere on screen is
+  -- not enough to classify the cursor row as a Claude composer frame.
+  if kind == nil then
+    local cursor_raw = lines[cursor.row]
+    if cursor_raw:sub(1, 3) == "│" then
+      local after_frame = cursor_raw:sub(4):gsub("^ +", "")
+      for _, glyph in ipairs(input_line_prompt_glyphs) do
+        if after_frame:sub(1, #glyph) == glyph then has_claude_frame = true; break end
+      end
+    end
+  end
+
+  -- Only inspect the contiguous composer block. A blank row ends the block;
+  -- Claude's top frame border ends it without counting as composer content.
+  for index = cursor.row - 1, 1, -1 do
+    local row = lines[index]:gsub("^%s+", "")
+    if has_claude_frame then
+      local is_top_border = false
+      for _, border in ipairs({ "╭", "┌", "─" }) do
+        if row:sub(1, #border) == border then is_top_border = true; break end
+      end
+      if is_top_border then break end
+    end
+    if has_claude_frame and row:sub(1, 3) == "│" then
+      row = row:sub(4):gsub("│%s*$", "")
+    end
+    if input_line_trim(row) == "" then break end
+    return nil, "non-blank rows appear above the cursor prompt"
+  end
+
+  local raw_cursor_line = lines[cursor.row]
+  local is_framed_prompt = has_claude_frame and raw_cursor_line:sub(1, 3) == "│"
+  local prompt_line = raw_cursor_line
+  if is_framed_prompt then prompt_line = prompt_line:sub(4) end
+  local cursor_line = prompt_line:gsub("^ +", "")
+  local prompt_glyph, text
+  for _, glyph in ipairs(input_line_prompt_glyphs) do
+    if cursor_line:sub(1, #glyph) == glyph then
+      prompt_glyph, text = glyph, cursor_line:sub(#glyph + 1)
+      break
+    end
+  end
+  if not prompt_glyph then return nil, "cursor row has no supported prompt glyph" end
+
+  -- capture_styled converts the terminal's zero-based cursor to a 1-based
+  -- cell column for Lua. These prompt glyphs and the frame bar each occupy
+  -- one cell; allow the caret immediately after the glyph or one trailing
+  -- space, and fail closed for every other cursor position.
+  local leading_spaces = prompt_line:match("^( *)") or ""
+  local prompt_prefix_cells = #leading_spaces + (is_framed_prompt and 1 or 0) + 1
+  if cursor.col ~= prompt_prefix_cells + 1 and cursor.col ~= prompt_prefix_cells + 2 then
+    return nil, "cursor column is not immediately after the prompt glyph"
+  end
+
+  text = input_line_trim(text:gsub("│%s*$", ""))
+  if (kind == "codex" or kind == nil) and text == input_line_codex_placeholder then
+    return true
+  end
+  if text ~= "" then return nil, "cursor prompt contains visible text" end
+
+  -- Rows below the cursor are footer area (`? for shortcuts` applies to all
+  -- kinds); they never change the cursor-row allow-list result.
+  return true
+end
+
+function remuda.input_line_empty(session, opts)
+  if type(session) ~= "string" or session == "" then
+    return nil, "session must be a non-empty name"
+  end
+  if opts ~= nil and type(opts) ~= "table" then
+    return nil, "opts must be a table"
+  end
+  local kind = opts and opts.kind
+  if kind ~= nil and kind ~= "shell" and kind ~= "claude" and kind ~= "codex" then
+    return nil, "opts.kind must be shell, claude, or codex"
+  end
+  local ok, screen = pcall(remuda.capture_styled, session)
+  if not ok then return nil, tostring(screen) end
+  return input_line_empty_from_snapshot(kind, screen)
+end
+
+register(
+  "input_line_empty",
+  "true means only that the cursor row matches the empty-prompt shape; callers must add per-kind checks. Return true only when the cursor is immediately after a recognized prompt glyph (or one optional space) and its contiguous composer block above contains no non-blank rows; a blank row ends the block, and a Claude top frame border ends its frame. Other ambiguous screens return nil and a reason. Dim ghost spans are dropped before cursor-column math; dim ghost text is ignored, and visible paste placeholders count as content. Claude frame bars must start in column one; an indented frame returns nil. The exact Codex placeholder counts as empty for codex or generic mode. Pass opts.kind = 'shell', 'claude', or 'codex' for that policy; kind is optional, but agent-specific layouts can be ambiguous without it. Limit: a continuation prompt after a blank row inside the composer can still read as empty; rows below the cursor are not inspected (including '? for shortcuts' for every kind), and the Codex placeholder counts as empty regardless of rows below. Use stricter agent-specific recognizers in Butler Lua per kind. Unlike Butler's helper, this word requires a visible cursor, rejects unknown kinds, and recognizes only the built-in Codex placeholder.",
+  "input_line_empty(session, opts?) -> true | nil, reason"
+)
+
 function remuda.input.text(session, text)
   remuda._input_text(session, tostring(text))
 end
