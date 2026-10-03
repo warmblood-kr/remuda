@@ -1805,23 +1805,27 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn assert_worker_admin_is_deny_only(admin_sid: *mut std::ffi::c_void) {
+    fn assert_worker_admin_is_deny_only(admin_sid: *mut std::ffi::c_void, check_membership: bool) {
         use windows_sys::Win32::Security::{
             CheckTokenMembership, EqualSid, GetTokenInformation, TokenGroups, SID_AND_ATTRIBUTES,
             TOKEN_GROUPS, TOKEN_QUERY,
         };
         use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
 
-        let mut is_member = 1;
-        assert_ne!(
-            unsafe { CheckTokenMembership(std::ptr::null_mut(), admin_sid, &mut is_member) },
-            0,
-            "check impersonated Administrators membership"
-        );
-        assert_eq!(
-            is_member, 0,
-            "Administrators must not be enabled in worker token"
-        );
+        // CheckTokenMembership itself fails for a token with a restricting SID;
+        // deny-only is asserted from TokenGroups below in all cases.
+        if check_membership {
+            let mut is_member = 1;
+            assert_ne!(
+                unsafe { CheckTokenMembership(std::ptr::null_mut(), admin_sid, &mut is_member) },
+                0,
+                "check impersonated Administrators membership"
+            );
+            assert_eq!(
+                is_member, 0,
+                "Administrators must not be enabled in worker token"
+            );
+        }
 
         let mut raw_token = std::ptr::null_mut();
         assert_ne!(
@@ -1902,7 +1906,7 @@ mod tests {
                 "impersonate restricted worker token"
             );
             let _revert = RevertImpersonation;
-            assert_worker_admin_is_deny_only(admin_sid);
+            assert_worker_admin_is_deny_only(admin_sid, true);
 
             let reader = lua_with_xdg_root(&worker_root);
             select_backend(&reader, "xdg");
@@ -1958,7 +1962,7 @@ mod tests {
                     "impersonate token with unmatched restricting SID"
                 );
                 let _revert = RevertImpersonation;
-                assert_worker_admin_is_deny_only(admin_sid);
+                assert_worker_admin_is_deny_only(admin_sid, false);
                 // This denial does not distinguish the namespace-directory ACL from the file ACL.
                 reader
                     .load(
@@ -1980,7 +1984,7 @@ mod tests {
                 "impersonate token with Administrators restricting SID"
             );
             let _revert = RevertImpersonation;
-            assert_worker_admin_is_deny_only(admin_sid);
+            assert_worker_admin_is_deny_only(admin_sid, false);
             reader
                 .load(
                     r#"
