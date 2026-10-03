@@ -2061,6 +2061,7 @@ mod tests {
         let root = TestRoot::new();
         let handle = xdg_data_handle(&root.0, "failed-write");
         let namespace = root.0.join("data/storage/failed-write");
+        fs::create_dir_all(&namespace).unwrap();
         let target = namespace.join("blocked");
         fs::create_dir(&target).unwrap();
         let location = handle.file_path("blocked", false).unwrap();
