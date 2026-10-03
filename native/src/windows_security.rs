@@ -4,6 +4,26 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 #[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct NtOpenPolicy {
+    pub(crate) object_attributes: u32,
+    pub(crate) create_options: u32,
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn relative_component_utf16(component: &str) -> Option<Vec<u16>> {
+    Some(component.encode_utf16().collect())
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn nt_open_policy(_directory: bool) -> NtOpenPolicy {
+    NtOpenPolicy {
+        object_attributes: 0,
+        create_options: 0,
+    }
+}
+
+#[cfg(any(windows, test))]
 fn ace_sid_fits(ace_size: usize, fixed_size: usize, sid_size: usize) -> bool {
     fixed_size
         .checked_add(sid_size)
@@ -433,6 +453,42 @@ mod tests {
             .map(|(key, value)| (key.to_string(), OsString::from(value)))
             .collect();
         move |name| values.get(name).cloned()
+    }
+
+    #[test]
+    fn windows_component_validation_rejects_path_syntax() {
+        for component in ["", ".", "..", "a/b", r"a\b", "nul\0byte"] {
+            assert!(
+                relative_component_utf16(component).is_none(),
+                "{component:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_relative_name_builder_encodes_one_nul_terminated_component() {
+        assert_eq!(
+            relative_component_utf16("mail_1.bin"),
+            Some("mail_1.bin\0".encode_utf16().collect())
+        );
+    }
+
+    #[test]
+    fn windows_open_flag_calculation_requires_no_reparse_and_expected_type() {
+        assert_eq!(
+            nt_open_policy(true),
+            NtOpenPolicy {
+                object_attributes: 0x0000_1000, // OBJ_DONT_REPARSE
+                create_options: 0x0020_0021,    // FILE_OPEN_REPARSE_POINT | sync | directory
+            }
+        );
+        assert_eq!(
+            nt_open_policy(false),
+            NtOpenPolicy {
+                object_attributes: 0x0000_1000,
+                create_options: 0x0020_0060, // FILE_OPEN_REPARSE_POINT | sync | non-directory
+            }
+        );
     }
 
     #[test]
