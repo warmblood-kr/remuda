@@ -543,22 +543,20 @@ fn spawn_reader(
 ) {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        let mut dsr_carry = Vec::new();
         while let Ok(n) = reader.read(&mut buf) {
             if n == 0 {
                 break;
             }
-            let asked = buf[..n].windows(DSR_CURSOR.len()).any(|w| w == DSR_CURSOR);
-            let at = match screen.lock() {
-                Ok(mut parser) => {
-                    let at = process_output(&mut parser, &buf[..n], &scrollback_total);
-                    output_version.fetch_add(1, Ordering::SeqCst);
-                    at
-                }
-                // Poisoned: the grid can no longer be trusted.
-                Err(_) => break,
-            };
-            if asked {
-                answer_cursor_query(&writer, at);
+            if !process_reader_chunk(
+                &buf[..n],
+                &mut dsr_carry,
+                &screen,
+                &scrollback_total,
+                &output_version,
+                &writer,
+            ) {
+                break;
             }
             if let Ok(mut watchers) = watchers.lock() {
                 watchers.retain(|watcher| match watcher {
@@ -576,6 +574,41 @@ fn spawn_reader(
             reader_closed.store(true, Ordering::Release);
         }
     });
+}
+
+/// Process one read from the pty and answer a cursor query found in that read.
+/// Query matching is deliberately kept at this seam so reader chunk behavior
+/// can be exercised without a platform pty.
+fn process_reader_chunk(
+    bytes: &[u8],
+    dsr_carry: &mut Vec<u8>,
+    screen: &Arc<Mutex<vt100::Parser>>,
+    scrollback_total: &AtomicUsize,
+    output_version: &AtomicU64,
+    writer: &SharedWriter,
+) -> bool {
+    let mut query_window = Vec::with_capacity(dsr_carry.len() + bytes.len());
+    query_window.extend_from_slice(dsr_carry);
+    query_window.extend_from_slice(bytes);
+    let asked = query_window
+        .windows(DSR_CURSOR.len())
+        .any(|window| window == DSR_CURSOR);
+    let carry_len = query_window.len().min(DSR_CURSOR.len() - 1);
+    dsr_carry.clear();
+    dsr_carry.extend_from_slice(&query_window[query_window.len() - carry_len..]);
+    let at = match screen.lock() {
+        Ok(mut parser) => {
+            let at = process_output(&mut parser, bytes, scrollback_total);
+            output_version.fetch_add(1, Ordering::SeqCst);
+            at
+        }
+        // Poisoned: the grid can no longer be trusted.
+        Err(_) => return false,
+    };
+    if asked {
+        answer_cursor_query(writer, at);
+    }
+    true
 }
 
 /// Process bounded chunks while a temporary nonzero scroll offset counts
@@ -1440,6 +1473,29 @@ mod input_writer_tests {
         assert!(started.elapsed() < Duration::from_millis(100));
         drop(guard);
         assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cursor_query_reply_survives_split_reads() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer: SharedWriter =
+            Arc::new(Mutex::new(Box::new(CaptureWrites(Arc::clone(&captured)))));
+        let screen = Arc::new(Mutex::new(vt100::Parser::new(24, 80, SCROLLBACK_ROWS)));
+        let scrollback_total = AtomicUsize::new(0);
+        let output_version = AtomicU64::new(0);
+        let mut dsr_carry = Vec::new();
+
+        for chunk in [b"\x1b[".as_slice(), b"6n"] {
+            assert!(process_reader_chunk(
+                chunk,
+                &mut dsr_carry,
+                &screen,
+                &scrollback_total,
+                &output_version,
+                &writer,
+            ));
+        }
+        assert_eq!(*captured.lock().unwrap(), b"\x1b[1;1R");
     }
 }
 
