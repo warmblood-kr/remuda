@@ -1093,7 +1093,8 @@ local function clear_imperative_module_registrations(name, activation)
 end
 
 local function stop_module_activation(name, module)
-  if not module or not module.started or not module.stop or module.stopped then return end
+  if not module or not module.stop or module.stopped
+    or (module.start and not module.start_attempted) then return end
   module.stopped = true
   local ok, err = pcall(module.stop, module.state)
   if not ok then
@@ -1461,6 +1462,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
   end
   local activation
   local start = candidate.start and function(started_state)
+    activation.start_attempted = true
     local result = with_owner(name, candidate.start, started_state)
     activation.started = true
     return result
@@ -1482,6 +1484,7 @@ function remuda._activate_module(name, candidate, reactivate, commands_only)
     start = start,
     commands = commands,
     started = false,
+    start_attempted = false,
     ready = ready,
     timeout_ms = timeout_ms,
     stopped = false,

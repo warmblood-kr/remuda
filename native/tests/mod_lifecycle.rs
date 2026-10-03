@@ -331,7 +331,7 @@ fn lifecycle_stop_runs_before_the_next_activation_starts() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn failed_reload_skips_stop_for_unstarted_candidate_and_restarts_previous() {
+fn failed_reload_stops_candidate_after_start_attempt_and_restarts_previous() {
     let home = DataHome::new();
     let manifest = home.root.join("remuda/mods/sample/extension.toml");
     fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
@@ -378,7 +378,7 @@ fn failed_reload_skips_stop_for_unstarted_candidate_and_restarts_previous() {
     read_value(&image, "remuda.emit('ping')");
     assert_eq!(
         read_value(&image, "return table.concat(order, ',')"),
-        "old-start1,old-stop1,new-start,old-start2,old-hook"
+        "old-start1,old-stop1,new-start,new-stop,old-start2,old-hook"
     );
 
     write_entry(
@@ -395,7 +395,7 @@ fn failed_reload_skips_stop_for_unstarted_candidate_and_restarts_previous() {
     image.stop_modules_bounded();
     assert_eq!(
         read_value(&image, "return table.concat(order, ',')"),
-        "old-start1,old-stop1,new-start,old-start2,old-hook,old-stop2,good-start,good-hook,good-stop"
+        "old-start1,old-stop1,new-start,new-stop,old-start2,old-hook,old-stop2,good-start,good-hook,good-stop"
     );
 }
 
@@ -448,7 +448,7 @@ fn failed_previous_restart_leaves_module_inactive_without_a_second_stop() {
     read_value(&image, "remuda.emit('ping')");
     assert_eq!(
         read_value(&image, "return table.concat(order, ',')"),
-        "old-start1,old-stop1,new-start,old-start2"
+        "old-start1,old-stop1,new-start,new-stop,old-start2"
     );
 
     write_entry(
@@ -463,7 +463,7 @@ fn failed_previous_restart_leaves_module_inactive_without_a_second_stop() {
     image.stop_modules_bounded();
     assert_eq!(
         read_value(&image, "return table.concat(order, ',')"),
-        "old-start1,old-stop1,new-start,old-start2,recovered-start,recovered-hook,recovered-stop"
+        "old-start1,old-stop1,new-start,new-stop,old-start2,recovered-start,recovered-hook,recovered-stop"
     );
 }
 
@@ -676,6 +676,40 @@ fn mod_command_loads_commands_without_start_then_bare_exec_starts_once() {
 }
 
 #[test]
+fn stop_only_module_stops_on_reload_and_shutdown() {
+    let home = DataHome::new();
+    let manifest = home.root.join("remuda/mods/sample/extension.toml");
+    fs::create_dir_all(manifest.parent().expect("manifest parent")).unwrap();
+    fs::write(
+        &manifest,
+        "name = \"sample\"\nentry = \"packages/sample/init.lua\"\napi = \"remuda-lua-v1\"\nlifecycle = \"remuda-module-v1\"\n",
+    )
+    .unwrap();
+    write_entry(
+        &home.entry(),
+        r#"return {
+          api = "remuda-module-v1", state_version = 1,
+          initialize = function() return {} end,
+          stop = function() remuda.emit("stop_probe") end,
+        }"#,
+    );
+    let image = Image::spawn(
+        Path::new("/tmp/remuda-mod-stop-only.sock"),
+        Arc::new(Registry::new()),
+        Arc::new(Counters::default()),
+    );
+    read_value(&image, include_str!("api/v3.lua"));
+    read_value(
+        &image,
+        "stop_calls = 0; remuda.on('stop_probe', function() stop_calls = stop_calls + 1 end); remuda.exec('sample')",
+    );
+    read_value(&image, "remuda.reload('sample')");
+    assert_eq!(read_value(&image, "return stop_calls"), "1");
+    image.stop_modules_bounded();
+    assert_eq!(read_value(&image, "return stop_calls"), "2");
+}
+
+#[test]
 fn failed_deferred_start_rolls_back_commands_hooks_and_schedules_before_retry() {
     let home = DataHome::new();
     let manifest = home.root.join("remuda/mods/sample/extension.toml");
@@ -702,7 +736,7 @@ fn failed_deferred_start_rolls_back_commands_hooks_and_schedules_before_retry() 
             end
           end,
           stop = function()
-            remuda._sample_test_stop_calls = remuda._sample_test_stop_calls + 1
+            remuda.emit("stop_probe")
           end,
         }"#,
     );
@@ -714,40 +748,34 @@ fn failed_deferred_start_rolls_back_commands_hooks_and_schedules_before_retry() 
     read_value(&image, include_str!("api/v3.lua"));
     read_value(
         &image,
-        "remuda._sample_test_fail_start = true; remuda._sample_test_stop_calls = 0",
+        "remuda._sample_test_fail_start = true; stop_calls = 0; remuda.on('stop_probe', function() stop_calls = stop_calls + 1 end)",
     );
     read_value(
         &image,
         "remuda._load_extension_command('sample-cmd', 'sample')",
     );
     image.stop_modules_bounded();
-    assert_eq!(
-        read_value(&image, "return tostring(remuda._sample_test_stop_calls)"),
-        "0"
-    );
+    assert_eq!(read_value(&image, "return tostring(stop_calls)"), "0");
 
     assert!(image.eval("remuda.exec('sample')", None).is_err());
     assert_eq!(
         read_value(
             &image,
-            "local hooks = 0 for _, h in ipairs(remuda.hooks.start_probe or {}) do if h.owner == 'sample' then hooks = hooks + 1 end end; local timers = 0 for _, s in pairs(remuda.schedules) do if s.owner == 'sample' then timers = timers + 1 end end; return tostring(remuda._extension_commands['sample-cmd'] == nil) .. ':' .. hooks .. ':' .. timers .. ':' .. remuda._sample_test_stop_calls",
+            "local hooks = 0 for _, h in ipairs(remuda.hooks.start_probe or {}) do if h.owner == 'sample' then hooks = hooks + 1 end end; local timers = 0 for _, s in pairs(remuda.schedules) do if s.owner == 'sample' then timers = timers + 1 end end; return tostring(remuda._extension_commands['sample-cmd'] == nil) .. ':' .. hooks .. ':' .. timers .. ':' .. stop_calls",
         ),
-        "true:0:0:0"
+        "true:0:0:1"
     );
 
     read_value(&image, "remuda.exec('sample')");
     assert_eq!(
         read_value(
             &image,
-            "local hooks = 0 for _, h in ipairs(remuda.hooks.start_probe or {}) do if h.owner == 'sample' then hooks = hooks + 1 end end; local timers = 0 for _, s in pairs(remuda.schedules) do if s.owner == 'sample' then timers = timers + 1 end end; return tostring(remuda._extension_commands['sample-cmd'] ~= nil) .. ':' .. hooks .. ':' .. timers .. ':' .. remuda._sample_test_stop_calls",
+            "local hooks = 0 for _, h in ipairs(remuda.hooks.start_probe or {}) do if h.owner == 'sample' then hooks = hooks + 1 end end; local timers = 0 for _, s in pairs(remuda.schedules) do if s.owner == 'sample' then timers = timers + 1 end end; return tostring(remuda._extension_commands['sample-cmd'] ~= nil) .. ':' .. hooks .. ':' .. timers .. ':' .. stop_calls",
         ),
-        "true:1:1:0"
+        "true:1:1:1"
     );
     image.stop_modules_bounded();
-    assert_eq!(
-        read_value(&image, "return tostring(remuda._sample_test_stop_calls)"),
-        "1"
-    );
+    assert_eq!(read_value(&image, "return tostring(stop_calls)"), "2");
 }
 
 #[test]
