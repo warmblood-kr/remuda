@@ -3,23 +3,9 @@
 use std::fs;
 use std::process::{Command, Output};
 
-struct PrivateDaemonCleanup(std::path::PathBuf);
-
-impl Drop for PrivateDaemonCleanup {
-    fn drop(&mut self) {
-        let socket = remuda_native::daemon::socket_path_in(&self.0, "s");
-        if socket.exists() || cfg!(windows) {
-            let _ = Command::new(env!("CARGO_BIN_EXE_remuda"))
-                .args(["-s", "s", "stop", "-f"])
-                .env("REMUDA_RUNTIME_DIR", &self.0)
-                .env("XDG_DATA_HOME", self.0.join("data"))
-                .env("XDG_CACHE_HOME", self.0.join("cache"))
-                .env("HOME", &self.0)
-                .output();
-        }
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
+#[path = "daemon_support/autostart_guard.rs"]
+mod autostart_daemon_guard;
+use autostart_daemon_guard::AutostartDaemonGuard;
 
 #[test]
 fn pending_handle_count_is_bounded_and_overflow_fails_immediately() {
@@ -35,13 +21,20 @@ fn pending_handle_count_is_bounded_and_overflow_fails_immediately() {
 }
 
 #[allow(clippy::too_many_lines)] // The fixture is one Lua module used by the integration cases below.
-fn fixture(tag: &str) -> (std::path::PathBuf, impl Fn(&[&str]) -> Output) {
+fn fixture(
+    tag: &str,
+) -> (
+    std::path::PathBuf,
+    impl Fn(&[&str]) -> Output,
+    AutostartDaemonGuard,
+) {
     let root = if cfg!(target_os = "macos") {
         std::path::PathBuf::from("/private/tmp")
     } else {
         std::env::temp_dir()
     };
     let dir = root.join(format!("r-dr-{}-{tag}", std::process::id()));
+    let daemon_guard = AutostartDaemonGuard::new(&dir);
     let _ = fs::remove_dir_all(&dir);
     let package = dir.join("data/remuda/mods/deferred");
     fs::create_dir_all(package.join("packages/deferred")).unwrap();
@@ -221,7 +214,7 @@ end)
             .output()
             .expect("run remuda")
     };
-    (dir, run)
+    (dir, run, daemon_guard)
 }
 
 #[cfg(unix)]
@@ -314,8 +307,7 @@ fn secret_prompt_client_exits_and_restores_tty(
 #[cfg(unix)]
 #[test]
 fn secret_prompt_deadline_and_termination_signals_restore_the_tty() {
-    let (dir, remuda) = fixture("secret-tty-lifecycle");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("secret-tty-lifecycle");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -345,8 +337,7 @@ fn secret_prompt_deadline_and_termination_signals_restore_the_tty() {
 
 #[test]
 fn cli_waits_for_deferred_result_and_preserves_plain_return_behavior() {
-    let (dir, remuda) = fixture("result");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("result");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -372,8 +363,7 @@ fn cli_waits_for_deferred_result_and_preserves_plain_return_behavior() {
 
 #[test]
 fn cli_reports_pending_timeout() {
-    let (dir, remuda) = fixture("timeout");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("timeout");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -401,8 +391,7 @@ fn cli_reports_pending_timeout() {
 
 #[test]
 fn double_resolution_fails_without_replacing_the_first_result() {
-    let (dir, remuda) = fixture("double");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("double");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -424,8 +413,7 @@ fn disconnect_notifies_on_cancel_and_drops_the_pending_reply() {
     use std::io::Write;
     use std::time::{Duration, Instant};
 
-    let (dir, remuda) = fixture("disconnect");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("disconnect");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -460,8 +448,7 @@ fn disconnect_notifies_on_cancel_and_drops_the_pending_reply() {
 
 #[test]
 fn deferred_output_over_limit_is_an_error_without_truncation() {
-    let (dir, remuda) = fixture("oversize");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("oversize");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -484,8 +471,7 @@ fn deferred_output_over_limit_is_an_error_without_truncation() {
 
 #[test]
 fn synchronous_value_over_limit_is_an_error_and_daemon_stays_healthy() {
-    let (dir, remuda) = fixture("oversize_sync");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("oversize_sync");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -522,8 +508,7 @@ fn synchronous_value_over_limit_is_an_error_and_daemon_stays_healthy() {
 
 #[test]
 fn maximum_deferred_output_round_trips_with_base64_wire_encoding() {
-    let (dir, remuda) = fixture("max_output");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("max_output");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -547,8 +532,7 @@ fn secret_prompt_non_tty_fallback_and_answer_do_not_leak() {
     use remuda_native::ipc::TryClone;
     use std::io::{BufRead, BufReader, Write};
 
-    let (dir, remuda) = fixture("secret_prompt");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("secret_prompt");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -638,8 +622,7 @@ fn secret_answer_frame_round_trips_at_four_kib_and_reports_too_long() {
     use remuda_native::ipc::TryClone;
     use std::io::{BufRead, BufReader, Write};
 
-    let (dir, remuda) = fixture("secret_cap");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("secret_cap");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -812,8 +795,7 @@ fn secret_prompt_in_session(
 fn session_secret_prompt_label_names_the_session_and_strips_controls() {
     use remuda_native::daemon;
 
-    let (dir, remuda) = fixture("secret_session_label");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("secret_session_label");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -842,8 +824,7 @@ fn session_secret_prompt_label_names_the_session_and_strips_controls() {
 fn session_secret_prompt_tag_replaces_brackets_in_the_session_name() {
     use remuda_native::daemon;
 
-    let (dir, remuda) = fixture("secret_session_tag_brackets");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("secret_session_tag_brackets");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -867,8 +848,7 @@ fn session_secret_prompt_tag_replaces_brackets_in_the_session_name() {
 fn session_secret_prompt_tag_caps_the_session_name_at_64_chars() {
     use remuda_native::daemon;
 
-    let (dir, remuda) = fixture("secret_session_tag_cap");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("secret_session_tag_cap");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -893,8 +873,7 @@ fn session_secret_prompt_tag_caps_the_session_name_at_64_chars() {
 fn session_secret_prompt_tag_preserves_non_ascii_session_names() {
     use remuda_native::daemon;
 
-    let (dir, remuda) = fixture("secret_session_tag_unicode");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("secret_session_tag_unicode");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -923,8 +902,7 @@ fn secret_entered_in_session_pane_is_absent_from_capture_and_scrollback() {
     use remuda_native::{client, daemon};
     use std::time::{Duration, Instant};
 
-    let (dir, remuda) = fixture("secret_pane_leak");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("secret_pane_leak");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -1083,8 +1061,7 @@ fn secret_prompt_label_for_word(tag: &str, word: &str) -> String {
     use remuda_native::ipc::TryClone;
     use std::io::{BufRead, BufReader, Write};
 
-    let (dir, remuda) = fixture(tag);
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture(tag);
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -1134,8 +1111,7 @@ fn secret_prompt_label_caps_caller_text_at_256_chars() {
 
 #[test]
 fn prompt_line_from_a_non_tty_reports_not_a_terminal() {
-    let (dir, remuda) = fixture("line_non_tty");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (_dir, remuda, _daemon_guard) = fixture("line_non_tty");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -1155,8 +1131,7 @@ fn prompt_line_value_round_trips_over_the_daemon_socket() {
     use remuda_native::ipc::TryClone;
     use std::io::{BufRead, BufReader, Write};
 
-    let (dir, remuda) = fixture("line_answers");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("line_answers");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -1229,8 +1204,7 @@ fn prompt_line_sanitizes_raw_socket_answer() {
     use remuda_native::ipc::TryClone;
     use std::io::{BufRead, BufReader, Write};
 
-    let (dir, remuda) = fixture("line_sanitize");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("line_sanitize");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -1293,8 +1267,7 @@ fn deferred_prompt_rejects_crossed_answer_types_and_calls_back_once() {
     use remuda_native::ipc::TryClone;
     use std::io::{BufRead, BufReader, Write};
 
-    let (dir, remuda) = fixture("crossed_prompt_answers");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("crossed_prompt_answers");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -1373,8 +1346,7 @@ fn session_prompt_line_shows_tagged_label_and_sanitized_default() {
     use remuda_native::{client, daemon};
     use std::time::{Duration, Instant};
 
-    let (dir, remuda) = fixture("line_session_label");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("line_session_label");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -1486,8 +1458,7 @@ fn assert_no_secret_in_files(root: &std::path::Path, secret: &[u8]) {
 fn shutdown_answers_waiters_and_runs_shutdown_cancellation_callback() {
     use std::time::{Duration, Instant};
 
-    let (dir, remuda) = fixture("shutdown");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("shutdown");
     let boot = remuda(&["exec", "deferred"]);
     assert!(
         boot.status.success(),
@@ -1562,8 +1533,7 @@ fn prompt_pane_for_word(tag: &str, word: &str, columns: u16, wait_for: &str) -> 
     use remuda_native::{client, daemon};
     use std::time::{Duration, Instant};
 
-    let (dir, remuda) = fixture(tag);
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture(tag);
     // Declared after the daemon cleanup, so it is dropped (and the client
     // killed) before the daemon stops.
     let pid_file = dir.join("pane.pid");
@@ -1675,8 +1645,7 @@ fn prompt_line_preface_strips_escape_cr_and_bidi() {
 
 #[test]
 fn prompt_line_preface_over_the_cap_is_an_error() {
-    let (dir, remuda) = fixture("preface_caps");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (_dir, remuda, _daemon_guard) = fixture("preface_caps");
     let boot = remuda(&["exec", "deferred"]);
     assert!(boot.status.success(), "{boot:?}");
 
@@ -1706,8 +1675,7 @@ fn prompt_line_wire_is_compatible_without_a_preface() {
     .expect("old-style PromptLine");
     assert!(matches!(old, Response::PromptLine { .. }), "{old:?}");
 
-    let (dir, remuda) = fixture("preface_wire");
-    let _cleanup = PrivateDaemonCleanup(dir.clone());
+    let (dir, remuda, _daemon_guard) = fixture("preface_wire");
     let boot = remuda(&["exec", "deferred"]);
     assert!(boot.status.success(), "{boot:?}");
     let socket = remuda_native::daemon::socket_path_in(&dir, "s");
