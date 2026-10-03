@@ -2131,7 +2131,7 @@ impl HoldInputWriter {
             self.poison();
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
-                "focused input writer is stalled; key batch dropped",
+                "focused input writer is stalled; delivery uncertain",
             ));
         }
         match result.recv_timeout(crate::pty::PTY_WRITE_TIMEOUT) {
@@ -2151,7 +2151,7 @@ impl HoldInputWriter {
                 self.poison();
                 Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
-                    "focused input writer stopped; key batch dropped",
+                    "focused input writer stopped; delivery uncertain",
                 ))
             }
         }
