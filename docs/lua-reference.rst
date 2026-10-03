@@ -69,7 +69,7 @@ cli
 cli.parse
 ---------
 
-``cli.parse(spec, argv) -> report`` — Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set multiple = true on the final positional argument to collect message body words.
+``cli.parse(spec, argv) -> report`` — Parse a word list against a runtime command declaration without printing or exiting. Returns {ok, verb?, values, kind?, text, code}; set required = false on an optional positional (positionals are required by default), and set multiple = true on the final positional argument to collect message body words.
 
 click
 -----
