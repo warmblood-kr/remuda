@@ -329,8 +329,6 @@ struct FileLocation {
     directory: crate::windows_security::StorageDirectory,
     #[cfg(windows)]
     name: String,
-    #[cfg(windows)]
-    path: PathBuf,
     #[cfg(not(any(unix, windows)))]
     path: PathBuf,
 }
@@ -563,7 +561,7 @@ fn storage_io_error(error: io::Error) -> String {
             | io::ErrorKind::AlreadyExists
             | io::ErrorKind::InvalidInput
     ) {
-        "denied: storage path is unsafe".into()
+        format!("denied: storage path is unsafe: {error}")
     } else {
         "unavailable: storage I/O failed".into()
     }
@@ -679,9 +677,7 @@ fn write_location(location: &FileLocation, bytes: &[u8]) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
-        location.directory.open_file(&location.name, true)?;
-        // The handle walk validated the leaf and every parent; D2 makes this handle-relative.
-        crate::fs_atomic::write_atomic_lua_private(&location.path, bytes)
+        location.directory.write_atomic(&location.name, bytes)
     }
     #[cfg(all(not(unix), not(windows)))]
     {
@@ -1026,7 +1022,6 @@ impl KindHandle {
             Ok(FileLocation {
                 directory,
                 name: leaf.to_owned(),
-                path: root.path.join(&self.namespace).join(name),
             })
         }
         #[cfg(all(not(unix), not(windows)))]
@@ -1482,6 +1477,15 @@ mod tests {
     }
 
     #[test]
+    fn denied_storage_errors_include_the_underlying_message() {
+        let error = io::Error::new(io::ErrorKind::PermissionDenied, "child ACE mask mismatch");
+        assert_eq!(
+            storage_io_error(error),
+            "denied: storage path is unsafe: child ACE mask mismatch"
+        );
+    }
+
+    #[test]
     fn collect_files_if_present_treats_a_missing_root_as_empty() {
         let root = TestRoot::new();
         let missing = root.0.join("not-created");
@@ -1494,6 +1498,127 @@ mod tests {
             result.is_ok(),
             "Windows CI must create symlink fixtures: {result:?}"
         );
+    }
+
+    #[cfg(windows)]
+    fn xdg_data_handle(root: &Path, namespace: &str) -> KindHandle {
+        let path = root.join("data/storage");
+        let directory = crate::windows_security::ensure_storage_root(&path).unwrap();
+        let roots = BTreeMap::from([("data", WindowsFileRoot { path, directory })]);
+        KindHandle {
+            namespace: namespace.to_owned(),
+            kind: HandleKind::Data,
+            files: Arc::new(Mutex::new(BTreeMap::new())),
+            roots: Some(Arc::new(roots)),
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_no_atomic_temporary_files(directory: &crate::windows_security::StorageDirectory) {
+        assert!(
+            directory
+                .names()
+                .unwrap()
+                .iter()
+                .all(|name| !name.starts_with(ATOMIC_TEMP_PREFIX)),
+            "failed storage write leaked a temporary sibling"
+        );
+    }
+
+    #[cfg(windows)]
+    fn assert_inherited_storage_acl(file: &fs::File) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT,
+        };
+        use windows_sys::Win32::Security::{
+            GetAce, GetAclInformation, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION,
+            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+        };
+
+        let mut dacl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: file is an open handle and all output pointers remain live for the call.
+        let result = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(result, 0, "query opened storage handle ACL");
+        assert!(
+            !descriptor.is_null(),
+            "opened handle has a security descriptor"
+        );
+        assert!(!dacl.is_null(), "opened storage handle has a DACL");
+        let mut info = ACL_SIZE_INFORMATION::default();
+        assert_ne!(
+            // SAFETY: dacl is owned by descriptor; info is a correctly sized output buffer.
+            unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                    std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    windows_sys::Win32::Security::AclSizeInformation,
+                )
+            },
+            0,
+            "query opened storage handle ACE count"
+        );
+        assert_eq!(info.AceCount, 3, "opened storage handle ACL is not widened");
+        let mut principals = Vec::new();
+        for index in 0..info.AceCount {
+            let mut raw_ace = std::ptr::null_mut();
+            assert_ne!(
+                // SAFETY: dacl is valid and raw_ace is a writable output pointer.
+                unsafe { GetAce(dacl, index, &mut raw_ace) },
+                0,
+                "read storage ACE"
+            );
+            assert!(!raw_ace.is_null(), "storage ACL ACE is present");
+            // SAFETY: GetAce returned an ACE pointer owned by the live DACL.
+            let header = unsafe { &*raw_ace.cast::<ACE_HEADER>() };
+            assert_eq!(header.AceType, 0, "storage ACL contains only allow ACEs");
+            assert_ne!(header.AceFlags & 0x10, 0, "storage ACE is inherited");
+            assert!(header.AceSize as usize >= std::mem::size_of::<ACCESS_ALLOWED_ACE>());
+            // SAFETY: AceSize covers the ACCESS_ALLOWED_ACE prefix checked above.
+            let ace = unsafe { &*raw_ace.cast::<ACCESS_ALLOWED_ACE>() };
+            assert_eq!(
+                ace.Mask,
+                windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS,
+                "storage ACE preserves the protected root mask"
+            );
+            let sid = (&ace.SidStart as *const u32).cast_mut().cast();
+            let mut sid_text = std::ptr::null_mut();
+            // SAFETY: sid points into a live, size-checked allow ACE.
+            assert_ne!(unsafe { ConvertSidToStringSidW(sid, &mut sid_text) }, 0);
+            assert!(!sid_text.is_null(), "storage ACE SID converted");
+            let mut length = 0;
+            // SAFETY: ConvertSidToStringSidW returns a NUL-terminated allocation.
+            while unsafe { *sid_text.add(length) } != 0 {
+                length += 1;
+            }
+            // SAFETY: the scan found the NUL terminator within the returned allocation.
+            principals.push(String::from_utf16_lossy(unsafe {
+                std::slice::from_raw_parts(sid_text, length)
+            }));
+            // SAFETY: sid_text is the allocation returned by ConvertSidToStringSidW.
+            unsafe { windows_sys::Win32::Foundation::LocalFree(sid_text.cast()) };
+        }
+        principals.sort();
+        assert_eq!(
+            principals,
+            ["S-1-3-4", "S-1-5-18", "S-1-5-32-544"],
+            "opened storage handle ACL principals"
+        );
+        // SAFETY: descriptor is the allocation returned by GetSecurityInfo.
+        unsafe { windows_sys::Win32::Foundation::LocalFree(descriptor.cast()) };
     }
 
     #[test]
@@ -1901,6 +2026,110 @@ mod tests {
         )
         .exec()
         .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn xdg_write_uses_validated_parent_after_namespace_is_replaced_by_junction() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = TestRoot::new();
+        let outside = root.0.join("outside");
+        fs::create_dir(&outside).unwrap();
+        let handle = xdg_data_handle(&root.0, "swapped");
+        let location = handle.file_path("target", true).unwrap();
+        let namespace = root.0.join("data/storage/swapped");
+        let parked = root.0.join("parked-namespace");
+        fs::rename(&namespace, &parked).unwrap();
+        require_symlink(symlink_dir(&outside, &namespace));
+
+        write_location(&location, b"validated-parent")
+            .expect("write should use the already validated directory handle");
+        assert!(
+            !outside.join("target").exists(),
+            "write followed a swapped namespace junction"
+        );
+        assert_eq!(
+            fs::read(parked.join("target")).unwrap(),
+            b"validated-parent"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn xdg_failed_write_leaves_no_empty_target_or_atomic_temporary() {
+        let root = TestRoot::new();
+        let handle = xdg_data_handle(&root.0, "failed-write");
+        let namespace = root.0.join("data/storage/failed-write");
+        fs::create_dir_all(&namespace).unwrap();
+        let target = namespace.join("blocked");
+        fs::create_dir(&target).unwrap();
+        let location = handle.file_path("blocked", false).unwrap();
+
+        let error = write_location(&location, b"must-not-be-written")
+            .expect_err("directory leaf must refuse file replacement");
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::InvalidInput,
+            "directory leaf error"
+        );
+        assert!(target.is_dir(), "failed write replaced the directory leaf");
+        assert_no_atomic_temporary_files(&location.directory);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn xdg_new_file_and_directory_inherit_verified_storage_acl() {
+        let root = TestRoot::new();
+        let handle = xdg_data_handle(&root.0, "inherited-acl");
+        let location = handle.file_path("nested/item", true).unwrap();
+        write_location(&location, b"protected").unwrap();
+        let file = location.directory.open_file("item", false).unwrap();
+
+        assert_inherited_storage_acl(location.directory.as_file_for_test());
+        assert_inherited_storage_acl(&file);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn xdg_overwrite_never_exposes_an_empty_or_partial_file() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+
+        let root = TestRoot::new();
+        let handle = xdg_data_handle(&root.0, "atomic-overwrite");
+        let location = handle.file_path("item", true).unwrap();
+        let first = vec![b'A'; 64 * 1024];
+        let second = vec![b'B'; 64 * 1024];
+        write_location(&location, &first).unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let reader_done = Arc::clone(&done);
+        let path = root.0.join("data/storage/atomic-overwrite/item");
+        let reader_first = first.clone();
+        let reader_second = second.clone();
+        let reader = thread::spawn(move || {
+            while !reader_done.load(Ordering::Acquire) {
+                let bytes = fs::read(&path).expect("atomic target stays present during overwrite");
+                assert!(
+                    bytes == reader_first || bytes == reader_second,
+                    "reader observed an empty or partial storage value"
+                );
+            }
+        });
+        let mut write_error = None;
+        for index in 0..64 {
+            if let Err(error) =
+                write_location(&location, if index % 2 == 0 { &second } else { &first })
+            {
+                write_error = Some(error);
+                break;
+            }
+        }
+        done.store(true, Ordering::Release);
+        reader.join().unwrap();
+        if let Some(error) = write_error {
+            panic!("atomic overwrite failed: {error}");
+        }
     }
 
     #[cfg(windows)]

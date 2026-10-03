@@ -37,6 +37,11 @@ const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 #[cfg(any(windows, test))]
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 
+#[cfg(all(test, windows))]
+thread_local! {
+    static FAIL_NEXT_STORAGE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[cfg(any(windows, test))]
 pub(crate) fn nt_open_policy(directory: bool) -> NtOpenPolicy {
     NtOpenPolicy {
@@ -52,16 +57,96 @@ pub(crate) fn nt_open_policy(directory: bool) -> NtOpenPolicy {
 }
 
 #[cfg(any(windows, test))]
+struct FileRenameInfoBuffer {
+    words: Vec<usize>,
+    byte_len: usize,
+}
+
+#[cfg(any(windows, test))]
+const FILE_RENAME_INFORMATION_EX_CLASS: i32 = 65;
+
+#[cfg(any(windows, test))]
+impl FileRenameInfoBuffer {
+    fn as_mut_bytes(&mut self) -> &mut [u8] {
+        // SAFETY: `words` is aligned storage and every allocated byte is initialized.
+        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr().cast(), self.byte_len) }
+    }
+}
+
+#[cfg(any(windows, test))]
+impl std::ops::Deref for FileRenameInfoBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `words` is aligned storage and every allocated byte is initialized.
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast(), self.byte_len) }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn build_nt_file_rename_info(
+    root_directory: usize,
+    name: &str,
+    replace: bool,
+) -> std::io::Result<FileRenameInfoBuffer> {
+    if name.is_empty() || name.contains(['\0', '/', '\\']) {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    let encoded = name.encode_utf16().collect::<Vec<_>>();
+    let name_bytes = encoded
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let name_length = u32::try_from(name_bytes)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let root_offset = std::mem::size_of::<u32>().next_multiple_of(std::mem::align_of::<usize>());
+    let length_offset = root_offset + std::mem::size_of::<usize>();
+    let name_offset = length_offset + std::mem::size_of::<u32>();
+    let byte_len = name_offset + name_bytes + std::mem::size_of::<u16>();
+    let word_count = byte_len.div_ceil(std::mem::size_of::<usize>());
+    let mut info = FileRenameInfoBuffer {
+        words: vec![0; word_count],
+        byte_len,
+    };
+    let bytes = info.as_mut_bytes();
+    let flags = 0x2 | u32::from(replace); // POSIX semantics plus optional replace.
+    bytes[..4].copy_from_slice(&flags.to_ne_bytes());
+    bytes[root_offset..length_offset].copy_from_slice(&root_directory.to_ne_bytes());
+    bytes[length_offset..name_offset].copy_from_slice(&name_length.to_ne_bytes());
+    for (index, unit) in encoded.into_iter().enumerate() {
+        let offset = name_offset + index * std::mem::size_of::<u16>();
+        bytes[offset..offset + 2].copy_from_slice(&unit.to_ne_bytes());
+    }
+    Ok(info)
+}
+
+#[cfg(any(windows, test))]
 fn ace_sid_fits(ace_size: usize, fixed_size: usize, sid_size: usize) -> bool {
     fixed_size
         .checked_add(sid_size)
         .is_some_and(|required| ace_size >= required)
 }
 
+#[cfg(any(windows, test))]
+fn inherited_child_ace_matches(is_directory: bool, flags: u8, mask: u32) -> bool {
+    const INHERITED_ACE: u8 = 0x10;
+    const FILE_INHERITANCE_FLAGS: u8 = 0x01 | 0x02 | 0x08;
+    const FILE_ALL_ACCESS_MASK: u32 = 0x001F_01FF;
+
+    flags & INHERITED_ACE != 0
+        && mask == FILE_ALL_ACCESS_MASK
+        && (is_directory || flags & FILE_INHERITANCE_FLAGS == 0)
+}
+
 #[allow(dead_code)]
 pub(crate) fn protected_storage_sddl(owner_sid: &str) -> String {
     // Protect the root from parent ACLs; let its three trusted principals inherit to children.
     format!("O:{owner_sid}D:PAI(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)")
+}
+
+#[cfg(any(windows, test))]
+fn trusted_storage_owner(actual_sid: &str, current_user_sid: &str) -> bool {
+    actual_sid == current_user_sid || matches!(actual_sid, "S-1-5-18" | "S-1-5-32-544")
 }
 
 #[allow(dead_code)]
@@ -97,10 +182,16 @@ pub(crate) fn storage_root_for(env: &dyn Fn(&str) -> Option<OsString>) -> Result
 
 #[cfg(windows)]
 mod platform {
-    use super::{ace_sid_fits, nt_open_policy, protected_storage_sddl, relative_component_utf16};
+    #[cfg(test)]
+    use super::FAIL_NEXT_STORAGE_RENAME;
+    use super::{
+        ace_sid_fits, build_nt_file_rename_info, inherited_child_ace_matches, nt_open_policy,
+        protected_storage_sddl, relative_component_utf16, trusted_storage_owner,
+        FILE_RENAME_INFORMATION_EX_CLASS,
+    };
     use std::ffi::{c_void, OsStr};
     use std::fs;
-    use std::io;
+    use std::io::{self, Write};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::Path;
@@ -108,7 +199,8 @@ mod platform {
     use std::sync::Mutex;
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        NtCreateFile, NtOpenFile, NtQueryDirectoryFile, FILE_NAMES_INFORMATION,
+        NtCreateFile, NtOpenFile, NtQueryDirectoryFile, NtSetInformationFile,
+        FILE_NAMES_INFORMATION,
     };
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, LocalFree, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING,
@@ -119,7 +211,7 @@ mod platform {
     };
     use windows_sys::Win32::Security::{
         GetAce, GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-        GetTokenInformation, TokenUser, ACE_HEADER, ACL_SIZE_INFORMATION,
+        GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION,
         DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED, TOKEN_QUERY,
         TOKEN_USER,
     };
@@ -163,6 +255,11 @@ mod platform {
     }
 
     impl StorageDirectory {
+        #[cfg(test)]
+        pub(crate) fn as_file_for_test(&self) -> &std::fs::File {
+            &self.file
+        }
+
         pub(crate) fn open_directory(&self, name: &str, create: bool) -> io::Result<Self> {
             if create
                 && self
@@ -172,7 +269,8 @@ mod platform {
             {
                 return Err(io::Error::from(io::ErrorKind::AlreadyExists));
             }
-            let file = open_relative(&self.file, name, true, create, 0x0010_0087)?;
+            let file = open_relative(&self.file, name, true, create, 0x0012_0087)?;
+            verify_inherited_acl(&file, "storage child directory", true)?;
             Ok(Self {
                 file,
                 names_lock: Mutex::new(()),
@@ -180,21 +278,80 @@ mod platform {
         }
 
         pub(crate) fn open_file(&self, name: &str, write: bool) -> io::Result<std::fs::File> {
-            open_relative(
+            let file = open_relative(
                 &self.file,
                 name,
                 false,
                 write,
-                if write { 0x0010_0082 } else { 0x0010_0081 },
-            )
+                if write { 0x0012_0082 } else { 0x0012_0081 },
+            )?;
+            verify_inherited_acl(&file, "storage child file", false)?;
+            Ok(file)
+        }
+
+        pub(crate) fn write_atomic(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+            match self.open_file(name, false) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let mut temporary = None;
+            for _ in 0..8 {
+                let name = random_temporary_name()?;
+                match create_relative_file(&self.file, &name) {
+                    Ok(file) => {
+                        temporary = Some(TempFileGuard {
+                            file,
+                            delete_on_drop: true,
+                        });
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let mut temporary =
+                temporary.ok_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists))?;
+            verify_inherited_acl(&temporary.file, "storage temporary file", false)?;
+            temporary.file.write_all(bytes)?;
+            temporary.file.sync_all()?;
+
+            #[cfg(test)]
+            if FAIL_NEXT_STORAGE_RENAME.with(|fail| fail.replace(false)) {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+
+            let mut rename_info =
+                build_nt_file_rename_info(self.file.as_raw_handle() as usize, name, true)?;
+            let length = u32::try_from(rename_info.len())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            // SAFETY: A zeroed IO_STATUS_BLOCK is a valid writable output structure.
+            let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+            // NtSetInformationFile accepts the held parent handle in the relative-name payload.
+            // SAFETY: the aligned buffer, status block, and owned file handle live through the call.
+            let status = unsafe {
+                NtSetInformationFile(
+                    temporary.file.as_raw_handle(),
+                    &mut status_block,
+                    rename_info.as_mut_bytes().as_mut_ptr().cast(),
+                    length,
+                    FILE_RENAME_INFORMATION_EX_CLASS,
+                )
+            };
+            if status < 0 {
+                return Err(nt_error(status));
+            }
+            temporary.delete_on_drop = false;
+            Ok(())
         }
 
         pub(crate) fn delete_file(&self, name: &str) -> io::Result<bool> {
-            let file = match open_relative(&self.file, name, false, false, 0x0011_0080) {
+            let file = match open_relative(&self.file, name, false, false, 0x0013_0080) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error),
             };
+            verify_inherited_acl(&file, "storage child file", false)?;
             let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
             // SAFETY: file is a no-follow regular-file handle with DELETE access.
             if unsafe {
@@ -303,6 +460,102 @@ mod platform {
         }
     }
 
+    struct TempFileGuard {
+        file: std::fs::File,
+        delete_on_drop: bool,
+    }
+
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            if self.delete_on_drop {
+                mark_file_for_delete(&self.file);
+            }
+        }
+    }
+
+    fn mark_file_for_delete(file: &std::fs::File) {
+        let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: The owned temp handle has DELETE access and the disposition buffer is sized.
+        unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                4,
+                (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            );
+        }
+    }
+
+    fn random_temporary_name() -> io::Result<String> {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|_| io::Error::other("storage randomness unavailable"))?;
+        let mut name = String::from(".remuda-atomic-");
+        for byte in random {
+            use std::fmt::Write as _;
+            write!(&mut name, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        name.push_str(".tmp");
+        Ok(name)
+    }
+
+    fn create_relative_file(parent: &std::fs::File, component: &str) -> io::Result<std::fs::File> {
+        let name = relative_component_utf16(component)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let length = ((name.len() - 1) * std::mem::size_of::<u16>()) as u16;
+        let mut unicode = UNICODE_STRING {
+            Length: length,
+            MaximumLength: (name.len() * std::mem::size_of::<u16>()) as u16,
+            Buffer: name.as_ptr().cast_mut(),
+        };
+        let policy = nt_open_policy(false);
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle(),
+            ObjectName: &mut unicode,
+            Attributes: policy.object_attributes,
+            SecurityDescriptor: ptr::null_mut(),
+            SecurityQualityOfService: ptr::null_mut(),
+        };
+        // SAFETY: A zeroed IO_STATUS_BLOCK is the required initialized output structure.
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        let mut raw = ptr::null_mut();
+        // FILE_CREATE makes collisions fail instead of opening an existing sibling.
+        // SAFETY: all NT structures and the component buffer remain live through the call.
+        let status = unsafe {
+            NtCreateFile(
+                &mut raw,
+                0x0013_0082, // DELETE | READ_CONTROL | SYNCHRONIZE | READ_ATTRIBUTES | WRITE_DATA
+                &attributes,
+                &mut status_block,
+                ptr::null(),
+                0x80,
+                7,
+                2,
+                policy.create_options,
+                ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            if !raw.is_null() {
+                // SAFETY: A non-null failed output handle must be released.
+                unsafe { CloseHandle(raw) };
+            }
+            return Err(nt_error(status));
+        }
+        if raw.is_null() {
+            return Err(io::Error::other("storage temp create returned no handle"));
+        }
+        // SAFETY: A successful NtCreateFile call returned an owned file handle.
+        let file = unsafe { std::fs::File::from_raw_handle(raw) };
+        if let Err(error) = verify_handle(&file, false) {
+            mark_file_for_delete(&file);
+            return Err(error);
+        }
+        Ok(file)
+    }
+
     fn nt_error(status: i32) -> io::Error {
         match status as u32 {
             0xC000_0034 | 0xC000_003A => io::Error::from(io::ErrorKind::NotFound),
@@ -406,6 +659,138 @@ mod platform {
         let is_directory = tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
         if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || is_directory != directory {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        Ok(())
+    }
+
+    fn verify_inherited_acl(
+        file: &std::fs::File,
+        subject: &str,
+        is_directory: bool,
+    ) -> io::Result<()> {
+        let mut owner = ptr::null_mut();
+        let mut dacl = ptr::null_mut();
+        let mut raw_descriptor = ptr::null_mut();
+        // SAFETY: file is a live handle opened with READ_CONTROL; output pointers are valid.
+        let result = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut raw_descriptor,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+        if raw_descriptor.is_null() {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        let descriptor = LocalMemory(raw_descriptor.cast());
+        let user = UserSid::current()?;
+        if owner.is_null() {
+            return Err(policy_error(&format!("{subject} owner is missing")));
+        }
+        // Elevated setup can create children as Administrators or SYSTEM; trust those SIDs only.
+        if !trusted_storage_owner(&sid_text(owner)?, &user.text) {
+            return Err(policy_error(&format!("{subject} owner is untrusted")));
+        }
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: descriptor owns a valid security descriptor and outputs are writable.
+        if unsafe { GetSecurityDescriptorControl(descriptor.0.cast(), &mut control, &mut revision) }
+            == 0
+        {
+            return Err(last_error());
+        }
+        if control & SE_DACL_PROTECTED != 0 {
+            return Err(policy_error(&format!("{subject} DACL is protected")));
+        }
+        let mut present = 0;
+        let mut actual_dacl = ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: descriptor is valid and the DACL fields are output pointers.
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor.0.cast(),
+                &mut present,
+                &mut actual_dacl,
+                &mut defaulted,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        if present == 0 || actual_dacl.is_null() {
+            return Err(policy_error(&format!("{subject} DACL is missing")));
+        }
+        let mut info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: actual_dacl is owned by descriptor; info is a sized output buffer.
+        if unsafe {
+            GetAclInformation(
+                actual_dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                windows_sys::Win32::Security::AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        if info.AceCount != 3 {
+            return Err(policy_error(&format!("{subject} ACE count mismatch")));
+        }
+        let mut principals = Vec::with_capacity(3);
+        for index in 0..info.AceCount {
+            let mut raw_ace = ptr::null_mut();
+            // SAFETY: actual_dacl is valid and raw_ace is a writable output pointer.
+            if unsafe { GetAce(actual_dacl, index, &mut raw_ace) } == 0 || raw_ace.is_null() {
+                return Err(last_error());
+            }
+            // SAFETY: GetAce returned an ACE pointer owned by the live DACL.
+            let header = unsafe { &*(raw_ace.cast::<ACE_HEADER>()) };
+            if header.AceSize as usize > info.AclBytesInUse as usize || header.AceType != 0 {
+                return Err(policy_error(&format!(
+                    "{subject} ACE size or type mismatch"
+                )));
+            }
+            let fixed_size = std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>();
+            if (header.AceSize as usize) < fixed_size + 8 {
+                return Err(policy_error(&format!("{subject} ACE header is truncated")));
+            }
+            // SAFETY: AceSize covers the ACCESS_ALLOWED_ACE prefix checked above.
+            let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
+            if !inherited_child_ace_matches(is_directory, header.AceFlags, ace.Mask) {
+                return Err(policy_error(&format!(
+                    "{subject} ACE flags or mask mismatch"
+                )));
+            }
+            let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
+            let sid_bytes = sid.cast::<u8>();
+            // SAFETY: the checked ACE prefix includes the initial eight-byte SID header.
+            let (revision, sub_authority_count) = unsafe { (*sid_bytes, *sid_bytes.add(1)) };
+            if revision != 1 || sub_authority_count > 15 {
+                return Err(policy_error(&format!("{subject} ACE SID is invalid")));
+            }
+            let sid_size = 8 + usize::from(sub_authority_count) * std::mem::size_of::<u32>();
+            if !ace_sid_fits(header.AceSize as usize, fixed_size, sid_size) {
+                return Err(policy_error(&format!("{subject} ACE SID is truncated")));
+            }
+            principals.push(sid_text(sid)?);
+        }
+        principals.sort();
+        let mut expected = vec![
+            "S-1-3-4".to_owned(),
+            "S-1-5-18".to_owned(),
+            "S-1-5-32-544".to_owned(),
+        ];
+        expected.sort();
+        if principals != expected {
+            return Err(policy_error(&format!("{subject} principal set mismatch")));
         }
         Ok(())
     }
@@ -786,6 +1171,46 @@ mod tests {
     }
 
     #[test]
+    fn nt_rename_info_builder_is_handle_relative_utf16_and_nul_terminated() {
+        let root = 0x1234usize;
+        let name = "résumé.tmp";
+        let info = build_nt_file_rename_info(root, name, true).unwrap();
+        let root_offset = 4usize.next_multiple_of(std::mem::size_of::<usize>());
+        let length_offset = root_offset + std::mem::size_of::<usize>();
+        let name_offset = length_offset + std::mem::size_of::<u32>();
+        let encoded = name.encode_utf16().collect::<Vec<_>>();
+
+        assert_eq!(FILE_RENAME_INFORMATION_EX_CLASS, 65);
+        assert_eq!(u32::from_le_bytes(info[0..4].try_into().unwrap()), 0x3);
+        let no_replace = build_nt_file_rename_info(root, name, false).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(no_replace[0..4].try_into().unwrap()),
+            0x2
+        );
+        assert_eq!(
+            usize::from_le_bytes(info[root_offset..length_offset].try_into().unwrap()),
+            root
+        );
+        assert_eq!(
+            u32::from_le_bytes(info[length_offset..name_offset].try_into().unwrap()) as usize,
+            encoded.len() * std::mem::size_of::<u16>()
+        );
+        let mut expected = encoded
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        expected.extend_from_slice(&[0, 0]);
+        assert_eq!(&info[name_offset..], expected.as_slice());
+    }
+
+    #[test]
+    fn rename_info_builder_rejects_empty_or_nul_containing_leaf_names() {
+        assert!(build_nt_file_rename_info(1, "", true).is_err());
+        assert!(build_nt_file_rename_info(1, "bad\0name", true).is_err());
+        assert!(build_nt_file_rename_info(1, "nested/name", true).is_err());
+    }
+
+    #[test]
     fn storage_sddl_grants_only_owner_system_and_administrators() {
         assert_eq!(
             protected_storage_sddl("S-1-5-21-42"),
@@ -794,9 +1219,32 @@ mod tests {
     }
 
     #[test]
+    fn storage_child_owner_accepts_only_current_user_system_or_administrators() {
+        let current = "S-1-5-21-42";
+        for trusted in [current, "S-1-5-18", "S-1-5-32-544"] {
+            assert!(
+                trusted_storage_owner(trusted, current),
+                "trusted SID {trusted}"
+            );
+        }
+        assert!(!trusted_storage_owner("S-1-5-21-99", current));
+    }
+
+    #[test]
     fn ace_size_must_contain_the_full_sid() {
         assert!(ace_sid_fits(28, 8, 20));
         assert!(!ace_sid_fits(27, 8, 20));
+    }
+
+    #[test]
+    fn inherited_ace_matcher_applies_file_and_directory_rules() {
+        let file_all_access = 0x001F_01FF;
+        assert!(inherited_child_ace_matches(true, 0x13, file_all_access));
+        assert!(inherited_child_ace_matches(false, 0x10, file_all_access));
+        assert!(!inherited_child_ace_matches(false, 0x11, file_all_access));
+        assert!(!inherited_child_ace_matches(false, 0x18, file_all_access));
+        assert!(!inherited_child_ace_matches(false, 0x00, file_all_access));
+        assert!(!inherited_child_ace_matches(false, 0x10, 0x1000_0000));
     }
 
     #[test]
@@ -874,5 +1322,22 @@ mod windows_tests {
         assert!(status.success(), "could not create junction for test");
         assert!(ensure_storage_root(&link).is_err());
         fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn failed_handle_relative_rename_leaves_no_target_or_temporary_sibling() {
+        let root = test_root();
+        let storage = ensure_storage_root(&root).unwrap();
+        let namespace = storage.open_directory("atomic-failure", true).unwrap();
+        FAIL_NEXT_STORAGE_RENAME.with(|fail| fail.set(true));
+        let result = namespace.write_atomic("target", b"value");
+        FAIL_NEXT_STORAGE_RENAME.with(|fail| fail.set(false));
+        let error = result.unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(namespace.names().unwrap(), Vec::<String>::new());
+        drop(namespace);
+        drop(storage);
+        fs::remove_dir_all(root).unwrap();
     }
 }
