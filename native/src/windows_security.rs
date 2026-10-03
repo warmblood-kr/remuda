@@ -656,9 +656,9 @@ mod platform {
                 &mut raw_descriptor,
             )
         };
-            if result != 0 {
-                return Err(io::Error::from_raw_os_error(result as i32));
-            }
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
         if raw_descriptor.is_null() {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
@@ -1185,6 +1185,18 @@ mod tests {
             protected_storage_sddl("S-1-5-21-42"),
             "O:S-1-5-21-42D:PAI(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"
         );
+    }
+
+    #[test]
+    fn storage_child_owner_accepts_only_current_user_system_or_administrators() {
+        let current = "S-1-5-21-42";
+        for trusted in [current, "S-1-5-18", "S-1-5-32-544"] {
+            assert!(
+                trusted_storage_owner(trusted, current),
+                "trusted SID {trusted}"
+            );
+        }
+        assert!(!trusted_storage_owner("S-1-5-21-99", current));
     }
 
     #[test]
