@@ -90,6 +90,7 @@ register("tools", "The `remuda.tool` registry table, keyed by tool name.", "tabl
 register("_extension_commands", "Handlers registered for installed mod commands.", "table")
 register("extension_command", "Register a handler for an installed mod command. Its caller table includes advisory daemon-derived kind and session fields, plus forwarded env/stdin values; kind outside does not establish operator identity.", "extension_command(name, handler(args, caller)) -> nil")
 register("_dispatch_extension_command", "Dispatch arguments and caller context to a loaded mod command handler.", "_dispatch_extension_command(name, args, caller) -> value")
+register("_exec_commands", "Load a mod and run its optional commands hook without starting it; legacy mods keep their existing start behavior.", "_exec_commands(name) -> nil")
 
 -- #394: a mod subcommand loads its mod on first use, so the first command
 -- after an install works. OWNER names an installed mod (`exec` resolves
@@ -98,7 +99,7 @@ register("_dispatch_extension_command", "Dispatch arguments and caller context t
 -- readiness, load from the CLI instead (probe, `remuda exec`, dispatch).
 function remuda._load_extension_command(name, owner)
   if remuda._extension_commands[name] then return false end
-  local loaded, err = pcall(remuda.exec, owner)
+  local loaded, err = pcall(remuda._exec_commands, owner)
   if loaded and remuda._extension_commands[name] then return true end
   remuda._extension_commands[name], extension_command_owners[name] = nil, nil
   local reason = loaded and ("it did not register the command " .. tostring(name))
@@ -1092,7 +1093,8 @@ local function clear_imperative_module_registrations(name, activation)
 end
 
 local function stop_module_activation(name, module)
-  if not module or not module.stop or module.stopped then return end
+  if not module or not module.stop or module.stopped
+    or (module.start and not module.start_attempted) then return end
   module.stopped = true
   local ok, err = pcall(module.stop, module.state)
   if not ok then
@@ -1161,14 +1163,19 @@ local function array_length(value, label)
   return length
 end
 
--- REACTIVATE false is `exec`: ensure the mod is active, but leave an active
--- one (and its `start` effects) alone — only `reload` re-runs `start` (#116).
+-- REACTIVATE false is `exec`: ensure the mod is active and launch a
+-- commands-only activation once; leave a started mod alone. Only `reload`
+-- replaces an activation and re-runs its hooks (#116).
 -- A `start` that failed rolls back (#129), so the next `exec` retries it.
-function remuda._activate_module(name, candidate, reactivate)
+function remuda._activate_module(name, candidate, reactivate, commands_only)
   if type(name) ~= "string" or name == "" then
     error("module name must be a non-empty string", 0)
   end
   if reactivate == false and modules[name] ~= nil then
+    local active = modules[name]
+    if not commands_only and not active.started and active.start then
+      return false, active.state, active.start, active.rollback, nil
+    end
     return false
   end
   if type(candidate) ~= "table" or candidate.api ~= "remuda-module-v1" then
@@ -1183,6 +1190,9 @@ function remuda._activate_module(name, candidate, reactivate)
   end
   if candidate.start ~= nil and type(candidate.start) ~= "function" then
     error("module start must be a function", 0)
+  end
+  if candidate.commands ~= nil and type(candidate.commands) ~= "function" then
+    error("module commands must be a function", 0)
   end
   if candidate.stop ~= nil and type(candidate.stop) ~= "function" then
     error("module stop must be a function", 0)
@@ -1450,13 +1460,20 @@ function remuda._activate_module(name, candidate, reactivate)
   local stop = candidate.stop and function(stopped_state)
     return with_owner(name, candidate.stop, stopped_state)
   end
+  local activation
   local start = candidate.start and function(started_state)
-    return with_owner(name, candidate.start, started_state)
+    activation.start_attempted = true
+    local result = with_owner(name, candidate.start, started_state)
+    activation.started = true
+    return result
+  end
+  local commands = candidate.commands and function(command_state)
+    return with_owner(name, candidate.commands, command_state)
   end
   local ready = candidate.ready and function(ready_state)
     return with_owner(name, candidate.ready, ready_state)
   end
-  local activation = {
+  activation = {
     version = version,
     state = state,
     tools = tool_names,
@@ -1465,6 +1482,9 @@ function remuda._activate_module(name, candidate, reactivate)
     contributions = declared_contributions,
     stop = stop,
     start = start,
+    commands = commands,
+    started = false,
+    start_attempted = false,
     ready = ready,
     timeout_ms = timeout_ms,
     stopped = false,
@@ -1585,7 +1605,10 @@ function remuda._activate_module(name, candidate, reactivate)
       end
     end
   end
-  return true, state, start, rollback
+  activation.rollback = rollback
+  local launch_start = start
+  if commands_only and commands then launch_start = nil end
+  return true, state, launch_start, rollback, commands
 end
 
 -- Called by the daemon's clean shutdown path. A snapshot avoids mutation

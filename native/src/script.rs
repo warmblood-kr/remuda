@@ -29,12 +29,13 @@ use std::time::Duration;
 /// Every name in the live `remuda` table: the operations bound here, plus
 /// what `tools.lua` adds in pure Lua. Asserted against the live table, both
 /// directions.
-pub const BINDINGS: [&str; 95] = [
+pub const BINDINGS: [&str; 96] = [
     "_advice_reattach",
     "_call",
     "_descriptors",
     "_dispatch_extension_command",
     "_event_counts",
+    "_exec_commands",
     "_extension_commands",
     "_function_source",
     "_input_submit",
@@ -1357,20 +1358,31 @@ fn exec_binding(lua: &Lua, table: &Table) -> mlua::Result<()> {
     table
         .set(
             "exec",
-            lua.create_function(|lua, name: String| execute_package(lua, &name, false))?,
+            lua.create_function(|lua, name: String| execute_package(lua, &name, false, false))?,
         )
         .and_then(|()| {
             table.set(
+                "_exec_commands",
+                lua.create_function(|lua, name: String| execute_package(lua, &name, false, true))?,
+            )
+        })
+        .and_then(|()| {
+            table.set(
                 "reload",
-                lua.create_function(|lua, name: String| execute_package(lua, &name, true))?,
+                lua.create_function(|lua, name: String| execute_package(lua, &name, true, false))?,
             )
         })
 }
 
 /// A top-level mod first gets its `requires` checked as a whole, then its
 /// lifecycle hosts activated in order (exec leaves an active one alone).
-fn execute_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Result<()> {
-    let loaded = load_package(lua, name, require_lifecycle);
+fn execute_package(
+    lua: &Lua,
+    name: &str,
+    require_lifecycle: bool,
+    commands_only: bool,
+) -> mlua::Result<()> {
+    let loaded = load_package(lua, name, require_lifecycle, commands_only);
     // A mod that redefined an advised function keeps its advice: the new
     // definition becomes the base (hook-design §2). Even after a failed
     // load, which may have redefined some before it stopped.
@@ -1381,21 +1393,31 @@ fn execute_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Resu
     loaded
 }
 
-fn load_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Result<()> {
+fn load_package(
+    lua: &Lua,
+    name: &str,
+    require_lifecycle: bool,
+    commands_only: bool,
+) -> mlua::Result<()> {
     if !name.contains('/') {
         for host in crate::packages::requirement_order(name).map_err(mlua::Error::runtime)? {
             let lifecycle = crate::packages::resolve(&host)
                 .map_err(mlua::Error::runtime)?
                 .is_some_and(|package| package.lifecycle.is_some());
             if lifecycle {
-                activate_package(lua, &host, false)?;
+                activate_package(lua, &host, false, commands_only)?;
             }
         }
     }
-    activate_package(lua, name, require_lifecycle)
+    activate_package(lua, name, require_lifecycle, commands_only)
 }
 
-fn activate_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Result<()> {
+fn activate_package(
+    lua: &Lua,
+    name: &str,
+    require_lifecycle: bool,
+    commands_only: bool,
+) -> mlua::Result<()> {
     let package = crate::packages::resolve(name)
         .map_err(mlua::Error::runtime)?
         .ok_or_else(|| mlua::Error::runtime(format!("no such package: {name}")))?;
@@ -1451,19 +1473,23 @@ fn activate_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Res
             .eval()?;
         let activate: mlua::Function =
             lua.named_registry_value("remuda.lifecycle.activate_module")?;
-        let (_, state, start, rollback): (bool, Value, Value, Value) =
-            activate.call((name, declaration, require_lifecycle))?;
+        let (_, state, start, rollback, commands): (bool, Value, Value, Value, Value) =
+            activate.call((name, declaration, require_lifecycle, commands_only))?;
         active.set(true);
-        if let (Value::Function(start), Value::Function(rollback)) = (start, rollback) {
-            let remuda_global: Table = lua.globals().get("remuda")?;
-            let was_active: bool = remuda_global
-                .get("_lifecycle_start_active")
-                .unwrap_or(false);
-            remuda_global.set("_lifecycle_start_active", true)?;
-            let result = start.call::<()>(state);
-            remuda_global.set("_lifecycle_start_active", was_active)?;
+        if let Value::Function(commands) = &commands {
+            if let Err(error) = call_lifecycle_callback(lua, commands, state.clone()) {
+                if let Value::Function(rollback) = &rollback {
+                    rollback.call::<()>(())?;
+                }
+                return Err(error);
+            }
+        }
+        if let Value::Function(start) = &start {
+            let result = call_lifecycle_callback(lua, start, state);
             if let Err(error) = result {
-                rollback.call::<()>(())?;
+                if let Value::Function(rollback) = &rollback {
+                    rollback.call::<()>(())?;
+                }
                 return Err(error);
             }
         }
@@ -1473,6 +1499,17 @@ fn activate_package(lua: &Lua, name: &str, require_lifecycle: bool) -> mlua::Res
             .set_name(package.chunk_name)
             .exec()
     }
+}
+
+/// Run lifecycle callbacks under the same error policy, so errors from hooks
+/// they emit are propagated to the activation transaction for rollback.
+fn call_lifecycle_callback(lua: &Lua, callback: &mlua::Function, state: Value) -> mlua::Result<()> {
+    let remuda: Table = lua.globals().get("remuda")?;
+    let was_active: bool = remuda.get("_lifecycle_start_active").unwrap_or(false);
+    remuda.set("_lifecycle_start_active", true)?;
+    let result = callback.call::<()>(state);
+    remuda.set("_lifecycle_start_active", was_active)?;
+    result
 }
 
 /// Keep the Lua lifecycle manager callable by the loader without exposing its
