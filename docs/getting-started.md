@@ -122,9 +122,10 @@ Next: once it answers, go on to step 5.
 Do steps 1 and 2 on machines B and C. The machines must reach each other,
 for example over your VPN.
 
-The next command sets up the cluster on this machine. It also opens a
-network listener on this machine's local network (LAN) address, port 7441.
-Only admitted machines can connect to it. Use `--no-listen` on machines
+The next command sets up the cluster on this machine. By default it opens a
+network listener on a private LAN address at port 7441. Peers can reach the
+port, but an unadmitted peer cannot join without a valid invitation; admitted
+nodes authenticate with their registered key. Use `--no-listen` on machines
 that do not need to accept connections. To limit the bind address, run
 `remuda cluster listen --bind IP[:PORT]` (use `127.0.0.1:7441` for local-only).
 On every machine:
@@ -134,16 +135,17 @@ remuda cluster init
 ```
 
 You should see the listener start notice, `Cluster initialized`, then this
-machine's `Node:` and `Fingerprint:`. The listener lines show the actual
-address, where `IP` is this machine's LAN address:
+machine's `Node:` and `Fingerprint:`. The listener lines show the actual bound
+address and classify it as loopback, private LAN, all interfaces, or public.
+With the default settings, `IP` is this machine's private LAN address:
 
 ```text
-Starting the listener for cluster nodes on the private LAN (port 7441 by default). Only admitted machines can connect. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (127.0.0.1:7441 for local-only).
+Starting the listener for cluster nodes (port 7441 by default). Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (127.0.0.1:7441 for local-only).
 Cluster initialized
 Node: studio
 Fingerprint: SHA256:...
 Listening for cluster nodes on IP:7441 (reachable from your LAN)
-Only admitted machines can connect.
+Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key.
 To skip opening a port on init, use `remuda cluster init --no-listen`; to stop it later, run `remuda cluster listen --off`; to limit the address, run `remuda cluster listen --bind IP[:PORT]` (use `127.0.0.1:7441` for local-only).
 Next: run `remuda cluster invite` here, then run its printed `remuda cluster join ...` command on the other node.
 ```

@@ -1275,7 +1275,7 @@ fn cluster_init(server: &str, path: &Path, no_listen: bool) -> ExitCode {
     })
 }
 
-const CLUSTER_INIT_LISTENER_START_NOTICE: &str = "Starting the listener for cluster nodes on the private LAN (port 7441 by default). Only admitted machines can connect. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (127.0.0.1:7441 for local-only).";
+const CLUSTER_INIT_LISTENER_START_NOTICE: &str = "Starting the listener for cluster nodes (port 7441 by default). Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key. To skip opening a port, use remuda cluster init --no-listen; to stop it later, run remuda cluster listen --off; to limit its address, run remuda cluster listen --bind IP[:PORT] (127.0.0.1:7441 for local-only).";
 
 fn write_cluster_init_listener_starting_notice() -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
@@ -1340,25 +1340,21 @@ fn render_init_listener_lines(status: &remuda_core::protocol::ListenerStatus) ->
             } else {
                 listen_addrs.to_vec()
             };
-            let rendered_addresses = addresses
+            let mut lines = addresses
                 .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            let reachability = if addresses.iter().all(|address| address.ip().is_loopback()) {
-                "loopback only"
-            } else {
-                "reachable from your LAN"
-            };
-            let mut lines = vec![format!(
-                "Listening for cluster nodes on {rendered_addresses} ({reachability})"
-            )];
+                .map(|address| {
+                    format!(
+                        "Listening for cluster nodes on {address} ({})",
+                        listener_address_reachability(address.ip())
+                    )
+                })
+                .collect::<Vec<_>>();
             if let Some(advertise_addr) =
                 advertise_addr.filter(|advertised| !addresses.contains(advertised))
             {
                 lines.push(format!("Invites use {advertise_addr}"));
             }
-            lines.push("Only admitted machines can connect.".into());
+            lines.push("Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key.".into());
             lines.push("To skip opening a port on init, use `remuda cluster init --no-listen`; to stop it later, run `remuda cluster listen --off`; to limit the address, run `remuda cluster listen --bind IP[:PORT]` (use `127.0.0.1:7441` for local-only).".into());
             lines.push(next_step_init().into());
             lines
@@ -1372,6 +1368,20 @@ fn render_init_listener_lines(status: &remuda_core::protocol::ListenerStatus) ->
             format!("Listener failed: {reason}"),
             listener_failure_next_step(reason).into(),
         ],
+    }
+}
+
+fn listener_address_reachability(address: std::net::IpAddr) -> &'static str {
+    if address.is_loopback() {
+        "loopback only"
+    } else if address.is_unspecified() {
+        "all interfaces"
+    } else if remuda_native::net::advertise_addr::is_private_lan(address) {
+        "reachable from your LAN"
+    } else if is_public_listener_address(address) {
+        "public address"
+    } else {
+        "bound address"
     }
 }
 
@@ -2957,18 +2967,18 @@ mod cluster_cli_tests {
             "node-a",
             "fingerprint-a",
             &ListenerStatus::On {
-                addr: "192.0.2.4:7441".parse().unwrap(),
+                addr: "192.168.0.4:7441".parse().unwrap(),
                 auto: true,
-                advertise_addr: Some("192.0.2.4:7441".parse().unwrap()),
-                listen_addrs: vec!["192.0.2.4:7441".parse().unwrap()],
+                advertise_addr: Some("192.168.0.4:7441".parse().unwrap()),
+                listen_addrs: vec!["192.168.0.4:7441".parse().unwrap()],
             },
         );
         assert!(listening.iter().any(|line| {
-            line == "Listening for cluster nodes on 192.0.2.4:7441 (reachable from your LAN)"
+            line == "Listening for cluster nodes on 192.168.0.4:7441 (reachable from your LAN)"
         }));
-        assert!(listening
-            .iter()
-            .any(|line| line == "Only admitted machines can connect."));
+        assert!(listening.iter().any(|line| {
+            line == "Peers can reach the port, but an unadmitted peer cannot join without a valid invitation; admitted nodes authenticate with their registered key."
+        }));
         assert!(listening.iter().any(|line| {
             line.contains("remuda cluster init --no-listen")
                 && line.contains("remuda cluster listen --off")
@@ -4106,6 +4116,33 @@ mod cluster_cli_tests {
             ),
             "init output must show the detected bind address: {lines}"
         );
+    }
+
+    #[test]
+    fn init_listener_labels_each_address_by_its_address_class() {
+        use remuda_core::protocol::ListenerStatus;
+        use std::net::SocketAddr;
+
+        for (address, label) in [
+            ("127.0.0.1:7441", "loopback only"),
+            ("192.168.1.20:7441", "reachable from your LAN"),
+            ("0.0.0.0:7441", "all interfaces"),
+            ("8.8.8.8:7441", "public address"),
+        ] {
+            let address = address.parse::<SocketAddr>().unwrap();
+            let lines = render_init_listener_lines(&ListenerStatus::On {
+                addr: address,
+                auto: false,
+                advertise_addr: Some(address),
+                listen_addrs: vec![address],
+            });
+            assert!(
+                lines.contains(&format!(
+                    "Listening for cluster nodes on {address} ({label})"
+                )),
+                "listener address class for {address}: {lines:?}"
+            );
+        }
     }
 
     #[test]
