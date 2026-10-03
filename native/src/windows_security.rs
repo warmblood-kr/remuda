@@ -52,6 +52,67 @@ pub(crate) fn nt_open_policy(directory: bool) -> NtOpenPolicy {
 }
 
 #[cfg(any(windows, test))]
+struct FileRenameInfoBuffer {
+    words: Vec<usize>,
+    byte_len: usize,
+}
+
+#[cfg(any(windows, test))]
+impl FileRenameInfoBuffer {
+    fn as_mut_bytes(&mut self) -> &mut [u8] {
+        // SAFETY: `words` is aligned storage and every allocated byte is initialized.
+        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr().cast(), self.byte_len) }
+    }
+}
+
+#[cfg(any(windows, test))]
+impl std::ops::Deref for FileRenameInfoBuffer {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: `words` is aligned storage and every allocated byte is initialized.
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr().cast(), self.byte_len) }
+    }
+}
+
+#[cfg(any(windows, test))]
+fn build_file_rename_info(
+    root_directory: usize,
+    name: &str,
+    replace: bool,
+) -> std::io::Result<FileRenameInfoBuffer> {
+    if name.is_empty() || name.contains(['\0', '/', '\\']) {
+        return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+    }
+    let encoded = name.encode_utf16().collect::<Vec<_>>();
+    let name_bytes = encoded
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let name_length = u32::try_from(name_bytes)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let root_offset = std::mem::size_of::<u32>().next_multiple_of(std::mem::align_of::<usize>());
+    let length_offset = root_offset + std::mem::size_of::<usize>();
+    let name_offset = length_offset + std::mem::size_of::<u32>();
+    let byte_len = name_offset + name_bytes + std::mem::size_of::<u16>();
+    let word_count = byte_len.div_ceil(std::mem::size_of::<usize>());
+    let mut info = FileRenameInfoBuffer {
+        words: vec![0; word_count],
+        byte_len,
+    };
+    let bytes = info.as_mut_bytes();
+    let flags = 0x2 | u32::from(replace); // POSIX semantics plus optional replace.
+    bytes[..4].copy_from_slice(&flags.to_ne_bytes());
+    bytes[root_offset..length_offset].copy_from_slice(&root_directory.to_ne_bytes());
+    bytes[length_offset..name_offset].copy_from_slice(&name_length.to_ne_bytes());
+    for (index, unit) in encoded.into_iter().enumerate() {
+        let offset = name_offset + index * std::mem::size_of::<u16>();
+        bytes[offset..offset + 2].copy_from_slice(&unit.to_ne_bytes());
+    }
+    Ok(info)
+}
+
+#[cfg(any(windows, test))]
 fn ace_sid_fits(ace_size: usize, fixed_size: usize, sid_size: usize) -> bool {
     fixed_size
         .checked_add(sid_size)
@@ -97,10 +158,13 @@ pub(crate) fn storage_root_for(env: &dyn Fn(&str) -> Option<OsString>) -> Result
 
 #[cfg(windows)]
 mod platform {
-    use super::{ace_sid_fits, nt_open_policy, protected_storage_sddl, relative_component_utf16};
+    use super::{
+        ace_sid_fits, build_file_rename_info, nt_open_policy, protected_storage_sddl,
+        relative_component_utf16,
+    };
     use std::ffi::{c_void, OsStr};
     use std::fs;
-    use std::io;
+    use std::io::{self, Write};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::Path;
@@ -119,7 +183,7 @@ mod platform {
     };
     use windows_sys::Win32::Security::{
         GetAce, GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-        GetTokenInformation, TokenUser, ACE_HEADER, ACL_SIZE_INFORMATION,
+        GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION,
         DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED, TOKEN_QUERY,
         TOKEN_USER,
     };
@@ -177,7 +241,8 @@ mod platform {
             {
                 return Err(io::Error::from(io::ErrorKind::AlreadyExists));
             }
-            let file = open_relative(&self.file, name, true, create, 0x0010_0087)?;
+            let file = open_relative(&self.file, name, true, create, 0x0012_0087)?;
+            verify_inherited_acl(&file)?;
             Ok(Self {
                 file,
                 names_lock: Mutex::new(()),
@@ -185,21 +250,73 @@ mod platform {
         }
 
         pub(crate) fn open_file(&self, name: &str, write: bool) -> io::Result<std::fs::File> {
-            open_relative(
+            let file = open_relative(
                 &self.file,
                 name,
                 false,
                 write,
-                if write { 0x0010_0082 } else { 0x0010_0081 },
-            )
+                if write { 0x0012_0082 } else { 0x0012_0081 },
+            )?;
+            verify_inherited_acl(&file)?;
+            Ok(file)
+        }
+
+        #[allow(dead_code)] // Wired into storage::write_location in the next D2 commit.
+        pub(crate) fn write_atomic(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+            match self.open_file(name, false) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+
+            let mut temporary = None;
+            for _ in 0..8 {
+                let name = random_temporary_name()?;
+                match create_relative_file(&self.file, &name) {
+                    Ok(file) => {
+                        temporary = Some(TempFileGuard {
+                            file,
+                            delete_on_drop: true,
+                        });
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let mut temporary =
+                temporary.ok_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists))?;
+            verify_inherited_acl(&temporary.file)?;
+            temporary.file.write_all(bytes)?;
+            temporary.file.sync_all()?;
+
+            let mut rename_info =
+                build_file_rename_info(self.file.as_raw_handle() as usize, name, true)?;
+            let length = u32::try_from(rename_info.len())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+            // FileRenameInfoEx = 22; POSIX semantics and replace-if-exists are both required.
+            if unsafe {
+                SetFileInformationByHandle(
+                    temporary.file.as_raw_handle(),
+                    22,
+                    rename_info.as_mut_bytes().as_mut_ptr().cast(),
+                    length,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            temporary.delete_on_drop = false;
+            Ok(())
         }
 
         pub(crate) fn delete_file(&self, name: &str) -> io::Result<bool> {
-            let file = match open_relative(&self.file, name, false, false, 0x0011_0080) {
+            let file = match open_relative(&self.file, name, false, false, 0x0013_0080) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => return Err(error),
             };
+            verify_inherited_acl(&file)?;
             let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
             // SAFETY: file is a no-follow regular-file handle with DELETE access.
             if unsafe {
@@ -308,6 +425,100 @@ mod platform {
         }
     }
 
+    struct TempFileGuard {
+        file: std::fs::File,
+        delete_on_drop: bool,
+    }
+
+    impl Drop for TempFileGuard {
+        fn drop(&mut self) {
+            if self.delete_on_drop {
+                mark_file_for_delete(&self.file);
+            }
+        }
+    }
+
+    fn mark_file_for_delete(file: &std::fs::File) {
+        let mut disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        // SAFETY: The owned temp handle has DELETE access and the disposition buffer is sized.
+        unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                4,
+                (&mut disposition as *mut FILE_DISPOSITION_INFO).cast(),
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            );
+        }
+    }
+
+    fn random_temporary_name() -> io::Result<String> {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|_| io::Error::other("storage randomness unavailable"))?;
+        let mut name = String::from(".remuda-atomic-");
+        for byte in random {
+            use std::fmt::Write as _;
+            write!(&mut name, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        name.push_str(".tmp");
+        Ok(name)
+    }
+
+    fn create_relative_file(parent: &std::fs::File, component: &str) -> io::Result<std::fs::File> {
+        let name = relative_component_utf16(component)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let length = ((name.len() - 1) * std::mem::size_of::<u16>()) as u16;
+        let mut unicode = UNICODE_STRING {
+            Length: length,
+            MaximumLength: (name.len() * std::mem::size_of::<u16>()) as u16,
+            Buffer: name.as_ptr().cast_mut(),
+        };
+        let policy = nt_open_policy(false);
+        let attributes = OBJECT_ATTRIBUTES {
+            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle(),
+            ObjectName: &mut unicode,
+            Attributes: policy.object_attributes,
+            SecurityDescriptor: ptr::null_mut(),
+            SecurityQualityOfService: ptr::null_mut(),
+        };
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        let mut raw = ptr::null_mut();
+        // FILE_CREATE makes collisions fail instead of opening an existing sibling.
+        let status = unsafe {
+            NtCreateFile(
+                &mut raw,
+                0x0013_0082, // DELETE | READ_CONTROL | SYNCHRONIZE | READ_ATTRIBUTES | WRITE_DATA
+                &attributes,
+                &mut status_block,
+                ptr::null(),
+                0x80,
+                7,
+                2,
+                policy.create_options,
+                ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            if !raw.is_null() {
+                // SAFETY: A non-null failed output handle must be released.
+                unsafe { CloseHandle(raw) };
+            }
+            return Err(nt_error(status));
+        }
+        if raw.is_null() {
+            return Err(io::Error::other("storage temp create returned no handle"));
+        }
+        // SAFETY: A successful NtCreateFile call returned an owned file handle.
+        let file = unsafe { std::fs::File::from_raw_handle(raw) };
+        if let Err(error) = verify_handle(&file, false) {
+            mark_file_for_delete(&file);
+            return Err(error);
+        }
+        Ok(file)
+    }
+
     fn nt_error(status: i32) -> io::Error {
         match status as u32 {
             0xC000_0034 | 0xC000_003A => io::Error::from(io::ErrorKind::NotFound),
@@ -411,6 +622,116 @@ mod platform {
         let is_directory = tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
         if tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 || is_directory != directory {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        Ok(())
+    }
+
+    fn verify_inherited_acl(file: &std::fs::File) -> io::Result<()> {
+        let mut owner = ptr::null_mut();
+        let mut dacl = ptr::null_mut();
+        let mut raw_descriptor = ptr::null_mut();
+        // SAFETY: file is a live handle opened with READ_CONTROL; output pointers are valid.
+        let result = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                ptr::null_mut(),
+                &mut dacl,
+                ptr::null_mut(),
+                &mut raw_descriptor,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::from_raw_os_error(result as i32));
+        }
+        let descriptor = LocalMemory(raw_descriptor.cast());
+        let user = UserSid::current()?;
+        if owner.is_null()
+            // SAFETY: Both owner and current-user SIDs remain live for this comparison.
+            || unsafe { windows_sys::Win32::Security::EqualSid(owner, user.sid) } == 0
+        {
+            return Err(policy_error("storage child owner mismatch"));
+        }
+        let mut control = 0;
+        let mut revision = 0;
+        // SAFETY: descriptor owns a valid security descriptor and outputs are writable.
+        if unsafe { GetSecurityDescriptorControl(descriptor.0.cast(), &mut control, &mut revision) }
+            == 0
+        {
+            return Err(last_error());
+        }
+        if control & SE_DACL_PROTECTED != 0 {
+            return Err(policy_error("storage child DACL does not inherit"));
+        }
+        let mut present = 0;
+        let mut actual_dacl = ptr::null_mut();
+        let mut defaulted = 0;
+        // SAFETY: descriptor is valid and the DACL fields are output pointers.
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor.0.cast(),
+                &mut present,
+                &mut actual_dacl,
+                &mut defaulted,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        if present == 0 || actual_dacl.is_null() {
+            return Err(policy_error("storage child DACL missing"));
+        }
+        let mut info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: actual_dacl is owned by descriptor; info is a sized output buffer.
+        if unsafe {
+            GetAclInformation(
+                actual_dacl,
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+                windows_sys::Win32::Security::AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        if info.AceCount != 3 {
+            return Err(policy_error("storage child ACE set mismatch"));
+        }
+        let mut principals = Vec::with_capacity(3);
+        for index in 0..info.AceCount {
+            let mut raw_ace = ptr::null_mut();
+            // SAFETY: actual_dacl is valid and raw_ace is a writable output pointer.
+            if unsafe { GetAce(actual_dacl, index, &mut raw_ace) } == 0 || raw_ace.is_null() {
+                return Err(last_error());
+            }
+            // SAFETY: GetAce returned an ACE pointer owned by the live DACL.
+            let header = unsafe { &*(raw_ace.cast::<ACE_HEADER>()) };
+            if header.AceType != 0 || header.AceFlags & 0x10 == 0 {
+                return Err(policy_error("storage child ACE policy mismatch"));
+            }
+            let fixed_size = std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>();
+            if (header.AceSize as usize) < fixed_size + 8 {
+                return Err(policy_error("storage child ACE is truncated"));
+            }
+            // SAFETY: AceSize covers the ACCESS_ALLOWED_ACE prefix checked above.
+            let ace = unsafe { &*(raw_ace.cast::<ACCESS_ALLOWED_ACE>()) };
+            if ace.Mask != FILE_ALL_ACCESS {
+                return Err(policy_error("storage child ACE mask mismatch"));
+            }
+            let sid = (&ace.SidStart as *const u32).cast_mut().cast::<c_void>();
+            principals.push(sid_text(sid)?);
+        }
+        principals.sort();
+        let mut expected = vec![
+            "S-1-3-4".to_owned(),
+            "S-1-5-18".to_owned(),
+            "S-1-5-32-544".to_owned(),
+        ];
+        expected.sort();
+        if principals != expected {
+            return Err(policy_error("storage child principals mismatch"));
         }
         Ok(())
     }
