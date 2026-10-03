@@ -1442,6 +1442,29 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    fn metadata_probe(path: &Path) -> String {
+        match fs::metadata(path) {
+            Ok(_) => "Ok".to_owned(),
+            Err(error) => format!("Err({:?}, {:?})", error.kind(), error.raw_os_error()),
+        }
+    }
+
+    #[cfg(windows)]
+    fn secret_path_probes(root: &Path) -> String {
+        let secret = root.join("secret");
+        let storage = secret.join("storage");
+        format!(
+            "root {}: {}; root/secret {}: {}; root/secret/storage {}: {}",
+            root.display(),
+            metadata_probe(root),
+            secret.display(),
+            metadata_probe(&secret),
+            storage.display(),
+            metadata_probe(&storage),
+        )
+    }
+
     fn env(values: &[(&str, &str)]) -> impl Fn(&str) -> Option<OsString> {
         let values: HashMap<_, _> = values
             .iter()
@@ -1964,7 +1987,9 @@ mod tests {
                 let _revert = RevertImpersonation;
                 assert_worker_admin_is_deny_only(admin_sid, false);
                 // This denial does not distinguish the namespace-directory ACL from the file ACL.
-                reader
+                let probes = secret_path_probes(&worker_root);
+                eprintln!("Guests-restricted path probes: {probes}");
+                let result = reader
                     .load(
                         r#"
                         local secret = remuda.storage.get("restricted-negative"):secret()
@@ -1973,8 +1998,11 @@ mod tests {
                             "unmatched restricting SID must deny read")
                         "#,
                     )
-                    .exec()
-                    .unwrap();
+                    .exec();
+                assert!(
+                    result.is_ok(),
+                    "Guests-restricted read result: {result:?}; {probes}"
+                );
             }
 
             let control_token = restricted_admin_token(admin_sid, Some(admin_sid));
@@ -1985,7 +2013,9 @@ mod tests {
             );
             let _revert = RevertImpersonation;
             assert_worker_admin_is_deny_only(admin_sid, false);
-            reader
+            let probes = secret_path_probes(&worker_root);
+            eprintln!("Administrators-restricted path probes: {probes}");
+            let result = reader
                 .load(
                     r#"
                     local secret = remuda.storage.get("restricted-negative"):secret()
@@ -1993,8 +2023,11 @@ mod tests {
                     assert(value == "elevated secret", "Administrators restricting SID should allow get: " .. tostring(reason))
                     "#,
                 )
-                .exec()
-                .unwrap();
+                .exec();
+            assert!(
+                result.is_ok(),
+                "Administrators-restricted control result: {result:?}; {probes}"
+            );
         })
         .join()
         .expect("restricted negative worker panicked");
