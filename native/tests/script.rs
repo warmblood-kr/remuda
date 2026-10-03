@@ -1100,7 +1100,7 @@ fn remuda_new_can_set_cwd_and_env_on_the_launched_process() {
         .replace('"', "\\\"");
     let source = format!(
         r#"
-        remuda.new("probed", {{"sh", "-c", "pwd && echo $PROBE_VAR && echo path-has:$PATH"}}, "{cwd_literal}", {{PROBE_VAR = "remuda-env-probe-7f3a"}})
+        remuda.new("probed", {{"sh", "-c", "pwd && echo $PROBE_VAR && echo path-has:${{PATH%%:*}} && sleep 30"}}, "{cwd_literal}", {{PROBE_VAR = "remuda-env-probe-7f3a"}})
         "#
     );
     script::run(&path, &write(&dir, "cwd-env.lua", &source)).expect("script");
