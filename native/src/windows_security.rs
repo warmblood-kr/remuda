@@ -791,6 +791,40 @@ mod tests {
     }
 
     #[test]
+    fn rename_info_builder_is_handle_relative_utf16_and_nul_terminated() {
+        let root = 0x1234usize;
+        let name = "résumé.tmp";
+        let info = build_file_rename_info(root, name, true).unwrap();
+        let root_offset = 4usize.next_multiple_of(std::mem::size_of::<usize>());
+        let length_offset = root_offset + std::mem::size_of::<usize>();
+        let name_offset = length_offset + std::mem::size_of::<u32>();
+        let encoded = name.encode_utf16().collect::<Vec<_>>();
+
+        assert_eq!(u32::from_le_bytes(info[0..4].try_into().unwrap()), 0x3);
+        assert_eq!(
+            usize::from_le_bytes(info[root_offset..length_offset].try_into().unwrap()),
+            root
+        );
+        assert_eq!(
+            u32::from_le_bytes(info[length_offset..name_offset].try_into().unwrap()) as usize,
+            encoded.len() * std::mem::size_of::<u16>()
+        );
+        let mut expected = encoded
+            .into_iter()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        expected.extend_from_slice(&[0, 0]);
+        assert_eq!(&info[name_offset..], expected.as_slice());
+    }
+
+    #[test]
+    fn rename_info_builder_rejects_empty_or_nul_containing_leaf_names() {
+        assert!(build_file_rename_info(1, "", true).is_err());
+        assert!(build_file_rename_info(1, "bad\0name", true).is_err());
+        assert!(build_file_rename_info(1, "nested/name", true).is_err());
+    }
+
+    #[test]
     fn storage_sddl_grants_only_owner_system_and_administrators() {
         assert_eq!(
             protected_storage_sddl("S-1-5-21-42"),
