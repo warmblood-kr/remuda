@@ -196,6 +196,8 @@ On Windows, environment names that differ only by case refer to the same
 variable; which value wins is undefined, so callers must not pass both. With
 `cwd`, a bare program name is looked up in the daemon's `PATH`; without `cwd`,
 lookup uses the child's `PATH` (including any supplied or cleared environment).
+With `cwd`, `argv[1]` must be an absolute path or a bare command name, and a
+bare name is never searched in `cwd`.
 
 The buffer between the reader thread and the Image is capped, on purpose.
 When it fills, the reader thread simply stops reading — the child's own
